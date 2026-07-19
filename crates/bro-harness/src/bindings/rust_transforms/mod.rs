@@ -15,10 +15,12 @@
 //! is a compact one-line-per-tool description; full contracts come from
 //! `rust.describe` at runtime (values stay in the isolate, no prompt bloat).
 
+mod extract_trait;
 mod fix;
 mod helpers;
 mod impl_extract;
 mod imports;
+mod lift_free;
 mod r#move;
 mod move_struct_fields;
 mod rewrite_callers;
@@ -446,6 +448,83 @@ NEVER WRITES. Feed {changes} into edits.merge, then edits.apply. Same shape as
 rust.rewriteModuleCallers (the other companion caller-rewrite).
 "#;
 
+const EXTRACT_TRAIT_CONTRACT: &str = r#"rust.extractTrait - extract inherent impl methods into a trait.
+
+WHAT IT DOES
+  Ports v1 extract_rust_trait (design section 3.1). Removes selected methods
+  from one inherent impl, creates/appends a trait plus `impl Trait for Type`
+  in the target, and reports object-safety and call-site import requirements.
+
+PARAMS
+  source: string       Source file (workspace-relative, no `..`).
+  target: string       Target trait file (workspace-relative, no `..`). May
+                       be a new file.
+  implName: string     Inherent impl label, for example "impl Store".
+  traitName: string    Name for the extracted trait.
+  itemNames: string[]  Method names to extract.
+
+RETURNS
+  { title, changes, creates, findings, dyn_compatible,
+    object_safety_report, call_site_warnings, trait_in_scope_required,
+    would_change_files, would_create_files, provenance:"syntax_only" }
+  object_safety_report names generic methods, by-value self methods, and
+  associated constants. trait_in_scope_required lists distant caller modules
+  that need the new trait imported.
+
+RECIPE
+  const r = await rust.extractTrait({
+    source: "src/store.rs", target: "src/store_api.rs",
+    implName: "impl Store", traitName: "StoreApi",
+    itemNames: ["get", "set"]
+  });
+  const es = await edits.begin();
+  await edits.merge({ es, changes: r.changes });
+  for (const c of r.creates) await edits.createFile({ es, path: c.path, content: c.content });
+  await edits.apply({ es });
+
+NOTES
+  NEVER writes. Run a compiler gate after apply. If a selected method calls a
+  private non-selected inherent helper, the planner refuses with
+  extract_trait_orphaned_call. A target-exists refusal after a prior apply is
+  the DONE signal, not a retry.
+"#;
+
+const LIFT_TO_FREE_CONTRACT: &str = r#"rust.liftToFree - lift inherent methods to free functions.
+
+WHAT IT DOES
+  Ports v1 lift_rust_inherent_to_free (design section 3.1). Moves selected
+  inherent methods that do not depend on instance state into a target file as
+  free functions. Explicit lifetimes are preserved verbatim.
+
+PARAMS
+  source: string       Source file (workspace-relative, no `..`).
+  target: string       Target free-function file (workspace-relative, no
+                       `..`). May be a new file.
+  itemNames: string[]  Inherent method names to lift.
+
+RETURNS
+  { title, changes, creates, findings, refusal_reasons,
+    would_change_files, would_create_files, provenance:"syntax_only" }
+  Mixed selections are allowed: eligible methods produce edits while refused
+  methods are listed with per-method reasons. If every selected method is
+  refused, the tool returns method_lift_refused.
+
+RECIPE
+  const r = await rust.liftToFree({
+    source: "src/helpers.rs", target: "src/free.rs",
+    itemNames: ["normalize", "parse"]
+  });
+  const es = await edits.begin();
+  await edits.merge({ es, changes: r.changes });
+  for (const c of r.creates) await edits.createFile({ es, path: c.path, content: c.content });
+  await edits.apply({ es });
+
+LIMITATIONS
+  The v1 engine does not rewrite call sites. Run a compiler gate and repair
+  callers after apply. Selection is limited to the first inherent impl block
+  discovered in the source file.
+"#;
+
 #[async_trait]
 impl Tool for RustDescribe {
     fn name(&self) -> &str {
@@ -493,11 +572,13 @@ impl Tool for RustDescribe {
                 ToolResult::Json(json!({ "contract": MOVE_STRUCT_FIELDS_CONTRACT }))
             }
             "updateCallers" => ToolResult::Json(json!({ "contract": UPDATE_CALLERS_CONTRACT })),
+            "extractTrait" => ToolResult::Json(json!({ "contract": EXTRACT_TRAIT_CONTRACT })),
+            "liftToFree" => ToolResult::Json(json!({ "contract": LIFT_TO_FREE_CONTRACT })),
             "rewriteModuleCallers" => {
                 ToolResult::Json(json!({ "contract": REWRITE_MODULE_CALLERS_CONTRACT }))
             }
             other => ToolResult::Error(format!(
-                "rust.describe: unknown transform `{other}` (available: fixRound, extractItems, inlineModToFile, moduleWiring, setVisibility, extractImplMethods, organizeImports, moveStructFields, updateCallers, rewriteModuleCallers)"
+                "rust.describe: unknown transform `{other}` (available: fixRound, extractItems, inlineModToFile, moduleWiring, setVisibility, extractImplMethods, organizeImports, moveStructFields, updateCallers, extractTrait, liftToFree, rewriteModuleCallers)"
             )),
         }
     }
@@ -517,6 +598,8 @@ pub fn tools(ledger: Arc<ProvenanceLedger>) -> Vec<Arc<dyn Tool>> {
             &ledger,
         ))) as Arc<dyn Tool>,
         Arc::new(update_callers::RustUpdateCallers(Arc::clone(&ledger))) as Arc<dyn Tool>,
+        Arc::new(extract_trait::RustExtractTrait(Arc::clone(&ledger))) as Arc<dyn Tool>,
+        Arc::new(lift_free::RustLiftToFree(Arc::clone(&ledger))) as Arc<dyn Tool>,
         Arc::new(rewrite_callers::RustRewriteModuleCallers) as Arc<dyn Tool>,
         Arc::new(wiring::RustSetVisibility(ledger)) as Arc<dyn Tool>,
     ]
@@ -528,7 +611,7 @@ pub fn tools(ledger: Arc<ProvenanceLedger>) -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> ToolNamespaceDescription {
     ToolNamespaceDescription {
         name: "rust".to_string(),
-        description: "Rust transform bindings ported from the v1 bbox-refactor rust catalog (design/refactor-tools/rust/rust-isolate-surface.md). Each transform NEVER writes: it returns {changes, creates, findings} for edits.merge/createFile and records host-authored changes in the provenance ledger so edits.apply computes semantic_status lineage. Call rust.describe({transform}) for the full contract. Transforms: fixRound - classify rustc/clippy build.gate diagnostics into compiler_suggested edits (verbatim MachineApplicable suggestions) + syntax_only synthesized proposals (add-use, visibility-bump) + explicit leftovers (borrow-checker, trait-bound); the compile-fix loop engine. Clippy diagnostics classify the same way (same JSON shape). extractItems - move top-level items into a (new) submodule; compound mode (default) does scaffolded target + `mod <name>;` in parent + visibility bumps on moved items and struct fields + auto-pruned `use <module>::{...};` re-import; knobs select synthesis shape (withLocalDeps, section, mergeIntoExistingTarget, useDeclVisibility, useDeclItems) while dependency analysis runs always and reports in findings. inlineModToFile - inline `mod foo { ... }` body to a sibling submodule file; outer attrs like #[cfg(test)] stay attached. moduleWiring - one conservative module-graph edit (add_mod/remove_mod/add_use/remove_use, idempotent). setVisibility - rewrite visibility of items, impl methods, or struct fields; preserves async/unsafe/const qualifiers. extractImplMethods - move named Rust impl methods from one file into another; preserves attributes/modifiers, rebases super:: paths, applies visibility overrides. organizeImports - minimize wildcard `use foo::*;` into explicit `use foo::{A, B};` for directly-referenced names (mode=minimize, default; mode=organize is the future rust-analyzer source.organizeImports path, lands with lsp.assist phase 2). moveStructFields - move named fields from one struct to another (RX-S1); the acknowledge_repr operator opt-out arrives dispatch-side via ToolArgDefaults lookup, never as cell input. updateCallers - companion caller-rewrite after moveStructFields; conservatively rewrites self.field and self.method(args) through a delegate field, surfacing unrewriteable accessors in findings. rewriteModuleCallers - rewrite caller prefixes after a module move; <source_simple>::<item> to <target_simple>::<item> in all project .rs files, word-boundary checked."
+        description: "Rust transform bindings ported from the v1 bbox-refactor rust catalog (design/refactor-tools/rust/rust-isolate-surface.md). Each transform NEVER writes: it returns {changes, creates, findings} for edits.merge/createFile and records host-authored changes in the provenance ledger so edits.apply computes semantic_status lineage. Call rust.describe({transform}) for the full contract. Transforms: fixRound - classify rustc/clippy build.gate diagnostics into compiler_suggested edits (verbatim MachineApplicable suggestions) + syntax_only synthesized proposals (add-use, visibility-bump) + explicit leftovers (borrow-checker, trait-bound); the compile-fix loop engine. Clippy diagnostics classify the same way (same JSON shape). extractItems - move top-level items into a (new) submodule; compound mode (default) does scaffolded target + `mod <name>;` in parent + visibility bumps on moved items and struct fields + auto-pruned `use` decl. inlineModToFile - inline `mod foo { ... }` body to a sibling submodule file. moduleWiring - one conservative module-graph edit. setVisibility - rewrite visibility of items, impl methods, or struct fields. extractImplMethods - move named Rust impl methods into another file. organizeImports - minimize wildcard imports. moveStructFields - move named fields between structs with dispatch-side repr authority. updateCallers - conservatively rewrite accesses through a delegate. extractTrait - extract inherent methods into a trait with object-safety and trait-scope reports. liftToFree - lift state-independent inherent methods to free functions with per-method refusal findings. rewriteModuleCallers - rewrite caller prefixes after a module move."
             .to_string(),
         declarations: r#"type RustChangeProposal = { span: Span; new_text: string; provenance: "compiler_suggested" | "syntax_only"; code?: string };
 type RustLeftover = { message: string; code?: string; reason: string };
@@ -547,6 +630,9 @@ type RustRewriteModuleCallersResult = { changes: SpanChange[]; findings: Record<
 type RustOrganizeImportsResult = { title: string; changes: RustSpanChange[]; creates: RustCreate[]; findings: ({ finding: string } & Record<string, unknown>)[]; mode: "minimize"; would_change_files: RustWouldChangeFile[]; would_create_files: RustWouldCreateFile[]; provenance: "syntax_only" };
 type RustMoveStructFieldsResult = { title: string; changes: RustSpanChange[]; creates: RustCreate[]; findings: ({ finding: string } & Record<string, unknown>)[]; would_change_files: RustWouldChangeFile[]; would_create_files: RustWouldCreateFile[]; operator_opt_outs_used: string[]; provenance: "syntax_only" };
 type RustUpdateCallersResult = { changes: RustSpanChange[]; findings: ({ finding: string } & Record<string, unknown>)[]; counts: { files_touched: number; rewrites: number }; provenance: "syntax_only" };
+type RustExtractTraitResult = { title: string; changes: RustSpanChange[]; creates: RustCreate[]; findings: ({ finding: string } & Record<string, unknown>)[]; dyn_compatible: boolean; object_safety_report: { generic_methods: string[]; self_by_value_methods: string[]; associated_constants: string[]; dyn_compatible: boolean }; call_site_warnings: string[]; trait_in_scope_required: string[]; would_change_files: RustWouldChangeFile[]; would_create_files: RustWouldCreateFile[]; provenance: "syntax_only" };
+type RustLiftRefusalReason = { method: string; reason: string };
+type RustLiftToFreeResult = { title: string; changes: RustSpanChange[]; creates: RustCreate[]; findings: ({ finding: string } & Record<string, unknown>)[]; refusal_reasons: RustLiftRefusalReason[]; would_change_files: RustWouldChangeFile[]; would_create_files: RustWouldCreateFile[]; provenance: "syntax_only" };
 declare const rust: {
   /** Full contract (params, result vocabulary, recipe) for one rust transform. Call before first use. */
   describe(args: { transform: string }): Promise<{ contract: string }>;
@@ -568,6 +654,10 @@ declare const rust: {
   moveStructFields(args: { source: string; target: string; structName: string; itemNames: string[]; visibility?: string }): Promise<RustMoveStructFieldsResult>;
   /** Rewrite callers through a delegate field (RX-S2b). Companion to moveStructFields: conservatively rewrites self.field and self.method(args) to go through a delegate field. Unrewriteable accessors surface in findings. NEVER writes: feed {changes} into edits.merge. */
   updateCallers(args: { source: string; structName?: string; delegateField: string; target?: string; delegateType?: string; itemNames: string[] }): Promise<RustUpdateCallersResult>;
+  /** Extract selected inherent impl methods into a trait and trait impl. Reports object safety, call-site warnings, and files that require the trait in scope. NEVER writes: feed {changes} into edits.merge and {creates} into edits.createFile. */
+  extractTrait(args: { source: string; target: string; implName: string; traitName: string; itemNames: string[] }): Promise<RustExtractTraitResult>;
+  /** Lift selected inherent methods that do not depend on instance state into free functions. Explicit lifetimes are preserved; mixed selections report per-method refusals. NEVER writes: feed {changes} into edits.merge and {creates} into edits.createFile. */
+  liftToFree(args: { source: string; target: string; itemNames: string[] }): Promise<RustLiftToFreeResult>;
   /** Rewrite caller prefixes after a module move: <source_simple>::<item> -> <target_simple>::<item> in all project .rs files, word-boundary checked. Composable after any extract/move. NEVER writes: feed {changes} into edits.merge. */
   rewriteModuleCallers(args: { project_dir: string; item_names: string[]; module_name?: string; target_prelude?: string; skip_files?: string[] }): Promise<RustRewriteModuleCallersResult>;
 };"#
