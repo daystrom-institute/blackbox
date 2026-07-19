@@ -385,13 +385,20 @@ monolith:
    dual-path role mask (post-mortem item 2).
 
    **Contract (decided 2026-07-19):**
-   - *Wire:* Unix domain socket + newline-delimited JSON with a versioned
-     handshake and a file-sourced bearer token; message types live in
-     `bro-protocol`. The harness needs zero changes: it stays a plain
-     stdio child of fleetd and never dials anyone. The socket path
-     derives from the daemon's state dir, so the prod and dev daemons on
-     one machine each get their OWN fleetd; a shared supervisor would let
-     one daemon adopt the other's sessions.
+   - *Wire:* Unix domain socket + bounded length-prefixed JSON frames
+     (`bro-rpc`: big-endian u32 length + UTF-8 JSON, mid-serialize abort
+     at the frame cap; never newline framing, since model events and tool
+     results carry arbitrary newlines and an oversize line cannot be
+     rejected from a header) with a versioned handshake and a
+     file-sourced bearer token; message types live in `bro-protocol`.
+     (Corrected 2026-07-19 from "newline-delimited JSON": the framing
+     amendment adopted with the salvage mining superseded this sentence
+     before fleetd was built, and the built system follows `bro-rpc`.)
+     The harness needs zero changes: it stays a plain stdio child of
+     fleetd speaking NDJSON on stdin/stdout as today, and never dials
+     anyone. The socket path derives from the daemon's state dir, so the
+     prod and dev daemons on one machine each get their OWN fleetd; a
+     shared supervisor would let one daemon adopt the other's sessions.
    - *Replay:* no in-memory replay buffer. The session's existing
      event-log JSONL in the task store is the replay source; the daemon
      is the authority on its own cursor (last-ingested seq per session)
