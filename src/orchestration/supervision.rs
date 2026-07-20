@@ -288,18 +288,6 @@ impl SupervisionState {
         self.emit_token_burn_alert(cfg, now_ms);
     }
 
-    pub fn observe_bulk_sink(&mut self, sink: &EventSink, cfg: &SupervisionConfig, now_ms: u64) {
-        if !self.enabled {
-            return;
-        }
-
-        self.event_count = self.event_count.saturating_add(1);
-        self.last_event_at_ms = Some(now_ms);
-
-        self.observe_usage(sink);
-        self.emit_token_burn_alert(cfg, now_ms);
-    }
-
     /// Seconds of inactivity since the last observed event, but only once the
     /// configured idle threshold has been crossed. Returns `None` while still
     /// below threshold (or when no event has ever been observed). This is the
@@ -1128,22 +1116,6 @@ mod tests {
         assert_eq!(
             snap["idle_notice"], "no activity for 190s (no tool running)",
             "idle with no tool in flight reads as the model being quiet"
-        );
-    }
-
-    #[test]
-    fn bulk_only_provider_reports_tool_state_unknown() {
-        let mut state = SupervisionState::default();
-        // Bulk-output providers only ever feed observe_bulk_sink — no mid-run
-        // visibility, so tool_running stays unknown rather than faking false.
-        state.observe_bulk_sink(&sink_without_usage(), &cfg(), 1_000);
-        assert_eq!(state.tool_running, None);
-
-        let snap = state.snapshot(&cfg(), 1_000 + STALL_NOTICE_MS + 1_000);
-        assert!(snap["tool_running"].is_null());
-        assert_eq!(
-            snap["idle_notice"],
-            "no activity for 181s (tool state unknown)"
         );
     }
 

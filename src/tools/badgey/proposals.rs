@@ -549,15 +549,18 @@ impl BlackboxServer {
                     )
                     .map_err(|e| format!("marking action dispatching: {e}"))?;
                 completion_from = dispatching.clone();
-                if let Err(err) = self.badgey_spawn_privileged_task(
-                    &task_id,
-                    orchestration::badgey::descriptor().scout_brofile_ref,
-                    charter,
-                    &instance.scope.project_id,
-                    Some(instance.thread_of_record_id.as_str()),
-                    Some(instance.id.as_str()),
-                    Some("badgey-scout".to_string()),
-                ) {
+                if let Err(err) = self
+                    .badgey_spawn_privileged_task(
+                        &task_id,
+                        orchestration::badgey::descriptor().scout_brofile_ref,
+                        charter,
+                        &instance.scope.project_id,
+                        Some(instance.thread_of_record_id.as_str()),
+                        Some(instance.id.as_str()),
+                        Some("badgey-scout".to_string()),
+                    )
+                    .await
+                {
                     let _ = self.state.consultant_journal.transition(
                         &action_id,
                         dispatching,
@@ -629,7 +632,7 @@ impl BlackboxServer {
         Ok(result)
     }
 
-    pub(crate) fn badgey_spawn_privileged_task(
+    pub(crate) async fn badgey_spawn_privileged_task(
         &self,
         task_id: &str,
         brofile: &str,
@@ -711,6 +714,7 @@ impl BlackboxServer {
                 origin: bro_core::Origin::AgentDispatch,
             },
         )
+        .await
         .map_err(|e| e.to_string())?;
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         Ok(task)
@@ -850,7 +854,8 @@ impl BlackboxServer {
                     Some(instance.thread_of_record_id.as_str()),
                     Some(id.as_str()),
                     Some("badgey-redispatch".to_string()),
-                )?;
+                )
+                .await?;
                 Ok(json!({"task_id": task_id}))
             } else {
                 let kind = applying

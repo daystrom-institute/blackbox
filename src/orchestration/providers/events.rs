@@ -88,8 +88,6 @@ pub trait ProviderEvents {
     fn detect_disruption(&self, evt: &Value) -> Option<Disruption>;
     /// Parse a streaming JSON event and update the sink.
     fn parse_event(&self, evt: &Value, sink: &mut EventSink);
-    /// For non-streaming providers, parse the full stdout after process exit.
-    fn parse_bulk_output(&self, raw: &str, sink: &mut EventSink);
     /// Build provider-native transcript export args, if any.
     #[allow(dead_code)]
     fn build_export_args(&self, session_id: &str) -> Option<Vec<String>>;
@@ -135,15 +133,6 @@ impl ProviderEvents for Provider {
             | Provider::Brodex
             | Provider::VibeBh => parse_claude_event(evt, sink),
             Provider::Workflow => {}
-        }
-    }
-
-    /// For non-streaming providers, parse the full stdout after process exit.
-    fn parse_bulk_output(&self, raw: &str, sink: &mut EventSink) {
-        if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
-            self.parse_event(&parsed, sink);
-        } else {
-            sink.last_assistant_message = Some(raw.trim().to_string());
         }
     }
 
