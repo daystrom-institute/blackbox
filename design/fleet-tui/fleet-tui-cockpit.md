@@ -50,6 +50,21 @@ brief: "A new top-level bro-client TUI: a human cockpit for dispatching and live
 > in the `hyperclaude` reference (`/home/invidious/repos/hyperclaude/docs/`), not
 > separate CLI flags.
 
+> **2026-07-19 correction.** This document's in-process execution model (the
+> cockpit links the orchestration core and spawns agents directly,
+> "blackboxd is not in the execution path") and the symbols it cites for that
+> model — `spawn_task_reserved`, `spawn_task_interactive`, `SpawnedTask` (and
+> its writable `ChildStdin`), `move_large_prompt_arg_to_stdin`, and
+> `orchestration::spawn_task` — are gone. The fleet client became daemon-only
+> before the fleetd extraction (`harness-daemon-boundary.md` section 15, step
+> 1b: `bro fleet` dispatches only over `/control/*` HTTP), and the daemon's
+> own spawn pipeline named above was then deleted outright by the fleetd
+> extraction (`locality-first-decomposition.md` section 5): every dispatch now
+> composes a `WorkerSpawnSpec` and runs it through `HarnessExecutor`
+> (`LocalExecutor`/`FleetdExecutor`). Treat every `file:line` citation to
+> those symbols below as historical evidence for what v1 built, not current
+> code.
+
 A new top-level surface in the `bro` client (`src/cli.rs`, subcommands at
 `cli.rs:86-90`): a **human cockpit** for running and live-driving many
 **top-level entrypoint agents** at once — the agents *I* dispatch and steer
