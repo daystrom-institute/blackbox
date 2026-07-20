@@ -57,9 +57,13 @@ pub struct ProjectContext {
     pub checkout: Option<CheckoutContext>,
 }
 
-/// The concrete non-base checkout a [`ProjectContext`] resolution passed
-/// through. `checkout_dir` doubles as the checkout identity until a
-/// consumer needs a minted `checkout_id`.
+/// The concrete checkout a [`ProjectContext`] resolution passed through.
+///
+/// Under the identity contract EVERY resolved project normalizes to a concrete
+/// checkout, the registered base included, so a base-scoped session has its own
+/// overlay identity exactly like a worktree session (design §3.2). `managed`
+/// still distinguishes the base/managed-worktree write gate from an arbitrary
+/// user worktree.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct CheckoutContext {
     /// Canonical top of the checkout containing the input path.
@@ -67,8 +71,19 @@ pub struct CheckoutContext {
     /// True when the worktree carries a managed marker (fleet/agent
     /// dispatch worktrees, in-tree linked worktrees) — the write-side
     /// aliasing gate. Arbitrary user worktrees of a registered repo resolve
-    /// with `managed = false` and must not receive write-side aliasing.
+    /// with `managed = false` and must not receive write-side aliasing. The
+    /// normalized base checkout is `managed = true`.
     pub managed: bool,
+    /// Durable, reuse-safe checkout identity persisted in
+    /// `.bbox/local/checkout-id` (see
+    /// `bbox_corpus_core::identity::ensure_checkout_id`). It is the overlay's
+    /// primary key and the GC identity, so it is strong-random and NOT
+    /// path-derived: a replacement checkout at the same path mints a fresh one.
+    /// `None` on resolutions that predate minting or when the marker could not
+    /// be written; `checkout_dir` remains the transitional fallback until the
+    /// overlay consumes this (design §3.2). Host-local — never travels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_id: Option<String>,
 }
 
 /// Resolve a caller-supplied filesystem path to the registered project that

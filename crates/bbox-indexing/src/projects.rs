@@ -647,6 +647,10 @@ pub fn resolve_project_context(
             let checkout = (checkout_dir != base.canonical_path).then(|| CheckoutContext {
                 managed: resolve_managed_fleet_worktree(Some(raw), projects).is_some(),
                 checkout_dir,
+                // Minted lazily on first provisional write, not on read-side
+                // resolution (design §3.3). Additive: transitional consumers
+                // key on `checkout_dir` until the overlay lands.
+                checkout_id: None,
             });
             Some(ProjectContext {
                 checkout,
@@ -668,6 +672,8 @@ pub fn resolve_project_context(
                 checkout: Some(CheckoutContext {
                     checkout_dir: worktree.to_string_lossy().into_owned(),
                     managed: true,
+                    // Minted lazily on first provisional write (design §3.3).
+                    checkout_id: None,
                 }),
                 ..base_context(base)
             })

@@ -370,6 +370,7 @@ dependencies = [
  "tempfile",
  "tera",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -325,6 +325,25 @@ pub struct ProjectConfig {
 pub struct ProjectIdentityConfig {
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// Durable, cross-host repo-FAMILY id — the committed authority for the
+    /// `(repo_id, bbox_root_relpath)` published-scope key. Minted ONCE at
+    /// first eject/init as the full first-commit SHA (see
+    /// `bbox_corpus_core::identity::mint_repo_id`); the legacy computed 32-bit
+    /// hash is only a bootstrap hint. Absent in configs written before this
+    /// field existed; resolution falls back down the precedence ladder
+    /// (design: checkout-identity-and-provisional-knowledge.md §3.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<String>,
+    /// Operator override for the durable `repo_id` — wins over the recorded
+    /// value. Handles fork/upstream conflation where two histories should share
+    /// (or deliberately NOT share) one durable identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key_override: Option<String>,
+    /// Also-known-as durable ids for history-rewrite reconciliation: entries
+    /// keyed under a pre-rewrite `repo_id` still resolve here. Declared, so
+    /// preferred over the weak computed hash when no current id is recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aka_repo_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]

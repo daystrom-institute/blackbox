@@ -72,6 +72,33 @@ pub fn git_first_commit_from_stdout(stdout: &[u8]) -> Option<String> {
     roots.first().map(|line| (*line).to_string())
 }
 
+/// True when `path` is inside a SHALLOW clone (one created with
+/// `--depth`/`--shallow-since`, or otherwise carrying `.git/shallow`).
+///
+/// This gates durable `repo_id` minting: `git_first_commit_for_path` runs
+/// `git rev-list --max-parents=0 HEAD`, which in a shallow clone returns the
+/// grafted shallow BOUNDARY commit, not the repository's true root. Minting a
+/// durable identity from that boundary would fabricate a wrong id that then
+/// travels in committed `.bbox/config.toml`, so minting must refuse here.
+/// Fails CLOSED: a git error or unparseable answer is treated as shallow
+/// (`true`), never as a safe-to-mint `false`.
+pub fn is_shallow_repository(path: &Path) -> bool {
+    let Some(output) = git_output(
+        path,
+        &["rev-parse", "--is-shallow-repository"],
+        "checking shallow repository",
+    ) else {
+        return true;
+    };
+    if !output.status.success() {
+        return true;
+    }
+    match String::from_utf8(output.stdout) {
+        Ok(s) => s.trim() != "false",
+        Err(_) => true,
+    }
+}
+
 pub fn git_remote_origin_for_path(path: &Path) -> Option<String> {
     let output = git_output(
         path,
