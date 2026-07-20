@@ -30,7 +30,7 @@
     <array>
         <string>/Users/invidious/.local/bin/fleetd</string>
         <string>--state-dir</string>
-        <string>/Users/invidious/.local/state/blackbox-dev</string>
+        <string>/Users/invidious/.local/state/blackbox-dev/bro</string>
     </array>
 
     <key>EnvironmentVariables</key>
@@ -45,9 +45,9 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/Users/invidious/.local/state/blackbox-dev/fleetd.log</string>
+    <string>/Users/invidious/.local/state/blackbox-dev/bro/fleetd.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/invidious/.local/state/blackbox-dev/fleetd.err.log</string>
+    <string>/Users/invidious/.local/state/blackbox-dev/bro/fleetd.err.log</string>
 
     <key>ProcessType</key>
     <string>Background</string>

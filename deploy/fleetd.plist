@@ -14,8 +14,13 @@
 
   --state-dir is the ONE thing that must stay in step with the daemon: the
   socket and shared-secret token derive from it, and that derivation is what
-  keeps the prod and dev daemons on separate supervisors. Leaving it at the
-  default here matches a prod daemon with no explicit `paths.state_dir`.
+  keeps the prod and dev daemons on separate supervisors. The daemon derives
+  its fleetd paths from its BRO dispatch store dir (state_dir/bro, the same
+  root as harness-sessions/), NOT the plain state dir, so this unit must
+  point --state-dir at .../blackbox/bro. Corrected 2026-07-19 after first
+  rollout: the original unit pointed at the plain state dir and the daemon
+  auto-started a second fleetd at the derived path, orphaning this one
+  (gap filed to align fleetd's built-in default with the daemon derivation).
 
   KeepAlive is a plain true rather than blackboxd's
   {SuccessfulExit: false}: a supervisor that exits cleanly (SIGTERM on
@@ -31,7 +36,7 @@
     <array>
         <string>/Users/invidious/.local/bin/fleetd</string>
         <string>--state-dir</string>
-        <string>/Users/invidious/.local/state/blackbox</string>
+        <string>/Users/invidious/.local/state/blackbox/bro</string>
     </array>
 
     <key>EnvironmentVariables</key>
@@ -46,9 +51,9 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/Users/invidious/.local/state/blackbox/fleetd.log</string>
+    <string>/Users/invidious/.local/state/blackbox/bro/fleetd.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/invidious/.local/state/blackbox/fleetd.err.log</string>
+    <string>/Users/invidious/.local/state/blackbox/bro/fleetd.err.log</string>
 
     <key>ProcessType</key>
     <string>Background</string>
