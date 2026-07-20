@@ -25,8 +25,6 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use tokio::process::Command;
 use tokio::sync::Notify;
 
 use crate::managed_worktrees;
@@ -57,7 +55,6 @@ const BLACKBOX_SERVICE_ENV_VARS: &[&str] = &[
     "TRANSCRIPT_SEARCH_INDEX_PATH",
 ];
 
-const PROMPT_STDIN_ARG_BYTES_THRESHOLD: usize = 64 * 1024;
 const HARNESS_SPAWN_SCRUB_ENV: &str = "BRO_HARNESS_SPAWN_SCRUB";
 
 /// The process-wide executor every harness dispatch goes through.
@@ -1260,6 +1257,15 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
     }
 }
 
+/// Build a harness transcript location from loose parts.
+///
+/// Test-only since the one-shot cutover: production derives the location from
+/// the spawn spec ([`harness_transcript_location_from_spec`]), which is the
+/// single pinned derivation both the daemon and the executor flow from. This
+/// survives because the pending-location resolution in `ingest_harness_event`
+/// still needs a pending-shaped location to resolve, and constructing one by
+/// hand is clearer in a test than assembling a whole synthetic spec.
+#[cfg(test)]
 fn harness_transcript_location(
     provider: Provider,
     store_dir: &std::path::Path,
@@ -2434,12 +2440,20 @@ pub struct SpawnTaskParams {
     pub origin: bro_core::Origin,
 }
 
-pub fn spawn_with_pre_minted_id(
+/// Dispatch against a task id the caller minted itself.
+///
+/// Differs from [`spawn_task_with_tool_placement`] only in duplicate policy: a
+/// pre-minted id that is already claimed is an ERROR here, not a silent
+/// return of the existing task, because a caller that minted its own id and
+/// finds it taken has a real bug rather than a retry. Everything downstream,
+/// including the choice of executor seam, is identical: harness workers become
+/// fleetd children on this path exactly as on every other.
+pub async fn spawn_with_pre_minted_id(
     task_id: String,
     params: SpawnTaskParams,
 ) -> Result<Arc<Task>, BroSpawnError> {
     params.task_store.write().reserve_id(&task_id)?;
-    Ok(spawn_task_reserved(task_id, params))
+    Ok(spawn_reserved_dispatch(task_id, params, None, None).await)
 }
 
 fn failed_duplicate_task(
@@ -2958,6 +2972,81 @@ pub async fn spawn_task_with_tool_placement(
     system_events: Option<crate::system_events::SharedEventHub>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
+    // Reservation happens HERE, ahead of the provider branch, so both entry
+    // points into `spawn_reserved_dispatch` agree on when the id is claimed
+    // and each can keep its own duplicate policy. This entry is idempotent:
+    // a duplicate dispatch returns the task that already exists.
+    if let Err(err) = task_store.write().reserve_id(&task_id) {
+        if let Some(existing) = task_store.read().get(&task_id) {
+            return existing;
+        }
+        return failed_duplicate_task(
+            task_id,
+            provider,
+            session_id,
+            cwd,
+            bro_label,
+            agent_label,
+            err.to_string(),
+            origin,
+        );
+    }
+
+    spawn_reserved_dispatch(
+        task_id,
+        SpawnTaskParams {
+            provider,
+            args,
+            session_id,
+            cwd,
+            env_overrides,
+            store_dir,
+            task_store,
+            tail_tx,
+            roster_events,
+            bro_label,
+            agent_label,
+            system_events,
+            origin,
+        },
+        tool_placement,
+        tool_defaults,
+    )
+    .await
+}
+
+/// Compose and dispatch a worker for a task id that is ALREADY RESERVED.
+///
+/// Every dispatch path funnels through here, which is what makes the
+/// pre-dispatch treatment uniform: the scratch-cwd fallback, the project
+/// dispatch env, the cockpit MCP injection, and the choice of executor seam all
+/// happen once, in one place, rather than being re-derived per entry point.
+///
+/// Precondition: `task_id` is reserved in the store. On any setup failure the
+/// reservation is released before returning a failed task, so a caller that
+/// retries the same id is not blocked by a stale claim.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_reserved_dispatch(
+    task_id: String,
+    params: SpawnTaskParams,
+    tool_placement: Option<BTreeMap<String, String>>,
+    tool_defaults: Option<BTreeMap<String, String>>,
+) -> Arc<Task> {
+    let SpawnTaskParams {
+        provider,
+        args,
+        session_id,
+        cwd,
+        env_overrides,
+        store_dir,
+        task_store,
+        tail_tx,
+        roster_events,
+        bro_label,
+        agent_label,
+        system_events,
+        origin,
+    } = params;
     // A session must never inherit the daemon's process cwd ($HOME under
     // launchd): a dispatch without an explicit cwd used to confine the
     // session's file tools to the operator's home directory and write there
@@ -3025,52 +3114,42 @@ pub async fn spawn_task_with_tool_placement(
         .await;
     }
 
-    // CLI providers: shells inherit the spawned child's process env, so the
-    // project dispatch env merges into env_overrides directly.
-    let env_overrides = match dispatch_shell_env {
-        Some(extra) => {
-            let mut merged = env_overrides.unwrap_or_default();
-            for (k, v) in extra {
-                merged.entry(k).or_insert(v);
-            }
-            Some(merged)
-        }
-        None => env_overrides,
-    };
-
-    if let Err(err) = task_store.write().reserve_id(&task_id) {
-        if let Some(existing) = task_store.read().get(&task_id) {
-            return existing;
-        }
-        return failed_duplicate_task(
-            task_id,
-            provider,
-            session_id,
-            cwd,
-            bro_label,
-            agent_label,
-            err.to_string(),
-            origin,
-        );
-    }
-
-    let params = SpawnTaskParams {
+    // Nothing else is dispatchable. Every provider that can back a worker is
+    // harness-backed and went through the seam above; `Provider::Workflow` is
+    // a pseudo-provider for daemon-internal tasks, which are created by
+    // `spawn_in_process_task` and never spawn a child at all (the allocator
+    // agrees: `provider_binary_missing` reports it missing unconditionally, so
+    // it is never selected as a lane).
+    //
+    // Reaching here therefore means a brofile literally declared
+    // `provider = "workflow"`. That used to try to exec a binary named
+    // "workflow" and fail with a bare "No such file or directory"; failing
+    // with the actual reason is strictly more useful, and it keeps the
+    // invariant this slice establishes: when the executor is fleetd, no
+    // harness child is ever a direct daemon child, because there is no
+    // inline spawn path left to be one.
+    let _ = (args, env_overrides, dispatch_shell_env, tail_tx);
+    tracing::error!(
+        task_id = %task_id,
+        %provider,
+        "dispatch requested a non-dispatchable provider; check the brofile"
+    );
+    failed_harness_child_setup(
+        task_id,
         provider,
-        args,
         session_id,
         cwd,
-        env_overrides,
         store_dir,
         task_store,
-        tail_tx,
         roster_events,
         bro_label,
         agent_label,
-        system_events,
+        anyhow::anyhow!(
+            "`{provider}` is not a dispatchable provider: it backs daemon-internal \
+             tasks only and has no worker binary. Set a real provider on the brofile."
+        ),
         origin,
-    };
-
-    spawn_task_reserved(task_id, params)
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3129,24 +3208,6 @@ async fn spawn_harness_child_task(
             );
         }
     };
-
-    // Reserve the task id up front, so a duplicate dispatch is idempotent
-    // rather than spawning a second child for the same task.
-    if let Err(err) = task_store.write().reserve_id(&task_id) {
-        if let Some(existing) = task_store.read().get(&task_id) {
-            return existing;
-        }
-        return failed_duplicate_task(
-            task_id,
-            provider,
-            session_id,
-            cwd,
-            bro_label,
-            agent_label,
-            err.to_string(),
-            origin,
-        );
-    }
 
     // Pin the child's transcript location from the spec's event-log path (the
     // single derivation both sides now flow from).
@@ -3675,6 +3736,11 @@ fn ensure_cli_flag(args: &mut Vec<String>, flag: &str) {
 // removed with the executor extraction.
 
 #[allow(clippy::too_many_arguments)]
+/// Publish a failed task for a harness dispatch that never got a child.
+///
+/// Precondition: `task_id` is reserved (`spawn_reserved_dispatch` claims it
+/// before any provider branch runs). This consumes that reservation rather
+/// than taking its own, which is why it can `insert_reserved` directly.
 fn failed_harness_child_setup(
     task_id: String,
     provider: Provider,
@@ -3688,21 +3754,6 @@ fn failed_harness_child_setup(
     error: anyhow::Error,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
-    if let Err(reservation_error) = task_store.write().reserve_id(&task_id) {
-        if let Some(existing) = task_store.read().get(&task_id) {
-            return existing;
-        }
-        return failed_duplicate_task(
-            task_id,
-            provider,
-            session_id,
-            cwd,
-            bro_label,
-            agent_label,
-            reservation_error.to_string(),
-            origin,
-        );
-    }
     let mut task = failed_duplicate_task(
         task_id.clone(),
         provider,
@@ -4002,53 +4053,6 @@ fn parse_dispatch_tool_placement(
     Ok(out)
 }
 
-fn move_large_prompt_arg_to_stdin(provider: Provider, args: &mut Vec<String>) -> Option<String> {
-    if !matches!(
-        provider,
-        Provider::Glm | Provider::Deepseek | Provider::Minimax | Provider::Kimi
-    ) {
-        return None;
-    }
-    let mut idx = 0usize;
-    let mut prompt_idx = None;
-    while idx < args.len() {
-        let arg = args[idx].as_str();
-        if arg == "-p" || arg == "--print" {
-            let candidate_idx = idx + 1;
-            if args
-                .get(candidate_idx)
-                .is_some_and(|candidate| candidate.len() >= PROMPT_STDIN_ARG_BYTES_THRESHOLD)
-            {
-                prompt_idx = Some(candidate_idx);
-            }
-            break;
-        }
-        if claude_family_option_takes_value(arg) && idx + 1 < args.len() {
-            idx += 2;
-        } else {
-            idx += 1;
-        }
-    }
-    let prompt_idx = prompt_idx?;
-    Some(args.remove(prompt_idx))
-}
-
-fn claude_family_option_takes_value(arg: &str) -> bool {
-    matches!(
-        arg,
-        "-m" | "--model"
-            | "--permission-mode"
-            | "--output-format"
-            | "--input-format"
-            | "--resume"
-            | "--add-dir"
-            | "--mcp-config"
-            | "--append-system-prompt"
-            | "--allowedTools"
-            | "--disallowedTools"
-    )
-}
-
 const HARNESS_TEE_CHANNEL_CAPACITY: usize = 256;
 
 struct HarnessTee {
@@ -4132,614 +4136,6 @@ fn open_harness_tee(id: &str, suffix: &str) -> Option<HarnessTee> {
         tx,
         warned_drop: false,
     })
-}
-
-/// The non-harness spawn path: a provider CLI child whose stdout the daemon
-/// reads inline.
-///
-/// Harness-backed providers no longer arrive here from
-/// `spawn_task_with_tool_placement`, which routes them to
-/// `spawn_harness_child_task` and the executor seam. They CAN still arrive
-/// through `spawn_with_pre_minted_id` (Badgey's one-shot persona dispatch),
-/// which is why the harness branch in the stdout reader below is live rather
-/// than dead code.
-fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
-    let SpawnTaskParams {
-        provider,
-        args,
-        session_id,
-        cwd,
-        env_overrides,
-        store_dir,
-        task_store,
-        tail_tx,
-        roster_events,
-        bro_label,
-        agent_label,
-        system_events,
-        origin,
-    } = params;
-    let id = task_id;
-    let harness_child = matches!(
-        provider,
-        Provider::Glm
-            | Provider::Deepseek
-            | Provider::Minimax
-            | Provider::Kimi
-            | Provider::Brodex
-            | Provider::VibeBh
-    );
-    let transcript_location = harness_child
-        .then(|| harness_transcript_location(provider, &store_dir, &session_id, cwd.as_deref()))
-        .flatten();
-
-    let path_env = providers::dispatch_path_env();
-
-    // Resolve binary through a login shell so nvm/asdf/rbenv-installed CLIs
-    // work even when the daemon was launched by launchctl/systemd with a
-    // narrow PATH. Falls back to the bare name, which preserves the
-    // existing error surface when the binary genuinely is not installed.
-    let raw_bin = if let Ok(cfg) = blackbox::config::load() {
-        provider.bin_with_config(&cfg.providers)
-    } else {
-        provider.bin()
-    };
-    let bin = providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
-    let mut args = args;
-    // An oversized prompt spills to stdin; otherwise the child gets no stdin at
-    // all. There is no persistent-stdin mode here any more: the harness control
-    // lane owns bidirectional sessions, through the executor seam.
-    let stdin_payload = move_large_prompt_arg_to_stdin(provider, &mut args);
-    let mut cmd = Command::new(&bin);
-    cmd.args(&args)
-        .stdin(if stdin_payload.is_some() {
-            std::process::Stdio::piped()
-        } else {
-            std::process::Stdio::null()
-        })
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .env("PATH", &path_env)
-        .env("NO_COLOR", "1")
-        .env("TERM", "dumb")
-        .env("FORCE_COLOR", "0");
-
-    if let Some(ref c) = cwd {
-        cmd.current_dir(c);
-    }
-    for key in BLACKBOX_SERVICE_ENV_VARS {
-        cmd.env_remove(key);
-    }
-    if let Some(ref overrides) = env_overrides {
-        for (k, v) in overrides {
-            cmd.env(k, v);
-        }
-    }
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            // Return a failed task immediately
-            let task = Arc::new(Task {
-                inner: Mutex::new(TaskInner {
-                    id: id.clone(),
-                    provider,
-                    session_id,
-                    events: EventRing::new(),
-                    model: None,
-                    last_assistant_message: None,
-                    usage: None,
-                    cost_usd: None,
-                    num_turns: None,
-                    stderr: format!("spawn error: {e}"),
-                    status: TaskStatus::Failed,
-                    started_at: now_ms(),
-                    completed_at: Some(now_ms()),
-                    exit_code: None,
-                    managed_worktree: managed_worktrees::managed_worktree_for_cwd(cwd.as_deref()),
-                    cwd,
-                    bro_label: bro_label.clone(),
-                    name: None,
-                    agent_label: agent_label.clone(),
-                    report: None,
-                    interrupted: false,
-                    recoverable: false,
-                    transcript_location: transcript_location.clone(),
-                    transcript_cursor: None,
-                    live_cursor: 0,
-                    harness_ingest_seq: 0,
-                    last_delta_roster_emit_ms: 0,
-                    supervision: SupervisionState::default(),
-                    origin,
-                    workflow_owned: workflow_owned_for_origin(origin),
-                }),
-                notify: Arc::new(Notify::new()),
-                child_id: Mutex::new(None),
-                roster_events: roster_events.clone(),
-            });
-            let _ = task_store.write().insert_reserved(id, task.clone());
-            task.emit_roster_added();
-            request_persist(&task_store, &store_dir);
-            task.notify.notify_waiters();
-            return task;
-        }
-    };
-
-    let pid = child.id();
-    // Write the spilled prompt, then drop the handle so the child sees EOF.
-    if let Some(payload) = stdin_payload
-        && let Some(mut stdin) = child.stdin.take()
-    {
-        tokio::spawn(async move {
-            let _ = stdin.write_all(payload.as_bytes()).await;
-        });
-    }
-    let task = Arc::new(Task {
-        inner: Mutex::new(TaskInner {
-            id: id.clone(),
-            provider,
-            session_id: session_id.clone(),
-            events: EventRing::new(),
-            model: None,
-            last_assistant_message: None,
-            usage: None,
-            cost_usd: None,
-            num_turns: None,
-            stderr: String::new(),
-            status: TaskStatus::Running,
-            started_at: now_ms(),
-            completed_at: None,
-            exit_code: None,
-            cwd: cwd.clone(),
-            managed_worktree: managed_worktrees::managed_worktree_for_cwd(cwd.as_deref()),
-            bro_label,
-            name: None,
-            agent_label,
-            report: None,
-            interrupted: false,
-            recoverable: false,
-            transcript_location,
-            transcript_cursor: None,
-            live_cursor: 0,
-            harness_ingest_seq: 0,
-            last_delta_roster_emit_ms: 0,
-            supervision: SupervisionState::default(),
-            origin,
-            workflow_owned: workflow_owned_for_origin(origin),
-        }),
-        notify: Arc::new(Notify::new()),
-        child_id: Mutex::new(pid),
-        roster_events: roster_events.clone(),
-    });
-
-    if let Err(err) = task_store.write().insert_reserved(id.clone(), task.clone()) {
-        task_store.write().release_reservation(&id);
-        let failed = failed_duplicate_task(
-            id,
-            provider,
-            session_id,
-            cwd,
-            None,
-            None,
-            err.to_string(),
-            origin,
-        );
-        failed.notify.notify_waiters();
-        return failed;
-    }
-
-    task.emit_roster_added();
-
-    // Emit tail event
-    let cursor = task.next_live_cursor();
-    let _ = tail_tx.send(tail::TailEvent::TaskStarted {
-        cursor,
-        task_id: id.clone(),
-        provider,
-        bro_name: None,
-    });
-    // Emit task.started system event. Observation-only: failures logged, not propagated.
-    if let Some(ref hub) = system_events {
-        let task_id_ev = id.clone();
-        let bro_ev = task.inner.lock().bro_label.clone();
-        let provider_str = provider.to_string();
-        let hub_clone = hub.clone();
-        tokio::spawn(async move {
-            let mut correlation = serde_json::Map::new();
-            correlation.insert("task_id".into(), serde_json::json!(task_id_ev));
-            let draft = crate::system_events::SystemEventDraft {
-                kind: crate::system_events::types::SystemEventKind::TaskStarted,
-                producer: "orchestration.dispatch".to_string(),
-                project: None,
-                principal: None,
-                subject: None,
-                correlation,
-                causation_id: None,
-                payload: serde_json::json!({
-                    "task_id": task_id_ev,
-                    "provider": provider_str,
-                    "bro": bro_ev,
-                }),
-            };
-            if let Err(e) = hub_clone.emit(draft).await {
-                tracing::warn!("task.started system event emit failed: {e:#}");
-            }
-        });
-    }
-
-    // Spawn stdout reader — signals completion via oneshot so the process
-    // waiter can ensure all output is consumed before marking the task done.
-    let stdout = child.stdout.take().unwrap();
-    let stderr_handle = child.stderr.take().unwrap();
-    let task_ref = task.clone();
-    let is_streaming = provider.is_streaming_json();
-    let tail_tx_clone = tail_tx.clone();
-    let task_id_clone = id.clone();
-    let system_events_progress = system_events.clone();
-    let disruption_store_dir = store_dir.clone();
-    let disruption_task_id = id.clone();
-
-    let (stdout_done_tx, stdout_done_rx) = tokio::sync::oneshot::channel::<()>();
-
-    if is_streaming {
-        // Line-by-line JSON parsing
-        let tee_id_out = id.clone();
-        tokio::spawn(async move {
-            let reader = tokio::io::BufReader::new(stdout);
-            let mut lines = reader.lines();
-            let mut tee = open_harness_tee(&tee_id_out, "stdout.jsonl");
-            let mut last_emitted_snippet: Option<String> = None;
-            // Cooldown the lane the instant the provider returns a 429/overload,
-            // so dispatch steers off it without waiting for the next probe tick.
-            // Once per run is enough.
-            let mut disruption_recorded = false;
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(w) = tee.as_mut() {
-                    w.try_write_line(&line);
-                }
-                if let Ok(evt) = serde_json::from_str::<Value>(&line) {
-                    if !disruption_recorded {
-                        if let Some(disruption) = provider.detect_disruption(&evt) {
-                            disruption_recorded = true;
-                            let store_dir = disruption_store_dir.clone();
-                            let task_id = disruption_task_id.clone();
-                            let observed_at = now_ms();
-                            tokio::task::spawn_blocking(move || {
-                                let account =
-                                    allocator::lookup_lease_for_task(&store_dir, &task_id)
-                                        .and_then(|lease| lease.account);
-                                account_probes::record_disruption_cooldown(
-                                    &store_dir,
-                                    provider,
-                                    account.as_deref(),
-                                    disruption,
-                                    observed_at,
-                                );
-                            });
-                        }
-                    }
-                    if harness_child {
-                        ingest_harness_event(
-                            &task_ref,
-                            provider,
-                            evt,
-                            &tail_tx_clone,
-                            &task_id_clone,
-                            system_events_progress.clone(),
-                        );
-                        continue;
-                    }
-                    let (snippet_to_emit, task_event_to_emit) = {
-                        let mut inner = task_ref.inner.lock();
-                        let task_event = append_task_event(&mut inner, evt.clone());
-                        let mut sink = EventSink {
-                            last_assistant_message: inner.last_assistant_message.clone(),
-                            usage: inner.usage.clone(),
-                            cost_usd: inner.cost_usd,
-                            num_turns: inner.num_turns,
-                            session_id: if inner.session_id != "pending" {
-                                Some(inner.session_id.clone())
-                            } else {
-                                None
-                            },
-                            interrupted: false,
-                        };
-                        provider.parse_event(&evt, &mut sink);
-                        let emitted_session_id = sink.session_id.clone();
-                        let mut accepted = true;
-                        let mut session_id_observed = false;
-                        if let Some(sid) = emitted_session_id {
-                            if inner.session_id == "pending" {
-                                inner.session_id = sid;
-                                session_id_observed = true;
-                            } else if inner.session_id != sid {
-                                // Provider emitted a session_id that doesn't
-                                // match the one we asked to resume. Mark failed
-                                // and discard parsed output so the caller does
-                                // not accidentally trust forked-session text.
-                                reject_forked_session(&mut inner, &sid);
-                                accepted = false;
-                            }
-                        }
-                        if accepted {
-                            apply_cwd_updates_from_event(&mut inner, &evt);
-                            inner.supervision.observe_event(
-                                &evt,
-                                &sink,
-                                &supervision::config(),
-                                now_ms(),
-                            );
-                            apply_sink_updates(&mut inner, sink);
-                        }
-                        let snippet_to_emit = accepted
-                            .then(|| {
-                                inner.last_assistant_message.as_ref().map(|msg| {
-                                    const TAIL_CHARS: usize = 160;
-                                    let count = msg.chars().count();
-                                    if count > TAIL_CHARS {
-                                        let skip = count - TAIL_CHARS;
-                                        let tail: String = msg.chars().skip(skip).collect();
-                                        format!("…{tail}")
-                                    } else {
-                                        msg.clone()
-                                    }
-                                })
-                            })
-                            .flatten()
-                            .map(|snippet| {
-                                let should_emit = !snippet.is_empty()
-                                    && last_emitted_snippet.as_deref() != Some(snippet.as_str());
-                                let cursor = if should_emit {
-                                    inner.live_cursor += 1;
-                                    Some(inner.live_cursor)
-                                } else {
-                                    None
-                                };
-                                (snippet, session_id_observed, cursor)
-                            })
-                            .or_else(|| session_id_observed.then(|| (String::new(), true, None)));
-                        (snippet_to_emit, task_event)
-                    };
-
-                    let _ = tail_tx_clone.send(task_event_to_emit);
-                    task_ref.emit_roster_updated();
-
-                    if let Some((snippet, session_id_observed, cursor)) = snippet_to_emit {
-                        if session_id_observed {
-                            task_ref.notify.notify_waiters();
-                        }
-                        if let Some(cursor) = cursor {
-                            let _ = tail_tx_clone.send(tail::TailEvent::TaskProgress {
-                                cursor,
-                                task_id: task_id_clone.clone(),
-                                activity: snippet.clone(),
-                            });
-                            // Emit task.progress system event. Observation-only: failures logged.
-                            if let Some(ref hub) = system_events_progress {
-                                emit_task_progress_event(
-                                    hub,
-                                    task_id_clone.clone(),
-                                    snippet.clone(),
-                                );
-                            }
-                            last_emitted_snippet = Some(snippet);
-                        }
-                    }
-                }
-            }
-            let _ = stdout_done_tx.send(());
-        });
-    } else {
-        // Bulk stdout collection
-        let task_ref_bulk = task.clone();
-        tokio::spawn(async move {
-            let mut buf = String::new();
-            let mut reader = tokio::io::BufReader::new(stdout);
-            loop {
-                let mut chunk = String::new();
-                match reader.read_line(&mut chunk).await {
-                    Ok(0) => break,
-                    Ok(_) => buf.push_str(&chunk),
-                    Err(_) => break,
-                }
-            }
-            if !buf.trim().is_empty() {
-                let mut inner = task_ref_bulk.inner.lock();
-                let mut sink = EventSink {
-                    last_assistant_message: inner.last_assistant_message.clone(),
-                    usage: inner.usage.clone(),
-                    cost_usd: inner.cost_usd,
-                    num_turns: inner.num_turns,
-                    session_id: None,
-                    interrupted: false,
-                };
-                provider.parse_bulk_output(buf.trim(), &mut sink);
-                let mut session_id_observed = false;
-                if let Some(sid) = sink.session_id.clone() {
-                    if inner.session_id == "pending" {
-                        inner.session_id = sid;
-                        session_id_observed = true;
-                        inner.supervision.observe_bulk_sink(
-                            &sink,
-                            &supervision::config(),
-                            now_ms(),
-                        );
-                        apply_sink_updates(&mut inner, sink);
-                    } else if inner.session_id != sid {
-                        reject_forked_session(&mut inner, &sid);
-                    } else {
-                        inner.supervision.observe_bulk_sink(
-                            &sink,
-                            &supervision::config(),
-                            now_ms(),
-                        );
-                        apply_sink_updates(&mut inner, sink);
-                    }
-                } else {
-                    inner
-                        .supervision
-                        .observe_bulk_sink(&sink, &supervision::config(), now_ms());
-                    apply_sink_updates(&mut inner, sink);
-                }
-                drop(inner);
-                task_ref_bulk.emit_roster_updated();
-                if session_id_observed {
-                    task_ref_bulk.notify.notify_waiters();
-                }
-            }
-            let _ = stdout_done_tx.send(());
-        });
-    }
-
-    // Spawn stderr reader. Signals completion via oneshot so the waiter can
-    // join it before snapshotting `inner.stderr` — without this, a fast fatal
-    // exit (e.g. the harness bailing before any stdout) races the snapshot and
-    // the task's `error` comes back empty, hiding the failure reason.
-    let task_ref_err = task.clone();
-    let tee_id_err = id.clone();
-    let (stderr_done_tx, stderr_done_rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
-        let reader = tokio::io::BufReader::new(stderr_handle);
-        let mut lines = reader.lines();
-        let mut tee = open_harness_tee(&tee_id_err, "stderr.log");
-        while let Ok(Some(line)) = lines.next_line().await {
-            if let Some(w) = tee.as_mut() {
-                w.try_write_line(&line);
-            }
-            let mut inner = task_ref_err.inner.lock();
-            inner.stderr.push_str(&line);
-            inner.stderr.push('\n');
-        }
-        let _ = stderr_done_tx.send(());
-    });
-
-    // Spawn process waiter — waits for the process exit AND both readers
-    // to finish before marking the task terminal. This ensures results are
-    // fully parsed (stdout) and the failure reason is captured (stderr) before
-    // waiters are notified.
-    let task_ref_wait = task.clone();
-    let task_id_wait = id.clone();
-    let tail_tx_wait = tail_tx;
-    let system_events_wait = system_events;
-    tokio::spawn(async move {
-        let status = child.wait().await;
-        // Wait for stdout reader to finish before processing results —
-        // ensures all events/results are parsed before we mark terminal.
-        let _ = stdout_done_rx.await;
-        // Join the stderr reader too, so `error_snippet` reflects the real
-        // failure message rather than an empty (still-draining) buffer.
-        let _ = stderr_done_rx.await;
-        let code = status.ok().and_then(|s| s.code());
-        if harness_child {
-            harness_controls().write().remove(&task_id_wait);
-        }
-
-        let (terminal_status, elapsed, cost, error_snippet, source_session, task_kind, cursor) = {
-            let mut inner = task_ref_wait.inner.lock();
-            inner.exit_code = code;
-            // Preserve terminal states set during stream parsing (Cancelled
-            // on kill, Failed on session fork detection) — don't let a
-            // clean exit code flip a detected failure back to Completed.
-            if inner.status != TaskStatus::Cancelled && inner.status != TaskStatus::Failed {
-                inner.status = if code == Some(0) {
-                    TaskStatus::Completed
-                } else {
-                    TaskStatus::Failed
-                };
-            }
-            inner.completed_at = Some(now_ms());
-            let elapsed = format_elapsed(inner.started_at, inner.completed_at);
-            let terminal_status = inner.status;
-            let cost = inner.cost_usd;
-            let error_snippet: String = inner.stderr.chars().take(200).collect();
-            let source_session = inner.session_id.clone();
-            let task_kind = inner.bro_label.clone();
-            inner.live_cursor += 1;
-            let cursor = inner.live_cursor;
-            (
-                terminal_status,
-                elapsed,
-                cost,
-                error_snippet,
-                source_session,
-                task_kind,
-                cursor,
-            )
-        };
-        task_ref_wait.emit_roster_updated();
-        match terminal_status {
-            TaskStatus::Completed => {
-                let _ = tail_tx_wait.send(tail::TailEvent::TaskCompleted {
-                    cursor,
-                    task_id: task_id_wait.clone(),
-                    elapsed: elapsed.clone(),
-                    cost,
-                    source_session,
-                    task_kind,
-                });
-            }
-            TaskStatus::Failed => {
-                let _ = tail_tx_wait.send(tail::TailEvent::TaskFailed {
-                    cursor,
-                    task_id: task_id_wait.clone(),
-                    elapsed: elapsed.clone(),
-                    error: error_snippet.clone(),
-                });
-            }
-            _ => {}
-        }
-        // Emit terminal system event. Observation-only: failures logged, not propagated.
-        // MutexGuard dropped above so the async emit is safe to await.
-        if let Some(ref hub) = system_events_wait {
-            let mut correlation = serde_json::Map::new();
-            correlation.insert("task_id".into(), serde_json::json!(task_id_wait));
-            let (kind, payload) = match terminal_status {
-                TaskStatus::Completed => (
-                    crate::system_events::types::SystemEventKind::TaskCompleted,
-                    serde_json::json!({"task_id": task_id_wait, "elapsed": elapsed, "cost_usd": cost}),
-                ),
-                TaskStatus::Failed => (
-                    crate::system_events::types::SystemEventKind::TaskFailed,
-                    serde_json::json!({"task_id": task_id_wait, "elapsed": elapsed, "error": error_snippet}),
-                ),
-                TaskStatus::Cancelled => (
-                    crate::system_events::types::SystemEventKind::TaskCancelled,
-                    serde_json::json!({"task_id": task_id_wait, "elapsed": elapsed}),
-                ),
-                TaskStatus::Running => unreachable!("terminal state check above"),
-            };
-            let draft = crate::system_events::SystemEventDraft {
-                kind,
-                producer: "orchestration.dispatch".to_string(),
-                project: None,
-                principal: None,
-                subject: None,
-                correlation,
-                causation_id: None,
-                payload,
-            };
-            if let Err(e) = hub.emit(draft).await {
-                tracing::warn!("task terminal system event emit failed: {e:#}");
-            }
-        }
-
-        // Propagate session ID to team members
-        {
-            let inner = task_ref_wait.inner.lock();
-            if inner.session_id != "pending" {
-                let sid = inner.session_id.clone();
-                let tid = inner.id.clone();
-                drop(inner);
-                team::propagate_session_id(&tid, &sid, &store_dir);
-            }
-        }
-
-        // Persist and notify waiters
-        request_persist(&task_store, &store_dir);
-        task_ref_wait.notify.notify_waiters();
-    });
-
-    task
 }
 
 /// Wait for a task to complete. Returns immediately if already terminal.
@@ -5900,6 +5296,128 @@ mod tests {
         assert_eq!(healthy.inner.lock().status, TaskStatus::Completed);
     }
 
+    /// The invariant slice 3 establishes: EVERY dispatch path that can produce
+    /// a harness worker goes through the executor seam, so when the executor
+    /// is fleetd no harness child is ever a direct daemon child.
+    ///
+    /// `spawn_with_pre_minted_id` is the path that used to bypass it (Badgey's
+    /// one-shot persona dispatch), which is why it is the one asserted here.
+    /// Two observable signatures of the seam, neither of which the old inline
+    /// spawn produced: the control lane is registered in `harness_controls`
+    /// (the seam's `WorkerHandle.control`), and the transcript location is
+    /// pinned from the spawn spec's `event_log_path` under `harness-sessions/`.
+    #[tokio::test]
+    async fn a_pre_minted_dispatch_goes_through_the_executor_seam() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let harness_bin = root.join("seam-harness");
+        // Idle until stdin closes, so the worker is still live while we assert.
+        std::fs::write(&harness_bin, "#!/bin/sh\ncat > /dev/null\n").unwrap();
+        let mut permissions = std::fs::metadata(&harness_bin).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&harness_bin, permissions).unwrap();
+
+        let mut env = crate::util::TestEnvGuard::new();
+        env.remove("BLACKBOX_MCP_URL");
+        env.set("BRO_HARNESS_BIN", &harness_bin);
+
+        let store = Arc::new(RwLock::new(TaskStore::new()));
+        let (tail_tx, _rx) = tokio::sync::broadcast::channel(32);
+        let task = spawn_with_pre_minted_id(
+            "seam-task".to_string(),
+            SpawnTaskParams {
+                provider: Provider::Glm,
+                args: vec!["-p".to_string(), "hello".to_string()],
+                session_id: "pending".to_string(),
+                cwd: Some(root.to_string_lossy().into_owned()),
+                env_overrides: None,
+                store_dir: root.join("store"),
+                task_store: store.clone(),
+                tail_tx,
+                roster_events: None,
+                bro_label: None,
+                agent_label: None,
+                system_events: None,
+                origin: bro_core::Origin::AgentDispatch,
+            },
+        )
+        .await
+        .expect("pre-minted dispatch");
+
+        assert!(
+            harness_controls().read().contains_key("seam-task"),
+            "a seam dispatch registers its control lane; the old inline spawn did not"
+        );
+        let location = task
+            .inner
+            .lock()
+            .transcript_location
+            .clone()
+            .expect("the seam pins a transcript location from the spec");
+        assert!(
+            location.path.to_string_lossy().contains("harness-sessions"),
+            "location must come from the spec's event_log_path: {}",
+            location.path.display()
+        );
+        // A dispatch with no provider session yet keeps the task's session_id
+        // as the placeholder while the spec uses the unique task id as its
+        // supervision key, so the location records no provider session.
+        assert_eq!(location.session_id, None);
+
+        harness_killers()
+            .read()
+            .get("seam-task")
+            .expect("a seam dispatch registers a kill switch")
+            .kill();
+    }
+
+    /// `Provider::Workflow` backs daemon-internal tasks and has no worker
+    /// binary. With the inline spawn path gone it must fail with the actual
+    /// reason rather than trying to exec a binary named "workflow".
+    #[tokio::test]
+    async fn a_non_dispatchable_provider_fails_with_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = Arc::new(RwLock::new(TaskStore::new()));
+        let (tail_tx, _rx) = tokio::sync::broadcast::channel(32);
+
+        let task = spawn_with_pre_minted_id(
+            "workflow-task".to_string(),
+            SpawnTaskParams {
+                provider: Provider::Workflow,
+                args: Vec::new(),
+                session_id: "pending".to_string(),
+                cwd: Some(root.to_string_lossy().into_owned()),
+                env_overrides: None,
+                store_dir: root.join("store"),
+                task_store: store.clone(),
+                tail_tx,
+                roster_events: None,
+                bro_label: None,
+                agent_label: None,
+                system_events: None,
+                origin: bro_core::Origin::AgentDispatch,
+            },
+        )
+        .await
+        .expect("the dispatch is accepted, then fails with a reason");
+
+        let inner = task.inner.lock();
+        assert_eq!(inner.status, TaskStatus::Failed);
+        assert!(
+            inner.stderr.contains("not a dispatchable provider"),
+            "the failure must name the real cause, not a missing binary: {}",
+            inner.stderr
+        );
+        assert!(
+            !inner.stderr.contains("No such file"),
+            "must not read as a missing binary: {}",
+            inner.stderr
+        );
+    }
+
     /// The durable cursor advances only for events that carry a `seq`, and
     /// only after ingest. It is what a re-adopting daemon replays from, so an
     /// event without a seq must leave it alone (replay more, never less).
@@ -6996,71 +6514,6 @@ mod tests {
     }
 
     #[test]
-    fn large_claude_family_prompt_moves_to_stdin() {
-        let prompt = "x".repeat(PROMPT_STDIN_ARG_BYTES_THRESHOLD);
-        let mut args = vec![
-            "--resume".into(),
-            "session-1".into(),
-            "-p".into(),
-            prompt.clone(),
-            "--output-format".into(),
-            "stream-json".into(),
-        ];
-
-        let stdin = move_large_prompt_arg_to_stdin(Provider::Glm, &mut args);
-
-        assert_eq!(stdin.as_deref(), Some(prompt.as_str()));
-        assert_eq!(
-            args,
-            vec![
-                "--resume",
-                "session-1",
-                "-p",
-                "--output-format",
-                "stream-json"
-            ]
-        );
-
-        let mut minimax_args = vec!["-p".into(), prompt.clone()];
-        let minimax_stdin = move_large_prompt_arg_to_stdin(Provider::Minimax, &mut minimax_args);
-        assert_eq!(minimax_stdin.as_deref(), Some(prompt.as_str()));
-        assert_eq!(minimax_args, vec!["-p"]);
-    }
-
-    #[test]
-    fn small_or_non_claude_prompt_stays_in_argv() {
-        let mut small_args = vec!["-p".into(), "hello".into()];
-        assert!(move_large_prompt_arg_to_stdin(Provider::Glm, &mut small_args).is_none());
-        assert_eq!(small_args, vec!["-p", "hello"]);
-
-        let prompt = "x".repeat(PROMPT_STDIN_ARG_BYTES_THRESHOLD);
-        let mut codex_args = vec!["exec".into(), "--json".into(), prompt];
-        assert!(move_large_prompt_arg_to_stdin(Provider::Brodex, &mut codex_args).is_none());
-        assert_eq!(codex_args.len(), 3);
-    }
-
-    #[test]
-    fn large_prompt_detection_skips_option_values_named_like_print_flag() {
-        let prompt = "x".repeat(PROMPT_STDIN_ARG_BYTES_THRESHOLD);
-        let mut args = vec![
-            "--resume".into(),
-            "-p".into(),
-            "-p".into(),
-            prompt.clone(),
-            "--output-format".into(),
-            "stream-json".into(),
-        ];
-
-        let stdin = move_large_prompt_arg_to_stdin(Provider::Glm, &mut args);
-
-        assert_eq!(stdin.as_deref(), Some(prompt.as_str()));
-        assert_eq!(
-            args,
-            vec!["--resume", "-p", "-p", "--output-format", "stream-json"]
-        );
-    }
-
-    #[test]
     fn task_store_rejects_duplicate_task_ids_without_overwrite() {
         let mut store = TaskStore::new();
         let first = Arc::new(Task {
@@ -7520,6 +6973,7 @@ mod tests {
                 origin: bro_core::Origin::AgentDispatch,
             },
         )
+        .await
         .unwrap();
 
         assert_eq!(task.id(), "task-known-id");
