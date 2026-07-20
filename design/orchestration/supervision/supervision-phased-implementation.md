@@ -88,7 +88,9 @@ Work:
 - Add or verify tests that task status exposes green snapshots and full alert
   snapshots.
 - Verify streaming providers call `observe_event`.
-- Verify bulk providers call `observe_bulk_sink`.
+- Verify bulk providers call `observe_bulk_sink`. (**2026-07-19: N/A.** The
+  bulk-output arm and `observe_bulk_sink` itself were deleted with the inline
+  spawn pipeline; every provider now streams through `observe_event`.)
 - Document token-burn baseline seeding as optional until a real baseline source
   exists.
 
