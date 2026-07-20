@@ -807,6 +807,31 @@ pub fn load_project(project_root: &Path) -> Result<ProjectConfig> {
     Ok(raw)
 }
 
+/// Gather the durable `repo_id` resolution inputs for a project root by
+/// reading its committed `.bbox/config.toml` `[project]` table and pairing the
+/// recorded authority with the bootstrap-computed hint.
+///
+/// This is the config-side half of the identity contract (design §3.1): it
+/// reads `repo_id` / `project_key_override` / `aka_repo_ids` and computes the
+/// legacy `repo_id_for_root` hash as the last-resort fallback, handing a
+/// fully-populated [`RepoIdInputs`] to `bbox_corpus_core::identity::resolve_repo_id`.
+/// The gatherer lives here (not in the foundation crate) because parsing the
+/// config table is config's job; `bbox-corpus-core` owns only the identity
+/// types and the precedence rule.
+pub fn read_repo_id_inputs(project_root: &Path) -> bbox_corpus_core::identity::RepoIdInputs {
+    let project = load_project(project_root)
+        .map(|c| c.project)
+        .unwrap_or_default();
+    let computed = bbox_corpus_core::git::git_root_for_path(project_root)
+        .and_then(|root| bbox_corpus_core::entity_ref::repo_id_for_root(&root).ok());
+    bbox_corpus_core::identity::RepoIdInputs {
+        project_key_override: project.project_key_override,
+        recorded: project.repo_id,
+        aka_repo_ids: project.aka_repo_ids,
+        computed,
+    }
+}
+
 pub fn merge_project(base: &Config, project: &ProjectConfig) -> Config {
     let mut merged = base.clone();
     if let Some(write_path) = project.roadmap.write_path.clone() {

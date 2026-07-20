@@ -2,5 +2,6 @@
 //! Modules move verbatim; the origin re-exports them under their original
 //! `crate::<module>` paths.
 
+pub mod inventory;
 pub mod knowledge;
 pub mod render;
