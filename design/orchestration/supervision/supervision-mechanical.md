@@ -90,7 +90,11 @@ are bounded.
 - streaming providers parse each NDJSON event with `provider.parse_event`
   before `inner.supervision.observe_event(...)`
 - bulk-output providers parse at completion and call
-  `inner.supervision.observe_bulk_sink(...)`
+  `inner.supervision.observe_bulk_sink(...)` (**2026-07-19: removed.** Every
+  harness-backed provider now streams the Claude-compatible envelope, so
+  there is no remaining bulk-output arm; `SupervisionState::observe_bulk_sink`
+  and `ProviderEvents::parse_bulk_output` were deleted along with the inline
+  spawn pipeline they served. `observe_event` is the only observation path.)
 - task result/status/timeout rendering reads the idle fact directly from
   `last_event_at_ms` at snapshot time — no separate `observe_stall` pre-call
 

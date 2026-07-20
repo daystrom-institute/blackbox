@@ -16,6 +16,19 @@ brief: "A minimal headless coding agent that speaks provider APIs directly (Anth
 > output, RTK output compaction, in-process executor, namespace isolation) were
 > excised to [`backlog-transport-polish.md`](./backlog-transport-polish.md).
 
+> **2026-07-19 correction.** The `spawn_task_reserved` pipeline this document
+> describes below (Decisions table, "The seam we are slotting into", the
+> Architecture diagram) and the `move_large_prompt_arg_to_stdin` stdin-promotion
+> helper referenced under the CLI flag table were deleted by the fleetd
+> extraction on `beta/blackbox-v2`. Every harness dispatch now flows through
+> `prepare_harness_child_launch` -> `WorkerSpawnSpec` -> `HarnessExecutor`
+> (`LocalExecutor` or `FleetdExecutor` over `crates/fleetd`); see
+> [`harness-daemon-boundary.md`](./harness-daemon-boundary.md) section 15 and
+> [`locality-first-decomposition.md`](../daemon-runtime/locality-first-decomposition.md)
+> section 5. The subprocess-shaped seam described below (argv, NDJSON on
+> stdout, the Claude-compatible envelope) is unchanged; only the daemon-side
+> spawn/supervision machinery moved.
+
 # Custom provider harness (`bro-harness`)
 
 > **Status note.** Began as an Anthropic-only harness; now generalized to a

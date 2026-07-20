@@ -415,6 +415,35 @@ monolith:
      Process-adoption tricks are not worth it for a tiny binary that
      should change a few times a year; its stability is the point of
      extracting it.
+
+   **Implementation status (2026-07-19, `beta/blackbox-v2`): shipped.** This
+   slice is no longer proposed-tense; Phase A + B landed and merged. What's
+   built, so the Contract paragraph above reads as record rather than
+   pending work:
+   - The `crates/fleetd` binary exists and owns worker spawn/supervision over
+     the `bro-rpc` Unix-domain-socket wire described above.
+   - Every harness dispatch composes a `WorkerSpawnSpec` and runs it through
+     `HarnessExecutor`; `LocalExecutor` and `FleetdExecutor` (over
+     `crates/fleetd`) are the two live implementations, selected once at
+     daemon startup by `install_harness_executor`.
+   - The default is fleetd (`daemon.executor` config, default
+     `ExecutorKind::Fleetd`); `ExecutorKind::Local` is the explicit escape
+     hatch back to in-daemon children, still what unit tests and library
+     consumers get with no daemon startup.
+   - The durable-cursor replay design is built as specified: no in-memory
+     replay buffer, the daemon tracks a per-session durable ingest cursor
+     against the event-log JSONL, and fleetd streams the file tail from
+     that cursor on reconnect. Re-adoption on daemon start is automatic.
+   - Badgey one-shot dispatches route through the same
+     `WorkerSpawnSpec`/`HarnessExecutor` seam as interactive/reserved
+     dispatch; there is no separate one-shot spawn path left to keep in
+     sync.
+   - The inline pipeline this slice replaces (`spawn_task_reserved`,
+     `spawn_task_interactive`, `SpawnedTask`, `move_large_prompt_arg_to_stdin`,
+     `ProviderEvents::parse_bulk_output`, `SupervisionState::observe_bulk_sink`)
+     is deleted, not merely superseded. See
+     [`harness-daemon-boundary.md`](../bro-harness/harness-daemon-boundary.md)
+     section 15 for the ledger of what that replaced.
 6. **Corpus off-host.** Now a relocation, not a split: the surviving
    daemon surface passes the residency test wholesale. Deployment rides
    `bbox-cage`; state-root resolution derives from one `BLACKBOX_STATE_DIR`
