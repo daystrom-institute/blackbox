@@ -220,6 +220,69 @@ pub fn list_worktree_paths(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Read a file's content from a COMMITTED tree via `git show <ref>:<repo_rel>`,
+/// bypassing the working tree entirely (design §4.1: published truth is the
+/// committed tree, not the dirty working copy the loader reads today).
+///
+/// `repo_rel` is the path RELATIVE TO THE REPO ROOT, always `/`-separated (git
+/// pathspec form) regardless of host OS. `ref` is any commit-ish (`HEAD`, a
+/// branch, a SHA). Returns `None` when the path does not exist at that ref, the
+/// ref is unknown, or `root` is not a git repo — never an empty-string
+/// false-positive. Bytes are decoded lossily; knowledge/gap entries are UTF-8
+/// JSON so this is exact for the intended callers.
+pub fn read_committed_file(root: &Path, r#ref: &str, repo_rel: &str) -> Option<String> {
+    let spec = format!("{}:{}", r#ref, repo_rel);
+    let output = git_output(root, &["show", &spec], "reading committed file")?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// List the files under a directory in a COMMITTED tree via
+/// `git ls-tree -r --name-only <ref> -- <dir_rel>`. Returns repo-root-relative,
+/// `/`-separated paths (git's native output form), recursively (blobs only).
+///
+/// `dir_rel` is relative to the repo root, `/`-separated. Used to enumerate a
+/// scope's committed `.bbox/knowledge/` entries without touching the working
+/// tree. Empty vec when the dir is absent at that ref, the ref is unknown, or
+/// `root` is not a git repo.
+pub fn list_committed_dir(root: &Path, r#ref: &str, dir_rel: &str) -> Vec<String> {
+    let Some(output) = git_output(
+        root,
+        &["ls-tree", "-r", "--name-only", r#ref, "--", dir_rel],
+        "listing committed dir",
+    ) else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let Ok(text) = String::from_utf8(output.stdout) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The best common ancestor of two commit-ishes via `git merge-base <a> <b>`,
+/// used to compute a checkout's provisional overlay as a merge-base-relative
+/// diff against the published tree (design §4.1). Returns `None` when there is
+/// no common ancestor (unrelated histories), a ref is unknown, or `root` is not
+/// a git repo.
+pub fn merge_base(root: &Path, a: &str, b: &str) -> Option<String> {
+    let output = git_output(root, &["merge-base", a, b], "computing merge base")?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(output.stdout).ok()?;
+    let sha = sha.trim();
+    (!sha.is_empty()).then(|| sha.to_string())
+}
+
 /// Map a linked-worktree top to its base repository — the directory whose
 /// `.git` *directory* backs the worktree. Structural, no git subprocess: a
 /// linked worktree's `.git` marker is a FILE containing
@@ -858,6 +921,89 @@ mod tests {
             "git {:?} failed: {}",
             args,
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo(root: &Path) {
+        run_git(root, &["init", "-q"]);
+        run_git(root, &["config", "user.email", "t@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+    }
+
+    fn write(root: &Path, rel: &str, content: &str) {
+        let p = root.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, content).unwrap();
+    }
+
+    #[test]
+    fn read_committed_file_ignores_working_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        init_repo(&root);
+        write(&root, ".bbox/knowledge/e1.json", "committed");
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-q", "-m", "c1"]);
+        // Dirty the working copy AFTER the commit.
+        write(&root, ".bbox/knowledge/e1.json", "dirty-working-copy");
+
+        assert_eq!(
+            read_committed_file(&root, "HEAD", ".bbox/knowledge/e1.json").as_deref(),
+            Some("committed"),
+            "must read the committed blob, not the dirty working tree"
+        );
+        assert_eq!(
+            read_committed_file(&root, "HEAD", ".bbox/knowledge/nope.json"),
+            None,
+            "absent path yields None, not empty string"
+        );
+    }
+
+    #[test]
+    fn list_committed_dir_lists_only_committed_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        init_repo(&root);
+        write(&root, ".bbox/knowledge/e1.json", "a");
+        write(&root, ".bbox/knowledge/e2.json", "b");
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-q", "-m", "c1"]);
+        // An untracked working-tree file must NOT appear.
+        write(&root, ".bbox/knowledge/e3.json", "c");
+
+        let mut listed = list_committed_dir(&root, "HEAD", ".bbox/knowledge");
+        listed.sort();
+        assert_eq!(
+            listed,
+            vec![
+                ".bbox/knowledge/e1.json".to_string(),
+                ".bbox/knowledge/e2.json".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_base_finds_common_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        init_repo(&root);
+        write(&root, "f.txt", "base");
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-q", "-m", "base"]);
+        let base = current_head(&root).unwrap();
+
+        // Diverge onto a branch and advance main.
+        run_git(&root, &["checkout", "-q", "-b", "feature"]);
+        write(&root, "f.txt", "feature");
+        run_git(&root, &["commit", "-q", "-am", "feat"]);
+        run_git(&root, &["checkout", "-q", "-"]);
+        write(&root, "f.txt", "main2");
+        run_git(&root, &["commit", "-q", "-am", "main2"]);
+
+        assert_eq!(
+            merge_base(&root, "HEAD", "feature").as_deref(),
+            Some(base.as_str()),
+            "merge-base of diverged branches is their common ancestor"
         );
     }
 }
