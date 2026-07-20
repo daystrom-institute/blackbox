@@ -818,7 +818,13 @@ roster render.
     `mod.rs::spawn_task_interactive` (+ `SpawnedTask.stdin`) and the fleet
     pin-tools / `ProviderMcp::build_fleet_mcp_args` translation — both candidates
     to wire into daemon-side `/control/exec` (forwarding fleet.json MCP/pin tools)
-    or delete when the daemon dispatch is consolidated.
+    or delete when the daemon dispatch is consolidated. **2026-07-19: resolved
+    by deletion.** The fleetd extraction
+    (`design/daemon-runtime/locality-first-decomposition.md` section 5) removed
+    `spawn_task_interactive` and `SpawnedTask` (including its `stdin` field)
+    outright; every dispatch, interactive or reserved, now composes a
+    `WorkerSpawnSpec` and runs it through `HarnessExecutor`
+    (`LocalExecutor`/`FleetdExecutor`).
   - **Step 1c — DONE: pure view/wire DTOs relocated to `bro-protocol`; client
     `TaskStatus` unified.** The genuinely-pure command-plane + transcript DTOs
     now live at the contract bottom: `DispatchSpec`/`ResumeSpec`
@@ -870,7 +876,9 @@ roster render.
     left (still referenced by the shared `spawn_task_reserved` machinery) and
     the `build_fleet_mcp_args` family left (still test-covered). `bro-cli` still
     depends on `blackbox` for `parser` (1d-ii) and `config::load` (1d-iii).
-    Validated: `cargo check --workspace` clean 0/0.
+    Validated: `cargo check --workspace` clean 0/0. (Both orphans, plus
+    `spawn_task_reserved` itself, were deleted 2026-07-19 by the fleetd
+    extraction; see the correction two entries above.)
   - **Step 1d-ii — DONE: transcript parser extracted into shared `bro-transcript`.**
     Correction to the earlier plan: `parser` is NOT a bro-cli-only surface and
     its per-provider parsers are NOT §4 dead code — the daemon's transcript
