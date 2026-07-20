@@ -8,12 +8,18 @@
 //! dispatch composition changing.
 //!
 //! Slice 5 of `design/daemon-runtime/locality-first-decomposition.md`. The
-//! split is: everything below is the *execution half* the interactive harness
-//! path used to run inline in `spawn_task_reserved` (login-shell bin
-//! resolution, env hygiene, stdin control writer, stdout line pump, stderr
-//! collection, waiter ordering); the daemon keeps the *state half* (task store,
+//! split is: everything below is the *execution half* the harness dispatch
+//! path used to run inline in the daemon (login-shell bin resolution, env
+//! hygiene, stdin control writer, stdout line pump, stderr collection, waiter
+//! ordering); the daemon keeps the *state half* (task store,
 //! roster/tail/system events, `ingest_harness_event` over the line stream,
 //! terminal publication).
+//!
+//! There is no longer a second, inline way to start a harness worker. Every
+//! dispatch path funnels through `spawn_reserved_dispatch` and arrives here,
+//! which is what makes "with the fleetd executor, no harness child is a direct
+//! daemon child" a structural property rather than a convention: the code that
+//! could violate it does not exist.
 //!
 //! The seam is `async` as of the fleetd cutover: a socket-backed executor has
 //! to dial, authenticate, and await a `SessionStarted` before it can hand back

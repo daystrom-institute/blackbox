@@ -8,8 +8,12 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(name = "bro-harness", disable_help_flag = false)]
 pub struct Cli {
-    /// The user turn. May be omitted when the daemon moves a large prompt to
-    /// stdin (`move_large_prompt_arg_to_stdin`); in that case stdin is read.
+    /// The user turn. May be omitted, in which case stdin is read.
+    ///
+    /// The daemon no longer takes that route: it passes the turn as the spawn
+    /// spec's `initial_messages`, queued on the control lane ahead of anything
+    /// else, so `-p` is absent on daemon dispatches. Reading the prompt from
+    /// stdin remains supported for standalone invocations.
     #[arg(short = 'p', long = "prompt")]
     pub prompt: Option<String>,
 
