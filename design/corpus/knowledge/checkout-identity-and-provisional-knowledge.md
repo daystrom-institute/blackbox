@@ -32,7 +32,7 @@ Attack the knowledge/code seam as one push, foundation first:
    travels: `(repo_id, bbox_root_relpath)` where `repo_id` is a strongly
    minted value RECORDED in committed `.bbox/config.toml`, not the weak
    computed hash. Mint a durable, checkout-local `checkout_id`. Stamp
-   knowledge and indexed-lane responses with a generation.
+   knowledge and indexed-lane responses with a `built_from` commit.
 2. **The provisional lane.** Replace `write_redirects` (the host-local map
    that today decides which worktree a repo-owned entry file lands in) with a
    versioned provisional overlay computed from each checkout's own `.bbox/`
@@ -215,17 +215,24 @@ teardown deregistration. Provisional-checkout watching is new wiring; the
 existing watcher initializes from base roots only
 (`src/server/background.rs:173-180`).
 
-### 3.4 Generation stamps
+### 3.4 Built-from stamps
 
-Knowledge and indexed responses carry the commit/generation they were built
-from, so a consumer distinguishes published from provisional. Additive.
-Per-snapshot granularity likely suffices; per-entry is the fallback.
+Knowledge and indexed responses carry the commit they were built from (a
+`built_from` stamp), so a consumer distinguishes published from provisional.
+The name is deliberate: "generation" already means the committed-file
+generation-purge in `knowledge.rs`, and "epoch" is the one-time schema-migration
+boundary in §3.5, so the per-response provenance stamp takes a third, unambiguous
+name. Additive. Per-snapshot granularity likely suffices; per-entry is the
+fallback. The index side substantially exists already: project-file docs are
+stamped from `(repo_id, project_id, head_sha)` (`project_files.rs`
+`clean_snapshot_id` + `head_fingerprint`), so this slice mainly adds the
+knowledge-response stamp.
 
 ### 3.5 Migration: inventory and quarantine (closes round 1, finding 7)
 
 Lazy "stamp on read, fall back to path" mis-keys (repo A at `/old/path`
-stamped repo B after A moves and B occupies it) and a generation cannot prove
-coverage across offline hosts and dormant stores. Migration is an explicit
+stamped repo B after A moves and B occupies it) and a `built_from` stamp cannot
+prove coverage across offline hosts and dormant stores. Migration is an explicit
 **schema epoch**: a one-time inventory resolves every entry to
 `(recorded repo_id, relpath)` by §3.1 precedence, QUARANTINES the
 unresolvable (moved, ambiguous, no reachable recorded id) for operator
@@ -233,7 +240,7 @@ resolution rather than re-keying by current path, retains the path key only as
 an inventory-bounded read fallback with deterministic conflict handling
 (recorded-id match wins; a path match disagreeing with a recorded id is
 quarantined), and asserts coverage by the epoch marker plus an empty
-quarantine, never a generation number.
+quarantine, never a per-response `built_from` stamp.
 
 ### 3.6 Two known consumers
 
@@ -433,7 +440,7 @@ migration** (§6 slice 7). Not left implicit.
 
 1. **Identity contract, additive.** Strongly-minted recorded `repo_id` +
    `bbox_root_relpath` + precedence; durable checkout-local `checkout_id`;
-   generation stamps; schema-epoch inventory + quarantine.
+   `built_from` stamps; schema-epoch inventory + quarantine.
 2. **Checkout registry + discovery lifecycle.** Register on write, startup
    reload + write-gate re-verify, periodic reconciliation, teardown
    deregistration.
@@ -485,7 +492,7 @@ Each slice lands on the monolith and gets the full lane gate.
   first cut to push (scope overlap, entailment) before diminishing returns.
 - **Provisional query UX.** The peer-visibility flag name and whether an
   orchestrator gets a fleet-wide provisional view.
-- **Generation stamp granularity.** Per-snapshot vs per-entry.
+- **`built_from` stamp granularity.** Per-snapshot vs per-entry.
 - **Gap convergence shape.** One generalized overlay vs a gap-specific
   migration reusing the registry, promotion, and staged-write path.
 - **Remote-rung transport.** How provisional visibility would ever cross
