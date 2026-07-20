@@ -27,10 +27,25 @@ async fn main() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let cli = bro_harness::cli::Cli::parse();
-    if let Err(e) = bro_harness::agent_loop::run(cli).await {
-        // Surface the failure on stderr; the daemon captures it as the task's
-        // stderr and marks the task failed on non-zero exit.
-        tracing::error!("harness error: {e:#}");
-        std::process::exit(1);
+    match bro_harness::agent_loop::run(cli).await {
+        Ok(()) => {
+            // Exit explicitly rather than returning into the `#[tokio::main]`
+            // runtime drop. `tokio::io::stdin()` parks a blocking read on the
+            // blocking pool, and the daemon holds the child's stdin open for
+            // the session's whole life, so that read never sees EOF. Dropping
+            // the runtime joins the blocking pool, which would then hang
+            // forever waiting on that parked read, so the child never exits
+            // and the daemon never observes the terminal state. The session
+            // snapshot and event log are already durably flushed at the turn
+            // boundary before `run` returns, so an immediate exit loses
+            // nothing. Symmetric with the error arm below.
+            std::process::exit(0);
+        }
+        Err(e) => {
+            // Surface the failure on stderr; the daemon captures it as the
+            // task's stderr and marks the task failed on non-zero exit.
+            tracing::error!("harness error: {e:#}");
+            std::process::exit(1);
+        }
     }
 }
