@@ -193,6 +193,33 @@ pub fn managed_checkout_root(path: &Path) -> Option<PathBuf> {
     (marker.trim() == MANAGED_CHECKOUT_MARKER_V1).then_some(root)
 }
 
+/// Every worktree path of the repository containing `root` — the primary
+/// checkout plus every linked worktree — via `git worktree list --porcelain`.
+///
+/// Used by checkout discovery (design §3.3): a registered repo's linked
+/// worktrees are re-findable this way even if the host-local checkout registry
+/// is lost. Paths are canonicalized; unparseable/missing paths are skipped.
+/// Returns an empty vec when `root` is not in a git repo.
+pub fn list_worktree_paths(root: &Path) -> Vec<PathBuf> {
+    let Some(output) = git_output(
+        root,
+        &["worktree", "list", "--porcelain"],
+        "listing worktrees",
+    ) else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let Ok(text) = String::from_utf8(output.stdout) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .filter_map(|path| fs::canonicalize(path.trim()).ok())
+        .collect()
+}
+
 /// Map a linked-worktree top to its base repository — the directory whose
 /// `.git` *directory* backs the worktree. Structural, no git subprocess: a
 /// linked worktree's `.git` marker is a FILE containing
