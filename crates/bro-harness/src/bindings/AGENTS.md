@@ -10,6 +10,14 @@ platform contract from `design/bro-harness/code-mode-cell-dsl.md`.
 - **Cell-only constructs.** Bindings join the code-mode callable set + seam
   (ToolFilter still gates by canonical dotted name, e.g. `"code.items"`) and
   NEVER the flat wire registry. A model outside a cell cannot call them.
+- **Invocation form: bare namespace globals, never `tools.<ns>.*`.**
+  Namespace-bound bindings project as top-level globals (`rust.migrateErrorType(...)`,
+  `code.items(...)`); the flat `tools.*` object holds only unbound core tools
+  (file/shell/git/web). `tools.rust` is undefined and calling it fails with
+  `TypeError: Cannot read properties of undefined`: three probe dispatches
+  burned on exactly this before the error message was read properly. When a
+  probe agent claims a binding "does not exist", check its invocation form
+  before believing the tool is missing.
 - **Harness-native, zero daemon reach-back** (decision af3c4783): every
   binding is a function of the working set plus harness-owned children
   (language servers). The container test — harness + working set + spawned
@@ -113,7 +121,13 @@ Footguns that bit:
   parse_error_after_apply — bouncing with `applied: false` + findings
   `{kind, file, detail, resolution_hint}` and byte-exact rollback. Findings
   must be repairable without re-running discovery. Operator authority
-  (RX-V1 flags) arrives dispatch-side, never as a cell argument.
+  (RX-V1 flags) arrives dispatch-side, never as a cell argument: the binding
+  reads it host-side via `cx.tool_arg_defaults.lookup(tool, param)`, and the
+  daemon fills that map from ambient context, then the brofile's
+  `tool_defaults`, then per-dispatch `ExecParams.tool_defaults` (most
+  specific wins), forwarded to the harness child via `--additional-context`.
+  A cell-authored `acknowledge_*` is a schema error naming the channel.
+  Isolate probes exercise the granted leg with `--tool-defaults`.
 - **Spans are hash-anchored at read time**; an EditSet pins one content
   hash per file; after a successful apply every older Span for that file is
   stale BY DESIGN — re-derive facts. Check expected hashes BEFORE
