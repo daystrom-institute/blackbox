@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -950,6 +950,20 @@ pub struct KnowledgeStore {
     /// a base root's committed file is observed at load (the merge landed).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub write_redirects: HashMap<String, String>,
+    /// Load-time provenance: canonical project-root path → the HEAD commit its
+    /// committed `.bbox/knowledge/` entries were built from at the last reload
+    /// (design §3.4, "built_from" stamp). This is the commit a consumer reads
+    /// to distinguish published from provisional once the overlay lands.
+    ///
+    /// NEVER persisted: it is `#[serde(skip)]`, so it is absent from both the
+    /// central `kb.json` and every repo-owned entry file, and is recomputed
+    /// fresh on every reload. It is host/checkout-derived provenance, not
+    /// durable entry content — writing it into a committed file would let it
+    /// travel and go stale. Named `built_from` on purpose: "generation" is the
+    /// committed-file generation-purge here, and "epoch" is the schema-migration
+    /// boundary (§3.5).
+    #[serde(skip)]
+    pub built_from: BTreeMap<String, String>,
 }
 
 impl KnowledgeStore {
@@ -958,6 +972,7 @@ impl KnowledgeStore {
             version: 1,
             entries: Vec::new(),
             write_redirects: HashMap::new(),
+            built_from: BTreeMap::new(),
         }
     }
 }
@@ -1040,6 +1055,9 @@ impl Knowledge {
             .filter(|(id, _)| self.store.entries.iter().any(|e| &e.id == *id))
             .map(|(id, dir)| (id.clone(), dir.clone()))
             .collect();
+        // Carry load-time provenance into the snapshot for `StoreSnapshot`
+        // consumers. `#[serde(skip)]` keeps it out of the persisted `kb.json`.
+        central.built_from = self.store.built_from.clone();
         central
     }
 
@@ -1158,7 +1176,16 @@ impl Knowledge {
     /// dropped from central on the next save).
     fn load_project_entries(&mut self) -> Result<()> {
         let roots = self.project_roots.clone();
+        // Fresh each reload: `built_from` is load-time provenance, so a root
+        // that dropped out of `project_roots` must not linger. `reload` already
+        // resets `self.store` (to a new store or a deserialized one whose
+        // `built_from` is `#[serde(skip)]` → empty), so clearing here is belt +
+        // suspenders against a caller that repopulates without a full reset.
+        self.store.built_from.clear();
         for root in &roots {
+            // The commit these committed entries were built from (design §3.4).
+            // Best-effort: `None` for a non-git root or a repo with no HEAD.
+            let head = bbox_corpus_core::git::current_head(root);
             for entry in load_repo_kb_entries(root)? {
                 // A base root's committed file for a redirected id means the
                 // worktree branch merged: the redirect (and the central
@@ -1170,6 +1197,11 @@ impl Knowledge {
                 } else {
                     self.store.entries.push(entry);
                 }
+            }
+            if let Some(head) = head {
+                self.store
+                    .built_from
+                    .insert(root.to_string_lossy().into_owned(), head);
             }
         }
         Ok(())
@@ -1213,6 +1245,14 @@ impl Knowledge {
     /// layer.
     pub fn all_entries(&self) -> &[KnowledgeEntry] {
         &self.store.entries
+    }
+
+    /// Load-time `built_from` provenance: canonical project-root path → the
+    /// HEAD commit its committed entries were built from at the last reload
+    /// (design §3.4). Recomputed each reload, never persisted. The commit a
+    /// consumer reads to distinguish published from provisional.
+    pub fn built_from(&self) -> &BTreeMap<String, String> {
+        &self.store.built_from
     }
 
     /// Count entries currently scoped to `project_dir` (across central and any
@@ -4346,6 +4386,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let legacy = KnowledgeStore {
             version: 1,
             write_redirects: Default::default(),
+            built_from: Default::default(),
             entries: vec![KnowledgeEntry {
                 id: "legacy01".into(),
                 title: "old convention".into(),
@@ -4967,5 +5008,103 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             .find(|entry| entry.id == out.id)
             .expect("entry should persist");
         assert_eq!(stored.cluster.as_deref(), Some("Lifecycle Rules"));
+    }
+
+    // ── built_from provenance stamps (design §3.4) ────────────────────
+
+    fn git_init_commit(dir: &Path) -> String {
+        let run = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("seed.txt"), "seed").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "seed"]);
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn built_from_stamps_project_root_head() {
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let head = git_init_commit(&root);
+        std::fs::create_dir_all(repo_kb_dir(&root)).unwrap();
+
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        kb.set_project_roots(vec![root.clone()]).unwrap();
+
+        assert_eq!(
+            kb.built_from().get(root.to_str().unwrap()).map(String::as_str),
+            Some(head.as_str()),
+            "built_from must map the root to its HEAD commit"
+        );
+    }
+
+    #[test]
+    fn built_from_absent_for_non_git_root() {
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        std::fs::create_dir_all(repo_kb_dir(&root)).unwrap();
+
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        kb.set_project_roots(vec![root.clone()]).unwrap();
+
+        assert!(
+            kb.built_from().is_empty(),
+            "a non-git root has no HEAD, so no built_from stamp"
+        );
+    }
+
+    #[test]
+    fn built_from_recomputed_and_never_persisted() {
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        git_init_commit(&root);
+        std::fs::create_dir_all(repo_kb_dir(&root)).unwrap();
+        let kb_path = central.path().join("kb.json");
+
+        let mut kb = Knowledge::open(&kb_path).unwrap();
+        kb.set_project_roots(vec![root.clone()]).unwrap();
+        assert!(!kb.built_from().is_empty());
+        kb.save().unwrap();
+
+        // Never serialized into the central store.
+        let raw = std::fs::read_to_string(&kb_path).unwrap();
+        assert!(
+            !raw.contains("built_from"),
+            "built_from must not be persisted to kb.json: {raw}"
+        );
+
+        // Recomputed fresh on reopen (skip-deserialized to empty, then
+        // repopulated by set_project_roots).
+        let mut kb2 = Knowledge::open(&kb_path).unwrap();
+        assert!(
+            kb2.built_from().is_empty(),
+            "built_from starts empty before roots are registered"
+        );
+        kb2.set_project_roots(vec![root.clone()]).unwrap();
+        assert!(!kb2.built_from().is_empty());
+
+        // Dropping the root from the set clears its stamp.
+        kb2.set_project_roots(vec![]).unwrap();
+        assert!(kb2.built_from().is_empty());
     }
 }

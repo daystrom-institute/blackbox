@@ -1819,6 +1819,7 @@ pdf_figure = "voyage_visual"
         let store = KnowledgeStore {
             version: 1,
             write_redirects: Default::default(),
+            built_from: Default::default(),
             entries: vec![KnowledgeEntry {
                 id: "vector-only".into(),
                 title: "Vector only".into(),

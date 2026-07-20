@@ -280,6 +280,7 @@ mod tests {
             serde_json::to_string(&KnowledgeStore {
                 version: 1,
                 write_redirects: Default::default(),
+                built_from: Default::default(),
                 entries: vec![],
             })
             .unwrap(),
