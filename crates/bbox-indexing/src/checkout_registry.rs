@@ -190,7 +190,7 @@ impl CheckoutRegistry {
 /// when it registers; discovery yields locations only.
 pub fn discover_checkout_dirs(projects: &[ProjectRecord]) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = Vec::new();
-    let mut push = |p: PathBuf, found: &mut Vec<PathBuf>| {
+    let push = |p: PathBuf, found: &mut Vec<PathBuf>| {
         if !found.contains(&p) {
             found.push(p);
         }

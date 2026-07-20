@@ -281,6 +281,7 @@ mod tests {
                 version: 1,
                 write_redirects: Default::default(),
                 built_from: Default::default(),
+                provenance: Default::default(),
                 entries: vec![],
             })
             .unwrap(),

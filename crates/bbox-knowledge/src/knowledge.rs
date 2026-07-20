@@ -772,13 +772,22 @@ fn project_is_repo_owned(project_dir: &Path) -> bool {
 
 /// Load every project-scoped entry committed under `<project_dir>/.bbox/knowledge/`,
 /// stamping each with `project = project_dir` (the field is absent on disk).
-fn load_repo_kb_entries(project_dir: &Path) -> Result<Vec<KnowledgeEntry>> {
+fn load_repo_kb_entries(
+    project_dir: &Path,
+) -> Result<(Vec<KnowledgeEntry>, BTreeMap<String, EntryProvenance>)> {
     let dir = repo_kb_dir(project_dir);
     if !dir.exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), BTreeMap::new()));
     }
     let project = project_dir.to_string_lossy().to_string();
     let mut out = Vec::new();
+    let mut provenance = BTreeMap::new();
+    // Committed-tree context for the published-vs-provisional label (slice 3.2),
+    // computed once per root: the git root plus the repo-relative prefix of this
+    // checkout's `.bbox/` (`""` at repo root, `"<sub>/"` for a monorepo
+    // subproject). `None` for a non-git root or one with no HEAD — every entry
+    // then stays `Unknown` (absent from the map).
+    let prov_ctx = provenance_context(project_dir);
     let mut skipped = 0usize;
     // A directory-level read failure (TOCTOU between the exists() check and the
     // read, a permissions blip) must also be non-fatal: aborting here would let
@@ -789,7 +798,7 @@ fn load_repo_kb_entries(project_dir: &Path) -> Result<Vec<KnowledgeEntry>> {
         Ok(rd) => rd,
         Err(e) => {
             tracing::warn!("kb load: cannot read {}: {e}", dir.display());
-            return Ok(Vec::new());
+            return Ok((Vec::new(), BTreeMap::new()));
         }
     };
     // Skip-and-continue per file: a single malformed/partial entry (e.g. an
@@ -824,6 +833,22 @@ fn load_repo_kb_entries(project_dir: &Path) -> Result<Vec<KnowledgeEntry>> {
             }
         };
         entry.project = Some(project.clone());
+        // Published-vs-provisional label (slice 3.2): a working file
+        // byte-identical to its committed-tree blob is Published; anything else
+        // (new, modified, or committed-read failed while the root IS a git repo
+        // with a HEAD) is Provisional. Unknown (absent) when there is no git
+        // context. `raw` is the committed-FORMAT on-disk content (project +
+        // recall are stripped from committed files and re-applied in memory),
+        // so a byte comparison against the committed blob is exact.
+        if let Some((git_root, rel_prefix)) = &prov_ctx {
+            let repo_rel = format!("{rel_prefix}.bbox/knowledge/{}.json", entry.id);
+            let prov = match bbox_corpus_core::git::read_committed_file(git_root, "HEAD", &repo_rel)
+            {
+                Some(committed) if committed == raw => EntryProvenance::Published,
+                _ => EntryProvenance::Provisional,
+            };
+            provenance.insert(entry.id.clone(), prov);
+        }
         out.push(entry);
     }
     // Merge host-local recall telemetry back onto the committed (recall-free)
@@ -847,7 +872,23 @@ fn load_repo_kb_entries(project_dir: &Path) -> Result<Vec<KnowledgeEntry>> {
     } else {
         tracing::debug!("kb load: {} loaded={}", dir.display(), out.len());
     }
-    Ok(out)
+    Ok((out, provenance))
+}
+
+/// Committed-tree context for the provenance label: the git root plus the
+/// repo-relative prefix of `project_dir`'s `.bbox/` (`""` at the repo root,
+/// `"<sub>/"` for a monorepo subproject). `None` when `project_dir` is not in a
+/// git repo, the repo has no HEAD, or the root sits outside the resolved git
+/// tree — every entry then stays `Unknown`.
+fn provenance_context(project_dir: &Path) -> Option<(PathBuf, String)> {
+    let git_root = bbox_corpus_core::git::git_root_for_path(project_dir)?;
+    bbox_corpus_core::git::current_head(&git_root)?;
+    let rel_prefix = match bbox_corpus_core::identity::bbox_root_relpath(&git_root, project_dir) {
+        Some(rel) if rel == "." => String::new(),
+        Some(rel) => format!("{rel}/"),
+        None => return None,
+    };
+    Some((git_root, rel_prefix))
 }
 
 /// Persist `entries` (all owned by `project_dir`) one file per entry under
@@ -950,6 +991,18 @@ pub struct KnowledgeStore {
     /// a base root's committed file is observed at load (the merge landed).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub write_redirects: HashMap<String, String>,
+    /// Load-time published-vs-provisional label per entry id (design §3.4 /
+    /// slice 3.2). An entry whose committed-tree blob is byte-identical to its
+    /// working file is [`EntryProvenance::Published`]; a dirty/new/uncommitted
+    /// working file is [`EntryProvenance::Provisional`]; a non-git root or a
+    /// root with no HEAD leaves the id absent (→ [`EntryProvenance::Unknown`]).
+    ///
+    /// Labeling ONLY (slice 3.2): it does not change which entries are visible;
+    /// the working tree is still the source of truth for the query surface. The
+    /// label is what the cross-checkout visibility rule and the merge gate will
+    /// consume. `#[serde(skip)]`: never persisted, recomputed each reload.
+    #[serde(skip)]
+    pub provenance: BTreeMap<String, EntryProvenance>,
     /// Load-time provenance: canonical project-root path → the HEAD commit its
     /// committed `.bbox/knowledge/` entries were built from at the last reload
     /// (design §3.4, "built_from" stamp). This is the commit a consumer reads
@@ -966,6 +1019,23 @@ pub struct KnowledgeStore {
     pub built_from: BTreeMap<String, String>,
 }
 
+/// Published-vs-provisional label for a durable entry, derived at load by
+/// comparing the working file to its committed-tree blob (design §3.4, slice
+/// 3.2). Never persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EntryProvenance {
+    /// Provenance not determined: a non-git root, a root with no HEAD, or an
+    /// entry outside a resolvable git tree. The safe default.
+    #[default]
+    Unknown,
+    /// The working file is byte-identical to the committed-tree blob — the
+    /// entry is published truth.
+    Published,
+    /// The working file is new, modified, or otherwise not byte-identical to
+    /// the committed tree — an uncommitted provisional change.
+    Provisional,
+}
+
 impl KnowledgeStore {
     pub fn new() -> Self {
         Self {
@@ -973,6 +1043,7 @@ impl KnowledgeStore {
             entries: Vec::new(),
             write_redirects: HashMap::new(),
             built_from: BTreeMap::new(),
+            provenance: BTreeMap::new(),
         }
     }
 }
@@ -1058,6 +1129,7 @@ impl Knowledge {
         // Carry load-time provenance into the snapshot for `StoreSnapshot`
         // consumers. `#[serde(skip)]` keeps it out of the persisted `kb.json`.
         central.built_from = self.store.built_from.clone();
+        central.provenance = self.store.provenance.clone();
         central
     }
 
@@ -1182,11 +1254,16 @@ impl Knowledge {
         // `built_from` is `#[serde(skip)]` → empty), so clearing here is belt +
         // suspenders against a caller that repopulates without a full reset.
         self.store.built_from.clear();
+        // Provenance is load-time, per-reload state like built_from; clear so a
+        // dropped root or a promoted entry does not keep a stale label.
+        self.store.provenance.clear();
         for root in &roots {
             // The commit these committed entries were built from (design §3.4).
             // Best-effort: `None` for a non-git root or a repo with no HEAD.
             let head = bbox_corpus_core::git::current_head(root);
-            for entry in load_repo_kb_entries(root)? {
+            let (entries, prov) = load_repo_kb_entries(root)?;
+            self.store.provenance.extend(prov);
+            for entry in entries {
                 // A base root's committed file for a redirected id means the
                 // worktree branch merged: the redirect (and the central
                 // retention copy it justified) is no longer needed. The repo
@@ -1253,6 +1330,14 @@ impl Knowledge {
     /// consumer reads to distinguish published from provisional.
     pub fn built_from(&self) -> &BTreeMap<String, String> {
         &self.store.built_from
+    }
+
+    /// Published-vs-provisional label for an entry id (design §3.4, slice 3.2).
+    /// `Unknown` when the id was loaded from a non-git root, a root with no
+    /// HEAD, or is not present. Labeling only — this does not affect which
+    /// entries are visible.
+    pub fn provenance_of(&self, id: &str) -> EntryProvenance {
+        self.store.provenance.get(id).copied().unwrap_or_default()
     }
 
     /// Count entries currently scoped to `project_dir` (across central and any
@@ -4251,7 +4336,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         );
 
         // Reload merges telemetry back onto the recall-free committed entry.
-        let loaded = load_repo_kb_entries(&repo_root).unwrap();
+        let (loaded, _prov) = load_repo_kb_entries(&repo_root).unwrap();
         let e = loaded.iter().find(|e| e.id == "recl0001").unwrap();
         assert_eq!(e.recall_count, 99);
         assert_eq!(e.last_recalled.as_deref(), Some("2026-05-31T00:00:00Z"));
@@ -4387,6 +4472,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             version: 1,
             write_redirects: Default::default(),
             built_from: Default::default(),
+            provenance: Default::default(),
             entries: vec![KnowledgeEntry {
                 id: "legacy01".into(),
                 title: "old convention".into(),
@@ -5106,5 +5192,139 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         // Dropping the root from the set clears its stamp.
         kb2.set_project_roots(vec![]).unwrap();
         assert!(kb2.built_from().is_empty());
+    }
+
+    // ── published-vs-provisional labeling (design §3.4, slice 3.2) ─────
+
+    fn git_run(dir: &Path, args: &[&str]) {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?}"
+        );
+    }
+
+    fn entry_json(id: &str, content: &str) -> String {
+        let e = KnowledgeEntry {
+            id: id.into(),
+            title: "t".into(),
+            content: content.into(),
+            cluster: None,
+            variants: Default::default(),
+            category: Category::Convention,
+            scope: Scope::Project,
+            project: None,
+            providers: vec![],
+            priority: Priority::Standard,
+            weight: 100,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            render: true,
+            decay: true,
+            review_at: None,
+            supersedes: None,
+            links: vec![],
+            rationale: None,
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-01-01".into(),
+            updated_at: "2026-01-01".into(),
+            recall_count: 0,
+            last_recalled: None,
+        };
+        serde_json::to_string(&e).unwrap()
+    }
+
+    #[test]
+    fn provenance_labels_published_and_provisional() {
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        git_init_commit(&root); // seed commit so HEAD exists
+        let kbdir = repo_kb_dir(&root);
+        std::fs::create_dir_all(&kbdir).unwrap();
+        // Two committed entries.
+        std::fs::write(kbdir.join("e1.json"), entry_json("e1", "one")).unwrap();
+        std::fs::write(kbdir.join("e2.json"), entry_json("e2", "two")).unwrap();
+        git_run(&root, &["add", "."]);
+        git_run(&root, &["commit", "-q", "-m", "entries"]);
+        // e2 modified in the working tree; e3 brand new (uncommitted).
+        std::fs::write(kbdir.join("e2.json"), entry_json("e2", "two-EDITED")).unwrap();
+        std::fs::write(kbdir.join("e3.json"), entry_json("e3", "three")).unwrap();
+
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        kb.set_project_roots(vec![root.clone()]).unwrap();
+
+        // Labeling ONLY: all three working-tree entries stay visible.
+        assert!(kb.entry("e1").is_some());
+        assert!(kb.entry("e2").is_some());
+        assert!(kb.entry("e3").is_some());
+        // Labels reflect committed-vs-working.
+        assert_eq!(kb.provenance_of("e1"), EntryProvenance::Published);
+        assert_eq!(kb.provenance_of("e2"), EntryProvenance::Provisional);
+        assert_eq!(kb.provenance_of("e3"), EntryProvenance::Provisional);
+    }
+
+    #[test]
+    fn provenance_unknown_for_non_git_root() {
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let kbdir = repo_kb_dir(&root);
+        std::fs::create_dir_all(&kbdir).unwrap();
+        std::fs::write(kbdir.join("e1.json"), entry_json("e1", "one")).unwrap();
+
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        kb.set_project_roots(vec![root.clone()]).unwrap();
+        // Still visible, just unlabeled.
+        assert!(kb.entry("e1").is_some());
+        assert_eq!(kb.provenance_of("e1"), EntryProvenance::Unknown);
+    }
+
+    #[test]
+    fn provenance_field_is_never_serialized() {
+        // The label is #[serde(skip)]: it must never appear in the persisted
+        // store, and must skip-deserialize to empty. (Testing the invariant
+        // directly, not through save() — save rewrites repo-owned files in the
+        // daemon's persist format, a separate concern from serialization.)
+        let mut store = KnowledgeStore::new();
+        store
+            .provenance
+            .insert("e1".into(), EntryProvenance::Published);
+        let json = serde_json::to_string(&store).unwrap();
+        assert!(
+            !json.contains("provenance"),
+            "provenance must not be serialized: {json}"
+        );
+        let back: KnowledgeStore = serde_json::from_str(&json).unwrap();
+        assert!(
+            back.provenance.is_empty(),
+            "provenance must skip-deserialize to empty"
+        );
+    }
+
+    #[test]
+    fn provenance_recomputed_and_cleared_on_root_change() {
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        git_init_commit(&root);
+        let kbdir = repo_kb_dir(&root);
+        std::fs::create_dir_all(&kbdir).unwrap();
+        std::fs::write(kbdir.join("e1.json"), entry_json("e1", "one")).unwrap();
+
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        // Uncommitted new entry → Provisional.
+        kb.set_project_roots(vec![root.clone()]).unwrap();
+        assert_eq!(kb.provenance_of("e1"), EntryProvenance::Provisional);
+
+        // Dropping the root clears the label.
+        kb.set_project_roots(vec![]).unwrap();
+        assert_eq!(kb.provenance_of("e1"), EntryProvenance::Unknown);
     }
 }
