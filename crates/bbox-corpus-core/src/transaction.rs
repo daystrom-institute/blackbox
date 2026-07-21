@@ -15,6 +15,7 @@ use crate::json_store::{
     atomic_write_bytes_from_dir_locked, atomic_write_json_locked, to_vec_pretty_newline,
 };
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -100,6 +101,12 @@ pub fn apply_transaction(
     fs::create_dir_all(root.join("completed"))
         .with_context(|| format!("creating transaction root {}", root.display()))?;
     reject_symlink_components(&root, Path::new("completed"))?;
+    let _lane_lock = acquire_transaction_lane(&root, false)?.with_context(|| {
+        format!(
+            "knowledge transaction lane at {} is active; retry after the current writer or closeout finishes",
+            root.display()
+        )
+    })?;
     ensure_unique_targets(&writes)?;
 
     let transaction_id = transaction_id();
@@ -158,6 +165,23 @@ pub fn apply_transaction(
 /// Any complete manifest rolls forward idempotently, then records the closeout
 /// proof and clears the pointer.
 pub fn recover_pending_transaction(checkout_dir: &Path) -> Result<Option<RepoTransactionManifest>> {
+    recover_pending_transaction_with_lock(checkout_dir, true)
+}
+
+/// Recover a pending transaction only when no live writer or closeout still
+/// owns the checkout lane. The directory advisory lock is released by the OS
+/// if its process unwinds or exits, so periodic reconciliation can distinguish
+/// an abandoned pointer from an in-flight transaction without a timeout.
+pub fn recover_abandoned_pending_transaction(
+    checkout_dir: &Path,
+) -> Result<Option<RepoTransactionManifest>> {
+    recover_pending_transaction_with_lock(checkout_dir, false)
+}
+
+fn recover_pending_transaction_with_lock(
+    checkout_dir: &Path,
+    wait_for_lane: bool,
+) -> Result<Option<RepoTransactionManifest>> {
     let pointer_path = pending_path(checkout_dir);
     if !pointer_path.exists() {
         return Ok(None);
@@ -170,6 +194,12 @@ pub fn recover_pending_transaction(checkout_dir: &Path) -> Result<Option<RepoTra
         &checkout_dir,
         Path::new(".bbox/local/knowledge-transactions/pending.json"),
     )?;
+    let Some(_lane_lock) = acquire_transaction_lane(&root, wait_for_lane)? else {
+        return Ok(None);
+    };
+    if !pointer_path.exists() {
+        return Ok(None);
+    }
     let pointer_bytes = fs::read(&pointer_path)
         .with_context(|| format!("reading pending pointer {}", pointer_path.display()))?;
     let pointer: TransactionPointer = match serde_json::from_slice(&pointer_bytes) {
@@ -217,6 +247,22 @@ pub fn recover_pending_transaction(checkout_dir: &Path) -> Result<Option<RepoTra
     apply_manifest(&checkout_dir, &transaction_dir, &manifest)?;
     complete_transaction(&root, &transaction_dir, &pointer_path, &manifest)?;
     Ok(Some(manifest))
+}
+
+fn acquire_transaction_lane(root: &Path, wait: bool) -> Result<Option<File>> {
+    let lane = File::open(root)
+        .with_context(|| format!("opening knowledge transaction lane {}", root.display()))?;
+    if wait {
+        lane.lock_exclusive()
+            .with_context(|| format!("locking knowledge transaction lane {}", root.display()))?;
+        return Ok(Some(lane));
+    }
+    match lane.try_lock_exclusive() {
+        Ok(()) => Ok(Some(lane)),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(err) => Err(err)
+            .with_context(|| format!("locking knowledge transaction lane {}", root.display())),
+    }
 }
 
 fn prepare_manifest(
@@ -699,6 +745,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fs::read(target).unwrap(), b"new");
+    }
+
+    #[test]
+    fn periodic_recovery_waits_for_a_live_lane_and_repairs_it_after_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let root_dir = transaction_root(&root);
+        fs::create_dir_all(root_dir.join("completed")).unwrap();
+        let lane = acquire_transaction_lane(&root_dir, false)
+            .unwrap()
+            .expect("fixture owns the live transaction lane");
+        fs::write(root_dir.join(PENDING_FILE), b"{\"version\":").unwrap();
+
+        assert!(
+            recover_abandoned_pending_transaction(&root)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            root_dir.join(PENDING_FILE).exists(),
+            "periodic recovery must not clear a live owner's pointer"
+        );
+
+        drop(lane);
+        assert!(
+            recover_abandoned_pending_transaction(&root)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !root_dir.join(PENDING_FILE).exists(),
+            "the abandoned pointer must self-heal without daemon restart"
+        );
     }
 
     #[test]

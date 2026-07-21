@@ -133,6 +133,21 @@ impl BlackboxServer {
     }
 
     pub(crate) fn recover_dark_knowledge_transactions(&self) -> usize {
+        self.recover_dark_knowledge_transactions_with(
+            bbox_knowledge::transaction::recover_pending_transaction,
+        )
+    }
+
+    pub(crate) fn recover_abandoned_dark_knowledge_transactions(&self) -> usize {
+        self.recover_dark_knowledge_transactions_with(
+            bbox_knowledge::transaction::recover_abandoned_pending_transaction,
+        )
+    }
+
+    fn recover_dark_knowledge_transactions_with(
+        &self,
+        recover: fn(&Path) -> Result<Option<bbox_knowledge::transaction::RepoTransactionManifest>>,
+    ) -> usize {
         let projects = self.state.projects.read().list();
         let mut checkout_dirs = discover_checkout_dirs(&projects)
             .into_iter()
@@ -151,7 +166,7 @@ impl BlackboxServer {
             if !bbox_knowledge::transaction::has_pending_transaction(&checkout_dir) {
                 continue;
             }
-            match bbox_knowledge::transaction::recover_pending_transaction(&checkout_dir) {
+            match recover(&checkout_dir) {
                 Ok(Some(_)) => recovered += 1,
                 Ok(None) => {}
                 Err(err) => tracing::warn!(

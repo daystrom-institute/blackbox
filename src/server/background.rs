@@ -35,10 +35,17 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     Ok(())
 }
 
-async fn run_knowledge_lifecycle_pass(shared: Arc<SharedState>, recover_pending: bool) {
+async fn run_knowledge_lifecycle_pass(shared: Arc<SharedState>, startup: bool) {
     let result = tokio::task::spawn_blocking(move || {
         let server = crate::server::BlackboxServer::new(shared);
-        let recovered = recover_pending.then(|| server.recover_dark_knowledge_transactions());
+        // Recovery is part of every lifecycle pass. Startup may wait because
+        // no request work exists yet; periodic passes only recover abandoned
+        // lanes and never steal an advisory lock from a live writer/closeout.
+        let recovered = if startup {
+            server.recover_dark_knowledge_transactions()
+        } else {
+            server.recover_abandoned_dark_knowledge_transactions()
+        };
         let inventory = server.run_knowledge_schema_epoch_inventory();
         let path_fallback = inventory
             .as_ref()
@@ -54,7 +61,7 @@ async fn run_knowledge_lifecycle_pass(shared: Arc<SharedState>, recover_pending:
     .await;
     match result {
         Ok((recovered, inventory, path_fallback, reconciliation)) => {
-            if let Some(recovered) = recovered {
+            if recovered > 0 {
                 tracing::info!(recovered, "knowledge transaction recovery completed");
             }
             match inventory {

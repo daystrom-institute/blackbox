@@ -1129,6 +1129,7 @@ pub struct Knowledge {
 struct CheckoutMutationRestore {
     id: String,
     prior: Option<KnowledgeEntry>,
+    restore_after_write: bool,
 }
 
 fn mutation_uses_checkout_carrier(entry: &KnowledgeEntry, write_dir: Option<&str>) -> bool {
@@ -1162,13 +1163,11 @@ impl Knowledge {
         seed: Option<&KnowledgeEntry>,
         write_dir: Option<&str>,
     ) -> Result<Option<CheckoutMutationRestore>> {
-        if write_dir.is_none()
-            || seed.is_some_and(|entry| !mutation_uses_checkout_carrier(entry, write_dir))
-        {
+        if write_dir.is_none() {
             return Ok(None);
         }
         let seed = seed.with_context(|| {
-            format!("checkout-scoped knowledge mutation has no visible seed for {id}")
+            format!("checkout-authorized knowledge mutation has no visible seed for {id}")
         })?;
         if seed.id != id {
             anyhow::bail!(
@@ -1186,6 +1185,7 @@ impl Knowledge {
         Ok(Some(CheckoutMutationRestore {
             id: id.to_string(),
             prior,
+            restore_after_write: mutation_uses_checkout_carrier(seed, write_dir),
         }))
     }
 
@@ -1193,6 +1193,9 @@ impl Knowledge {
         let Some(restore) = restore else {
             return;
         };
+        if !restore.restore_after_write {
+            return;
+        }
         match restore.prior {
             Some(prior) => {
                 if let Some(entry) = self
@@ -4090,6 +4093,66 @@ mod tests {
                 .join(format!("{second}.json"))
                 .is_file()
         );
+    }
+
+    #[test]
+    fn base_carrier_update_starts_from_fresh_visible_seed() {
+        let central = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let base_root = base.path().canonicalize().unwrap();
+        std::fs::create_dir_all(repo_kb_dir(&base_root)).unwrap();
+        let project = base_root.to_string_lossy().into_owned();
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        kb.set_project_roots(vec![base_root.clone()]).unwrap();
+        let id = kb
+            .learn_result_with_write_dir(
+                &LearnParams {
+                    content: "initial base entry".into(),
+                    category: "convention".into(),
+                    scope: Some("project".into()),
+                    project: Some(project.clone()),
+                    ..Default::default()
+                },
+                false,
+                Some(&project),
+            )
+            .unwrap()
+            .id;
+
+        let mut fresh_seed = kb.entry(&id).unwrap().clone();
+        fresh_seed.rationale = Some("external edit observed before watcher reload".into());
+        std::fs::write(
+            repo_kb_dir(&base_root).join(format!("{id}.json")),
+            serde_json::to_vec_pretty(&fresh_seed).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            kb.entry(&id).unwrap().rationale.is_none(),
+            "fixture must leave the in-memory generation stale"
+        );
+
+        kb.learn_result_with_checkout(
+            &LearnParams {
+                id: Some(id.clone()),
+                content: "operator update".into(),
+                category: "convention".into(),
+                scope: Some("project".into()),
+                project: Some(project.clone()),
+                ..Default::default()
+            },
+            false,
+            Some(&project),
+            Some(&fresh_seed),
+        )
+        .unwrap();
+
+        let on_disk: KnowledgeEntry = serde_json::from_slice(
+            &std::fs::read(repo_kb_dir(&base_root).join(format!("{id}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(on_disk.rationale, fresh_seed.rationale);
+        assert_eq!(kb.entry(&id).unwrap().rationale, fresh_seed.rationale);
+        assert_eq!(kb.entry(&id).unwrap().content, "operator update");
     }
 
     /// A checkout entry survives a daemon restart in the checkout carrier,

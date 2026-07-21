@@ -92,7 +92,7 @@ Mutation coverage and crash consistency are also landed. `forget`, `review`,
 `knowledge_link`, and both sides of a superseding `decide` resolve through the
 authoritative checkout. Repo-owned writes use an exclusive pending claim,
 staged old/new bytes, a recoverable manifest, loader/watcher exclusion, and
-startup roll-forward. Fleet closeout takes the same claim and proves every
+startup plus abandoned-lane roll-forward. Fleet closeout takes the same claim and proves every
 completed manifest's terminal blobs against the locally folded candidate tree
 before push.
 
@@ -678,6 +678,10 @@ already promoted):
   atomic create-if-absent, and daemon writes, crash recovery, and `/closeout`
   all contend for the SAME claim, so two writes cannot race and closeout cannot
   observe "no pointer" in the instant before a new transaction creates one.
+  The checkout transaction directory also carries an OS advisory lock held for
+  the entire write or closeout. Periodic recovery takes that lock nonblocking,
+  so process exit or panic makes an abandoned pointer recoverable while a live
+  owner remains untouchable, including when it runs in another process.
   Closeout acquires (or revalidates) the claim and holds it through candidate
   commit construction, so no write applies canonical files underneath a
   running integration. A second writer in the same checkout receives an
@@ -697,12 +701,13 @@ already promoted):
   at any step leaves the manifest and pointer recoverable to a terminal state.
 - **Idempotent recovery to a terminal state.** The loader and watcher skip a
   checkout whose pending pointer is set, so a scan never observes a partial
-  apply. On restart, recovery reads the manifest and drives it to a TERMINAL
-  state before clearing the pointer: either roll forward (re-copy every staged
-  new version, idempotent and safe to repeat) or roll back (restore every old
-  version from the manifest). Because the manifest retains old and new for
-  every path, recovery is possible even after some canonical files were already
-  replaced; a crash never leaves some-old-some-new visible.
+  apply. Startup and every periodic lifecycle pass read pending manifests and
+  drive them to a TERMINAL state before clearing the pointer: either roll
+  forward (re-copy every staged new version, idempotent and safe to repeat) or
+  roll back (restore every old version from the manifest). Because the manifest
+  retains old and new for every path, recovery is possible even after some
+  canonical files were already replaced; a daemon-surviving panic self-heals
+  on reconciliation rather than wedging the checkout until restart.
 - **Same-commit proof at closeout (commit-completeness).** git commit is the
   traveling boundary, but the agent controls it, so the daemon cannot force all
   N files into one commit; instead the completed transaction manifest names
@@ -721,6 +726,12 @@ already promoted):
   roots, staged refs, and canonical targets reject symlink traversal. Recovery
   clears a torn legacy pointer that cannot name a manifest instead of wedging
   the checkout permanently.
+- **Host-local ignore prerequisite.** Onboarded repos commit
+  `.bbox/local/.gitignore`, which ignores checkout ids, transaction manifests,
+  and the closeout claim. In an un-onboarded repo, non-discard closeout refuses
+  to force-remove any host-local debris beyond the exact generated claim and
+  reports the blocking paths. Install the standard ignore file or clean those
+  paths explicitly; closeout never broadens that exception to user changes.
 - **Generation-zero migration.** Existing committed or on-disk entry files are
   generation 0 and always covered, so the loader never starts ignoring legacy
   files that predate any transaction; the pending pointer guards only the
@@ -741,7 +752,7 @@ is a deletion, not a redesign.
 transaction protocol lives in `bbox_corpus_core::transaction`, with a
 compatibility re-export from `bbox_knowledge::transaction`; checkout knowledge
 mutation seeding and restoration live beside `persist_repo_owned_mutation_at`;
-lifecycle startup owns stale pending recovery; and
+the recurring lifecycle pass owns stale pending recovery; and
 `bro_tools::fleet_worktree` owns the closeout claim plus candidate-blob proof.
 These are named anchors rather than line cites so this design survives
 mechanical movement during later decomposition.

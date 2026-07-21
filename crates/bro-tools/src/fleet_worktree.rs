@@ -6,6 +6,7 @@
 use crate::tool::{Tool, ToolAnnotations, ToolCx, ToolResult, schema_for};
 use anyhow::Context as _;
 use async_trait::async_trait;
+use fs2::FileExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -798,6 +799,7 @@ struct CloseoutKnowledgeFile {
 struct KnowledgeCloseoutClaim {
     path: PathBuf,
     bytes: Vec<u8>,
+    _lane_lock: std::fs::File,
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -814,6 +816,13 @@ impl KnowledgeCloseoutClaim {
             &req.worktree,
             Path::new(".bbox/local/knowledge-transactions"),
         )?;
+        let lane_lock = std::fs::File::open(&root)?;
+        lane_lock.try_lock_exclusive().with_context(|| {
+            format!(
+                "checkout transaction lane at {} is active; retry after the current writer or closeout finishes",
+                root.display()
+            )
+        })?;
         let path = root.join("pending.json");
         let transaction_id = format!(
             "closeout-{}-{}",
@@ -845,7 +854,11 @@ impl KnowledgeCloseoutClaim {
         std::fs::File::open(&root)?.sync_all()?;
         std::fs::remove_file(&temp)?;
         std::fs::File::open(&root)?.sync_all()?;
-        Ok(Self { path, bytes })
+        Ok(Self {
+            path,
+            bytes,
+            _lane_lock: lane_lock,
+        })
     }
 }
 
