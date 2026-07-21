@@ -717,36 +717,23 @@ mod tests {
             .state
             .idx
             .read()
-            .search(&crate::index::SearchParams {
-                query: "NEW PUBLISHED CONTENT".into(),
-                mode: None,
-                account: None,
-                project: None,
-                role: None,
-                include_subagents: None,
-                limit: Some(10),
-                exclude_self: None,
-            })
+            .hybrid_bm25_hits("NEW PUBLISHED CONTENT", 10, Some("knowledge"))
             .unwrap();
         assert!(
-            published_hits.contains("NEW_PUBLISHED_CONTENT"),
-            "{published_hits}"
+            published_hits
+                .iter()
+                .any(|hit| hit.entity_id == crate::index::knowledge_entity_id("shared")),
+            "{published_hits:?}"
         );
         let peer_hits = server
             .state
             .idx
             .read()
-            .search(&crate::index::SearchParams {
-                query: "PEER CONTENT".into(),
-                mode: None,
-                account: None,
-                project: None,
-                role: None,
-                include_subagents: None,
-                limit: Some(10),
-                exclude_self: None,
-            })
+            .hybrid_bm25_hits("PEER CONTENT", 10, Some("knowledge"))
             .unwrap();
-        assert!(peer_hits.contains("PEER_CONTENT"), "{peer_hits}");
+        assert!(
+            peer_hits.iter().any(|hit| hit.entity_id == peer_ref),
+            "{peer_hits:?}"
+        );
     }
 }
