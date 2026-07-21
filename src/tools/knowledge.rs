@@ -175,32 +175,38 @@ impl BlackboxServer {
             }
         };
         let checkout = match checkout {
-            Some(checkout) => {
-                let row = bbox_indexing::checkout_registry::CheckoutRow {
-                    checkout_id: checkout.checkout_id.clone(),
-                    checkout_dir: checkout.checkout_dir.clone(),
-                    repo_id: Some(checkout.published_scope.repo_id.clone()),
-                    bbox_root_relpath: Some(checkout.published_scope.bbox_root_relpath.clone()),
-                    branch_ref: checkout.branch_ref.clone(),
-                };
-                match self.state.checkout_registry.write().register(row) {
-                    Ok(()) => Some(checkout),
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            project = %raw,
-                            "dark knowledge checkout registration failed; continuing legacy write"
-                        );
-                        None
-                    }
+            Some(checkout) => match self.register_dark_knowledge_checkout(&checkout) {
+                Ok(()) => Some(checkout),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        project = %raw,
+                        "dark knowledge checkout registration failed; continuing legacy write"
+                    );
+                    None
                 }
-            }
+            },
             None => None,
         };
         Ok((write_dir, checkout))
     }
 
-    fn refresh_dark_knowledge_overlay(
+    pub(crate) fn register_dark_knowledge_checkout(
+        &self,
+        checkout: &bbox_corpus_core::project_record::ResolvedCheckoutScope,
+    ) -> anyhow::Result<()> {
+        self.state.checkout_registry.write().register(
+            bbox_indexing::checkout_registry::CheckoutRow {
+                checkout_id: checkout.checkout_id.clone(),
+                checkout_dir: checkout.checkout_dir.clone(),
+                repo_id: Some(checkout.published_scope.repo_id.clone()),
+                bbox_root_relpath: Some(checkout.published_scope.bbox_root_relpath.clone()),
+                branch_ref: checkout.branch_ref.clone(),
+            },
+        )
+    }
+
+    pub(crate) fn refresh_dark_knowledge_overlay(
         &self,
         checkout: &bbox_corpus_core::project_record::ResolvedCheckoutScope,
     ) {

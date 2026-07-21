@@ -125,6 +125,20 @@ impl BlackboxServer {
             }
         }
 
+        // The trusted session checkout is the authority for `own`. Recompute
+        // it at read time so edits made outside bbox_learn/remember/decide and
+        // dirty knowledge present before project registration are visible on
+        // the first request, without minting identities for unrelated clean
+        // checkouts during daemon startup.
+        if mode == ProvisionalMode::Own
+            && let Some(own) = session_checkout.as_deref()
+            && selected_scopes.contains_key(&own.published_scope)
+        {
+            self.register_dark_knowledge_checkout(own)
+                .context("registering authoritative knowledge checkout")?;
+            self.refresh_dark_knowledge_overlay(own);
+        }
+
         let overlays = self.state.knowledge_overlays.read();
         let mut diagnostics = Vec::new();
         for (scope, project) in selected_scopes {
@@ -473,15 +487,8 @@ mod tests {
 
         let own_id = "own-checkout";
         let peer_id = "peer-checkout";
-        let mut own_values = BTreeMap::new();
-        own_values.insert(
-            "shared".into(),
-            OverlayValue::Upsert {
-                entry: Box::new(entry("shared", "OWN_CONTENT")),
-                content_hash: "own-hash".into(),
-            },
-        );
-        own_values.insert("deleted".into(), OverlayValue::Tombstone);
+        write_entry(&base, &entry("shared", "OWN_CONTENT"));
+        std::fs::remove_file(base.join(".bbox/knowledge/deleted.json")).unwrap();
         let mut peer_values = BTreeMap::new();
         peer_values.insert(
             "shared".into(),
@@ -490,10 +497,6 @@ mod tests {
                 content_hash: "peer-hash".into(),
             },
         );
-        state
-            .knowledge_overlays
-            .write()
-            .publish(snapshot(&scope, own_id, own_values));
         state
             .knowledge_overlays
             .write()
@@ -565,6 +568,7 @@ mod tests {
             "{diagnostics}"
         );
 
+        std::fs::write(peer_path.join(".bbox/knowledge/shared.json"), "not-json").unwrap();
         let invalid_server = BlackboxServer::new(state);
         invalid_server
             .session_checkout
