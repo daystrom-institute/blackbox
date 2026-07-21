@@ -295,14 +295,8 @@ pub fn hybrid_search_typed(
             &vector_status.partitions,
             &mut degraded,
         )?;
-        // Knowledge vectors were built from the old daemon-wide aggregate and
-        // cannot establish session visibility. Drop them before fusion; the
-        // authorized request view contributes its own ranked knowledge lane.
         for list in &mut vector_lists {
-            list.hits.retain(|hit| {
-                !hit.entity_id.starts_with("knowledge:")
-                    && !hit.entity_id.starts_with("provisional_knowledge:")
-            });
+            retain_authorized_knowledge_vectors(list, knowledge);
         }
         vector_status.searched_partitions = vector_lists
             .iter()
@@ -444,6 +438,21 @@ pub fn hybrid_search_typed(
         vector_status,
         degraded,
     })
+}
+
+fn retain_authorized_knowledge_vectors(list: &mut RankedList, knowledge: &Knowledge) {
+    list.hits
+        .retain(|hit| match EntityRef::parse(&hit.entity_id) {
+            Ok(EntityRef::Knowledge { id }) => knowledge.entry(&id).is_some(),
+            Ok(EntityRef::ProvisionalKnowledge { .. }) => knowledge.entry(&hit.entity_id).is_some(),
+            Err(_)
+                if hit.entity_id.starts_with("knowledge:")
+                    || hit.entity_id.starts_with("provisional_knowledge:") =>
+            {
+                false
+            }
+            _ => true,
+        });
 }
 
 /// Pre-fusion doc_type scoping: the BM25 lane is already filtered at the
@@ -1252,6 +1261,84 @@ mod tests {
             score,
             sources: BTreeMap::new(),
         }
+    }
+
+    fn visible_knowledge_entry(id: &str) -> KnowledgeEntry {
+        KnowledgeEntry {
+            id: id.into(),
+            title: "visible".into(),
+            content: "visible content".into(),
+            cluster: None,
+            variants: HashMap::new(),
+            category: Category::Memory,
+            scope: Scope::Project,
+            project: Some("/tmp/project".into()),
+            providers: Vec::new(),
+            priority: Priority::Standard,
+            weight: 100,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            render: true,
+            decay: true,
+            review_at: None,
+            supersedes: None,
+            links: Vec::new(),
+            rationale: None,
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-07-21T00:00:00Z".into(),
+            updated_at: "2026-07-21T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        }
+    }
+
+    #[test]
+    fn knowledge_vectors_are_kept_only_for_exactly_visible_entities() {
+        let scope = bbox_corpus_core::identity::PublishedScope {
+            repo_id: "repo".into(),
+            bbox_root_relpath: ".".into(),
+        };
+        let provisional_ref =
+            bbox_knowledge::overlay::provisional_entity_ref(&scope, "checkout", "changed");
+        let mut provisional = visible_knowledge_entry("changed");
+        provisional.id = provisional_ref.clone();
+        let knowledge = Knowledge::detached_view(
+            vec![visible_knowledge_entry("published"), provisional],
+            BTreeMap::new(),
+        );
+        let hit = |entity_id: &str, rank| RankedHit {
+            entity_id: entity_id.into(),
+            rank,
+            score: 1.0,
+            source: "vector:test".into(),
+        };
+        let mut list = RankedList {
+            source: "vector:test".into(),
+            weight: 0.6,
+            hits: vec![
+                hit("knowledge:published", 1),
+                hit("knowledge:hidden", 2),
+                hit(&provisional_ref, 3),
+                hit("project_file:p:f:h:1", 4),
+            ],
+        };
+
+        retain_authorized_knowledge_vectors(&mut list, &knowledge);
+
+        let ids = list
+            .hits
+            .iter()
+            .map(|hit| hit.entity_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            [
+                "knowledge:published",
+                provisional_ref.as_str(),
+                "project_file:p:f:h:1"
+            ]
+        );
     }
 
     #[test]

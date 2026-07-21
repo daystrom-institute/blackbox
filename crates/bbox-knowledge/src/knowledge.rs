@@ -776,6 +776,25 @@ fn load_repo_kb_stats(project_dir: &Path) -> std::collections::BTreeMap<String, 
     })
 }
 
+/// Merge publisher-host recall telemetry onto committed entries without
+/// changing their durable content. Published-tree loaders use this after
+/// parsing blobs so ranking does not reset every entry to zero activity.
+pub fn hydrate_repo_recall_stats<'a>(
+    project_dir: &Path,
+    entries: impl IntoIterator<Item = &'a mut KnowledgeEntry>,
+) {
+    let stats = load_repo_kb_stats(project_dir);
+    if stats.is_empty() {
+        return;
+    }
+    for entry in entries {
+        if let Some(stat) = stats.get(&entry.id) {
+            entry.recall_count = stat.recall_count;
+            entry.last_recalled = stat.last_recalled.clone();
+        }
+    }
+}
+
 /// Persist the host-local recall-stats sidecar for a repo. A `BTreeMap` keyed by
 /// id keeps key order stable (no spurious diffs), and the dir's `.gitignore`
 /// (`*`, except itself) is ensured so the sidecar is never committed. Writes only
@@ -908,15 +927,7 @@ fn load_repo_kb_entries(
     }
     // Merge host-local recall telemetry back onto the committed (recall-free)
     // entries. Absent stats leave the defaults (recall_count=0, last_recalled=None).
-    let stats = load_repo_kb_stats(project_dir);
-    if !stats.is_empty() {
-        for entry in &mut out {
-            if let Some(stat) = stats.get(&entry.id) {
-                entry.recall_count = stat.recall_count;
-                entry.last_recalled = stat.last_recalled.clone();
-            }
-        }
-    }
+    hydrate_repo_recall_stats(project_dir, &mut out);
     if skipped > 0 {
         tracing::warn!(
             "kb load: {} loaded={} skipped={}",
@@ -1120,6 +1131,30 @@ struct CheckoutMutationRestore {
     prior: Option<KnowledgeEntry>,
 }
 
+fn mutation_uses_checkout_carrier(entry: &KnowledgeEntry, write_dir: Option<&str>) -> bool {
+    let Some(write_dir) = write_dir.map(str::trim).filter(|dir| !dir.is_empty()) else {
+        return false;
+    };
+    let Some(project) = entry
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+    else {
+        return true;
+    };
+    if write_dir == project {
+        return false;
+    }
+    match (
+        Path::new(write_dir).canonicalize(),
+        Path::new(project).canonicalize(),
+    ) {
+        (Ok(write_dir), Ok(project)) => write_dir != project,
+        _ => true,
+    }
+}
+
 impl Knowledge {
     fn install_checkout_mutation_seed(
         &mut self,
@@ -1127,7 +1162,9 @@ impl Knowledge {
         seed: Option<&KnowledgeEntry>,
         write_dir: Option<&str>,
     ) -> Result<Option<CheckoutMutationRestore>> {
-        if write_dir.is_none() {
+        if write_dir.is_none()
+            || seed.is_some_and(|entry| !mutation_uses_checkout_carrier(entry, write_dir))
+        {
             return Ok(None);
         }
         let seed = seed.with_context(|| {
@@ -1171,6 +1208,14 @@ impl Knowledge {
             }
             None => self.store.entries.retain(|entry| entry.id != restore.id),
         }
+    }
+
+    fn mutation_uses_checkout_carrier(&self, id: &str, write_dir: Option<&str>) -> bool {
+        self.store
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .is_some_and(|entry| mutation_uses_checkout_carrier(entry, write_dir))
     }
 
     pub fn open(store_path: &Path) -> Result<Self> {
@@ -1562,6 +1607,20 @@ impl Knowledge {
 
     pub fn view_metadata(&self, id: &str) -> Option<&KnowledgeViewMetadata> {
         self.view_metadata.get(id)
+    }
+
+    /// Resolve a logical knowledge ref through a detached visibility view.
+    /// Own-mode views can replace the published entry with one compound
+    /// provisional entity id, while graph edges and older breadcrumbs still
+    /// address the stable `knowledge:<id>` logical ref.
+    pub fn entry_for_logical_ref(&self, logical_ref: &str) -> Option<&KnowledgeEntry> {
+        let mut candidates = self
+            .view_metadata
+            .iter()
+            .filter(|(_, metadata)| metadata.logical_ref == logical_ref)
+            .filter_map(|(entity_id, _)| self.entry(entity_id));
+        let first = candidates.next()?;
+        candidates.next().is_none().then_some(first)
     }
 
     /// Rank the already-visible knowledge candidates for hybrid retrieval.
@@ -1961,8 +2020,9 @@ impl Knowledge {
         };
 
         self.store.entries.push(entry);
+        let checkout_scoped = self.mutation_uses_checkout_carrier(&id, write_dir);
         let persisted = self.persist_repo_owned_mutation_at(&[&id], write_dir);
-        if write_dir.is_some() {
+        if checkout_scoped {
             self.store.entries.retain(|entry| entry.id != id);
         }
         persisted?;
@@ -2069,8 +2129,9 @@ impl Knowledge {
             last_recalled: None,
         });
 
+        let checkout_scoped = self.mutation_uses_checkout_carrier(&id, write_dir);
         let persisted = self.persist_repo_owned_mutation_at(&[&id], write_dir);
-        if write_dir.is_some() {
+        if checkout_scoped {
             self.store.entries.retain(|entry| entry.id != id);
         }
         persisted?;
@@ -2213,8 +2274,9 @@ impl Knowledge {
         if let Some(old_id) = p.supersedes.as_deref() {
             changed_ids.push(old_id);
         }
+        let checkout_scoped = self.mutation_uses_checkout_carrier(&id, write_dir);
         let persisted = self.persist_repo_owned_mutation_at(&changed_ids, write_dir);
-        if write_dir.is_some() {
+        if checkout_scoped {
             self.store.entries.retain(|entry| entry.id != id);
         }
         self.restore_checkout_mutation_seed(superseded_restore);
@@ -3866,6 +3928,27 @@ mod tests {
     }
 
     #[test]
+    fn detached_view_resolves_one_provisional_variant_by_logical_ref() {
+        let entity_id = "provisional_knowledge:scope:checkout:entry".to_string();
+        let mut provisional = entry("entry", "provisional", "visible variant", Scope::Project);
+        provisional.id = entity_id.clone();
+        let metadata = BTreeMap::from([(
+            entity_id.clone(),
+            KnowledgeViewMetadata {
+                logical_ref: "knowledge:entry".into(),
+                ..Default::default()
+            },
+        )]);
+        let view = Knowledge::detached_view(vec![provisional], metadata);
+
+        assert_eq!(
+            view.entry_for_logical_ref("knowledge:entry")
+                .map(|entry| entry.id.as_str()),
+            Some(entity_id.as_str())
+        );
+    }
+
+    #[test]
     fn render_scope_project_filters_by_base_while_writing_into_worktree() {
         let central = tempfile::tempdir().unwrap();
         let worktree = tempfile::tempdir().unwrap();
@@ -3958,6 +4041,54 @@ mod tests {
         assert!(
             rider.contains(&format!("{id}.json")),
             "rider should reference the committed entry file: {rider}"
+        );
+    }
+
+    #[test]
+    fn base_carrier_write_stays_in_authoritative_memory_generation() {
+        let central = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let base_root = base.path().canonicalize().unwrap();
+        std::fs::create_dir_all(repo_kb_dir(&base_root)).unwrap();
+
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        kb.set_project_roots(vec![base_root.clone()]).unwrap();
+        let params = |content: &str| LearnParams {
+            content: content.into(),
+            category: "convention".into(),
+            scope: Some("project".into()),
+            project: Some(base_root.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let first = kb
+            .learn_result_with_write_dir(
+                &params("first base entry"),
+                false,
+                Some(base_root.to_str().unwrap()),
+            )
+            .unwrap()
+            .id;
+        assert!(kb.entry(&first).is_some());
+
+        let second = kb
+            .learn_result_with_write_dir(
+                &params("second base entry"),
+                false,
+                Some(base_root.to_str().unwrap()),
+            )
+            .unwrap()
+            .id;
+        kb.save().unwrap();
+
+        assert!(
+            repo_kb_dir(&base_root)
+                .join(format!("{first}.json"))
+                .is_file()
+        );
+        assert!(
+            repo_kb_dir(&base_root)
+                .join(format!("{second}.json"))
+                .is_file()
         );
     }
 

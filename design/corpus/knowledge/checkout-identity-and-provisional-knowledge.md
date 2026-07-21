@@ -8,7 +8,7 @@ topic:
   - knowledge
   - daemon-runtime
 tags: [identity, worktrees, knowledge-seam, provisional-lane, write-redirects, repo-id, render-check]
-brief: "Retire write_redirects, the host-local map that makes kb.json required to interpret the repo's own committed .bbox/ files. Two moves in one push: (1) a durable published-scope identity key anchored on a strongly-minted repo_id recorded in .bbox/config.toml (the computed first-commit hash is only a bootstrap hint) plus bbox_root_relpath, and (2) a versioned provisional knowledge lane. Each scope has one published layer read from a pinned committed ref; every checkout, including the publisher checkout, contributes at most one provisional overlay computed as a merge-base-relative working-tree diff with tombstones. Overlay keys are (published_scope, checkout_id, entry_id); promotion is content equality at the pinned published commit; own-checkout visibility binds only to server-authoritative session context. Monolithic-rung only. Slices 1 + 3 of locality-first-decomposition.md, hardened through seven adversarial review rounds and a live-code repair pass (2026-07-20)."
+brief: "Retire write_redirects, the host-local map that makes kb.json required to interpret the repo's own committed .bbox/ files. Two moves in one push: (1) a durable published-scope identity key anchored on a strongly-minted repo_id recorded in .bbox/config.toml (the computed first-commit hash is only a bootstrap hint) plus bbox_root_relpath, and (2) a versioned provisional knowledge lane. Each scope has one published layer read from a pinned committed ref; every checkout, including the publisher checkout, contributes at most one provisional overlay computed as a merge-base-relative working-tree diff with tombstones. Overlay keys are (published_scope, checkout_id, entry_id); promotion is content equality at the pinned published commit; own-checkout visibility binds only to server-authoritative session context. Monolithic-rung only. Slices 1 + 3 of locality-first-decomposition.md, hardened through persisted adversarial review and a live-code repair pass (2026-07-21)."
 ---
 
 # Checkout identity and the provisional knowledge lane
@@ -26,6 +26,12 @@ brief: "Retire write_redirects, the host-local map that makes kb.json required t
 > and the finish of the identity model
 > [repo-owned-project-state.md](repo-owned-project-state.md) specified but did
 > not ship.
+
+The 2026-07-21 repair pass tightened the landed contract around transaction
+authority, independent-clone object access, stable overlay publication,
+strict schema inventory, static-search isolation, reindex preservation, and
+closeout ordering. Those are now acceptance requirements, not optional
+hardening notes.
 
 ## 0. Decision and scope
 
@@ -398,11 +404,19 @@ adds two persisted products:
   cannot be mapped to a repository has no honest repo-owned destination.
 
 Writing the repo marker requires a recorded/overridden repo authority and a
-clean inventory for that scope. A daemon on another host re-runs inventory for
-its own legacy central store even when the committed repo marker is already
-present. The path fallback is cut locally only when every registered scope has
-the epoch marker and the local quarantine is empty; no host claims coverage for
-an offline host's private central store.
+strict clean inventory for that scope. Strict means every JSON path under the
+scope can be read as a regular non-symlink file, parses as project knowledge,
+has a filename matching its embedded id, carries no host path authority, and
+is present in the daemon's loaded scope. A tolerant runtime loader may skip a
+bad file to preserve availability, but that skipped file blocks the migration
+marker and is recorded in the host quarantine ledger. A daemon on another host
+re-runs inventory for its own legacy central store even when the committed repo
+marker is already present. The path fallback is cut locally only when every
+registered scope has the epoch marker and the local quarantine is empty; no
+host claims coverage for an offline host's private central store. An empty
+project registry cannot prove the cut vacuously. The host cut marker is parsed
+and version-checked at startup, and every later registered scope is re-audited
+so post-cut debris remains quarantined and visible as an operational blocker.
 
 ### 3.6 First consumers
 
@@ -471,6 +485,12 @@ The buildable algorithm is exact:
    a tombstone when a `B` path is absent, and nothing when bytes are equal;
 6. parse and validate every emitted upsert, including filename stem equal to
    entry id and no duplicate ids, then publish one immutable overlay snapshot.
+
+Managed pool lanes can be full independent clones. Their object databases may
+not contain a publisher commit that advanced after the clone was created. Git
+reads and merge-base calculation therefore add the elected publisher's object
+directory as a read-only alternate for the command. This makes the pinned
+publisher commit readable without fetching into or mutating the checkout.
 
 For the publisher checkout on the pinned branch, `H == P` and `B == P`, so the
 same algorithm yields only its uncommitted changes. For a checkout strictly
@@ -579,6 +599,17 @@ peer document or drop a shadowing own result below the candidate cutoff.
 Inspection of a compound provisional ref is stable and unambiguous even when
 several checkouts modify the same logical entry.
 
+Static corpus surfaces such as `bbox_search` and `bbox_corpus_search` have no
+checkout authority and exclude provisional knowledge before TopDocs cutoff.
+Hybrid retrieval removes static indexed knowledge, injects the authorized
+request view as its own candidate lane, and permits a knowledge vector hit only
+when that exact entity id is present in the same view. A modified own-checkout
+entry therefore cannot inherit the stale published vector for its logical id;
+an unchanged visible published entry can still use its vector. The heuristic
+rerank multipliers and cap remain unchanged. Any later change to those signals
+still requires the MRR and recall sweep described by the corpus-core ranking
+contract.
+
 ### 4.4 Promotion: pinned-ref observation, content equality
 
 A branch's overlay entry promotes to published when the change reaches the
@@ -649,7 +680,9 @@ already promoted):
   observe "no pointer" in the instant before a new transaction creates one.
   Closeout acquires (or revalidates) the claim and holds it through candidate
   commit construction, so no write applies canonical files underneath a
-  running integration.
+  running integration. A second writer in the same checkout receives an
+  explicit conflict and must retry after the first transaction completes. The
+  daemon does not merge two concurrent mutation intents.
 - **Recoverable manifest, both directions.** Under the claim, the write stages
   every new file version to a host-local scratch path and records a manifest
   holding, per affected path, BOTH the old bytes (or a content-addressed copy)
@@ -680,7 +713,14 @@ already promoted):
   is the transaction's). It fails closed on a partial or content-mismatched
   commit (one file of a two-file supersession, or a path present with stale
   bytes). A checkout with an unresolved pending pointer is likewise ineligible
-  for integration.
+  for integration. This proof runs against the candidate tree before any target
+  ref moves, including remote-moved recovery and discard closeout. Fresh
+  checkouts and discard paths take the same claim rather than skipping the
+  transaction lane.
+- **Path containment.** Transaction ids reject dot segments, and transaction
+  roots, staged refs, and canonical targets reject symlink traversal. Recovery
+  clears a torn legacy pointer that cannot name a manifest instead of wedging
+  the checkout permanently.
 - **Generation-zero migration.** Existing committed or on-disk entry files are
   generation 0 and always covered, so the loader never starts ignoring legacy
   files that predate any transaction; the pending pointer guards only the
@@ -731,6 +771,13 @@ views drive `bbox_gaps` and inbox/closeout checks. Successive mutations seed
 from the checkout's own gap file, and multi-file supersession uses the same
 exclusive pending claim, recoverable manifest, and candidate-blob closeout
 proof as knowledge.
+
+`bbox_gap` remains project-scoped by default when the MCP session carries an
+authoritative checkout. `scope="global"` is the explicit cross-project choice.
+This is a documented storage policy, not an inference from an arbitrary tool
+argument. Both a target and its supersession peer must belong to the supplied
+authority, and gap transactions anchor at the checkout git root so monorepo
+knowledge and gap writes share one claim.
 
 ## 6. Sequencing
 
@@ -809,6 +856,12 @@ Each slice lands on the monolith and gets the full lane gate.
   recognition set, never the broad read set, or a user worktree's scratch
   leaks in. Two gates stay distinct (`bbox-corpus-core` CLAUDE.md invariant);
   this design consumes them.
+- **Legacy host-local stores.** Notes, pins, roadmaps, and whiteboards continue
+  to use their older path resolver, which can normalize a selector to a
+  registered monorepo root's canonical path. That behavior is now explicit and
+  is not durable published-scope authority. Migrating those stores is a
+  separate host-local surface; only the repo-owned knowledge and gap twins gain
+  published-scope authority here.
 - **`repo_id` remap.** `aka_repo_ids` consulted at resolution per §3.1
   precedence or a history rewrite orphans knowledge; fork/upstream conflation
   handled by opt-in `project_key_override`.

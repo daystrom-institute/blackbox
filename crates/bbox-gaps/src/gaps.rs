@@ -731,7 +731,16 @@ fn persist_repo_gap_entries(
             new_bytes: Some(new_bytes),
         });
     }
-    bbox_corpus_core::transaction::apply_transaction(project_dir, writes)?;
+    let checkout_dir = match bbox_corpus_core::git::git_root_for_path(project_dir) {
+        Some(root) => root,
+        None => project_dir.canonicalize().with_context(|| {
+            format!(
+                "resolving non-git gap transaction root at {}",
+                project_dir.display()
+            )
+        })?,
+    };
+    bbox_corpus_core::transaction::apply_transaction(&checkout_dir, writes)?;
     Ok(())
 }
 
@@ -1169,6 +1178,31 @@ impl GapStore {
         Ok(())
     }
 
+    fn validate_mutation_authority(
+        gap: &GapNote,
+        project: Option<&str>,
+        write_dir: Option<&str>,
+        path_fallback_cut: bool,
+    ) -> Result<()> {
+        let Some(owner) = gap.project.as_deref() else {
+            return Ok(());
+        };
+        if let Some(project) = project
+            && project != owner
+        {
+            anyhow::bail!(
+                "gap {} belongs to project {owner}; supplied checkout authority is for {project}",
+                gap.id
+            );
+        }
+        if path_fallback_cut && (project != Some(owner) || write_dir.is_none()) {
+            anyhow::bail!(
+                "path-scoped project fallback is retired; project gap mutation requires matching checkout authority"
+            );
+        }
+        Ok(())
+    }
+
     pub fn resolve(&mut self, p: &GapResolveParams) -> Result<String> {
         let path = self.store_path.clone();
         bbox_corpus_core::json_store::with_store_lock(&path, || {
@@ -1211,11 +1245,21 @@ impl GapStore {
                 format!("gap-{s}")
             }
         });
-        // Validate the supersessor exists before mutating either side.
+        // Validate the supersessor exists and is covered by the same authority
+        // before mutating either side.
         if let Some(by) = superseded_by.as_deref() {
-            if !self.data.gaps.iter().any(|g| g.matches_id(by)) {
-                anyhow::bail!("superseded_by gap not found: {by}");
-            }
+            let other = self
+                .data
+                .gaps
+                .iter()
+                .find(|g| g.matches_id(by))
+                .with_context(|| format!("superseded_by gap not found: {by}"))?;
+            Self::validate_mutation_authority(
+                other,
+                p.project.as_deref(),
+                p.write_dir.as_deref(),
+                self.path_fallback_cut,
+            )?;
         }
 
         let now = Self::now_iso();
@@ -1231,12 +1275,12 @@ impl GapStore {
                 )
             })?;
 
-        if self.path_fallback_cut && self.data.gaps[idx].project.is_some() && p.write_dir.is_none()
-        {
-            anyhow::bail!(
-                "path-scoped project fallback is retired; project gap mutation requires checkout authority"
-            );
-        }
+        Self::validate_mutation_authority(
+            &self.data.gaps[idx],
+            p.project.as_deref(),
+            p.write_dir.as_deref(),
+            self.path_fallback_cut,
+        )?;
 
         let resolved_id = self.data.gaps[idx].id.clone();
         {
@@ -1310,24 +1354,28 @@ impl GapStore {
             .map(|v| parse_blocking_level(Some(v)))
             .transpose()?;
 
-        let path_fallback_cut = self.path_fallback_cut;
-        let gap = self
+        let gap_index = self
             .data
             .gaps
-            .iter_mut()
-            .find(|g| g.matches_id(&p.id))
+            .iter()
+            .position(|g| g.matches_id(&p.id))
             .with_context(|| {
                 format!(
                     "Gap not found: {} (expected `gap-<8hex>`, e.g. `gap-a1b2c3d4`)",
                     p.id
                 )
             })?;
-
-        if path_fallback_cut && gap.project.is_some() && p.write_dir.is_none() {
-            anyhow::bail!(
-                "path-scoped project fallback is retired; project gap mutation requires checkout authority"
-            );
-        }
+        Self::validate_mutation_authority(
+            &self.data.gaps[gap_index],
+            p.project.as_deref(),
+            p.write_dir.as_deref(),
+            self.path_fallback_cut,
+        )?;
+        let gap = self
+            .data
+            .gaps
+            .get_mut(gap_index)
+            .expect("gap index was resolved above");
 
         if let Some(v) = p.title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             gap.title = v.to_string();
@@ -2041,6 +2089,147 @@ mod tests {
                 .files
                 .iter()
                 .all(|file| file.relative_path.starts_with(".bbox/gaps/"))
+        );
+    }
+
+    #[test]
+    fn monorepo_gap_transaction_is_anchored_at_checkout_root() {
+        let root_dir = tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let project = root.join("services/api");
+        fs::create_dir_all(&project).unwrap();
+
+        let central = tempdir().unwrap();
+        let mut store = GapStore::open(&central.path().join("gaps.json")).unwrap();
+        store.set_project_roots(vec![project.clone()]).unwrap();
+        store
+            .file(&project_params(
+                "monorepo gap",
+                "tooling/test-domain/monorepo-transaction",
+                &project,
+            ))
+            .unwrap();
+
+        let completed = root.join(".bbox/local/knowledge-transactions/completed");
+        assert!(completed.is_dir());
+        assert!(
+            !project.join(".bbox/local/knowledge-transactions").exists(),
+            "subproject must not create a second transaction lane"
+        );
+        let manifest_path = fs::read_dir(completed)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let manifest: bbox_corpus_core::transaction::RepoTransactionManifest =
+            serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+        assert!(
+            manifest
+                .files
+                .iter()
+                .all(|file| { file.relative_path.starts_with("services/api/.bbox/gaps/") })
+        );
+    }
+
+    #[test]
+    fn cut_rejects_authority_from_a_different_project() {
+        let root_a_dir = tempdir().unwrap();
+        let root_a = root_a_dir.path().canonicalize().unwrap();
+        let root_b_dir = tempdir().unwrap();
+        let root_b = root_b_dir.path().canonicalize().unwrap();
+        let central = tempdir().unwrap();
+        let mut store = GapStore::open(&central.path().join("gaps.json")).unwrap();
+        store
+            .set_project_roots(vec![root_a.clone(), root_b.clone()])
+            .unwrap();
+        let (id, _) = store
+            .file(&project_params(
+                "owned by a",
+                "tooling/test-domain/project-authority",
+                &root_a,
+            ))
+            .unwrap();
+        let before = fs::read(root_a.join(".bbox/gaps").join(format!("{id}.json"))).unwrap();
+        store.set_path_fallback_cut(true);
+
+        let err = store
+            .update(&GapUpdateParams {
+                id: id.clone(),
+                title: Some("mutated from b".into()),
+                project: Some(root_b.to_string_lossy().into_owned()),
+                write_dir: Some(root_b.to_string_lossy().into_owned()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("belongs to project"));
+        assert_eq!(
+            fs::read(root_a.join(".bbox/gaps").join(format!("{id}.json"))).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn supersession_requires_authority_for_both_project_records() {
+        let root_a_dir = tempdir().unwrap();
+        let root_a = root_a_dir.path().canonicalize().unwrap();
+        let root_b_dir = tempdir().unwrap();
+        let root_b = root_b_dir.path().canonicalize().unwrap();
+        let central = tempdir().unwrap();
+        let mut store = GapStore::open(&central.path().join("gaps.json")).unwrap();
+        store
+            .set_project_roots(vec![root_a.clone(), root_b.clone()])
+            .unwrap();
+        let (old_id, _) = store
+            .file(&project_params(
+                "old a",
+                "tooling/test-domain/cross-supersession-a",
+                &root_a,
+            ))
+            .unwrap();
+        let (new_id, _) = store
+            .file(&project_params(
+                "new b",
+                "tooling/test-domain/cross-supersession-b",
+                &root_b,
+            ))
+            .unwrap();
+        store.set_path_fallback_cut(true);
+
+        let err = store
+            .resolve(&GapResolveParams {
+                id: old_id.clone(),
+                resolution: "addressed".into(),
+                superseded_by: Some(new_id.clone()),
+                project: Some(root_a.to_string_lossy().into_owned()),
+                write_dir: Some(root_a.to_string_lossy().into_owned()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("belongs to project"));
+        assert_eq!(
+            store
+                .all()
+                .iter()
+                .find(|gap| gap.id == old_id)
+                .unwrap()
+                .resolution,
+            GapResolution::Unresolved
+        );
+        assert!(
+            store
+                .all()
+                .iter()
+                .find(|gap| gap.id == new_id)
+                .unwrap()
+                .supersedes
+                .is_none()
         );
     }
 

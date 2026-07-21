@@ -6,7 +6,7 @@ use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_record::{ProjectRecord, ResolvedCheckoutScope};
 use bbox_gaps::gaps::GapStore;
 use bbox_gaps::overlay::{
-    GapOverlaySnapshot, GapOverlayStatus, GapOverlayValue, load_published_snapshot,
+    GapOverlayKey, GapOverlaySnapshot, GapOverlayStatus, GapOverlayValue, load_published_snapshot,
     recompute_overlay,
 };
 use bbox_indexing::publisher::{PublisherResolution, elect_publisher, project_published_scope};
@@ -23,6 +23,15 @@ impl BlackboxServer {
     /// Recompute the gap twin for one registered checkout. Publisher election,
     /// branch pinning, and invalid-snapshot replacement match knowledge.
     pub(crate) fn refresh_dark_gap_overlay(&self, checkout: &ResolvedCheckoutScope) {
+        let _refresh = self.state.gap_overlay_refresh.lock();
+        let generation = self
+            .state
+            .gap_overlays
+            .write()
+            .begin_refresh(GapOverlayKey {
+                published_scope: checkout.published_scope.clone(),
+                checkout_id: checkout.checkout_id.clone(),
+            });
         let projects = self.state.projects.read().list();
         let snapshot = match elect_publisher(
             &projects,
@@ -47,11 +56,14 @@ impl BlackboxServer {
                 .write()
                 .ensure_pinned(&checkout.published_scope, Path::new(&root))
             {
-                Ok(pin) => recompute_overlay(Path::new(&root), &pin.branch_ref, checkout),
+                Ok(pin) => stable_gap_overlay(Path::new(&root), &pin.branch_ref, checkout),
                 Err(err) => GapOverlaySnapshot::invalid(checkout, format!("{err:#}")),
             },
         };
-        self.state.gap_overlays.write().publish(snapshot);
+        self.state
+            .gap_overlays
+            .write()
+            .publish_if_latest(generation, snapshot);
     }
 
     /// Materialize pinned published gap records plus the selected provisional
@@ -277,4 +289,44 @@ impl BlackboxServer {
             diagnostics,
         })
     }
+}
+
+fn stable_gap_overlay(
+    publisher_root: &Path,
+    published_ref: &str,
+    checkout: &ResolvedCheckoutScope,
+) -> GapOverlaySnapshot {
+    let checkout_root = Path::new(&checkout.checkout_dir);
+    if bbox_knowledge::transaction::has_pending_transaction(checkout_root) {
+        return GapOverlaySnapshot::invalid(
+            checkout,
+            "checkout transaction is pending; provisional gap refresh deferred",
+        );
+    }
+    let mut candidate = recompute_overlay(publisher_root, published_ref, checkout);
+    for _ in 0..2 {
+        if bbox_knowledge::transaction::has_pending_transaction(checkout_root) {
+            return GapOverlaySnapshot::invalid(
+                checkout,
+                "checkout transaction began during provisional gap refresh",
+            );
+        }
+        let next = recompute_overlay(publisher_root, published_ref, checkout);
+        if same_gap_snapshot(&candidate, &next)
+            && !bbox_knowledge::transaction::has_pending_transaction(checkout_root)
+        {
+            return next;
+        }
+        candidate = next;
+    }
+    GapOverlaySnapshot::invalid(
+        checkout,
+        "checkout state changed repeatedly during provisional gap refresh",
+    )
+}
+
+fn same_gap_snapshot(left: &GapOverlaySnapshot, right: &GapOverlaySnapshot) -> bool {
+    left.snapshot_id == right.snapshot_id
+        && left.status == right.status
+        && left.diagnostics == right.diagnostics
 }

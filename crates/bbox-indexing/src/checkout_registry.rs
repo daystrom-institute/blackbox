@@ -87,6 +87,7 @@ impl Default for CheckoutRegistryStore {
 pub struct CheckoutRegistry {
     store: CheckoutRegistryStore,
     store_path: PathBuf,
+    needs_persist: bool,
 }
 
 impl CheckoutRegistry {
@@ -104,22 +105,24 @@ impl CheckoutRegistry {
         // already carry the authority needed by the composite v2 key and drop
         // scope-less discovery hints that can never be addressed in v2. The
         // next successful mutation persists the upgraded shape.
-        match store.version {
+        let needs_persist = match store.version {
             1 => {
                 store
                     .checkouts
                     .retain(|row| row.published_scope().is_some());
                 store.version = 2;
+                true
             }
-            2 => {}
+            2 => false,
             version => anyhow::bail!(
                 "unsupported checkout registry version {version} in {}",
                 store_path.display()
             ),
-        }
+        };
         Ok(Self {
             store,
             store_path: store_path.to_path_buf(),
+            needs_persist,
         })
     }
 
@@ -144,6 +147,7 @@ impl CheckoutRegistry {
     fn replace_store(&mut self, next: CheckoutRegistryStore) -> Result<()> {
         atomic_write_json_locked(&self.store_path, &next)?;
         self.store = next;
+        self.needs_persist = false;
         Ok(())
     }
 
@@ -162,6 +166,9 @@ impl CheckoutRegistry {
             .iter_mut()
             .find(|existing| existing.matches(&row.checkout_id, &scope))
         {
+            if *existing == row && !self.needs_persist {
+                return Ok(());
+            }
             *existing = row;
         } else {
             next.checkouts.push(row);
@@ -324,6 +331,25 @@ mod tests {
             reg.get("c1", &root_scope()).unwrap().branch_ref.as_deref(),
             Some("feature/y")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identical_registration_does_not_rewrite_registry_file() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("checkouts.json");
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().canonicalize().unwrap();
+        let row = row("c1", &checkout);
+        let mut registry = CheckoutRegistry::open(&path).unwrap();
+        registry.register(row.clone()).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+
+        registry.register(row).unwrap();
+
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
     }
 
     #[test]

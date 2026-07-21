@@ -254,8 +254,22 @@ pub fn read_committed_file(root: &Path, r#ref: &str, repo_rel: &str) -> Option<S
 
 /// Byte-exact counterpart to [`read_committed_file`].
 pub fn read_committed_file_bytes(root: &Path, r#ref: &str, repo_rel: &str) -> Option<Vec<u8>> {
+    read_committed_file_bytes_with_alternate(root, r#ref, repo_rel, None)
+}
+
+pub fn read_committed_file_bytes_with_alternate(
+    root: &Path,
+    r#ref: &str,
+    repo_rel: &str,
+    alternate_root: Option<&Path>,
+) -> Option<Vec<u8>> {
     let spec = format!("{}:{}", r#ref, repo_rel);
-    let output = git_output(root, &["show", &spec], "reading committed file")?;
+    let output = git_output_with_alternate(
+        root,
+        &["show", &spec],
+        alternate_root,
+        "reading committed file",
+    )?;
     if !output.status.success() {
         return None;
     }
@@ -278,9 +292,19 @@ pub fn list_committed_dir(root: &Path, r#ref: &str, dir_rel: &str) -> Vec<String
 /// successful empty result, while spawn, timeout, ref, and decoding failures
 /// remain distinguishable errors for fail-closed snapshot builders.
 pub fn list_committed_dir_result(root: &Path, r#ref: &str, dir_rel: &str) -> Result<Vec<String>> {
-    let output = git_output(
+    list_committed_dir_result_with_alternate(root, r#ref, dir_rel, None)
+}
+
+pub fn list_committed_dir_result_with_alternate(
+    root: &Path,
+    r#ref: &str,
+    dir_rel: &str,
+    alternate_root: Option<&Path>,
+) -> Result<Vec<String>> {
+    let output = git_output_with_alternate(
         root,
         &["ls-tree", "-r", "--name-only", r#ref, "--", dir_rel],
+        alternate_root,
         "listing committed dir",
     )
     .with_context(|| format!("listing committed directory in {}", root.display()))?;
@@ -307,7 +331,21 @@ pub fn list_committed_dir_result(root: &Path, r#ref: &str, dir_rel: &str) -> Res
 /// no common ancestor (unrelated histories), a ref is unknown, or `root` is not
 /// a git repo.
 pub fn merge_base(root: &Path, a: &str, b: &str) -> Option<String> {
-    let output = git_output(root, &["merge-base", a, b], "computing merge base")?;
+    merge_base_with_alternate(root, a, b, None)
+}
+
+pub fn merge_base_with_alternate(
+    root: &Path,
+    a: &str,
+    b: &str,
+    alternate_root: Option<&Path>,
+) -> Option<String> {
+    let output = git_output_with_alternate(
+        root,
+        &["merge-base", a, b],
+        alternate_root,
+        "computing merge base",
+    )?;
     if !output.status.success() {
         return None;
     }
@@ -714,9 +752,50 @@ pub fn parse_commit_log(stdout: &[u8]) -> Result<Vec<GitCommit>> {
 const GIT_OUTPUT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn git_output(path: &Path, args: &[&str], action: &'static str) -> Option<Output> {
+    git_output_with_alternate(path, args, None, action)
+}
+
+fn git_output_with_alternate(
+    path: &Path,
+    args: &[&str],
+    alternate_root: Option<&Path>,
+    action: &'static str,
+) -> Option<Output> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(path).args(args);
+    if let Some(alternate_root) = alternate_root
+        && let Some(objects) = git_objects_dir(alternate_root)
+    {
+        let mut paths = std::env::var_os("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+            .unwrap_or_default();
+        if !paths.contains(&objects) {
+            paths.push(objects);
+        }
+        if let Ok(joined) = std::env::join_paths(paths) {
+            cmd.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", joined);
+        }
+    }
     run_git_bounded(cmd, path, action)
+}
+
+fn git_objects_dir(root: &Path) -> Option<PathBuf> {
+    let output = git_output(
+        root,
+        &["rev-parse", "--git-path", "objects"],
+        "resolving git object directory",
+    )?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let path = PathBuf::from(value.trim());
+    let path = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    path.canonicalize().ok()
 }
 
 fn git_output_strings(path: &Path, args: &[String], action: &'static str) -> Option<Output> {
@@ -989,6 +1068,61 @@ mod tests {
             read_committed_file(&root, "HEAD", ".bbox/knowledge/nope.json"),
             None,
             "absent path yields None, not empty string"
+        );
+    }
+
+    #[test]
+    fn alternate_publisher_objects_support_independent_clone_overlay_reads() {
+        let publisher_dir = tempfile::tempdir().unwrap();
+        let publisher = publisher_dir.path().canonicalize().unwrap();
+        init_repo(&publisher);
+        write(&publisher, ".bbox/knowledge/first.json", "published-one");
+        run_git(&publisher, &["add", "."]);
+        run_git(&publisher, &["commit", "-q", "-m", "c1"]);
+
+        let clone_parent = tempfile::tempdir().unwrap();
+        let checkout = clone_parent.path().join("checkout");
+        let output = Command::new("git")
+            .args([
+                "clone",
+                "--no-local",
+                "-q",
+                publisher.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git clone failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let checkout = checkout.canonicalize().unwrap();
+        let checkout_head = resolve_commit(&checkout, "HEAD").unwrap();
+
+        write(&publisher, ".bbox/knowledge/second.json", "published-two");
+        run_git(&publisher, &["add", "."]);
+        run_git(&publisher, &["commit", "-q", "-m", "c2"]);
+        let publisher_head = resolve_commit(&publisher, "HEAD").unwrap();
+
+        assert!(
+            merge_base(&checkout, &checkout_head, &publisher_head).is_none(),
+            "independent clone must not already contain the publisher's new object"
+        );
+        assert_eq!(
+            merge_base_with_alternate(&checkout, &checkout_head, &publisher_head, Some(&publisher))
+                .as_deref(),
+            Some(checkout_head.as_str())
+        );
+        assert_eq!(
+            read_committed_file_bytes_with_alternate(
+                &checkout,
+                &publisher_head,
+                ".bbox/knowledge/second.json",
+                Some(&publisher)
+            )
+            .as_deref(),
+            Some(b"published-two".as_slice())
         );
     }
 

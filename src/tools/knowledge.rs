@@ -71,6 +71,51 @@ fn knowledge_entity_ref(id: &str) -> String {
     }
 }
 
+fn stable_knowledge_overlay(
+    publisher_root: &std::path::Path,
+    published_ref: &str,
+    checkout: &bbox_corpus_core::project_record::ResolvedCheckoutScope,
+) -> bbox_knowledge::overlay::OverlaySnapshot {
+    use bbox_knowledge::overlay::{OverlaySnapshot, recompute_overlay};
+
+    let checkout_root = std::path::Path::new(&checkout.checkout_dir);
+    if bbox_knowledge::transaction::has_pending_transaction(checkout_root) {
+        return OverlaySnapshot::invalid(
+            checkout,
+            "checkout transaction is pending; provisional overlay refresh deferred",
+        );
+    }
+    let mut candidate = recompute_overlay(publisher_root, published_ref, checkout);
+    for _ in 0..2 {
+        if bbox_knowledge::transaction::has_pending_transaction(checkout_root) {
+            return OverlaySnapshot::invalid(
+                checkout,
+                "checkout transaction began during provisional overlay refresh",
+            );
+        }
+        let next = recompute_overlay(publisher_root, published_ref, checkout);
+        if same_knowledge_snapshot(&candidate, &next)
+            && !bbox_knowledge::transaction::has_pending_transaction(checkout_root)
+        {
+            return next;
+        }
+        candidate = next;
+    }
+    OverlaySnapshot::invalid(
+        checkout,
+        "checkout state changed repeatedly during provisional overlay refresh",
+    )
+}
+
+fn same_knowledge_snapshot(
+    left: &bbox_knowledge::overlay::OverlaySnapshot,
+    right: &bbox_knowledge::overlay::OverlaySnapshot,
+) -> bool {
+    left.snapshot_id == right.snapshot_id
+        && left.status == right.status
+        && left.diagnostics == right.diagnostics
+}
+
 fn log_tool_ok(tool: &'static str, start: std::time::Instant, bytes: usize) {
     let ms = start.elapsed().as_secs_f64() * 1000.0;
     tracing::info!(target: "blackbox::tool", tool, elapsed_ms = ms, bytes, "ok");
@@ -199,8 +244,17 @@ impl BlackboxServer {
         checkout: &bbox_corpus_core::project_record::ResolvedCheckoutScope,
     ) {
         use bbox_indexing::publisher::{PublisherResolution, elect_publisher};
-        use bbox_knowledge::overlay::{OverlaySnapshot, recompute_overlay};
+        use bbox_knowledge::overlay::{OverlayKey, OverlaySnapshot};
 
+        let _refresh = self.state.knowledge_overlay_refresh.lock();
+        let generation = self
+            .state
+            .knowledge_overlays
+            .write()
+            .begin_refresh(OverlayKey {
+                published_scope: checkout.published_scope.clone(),
+                checkout_id: checkout.checkout_id.clone(),
+            });
         let projects = self.state.projects.read().list();
         let prior = self
             .state
@@ -235,7 +289,11 @@ impl BlackboxServer {
                 match pin {
                     Ok(pin) => {
                         publisher_project = Some(root.clone());
-                        recompute_overlay(std::path::Path::new(&root), &pin.branch_ref, checkout)
+                        stable_knowledge_overlay(
+                            std::path::Path::new(&root),
+                            &pin.branch_ref,
+                            checkout,
+                        )
                     }
                     Err(err) => OverlaySnapshot::invalid(checkout, format!("{err:#}")),
                 }
@@ -261,7 +319,14 @@ impl BlackboxServer {
         }
         affected.extend(snapshot.values.keys().cloned());
 
-        self.state.knowledge_overlays.write().publish(snapshot);
+        if !self
+            .state
+            .knowledge_overlays
+            .write()
+            .publish_if_latest(generation, snapshot)
+        {
+            return;
+        }
         if unchanged {
             return;
         }

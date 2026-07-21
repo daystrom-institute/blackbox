@@ -4,6 +4,7 @@
 //! under a configured root and use `bro-fleet/*` branch names.
 
 use crate::tool::{Tool, ToolAnnotations, ToolCx, ToolResult, schema_for};
+use anyhow::Context as _;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -669,23 +670,29 @@ pub fn run_closeout_phases_with_candidate_gate(
         if !merge_gate.ok {
             return CloseoutOutcome::Failed(merge_gate);
         }
+        let candidate_tree = merge_gate
+            .content
+            .get("candidate_tree")
+            .and_then(Value::as_str)
+            .expect("successful merge gate carries a candidate tree")
+            .to_string();
         results.push(merge_gate);
+
+        // Repo-owned knowledge files may have been written by several tool
+        // calls, but each completed transaction records the exact terminal
+        // blobs expected in the candidate commit. Prove those blobs are in the
+        // immutable candidate before moving the local target ref.
+        match verify_knowledge_transaction_closeout(req, &candidate_tree) {
+            HookRun::Blocked(p) => return CloseoutOutcome::Failed(p),
+            HookRun::Ran(p) => results.push(p),
+            HookRun::None => {}
+        }
 
         let ff_merge = phase_ff_merge(req);
         if !ff_merge.ok {
             return CloseoutOutcome::Failed(ff_merge);
         }
         results.push(ff_merge);
-
-        // Repo-owned knowledge files may have been written by several tool
-        // calls, but each completed transaction records the exact terminal
-        // blobs expected in the candidate commit. Prove those blobs are in the
-        // locally folded target before any push or worktree removal.
-        match verify_knowledge_transaction_closeout(req) {
-            HookRun::Blocked(p) => return CloseoutOutcome::Failed(p),
-            HookRun::Ran(p) => results.push(p),
-            HookRun::None => {}
-        }
 
         if base_diverged {
             // The LOCAL fold is complete. Pushing a diverged branch cannot
@@ -795,16 +802,18 @@ struct KnowledgeCloseoutClaim {
 
 #[allow(clippy::disallowed_methods)]
 impl KnowledgeCloseoutClaim {
-    fn acquire(req: &CloseoutRequest) -> anyhow::Result<Option<Self>> {
-        if req.disposition == "discard" {
-            return Ok(None);
-        }
+    fn acquire(req: &CloseoutRequest) -> anyhow::Result<Self> {
         let local = req.worktree.join(".bbox/local");
         let root = local.join("knowledge-transactions");
-        if !local.join("checkout-id").is_file() && !root.exists() {
-            return Ok(None);
-        }
+        reject_closeout_symlinks(
+            &req.worktree,
+            Path::new(".bbox/local/knowledge-transactions"),
+        )?;
         std::fs::create_dir_all(&root)?;
+        reject_closeout_symlinks(
+            &req.worktree,
+            Path::new(".bbox/local/knowledge-transactions"),
+        )?;
         let path = root.join("pending.json");
         let transaction_id = format!(
             "closeout-{}-{}",
@@ -816,15 +825,54 @@ impl KnowledgeCloseoutClaim {
             "transaction_id": transaction_id,
             "state": "closeout",
         }))?;
+        let temp = root.join(format!(".pending-{transaction_id}.tmp"));
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(&path)?;
+            .open(&temp)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
+        drop(file);
+        if let Err(err) = std::fs::hard_link(&temp, &path) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(err).with_context(|| {
+                format!(
+                    "claiming checkout transaction lane at {}; recover or finish the existing transaction before retrying",
+                    path.display()
+                )
+            });
+        }
         std::fs::File::open(&root)?.sync_all()?;
-        Ok(Some(Self { path, bytes }))
+        std::fs::remove_file(&temp)?;
+        std::fs::File::open(&root)?.sync_all()?;
+        Ok(Self { path, bytes })
     }
+}
+
+#[allow(clippy::disallowed_methods)]
+fn reject_closeout_symlinks(base: &Path, relative: &Path) -> anyhow::Result<()> {
+    let mut current = base.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            anyhow::bail!("unsafe closeout transaction path {}", relative.display());
+        };
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "closeout transaction path traverses symlink {}",
+                    current.display()
+                );
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("inspecting closeout path {}", current.display()));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -843,7 +891,7 @@ impl Drop for KnowledgeCloseoutClaim {
 /// completed checkout-local knowledge transaction. Later transactions win for
 /// a path, matching the order in which their canonical writes completed.
 #[allow(clippy::disallowed_methods)]
-fn verify_knowledge_transaction_closeout(req: &CloseoutRequest) -> HookRun {
+fn verify_knowledge_transaction_closeout(req: &CloseoutRequest, candidate_tree: &str) -> HookRun {
     let completed = req
         .worktree
         .join(".bbox/local/knowledge-transactions/completed");
@@ -937,7 +985,7 @@ fn verify_knowledge_transaction_closeout(req: &CloseoutRequest) -> HookRun {
     }
 
     for (relative_path, expected_sha) in &expected {
-        let spec = format!("{}:{relative_path}", req.target);
+        let spec = format!("{candidate_tree}:{relative_path}");
         let actual = match git_blob(&req.base_repo, &spec) {
             Ok(actual) => actual,
             Err(err) => {
@@ -1881,14 +1929,15 @@ fn recover_push_reject(
     if !merge_gate.ok {
         return PushRecoveryOutcome::Failed(merge_gate);
     }
+    let candidate_tree = merge_gate
+        .content
+        .get("candidate_tree")
+        .and_then(Value::as_str)
+        .expect("successful recovery merge gate carries a candidate tree")
+        .to_string();
 
-    let ff_merge = tag_recovery(phase_ff_merge(req), "remote_moved_ff_merge");
-    if !ff_merge.ok {
-        return PushRecoveryOutcome::Failed(ff_merge);
-    }
-
-    let mut recovery_phases = vec![rebase, merge_gate, ff_merge];
-    match verify_knowledge_transaction_closeout(req) {
+    let mut recovery_phases = vec![rebase, merge_gate];
+    match verify_knowledge_transaction_closeout(req, &candidate_tree) {
         HookRun::Blocked(phase) => {
             return PushRecoveryOutcome::Failed(tag_recovery(
                 phase,
@@ -1900,6 +1949,12 @@ fn recover_push_reject(
         }
         HookRun::None => {}
     }
+
+    let ff_merge = tag_recovery(phase_ff_merge(req), "remote_moved_ff_merge");
+    if !ff_merge.ok {
+        return PushRecoveryOutcome::Failed(ff_merge);
+    }
+    recovery_phases.push(ff_merge);
 
     let retry = tag_recovery(phase_push(req), "remote_moved_retry_push");
     if retry.ok {
@@ -3377,6 +3432,119 @@ mod tests {
         assert!(
             !branch_exists(repo.path(), "bro-fleet/test-branch"),
             "discard keeps operator-authorized branch deletion"
+        );
+    }
+
+    #[test]
+    fn discard_claims_fresh_checkout_transaction_lane() {
+        let repo = seed_repo();
+        let worktrees = tempfile::tempdir().unwrap();
+        let cwd = worktrees.path().join("wt-claim");
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                cwd.to_str().unwrap(),
+                "-b",
+                "bro-fleet/claim-test",
+            ],
+        );
+        let req = CloseoutRequest {
+            worktree: cwd.clone(),
+            base_repo: repo.path().canonicalize().unwrap(),
+            branch: "bro-fleet/claim-test".to_string(),
+            target: "main".to_string(),
+            disposition: "discard".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+            dry_run: false,
+            closeout_hooks: None,
+        };
+        assert!(!cwd.join(".bbox/local/checkout-id").exists());
+        assert!(!cwd.join(".bbox/local/knowledge-transactions").exists());
+
+        let claim = KnowledgeCloseoutClaim::acquire(&req).unwrap();
+        let pending = cwd.join(".bbox/local/knowledge-transactions/pending.json");
+        assert!(pending.is_file());
+        assert!(KnowledgeCloseoutClaim::acquire(&req).is_err());
+        drop(claim);
+        assert!(!pending.exists());
+
+        run_git(
+            repo.path(),
+            &["worktree", "remove", "--force", cwd.to_str().unwrap()],
+        );
+    }
+
+    #[test]
+    fn transaction_proof_blocks_before_target_ref_moves() {
+        let repo = seed_repo();
+        let worktrees = tempfile::tempdir().unwrap();
+        let cwd = worktrees.path().join("wt-proof");
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                cwd.to_str().unwrap(),
+                "-b",
+                "bro-fleet/proof-test",
+            ],
+        );
+        std::fs::create_dir_all(cwd.join(".bbox/knowledge")).unwrap();
+        std::fs::write(cwd.join(".bbox/knowledge/entry.json"), b"branch bytes").unwrap();
+        run_git(&cwd, &["add", ".bbox/knowledge/entry.json"]);
+        run_git(&cwd, &["commit", "-m", "add knowledge"]);
+        let completed = cwd.join(".bbox/local/knowledge-transactions/completed");
+        std::fs::create_dir_all(&completed).unwrap();
+        std::fs::write(
+            completed.join("proof.json"),
+            serde_json::to_vec_pretty(&json!({
+                "version": 1,
+                "kind": "knowledge_transaction_v1",
+                "transaction_id": "proof",
+                "created_at": "2026-07-21T00:00:00Z",
+                "files": [{
+                    "relative_path": ".bbox/knowledge/entry.json",
+                    "new_ref": "new/0",
+                    "new_sha256": "deadbeef"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let req = CloseoutRequest {
+            worktree: cwd.clone(),
+            base_repo: repo.path().canonicalize().unwrap(),
+            branch: "bro-fleet/proof-test".to_string(),
+            target: "main".to_string(),
+            disposition: "merge".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+            dry_run: false,
+            closeout_hooks: None,
+        };
+        let target_before = git_capture(repo.path(), &["rev-parse", "main"]).unwrap();
+        let gate = phase_merge_gate(&req, None);
+        assert!(gate.ok, "candidate construction failed: {:?}", gate.content);
+        let candidate = gate.content["candidate_tree"].as_str().unwrap();
+
+        assert!(matches!(
+            verify_knowledge_transaction_closeout(&req, candidate),
+            HookRun::Blocked(_)
+        ));
+        assert_eq!(
+            git_capture(repo.path(), &["rev-parse", "main"]).unwrap(),
+            target_before,
+            "candidate proof failure must leave the target ref unchanged"
+        );
+
+        run_git(
+            repo.path(),
+            &["worktree", "remove", "--force", cwd.to_str().unwrap()],
         );
     }
 

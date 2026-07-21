@@ -108,23 +108,28 @@ impl BlackboxServer {
                 server.session_knowledge_view(p.project.as_deref(), p.provisional.as_deref())?;
             let gap_view =
                 server.session_gap_view(p.project.as_deref(), p.provisional.as_deref())?;
+            let mut overlay_diagnostics = knowledge_view.diagnostics.clone();
+            overlay_diagnostics.extend(gap_view.diagnostics.iter().cloned());
             let threads = server.state.threads.read();
             let notes = server.state.notes.read();
             let task_store = server.state.task_store.read();
             let failed_rows = collect_failed_tasks(&task_store);
             let vector_alerts = collect_vector_connectivity_alerts();
             let cron_alerts = collect_cron_schedule_alerts(&server.state);
-            let inbox = inbox::compute_inbox(
-                &knowledge_view.knowledge,
-                &threads,
-                &notes,
-                &gap_view.gaps,
-                &failed_rows,
-                &vector_alerts,
-                &cron_alerts,
-                &server.state.whiteboards,
-                &p,
-            )?;
+            let inbox = append_overlay_diagnostics(
+                inbox::compute_inbox(
+                    &knowledge_view.knowledge,
+                    &threads,
+                    &notes,
+                    &gap_view.gaps,
+                    &failed_rows,
+                    &vector_alerts,
+                    &cron_alerts,
+                    &server.state.whiteboards,
+                    &p,
+                )?,
+                &overlay_diagnostics,
+            );
             if let Some(report) = import_report {
                 let rendered = report.render();
                 if rendered.is_empty() {
@@ -140,6 +145,21 @@ impl BlackboxServer {
     }
 }
 
+fn append_overlay_diagnostics(inbox: String, diagnostics: &[String]) -> String {
+    if diagnostics.is_empty() {
+        return inbox;
+    }
+    let mut out = String::from("Checkout visibility diagnostics:\n");
+    for diagnostic in diagnostics {
+        out.push_str("  - ");
+        out.push_str(diagnostic);
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(&inbox);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use crate::server::BlackboxServer;
@@ -147,6 +167,17 @@ mod tests {
     use rmcp::handler::server::wrapper::Parameters;
     use std::path::Path;
     use std::sync::Arc;
+
+    #[test]
+    fn inbox_surfaces_checkout_visibility_diagnostics() {
+        let rendered = super::append_overlay_diagnostics(
+            "No other attention items.\n".into(),
+            &["checkout overlay is invalid".into()],
+        );
+        assert!(rendered.contains("Checkout visibility diagnostics:"));
+        assert!(rendered.contains("checkout overlay is invalid"));
+        assert!(rendered.contains("No other attention items."));
+    }
 
     fn run_git(cwd: &Path, args: &[&str]) {
         let out = std::process::Command::new("git")

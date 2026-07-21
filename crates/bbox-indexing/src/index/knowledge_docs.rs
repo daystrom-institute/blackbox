@@ -175,7 +175,13 @@ pub fn reindex_knowledge_store_standalone(
     writer: &mut IndexWriter,
     meta: &mut HashMap<String, FileMeta>,
 ) -> Result<u64> {
-    writer.delete_term(Term::from_field_text(fields.doc_type, "knowledge"));
+    // Reindex owns the published generation only. Provisional documents are
+    // reconstructed from live checkout overlays and must survive an unrelated
+    // committed-store pass.
+    writer.delete_term(Term::from_field_text(
+        fields.knowledge_visibility,
+        "published",
+    ));
     // Central knowledge contributes globals and legacy, non-repo-owned
     // projects. Registered project scopes are replaced below from their
     // committed pinned publisher tree, never from working-tree bytes or a

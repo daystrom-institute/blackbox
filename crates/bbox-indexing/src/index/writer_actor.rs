@@ -547,6 +547,20 @@ mod tests {
             .unwrap()
     }
 
+    fn visibility_count(index: &TranscriptIndex, visibility: &str) -> usize {
+        use tantivy::collector::Count;
+        use tantivy::query::TermQuery;
+        use tantivy::schema::{IndexRecordOption, Term};
+
+        let reader = index.index_handle().reader().unwrap();
+        let searcher = reader.searcher();
+        let query = TermQuery::new(
+            Term::from_field_text(index.field_handles().knowledge_visibility, visibility),
+            IndexRecordOption::Basic,
+        );
+        searcher.search(&query, &Count).unwrap()
+    }
+
     #[test]
     fn batched_ops_commit_once_and_become_searchable_after_flush() {
         let dir = tempfile::tempdir().unwrap();
@@ -594,7 +608,8 @@ mod tests {
         });
         actor.flush_blocking().unwrap();
         assert!(search(&index, "published obsolete").contains("published"));
-        assert!(search(&index, "provisional obsolete").contains("provisional"));
+        assert!(!search(&index, "provisional obsolete").contains("provisional"));
+        assert_eq!(visibility_count(&index, "provisional"), 1);
 
         actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(test_entry(
             "scope0001",
@@ -602,8 +617,9 @@ mod tests {
         ))));
         actor.flush_blocking().unwrap();
         assert!(search(&index, "published variant update").contains("published"));
-        assert!(
-            search(&index, "provisional obsolete").contains("provisional"),
+        assert_eq!(
+            visibility_count(&index, "provisional"),
+            1,
             "variant-precise upsert must not delete the provisional document"
         );
 
@@ -618,7 +634,34 @@ mod tests {
 
         assert!(!search(&index, "published obsolete").contains("published"));
         assert!(!search(&index, "provisional obsolete").contains("provisional"));
+        assert_eq!(visibility_count(&index, "provisional"), 0);
         assert!(search(&index, "replacement current").contains("replacement"));
+    }
+
+    #[test]
+    fn reindex_passes_preserve_provisional_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = test_index(dir.path());
+        let actor = IndexWriterActor::spawn_for(&index);
+        let logical_ref = super::super::knowledge_docs::knowledge_entity_id("scope0002");
+        let published =
+            KnowledgeIndexDocument::published(test_entry("scope0002", "published generation"));
+        let mut provisional = published.clone();
+        provisional.entity_id = "provisional_knowledge:scope:checkout:scope0002".into();
+        provisional.entry.content = "provisional generation".into();
+        provisional.visibility = "provisional".into();
+        actor.enqueue(IndexWriteOp::ReplaceKnowledgeLogical {
+            logical_ref,
+            documents: vec![published, provisional],
+        });
+        actor.flush_blocking().unwrap();
+        assert_eq!(visibility_count(&index, "provisional"), 1);
+
+        actor.run_reindex_pass(false, true).unwrap();
+        assert_eq!(visibility_count(&index, "provisional"), 1);
+
+        actor.run_reindex_pass(true, true).unwrap();
+        assert_eq!(visibility_count(&index, "provisional"), 1);
     }
 
     #[test]

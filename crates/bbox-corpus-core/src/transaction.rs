@@ -93,8 +93,13 @@ pub fn apply_transaction(
         .canonicalize()
         .with_context(|| format!("canonicalizing checkout {}", checkout_dir.display()))?;
     let root = transaction_root(&checkout_dir);
+    reject_symlink_components(
+        &checkout_dir,
+        Path::new(".bbox/local/knowledge-transactions"),
+    )?;
     fs::create_dir_all(root.join("completed"))
         .with_context(|| format!("creating transaction root {}", root.display()))?;
+    reject_symlink_components(&root, Path::new("completed"))?;
     ensure_unique_targets(&writes)?;
 
     let transaction_id = transaction_id();
@@ -161,11 +166,29 @@ pub fn recover_pending_transaction(checkout_dir: &Path) -> Result<Option<RepoTra
         .canonicalize()
         .with_context(|| format!("canonicalizing checkout {}", checkout_dir.display()))?;
     let root = transaction_root(&checkout_dir);
-    let pointer: TransactionPointer = serde_json::from_slice(
-        &fs::read(&pointer_path)
-            .with_context(|| format!("reading pending pointer {}", pointer_path.display()))?,
-    )
-    .with_context(|| format!("parsing pending pointer {}", pointer_path.display()))?;
+    reject_symlink_components(
+        &checkout_dir,
+        Path::new(".bbox/local/knowledge-transactions/pending.json"),
+    )?;
+    let pointer_bytes = fs::read(&pointer_path)
+        .with_context(|| format!("reading pending pointer {}", pointer_path.display()))?;
+    let pointer: TransactionPointer = match serde_json::from_slice(&pointer_bytes) {
+        Ok(pointer) => pointer,
+        Err(err) => {
+            // The pre-atomic v1 claim writer could crash after create_new but
+            // before the pointer bytes were complete. Canonical files were not
+            // touched while the pointer was in that preparing window, so an
+            // unparseable legacy pointer is safe to clear and must not wedge
+            // the checkout forever.
+            clear_pointer(&pointer_path).with_context(|| {
+                format!(
+                    "clearing unparseable pending pointer {} after parse error: {err}",
+                    pointer_path.display()
+                )
+            })?;
+            return Ok(None);
+        }
+    };
     if pointer.version != TRANSACTION_VERSION {
         anyhow::bail!(
             "unsupported knowledge transaction pointer version {}",
@@ -178,6 +201,7 @@ pub fn recover_pending_transaction(checkout_dir: &Path) -> Result<Option<RepoTra
         return Ok(None);
     }
     let transaction_dir = root.join(&pointer.transaction_id);
+    reject_symlink_components(&root, Path::new(&pointer.transaction_id))?;
     let manifest_path = transaction_dir.join("manifest.json");
     if !manifest_path.exists() && matches!(pointer.state, TransactionState::Preparing) {
         let _ = fs::remove_dir_all(&transaction_dir);
@@ -213,6 +237,7 @@ fn prepare_manifest(
             )
         })?;
         validate_relative_path(relative)?;
+        reject_symlink_components(checkout_dir, relative)?;
         let relative_path = relative.to_string_lossy().replace('\\', "/");
         let old_bytes = match fs::read(&write.target) {
             Ok(bytes) => Some(bytes),
@@ -262,7 +287,9 @@ fn apply_manifest(
     validate_manifest(manifest, &manifest.transaction_id)?;
     for file in &manifest.files {
         let target = checkout_dir.join(&file.relative_path);
+        reject_symlink_components(checkout_dir, Path::new(&file.relative_path))?;
         if let Some(new_ref) = &file.new_ref {
+            reject_symlink_components(transaction_dir, Path::new(new_ref))?;
             let bytes = fs::read(transaction_dir.join(new_ref))?;
             if sha256(&bytes) != file.new_sha256.as_deref().unwrap_or_default() {
                 anyhow::bail!(
@@ -294,7 +321,9 @@ fn rollback_manifest(
 ) -> Result<()> {
     for file in &manifest.files {
         let target = checkout_dir.join(&file.relative_path);
+        reject_symlink_components(checkout_dir, Path::new(&file.relative_path))?;
         if let Some(old_ref) = &file.old_ref {
+            reject_symlink_components(transaction_dir, Path::new(old_ref))?;
             let bytes = fs::read(transaction_dir.join(old_ref))?;
             if sha256(&bytes) != file.old_sha256.as_deref().unwrap_or_default() {
                 anyhow::bail!(
@@ -371,6 +400,7 @@ fn validate_manifest(manifest: &RepoTransactionManifest, transaction_id: &str) -
 
 fn validate_transaction_id(transaction_id: &str) -> Result<()> {
     if transaction_id.is_empty()
+        || matches!(transaction_id, "." | "..")
         || !transaction_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
@@ -427,19 +457,59 @@ fn validate_relative_path(path: &Path) -> Result<()> {
 
 fn create_claim(path: &Path, pointer: &TransactionPointer) -> Result<()> {
     let bytes = to_vec_pretty_newline(pointer)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let temp = parent.join(format!(
+        ".pending-{}-{}.tmp",
+        pointer.transaction_id,
+        TRANSACTION_NONCE.fetch_add(1, Ordering::SeqCst)
+    ));
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
-        .open(path)
-        .with_context(|| {
+        .open(&temp)
+        .with_context(|| format!("staging knowledge transaction claim at {}", temp.display()))?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    if let Err(err) = fs::hard_link(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(err).with_context(|| {
             format!(
                 "claiming knowledge transaction at {}; recover or finish the existing transaction before retrying",
                 path.display()
             )
-        })?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    sync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
+        });
+    }
+    sync_dir(parent)?;
+    fs::remove_file(&temp)
+        .with_context(|| format!("removing staged transaction claim {}", temp.display()))?;
+    sync_dir(parent)
+}
+
+fn reject_symlink_components(base: &Path, relative: &Path) -> Result<()> {
+    validate_relative_path(relative)?;
+    let mut current = base.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            continue;
+        };
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "knowledge transaction path traverses symlink {}",
+                    current.display()
+                );
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("inspecting transaction path {}", current.display()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn clear_pointer(path: &Path) -> Result<()> {
@@ -606,6 +676,60 @@ mod tests {
 
         assert!(recover_pending_transaction(&root).unwrap().is_none());
         assert!(!has_pending_transaction(&root));
+    }
+
+    #[test]
+    fn malformed_legacy_pointer_clears_without_wedging_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let root_dir = transaction_root(&root);
+        fs::create_dir_all(&root_dir).unwrap();
+        fs::write(root_dir.join(PENDING_FILE), b"{\"version\":").unwrap();
+
+        assert!(recover_pending_transaction(&root).unwrap().is_none());
+        assert!(!has_pending_transaction(&root));
+
+        let target = root.join(".bbox/knowledge/entry.json");
+        apply_transaction(
+            &root,
+            vec![TransactionWrite {
+                target: target.clone(),
+                new_bytes: Some(b"new".to_vec()),
+            }],
+        )
+        .unwrap();
+        assert_eq!(fs::read(target).unwrap(), b"new");
+    }
+
+    #[test]
+    fn transaction_ids_reject_dot_segments() {
+        assert!(validate_transaction_id(".").is_err());
+        assert!(validate_transaction_id("..").is_err());
+        assert!(validate_transaction_id("valid-id_1.2").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transaction_rejects_symlinked_repo_owned_parent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.join(".bbox")).unwrap();
+        symlink(outside.path(), root.join(".bbox/knowledge")).unwrap();
+        let target = root.join(".bbox/knowledge/escaped.json");
+
+        let err = apply_transaction(
+            &root,
+            vec![TransactionWrite {
+                target,
+                new_bytes: Some(b"escaped".to_vec()),
+            }],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("traverses symlink"));
+        assert!(!outside.path().join("escaped.json").exists());
     }
 
     #[test]

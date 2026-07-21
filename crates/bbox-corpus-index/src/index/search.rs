@@ -299,6 +299,17 @@ impl TranscriptIndex {
             self.push_project_filter_clause(&mut clauses, project);
         }
 
+        // Transcript search is a static corpus surface and carries no
+        // checkout authority. Published knowledge may remain searchable for
+        // compatibility, but provisional variants are session-only.
+        clauses.push((
+            Occur::MustNot,
+            Box::new(TermQuery::new(
+                Term::from_field_text(self.fields.knowledge_visibility, "provisional"),
+                IndexRecordOption::Basic,
+            )),
+        ));
+
         // Caller-session auto-exclude. Disabled by default — the heuristic
         // (find an active transcript whose tail contains this query as a
         // recent user message) is best-effort and can mis-attribute when
@@ -464,6 +475,17 @@ impl TranscriptIndex {
                 Occur::MustNot,
                 Box::new(TermQuery::new(
                     Term::from_field_text(self.fields.doc_type, "knowledge"),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        } else {
+            // Static corpus callers have no checkout authority. Provisional
+            // knowledge is injected only through a session-scoped knowledge
+            // view, so it must never escape through this generic BM25 lane.
+            clauses.push((
+                Occur::MustNot,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.knowledge_visibility, "provisional"),
                     IndexRecordOption::Basic,
                 )),
             ));

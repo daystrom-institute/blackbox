@@ -61,6 +61,18 @@ pub enum QuarantineReason {
     /// The project root resolved outside its own git root (malformed or moved
     /// state) — the relpath discriminator cannot be computed.
     ProjectRootOutsideGitRoot,
+    /// A repo-owned entry or its directory could not be read safely.
+    UnreadableRepoEntry,
+    /// A repo-owned JSON file could not be parsed as a knowledge entry.
+    MalformedRepoEntry,
+    /// The durable filename and embedded entry id disagree.
+    FilenameIdMismatch,
+    /// A repo-owned entry is not project-scoped durable knowledge.
+    InvalidRepoEntryScope,
+    /// A committed repo-owned entry still embeds host path authority.
+    RepoEntryContainsPathAuthority,
+    /// A valid repo-owned file was absent from the daemon's loaded scope.
+    LoadedStoreMismatch,
 }
 
 impl QuarantineReason {
@@ -70,6 +82,14 @@ impl QuarantineReason {
             QuarantineReason::NoResolvableRepoId => "no_resolvable_repo_id",
             QuarantineReason::NotAGitRepo => "not_a_git_repo",
             QuarantineReason::ProjectRootOutsideGitRoot => "project_root_outside_git_root",
+            QuarantineReason::UnreadableRepoEntry => "unreadable_repo_entry",
+            QuarantineReason::MalformedRepoEntry => "malformed_repo_entry",
+            QuarantineReason::FilenameIdMismatch => "filename_id_mismatch",
+            QuarantineReason::InvalidRepoEntryScope => "invalid_repo_entry_scope",
+            QuarantineReason::RepoEntryContainsPathAuthority => {
+                "repo_entry_contains_path_authority"
+            }
+            QuarantineReason::LoadedStoreMismatch => "loaded_store_mismatch",
         }
     }
 }
@@ -142,6 +162,14 @@ pub struct QuarantinedKnowledgeEntry {
     pub reason: QuarantineReason,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuarantinedKnowledgeFile {
+    pub project: String,
+    pub path: String,
+    pub reason: QuarantineReason,
+    pub detail: String,
+}
+
 /// Full quarantined bytes, not only an id/reason report. An unresolved legacy
 /// entry has no honest repo-owned destination, so the host ledger must retain
 /// enough information for operator repair.
@@ -150,6 +178,8 @@ pub struct QuarantineLedgerStore {
     pub version: u32,
     pub schema_epoch: u32,
     pub entries: Vec<QuarantinedKnowledgeEntry>,
+    #[serde(default)]
+    pub files: Vec<QuarantinedKnowledgeFile>,
 }
 
 #[derive(Debug, Clone)]
@@ -169,8 +199,30 @@ impl KnowledgeInventory {
     }
 }
 
-pub fn path_fallback_was_cut(state_dir: &Path) -> bool {
-    state_dir.join(PATH_FALLBACK_CUT_MARKER).is_file()
+pub fn path_fallback_was_cut(state_dir: &Path) -> Result<bool> {
+    let path = state_dir.join(PATH_FALLBACK_CUT_MARKER);
+    if !path.exists() {
+        return Ok(false);
+    }
+    let raw = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let marker: PathFallbackCutMarker =
+        serde_json::from_slice(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    anyhow::ensure!(
+        marker.version == 1,
+        "unsupported path-fallback cut marker version {} in {}",
+        marker.version,
+        path.display()
+    );
+    anyhow::ensure!(
+        marker.schema_epoch == SCHEMA_EPOCH,
+        "path-fallback cut marker schema epoch {} does not match {} in {}",
+        marker.schema_epoch,
+        SCHEMA_EPOCH,
+        path.display()
+    );
+    chrono::DateTime::parse_from_rfc3339(&marker.cut_at)
+        .with_context(|| format!("invalid cut_at in {}", path.display()))?;
+    Ok(true)
 }
 
 /// Persist the cut before enabling it in memory. Existence is the monotonic
@@ -179,7 +231,8 @@ pub fn persist_path_fallback_cut(state_dir: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("creating inventory state dir {}", state_dir.display()))?;
     let path = state_dir.join(PATH_FALLBACK_CUT_MARKER);
-    if path.is_file() {
+    if path.exists() {
+        path_fallback_was_cut(state_dir)?;
         return Ok(path);
     }
     atomic_write_json_locked(
@@ -269,7 +322,7 @@ pub fn persist_schema_epoch_inventory(
     state_dir: &Path,
     resolve_inputs: impl Fn(&Path) -> RepoIdInputs,
 ) -> Result<PersistedInventoryReport> {
-    let inventory = inventory_project_entries(entries, |path| resolve_inputs(path));
+    let mut inventory = inventory_project_entries(entries, |path| resolve_inputs(path));
     let quarantine_entries = inventory
         .quarantined
         .iter()
@@ -288,15 +341,7 @@ pub fn persist_schema_epoch_inventory(
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("creating inventory state dir {}", state_dir.display()))?;
     let quarantine_path = state_dir.join(QUARANTINE_LEDGER);
-    write_json_if_changed(
-        &quarantine_path,
-        &QuarantineLedgerStore {
-            version: 1,
-            schema_epoch: SCHEMA_EPOCH,
-            entries: quarantine_entries,
-        },
-    )?;
-
+    let mut quarantined_files = Vec::new();
     let mut marked_scopes = Vec::new();
     for project_root in project_roots {
         let project_root = project_root
@@ -320,6 +365,20 @@ pub fn persist_schema_epoch_inventory(
             repo_id,
             bbox_root_relpath: relpath,
         };
+        let scope_file_quarantine = inspect_repo_owned_files(&project_root, entries);
+        for file in &scope_file_quarantine {
+            inventory.quarantined.push(QuarantineRow {
+                entry_id: Path::new(&file.path)
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("<repo-entry>")
+                    .to_string(),
+                project: Some(file.project.clone()),
+                reason: file.reason.clone(),
+            });
+        }
+        let files_clean = scope_file_quarantine.is_empty();
+        quarantined_files.extend(scope_file_quarantine);
         let scoped_entries = entries.iter().filter(|entry| {
             entry.scope == Scope::Project
                 && entry
@@ -327,13 +386,14 @@ pub fn persist_schema_epoch_inventory(
                     .as_deref()
                     .is_some_and(|project| project_path_matches(project, &project_root))
         });
-        let clean = scoped_entries.into_iter().all(|entry| {
-            inventory.resolved.get(&entry.id)
-                == Some(&ResolvedKey {
-                    repo_id: scope.repo_id.clone(),
-                    bbox_root_relpath: scope.bbox_root_relpath.clone(),
-                })
-        });
+        let clean = files_clean
+            && scoped_entries.into_iter().all(|entry| {
+                inventory.resolved.get(&entry.id)
+                    == Some(&ResolvedKey {
+                        repo_id: scope.repo_id.clone(),
+                        bbox_root_relpath: scope.bbox_root_relpath.clone(),
+                    })
+            });
         if !clean {
             continue;
         }
@@ -349,6 +409,16 @@ pub fn persist_schema_epoch_inventory(
     }
     marked_scopes.sort();
     marked_scopes.dedup();
+
+    write_json_if_changed(
+        &quarantine_path,
+        &QuarantineLedgerStore {
+            version: 1,
+            schema_epoch: SCHEMA_EPOCH,
+            entries: quarantine_entries,
+            files: quarantined_files,
+        },
+    )?;
 
     let mut resolved = inventory
         .resolved
@@ -385,6 +455,150 @@ pub fn persist_schema_epoch_inventory(
         inventory_path,
         quarantine_path,
     })
+}
+
+fn inspect_repo_owned_files(
+    project_root: &Path,
+    loaded_entries: &[KnowledgeEntry],
+) -> Vec<QuarantinedKnowledgeFile> {
+    let knowledge_dir = project_root.join(".bbox").join("knowledge");
+    let project = project_root.to_string_lossy().into_owned();
+    let read_dir = match std::fs::read_dir(&knowledge_dir) {
+        Ok(read_dir) => read_dir,
+        Err(err) => {
+            return vec![QuarantinedKnowledgeFile {
+                project,
+                path: knowledge_dir.to_string_lossy().into_owned(),
+                reason: QuarantineReason::UnreadableRepoEntry,
+                detail: err.to_string(),
+            }];
+        }
+    };
+    let mut quarantined = Vec::new();
+    for item in read_dir {
+        let entry = match item {
+            Ok(entry) => entry,
+            Err(err) => {
+                quarantined.push(QuarantinedKnowledgeFile {
+                    project: project.clone(),
+                    path: knowledge_dir.to_string_lossy().into_owned(),
+                    reason: QuarantineReason::UnreadableRepoEntry,
+                    detail: err.to_string(),
+                });
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let path_string = path.to_string_lossy().into_owned();
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if !metadata.file_type().is_symlink() => metadata,
+            Ok(_) => {
+                quarantined.push(QuarantinedKnowledgeFile {
+                    project: project.clone(),
+                    path: path_string,
+                    reason: QuarantineReason::UnreadableRepoEntry,
+                    detail: "repo-owned knowledge files must not be symlinks".into(),
+                });
+                continue;
+            }
+            Err(err) => {
+                quarantined.push(QuarantinedKnowledgeFile {
+                    project: project.clone(),
+                    path: path_string,
+                    reason: QuarantineReason::UnreadableRepoEntry,
+                    detail: err.to_string(),
+                });
+                continue;
+            }
+        };
+        if !metadata.is_file() {
+            quarantined.push(QuarantinedKnowledgeFile {
+                project: project.clone(),
+                path: path_string,
+                reason: QuarantineReason::UnreadableRepoEntry,
+                detail: "repo-owned knowledge JSON path is not a regular file".into(),
+            });
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                quarantined.push(QuarantinedKnowledgeFile {
+                    project: project.clone(),
+                    path: path_string,
+                    reason: QuarantineReason::UnreadableRepoEntry,
+                    detail: err.to_string(),
+                });
+                continue;
+            }
+        };
+        let parsed: KnowledgeEntry = match serde_json::from_slice(&bytes) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                quarantined.push(QuarantinedKnowledgeFile {
+                    project: project.clone(),
+                    path: path_string,
+                    reason: QuarantineReason::MalformedRepoEntry,
+                    detail: err.to_string(),
+                });
+                continue;
+            }
+        };
+        let stem = path.file_stem().and_then(|stem| stem.to_str());
+        if stem != Some(parsed.id.as_str()) {
+            quarantined.push(QuarantinedKnowledgeFile {
+                project: project.clone(),
+                path: path_string,
+                reason: QuarantineReason::FilenameIdMismatch,
+                detail: format!("filename stem {stem:?} does not match id {}", parsed.id),
+            });
+            continue;
+        }
+        if parsed.scope != Scope::Project {
+            quarantined.push(QuarantinedKnowledgeFile {
+                project: project.clone(),
+                path: path_string,
+                reason: QuarantineReason::InvalidRepoEntryScope,
+                detail: format!(
+                    "repo-owned entry {} has scope {:?}",
+                    parsed.id, parsed.scope
+                ),
+            });
+            continue;
+        }
+        if parsed.project.is_some() {
+            quarantined.push(QuarantinedKnowledgeFile {
+                project: project.clone(),
+                path: path_string,
+                reason: QuarantineReason::RepoEntryContainsPathAuthority,
+                detail: format!("repo-owned entry {} embeds a project path", parsed.id),
+            });
+            continue;
+        }
+        if !loaded_entries.iter().any(|entry| {
+            entry.id == parsed.id
+                && entry.scope == Scope::Project
+                && entry
+                    .project
+                    .as_deref()
+                    .is_some_and(|path| project_path_matches(path, project_root))
+        }) {
+            quarantined.push(QuarantinedKnowledgeFile {
+                project: project.clone(),
+                path: path_string,
+                reason: QuarantineReason::LoadedStoreMismatch,
+                detail: format!(
+                    "repo-owned entry {} is absent from the loaded project scope",
+                    parsed.id
+                ),
+            });
+        }
+    }
+    quarantined.sort_by(|left, right| left.path.cmp(&right.path));
+    quarantined
 }
 
 fn project_path_matches(raw: &str, project_root: &Path) -> bool {
@@ -608,6 +822,7 @@ mod tests {
         let quarantine: QuarantineLedgerStore =
             serde_json::from_slice(&std::fs::read(&report.quarantine_path).unwrap()).unwrap();
         assert!(quarantine.entries.is_empty());
+        assert!(quarantine.files.is_empty());
 
         let before = std::fs::read(&report.inventory_path).unwrap();
         persist_schema_epoch_inventory(&entries, std::slice::from_ref(&root), &state, |_| {
@@ -647,11 +862,47 @@ mod tests {
     fn path_fallback_cut_marker_is_persistent_and_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        assert!(!path_fallback_was_cut(&root));
+        assert!(!path_fallback_was_cut(&root).unwrap());
         let path = persist_path_fallback_cut(&root).unwrap();
-        assert!(path_fallback_was_cut(&root));
+        assert!(path_fallback_was_cut(&root).unwrap());
         let first = std::fs::read(&path).unwrap();
         assert_eq!(persist_path_fallback_cut(&root).unwrap(), path);
         assert_eq!(std::fs::read(path).unwrap(), first);
+    }
+
+    #[test]
+    fn malformed_repo_file_blocks_marker_and_is_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        git_repo(&root);
+        let knowledge_dir = root.join(".bbox/knowledge");
+        std::fs::create_dir_all(&knowledge_dir).unwrap();
+        std::fs::write(knowledge_dir.join("broken.json"), b"{not json").unwrap();
+        let state = root.join("state");
+
+        let report =
+            persist_schema_epoch_inventory(&[], &[root.clone()], &state, |_| recorded("repofam"))
+                .unwrap();
+
+        assert!(!report.inventory.is_covered());
+        assert!(report.marked_scopes.is_empty());
+        assert!(!knowledge_dir.join(SCHEMA_EPOCH_MARKER).exists());
+        let quarantine: QuarantineLedgerStore =
+            serde_json::from_slice(&std::fs::read(&report.quarantine_path).unwrap()).unwrap();
+        assert_eq!(quarantine.files.len(), 1);
+        assert_eq!(
+            quarantine.files[0].reason,
+            QuarantineReason::MalformedRepoEntry
+        );
+    }
+
+    #[test]
+    fn malformed_cut_marker_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join(PATH_FALLBACK_CUT_MARKER), b"{}").unwrap();
+
+        assert!(path_fallback_was_cut(&root).is_err());
+        assert!(persist_path_fallback_cut(&root).is_err());
     }
 }

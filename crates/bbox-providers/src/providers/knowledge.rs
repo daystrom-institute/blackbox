@@ -31,6 +31,7 @@ impl InspectableEntityProvider for KnowledgeProvider {
         if let Some(kb) = ctx.knowledge_view() {
             let entry = kb
                 .entry(id)
+                .or_else(|| kb.entry_for_logical_ref(&format!("knowledge:{id}")))
                 .ok_or_else(|| anyhow::anyhow!("knowledge entry {id} not found"))?;
             insert_entry_properties(&mut properties, entry);
         } else if let Some(stores) = ctx.stores() {
@@ -89,7 +90,10 @@ impl InspectableEntityProvider for KnowledgeProvider {
         let EntityRef::Knowledge { id } = r else {
             return None;
         };
-        if let Some(entry) = ctx.knowledge_view().and_then(|kb| kb.entry(id)) {
+        if let Some(entry) = ctx.knowledge_view().and_then(|kb| {
+            kb.entry(id)
+                .or_else(|| kb.entry_for_logical_ref(&format!("knowledge:{id}")))
+        }) {
             return Some(truncate_label(&entry.title));
         }
         if let Some(stores) = ctx.stores() {

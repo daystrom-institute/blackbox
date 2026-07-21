@@ -734,8 +734,9 @@ mod tests {
             .hybrid_bm25_hits("PEER CONTENT", 10, Some("knowledge"))
             .unwrap();
         assert!(
-            peer_hits.iter().any(|hit| hit.entity_id == peer_ref),
-            "{peer_hits:?}"
+            !peer_hits.iter().any(|hit| hit.entity_id == peer_ref),
+            "static corpus search must not expose checkout-only knowledge: {peer_hits:?}"
         );
+        assert!(all.knowledge.entry(&peer_ref).is_some(), "{peer_hits:?}");
     }
 }

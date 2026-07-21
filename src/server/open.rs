@@ -111,7 +111,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         }
     }
 
-    let path_fallback_cut = bbox_knowledge::inventory::path_fallback_was_cut(&cfg.paths.bro_home);
+    let path_fallback_cut = bbox_knowledge::inventory::path_fallback_was_cut(&cfg.paths.bro_home)?;
     let mut kb = Knowledge::open(&kb_path)?;
     kb.set_path_fallback_cut(path_fallback_cut);
     tracing::info!("Knowledge store: {}", kb_path.display());
@@ -284,6 +284,8 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         )?),
         knowledge_overlays: RwLock::new(bbox_knowledge::overlay::KnowledgeOverlayStore::default()),
         gap_overlays: RwLock::new(bbox_gaps::overlay::GapOverlayStore::default()),
+        knowledge_overlay_refresh: parking_lot::Mutex::new(()),
+        gap_overlay_refresh: parking_lot::Mutex::new(()),
         path_fallback_cut: std::sync::atomic::AtomicBool::new(path_fallback_cut),
         knowledge_published_cache: RwLock::new(Default::default()),
         packets: RwLock::new(packets_store),

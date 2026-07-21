@@ -4,8 +4,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tantivy::schema::Term;
-use tantivy::{Index, IndexWriter};
+use tantivy::collector::{Count, TopDocs};
+use tantivy::query::TermQuery;
+use tantivy::schema::{IndexRecordOption, Term};
+use tantivy::{Index, IndexWriter, TantivyDocument};
 
 use super::knowledge_docs;
 pub use super::passes::*;
@@ -124,11 +126,19 @@ pub(super) fn execute_reindex_pass(
     writer: &mut IndexWriter,
     drain: &mut dyn FnMut(&mut IndexWriter),
 ) -> Result<String> {
+    let provisional_documents = if full {
+        collect_provisional_documents(index, fields)?
+    } else {
+        Vec::new()
+    };
     // Reload meta at pass start (a prior pass may have committed since the
     // scheduler's speculative scan).
     let mut meta = if full {
         tracing::info!("auto-reindex: periodic full rebuild requested");
         writer.delete_all_documents()?;
+        for document in provisional_documents {
+            writer.add_document(document)?;
+        }
         // Don't commit yet — let the rebuild work and the trailing
         // writer.commit() atomically commit delete+adds together.
         // If we commit delete now and a later step fails, the index
@@ -308,6 +318,27 @@ pub(super) fn execute_reindex_pass(
     );
     tracing::info!("{}", summary);
     Ok(summary)
+}
+
+fn collect_provisional_documents(
+    index: &Index,
+    fields: FieldHandles,
+) -> Result<Vec<TantivyDocument>> {
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let query = TermQuery::new(
+        Term::from_field_text(fields.knowledge_visibility, "provisional"),
+        IndexRecordOption::Basic,
+    );
+    let count = searcher.search(&query, &Count)?;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    searcher
+        .search(&query, &TopDocs::with_limit(count))?
+        .into_iter()
+        .map(|(_, address)| searcher.doc::<TantivyDocument>(address).map_err(Into::into))
+        .collect()
 }
 
 /// Spawn the background reindex thread. Runs every `interval` seconds.

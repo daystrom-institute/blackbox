@@ -429,15 +429,12 @@ impl BlackboxServer {
                 "{legacy_gaps} central path-scoped gap entries remain"
             ));
         }
-        if already_cut {
-            return Ok(PathFallbackCutReport {
-                cut: true,
-                blockers,
-                ..Default::default()
-            });
-        }
-
         let projects = self.state.projects.read().list();
+        if projects.is_empty() {
+            blockers.push(
+                "no registered project scopes exist; refusing a vacuous path-fallback cut".into(),
+            );
+        }
         let mut scopes = BTreeSet::new();
         for project in &projects {
             match project_published_scope(project, crate::config::read_repo_id_inputs) {
@@ -503,6 +500,14 @@ impl BlackboxServer {
                     "scope {scope:?} has an invalid committed schema epoch marker: {err}"
                 )),
             }
+        }
+
+        if already_cut {
+            return Ok(PathFallbackCutReport {
+                cut: true,
+                blockers,
+                ..Default::default()
+            });
         }
 
         if !blockers.is_empty() {
@@ -853,12 +858,29 @@ mod tests {
         assert!(cut.cut);
         assert!(cut.newly_cut);
         assert!(server.path_fallback_is_cut());
-        assert!(bbox_knowledge::inventory::path_fallback_was_cut(
-            &server.state.store_dir
-        ));
+        assert!(bbox_knowledge::inventory::path_fallback_was_cut(&server.state.store_dir).unwrap());
 
         let repeated = server.reconcile_path_fallback_cut(&inventory).unwrap();
         assert!(repeated.cut);
         assert!(!repeated.newly_cut);
+    }
+
+    #[test]
+    fn path_fallback_cut_refuses_empty_project_registry() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = BlackboxServer::new(std::sync::Arc::new(SharedState::for_test(temp.path())));
+        let inventory = server.run_knowledge_schema_epoch_inventory().unwrap();
+
+        let report = server.reconcile_path_fallback_cut(&inventory).unwrap();
+
+        assert!(!report.cut);
+        assert!(
+            report
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("vacuous path-fallback cut")),
+            "{:?}",
+            report.blockers
+        );
     }
 }

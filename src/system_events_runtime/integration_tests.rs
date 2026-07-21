@@ -93,6 +93,8 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         ),
         knowledge_overlays: RwLock::new(bbox_knowledge::overlay::KnowledgeOverlayStore::default()),
         gap_overlays: RwLock::new(bbox_gaps::overlay::GapOverlayStore::default()),
+        knowledge_overlay_refresh: parking_lot::Mutex::new(()),
+        gap_overlay_refresh: parking_lot::Mutex::new(()),
         path_fallback_cut: std::sync::atomic::AtomicBool::new(false),
         knowledge_published_cache: RwLock::new(Default::default()),
         packets: RwLock::new(packets),

@@ -96,11 +96,33 @@ impl GapOverlaySnapshot {
 #[derive(Debug, Default)]
 pub struct GapOverlayStore {
     snapshots: BTreeMap<GapOverlayKey, GapOverlaySnapshot>,
+    requested_generations: BTreeMap<GapOverlayKey, u64>,
+    next_generation: u64,
 }
 
 impl GapOverlayStore {
-    pub fn publish(&mut self, snapshot: GapOverlaySnapshot) {
+    pub fn begin_refresh(&mut self, key: GapOverlayKey) -> u64 {
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("gap overlay refresh generation exhausted");
+        let generation = self.next_generation;
+        self.requested_generations.insert(key, generation);
+        generation
+    }
+
+    pub fn publish_if_latest(&mut self, generation: u64, snapshot: GapOverlaySnapshot) -> bool {
+        if self.requested_generations.get(&snapshot.key) != Some(&generation) {
+            return false;
+        }
         self.snapshots.insert(snapshot.key.clone(), snapshot);
+        true
+    }
+
+    pub fn publish(&mut self, snapshot: GapOverlaySnapshot) {
+        let generation = self.begin_refresh(snapshot.key.clone());
+        let published = self.publish_if_latest(generation, snapshot);
+        debug_assert!(published);
     }
 
     pub fn get(
@@ -123,10 +145,12 @@ impl GapOverlayStore {
         published_scope: &PublishedScope,
         checkout_id: &str,
     ) -> Option<GapOverlaySnapshot> {
-        self.snapshots.remove(&GapOverlayKey {
+        let key = GapOverlayKey {
             published_scope: published_scope.clone(),
             checkout_id: checkout_id.to_string(),
-        })
+        };
+        self.requested_generations.remove(&key);
+        self.snapshots.remove(&key)
     }
 
     pub fn remove_checkout(&mut self, checkout_id: &str) -> Vec<GapOverlaySnapshot> {
@@ -136,6 +160,8 @@ impl GapOverlayStore {
             .filter(|key| key.checkout_id == checkout_id)
             .cloned()
             .collect::<Vec<_>>();
+        self.requested_generations
+            .retain(|key, _| key.checkout_id != checkout_id);
         keys.into_iter()
             .filter_map(|key| self.snapshots.remove(&key))
             .collect()
@@ -172,7 +198,7 @@ pub fn load_published_snapshot_at_commit(
     durable_project: &str,
 ) -> Result<PublishedGapSnapshot> {
     let tree_dir = gaps_tree_dir(scope);
-    let files = read_committed_map(publisher_root, publisher_commit, &tree_dir)?;
+    let files = read_committed_map(publisher_root, publisher_commit, &tree_dir, None)?;
     let mut gaps = BTreeMap::new();
     for (filename, bytes) in files {
         let mut gap: GapNote = serde_json::from_slice(&bytes)
@@ -227,17 +253,22 @@ fn recompute_overlay_inner(
         })?;
     let checkout_head = git::current_head(checkout_root)
         .with_context(|| format!("checkout {} has no HEAD", checkout_root.display()))?;
-    let merge_base = git::merge_base(checkout_root, &checkout_head, &publisher_commit)
-        .with_context(|| {
-            format!(
-                "no merge base between checkout {} and published commit {}",
-                checkout_root.display(),
-                publisher_commit
-            )
-        })?;
+    let merge_base = git::merge_base_with_alternate(
+        checkout_root,
+        &checkout_head,
+        &publisher_commit,
+        Some(publisher_root),
+    )
+    .with_context(|| {
+        format!(
+            "no merge base between checkout {} and published commit {}",
+            checkout_root.display(),
+            publisher_commit
+        )
+    })?;
     let tree_dir = gaps_tree_dir(&checkout.published_scope);
-    let baseline = read_committed_map(checkout_root, &merge_base, &tree_dir)?;
-    let published = read_committed_map(publisher_root, &publisher_commit, &tree_dir)?;
+    let baseline = read_committed_map(checkout_root, &merge_base, &tree_dir, Some(publisher_root))?;
+    let published = read_committed_map(publisher_root, &publisher_commit, &tree_dir, None)?;
     let working = read_working_map(Path::new(&checkout.checkout_project_dir))?;
     let working_fingerprint = fingerprint_map(&working);
 
@@ -335,18 +366,22 @@ fn read_committed_map(
     root: &Path,
     commit: &str,
     tree_dir: &str,
+    alternate_root: Option<&Path>,
 ) -> Result<BTreeMap<String, Vec<u8>>> {
     let prefix = format!("{tree_dir}/");
     let mut files = BTreeMap::new();
-    for repo_path in git::list_committed_dir_result(root, commit, tree_dir)? {
+    for repo_path in
+        git::list_committed_dir_result_with_alternate(root, commit, tree_dir, alternate_root)?
+    {
         let Some(filename) = repo_path.strip_prefix(&prefix) else {
             continue;
         };
         if filename.contains('/') || !filename.ends_with(".json") {
             continue;
         }
-        let bytes = git::read_committed_file_bytes(root, commit, &repo_path)
-            .with_context(|| format!("reading committed gap file {repo_path} at {commit}"))?;
+        let bytes =
+            git::read_committed_file_bytes_with_alternate(root, commit, &repo_path, alternate_root)
+                .with_context(|| format!("reading committed gap file {repo_path} at {commit}"))?;
         files.insert(filename.to_string(), bytes);
     }
     Ok(files)
@@ -545,5 +580,38 @@ mod tests {
         assert!(!promoted.values.contains_key("gap-11111111"));
         assert!(!promoted.values.contains_key("gap-22222222"));
         assert!(promoted.values.contains_key("gap-33333333"));
+    }
+
+    #[test]
+    fn stale_refresh_cannot_overwrite_newer_snapshot() {
+        let checkout = ResolvedCheckoutScope {
+            published_scope: PublishedScope {
+                repo_id: "repo".into(),
+                bbox_root_relpath: ".".into(),
+            },
+            checkout_id: "checkout".into(),
+            checkout_dir: "/missing".into(),
+            checkout_project_dir: "/missing".into(),
+            branch_ref: None,
+        };
+        let key = GapOverlayKey {
+            published_scope: checkout.published_scope.clone(),
+            checkout_id: checkout.checkout_id.clone(),
+        };
+        let mut store = GapOverlayStore::default();
+        let stale = store.begin_refresh(key.clone());
+        let current = store.begin_refresh(key);
+
+        assert!(
+            store.publish_if_latest(current, GapOverlaySnapshot::invalid(&checkout, "current"))
+        );
+        assert!(!store.publish_if_latest(stale, GapOverlaySnapshot::invalid(&checkout, "stale")));
+        assert_eq!(
+            store
+                .get(&checkout.published_scope, &checkout.checkout_id)
+                .unwrap()
+                .diagnostics,
+            ["current"]
+        );
     }
 }

@@ -154,6 +154,7 @@ impl ServerHandler for BlackboxServer {
                     };
                     server.register_dark_knowledge_checkout(&checkout)?;
                     server.refresh_dark_knowledge_overlay(&checkout);
+                    server.refresh_dark_gap_overlay(&checkout);
                     Ok(Some(Arc::new(checkout)))
                 })
                 .await

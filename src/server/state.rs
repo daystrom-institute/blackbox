@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, OnceLock};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rmcp::handler::server::router::tool::ToolRouter;
 use serde::Serialize;
 use serde_json::Value;
@@ -64,6 +64,10 @@ pub(crate) struct SharedState {
     pub(crate) knowledge_overlays: RwLock<bbox_knowledge::overlay::KnowledgeOverlayStore>,
     /// Gap-store provisional snapshots using the same scope and checkout keys.
     pub(crate) gap_overlays: RwLock<bbox_gaps::overlay::GapOverlayStore>,
+    /// Serializes checkout recomputation through publication and index
+    /// convergence so an older refresh cannot finish after a newer one.
+    pub(crate) knowledge_overlay_refresh: Mutex<()>,
+    pub(crate) gap_overlay_refresh: Mutex<()>,
     /// Monotonic local migration gate. Once true, path strings remain input
     /// selectors only and can never regain project-scope authority.
     pub(crate) path_fallback_cut: AtomicBool,
@@ -407,7 +411,8 @@ impl SharedState {
         // repo-owned; the central store holds only global entries).
         let kb_path = store_dir.join("kb.json");
         let mut kb = Knowledge::open(&kb_path).unwrap();
-        let path_fallback_cut = bbox_knowledge::inventory::path_fallback_was_cut(store_dir);
+        let path_fallback_cut =
+            bbox_knowledge::inventory::path_fallback_was_cut(store_dir).unwrap();
         kb.set_path_fallback_cut(path_fallback_cut);
         let kb_project_roots: Vec<std::path::PathBuf> =
             ProjectRegistry::load_records(store_dir.join("projects.json"))
@@ -490,6 +495,8 @@ impl SharedState {
                 bbox_knowledge::overlay::KnowledgeOverlayStore::default(),
             ),
             gap_overlays: RwLock::new(bbox_gaps::overlay::GapOverlayStore::default()),
+            knowledge_overlay_refresh: Mutex::new(()),
+            gap_overlay_refresh: Mutex::new(()),
             path_fallback_cut: AtomicBool::new(path_fallback_cut),
             knowledge_published_cache: RwLock::new(BTreeMap::new()),
             packets: RwLock::new(Packets::open(store_dir).unwrap()),
