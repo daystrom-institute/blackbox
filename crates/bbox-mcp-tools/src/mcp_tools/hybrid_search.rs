@@ -1883,7 +1883,6 @@ pdf_figure = "voyage_visual"
         let path = dir.path().join("knowledge.json");
         let store = KnowledgeStore {
             version: 1,
-            write_redirects: Default::default(),
             built_from: Default::default(),
             provenance: Default::default(),
             entries: vec![KnowledgeEntry {

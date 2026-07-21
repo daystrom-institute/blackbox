@@ -26,32 +26,7 @@ impl BlackboxServer {
                 .as_ref()
                 .context("managed knowledge entry vanished before index sync")?;
             let expected_entry = serde_json::to_vec(expected_entry)?;
-            let documents = self
-                .session_knowledge_view(Some(&project), Some("all"))?
-                .items
-                .into_iter()
-                .filter(|item| item.metadata.logical_ref == logical_ref)
-                .map(|item| {
-                    let provisional = item.entity_ref.starts_with("provisional_knowledge:");
-                    crate::index::KnowledgeIndexDocument {
-                        entry: item.entry,
-                        entity_id: item.entity_ref,
-                        logical_ref: item.metadata.logical_ref,
-                        visibility: if provisional {
-                            "provisional".into()
-                        } else {
-                            "published".into()
-                        },
-                        scope_hash: item
-                            .metadata
-                            .published_scope
-                            .as_ref()
-                            .map(bbox_knowledge::overlay::published_scope_hash),
-                        checkout_id: item.metadata.checkout_id,
-                        snapshot_id: item.metadata.overlay_snapshot_id,
-                    }
-                })
-                .collect::<Vec<_>>();
+            let documents = self.knowledge_documents_for_project(&project, Some(&logical_ref))?;
             if !documents.iter().any(|document| {
                 serde_json::to_vec(&document.entry).is_ok_and(|entry| entry == expected_entry)
             }) {
@@ -73,6 +48,94 @@ impl BlackboxServer {
                 documents,
             });
         Ok(())
+    }
+
+    /// Reconcile one logical ref from the overlay/publisher view without
+    /// requiring the mutable base store to contain a checkout-authored entry.
+    pub(crate) fn sync_knowledge_logical_ref_for_project(
+        &self,
+        entry_id: &str,
+        project: &str,
+    ) -> anyhow::Result<()> {
+        let logical_ref = crate::index::knowledge_entity_id(entry_id);
+        let documents = self.knowledge_documents_for_project(project, Some(&logical_ref))?;
+        self.state
+            .index_writer
+            .enqueue(crate::index::IndexWriteOp::ReplaceKnowledgeLogical {
+                logical_ref,
+                documents,
+            });
+        Ok(())
+    }
+
+    /// Reconcile one complete managed scope when its pinned publisher commit
+    /// moves. This removes published ids that disappeared and replaces only
+    /// that scope, preserving globals and unrelated projects.
+    pub(crate) fn sync_knowledge_scope_to_index(
+        &self,
+        scope: &bbox_corpus_core::identity::PublishedScope,
+        project: &str,
+    ) -> anyhow::Result<()> {
+        let scope_hash = bbox_knowledge::overlay::published_scope_hash(scope);
+        let documents = self
+            .knowledge_documents_for_project(project, None)?
+            .into_iter()
+            .filter(|document| document.scope_hash.as_deref() == Some(scope_hash.as_str()))
+            .collect();
+        self.state
+            .index_writer
+            .enqueue(crate::index::IndexWriteOp::ReplaceKnowledgeScope {
+                scope_hash,
+                documents,
+            });
+        Ok(())
+    }
+
+    pub(crate) fn clear_knowledge_scope_in_index(
+        &self,
+        scope: &bbox_corpus_core::identity::PublishedScope,
+    ) {
+        self.state
+            .index_writer
+            .enqueue(crate::index::IndexWriteOp::ReplaceKnowledgeScope {
+                scope_hash: bbox_knowledge::overlay::published_scope_hash(scope),
+                documents: Vec::new(),
+            });
+    }
+
+    fn knowledge_documents_for_project(
+        &self,
+        project: &str,
+        logical_ref: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::index::KnowledgeIndexDocument>> {
+        Ok(self
+            .session_knowledge_view(Some(project), Some("all"))?
+            .items
+            .into_iter()
+            .filter(|item| {
+                logical_ref.is_none_or(|logical_ref| item.metadata.logical_ref == logical_ref)
+            })
+            .map(|item| {
+                let provisional = item.entity_ref.starts_with("provisional_knowledge:");
+                crate::index::KnowledgeIndexDocument {
+                    entry: item.entry,
+                    entity_id: item.entity_ref,
+                    logical_ref: item.metadata.logical_ref,
+                    visibility: if provisional {
+                        "provisional".into()
+                    } else {
+                        "published".into()
+                    },
+                    scope_hash: item
+                        .metadata
+                        .published_scope
+                        .as_ref()
+                        .map(bbox_knowledge::overlay::published_scope_hash),
+                    checkout_id: item.metadata.checkout_id,
+                    snapshot_id: item.metadata.overlay_snapshot_id,
+                }
+            })
+            .collect())
     }
 
     pub(crate) fn tombstone_knowledge_entry_in_index(&self, entry_id: &str) -> anyhow::Result<()> {

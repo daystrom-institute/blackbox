@@ -136,6 +136,30 @@ pub fn apply_knowledge_logical_replace(
     Ok(())
 }
 
+/// Replace every published or provisional document for one managed project
+/// scope while leaving global knowledge and other repositories untouched.
+/// This is the convergence operation used when a pinned publisher ref moves.
+pub fn apply_knowledge_scope_replace(
+    writer: &mut IndexWriter,
+    fields: FieldHandles,
+    knowledge_path: &Path,
+    scope_hash: &str,
+    documents: &[KnowledgeIndexDocument],
+) -> Result<()> {
+    writer.delete_term(Term::from_field_text(
+        fields.knowledge_scope_hash,
+        scope_hash,
+    ));
+    for document in documents
+        .iter()
+        .filter(|document| document.scope_hash.as_deref() == Some(scope_hash))
+        .filter(|document| indexable_knowledge_entry(&document.entry))
+    {
+        writer.add_document(build_knowledge_index_doc(document, knowledge_path, fields))?;
+    }
+    Ok(())
+}
+
 pub fn indexable_knowledge_entry(entry: &KnowledgeEntry) -> bool {
     // Superseded entries remain searchable so history queries can find the
     // original decision; H1 rerank should downweight them by status.
@@ -155,7 +179,7 @@ pub fn reindex_knowledge_store_standalone(
     // Central knowledge contributes globals and legacy, non-repo-owned
     // projects. Registered project scopes are replaced below from their
     // committed pinned publisher tree, never from working-tree bytes or a
-    // redirected central retention copy.
+    // legacy central project copy.
     let knowledge = Knowledge::open(knowledge_path)?;
     let projects =
         crate::projects::ProjectRegistry::load_records(projects_path).unwrap_or_default();
@@ -452,7 +476,6 @@ mod tests {
             &kb_path,
             serde_json::to_string(&KnowledgeStore {
                 version: 1,
-                write_redirects: Default::default(),
                 built_from: Default::default(),
                 provenance: Default::default(),
                 entries: vec![],

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::knowledge::{
     DecideParams, ForgetParams, KnowledgeLinkParams, KnowledgeListParams, LearnParams,
@@ -128,7 +128,7 @@ impl BlackboxServer {
     /// resolution: the entry's durable scope becomes the registered base
     /// (so render/list/inject filters keyed by the base path match it), and
     /// the returned write-dir — `Some` only for a recognized worktree —
-    /// redirects the repo-owned `.bbox/knowledge/` file into the caller's
+    /// routes the repo-owned `.bbox/knowledge/` file into the caller's
     /// checkout so it travels with the branch (gap-de82a74d). Absence of
     /// `project` means GLOBAL write scope (tool-arg-defaulting §3.1) and is
     /// never touched; empty/whitespace values are left for store validation.
@@ -142,52 +142,30 @@ impl BlackboxServer {
         let Some(raw) = project.clone().filter(|s| !s.trim().is_empty()) else {
             return Ok((None, None));
         };
-        // Preserve the established write resolution as the behavior-bearing
-        // path. Dark-overlay identity and registry state are observational in
-        // this slice, so their failure must never reject a write that the
-        // legacy path can perform.
-        let (durable_scope, write_dir) = self.resolve_project_write_scope(&raw);
-        *project = Some(durable_scope.clone());
-
-        let checkout = match self.resolve_project_write(&raw) {
-            Ok(resolution)
-                if resolution.durable_scope == durable_scope
-                    && resolution.write_dir == write_dir =>
-            {
-                resolution.checkout_scope
-            }
-            Ok(resolution) => {
-                tracing::warn!(
-                    project = %raw,
-                    legacy_scope = %durable_scope,
-                    overlay_scope = %resolution.durable_scope,
-                    "dark knowledge overlay resolution diverged from legacy write scope; continuing legacy write"
-                );
-                None
-            }
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    project = %raw,
-                    "dark knowledge overlay admission failed; continuing legacy write"
-                );
-                None
-            }
-        };
-        let checkout = match checkout {
-            Some(checkout) => match self.register_dark_knowledge_checkout(&checkout) {
-                Ok(()) => Some(checkout),
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        project = %raw,
-                        "dark knowledge checkout registration failed; continuing legacy write"
-                    );
-                    None
-                }
-            },
-            None => None,
-        };
+        let resolution = self.resolve_project_write(&raw)?;
+        let durable_scope = resolution.durable_scope;
+        let write_dir = resolution.write_dir;
+        let checkout = resolution.checkout_scope;
+        let managed_repo_owned = checkout.is_none()
+            && self
+                .state
+                .projects
+                .read()
+                .list()
+                .iter()
+                .any(|record| record.canonical_path == durable_scope)
+            && std::path::Path::new(&durable_scope)
+                .join(".bbox/knowledge")
+                .is_dir();
+        if (write_dir.is_some() || managed_repo_owned) && checkout.is_none() {
+            anyhow::bail!(
+                "managed checkout {raw} has no provisional identity; refusing a write that cannot be reconstructed after restart"
+            );
+        }
+        *project = Some(durable_scope);
+        if let Some(checkout) = checkout.as_ref() {
+            self.register_dark_knowledge_checkout(checkout)?;
+        }
         Ok((write_dir, checkout))
     }
 
@@ -214,6 +192,13 @@ impl BlackboxServer {
         use bbox_knowledge::overlay::{OverlaySnapshot, recompute_overlay};
 
         let projects = self.state.projects.read().list();
+        let prior = self
+            .state
+            .knowledge_overlays
+            .read()
+            .get(&checkout.published_scope, &checkout.checkout_id)
+            .cloned();
+        let mut publisher_project = None;
         let snapshot = match elect_publisher(
             &projects,
             &checkout.published_scope,
@@ -239,13 +224,57 @@ impl BlackboxServer {
                     .ensure_pinned(&checkout.published_scope, std::path::Path::new(&root));
                 match pin {
                     Ok(pin) => {
+                        publisher_project = Some(root.clone());
                         recompute_overlay(std::path::Path::new(&root), &pin.branch_ref, checkout)
                     }
                     Err(err) => OverlaySnapshot::invalid(checkout, format!("{err:#}")),
                 }
             }
         };
+        let prior_commit = prior
+            .as_ref()
+            .and_then(|snapshot| snapshot.stamp.as_ref())
+            .map(|stamp| stamp.publisher_commit.as_str());
+        let current_commit = snapshot
+            .stamp
+            .as_ref()
+            .map(|stamp| stamp.publisher_commit.as_str());
+        let publisher_moved = prior_commit != current_commit;
+        let mut affected = BTreeSet::new();
+        if let Some(prior) = &prior {
+            affected.extend(prior.values.keys().cloned());
+        }
+        affected.extend(snapshot.values.keys().cloned());
+
+        self.invalidate_published_knowledge_cache(&checkout.published_scope);
         self.state.knowledge_overlays.write().publish(snapshot);
+
+        let Some(project) = publisher_project else {
+            self.clear_knowledge_scope_in_index(&checkout.published_scope);
+            return;
+        };
+        if publisher_moved {
+            if let Err(err) =
+                self.sync_knowledge_scope_to_index(&checkout.published_scope, &project)
+            {
+                tracing::warn!(
+                    error = %err,
+                    scope = ?checkout.published_scope,
+                    "knowledge publisher convergence failed closed"
+                );
+                self.clear_knowledge_scope_in_index(&checkout.published_scope);
+            }
+            return;
+        }
+        for entry_id in affected {
+            if let Err(err) = self.sync_knowledge_logical_ref_for_project(&entry_id, &project) {
+                tracing::warn!(
+                    error = %err,
+                    entry = %entry_id,
+                    "knowledge overlay convergence failed; the next observer pass will retry"
+                );
+            }
+        }
     }
 }
 
@@ -299,24 +328,27 @@ impl BlackboxServer {
             let (write_dir, checkout) = server.prepare_knowledge_write(&mut p.project)?;
             let mut kb = server.state.kb.write();
             let result = kb.learn_result_with_write_dir(&p, false, write_dir.as_deref())?;
-            let rider = kb.repo_record_rider(&result.id);
+            let rider = kb.repo_record_rider_at(&result.id, write_dir.as_deref());
             drop(kb);
+            let overlay_refreshed = checkout.is_some();
             if let Some(checkout) = checkout.as_ref() {
                 server.refresh_dark_knowledge_overlay(checkout);
             }
-            Ok::<_, anyhow::Error>((result, rider))
+            Ok::<_, anyhow::Error>((result, rider, overlay_refreshed))
         })
         .await
         .map_err(|e| anyhow::anyhow!("knowledge write task failed: {e}"))
         .and_then(std::convert::identity);
 
         match write_result {
-            Ok((result, rider)) => {
+            Ok((result, rider, overlay_refreshed)) => {
                 if let Err(e) = self.state.kb_persister.request_durable().await {
                     log_tool_err("bbox_learn", start, &e);
                     return Self::err_text(&format!("Error: {e:#}"));
                 }
-                if let Err(err) = self.sync_knowledge_entry_to_index(&result.id) {
+                if !overlay_refreshed
+                    && let Err(err) = self.sync_knowledge_entry_to_index(&result.id)
+                {
                     tracing::warn!(error = %err, entry = %result.id, "knowledge index sync failed; will reconstruct on next reindex cycle");
                 }
                 match format {
@@ -379,24 +411,27 @@ impl BlackboxServer {
             let (write_dir, checkout) = server.prepare_knowledge_write(&mut p.project)?;
             let mut kb = server.state.kb.write();
             let result = kb.remember_result_with_write_dir(&p, false, write_dir.as_deref())?;
-            let rider = kb.repo_record_rider(&result.id);
+            let rider = kb.repo_record_rider_at(&result.id, write_dir.as_deref());
             drop(kb);
+            let overlay_refreshed = checkout.is_some();
             if let Some(checkout) = checkout.as_ref() {
                 server.refresh_dark_knowledge_overlay(checkout);
             }
-            Ok::<_, anyhow::Error>((result, rider))
+            Ok::<_, anyhow::Error>((result, rider, overlay_refreshed))
         })
         .await
         .map_err(|e| anyhow::anyhow!("knowledge write task failed: {e}"))
         .and_then(std::convert::identity);
 
         match write_result {
-            Ok((result, rider)) => {
+            Ok((result, rider, overlay_refreshed)) => {
                 if let Err(e) = self.state.kb_persister.request_durable().await {
                     log_tool_err("bbox_remember", start, &e);
                     return Self::err_text(&format!("Error: {e:#}"));
                 }
-                if let Err(err) = self.sync_knowledge_entry_to_index(&result.id) {
+                if !overlay_refreshed
+                    && let Err(err) = self.sync_knowledge_entry_to_index(&result.id)
+                {
                     tracing::warn!(error = %err, entry = %result.id, "knowledge index sync failed; will reconstruct on next reindex cycle");
                 }
                 let mut message = result.message;
@@ -428,27 +463,30 @@ impl BlackboxServer {
             let (write_dir, checkout) = server.prepare_knowledge_write(&mut p.project)?;
             let mut kb = server.state.kb.write();
             let result = kb.decide_result_with_write_dir(&p, false, write_dir.as_deref())?;
-            let rider = kb.repo_record_rider(&result.id);
+            let rider = kb.repo_record_rider_at(&result.id, write_dir.as_deref());
             drop(kb);
+            let overlay_refreshed = checkout.is_some();
             if let Some(checkout) = checkout.as_ref() {
                 server.refresh_dark_knowledge_overlay(checkout);
             }
-            Ok::<_, anyhow::Error>((result, rider))
+            Ok::<_, anyhow::Error>((result, rider, overlay_refreshed))
         })
         .await
         .map_err(|e| anyhow::anyhow!("knowledge write task failed: {e}"))
         .and_then(std::convert::identity);
 
         match write_result {
-            Ok((result, rider)) => {
+            Ok((result, rider, overlay_refreshed)) => {
                 if let Err(e) = self.state.kb_persister.request_durable().await {
                     log_tool_err("bbox_decide", start, &e);
                     return Self::err_text(&format!("Error: {e:#}"));
                 }
-                if let Err(err) = self.sync_knowledge_entry_to_index(&result.id) {
+                if !overlay_refreshed
+                    && let Err(err) = self.sync_knowledge_entry_to_index(&result.id)
+                {
                     tracing::warn!(error = %err, entry = %result.id, "knowledge index sync failed; will reconstruct on next reindex cycle");
                 }
-                if let Some(old_id) = result.superseded.as_deref() {
+                if !overlay_refreshed && let Some(old_id) = result.superseded.as_deref() {
                     if let Err(err) = self.tombstone_knowledge_entry_in_index(old_id) {
                         tracing::warn!(error = %err, entry = %old_id, "knowledge index tombstone failed; will reconstruct on next reindex cycle");
                     }
@@ -1031,20 +1069,19 @@ mod tests {
         assert_ne!(learn.is_error, Some(true), "learn failed: {learn:?}");
 
         // Durable scope = registered base; committed file = worktree checkout.
-        let (id, project) = {
-            let kb = server.state.kb.read();
-            let entry = kb
-                .all_entries()
-                .iter()
-                .find(|e| e.content.contains("WORKTREE_KB_MARKER"))
-                .expect("entry stored");
-            (entry.id.clone(), entry.project.clone())
-        };
-        assert_eq!(
-            project.as_deref(),
-            Some(base_canon.to_string_lossy().as_ref()),
-            "entry must key to the registered base, not the worktree"
-        );
+        // Provisional bytes are intentionally absent from the central store.
+        let ids = std::fs::read_dir(wt_canon.join(".bbox/knowledge"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                (path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+                    .then(|| path.file_stem().unwrap().to_string_lossy().into_owned())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 1, "{ids:?}");
+        let id = ids[0].clone();
+        assert!(server.state.kb.read().entry(&id).is_none());
         let rel = std::path::Path::new(".bbox")
             .join("knowledge")
             .join(format!("{id}.json"));
@@ -1089,6 +1126,19 @@ mod tests {
         // Tool arguments cannot grant own-checkout visibility. Model the MCP
         // transport authority that a real worktree session records at init.
         server.set_session_checkout_for_test(scope, checkout_id, wt_canon.clone());
+        let own = server
+            .session_knowledge_view(Some(base_canon.to_str().unwrap()), Some("own"))
+            .unwrap();
+        let own_entry = own
+            .items
+            .iter()
+            .find(|item| item.entry.id == id)
+            .expect("checkout entry visible through own overlay");
+        assert_eq!(
+            own_entry.entry.project.as_deref(),
+            Some(base_canon.to_string_lossy().as_ref()),
+            "overlay entry must key to the registered base, not the worktree"
+        );
 
         // The other half of the gap: render from the worktree sees the entry.
         let render = server
@@ -1107,9 +1157,8 @@ mod tests {
             "worktree render must include the just-learned entry: {rendered}"
         );
 
-        // Slice 3.3 is observational. If its checkout marker cannot be
-        // created, the established knowledge write still succeeds and lands
-        // in the same worktree path.
+        // A checkout write whose identity cannot be reconstructed after a
+        // restart fails closed before writing another provisional file.
         let local = wt_canon.join(".bbox/local");
         std::fs::remove_dir_all(&local).unwrap();
         std::fs::write(&local, "block overlay marker creation").unwrap();
@@ -1122,26 +1171,12 @@ mod tests {
                 ..Default::default()
             }))
             .await;
-        assert_ne!(
-            degraded.is_error,
-            Some(true),
-            "dark overlay admission must not fail a legacy write: {degraded:?}"
-        );
-        let degraded_id = server
-            .state
-            .kb
-            .read()
-            .all_entries()
-            .iter()
-            .find(|entry| entry.content.contains("WORKTREE_KB_DEGRADED_MARKER"))
-            .expect("degraded entry stored")
-            .id
-            .clone();
-        assert!(
-            wt_canon
-                .join(".bbox/knowledge")
-                .join(format!("{degraded_id}.json"))
-                .exists()
-        );
+        assert_eq!(degraded.is_error, Some(true), "{degraded:?}");
+        let remaining = std::fs::read_dir(wt_canon.join(".bbox/knowledge"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .count();
+        assert_eq!(remaining, 1, "failed admission must not write a new entry");
     }
 }

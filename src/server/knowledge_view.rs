@@ -56,6 +56,12 @@ impl BlackboxServer {
         self.session_checkout.get().and_then(Clone::clone)
     }
 
+    /// Drop the committed-tree cache for a scope before an observer publishes
+    /// a snapshot built from a newly resolved publisher commit.
+    pub(crate) fn invalidate_published_knowledge_cache(&self, scope: &PublishedScope) {
+        self.state.knowledge_published_cache.write().remove(scope);
+    }
+
     #[cfg(test)]
     pub(crate) fn set_session_checkout_for_test(
         &self,
@@ -685,7 +691,8 @@ mod tests {
             &base,
             &["commit", "-q", "-m", "advance published knowledge"],
         );
-        std::thread::sleep(PUBLISHED_REF_CACHE_TTL + Duration::from_millis(25));
+        server.refresh_dark_knowledge_overlay(&own_checkout);
+        server.state.index_writer.flush_blocking().unwrap();
         let refreshed = server
             .session_knowledge_view(Some(base.to_str().unwrap()), Some("published"))
             .unwrap();
@@ -693,5 +700,53 @@ mod tests {
             refreshed.knowledge.entry("shared").unwrap().content,
             "NEW_PUBLISHED_CONTENT"
         );
+        let all = server
+            .session_knowledge_view(Some(base.to_str().unwrap()), Some("all"))
+            .unwrap();
+        assert!(
+            all.knowledge.entry(&own_ref).is_none(),
+            "the matching checkout variant must promote away"
+        );
+        assert_eq!(
+            all.knowledge.entry(&peer_ref).unwrap().content,
+            "PEER_CONTENT",
+            "publisher advancement must preserve another checkout's variant"
+        );
+
+        let published_hits = server
+            .state
+            .idx
+            .read()
+            .search(&crate::index::SearchParams {
+                query: "NEW PUBLISHED CONTENT".into(),
+                mode: None,
+                account: None,
+                project: None,
+                role: None,
+                include_subagents: None,
+                limit: Some(10),
+                exclude_self: None,
+            })
+            .unwrap();
+        assert!(
+            published_hits.contains("NEW_PUBLISHED_CONTENT"),
+            "{published_hits}"
+        );
+        let peer_hits = server
+            .state
+            .idx
+            .read()
+            .search(&crate::index::SearchParams {
+                query: "PEER CONTENT".into(),
+                mode: None,
+                account: None,
+                project: None,
+                role: None,
+                include_subagents: None,
+                limit: Some(10),
+                exclude_self: None,
+            })
+            .unwrap();
+        assert!(peer_hits.contains("PEER_CONTENT"), "{peer_hits}");
     }
 }

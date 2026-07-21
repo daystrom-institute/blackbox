@@ -45,6 +45,10 @@ pub enum IndexWriteOp {
         logical_ref: String,
         documents: Vec<KnowledgeIndexDocument>,
     },
+    ReplaceKnowledgeScope {
+        scope_hash: String,
+        documents: Vec<KnowledgeIndexDocument>,
+    },
     UpsertRoadmap(Box<RoadmapItem>),
     DeleteRoadmap(String),
     UpsertThread(Box<Thread>),
@@ -332,6 +336,19 @@ fn apply_small_op(ctx: &ActorCtx, writer: &mut IndexWriter, op: IndexWriteOp) {
                 &documents,
             ),
         ),
+        IndexWriteOp::ReplaceKnowledgeScope {
+            scope_hash,
+            documents,
+        } => (
+            "replace_knowledge_scope",
+            super::knowledge_docs::apply_knowledge_scope_replace(
+                writer,
+                ctx.fields,
+                knowledge_path(&ctx.config),
+                &scope_hash,
+                &documents,
+            ),
+        ),
         IndexWriteOp::UpsertRoadmap(item) => (
             "upsert_roadmap",
             super::roadmap_docs::apply_roadmap_upsert(
@@ -602,6 +619,45 @@ mod tests {
         assert!(!search(&index, "published obsolete").contains("published"));
         assert!(!search(&index, "provisional obsolete").contains("provisional"));
         assert!(search(&index, "replacement current").contains("replacement"));
+    }
+
+    #[test]
+    fn scope_replace_preserves_globals_and_unrelated_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = test_index(dir.path());
+        let actor = IndexWriterActor::spawn_for(&index);
+        let mut old_scope = KnowledgeIndexDocument::published(test_entry(
+            "scope-a-old",
+            "obsolete scope alpha marker",
+        ));
+        old_scope.scope_hash = Some("scope-alpha".into());
+        let mut other_scope =
+            KnowledgeIndexDocument::published(test_entry("scope-b", "retained scope beta marker"));
+        other_scope.scope_hash = Some("scope-beta".into());
+        let global =
+            KnowledgeIndexDocument::published(test_entry("global-entry", "retained global marker"));
+        actor.enqueue(IndexWriteOp::ReplaceKnowledge(vec![
+            old_scope,
+            other_scope,
+            global,
+        ]));
+        actor.flush_blocking().unwrap();
+
+        let mut current_scope = KnowledgeIndexDocument::published(test_entry(
+            "scope-a-new",
+            "current scope alpha marker",
+        ));
+        current_scope.scope_hash = Some("scope-alpha".into());
+        actor.enqueue(IndexWriteOp::ReplaceKnowledgeScope {
+            scope_hash: "scope-alpha".into(),
+            documents: vec![current_scope],
+        });
+        actor.flush_blocking().unwrap();
+
+        assert!(!search(&index, "obsolete scope alpha").contains("obsolete"));
+        assert!(search(&index, "current scope alpha").contains("current"));
+        assert!(search(&index, "retained scope beta").contains("retained"));
+        assert!(search(&index, "retained global").contains("retained"));
     }
 
     #[test]

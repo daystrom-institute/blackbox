@@ -632,6 +632,50 @@ mod tests {
     }
 
     #[test]
+    fn overlay_suppresses_tombstone_already_absent_at_published_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("repo");
+        std::fs::create_dir_all(&base).unwrap();
+        run(&base, &["init", "-q", "-b", "main"]);
+        run(&base, &["config", "user.email", "t@example.com"]);
+        run(&base, &["config", "user.name", "Test"]);
+        write_entry(&base, &entry("gone", "published then removed"));
+        run(&base, &["add", ".bbox/knowledge"]);
+        run(&base, &["commit", "-q", "-m", "seed"]);
+
+        let worktree = temp.path().join("worktree");
+        run(
+            &base,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        std::fs::remove_file(worktree.join(".bbox/knowledge/gone.json")).unwrap();
+        std::fs::remove_file(base.join(".bbox/knowledge/gone.json")).unwrap();
+        run(&base, &["add", ".bbox/knowledge"]);
+        run(&base, &["commit", "-q", "-m", "publish deletion"]);
+
+        let checkout = ResolvedCheckoutScope {
+            published_scope: PublishedScope {
+                repo_id: "repo".into(),
+                bbox_root_relpath: ".".into(),
+            },
+            checkout_id: "checkout".into(),
+            checkout_dir: worktree.to_string_lossy().into_owned(),
+            checkout_project_dir: worktree.to_string_lossy().into_owned(),
+            branch_ref: Some("refs/heads/feature".into()),
+        };
+        let snapshot = recompute_overlay(&base, "refs/heads/main", &checkout);
+        assert_eq!(snapshot.status, OverlayStatus::Valid, "{snapshot:?}");
+        assert!(snapshot.values.is_empty(), "{snapshot:?}");
+    }
+
+    #[test]
     fn overlay_reads_monorepo_scope_from_repo_relative_tree() {
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().join("repo");
