@@ -106,13 +106,15 @@ impl BlackboxServer {
                     .cloned()
             });
         let explicit_managed_scope = requested_record.is_some();
-
         let managed_paths = projects
             .iter()
             .map(|project| project.canonical_path.as_str())
             .collect::<BTreeSet<_>>();
         let mut items = BTreeMap::<String, KnowledgeViewItem>::new();
         for entry in self.state.kb.read().all_entries() {
+            if self.path_fallback_is_cut() && entry.scope == Scope::Project {
+                continue;
+            }
             let is_managed_project = entry
                 .project
                 .as_deref()

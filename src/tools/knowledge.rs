@@ -149,6 +149,11 @@ impl BlackboxServer {
             .as_ref()
             .map(|checkout| self.resolved_dark_knowledge_carrier(checkout))
             .or(resolution.write_dir);
+        if self.path_fallback_is_cut() && checkout.is_none() {
+            anyhow::bail!(
+                "path-scoped project fallback is retired; project writes require a registered checkout with recorded repo identity"
+            );
+        }
         let managed_repo_owned = checkout.is_none()
             && self
                 .state
@@ -1087,6 +1092,23 @@ mod tests {
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[test]
+    fn path_cut_rejects_unregistered_project_write_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("unregistered");
+        std::fs::create_dir_all(&project).unwrap();
+        let server = crate::server::BlackboxServer::new(std::sync::Arc::new(
+            crate::server::state::SharedState::for_test(tmp.path()),
+        ));
+        server
+            .state
+            .path_fallback_cut
+            .store(true, std::sync::atomic::Ordering::Release);
+        let mut project = Some(project.to_string_lossy().into_owned());
+        let err = server.prepare_knowledge_write(&mut project).unwrap_err();
+        assert!(err.to_string().contains("project writes require"));
     }
 
     /// End-to-end repro of gap-de82a74d: an agent inside an in-tree linked

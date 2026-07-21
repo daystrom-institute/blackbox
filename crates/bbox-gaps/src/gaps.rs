@@ -754,6 +754,8 @@ pub struct GapStore {
     store_path: PathBuf,
     data: GapStoreData,
     project_roots: Vec<PathBuf>,
+    /// Store-layer enforcement for the monotonic path-authority cut.
+    path_fallback_cut: bool,
 }
 
 impl GapStore {
@@ -762,6 +764,7 @@ impl GapStore {
             store_path: store_path.to_path_buf(),
             data: GapStoreData::new(),
             project_roots: Vec::new(),
+            path_fallback_cut: false,
         };
         s.reload()?;
         Ok(s)
@@ -772,6 +775,10 @@ impl GapStore {
     pub fn set_project_roots(&mut self, roots: Vec<PathBuf>) -> Result<()> {
         self.project_roots = roots;
         self.reload()
+    }
+
+    pub fn set_path_fallback_cut(&mut self, cut: bool) {
+        self.path_fallback_cut = cut;
     }
 
     pub fn reload(&mut self) -> Result<()> {
@@ -926,7 +933,34 @@ impl GapStore {
             store_path: PathBuf::new(),
             data: GapStoreData { version: 1, gaps },
             project_roots: Vec::new(),
+            path_fallback_cut: true,
         }
+    }
+
+    /// Project records still relying on the host-local central path key.
+    /// The schema-epoch cut cannot retire that fallback while any remain.
+    pub fn legacy_path_scoped_entry_count(&self) -> Result<usize> {
+        let mut ids = self
+            .data
+            .gaps
+            .iter()
+            .filter(|gap| {
+                gap.project
+                    .as_deref()
+                    .is_some_and(|project| !project_is_repo_owned(Path::new(project)))
+            })
+            .map(|gap| gap.id.clone())
+            .collect::<BTreeSet<_>>();
+        if self.store_path.is_file() {
+            let raw: GapStoreData = serde_json::from_slice(&fs::read(&self.store_path)?)?;
+            ids.extend(
+                raw.gaps
+                    .into_iter()
+                    .filter(|gap| gap.project.is_some())
+                    .map(|gap| gap.id),
+            );
+        }
+        Ok(ids.len())
     }
 
     /// Open (non-addressed) gap with a matching `dedupe_key` in the same scope.
@@ -995,6 +1029,14 @@ impl GapStore {
             ),
             other => anyhow::bail!("scope must be `project` or `global`, got `{other}`"),
         };
+        if self.path_fallback_cut
+            && scope == "project"
+            && (project.is_none() || write_dir.is_none())
+        {
+            anyhow::bail!(
+                "path-scoped project fallback is retired; project gap writes require checkout authority"
+            );
+        }
         self.seed_checkout_entries(project.as_deref(), write_dir.as_deref())?;
 
         let allow_recurrence = p.allow_recurrence.unwrap_or(false);
@@ -1065,6 +1107,11 @@ impl GapStore {
         let path = self.store_path.clone();
         bbox_corpus_core::json_store::with_store_lock(&path, || {
             self.reload()?;
+            if self.path_fallback_cut && gap.project.is_some() {
+                anyhow::bail!(
+                    "path-scoped project fallback is retired; project gap ingestion requires checkout authority"
+                );
+            }
             if let Some(existing) = self.open_duplicate(&gap.dedupe_key, gap.project.as_deref()) {
                 return Ok((existing.id.clone(), false));
             }
@@ -1184,6 +1231,13 @@ impl GapStore {
                 )
             })?;
 
+        if self.path_fallback_cut && self.data.gaps[idx].project.is_some() && p.write_dir.is_none()
+        {
+            anyhow::bail!(
+                "path-scoped project fallback is retired; project gap mutation requires checkout authority"
+            );
+        }
+
         let resolved_id = self.data.gaps[idx].id.clone();
         {
             let gap = &mut self.data.gaps[idx];
@@ -1256,6 +1310,7 @@ impl GapStore {
             .map(|v| parse_blocking_level(Some(v)))
             .transpose()?;
 
+        let path_fallback_cut = self.path_fallback_cut;
         let gap = self
             .data
             .gaps
@@ -1267,6 +1322,12 @@ impl GapStore {
                     p.id
                 )
             })?;
+
+        if path_fallback_cut && gap.project.is_some() && p.write_dir.is_none() {
+            anyhow::bail!(
+                "path-scoped project fallback is retired; project gap mutation requires checkout authority"
+            );
+        }
 
         if let Some(v) = p.title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             gap.title = v.to_string();
@@ -1558,6 +1619,42 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].impact, GapImpact::High);
         assert_eq!(listed[0].gap_kind, GapKind::Tooling);
+    }
+
+    #[test]
+    fn legacy_path_count_reads_the_persisted_central_store() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store_path = root.join("gaps.json");
+        let project = root.join("legacy-project");
+        fs::create_dir_all(&project).unwrap();
+        let mut store = GapStore::open(&store_path).unwrap();
+        store
+            .file(&file_params("legacy", "tooling/test-domain/legacy"))
+            .unwrap();
+        store.data.gaps[0].project = Some(project.to_string_lossy().into_owned());
+        store.save().unwrap();
+        assert_eq!(store.legacy_path_scoped_entry_count().unwrap(), 1);
+
+        fs::create_dir_all(project.join(".bbox/gaps")).unwrap();
+        store.save().unwrap();
+        assert_eq!(store.legacy_path_scoped_entry_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn path_cut_rejects_low_level_project_write_before_mutating() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut store = GapStore::open(&root.join("gaps.json")).unwrap();
+        store.set_path_fallback_cut(true);
+        let mut params = file_params("blocked", "tooling/test-domain/path-cut");
+        params.scope = Some("project".into());
+        params.project = Some(project.to_string_lossy().into_owned());
+        let err = store.file(&params).unwrap_err();
+        assert!(err.to_string().contains("checkout authority"));
+        assert!(store.all().is_empty());
     }
 
     #[test]

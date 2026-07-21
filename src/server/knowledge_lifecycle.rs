@@ -7,7 +7,7 @@ use bbox_corpus_core::identity::{
 };
 use bbox_corpus_core::project_record::{ProjectRecord, ResolvedCheckoutScope};
 use bbox_indexing::checkout_registry::{CheckoutRow, discover_checkout_dirs};
-use bbox_indexing::publisher::{PublisherResolution, elect_publisher};
+use bbox_indexing::publisher::{PublisherResolution, elect_publisher, project_published_scope};
 use bbox_knowledge::knowledge::{KnowledgeEntry, Scope};
 
 use super::BlackboxServer;
@@ -19,6 +19,13 @@ pub(crate) struct KnowledgeCheckoutReconcileReport {
     pub(crate) refreshed: usize,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct PathFallbackCutReport {
+    pub(crate) cut: bool,
+    pub(crate) newly_cut: bool,
+    pub(crate) blockers: Vec<String>,
+}
+
 pub(crate) struct ExistingKnowledgeMutation {
     pub(crate) id: String,
     pub(crate) carrier: Option<String>,
@@ -27,6 +34,12 @@ pub(crate) struct ExistingKnowledgeMutation {
 }
 
 impl BlackboxServer {
+    pub(crate) fn path_fallback_is_cut(&self) -> bool {
+        self.state
+            .path_fallback_cut
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub(crate) fn prepare_existing_knowledge_mutation(
         &self,
         raw_ref: &str,
@@ -51,6 +64,18 @@ impl BlackboxServer {
         let Some(checkout) = self.authoritative_session_checkout() else {
             if provisional_checkout.is_some() {
                 anyhow::bail!("provisional knowledge mutation requires session checkout authority");
+            }
+            if self.path_fallback_is_cut()
+                && self
+                    .state
+                    .kb
+                    .read()
+                    .entry(&id)
+                    .is_some_and(|entry| entry.scope == Scope::Project)
+            {
+                anyhow::bail!(
+                    "path-scoped project fallback is retired; project knowledge mutation requires session checkout authority"
+                );
             }
             return Ok(ExistingKnowledgeMutation {
                 id,
@@ -376,6 +401,154 @@ impl BlackboxServer {
         )
     }
 
+    /// Retire path-keyed project authority only after every local and
+    /// traveling proof is complete. The host-local cut marker is persisted
+    /// before the in-memory flag flips, and its existence makes the cut
+    /// monotonic across restarts.
+    pub(crate) fn reconcile_path_fallback_cut(
+        &self,
+        inventory: &bbox_knowledge::inventory::PersistedInventoryReport,
+    ) -> Result<PathFallbackCutReport> {
+        let already_cut = self.path_fallback_is_cut();
+        let mut blockers = Vec::new();
+        if !inventory.inventory.quarantined.is_empty() {
+            blockers.push(format!(
+                "{} quarantined knowledge entries remain",
+                inventory.inventory.quarantined.len()
+            ));
+        }
+        let legacy_knowledge = self.state.kb.read().legacy_path_scoped_entry_count()?;
+        if legacy_knowledge > 0 {
+            blockers.push(format!(
+                "{legacy_knowledge} central path-scoped knowledge entries remain"
+            ));
+        }
+        let legacy_gaps = self.state.gaps.read().legacy_path_scoped_entry_count()?;
+        if legacy_gaps > 0 {
+            blockers.push(format!(
+                "{legacy_gaps} central path-scoped gap entries remain"
+            ));
+        }
+        if already_cut {
+            return Ok(PathFallbackCutReport {
+                cut: true,
+                blockers,
+                ..Default::default()
+            });
+        }
+
+        let projects = self.state.projects.read().list();
+        let mut scopes = BTreeSet::new();
+        for project in &projects {
+            match project_published_scope(project, crate::config::read_repo_id_inputs) {
+                Some(scope) => {
+                    scopes.insert(scope);
+                }
+                None => blockers.push(format!(
+                    "registered project {} has no recorded published scope",
+                    project.canonical_path
+                )),
+            }
+        }
+        for scope in scopes {
+            let publisher_root =
+                match elect_publisher(&projects, &scope, crate::config::read_repo_id_inputs) {
+                    PublisherResolution::One(root) => root,
+                    PublisherResolution::None => {
+                        blockers.push(format!("scope {scope:?} has no publisher"));
+                        continue;
+                    }
+                    PublisherResolution::Duplicate(paths) => {
+                        blockers.push(format!(
+                            "scope {scope:?} has duplicate publishers: {}",
+                            paths.join(", ")
+                        ));
+                        continue;
+                    }
+                };
+            let pin = match self
+                .state
+                .publisher_refs
+                .write()
+                .ensure_pinned(&scope, Path::new(&publisher_root))
+            {
+                Ok(pin) => pin,
+                Err(err) => {
+                    blockers.push(format!("scope {scope:?} publisher pin failed: {err:#}"));
+                    continue;
+                }
+            };
+            let marker_path = schema_epoch_repo_path(&scope);
+            let Some(raw) = bbox_corpus_core::git::read_committed_file(
+                Path::new(&publisher_root),
+                &pin.branch_ref,
+                &marker_path,
+            ) else {
+                blockers.push(format!(
+                    "scope {scope:?} has no committed schema epoch marker at {}",
+                    pin.branch_ref
+                ));
+                continue;
+            };
+            let marker = serde_json::from_str::<bbox_knowledge::inventory::SchemaEpochMarker>(&raw);
+            match marker {
+                Ok(marker)
+                    if marker.schema_epoch == bbox_knowledge::inventory::SCHEMA_EPOCH
+                        && marker.repo_id == scope.repo_id
+                        && marker.bbox_root_relpath == scope.bbox_root_relpath => {}
+                Ok(_) => blockers.push(format!(
+                    "scope {scope:?} has a mismatched committed schema epoch marker"
+                )),
+                Err(err) => blockers.push(format!(
+                    "scope {scope:?} has an invalid committed schema epoch marker: {err}"
+                )),
+            }
+        }
+
+        if !blockers.is_empty() {
+            return Ok(PathFallbackCutReport {
+                blockers,
+                ..Default::default()
+            });
+        }
+
+        // Close the readiness/write race. Store mutations perform their final
+        // cut check under these same write locks. A mutation already in flight
+        // finishes before this recheck and becomes a blocker; a later mutation
+        // observes the store-layer cut and refuses path authority.
+        let mut knowledge = self.state.kb.write();
+        let mut gaps = self.state.gaps.write();
+        let final_knowledge = knowledge.legacy_path_scoped_entry_count()?;
+        let final_gaps = gaps.legacy_path_scoped_entry_count()?;
+        if final_knowledge > 0 || final_gaps > 0 {
+            if final_knowledge > 0 {
+                blockers.push(format!(
+                    "{final_knowledge} central path-scoped knowledge entries appeared during cut readiness"
+                ));
+            }
+            if final_gaps > 0 {
+                blockers.push(format!(
+                    "{final_gaps} central path-scoped gap entries appeared during cut readiness"
+                ));
+            }
+            return Ok(PathFallbackCutReport {
+                blockers,
+                ..Default::default()
+            });
+        }
+        bbox_knowledge::inventory::persist_path_fallback_cut(&self.state.store_dir)?;
+        knowledge.set_path_fallback_cut(true);
+        gaps.set_path_fallback_cut(true);
+        self.state
+            .path_fallback_cut
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(PathFallbackCutReport {
+            cut: true,
+            newly_cut: true,
+            blockers,
+        })
+    }
+
     pub(crate) fn watch_dark_knowledge_checkout(&self, checkout_project_dir: &Path) {
         let mut watcher = self.state.bbox_watcher.lock().unwrap();
         let Some(watcher) = watcher.as_mut() else {
@@ -451,6 +624,21 @@ fn registry_key(row: &CheckoutRow) -> (String, PublishedScope) {
             bbox_root_relpath: String::new(),
         }),
     )
+}
+
+fn schema_epoch_repo_path(scope: &PublishedScope) -> String {
+    if scope.bbox_root_relpath == "." {
+        format!(
+            ".bbox/knowledge/{}",
+            bbox_knowledge::inventory::SCHEMA_EPOCH_MARKER
+        )
+    } else {
+        format!(
+            "{}/.bbox/knowledge/{}",
+            scope.bbox_root_relpath,
+            bbox_knowledge::inventory::SCHEMA_EPOCH_MARKER
+        )
+    }
 }
 
 fn recorded_scope(project: &ProjectRecord) -> Option<PublishedScope> {
@@ -640,5 +828,37 @@ mod tests {
                 .get(&scope, &checkout_id)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn path_fallback_cut_waits_for_committed_marker_and_is_monotonic() {
+        let (_temp, server, base, _worktree, _scope) = fixture();
+        let inventory = server.run_knowledge_schema_epoch_inventory().unwrap();
+        assert!(base.join(".bbox/knowledge/.schema-epoch").is_file());
+
+        let blocked = server.reconcile_path_fallback_cut(&inventory).unwrap();
+        assert!(!blocked.cut);
+        assert!(
+            blocked
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("no committed schema epoch marker")),
+            "{:?}",
+            blocked.blockers
+        );
+
+        git(&base, &["add", ".bbox/knowledge/.schema-epoch"]);
+        git(&base, &["commit", "-q", "-m", "record schema epoch"]);
+        let cut = server.reconcile_path_fallback_cut(&inventory).unwrap();
+        assert!(cut.cut);
+        assert!(cut.newly_cut);
+        assert!(server.path_fallback_is_cut());
+        assert!(bbox_knowledge::inventory::path_fallback_was_cut(
+            &server.state.store_dir
+        ));
+
+        let repeated = server.reconcile_path_fallback_cut(&inventory).unwrap();
+        assert!(repeated.cut);
+        assert!(!repeated.newly_cut);
     }
 }

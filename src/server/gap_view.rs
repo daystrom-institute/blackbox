@@ -90,6 +90,9 @@ impl BlackboxServer {
             .all()
             .iter()
             .filter(|gap| {
+                if self.path_fallback_is_cut() && gap.project.is_some() {
+                    return false;
+                }
                 !gap.project
                     .as_deref()
                     .is_some_and(|project| managed_paths.contains(project))
@@ -102,12 +105,13 @@ impl BlackboxServer {
             .map(|record| vec![record.clone()])
             .unwrap_or_else(|| projects.clone());
         let mut selected_scopes = BTreeMap::<PublishedScope, ProjectRecord>::new();
+        let mut diagnostics = Vec::new();
         for project in selected_projects {
             match project_published_scope(&project, crate::config::read_repo_id_inputs) {
                 Some(scope) => {
                     selected_scopes.entry(scope).or_insert(project);
                 }
-                None => {
+                None if !self.path_fallback_is_cut() => {
                     // Inventory-bounded compatibility until the final path
                     // fallback cut: registered projects without a recorded
                     // scope keep their legacy loaded gap view.
@@ -121,10 +125,16 @@ impl BlackboxServer {
                             .cloned(),
                     );
                 }
+                None if explicit_managed_scope => anyhow::bail!(
+                    "registered project {} has no authoritative published scope",
+                    project.canonical_path
+                ),
+                None => diagnostics.push(format!(
+                    "registered project {} has no authoritative published scope",
+                    project.canonical_path
+                )),
             }
         }
-
-        let mut diagnostics = Vec::new();
         for (scope, project) in selected_scopes {
             let publisher_root =
                 match elect_publisher(&projects, &scope, crate::config::read_repo_id_inputs) {

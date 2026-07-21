@@ -15,9 +15,8 @@ brief: "Retire write_redirects, the host-local map that makes kb.json required t
 
 > **Status: partial.** The additive foundation, prerequisite repair, dark
 > overlay, session-authoritative committed view, promotion, and registry
-> lifecycle, candidate-tree merge gate, and gap-store convergence through
-> slice 3.9 are landed on `beta/blackbox-v2`. The final path-fallback cut
-> remains.
+> lifecycle, candidate-tree merge gate, gap-store convergence, and monotonic
+> path-fallback cut are landed on `beta/blackbox-v2`.
 > Anchors were re-verified against that branch after the
 > slice-3.2 checkpoint and this design was repaired against the live loader,
 > resolver, index, and entity-ref paths on 2026-07-20. Line cites rot, so grep
@@ -108,8 +107,8 @@ Checkout gap variants are no longer retained in the host-global store. Gap
 lists and inbox views now read pinned published records plus
 session-authoritative `published|own|all` overlays.
 
-Still not implemented: response-level `built_from` and the path-fallback-cut
-slices. Section 6 is the authoritative remaining sequence.
+Still not implemented: response-level `built_from`. Section 6 records the
+landed sequence.
 
 When this document and an additive primitive disagree, the contract here wins
 and the primitive is repaired before live wiring.
@@ -779,8 +778,12 @@ sequence begins with a repair gate:
    registry, publisher pins, promotion, watcher lifecycle, and staged
    transactions; remove central retention of checkout variants and use
    session-authoritative published/own/all views.
-9. **Cut the path fallback** once the epoch marker plus empty local quarantine
-   confirm coverage.
+9. **Cut the path fallback (landed).** Persist a monotonic host-local cut only
+   after every registered scope has an exact epoch marker on its pinned
+   committed publisher ref, local quarantine is empty, and neither central
+   store retains a path-scoped project record. After the cut, path values stay
+   valid selectors, but project writes without registered checkout authority
+   fail closed and central path-scoped records never re-enter read views.
 
 Each slice lands on the monolith and gets the full lane gate.
 

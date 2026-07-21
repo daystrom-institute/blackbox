@@ -1109,6 +1109,10 @@ pub struct Knowledge {
     /// Request-local identity and provenance for detached visibility views.
     /// Empty on the mutable durable store.
     view_metadata: BTreeMap<String, KnowledgeViewMetadata>,
+    /// Store-layer enforcement for the monotonic path-authority cut. Daemon
+    /// lifecycle flips this while holding the store write lock, closing the
+    /// race between cut readiness and an in-flight legacy mutation.
+    path_fallback_cut: bool,
 }
 
 struct CheckoutMutationRestore {
@@ -1175,6 +1179,7 @@ impl Knowledge {
             store: KnowledgeStore::new(),
             project_roots: Vec::new(),
             view_metadata: BTreeMap::new(),
+            path_fallback_cut: false,
         };
         k.reload()?;
         Ok(k)
@@ -1194,6 +1199,60 @@ impl Knowledge {
     /// rename migration that just called `rename_project_refs`).
     pub fn update_project_roots(&mut self, roots: Vec<PathBuf>) {
         self.project_roots = roots;
+    }
+
+    pub fn set_path_fallback_cut(&mut self, cut: bool) {
+        self.path_fallback_cut = cut;
+    }
+
+    fn ensure_scope_write_authority(&self, scope: Scope, write_dir: Option<&str>) -> Result<()> {
+        if self.path_fallback_cut && scope == Scope::Project && write_dir.is_none() {
+            anyhow::bail!(
+                "path-scoped project fallback is retired; project knowledge writes require checkout authority"
+            );
+        }
+        Ok(())
+    }
+
+    fn ensure_existing_write_authority(&self, ids: &[&str], write_dir: Option<&str>) -> Result<()> {
+        if self.path_fallback_cut
+            && write_dir.is_none()
+            && ids.iter().any(|id| {
+                self.store
+                    .entries
+                    .iter()
+                    .any(|entry| entry.id == **id && entry.scope == Scope::Project)
+            })
+        {
+            anyhow::bail!(
+                "path-scoped project fallback is retired; project knowledge mutation requires checkout authority"
+            );
+        }
+        Ok(())
+    }
+
+    /// Project records still relying on the host-local central path key.
+    /// The schema-epoch cut cannot retire that fallback while any remain.
+    pub fn legacy_path_scoped_entry_count(&self) -> Result<usize> {
+        let mut ids = self
+            .store
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.scope == Scope::Project && self.repo_owned_carrier(entry).is_none()
+            })
+            .map(|entry| entry.id.clone())
+            .collect::<BTreeSet<_>>();
+        if self.store_path.is_file() {
+            let raw: KnowledgeStore = serde_json::from_slice(&fs::read(&self.store_path)?)?;
+            ids.extend(
+                raw.entries
+                    .into_iter()
+                    .filter(|entry| entry.scope == Scope::Project)
+                    .map(|entry| entry.id),
+            );
+        }
+        Ok(ids.len())
     }
 
     fn central_snapshot(&self) -> KnowledgeStore {
@@ -1257,6 +1316,18 @@ impl Knowledge {
     /// carrier, so it has no authority to purge or rewrite the base generation.
     fn persist_repo_owned_mutation_at(&self, ids: &[&str], write_dir: Option<&str>) -> Result<()> {
         let Some(write_dir) = write_dir.map(str::trim).filter(|dir| !dir.is_empty()) else {
+            if self.path_fallback_cut
+                && ids.iter().any(|id| {
+                    self.store
+                        .entries
+                        .iter()
+                        .any(|entry| entry.id == **id && entry.scope == Scope::Project)
+                })
+            {
+                anyhow::bail!(
+                    "path-scoped project fallback is retired; project knowledge writes require checkout authority"
+                );
+            }
             return self.persist_repo_owned_entries();
         };
         let entries = ids
@@ -1573,6 +1644,7 @@ impl Knowledge {
         if source_id.trim().is_empty() {
             anyhow::bail!("source knowledge id is required");
         }
+        self.ensure_existing_write_authority(&[&source_id], write_dir)?;
         EntityRef::parse(&p.target)
             .map_err(|err| anyhow::anyhow!("target must be a valid entity ref: {err}"))?;
         let kind = KnowledgeEdgeKind::parse(&p.kind)?;
@@ -1614,6 +1686,15 @@ impl Knowledge {
     /// defaulting). Used by `tool_docs::sync_into_knowledge` to keep
     /// the auto-generated tool reference in sync with the binary.
     pub fn upsert_generated(&mut self, entry: KnowledgeEntry) -> Result<()> {
+        self.ensure_scope_write_authority(entry.scope, None)?;
+        if self
+            .store
+            .entries
+            .iter()
+            .any(|existing| existing.id == entry.id)
+        {
+            self.ensure_existing_write_authority(&[&entry.id], None)?;
+        }
         if let Some(existing) = self.store.entries.iter_mut().find(|e| e.id == entry.id) {
             *existing = entry;
         } else {
@@ -1699,6 +1780,10 @@ impl Knowledge {
             .map_err(|_| anyhow::anyhow!("invalid category: {}", p.category))?;
         let title = p.title.clone().unwrap_or_else(|| derive_title(&p.content));
         let scope = Scope::parse_optional(p.scope.as_deref())?;
+        self.ensure_scope_write_authority(scope, write_dir)?;
+        if let Some(id) = p.id.as_deref() {
+            self.ensure_existing_write_authority(&[id], write_dir)?;
+        }
         let providers = p.providers.clone().unwrap_or_default();
         let priority = Priority::parse_optional(p.priority.as_deref())?;
         let weight = p.weight.unwrap_or(100);
@@ -1943,6 +2028,7 @@ impl Knowledge {
         };
         let title = p.title.clone().unwrap_or_else(|| derive_title(&p.content));
         let scope = Scope::parse_optional(p.scope.as_deref())?;
+        self.ensure_scope_write_authority(scope, write_dir)?;
 
         let now = Self::now_iso();
         let id = Self::gen_id();
@@ -2052,6 +2138,10 @@ impl Knowledge {
 
         let title = p.title.clone().unwrap_or_else(|| derive_title(&p.content));
         let scope = Scope::parse_optional(p.scope.as_deref())?;
+        self.ensure_scope_write_authority(scope, write_dir)?;
+        if let Some(old_id) = p.supersedes.as_deref() {
+            self.ensure_existing_write_authority(&[old_id], write_dir)?;
+        }
         let priority = Priority::parse_optional(p.priority.as_deref())?;
         let render_flag = p.render.unwrap_or(true);
 
@@ -2166,6 +2256,7 @@ impl Knowledge {
         checkout_entry: Option<&KnowledgeEntry>,
     ) -> Result<String> {
         let id = &p.id;
+        self.ensure_existing_write_authority(&[id], write_dir)?;
         let restore = self.install_checkout_mutation_seed(id, checkout_entry, write_dir)?;
 
         if let Some(entry) = self.store.entries.iter_mut().find(|e| &e.id == id) {
@@ -2978,6 +3069,7 @@ impl Knowledge {
             }
             "approve" => {
                 let id = id.context("'id' required for approve")?;
+                self.ensure_existing_write_authority(&[id], write_dir)?;
                 let restore = self.install_checkout_mutation_seed(id, checkout_entry, write_dir)?;
                 if let Some(entry) = self.store.entries.iter_mut().find(|e| e.id == id) {
                     entry.approval = Approval::UserConfirmed;
@@ -2993,6 +3085,7 @@ impl Knowledge {
             }
             "reject" => {
                 let id = id.context("'id' required for reject")?;
+                self.ensure_existing_write_authority(&[id], write_dir)?;
                 let restore = self.install_checkout_mutation_seed(id, checkout_entry, write_dir)?;
                 if let Some(entry) = self.store.entries.iter_mut().find(|e| e.id == id) {
                     entry.status = Status::Deleted;
@@ -3261,6 +3354,7 @@ impl Knowledge {
             store,
             project_roots: Vec::new(),
             view_metadata,
+            path_fallback_cut: true,
         }
     }
 
@@ -4958,6 +5052,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             std::fs::read_to_string(&kb_path).unwrap().contains(&id),
             "entry must stay in central until the project is repo-owned"
         );
+        assert_eq!(kb.legacy_path_scoped_entry_count().unwrap(), 1);
 
         // Eject opts the project in and migrates the entry.
         let moved = kb.eject_project_to_repo(&proj).unwrap();
@@ -4975,6 +5070,44 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             !std::fs::read_to_string(&kb_path).unwrap().contains(&id),
             "entry should leave central after eject"
         );
+        assert_eq!(kb.legacy_path_scoped_entry_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn path_cut_rejects_low_level_project_write_before_mutating() {
+        let central = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        kb.set_path_fallback_cut(true);
+        let err = kb
+            .learn_result(
+                &LearnParams {
+                    content: "must not become path-authoritative".into(),
+                    category: "convention".into(),
+                    scope: Some("project".into()),
+                    project: Some(project.path().to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("checkout authority"));
+        assert!(kb.all_entries().is_empty());
+    }
+
+    #[test]
+    fn path_cut_rejects_generated_project_upsert_before_mutating() {
+        let central = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        kb.set_path_fallback_cut(true);
+        let mut generated = entry("generated-project", "generated", "content", Scope::Project);
+        generated.project = Some(project.path().to_string_lossy().into_owned());
+
+        let err = kb.upsert_generated(generated).unwrap_err();
+
+        assert!(err.to_string().contains("checkout authority"));
+        assert!(kb.all_entries().is_empty());
     }
 
     #[test]

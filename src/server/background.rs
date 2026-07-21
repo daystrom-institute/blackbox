@@ -39,15 +39,21 @@ async fn run_knowledge_lifecycle_pass(shared: Arc<SharedState>, recover_pending:
     let result = tokio::task::spawn_blocking(move || {
         let server = crate::server::BlackboxServer::new(shared);
         let recovered = recover_pending.then(|| server.recover_dark_knowledge_transactions());
+        let inventory = server.run_knowledge_schema_epoch_inventory();
+        let path_fallback = inventory
+            .as_ref()
+            .ok()
+            .map(|report| server.reconcile_path_fallback_cut(report));
         (
             recovered,
-            server.run_knowledge_schema_epoch_inventory(),
+            inventory,
+            path_fallback,
             server.reconcile_dark_knowledge_checkouts(),
         )
     })
     .await;
     match result {
-        Ok((recovered, inventory, reconciliation)) => {
+        Ok((recovered, inventory, path_fallback, reconciliation)) => {
             if let Some(recovered) = recovered {
                 tracing::info!(recovered, "knowledge transaction recovery completed");
             }
@@ -59,6 +65,26 @@ async fn run_knowledge_lifecycle_pass(shared: Arc<SharedState>, recover_pending:
                     "knowledge schema epoch inventoried"
                 ),
                 Err(err) => tracing::warn!(error = %err, "knowledge schema inventory failed"),
+            }
+            if let Some(path_fallback) = path_fallback {
+                match path_fallback {
+                    Ok(report) if report.newly_cut => {
+                        tracing::info!("path-scoped project fallback retired")
+                    }
+                    Ok(report) if report.cut && !report.blockers.is_empty() => tracing::warn!(
+                        blockers = ?report.blockers,
+                        "post-cut path-scoped project debris remains quarantined from views"
+                    ),
+                    Ok(report) if !report.cut => tracing::debug!(
+                        blockers = ?report.blockers,
+                        "path-scoped project fallback remains enabled"
+                    ),
+                    Ok(_) => {}
+                    Err(err) => tracing::warn!(
+                        error = %err,
+                        "path-scoped project fallback gate failed"
+                    ),
+                }
             }
             match reconciliation {
                 Ok(reconciliation) => tracing::info!(

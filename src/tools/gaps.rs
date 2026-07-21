@@ -29,10 +29,37 @@ impl BlackboxServer {
             .as_ref()
             .map(|checkout| checkout.checkout_project_dir.clone())
             .or(resolution.write_dir);
+        if self.path_fallback_is_cut() && checkout.is_none() {
+            anyhow::bail!(
+                "path-scoped project fallback is retired; project gap writes require a registered checkout with recorded repo identity"
+            );
+        }
         if let Some(checkout) = checkout.as_ref() {
             self.register_dark_knowledge_checkout(checkout)?;
         }
         Ok((durable_scope, write_dir, checkout))
+    }
+
+    fn guard_unscoped_gap_mutation(
+        &self,
+        id: &str,
+        has_project_authority: bool,
+    ) -> anyhow::Result<()> {
+        if self.path_fallback_is_cut()
+            && !has_project_authority
+            && self
+                .state
+                .gaps
+                .read()
+                .all()
+                .iter()
+                .any(|gap| gap.id == id && gap.project.is_some())
+        {
+            anyhow::bail!(
+                "path-scoped project fallback is retired; project gap mutation requires session checkout authority"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -131,6 +158,7 @@ impl BlackboxServer {
                         .authoritative_session_checkout()
                         .map(|checkout| checkout.checkout_project_dir.clone())
                 });
+            server.guard_unscoped_gap_mutation(&p.id, raw_project.is_some())?;
             if let Some(raw) = raw_project {
                 let (project, write_dir, resolved_checkout) = server.resolve_gap_project(&raw)?;
                 p.project = Some(project);
@@ -167,6 +195,7 @@ impl BlackboxServer {
                         .authoritative_session_checkout()
                         .map(|checkout| checkout.checkout_project_dir.clone())
                 });
+            server.guard_unscoped_gap_mutation(&p.id, raw_project.is_some())?;
             if let Some(raw) = raw_project {
                 let (project, write_dir, resolved_checkout) = server.resolve_gap_project(&raw)?;
                 p.project = Some(project);
@@ -274,6 +303,25 @@ mod tests {
 
     fn gap_file(root: &Path, id: &str) -> std::path::PathBuf {
         root.join(".bbox").join("gaps").join(format!("{id}.json"))
+    }
+
+    #[tokio::test]
+    async fn path_cut_rejects_unregistered_project_gap_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("unregistered");
+        std::fs::create_dir_all(&project).unwrap();
+        let server = BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())));
+        server
+            .state
+            .path_fallback_cut
+            .store(true, std::sync::atomic::Ordering::Release);
+        let result = server
+            .bbox_gap(Parameters(gap_params(
+                project.to_string_lossy().into_owned(),
+            )))
+            .await;
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(format!("{:?}", result.content).contains("project gap writes require"));
     }
 
     /// (a) resolve with project=<in-tree linked worktree>: rewritten file

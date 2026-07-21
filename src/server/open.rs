@@ -111,7 +111,9 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         }
     }
 
+    let path_fallback_cut = bbox_knowledge::inventory::path_fallback_was_cut(&cfg.paths.bro_home);
     let mut kb = Knowledge::open(&kb_path)?;
+    kb.set_path_fallback_cut(path_fallback_cut);
     tracing::info!("Knowledge store: {}", kb_path.display());
     // Load each registered repo's committed .bbox/knowledge/ into the query
     // surface BEFORE any save. This must precede sync_tool_docs (which writes
@@ -137,6 +139,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     // purge committed `.bbox/gaps/` files for a repo-owned project.
     let gaps_path = cfg.paths.gaps_path.clone();
     let mut gaps_store = crate::gaps::GapStore::open(&gaps_path)?;
+    gaps_store.set_path_fallback_cut(path_fallback_cut);
     tracing::info!("Gap store: {}", gaps_path.display());
     {
         let gap_roots: Vec<std::path::PathBuf> = projects_store
@@ -281,6 +284,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         )?),
         knowledge_overlays: RwLock::new(bbox_knowledge::overlay::KnowledgeOverlayStore::default()),
         gap_overlays: RwLock::new(bbox_gaps::overlay::GapOverlayStore::default()),
+        path_fallback_cut: std::sync::atomic::AtomicBool::new(path_fallback_cut),
         knowledge_published_cache: RwLock::new(Default::default()),
         packets: RwLock::new(packets_store),
         surface_decisions: crate::server::surface::SurfaceDecisionCache::default(),

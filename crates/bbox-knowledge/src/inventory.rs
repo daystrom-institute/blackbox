@@ -14,12 +14,11 @@
 //! unresolvable for operator resolution rather than re-keying by current path.
 //! Coverage is asserted by the epoch marker plus an empty quarantine.
 //!
-//! This slice ships the pure, deterministic inventory PASS and its report
-//! types. It deliberately does NOT flip the live scope key, persist a gating
-//! marker, or run at daemon boot: the scope-key cutover and the path-fallback
-//! cut land with the overlay (design §6 steps 3 and 8), which is what consumes
-//! this resolution. Building the pass now, tested, is the additive foundation
-//! that cutover reads directly.
+//! The deterministic inventory pass, host ledgers, repo epoch marker, and
+//! monotonic local cut marker now live together here. Daemon lifecycle code
+//! runs the inventory and enables the cut only after verifying the repo marker
+//! on each pinned committed publisher ref, an empty quarantine, and no central
+//! path-scoped records.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -99,6 +98,7 @@ pub struct KnowledgeInventory {
 pub const SCHEMA_EPOCH_MARKER: &str = ".schema-epoch";
 pub const INVENTORY_LEDGER: &str = "knowledge-schema-epoch.json";
 pub const QUARANTINE_LEDGER: &str = "knowledge-quarantine.json";
+pub const PATH_FALLBACK_CUT_MARKER: &str = "knowledge-path-fallback-cut.json";
 
 /// Committed marker carried by one clean repo-owned knowledge scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +106,16 @@ pub struct SchemaEpochMarker {
     pub schema_epoch: u32,
     pub repo_id: String,
     pub bbox_root_relpath: String,
+}
+
+/// Monotonic host-local proof that this daemon store retired path-keyed
+/// project authority. Once present, runtime reads and writes never reopen the
+/// fallback, even if later inventory finds new legacy debris.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathFallbackCutMarker {
+    pub version: u32,
+    pub schema_epoch: u32,
+    pub cut_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +167,30 @@ impl KnowledgeInventory {
     pub fn is_covered(&self) -> bool {
         self.quarantined.is_empty()
     }
+}
+
+pub fn path_fallback_was_cut(state_dir: &Path) -> bool {
+    state_dir.join(PATH_FALLBACK_CUT_MARKER).is_file()
+}
+
+/// Persist the cut before enabling it in memory. Existence is the monotonic
+/// authority; the JSON body is audit metadata and is never rewritten.
+pub fn persist_path_fallback_cut(state_dir: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("creating inventory state dir {}", state_dir.display()))?;
+    let path = state_dir.join(PATH_FALLBACK_CUT_MARKER);
+    if path.is_file() {
+        return Ok(path);
+    }
+    atomic_write_json_locked(
+        &path,
+        &PathFallbackCutMarker {
+            version: 1,
+            schema_epoch: SCHEMA_EPOCH,
+            cut_at: chrono::Utc::now().to_rfc3339(),
+        },
+    )?;
+    Ok(path)
 }
 
 /// Run the schema-epoch inventory over `entries`, resolving every
@@ -607,5 +641,17 @@ mod tests {
             quarantine.entries[0].reason,
             QuarantineReason::NoResolvableRepoId
         );
+    }
+
+    #[test]
+    fn path_fallback_cut_marker_is_persistent_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        assert!(!path_fallback_was_cut(&root));
+        let path = persist_path_fallback_cut(&root).unwrap();
+        assert!(path_fallback_was_cut(&root));
+        let first = std::fs::read(&path).unwrap();
+        assert_eq!(persist_path_fallback_cut(&root).unwrap(), path);
+        assert_eq!(std::fs::read(path).unwrap(), first);
     }
 }
