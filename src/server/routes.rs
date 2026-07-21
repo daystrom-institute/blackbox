@@ -919,8 +919,6 @@ pub(crate) async fn control_closeout_handler(
     };
     use serde_json::json;
 
-    let _ = state; // SharedState is reserved for future hooks/state; not needed today.
-
     // Disposition whitelist (matches the existing tool's match arm).
     let disposition = req.disposition.trim().to_string();
     match disposition.as_str() {
@@ -1039,6 +1037,11 @@ pub(crate) async fn control_closeout_handler(
     // sent them fully resolved). Translate the wire shape into the bro_tools
     // local type; the driver fires them at phase boundaries. Skipped on dry_run.
     driver_req.closeout_hooks = req.closeout_hooks.as_ref().map(to_driver_hooks);
+    let teardown_checkout_id = bbox_corpus_core::identity::read_checkout_id(
+        &driver_req.worktree.join(".bbox/local/checkout-id"),
+    )
+    .ok()
+    .flatten();
 
     // The closeout phases shell out to sync git (fetch/rebase/merge/push/
     // worktree-remove — seconds to minutes) plus closeout hook scriptlets;
@@ -1057,6 +1060,26 @@ pub(crate) async fn control_closeout_handler(
                 }),
             })
         });
+
+    let checkout_removed = matches!(
+        &outcome,
+        ToolOutcome::Success { phases }
+            if phases.iter().any(|phase| {
+                phase.ok
+                    && phase.phase == bro_tools::fleet_worktree::CloseoutPhase::Remove
+            })
+    );
+    if checkout_removed
+        && let Some(checkout_id) = teardown_checkout_id
+        && let Err(err) =
+            BlackboxServer::new(state).deregister_dark_knowledge_checkout(&checkout_id)
+    {
+        tracing::warn!(
+            checkout_id,
+            error = %err,
+            "closeout removed checkout but registry teardown failed; periodic reconciliation will retry"
+        );
+    }
 
     // Translate bro_tools::CloseoutOutcome into the bro_protocol wire shape.
     // The two type families are intentionally distinct (bro_protocol is

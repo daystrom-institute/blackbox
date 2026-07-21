@@ -181,7 +181,9 @@ impl BlackboxServer {
                 bbox_root_relpath: Some(checkout.published_scope.bbox_root_relpath.clone()),
                 branch_ref: checkout.branch_ref.clone(),
             },
-        )
+        )?;
+        self.watch_dark_knowledge_checkout(std::path::Path::new(&checkout.checkout_project_dir));
+        Ok(())
     }
 
     pub(crate) fn refresh_dark_knowledge_overlay(
@@ -240,14 +242,22 @@ impl BlackboxServer {
             .as_ref()
             .map(|stamp| stamp.publisher_commit.as_str());
         let publisher_moved = prior_commit != current_commit;
+        let unchanged = prior.as_ref().is_some_and(|prior| {
+            prior.snapshot_id == snapshot.snapshot_id
+                && prior.status == snapshot.status
+                && prior.diagnostics == snapshot.diagnostics
+        });
         let mut affected = BTreeSet::new();
         if let Some(prior) = &prior {
             affected.extend(prior.values.keys().cloned());
         }
         affected.extend(snapshot.values.keys().cloned());
 
-        self.invalidate_published_knowledge_cache(&checkout.published_scope);
         self.state.knowledge_overlays.write().publish(snapshot);
+        if unchanged {
+            return;
+        }
+        self.invalidate_published_knowledge_cache(&checkout.published_scope);
 
         let Some(project) = publisher_project else {
             self.clear_knowledge_scope_in_index(&checkout.published_scope);

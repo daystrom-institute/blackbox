@@ -21,6 +21,11 @@ pub struct BbxWatcher {
     /// `(project_id, canonical .bbox root)` pairs. The project_id is the one
     /// supplied at registration — never reconstructed from the directory name.
     watched_roots: Arc<Mutex<Vec<(String, PathBuf)>>>,
+    /// Knowledge/gap-only roots for provisional checkout coverage. These roots
+    /// deliberately do not participate in artifact routing: an uncommitted
+    /// workflow or agent file in a worktree must not become a project-wide
+    /// installed artifact merely because provisional knowledge is watched.
+    repo_store_roots: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 impl BbxWatcher {
@@ -37,6 +42,8 @@ impl BbxWatcher {
     ) -> anyhow::Result<Self> {
         let watched_roots: Arc<Mutex<Vec<(String, PathBuf)>>> = Arc::new(Mutex::new(Vec::new()));
         let watched_roots_cb = watched_roots.clone();
+        let repo_store_roots: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let repo_store_roots_cb = repo_store_roots.clone();
         let catalog_cb = catalog.clone();
 
         let debouncer = new_debouncer(
@@ -51,9 +58,12 @@ impl BbxWatcher {
                     }
                 };
                 let roots = watched_roots_cb.lock().unwrap().clone();
+                let repo_store_roots = repo_store_roots_cb.lock().unwrap().clone();
                 let mut repo_store_dirty = false;
                 for event in events {
-                    if !repo_store_dirty && event_touches_repo_store(&event.event, &roots) {
+                    if !repo_store_dirty
+                        && event_touches_repo_store(&event.event, &repo_store_roots)
+                    {
                         repo_store_dirty = true;
                     }
                     handle_event(&event.event, &roots, &catalog_cb);
@@ -72,6 +82,7 @@ impl BbxWatcher {
         let mut watcher = Self {
             debouncer,
             watched_roots,
+            repo_store_roots,
         };
 
         for (project_id, project_dir) in projects {
@@ -87,26 +98,98 @@ impl BbxWatcher {
         self.watch_project_inner(project_id, project_dir)
     }
 
-    fn watch_project_inner(&mut self, project_id: &str, project_dir: &Path) -> anyhow::Result<()> {
-        let bbox_dir = project_dir.join(".bbox");
-        if !bbox_dir.exists() {
+    /// Add a checkout project root to the knowledge/gap watch set without
+    /// routing its other `.bbox` files through the artifact catalog.
+    pub fn watch_repo_store(&mut self, project_dir: &Path) -> anyhow::Result<()> {
+        let Some(canonical) = canonical_bbox_root(project_dir) else {
             return Ok(());
-        }
-        let canonical = match bbox_dir.canonicalize() {
-            Ok(c) => c,
-            Err(_) => return Ok(()),
         };
-        {
-            let mut roots = self.watched_roots.lock().unwrap();
-            if roots.iter().any(|(_, r)| r == &canonical) {
-                return Ok(());
-            }
-            roots.push((project_id.to_string(), canonical.clone()));
+        let already_watched = {
+            let roots = self.repo_store_roots.lock().unwrap();
+            roots.contains(&canonical)
+        };
+        if already_watched {
+            return Ok(());
         }
         self.debouncer
             .watch(&canonical, notify::RecursiveMode::Recursive)?;
+        self.repo_store_roots.lock().unwrap().push(canonical);
         Ok(())
     }
+
+    /// Remove a provisional checkout root from the knowledge/gap watch set.
+    /// Registered project roots retain their watch because they also carry
+    /// artifact-install authority.
+    pub fn unwatch_repo_store(&mut self, project_dir: &Path) -> anyhow::Result<bool> {
+        let bbox_root = project_dir
+            .join(".bbox")
+            .canonicalize()
+            .unwrap_or_else(|_| project_dir.join(".bbox"));
+        if self
+            .watched_roots
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, root)| root == &bbox_root)
+        {
+            return Ok(false);
+        }
+        let removed = {
+            let mut roots = self.repo_store_roots.lock().unwrap();
+            let before = roots.len();
+            roots.retain(|root| root != &bbox_root);
+            roots.len() != before
+        };
+        if !removed {
+            return Ok(false);
+        }
+        if let Err(err) = self.debouncer.unwatch(&bbox_root)
+            && bbox_root.exists()
+        {
+            return Err(err.into());
+        }
+        Ok(true)
+    }
+
+    fn watch_project_inner(&mut self, project_id: &str, project_dir: &Path) -> anyhow::Result<()> {
+        let Some(canonical) = canonical_bbox_root(project_dir) else {
+            return Ok(());
+        };
+        if self
+            .watched_roots
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, root)| root == &canonical)
+        {
+            return Ok(());
+        }
+        let already_watched = {
+            let roots = self.repo_store_roots.lock().unwrap();
+            roots.contains(&canonical)
+        };
+        if !already_watched {
+            self.debouncer
+                .watch(&canonical, notify::RecursiveMode::Recursive)?;
+            self.repo_store_roots
+                .lock()
+                .unwrap()
+                .push(canonical.clone());
+        }
+        self.watched_roots
+            .lock()
+            .unwrap()
+            .push((project_id.to_string(), canonical));
+        Ok(())
+    }
+}
+
+fn canonical_bbox_root(project_dir: &Path) -> Option<PathBuf> {
+    let bbox_dir = project_dir.join(".bbox");
+    bbox_dir
+        .is_dir()
+        .then(|| bbox_dir.canonicalize().ok())
+        .flatten()
 }
 
 /// Route a single debounced notify event to the appropriate artifact action.
@@ -221,7 +304,7 @@ fn handle_remove(path: &Path, project_id: &str, bbox_root: &Path, catalog: &Arti
 /// included on purpose: artifact routing ignores in-place modifies, but
 /// knowledge/gap entries are edited in place (manual edits, some editor/git
 /// write patterns). Access events are ignored.
-fn event_touches_repo_store(event: &notify::Event, roots: &[(String, PathBuf)]) -> bool {
+fn event_touches_repo_store(event: &notify::Event, roots: &[PathBuf]) -> bool {
     if !matches!(
         event.kind,
         notify::EventKind::Create(_) | notify::EventKind::Modify(_) | notify::EventKind::Remove(_)
@@ -232,7 +315,7 @@ fn event_touches_repo_store(event: &notify::Event, roots: &[(String, PathBuf)]) 
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             return false;
         }
-        roots.iter().any(|(_, root)| {
+        roots.iter().any(|root| {
             path.starts_with(root.join("knowledge"))
                 || path.parent() == Some(root.join("gaps").as_path())
         })
@@ -391,7 +474,7 @@ mod tests {
     fn knowledge_change_detection_matches_committed_entries_only() {
         let dir = tempdir().unwrap();
         let bbox_root = dir.path().canonicalize().unwrap().join(".bbox");
-        let roots = vec![("proj-k".to_string(), bbox_root.clone())];
+        let roots = vec![bbox_root.clone()];
 
         let kb_entry = bbox_root.join("knowledge").join("abc12345.json");
         let mk = |kind: notify::EventKind, path: &std::path::Path| notify::Event {
@@ -459,5 +542,26 @@ mod tests {
             !event_touches_repo_store(&create(&spool_drop), &roots),
             "gaps/inbox/ churn must not trigger a gap-store reload"
         );
+    }
+
+    #[test]
+    fn provisional_root_is_watched_without_artifact_authority() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().canonicalize().unwrap().join("checkout");
+        std::fs::create_dir_all(project.join(".bbox/knowledge")).unwrap();
+        let catalog = Arc::new(ArtifactCatalog::open(dir.path().join("catalog")).unwrap());
+        let mut watcher = BbxWatcher::start(Vec::new(), catalog, None).unwrap();
+
+        watcher.watch_repo_store(&project).unwrap();
+        assert!(watcher.watched_roots.lock().unwrap().is_empty());
+        assert_eq!(watcher.repo_store_roots.lock().unwrap().len(), 1);
+        watcher.watch_repo_store(&project).unwrap();
+        assert_eq!(
+            watcher.repo_store_roots.lock().unwrap().len(),
+            1,
+            "dynamic watcher registration is idempotent"
+        );
+        assert!(watcher.unwatch_repo_store(&project).unwrap());
+        assert!(watcher.repo_store_roots.lock().unwrap().is_empty());
     }
 }

@@ -144,6 +144,34 @@ impl KnowledgeOverlayStore {
     pub fn snapshots(&self) -> impl Iterator<Item = &OverlaySnapshot> {
         self.snapshots.values()
     }
+
+    /// Remove one checkout scope after registry reconciliation or explicit
+    /// teardown. Provisional bytes are never retained after their checkout is
+    /// gone; the branch or live checkout is their only durable source.
+    pub fn remove(
+        &mut self,
+        published_scope: &PublishedScope,
+        checkout_id: &str,
+    ) -> Option<OverlaySnapshot> {
+        self.snapshots.remove(&OverlayKey {
+            published_scope: published_scope.clone(),
+            checkout_id: checkout_id.to_string(),
+        })
+    }
+
+    /// Remove every scope carried by one checkout. A monorepo checkout can
+    /// own several independently published `.bbox` roots.
+    pub fn remove_checkout(&mut self, checkout_id: &str) -> Vec<OverlaySnapshot> {
+        let keys = self
+            .snapshots
+            .keys()
+            .filter(|key| key.checkout_id == checkout_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.into_iter()
+            .filter_map(|key| self.snapshots.remove(&key))
+            .collect()
+    }
 }
 
 pub fn published_scope_hash(scope: &PublishedScope) -> String {

@@ -23,7 +23,9 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     spawn_runtime_metrics_sampler();
     spawn_task_completed_router(shared.clone());
     spawn_system_event_signal_bridge(shared.clone());
+    run_knowledge_lifecycle_pass(shared.clone()).await;
     start_bbox_watcher(&shared);
+    spawn_knowledge_lifecycle_reconciler(shared.clone());
     restore_runtime_state(&shared).await;
     compact_system_events(&shared);
     spawn_outbox_worker(shared.clone());
@@ -31,6 +33,60 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     crate::embed_runtime::spawn_embed_residue_sweeper(shared.clone());
     spawn_packet_self_heal_scanner(shared);
     Ok(())
+}
+
+async fn run_knowledge_lifecycle_pass(shared: Arc<SharedState>) {
+    let result = tokio::task::spawn_blocking(move || {
+        let server = crate::server::BlackboxServer::new(shared);
+        (
+            server.run_knowledge_schema_epoch_inventory(),
+            server.reconcile_dark_knowledge_checkouts(),
+        )
+    })
+    .await;
+    match result {
+        Ok((inventory, reconciliation)) => {
+            match inventory {
+                Ok(inventory) => tracing::info!(
+                    resolved = inventory.inventory.resolved.len(),
+                    quarantined = inventory.inventory.quarantined.len(),
+                    marked_scopes = inventory.marked_scopes.len(),
+                    "knowledge schema epoch inventoried"
+                ),
+                Err(err) => tracing::warn!(error = %err, "knowledge schema inventory failed"),
+            }
+            match reconciliation {
+                Ok(reconciliation) => tracing::info!(
+                    discovered = reconciliation.discovered,
+                    dropped = reconciliation.dropped,
+                    refreshed = reconciliation.refreshed,
+                    "knowledge checkout lifecycle reconciled"
+                ),
+                Err(err) => {
+                    tracing::warn!(error = %err, "knowledge checkout reconciliation failed")
+                }
+            }
+        }
+        Err(err) => tracing::warn!(error = %err, "knowledge lifecycle task failed"),
+    }
+}
+
+fn spawn_knowledge_lifecycle_reconciler(shared: Arc<SharedState>) {
+    let interval_secs = std::env::var("BBOX_KNOWLEDGE_RECONCILE_INTERVAL_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(30);
+    if interval_secs == 0 {
+        tracing::debug!("knowledge checkout lifecycle reconciliation disabled");
+        return;
+    }
+    tokio::spawn(async move {
+        let interval = std::time::Duration::from_secs(interval_secs);
+        loop {
+            tokio::time::sleep(interval).await;
+            run_knowledge_lifecycle_pass(shared.clone()).await;
+        }
+    });
 }
 
 /// Augment the daemon's process `PATH` once at startup so direct child-process
@@ -209,11 +265,48 @@ fn start_bbox_watcher(shared: &Arc<SharedState>) {
         state
             .reindex_dirty
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Err(err) = std::thread::Builder::new()
+            .name("blackbox-knowledge-watch-refresh".into())
+            .spawn(move || {
+                let server = crate::server::BlackboxServer::new(state);
+                if let Err(err) = server.reconcile_dark_knowledge_checkouts() {
+                    tracing::warn!(
+                        error = %err,
+                        "watcher: checkout overlay reconciliation failed"
+                    );
+                }
+            })
+        {
+            tracing::warn!(error = %err, "watcher: could not spawn overlay refresh");
+        }
         tracing::debug!("watcher: .bbox repo-store change → kb+gaps reloaded, reindex flagged");
     });
 
     match watcher::BbxWatcher::start(project_roots, catalog, Some(on_knowledge_change)) {
-        Ok(w) => {
+        Ok(mut w) => {
+            for row in shared.checkout_registry.read().rows().to_vec() {
+                let scope = match row.published_scope() {
+                    Some(scope) => scope,
+                    None => continue,
+                };
+                let project_dir = if scope.bbox_root_relpath == "." {
+                    std::path::PathBuf::from(&row.checkout_dir)
+                } else {
+                    scope
+                        .bbox_root_relpath
+                        .split('/')
+                        .fold(std::path::PathBuf::from(&row.checkout_dir), |path, part| {
+                            path.join(part)
+                        })
+                };
+                if let Err(err) = w.watch_repo_store(&project_dir) {
+                    tracing::warn!(
+                        checkout = %project_dir.display(),
+                        error = %err,
+                        "provisional knowledge watcher failed to start"
+                    );
+                }
+            }
             *shared.bbox_watcher.lock().unwrap() = Some(w);
             tracing::info!(".bbox/ watcher started (artifacts + knowledge + gaps)");
         }

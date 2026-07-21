@@ -13,10 +13,11 @@ brief: "Retire write_redirects, the host-local map that makes kb.json required t
 
 # Checkout identity and the provisional knowledge lane
 
-> **Status: partial.** The additive foundation, prerequisite repair, slice 3.3
-> dark overlay, and slice 3.4 session-authoritative committed view are landed
-> and full-profile verified on `beta/blackbox-v2`. Promotion and lifecycle
-> wiring are not implemented.
+> **Status: partial.** The additive foundation, prerequisite repair, dark
+> overlay, session-authoritative committed view, promotion, and registry
+> lifecycle through slice 3.6 are landed on `beta/blackbox-v2`. Mutation
+> coverage, the merge gate, gap convergence, and the final path-fallback cut
+> remain.
 > Anchors were re-verified against that branch after the
 > slice-3.2 checkpoint and this design was repaired against the live loader,
 > resolver, index, and entity-ref paths on 2026-07-20. Line cites rot, so grep
@@ -82,9 +83,9 @@ P/H/B overlay afterward. Session-authoritative `published|own|all` visibility
 now drives list, hybrid search, inspection, render, graph, inbox, discover
 seed, and logical-ref-scoped index replacement.
 
-Still not implemented: the epoch marker and quarantine, response-level
-`built_from`, promotion, and registry lifecycle reconciliation. Section 6 is
-the authoritative remaining sequence.
+Still not implemented: response-level `built_from` and the later mutation,
+merge-gate, gap-convergence, and path-fallback-cut slices. Section 6 is the
+authoritative remaining sequence.
 
 When this document and an additive primitive disagree, the contract here wins
 and the primitive is repaired before live wiring.
@@ -471,7 +472,7 @@ closed), with §3.3's discoverable-vs-arbitrary degradation.
 Slice 3.3 recomputes after a successful daemon-owned knowledge write and offers
 an internal refresh used by tests and diagnostics. Slice 3.6 adds startup
 reconciliation, periodic refresh, teardown deregistration, and dynamic watcher
-coverage; 3.3 does not prematurely rebuild the fixed-root watcher.
+coverage while keeping provisional roots outside artifact-install authority.
 
 Overlay publication is all-or-nothing per `(published_scope, checkout_id)`.
 One unreadable, malformed, filename/id-mismatched, or duplicate-id file marks
@@ -700,12 +701,12 @@ sequence begins with a repair gate:
    index fields; apply visibility before ranking/inspection/rendering. Exercise
    a live throwaway dev daemon with base dirty state, a worktree modification,
    a tombstone, an attempted checkout spoof, and two peer variants of one id.
-4. **3.5 promotion + retire redirects.** Observe content equality at the
+4. **3.5 promotion + retire redirects (landed).** Observe content equality at the
    pinned published commit, remove only matching provisional variants, delete
    `write_redirects` and its purge exclusion, and stop retaining worktree
    copies in central `kb.json`. Validate write, restart, merge, publisher pull,
    and index convergence on the throwaway daemon.
-5. **3.6 registry lifecycle.** Startup discovery and write-gate revalidation,
+5. **3.6 registry lifecycle (landed).** Startup discovery and write-gate revalidation,
    periodic reconciliation, teardown deregistration, recovery of discoverable
    rows after registry loss, and dynamic watcher coverage rooted at
    `checkout_project_dir`. Complete the pure inventory runner, committed
