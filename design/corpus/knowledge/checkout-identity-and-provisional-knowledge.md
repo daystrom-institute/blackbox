@@ -15,8 +15,8 @@ brief: "Retire write_redirects, the host-local map that makes kb.json required t
 
 > **Status: partial.** The additive foundation, prerequisite repair, dark
 > overlay, session-authoritative committed view, promotion, and registry
-> lifecycle through slice 3.7 are landed on `beta/blackbox-v2`. The merge gate,
-> gap convergence, and the final path-fallback cut remain.
+> lifecycle and the candidate-tree merge gate through slice 3.8 are landed on
+> `beta/blackbox-v2`. Gap convergence and the final path-fallback cut remain.
 > Anchors were re-verified against that branch after the
 > slice-3.2 checkpoint and this design was repaired against the live loader,
 > resolver, index, and entity-ref paths on 2026-07-20. Line cites rot, so grep
@@ -90,9 +90,18 @@ startup roll-forward. Fleet closeout takes the same claim and proves every
 completed manifest's terminal blobs against the locally folded candidate tree
 before push.
 
-Still not implemented: response-level `built_from`, the merge-gate,
-gap-convergence, and path-fallback-cut slices. Section 6 is the authoritative
-remaining sequence.
+The merge gate is also landed. Closeout constructs a pre-integration candidate
+tree with `git merge-tree`, materializes it without moving a ref or checkout,
+checks every candidate project projection against the shared render
+implementation, and rejects exact-subject opposing-polarity directives. The
+base ref and remote remain unchanged on rejection. Every mutating closeout
+attempt invalidates the affected published-knowledge cache after the driver
+returns; successful teardown does the same while deregistering the checkout.
+The next view therefore observes any completed local integration and promotion
+without waiting for the cache TTL, even if a later push or removal failed.
+
+Still not implemented: response-level `built_from`, gap-convergence, and the
+path-fallback-cut slices. Section 6 is the authoritative remaining sequence.
 
 When this document and an additive primitive disagree, the contract here wins
 and the primitive is repaired before live wiring.
@@ -576,25 +585,29 @@ published absence is observed, the overlay entry stands.
 
 ### 4.5 The merge gate: candidate tree + scoped contradiction lint
 
-Two buildable halves and one scoped dependency (finding 6, round 1; finding 8,
-round 2):
+Landed in slice 3.8 (finding 6, round 1; finding 8, round 2):
 
-- **Candidate tree, buildable now:** construct the would-be-merge tree without
-  touching any working checkout via `git merge-tree` (or a temporary index),
-  and run the gate over THAT tree, pre-integration. The closeout `pre_push`
-  hook runs after the local fast-forward (`fleet_worktree.rs:607-645`), so the
-  gate is a new pre-integration point, not that hook.
-- **`render --check`, buildable now:** render the candidate tree's `.bbox/`
-  and diff against its committed provider files; a mismatch fails. Closes the
-  render-race staleness.
-- **Contradiction lint, scoped dependency:** `bbox_lint` today checks
-  status/expiry/recall/same-title dupes, not semantic contradiction
-  (`src/tools/render.rs:80-86`; `knowledge.rs:2348-2434`). A concrete first
-  cut: within one `published_scope`, flag two entries whose directives target
-  the same subject with opposing polarity (a "use X" vs "never X" pair keyed
-  on a normalized subject). This is a named sub-project with a defined
-  starting rule, not an assumed capability; the gate ships `render --check`
-  first and adds contradiction lint as it lands.
+- **Candidate tree:** closeout constructs the would-be integration with
+  `git merge-tree --write-tree`, verifies the resulting tree object, and runs
+  the gate before fast-forwarding the base ref. Remote-moved recovery rebuilds
+  and rechecks the candidate after its rebase. Rejection therefore leaves both
+  the base ref and remote unchanged.
+- **`render --check`:** the daemon materializes the candidate tree in a
+  temporary directory, discovers candidate `.bbox/` project roots, and compares
+  committed provider files byte-for-byte with projections produced by the same
+  implementation used for authoring. The check is read-only and a mismatch
+  fails closeout.
+- **Scoped contradiction lint:** within one candidate project scope, active and
+  unexpired directives with the same exactly normalized subject fail when one
+  has positive polarity (`always`, `prefer`, `must`, `use`) and one has negative
+  polarity (`must not`, `do not`, `don't`, `never`, `avoid`). Broader semantic
+  overlap and entailment remain deliberately out of scope for this first cut.
+- **Explicit promotion convergence:** every mutating closeout attempt
+  invalidates the affected published-scope cache after the driver returns, and
+  successful teardown does the same during checkout deregistration. The next
+  read rebuilds from any advanced pinned ref and applies the existing
+  content-equality promotion rule immediately rather than waiting for TTL
+  expiry, including when push or removal failed after local integration.
 
 ### 4.6 Mutation coverage with crash-consistent multi-file writes
 
@@ -730,8 +743,9 @@ sequence begins with a repair gate:
    both the new and old entry. Add host-local staging + recoverable manifest +
    pending pointer for multi-file atomicity, with closeout proving same-commit
    membership.
-7. **Merge gate.** `git merge-tree` candidate tree; `render --check`;
-   contradiction lint as the scoped sub-project; the explicit promotion hook.
+7. **Merge gate (landed).** `git merge-tree` candidate tree; shared-render
+   projection check; exact-subject opposing-polarity contradiction lint; and
+   explicit published-cache invalidation for immediate promotion observation.
 8. **Gap-store convergence.** Generalize the overlay to gaps, or the sequenced
    gap migration.
 9. **Cut the path fallback** once the epoch marker plus empty local quarantine

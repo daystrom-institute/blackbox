@@ -915,7 +915,8 @@ pub(crate) async fn control_closeout_handler(
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use bro_tools::fleet_worktree::{
-        CloseoutOutcome as ToolOutcome, prepare_closeout_request, run_closeout_phases,
+        CloseoutOutcome as ToolOutcome, prepare_closeout_request,
+        run_closeout_phases_with_candidate_gate,
     };
     use serde_json::json;
 
@@ -1033,6 +1034,7 @@ pub(crate) async fn control_closeout_handler(
     driver_req.commit_message = req.commit_message.clone();
     driver_req.paths = req.paths.clone();
     driver_req.dry_run = req.dry_run;
+    let was_dry_run = driver_req.dry_run;
     // Resolved project closeout hooks (the cockpit strict-loaded fleet.json and
     // sent them fully resolved). Translate the wire shape into the bro_tools
     // local type; the driver fires them at phase boundaries. Skipped on dry_run.
@@ -1047,19 +1049,24 @@ pub(crate) async fn control_closeout_handler(
     // worktree-remove — seconds to minutes) plus closeout hook scriptlets;
     // run on the blocking pool, never inline on a runtime worker (I2,
     // concurrency-model §5 Phase 4).
-    let outcome = tokio::task::spawn_blocking(move || run_closeout_phases(&driver_req))
-        .await
-        .unwrap_or_else(|join_err| {
-            ToolOutcome::Failed(bro_tools::fleet_worktree::PhaseResult {
-                phase: bro_tools::fleet_worktree::CloseoutPhase::Preflight,
-                repo_cwd: std::path::PathBuf::new(),
-                ok: false,
-                error_class: bro_tools::fleet_worktree::CloseoutErrorClass::None,
-                content: serde_json::json!({
-                    "error": format!("closeout driver task failed: {join_err}"),
-                }),
-            })
-        });
+    let outcome = tokio::task::spawn_blocking(move || {
+        let gate = |candidate: &bro_tools::fleet_worktree::CandidateTree| {
+            super::knowledge_merge_gate::evaluate(candidate)
+        };
+        run_closeout_phases_with_candidate_gate(&driver_req, Some(&gate))
+    })
+    .await
+    .unwrap_or_else(|join_err| {
+        ToolOutcome::Failed(bro_tools::fleet_worktree::PhaseResult {
+            phase: bro_tools::fleet_worktree::CloseoutPhase::Preflight,
+            repo_cwd: std::path::PathBuf::new(),
+            ok: false,
+            error_class: bro_tools::fleet_worktree::CloseoutErrorClass::None,
+            content: serde_json::json!({
+                "error": format!("closeout driver task failed: {join_err}"),
+            }),
+        })
+    });
 
     let checkout_removed = matches!(
         &outcome,
@@ -1069,16 +1076,22 @@ pub(crate) async fn control_closeout_handler(
                     && phase.phase == bro_tools::fleet_worktree::CloseoutPhase::Remove
             })
     );
-    if checkout_removed
-        && let Some(checkout_id) = teardown_checkout_id
-        && let Err(err) =
-            BlackboxServer::new(state).deregister_dark_knowledge_checkout(&checkout_id)
-    {
-        tracing::warn!(
-            checkout_id,
-            error = %err,
-            "closeout removed checkout but registry teardown failed; periodic reconciliation will retry"
-        );
+    if let Some(checkout_id) = teardown_checkout_id {
+        let server = BlackboxServer::new(state);
+        if checkout_removed {
+            if let Err(err) = server.deregister_dark_knowledge_checkout(&checkout_id) {
+                tracing::warn!(
+                    checkout_id,
+                    error = %err,
+                    "closeout removed checkout but registry teardown failed; periodic reconciliation will retry"
+                );
+            }
+        } else if !was_dry_run {
+            // The local target can advance even when a later push or removal
+            // fails. Refresh after every mutating closeout attempt so promotion
+            // never waits for the committed-tree cache TTL in that case.
+            server.refresh_published_knowledge_for_checkout(&checkout_id);
+        }
     }
 
     // Translate bro_tools::CloseoutOutcome into the bro_protocol wire shape.
@@ -1115,6 +1128,7 @@ fn to_wire_phase(r: &bro_tools::fleet_worktree::PhaseResult) -> bro_protocol::Ph
         ToolPhase::StageCommit => WirePhase::StageCommit,
         ToolPhase::FfBase => WirePhase::FfBase,
         ToolPhase::Rebase => WirePhase::Rebase,
+        ToolPhase::MergeGate => WirePhase::MergeGate,
         ToolPhase::FfMerge => WirePhase::FfMerge,
         ToolPhase::Push => WirePhase::Push,
         ToolPhase::Remove => WirePhase::Remove,
@@ -1127,6 +1141,7 @@ fn to_wire_phase(r: &bro_tools::fleet_worktree::PhaseResult) -> bro_protocol::Ph
         ToolErr::StageFailed => WireErr::StageFailed,
         ToolErr::CommitFailed => WireErr::CommitFailed,
         ToolErr::RebaseConflict => WireErr::RebaseConflict,
+        ToolErr::MergeGateBlocked => WireErr::MergeGateBlocked,
         ToolErr::FfMergeFailed => WireErr::FfMergeFailed,
         ToolErr::PushRejected => WireErr::PushRejected,
         ToolErr::RemoveFailed => WireErr::RemoveFailed,

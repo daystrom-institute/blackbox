@@ -144,6 +144,8 @@ pub enum CloseoutPhase {
     FfBase,
     /// `git rebase <target>` in the managed worktree.
     Rebase,
+    /// Build and validate the immutable would-be integration tree.
+    MergeGate,
     /// `git merge --ff-only <branch>` in the base/target checkout.
     FfMerge,
     /// `git push origin <target>` in the base/target checkout.
@@ -172,6 +174,8 @@ pub enum CloseoutErrorClass {
     CommitFailed,
     /// `git rebase <target>` failed in the worktree (conflict or other).
     RebaseConflict,
+    /// Candidate construction or a pre-integration project gate failed.
+    MergeGateBlocked,
     /// `git merge --ff-only <branch>` failed in base.
     FfMergeFailed,
     /// `git push` was rejected by the remote.

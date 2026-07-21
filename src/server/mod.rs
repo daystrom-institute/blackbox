@@ -2,6 +2,7 @@ mod background;
 pub mod dispatch;
 pub mod handler;
 mod knowledge_lifecycle;
+mod knowledge_merge_gate;
 mod knowledge_view;
 mod mcp;
 mod open;

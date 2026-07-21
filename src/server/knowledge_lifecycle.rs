@@ -309,9 +309,30 @@ impl BlackboxServer {
             affected_scopes.insert(snapshot.key.published_scope);
         }
         for scope in affected_scopes {
+            // A successful closeout may have advanced the publisher ref. Drop
+            // the committed-tree cache before rebuilding so promotion is
+            // observed immediately rather than after the cache TTL.
+            self.invalidate_published_knowledge_cache(&scope);
             self.reconcile_knowledge_scope_index(&scope);
         }
         Ok(rows.len())
+    }
+
+    /// Force the next published view to observe a target ref advanced by
+    /// closeout even when push or worktree removal has not completed yet.
+    pub(crate) fn refresh_published_knowledge_for_checkout(&self, checkout_id: &str) -> usize {
+        let scopes = self
+            .state
+            .checkout_registry
+            .read()
+            .rows_for_checkout(checkout_id)
+            .filter_map(CheckoutRow::published_scope)
+            .collect::<BTreeSet<_>>();
+        for scope in &scopes {
+            self.invalidate_published_knowledge_cache(scope);
+            self.reconcile_knowledge_scope_index(scope);
+        }
+        scopes.len()
     }
 
     pub(crate) fn run_knowledge_schema_epoch_inventory(
@@ -571,6 +592,11 @@ mod tests {
         let (_temp, server, _base, worktree, scope) = fixture();
         server.reconcile_dark_knowledge_checkouts().unwrap();
         let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&worktree).unwrap();
+        assert_eq!(
+            server.refresh_published_knowledge_for_checkout(&checkout_id),
+            1,
+            "closeout refresh resolves the checkout's published scope"
+        );
         assert_eq!(
             server
                 .deregister_dark_knowledge_checkout(&checkout_id)

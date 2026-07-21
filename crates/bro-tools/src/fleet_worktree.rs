@@ -234,6 +234,9 @@ pub enum CloseoutPhase {
     FfBase,
     /// `git rebase <target>` in the managed worktree.
     Rebase,
+    /// Build the would-be integration tree without moving refs, then run the
+    /// daemon-supplied project gates against that immutable tree.
+    MergeGate,
     /// `git merge --ff-only <branch>` in the base/target checkout.
     FfMerge,
     /// `git push origin <target>` in the base/target checkout.
@@ -265,6 +268,8 @@ pub enum CloseoutErrorClass {
     CommitFailed,
     /// `git rebase <target>` failed in the worktree (conflict or other).
     RebaseConflict,
+    /// Candidate construction or a pre-integration project gate failed.
+    MergeGateBlocked,
     /// `git merge --ff-only <branch>` failed in base.
     FfMergeFailed,
     /// `git push` was rejected by the remote.
@@ -334,6 +339,35 @@ pub struct CloseoutRequest {
     /// wire `CloseoutHooksWire`; the legacy `exit_worktree` tool path passes
     /// `None`. Skipped entirely on `dry_run`.
     pub closeout_hooks: Option<CloseoutHooks>,
+}
+
+/// Immutable would-be integration tree produced by `git merge-tree` before
+/// the target ref or base checkout is changed.
+#[derive(Debug, Clone)]
+pub struct CandidateTree {
+    pub repo: PathBuf,
+    pub tree_oid: String,
+    pub target: String,
+    pub branch: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CandidateGateReport {
+    pub ok: bool,
+    pub content: Value,
+}
+
+pub trait CandidateGate: Send + Sync {
+    fn evaluate(&self, candidate: &CandidateTree) -> anyhow::Result<CandidateGateReport>;
+}
+
+impl<F> CandidateGate for F
+where
+    F: Fn(&CandidateTree) -> anyhow::Result<CandidateGateReport> + Send + Sync,
+{
+    fn evaluate(&self, candidate: &CandidateTree) -> anyhow::Result<CandidateGateReport> {
+        self(candidate)
+    }
 }
 
 /// A closeout lifecycle event a `closeout_hooks` scriptlet can bind to. Fires at
@@ -557,6 +591,15 @@ pub fn prepare_closeout_request(
 /// `disposition must be keep, preflight, discard, publish, merge, or
 /// adopt; got preflight`).
 pub fn run_closeout_phases(req: &CloseoutRequest) -> CloseoutOutcome {
+    run_closeout_phases_with_candidate_gate(req, None)
+}
+
+/// Run closeout with an optional daemon-owned gate over the immutable
+/// candidate tree. Candidate construction itself always runs.
+pub fn run_closeout_phases_with_candidate_gate(
+    req: &CloseoutRequest,
+    candidate_gate: Option<&dyn CandidateGate>,
+) -> CloseoutOutcome {
     // Dry-run: run preflight for the real disposition and STOP. Return as a
     // single-phase result so the cockpit's renderer can still surface the
     // phase label and content. Non-dry-run path below is byte-identical.
@@ -622,6 +665,12 @@ pub fn run_closeout_phases(req: &CloseoutRequest) -> CloseoutOutcome {
         }
         results.push(rebase);
 
+        let merge_gate = phase_merge_gate(req, candidate_gate);
+        if !merge_gate.ok {
+            return CloseoutOutcome::Failed(merge_gate);
+        }
+        results.push(merge_gate);
+
         let ff_merge = phase_ff_merge(req);
         if !ff_merge.ok {
             return CloseoutOutcome::Failed(ff_merge);
@@ -675,7 +724,7 @@ pub fn run_closeout_phases(req: &CloseoutRequest) -> CloseoutOutcome {
             if push.error_class == CloseoutErrorClass::PushRejected
                 && push.repo_cwd == req.base_repo
             {
-                match recover_push_reject(req) {
+                match recover_push_reject(req, candidate_gate) {
                     PushRecoveryOutcome::Recovered(recovery_phases) => {
                         results.extend(recovery_phases);
                     }
@@ -1569,6 +1618,166 @@ fn phase_rebase(req: &CloseoutRequest) -> PhaseResult {
     }
 }
 
+// closeout/worktree git runs on the blocking pool via /control/closeout.
+#[allow(clippy::disallowed_methods)]
+fn phase_merge_gate(
+    req: &CloseoutRequest,
+    candidate_gate: Option<&dyn CandidateGate>,
+) -> PhaseResult {
+    let output = match Command::new("git")
+        .arg("-C")
+        .arg(&req.base_repo)
+        .args(["merge-tree", "--write-tree", &req.target, &req.branch])
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => {
+            return PhaseResult {
+                phase: CloseoutPhase::MergeGate,
+                repo_cwd: req.base_repo.clone(),
+                ok: false,
+                error_class: CloseoutErrorClass::MergeGateBlocked,
+                content: json!({
+                    "error": format!("starting git merge-tree failed: {err}"),
+                }),
+            };
+        }
+    };
+    if !output.status.success() {
+        return PhaseResult {
+            phase: CloseoutPhase::MergeGate,
+            repo_cwd: req.base_repo.clone(),
+            ok: false,
+            error_class: CloseoutErrorClass::MergeGateBlocked,
+            content: json!({
+                "error": "candidate tree construction found an integration conflict",
+                "stdout": String::from_utf8_lossy(&output.stdout).trim(),
+                "stderr": String::from_utf8_lossy(&output.stderr).trim(),
+            }),
+        };
+    }
+    let tree_oid = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let tree_spec = format!("{tree_oid}^{{tree}}");
+    if tree_oid.is_empty()
+        || !tree_oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !git_ok(&req.base_repo, &["cat-file", "-e", &tree_spec])
+    {
+        return PhaseResult {
+            phase: CloseoutPhase::MergeGate,
+            repo_cwd: req.base_repo.clone(),
+            ok: false,
+            error_class: CloseoutErrorClass::MergeGateBlocked,
+            content: json!({
+                "error": "git merge-tree did not return a valid candidate tree object",
+                "stdout": String::from_utf8_lossy(&output.stdout).trim(),
+            }),
+        };
+    }
+
+    let candidate = CandidateTree {
+        repo: req.base_repo.clone(),
+        tree_oid: tree_oid.clone(),
+        target: req.target.clone(),
+        branch: req.branch.clone(),
+    };
+    let report = match candidate_gate {
+        Some(gate) => match gate.evaluate(&candidate) {
+            Ok(report) => report,
+            Err(err) => {
+                return PhaseResult {
+                    phase: CloseoutPhase::MergeGate,
+                    repo_cwd: req.base_repo.clone(),
+                    ok: false,
+                    error_class: CloseoutErrorClass::MergeGateBlocked,
+                    content: json!({
+                        "error": format!("candidate project gate failed: {err:#}"),
+                        "candidate_tree": tree_oid,
+                    }),
+                };
+            }
+        },
+        None => CandidateGateReport {
+            ok: true,
+            content: json!({"project_checks": "not_configured"}),
+        },
+    };
+    let mut content = json!({
+        "candidate_tree": tree_oid,
+        "target": req.target,
+        "branch": req.branch,
+        "report": report.content,
+    });
+    if !report.ok {
+        let detail = content["report"]
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("candidate project checks rejected the integration");
+        content["error"] = Value::String(detail.to_string());
+    }
+    PhaseResult {
+        phase: CloseoutPhase::MergeGate,
+        repo_cwd: req.base_repo.clone(),
+        ok: report.ok,
+        error_class: if report.ok {
+            CloseoutErrorClass::None
+        } else {
+            CloseoutErrorClass::MergeGateBlocked
+        },
+        content,
+    }
+}
+
+/// Extract a candidate tree without checking it out or moving any ref.
+// closeout/worktree git and tar run on the blocking pool via /control/closeout.
+#[allow(clippy::disallowed_methods)]
+pub fn materialize_candidate_tree(
+    candidate: &CandidateTree,
+    destination: &Path,
+) -> anyhow::Result<()> {
+    use std::process::Stdio;
+
+    std::fs::create_dir_all(destination)?;
+    let mut archive = Command::new("git")
+        .arg("-C")
+        .arg(&candidate.repo)
+        .args(["archive", "--format=tar", &candidate.tree_oid])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let archive_stdout = archive
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("git archive did not expose stdout"))?;
+    let unpack = Command::new("tar")
+        .args(["-x", "-C"])
+        .arg(destination)
+        .stdin(Stdio::from(archive_stdout))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    let archive = archive.wait_with_output()?;
+    if !archive.status.success() {
+        anyhow::bail!(
+            "git archive candidate {} failed: {}",
+            candidate.tree_oid,
+            String::from_utf8_lossy(&archive.stderr).trim()
+        );
+    }
+    if !unpack.status.success() {
+        anyhow::bail!(
+            "extracting candidate {} failed: {}",
+            candidate.tree_oid,
+            String::from_utf8_lossy(&unpack.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 fn phase_ff_merge(req: &CloseoutRequest) -> PhaseResult {
     let base_repo = &req.base_repo;
     let branch = &req.branch;
@@ -1619,7 +1828,10 @@ enum PushRecoveryOutcome {
     Failed(PhaseResult),
 }
 
-fn recover_push_reject(req: &CloseoutRequest) -> PushRecoveryOutcome {
+fn recover_push_reject(
+    req: &CloseoutRequest,
+    candidate_gate: Option<&dyn CandidateGate>,
+) -> PushRecoveryOutcome {
     let base_repo = &req.base_repo;
     let target = &req.target;
     let remote_ref = format!("origin/{target}");
@@ -1662,14 +1874,37 @@ fn recover_push_reject(req: &CloseoutRequest) -> PushRecoveryOutcome {
         return PushRecoveryOutcome::Failed(rebase);
     }
 
+    let merge_gate = tag_recovery(
+        phase_merge_gate(req, candidate_gate),
+        "remote_moved_merge_gate",
+    );
+    if !merge_gate.ok {
+        return PushRecoveryOutcome::Failed(merge_gate);
+    }
+
     let ff_merge = tag_recovery(phase_ff_merge(req), "remote_moved_ff_merge");
     if !ff_merge.ok {
         return PushRecoveryOutcome::Failed(ff_merge);
     }
 
+    let mut recovery_phases = vec![rebase, merge_gate, ff_merge];
+    match verify_knowledge_transaction_closeout(req) {
+        HookRun::Blocked(phase) => {
+            return PushRecoveryOutcome::Failed(tag_recovery(
+                phase,
+                "remote_moved_transaction_proof",
+            ));
+        }
+        HookRun::Ran(phase) => {
+            recovery_phases.push(tag_recovery(phase, "remote_moved_transaction_proof"))
+        }
+        HookRun::None => {}
+    }
+
     let retry = tag_recovery(phase_push(req), "remote_moved_retry_push");
     if retry.ok {
-        PushRecoveryOutcome::Recovered(vec![rebase, ff_merge, retry])
+        recovery_phases.push(retry);
+        PushRecoveryOutcome::Recovered(recovery_phases)
     } else {
         PushRecoveryOutcome::Failed(push_recovery_retry_failed(
             retry,
@@ -2988,6 +3223,7 @@ mod tests {
                 CloseoutPhase::Preflight,
                 CloseoutPhase::FfBase,
                 CloseoutPhase::Rebase,
+                CloseoutPhase::MergeGate,
                 CloseoutPhase::FfMerge,
                 CloseoutPhase::Push,
                 CloseoutPhase::Remove,
@@ -3520,7 +3756,7 @@ mod tests {
         run_git(&peer_repo, &["commit", "-m", "remote move"]);
         run_git(&peer_repo, &["push", "origin", "main"]);
 
-        let phases = match recover_push_reject(&req) {
+        let phases = match recover_push_reject(&req, None) {
             PushRecoveryOutcome::Recovered(phases) => phases,
             PushRecoveryOutcome::Failed(result) => panic!(
                 "expected push recovery, got {:?} {:?}: {:?}",
@@ -3532,6 +3768,7 @@ mod tests {
             phases.iter().map(|r| r.phase).collect::<Vec<_>>(),
             vec![
                 CloseoutPhase::Rebase,
+                CloseoutPhase::MergeGate,
                 CloseoutPhase::FfMerge,
                 CloseoutPhase::Push,
             ]
@@ -3611,7 +3848,7 @@ mod tests {
         run_git(&peer_repo, &["commit", "-m", "remote conflict"]);
         run_git(&peer_repo, &["push", "origin", "main"]);
 
-        let failed = match recover_push_reject(&req) {
+        let failed = match recover_push_reject(&req, None) {
             PushRecoveryOutcome::Failed(result) => result,
             PushRecoveryOutcome::Recovered(phases) => panic!(
                 "expected rebase conflict, got recovery phases: {:?}",
@@ -4017,6 +4254,99 @@ mod tests {
         run_git(&cwd, &["add", "README.md"]);
         run_git(&cwd, &["commit", "-m", "worktree commit"]);
         (repo, origin, value, cwd, branch)
+    }
+
+    #[tokio::test]
+    async fn merge_gate_reads_candidate_before_base_fast_forward() {
+        let (repo, _origin, value, cwd, branch) = seed_foldable_worktree().await;
+        let base = repo.path().canonicalize().unwrap();
+        let req = CloseoutRequest {
+            worktree: cwd.clone(),
+            base_repo: base.clone(),
+            branch,
+            target: "main".to_string(),
+            disposition: "adopt".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+            dry_run: false,
+            closeout_hooks: None,
+        };
+        let gate = |candidate: &CandidateTree| {
+            assert_eq!(
+                std::fs::read_to_string(base.join("README.md")).unwrap(),
+                "base\n",
+                "base checkout must still be untouched while the gate runs"
+            );
+            let materialized = tempfile::tempdir().unwrap();
+            materialize_candidate_tree(candidate, materialized.path()).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(materialized.path().join("README.md")).unwrap(),
+                "base\ncommitted\n"
+            );
+            Ok(CandidateGateReport {
+                ok: true,
+                content: json!({"checked": true}),
+            })
+        };
+        let phases = match run_closeout_phases_with_candidate_gate(&req, Some(&gate)) {
+            CloseoutOutcome::Success { phases } => phases,
+            CloseoutOutcome::Failed(phase) => panic!("closeout failed: {:?}", phase.content),
+        };
+        let merge_gate = phases
+            .iter()
+            .find(|phase| phase.phase == CloseoutPhase::MergeGate)
+            .expect("merge gate phase");
+        assert_eq!(merge_gate.content["report"]["checked"], json!(true));
+        assert!(!cwd.exists());
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
+    }
+
+    #[tokio::test]
+    async fn merge_gate_rejection_blocks_before_base_and_remote_mutation() {
+        let (repo, origin, value, cwd, branch) = seed_foldable_worktree().await;
+        let base = repo.path().canonicalize().unwrap();
+        let base_before = git_capture(&base, &["rev-parse", "main"]).unwrap();
+        let origin_before = git_capture(origin.path(), &["rev-parse", "main"]).unwrap();
+        let req = CloseoutRequest {
+            worktree: cwd.clone(),
+            base_repo: base.clone(),
+            branch,
+            target: "main".to_string(),
+            disposition: "adopt".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+            dry_run: false,
+            closeout_hooks: None,
+        };
+        let gate = |_candidate: &CandidateTree| {
+            Ok(CandidateGateReport {
+                ok: false,
+                content: json!({"error": "candidate rejected by fixture"}),
+            })
+        };
+        match run_closeout_phases_with_candidate_gate(&req, Some(&gate)) {
+            CloseoutOutcome::Failed(phase) => {
+                assert_eq!(phase.phase, CloseoutPhase::MergeGate);
+                assert_eq!(phase.error_class, CloseoutErrorClass::MergeGateBlocked);
+            }
+            CloseoutOutcome::Success { .. } => panic!("candidate rejection must block closeout"),
+        }
+        assert_eq!(
+            git_capture(&base, &["rev-parse", "main"]).unwrap(),
+            base_before
+        );
+        assert_eq!(
+            git_capture(origin.path(), &["rev-parse", "main"]).unwrap(),
+            origin_before
+        );
+        assert!(cwd.exists());
+        run_git(
+            &base,
+            &["worktree", "remove", "--force", cwd.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
     }
 
     fn install_knowledge_closeout_fixture(cwd: &Path, expected_sha: Option<&str>) {
