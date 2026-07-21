@@ -182,7 +182,7 @@ impl BlackboxServer {
                 branch_ref: checkout.branch_ref.clone(),
             },
         )?;
-        self.watch_dark_knowledge_checkout(std::path::Path::new(&checkout.checkout_project_dir));
+        self.watch_resolved_dark_knowledge_checkout(checkout);
         Ok(())
     }
 

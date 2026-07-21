@@ -223,6 +223,10 @@ impl BlackboxServer {
         }
     }
 
+    pub(crate) fn watch_resolved_dark_knowledge_checkout(&self, checkout: &ResolvedCheckoutScope) {
+        self.watch_dark_knowledge_checkout(Path::new(&checkout.checkout_project_dir));
+    }
+
     fn resolve_registered_checkout(&self, row: &CheckoutRow) -> Option<ResolvedCheckoutScope> {
         let scope = row.published_scope()?;
         let checkout_dir = canonical_or_original(Path::new(&row.checkout_dir));
