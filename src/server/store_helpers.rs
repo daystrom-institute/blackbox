@@ -1,3 +1,5 @@
+use anyhow::Context;
+
 use crate::embed_queue;
 use crate::packets::apply_with as apply_packet_with;
 use crate::server::BlackboxServer;
@@ -20,7 +22,12 @@ impl BlackboxServer {
             })
             .map(str::to_owned);
         let documents = if let Some(project) = managed_project {
-            self.session_knowledge_view(Some(&project), Some("all"))?
+            let expected_entry = entry
+                .as_ref()
+                .context("managed knowledge entry vanished before index sync")?;
+            let expected_entry = serde_json::to_vec(expected_entry)?;
+            let documents = self
+                .session_knowledge_view(Some(&project), Some("all"))?
                 .items
                 .into_iter()
                 .filter(|item| item.metadata.logical_ref == logical_ref)
@@ -44,7 +51,15 @@ impl BlackboxServer {
                         snapshot_id: item.metadata.overlay_snapshot_id,
                     }
                 })
-                .collect()
+                .collect::<Vec<_>>();
+            if !documents.iter().any(|document| {
+                serde_json::to_vec(&document.entry).is_ok_and(|entry| entry == expected_entry)
+            }) {
+                anyhow::bail!(
+                    "refusing stale knowledge index sync for {logical_ref}: refreshed view does not contain the just-written entry"
+                );
+            }
+            documents
         } else {
             entry
                 .map(crate::index::KnowledgeIndexDocument::published)
@@ -71,9 +86,10 @@ impl BlackboxServer {
         embed_queue::tombstone_knowledge(&crate::index::knowledge_entity_id(entry_id));
         self.state
             .index_writer
-            .enqueue(crate::index::IndexWriteOp::DeleteKnowledge(
-                entry_id.to_string(),
-            ));
+            .enqueue(crate::index::IndexWriteOp::ReplaceKnowledgeLogical {
+                logical_ref: crate::index::knowledge_entity_id(entry_id),
+                documents: Vec::new(),
+            });
         Ok(())
     }
 

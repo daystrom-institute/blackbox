@@ -579,6 +579,17 @@ mod tests {
         assert!(search(&index, "published obsolete").contains("published"));
         assert!(search(&index, "provisional obsolete").contains("provisional"));
 
+        actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(test_entry(
+            "scope0001",
+            "published variant update",
+        ))));
+        actor.flush_blocking().unwrap();
+        assert!(search(&index, "published variant update").contains("published"));
+        assert!(
+            search(&index, "provisional obsolete").contains("provisional"),
+            "variant-precise upsert must not delete the provisional document"
+        );
+
         actor.enqueue(IndexWriteOp::ReplaceKnowledgeLogical {
             logical_ref,
             documents: vec![KnowledgeIndexDocument::published(test_entry(

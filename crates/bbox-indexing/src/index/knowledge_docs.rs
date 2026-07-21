@@ -265,7 +265,7 @@ pub fn apply_knowledge_upsert(
     entry: &KnowledgeEntry,
 ) -> Result<()> {
     let entity_id = knowledge_entity_id(&entry.id);
-    writer.delete_term(Term::from_field_text(fields.logical_ref, &entity_id));
+    writer.delete_term(Term::from_field_text(fields.entity_id, &entity_id));
     if indexable_knowledge_entry(entry) {
         writer.add_document(build_knowledge_doc(entry, knowledge_path, fields))?;
     }
@@ -279,7 +279,7 @@ pub fn apply_knowledge_delete(
     entry_id: &str,
 ) -> Result<()> {
     writer.delete_term(Term::from_field_text(
-        fields.logical_ref,
+        fields.entity_id,
         &knowledge_entity_id(entry_id),
     ));
     Ok(())

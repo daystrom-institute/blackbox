@@ -13,10 +13,10 @@ brief: "Retire write_redirects, the host-local map that makes kb.json required t
 
 # Checkout identity and the provisional knowledge lane
 
-> **Status: partial.** Eight additive foundation slices are landed on
-> `beta/blackbox-v2`. The prerequisite repair and slice 3.3 dark overlay are
-> implemented and lane-verified in the current working tree, but are not yet
-> committed. Visibility, promotion, and lifecycle wiring are not implemented.
+> **Status: partial.** The additive foundation, prerequisite repair, slice 3.3
+> dark overlay, and slice 3.4 session-authoritative committed view are landed
+> and full-profile verified on `beta/blackbox-v2`. Promotion and lifecycle
+> wiring are not implemented.
 > Anchors were re-verified against that branch after the
 > slice-3.2 checkpoint and this design was repaired against the live loader,
 > resolver, index, and entity-ref paths on 2026-07-20. Line cites rot, so grep
@@ -73,19 +73,18 @@ primitives (3.0), the duplicate-publisher guard (3.1), and
 published-vs-provisional labeling (3.2). These slices deliberately changed no
 live query behavior.
 
-Implemented in the current working tree and workspace-lane verified: init/eject
-merge-preserve and record `repo_id`; the checkout registry uses the composite
+Also landed and full-profile verified: init/eject merge-preserve and record
+`repo_id`; the checkout registry uses the composite
 `(checkout_id, published_scope)` key; base and worktree writes resolve a
 concrete checkout id and monorepo project directory; publisher refs are pinned;
 and `learn`/`remember`/`decide` register before mutation and recompute an exact
-P/H/B dark overlay afterward. Overlay admission and persistence failures are
-diagnostic only in this slice and cannot fail the established knowledge write.
-The overlay remains disconnected from every query, index, render, graph, and
-inbox consumer.
+P/H/B overlay afterward. Session-authoritative `published|own|all` visibility
+now drives list, hybrid search, inspection, render, graph, inbox, discover
+seed, and logical-ref-scoped index replacement.
 
 Still not implemented: the epoch marker and quarantine, response-level
-`built_from`, session-authoritative visibility, promotion, and registry
-lifecycle reconciliation. Section 6 is the authoritative remaining sequence.
+`built_from`, promotion, and registry lifecycle reconciliation. Section 6 is
+the authoritative remaining sequence.
 
 When this document and an additive primitive disagree, the contract here wins
 and the primitive is repaired before live wiring.
@@ -682,19 +681,19 @@ migration** (§6 slice 8). Not left implicit.
 The eight additive slices in §0.1 remain valid foundation, but the live
 sequence begins with a repair gate:
 
-1. **Prerequisite repair (implemented in the current working tree).** Wire merge-preserving `repo_id` recording into
+1. **Prerequisite repair (landed).** Wire merge-preserving `repo_id` recording into
    init/eject; make the checkout registry composite-keyed by checkout and
    published scope; normalize base checkouts; project `bbox_root_relpath` into
    the corresponding worktree project directory; add the host-local
    publisher-ref pin and scope failure states. Update tests that currently
    assert checkout-id-only upsert.
-2. **3.3 dark overlay + register-on-write (implemented in the current working tree).** Add `ResolvedCheckoutScope`,
+2. **3.3 dark overlay + register-on-write (landed).** Add `ResolvedCheckoutScope`,
    immutable overlay snapshots, exact merge-base working-tree diff with
    tombstones, validation, view stamps, and register-before-write ordering for
    `learn`/`remember`/`decide`. Compute published maps from the pinned committed
    ref, but keep both maps out of every live query/index/render consumer.
    Diagnostics prove recomputation without changing visible behavior.
-3. **3.4 committed view + session-authoritative visibility (implemented in the current working tree).** Replace the
+3. **3.4 committed view + session-authoritative visibility (landed).** Replace the
    working-base loader with the committed published map plus base overlay;
    carry `ResolvedCheckoutScope` on the MCP session; add
    `provisional=published|own|all`; add compound provisional entity refs and
