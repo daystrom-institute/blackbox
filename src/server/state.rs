@@ -582,4 +582,8 @@ pub(crate) struct BlackboxServer {
     /// id / path → base canonical path), falling back to the literal value
     /// for parity with the bbox_mcp_surface tool (gap-310c36b6).
     pub(crate) surface_project: OnceLock<Option<Arc<str>>>,
+    /// Server-authoritative checkout identity derived from trusted MCP
+    /// transport context at initialization. Tool arguments never replace it.
+    pub(crate) session_checkout:
+        OnceLock<Option<Arc<bbox_corpus_core::project_record::ResolvedCheckoutScope>>>,
 }

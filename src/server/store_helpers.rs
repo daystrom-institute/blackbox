@@ -5,15 +5,41 @@ use crate::server::routes::rebuild_edge_index_from_shared;
 
 impl BlackboxServer {
     pub(crate) fn sync_knowledge_entry_to_index(&self, entry_id: &str) -> anyhow::Result<()> {
-        let Some(entry) = self.state.kb.read().entry(entry_id).cloned() else {
-            return Ok(());
-        };
-        let entity_id = crate::index::knowledge_entity_id(entry_id);
-        let chunk_hash = crate::index::knowledge_chunk_hash(&entry);
-        embed_queue::enqueue_knowledge(&entry, &entity_id, &chunk_hash);
+        if let Some(entry) = self.state.kb.read().entry(entry_id).cloned()
+            && entry.scope == bbox_knowledge::knowledge::Scope::Global
+        {
+            let entity_id = crate::index::knowledge_entity_id(entry_id);
+            let chunk_hash = crate::index::knowledge_chunk_hash(&entry);
+            embed_queue::enqueue_knowledge(&entry, &entity_id, &chunk_hash);
+        }
+        let view = self.session_knowledge_view(None, Some("all"))?;
+        let documents = view
+            .items
+            .into_iter()
+            .map(|item| {
+                let provisional = item.entity_ref.starts_with("provisional_knowledge:");
+                crate::index::KnowledgeIndexDocument {
+                    entry: item.entry,
+                    entity_id: item.entity_ref,
+                    logical_ref: item.metadata.logical_ref,
+                    visibility: if provisional {
+                        "provisional".into()
+                    } else {
+                        "published".into()
+                    },
+                    scope_hash: item
+                        .metadata
+                        .published_scope
+                        .as_ref()
+                        .map(bbox_knowledge::overlay::published_scope_hash),
+                    checkout_id: item.metadata.checkout_id,
+                    snapshot_id: item.metadata.overlay_snapshot_id,
+                }
+            })
+            .collect();
         self.state
             .index_writer
-            .enqueue(crate::index::IndexWriteOp::UpsertKnowledge(Box::new(entry)));
+            .enqueue(crate::index::IndexWriteOp::ReplaceKnowledge(documents));
         Ok(())
     }
 

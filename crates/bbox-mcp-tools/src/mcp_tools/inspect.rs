@@ -13,6 +13,9 @@ use bbox_providers::providers::{self, EntityView, Neighborhood, NextHop, Provide
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct InspectEntityParams {
     pub entity_ref: String,
+    /// Knowledge visibility policy: published, own, or all.
+    #[serde(default)]
+    pub provisional: Option<String>,
     pub edge_types: Option<String>,
     pub direction: Option<String>,
     pub per_type_limit: Option<usize>,
@@ -444,6 +447,7 @@ mod tests {
         )));
         let params = InspectEntityParams {
             entity_ref: "system_memory:sm-agentic-opening-sequence".into(),
+            provisional: None,
             edge_types: None,
             direction: None,
             per_type_limit: Some(0),
@@ -476,6 +480,7 @@ mod tests {
         // family coverage row must report it present.
         let params = InspectEntityParams {
             entity_ref: "transcript:claude:sess-1:42:0".into(),
+            provisional: None,
             edge_types: None,
             direction: None,
             per_type_limit: None,
@@ -520,6 +525,7 @@ mod tests {
         )));
         let params = InspectEntityParams {
             entity_ref: "system_memory:sm-agentic-opening-sequence".into(),
+            provisional: None,
             edge_types: None,
             direction: None,
             per_type_limit: Some(0),

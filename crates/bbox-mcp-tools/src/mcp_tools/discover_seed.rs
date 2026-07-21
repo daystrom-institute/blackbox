@@ -86,6 +86,7 @@ pub fn discover_seed_entities(
             vector_weight: p.vector_weight,
             query_vector: p.query_vector.clone(),
             project: p.project.clone(),
+            provisional: None,
             rerank_cap: None,
             rerank: None,
         },

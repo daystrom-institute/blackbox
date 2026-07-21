@@ -395,6 +395,20 @@ impl TranscriptIndex {
         limit: usize,
         doc_type: Option<&str>,
     ) -> Result<Vec<HybridBm25Hit>> {
+        self.hybrid_bm25_hits_filtered(query, limit, doc_type, false)
+    }
+
+    /// Hybrid BM25 retrieval with an optional knowledge exclusion. Session
+    /// visibility is resolved outside the static corpus index; excluding all
+    /// indexed knowledge here lets the caller inject its authorized view
+    /// before fusion so hidden variants never consume the TopDocs cutoff.
+    pub fn hybrid_bm25_hits_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        doc_type: Option<&str>,
+        exclude_knowledge: bool,
+    ) -> Result<Vec<HybridBm25Hit>> {
         if self.is_empty() || query.trim().is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
@@ -441,6 +455,15 @@ impl TranscriptIndex {
                 Occur::Must,
                 Box::new(TermQuery::new(
                     Term::from_field_text(self.fields.doc_type, doc_type),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+        if exclude_knowledge {
+            clauses.push((
+                Occur::MustNot,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.doc_type, "knowledge"),
                     IndexRecordOption::Basic,
                 )),
             ));

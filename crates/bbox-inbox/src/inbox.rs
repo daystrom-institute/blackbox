@@ -16,6 +16,9 @@ pub struct InboxParams {
     /// Filter to a project path substring
     #[serde(default)]
     pub project: Option<String>,
+    /// Knowledge visibility policy: published, own, or all.
+    #[serde(default)]
+    pub provisional: Option<String>,
     /// Max rows per section (default: 10)
     #[serde(default)]
     pub limit: Option<u64>,
@@ -951,6 +954,7 @@ mod tests {
             &whiteboards,
             &InboxParams {
                 project: None,
+                provisional: None,
                 limit: None,
                 stale_days: None,
                 include_tasks: None,
@@ -992,6 +996,7 @@ mod tests {
             &whiteboards,
             &InboxParams {
                 project: Some("/repo/unrelated-project".into()),
+                provisional: None,
                 limit: None,
                 stale_days: None,
                 include_tasks: None,
@@ -1041,6 +1046,7 @@ mod tests {
             &whiteboards,
             &InboxParams {
                 project: Some("/repo/unrelated-project".into()),
+                provisional: None,
                 limit: None,
                 stale_days: None,
                 include_tasks: None,
@@ -1204,6 +1210,7 @@ mod tests {
             &whiteboards,
             &InboxParams {
                 project: None,
+                provisional: None,
                 limit: None,
                 stale_days: Some(0), // any open thread counts as stale
                 include_tasks: None,
@@ -1269,6 +1276,7 @@ mod tests {
             &whiteboards,
             &InboxParams {
                 project: Some("transcript-search".into()),
+                provisional: None,
                 limit: None,
                 stale_days: None,
                 include_tasks: None,
@@ -1366,6 +1374,7 @@ mod tests {
             &whiteboards,
             &InboxParams {
                 project: Some("/repo/x".into()),
+                provisional: None,
                 limit: Some(10),
                 stale_days: None,
                 include_tasks: Some(false),
@@ -1431,6 +1440,7 @@ mod tests {
             &whiteboards,
             &InboxParams {
                 project: Some("/repo/x".into()),
+                provisional: None,
                 limit: None,
                 stale_days: Some(1),
                 include_tasks: Some(false),
@@ -1503,6 +1513,7 @@ mod tests {
             &whiteboards,
             &InboxParams {
                 project: Some("/repo/x".into()),
+                provisional: None,
                 limit: None,
                 stale_days: None,
                 include_tasks: Some(false),

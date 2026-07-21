@@ -1,6 +1,7 @@
 mod background;
 pub mod dispatch;
 pub mod handler;
+mod knowledge_view;
 mod mcp;
 mod open;
 pub mod progress;
@@ -62,6 +63,7 @@ impl BlackboxServer {
                 + crate::tools::system_events::router(),
             surface: std::sync::OnceLock::new(),
             surface_project: std::sync::OnceLock::new(),
+            session_checkout: std::sync::OnceLock::new(),
         }
     }
 }

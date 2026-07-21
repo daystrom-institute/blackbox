@@ -41,5 +41,6 @@ tempfile = "3"
 bbox-util = { path = "../bbox-util" }
 bbox-stores = { path = "../bbox-stores" }
 bbox-knowledge = { path = "../bbox-knowledge" }
+bbox-config = { path = "../bbox-config" }
 bbox-threads = { path = "../bbox-threads" }
 bbox-edge-index = { path = "../bbox-edge-index" }

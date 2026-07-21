@@ -12,7 +12,7 @@ use tantivy::schema::*;
 use tantivy::tokenizer::TextAnalyzer;
 use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, Term};
 
-pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g8-base-project-id";
+pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g9-knowledge-visibility";
 const SCHEMA_VERSION_FILE: &str = "schema_version.txt";
 
 /// Metadata about an indexed file, for incremental updates.
@@ -103,6 +103,11 @@ pub struct FieldHandles {
     pub chunk_hash: Field,
     #[allow(dead_code)]
     pub entity_id: Field,
+    pub logical_ref: Field,
+    pub knowledge_visibility: Field,
+    pub knowledge_scope_hash: Field,
+    pub knowledge_checkout_id: Field,
+    pub knowledge_snapshot_id: Field,
     pub parser_version: Field,
     #[allow(dead_code)]
     pub commit_sha: Field,
@@ -686,6 +691,11 @@ pub fn build_schema() -> (Schema, FieldHandles) {
         code_content: builder.add_text_field("code_content", code_options),
         chunk_hash: builder.add_text_field("chunk_hash", STRING | STORED),
         entity_id: builder.add_text_field("entity_id", STRING | STORED),
+        logical_ref: builder.add_text_field("logical_ref", STRING | STORED),
+        knowledge_visibility: builder.add_text_field("knowledge_visibility", STRING | STORED),
+        knowledge_scope_hash: builder.add_text_field("knowledge_scope_hash", STRING | STORED),
+        knowledge_checkout_id: builder.add_text_field("knowledge_checkout_id", STRING | STORED),
+        knowledge_snapshot_id: builder.add_text_field("knowledge_snapshot_id", STRING | STORED),
         parser_version: builder.add_text_field("parser_version", STRING | STORED),
         commit_sha: builder.add_text_field("commit_sha", STRING | STORED),
         repo_id: builder.add_text_field("repo_id", STRING | STORED),

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
@@ -10,7 +10,35 @@ use tantivy::{IndexWriter, TantivyDocument};
 
 use super::{FieldHandles, FileMeta};
 use bbox_corpus_core::entity_ref::{EntityRef, PARSER_VERSION};
+use bbox_corpus_core::identity::PublishedScope;
 use bbox_knowledge::knowledge::{Knowledge, KnowledgeEntry, Status};
+use bbox_knowledge::overlay::{load_published_snapshot, published_scope_hash};
+
+#[derive(Debug, Clone)]
+pub struct KnowledgeIndexDocument {
+    pub entry: KnowledgeEntry,
+    pub entity_id: String,
+    pub logical_ref: String,
+    pub visibility: String,
+    pub scope_hash: Option<String>,
+    pub checkout_id: Option<String>,
+    pub snapshot_id: Option<String>,
+}
+
+impl KnowledgeIndexDocument {
+    pub fn published(entry: KnowledgeEntry) -> Self {
+        let entity_id = knowledge_entity_id(&entry.id);
+        Self {
+            logical_ref: entity_id.clone(),
+            entity_id,
+            entry,
+            visibility: "published".into(),
+            scope_hash: None,
+            checkout_id: None,
+            snapshot_id: None,
+        }
+    }
+}
 
 pub fn knowledge_entity_id(entry_id: &str) -> String {
     EntityRef::Knowledge {
@@ -33,10 +61,34 @@ pub fn build_knowledge_doc(
     knowledge_path: &Path,
     f: FieldHandles,
 ) -> TantivyDocument {
+    build_knowledge_index_doc(
+        &KnowledgeIndexDocument::published(entry.clone()),
+        knowledge_path,
+        f,
+    )
+}
+
+pub fn build_knowledge_index_doc(
+    source: &KnowledgeIndexDocument,
+    knowledge_path: &Path,
+    f: FieldHandles,
+) -> TantivyDocument {
+    let entry = &source.entry;
     let mut doc = TantivyDocument::new();
     doc.add_text(f.doc_type, "knowledge");
     doc.add_text(f.parser_version, PARSER_VERSION);
-    doc.add_text(f.entity_id, knowledge_entity_id(&entry.id));
+    doc.add_text(f.entity_id, &source.entity_id);
+    doc.add_text(f.logical_ref, &source.logical_ref);
+    doc.add_text(f.knowledge_visibility, &source.visibility);
+    if let Some(scope_hash) = &source.scope_hash {
+        doc.add_text(f.knowledge_scope_hash, scope_hash);
+    }
+    if let Some(checkout_id) = &source.checkout_id {
+        doc.add_text(f.knowledge_checkout_id, checkout_id);
+    }
+    if let Some(snapshot_id) = &source.snapshot_id {
+        doc.add_text(f.knowledge_snapshot_id, snapshot_id);
+    }
     doc.add_text(f.chunk_hash, knowledge_chunk_hash(entry));
     doc.add_text(f.chunk_kind, "knowledge_entry");
     doc.add_text(f.file_path, knowledge_path.to_string_lossy());
@@ -46,6 +98,22 @@ pub fn build_knowledge_doc(
     }
     doc.add_text(f.content, format!("{}\n\n{}", entry.title, entry.content));
     doc
+}
+
+pub fn apply_knowledge_replace(
+    writer: &mut IndexWriter,
+    fields: FieldHandles,
+    knowledge_path: &Path,
+    documents: &[KnowledgeIndexDocument],
+) -> Result<()> {
+    writer.delete_term(Term::from_field_text(fields.doc_type, "knowledge"));
+    for document in documents
+        .iter()
+        .filter(|document| indexable_knowledge_entry(&document.entry))
+    {
+        writer.add_document(build_knowledge_index_doc(document, knowledge_path, fields))?;
+    }
+    Ok(())
 }
 
 pub fn indexable_knowledge_entry(entry: &KnowledgeEntry) -> bool {
@@ -64,32 +132,95 @@ pub fn reindex_knowledge_store_standalone(
     meta: &mut HashMap<String, FileMeta>,
 ) -> Result<u64> {
     writer.delete_term(Term::from_field_text(fields.doc_type, "knowledge"));
-    // Do NOT early-return when central kb.json is absent. On a repo-owned-only
-    // host the central store may not exist, but the committed per-repo
-    // .bbox/knowledge entries still must be indexed. `Knowledge::open` tolerates
-    // an absent central store (resets to an empty central, then merges repo
-    // roots), so we always open + load roots and index whatever is present.
-    let mut knowledge = Knowledge::open(knowledge_path)?;
-    // Project-scoped entries live in each repo's committed .bbox/knowledge/, not
-    // the central store, so a reindex that only read kb.json would silently drop
-    // them from search. Load the registered repos' roots so committed project
-    // knowledge is indexed too.
-    let roots: Vec<std::path::PathBuf> =
-        crate::projects::ProjectRegistry::load_records(projects_path)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| std::path::PathBuf::from(r.canonical_path))
-            .collect();
-    if let Err(e) = knowledge.set_project_roots(roots) {
-        tracing::warn!("kb reindex project-root load: {e:#}");
-    }
-    let mut docs = 0;
-    for entry in knowledge
+    // Central knowledge contributes globals and legacy, non-repo-owned
+    // projects. Registered project scopes are replaced below from their
+    // committed pinned publisher tree, never from working-tree bytes or a
+    // redirected central retention copy.
+    let knowledge = Knowledge::open(knowledge_path)?;
+    let projects =
+        crate::projects::ProjectRegistry::load_records(projects_path).unwrap_or_default();
+    let managed_paths = projects
+        .iter()
+        .map(|project| project.canonical_path.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut documents = knowledge
         .all_entries()
         .iter()
-        .filter(|entry| indexable_knowledge_entry(entry))
+        .filter(|entry| {
+            !entry
+                .project
+                .as_deref()
+                .is_some_and(|project| managed_paths.contains(project))
+        })
+        .cloned()
+        .map(KnowledgeIndexDocument::published)
+        .collect::<Vec<_>>();
+
+    let mut publishers = BTreeMap::<PublishedScope, Vec<_>>::new();
+    for project in &projects {
+        let Some(scope) = crate::publisher::project_published_scope(
+            project,
+            bbox_config::config::read_repo_id_inputs,
+        ) else {
+            continue;
+        };
+        publishers.entry(scope).or_default().push(project);
+    }
+    let refs_path = projects_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("publisher-refs.json");
+    let mut refs = crate::publisher::PublisherRefStore::open(refs_path)?;
+    for (scope, claiming) in publishers {
+        if claiming.len() != 1 {
+            tracing::warn!(
+                scope = ?scope,
+                publishers = claiming.len(),
+                "knowledge reindex omitted duplicate publisher scope"
+            );
+            continue;
+        }
+        let project = claiming[0];
+        let root = Path::new(&project.canonical_path);
+        let pin = match refs.ensure_pinned(&scope, root) {
+            Ok(pin) => pin,
+            Err(err) => {
+                tracing::warn!(scope = ?scope, error = %err, "knowledge reindex omitted unpinned scope");
+                continue;
+            }
+        };
+        let published = match load_published_snapshot(
+            root,
+            &pin.branch_ref,
+            &scope,
+            &project.canonical_path,
+        ) {
+            Ok(published) => published,
+            Err(err) => {
+                tracing::warn!(scope = ?scope, error = %err, "knowledge reindex omitted unreadable published scope");
+                continue;
+            }
+        };
+        let scope_hash = published_scope_hash(&scope);
+        documents.extend(published.entries.into_values().map(|published_entry| {
+            let logical_ref = knowledge_entity_id(&published_entry.entry.id);
+            KnowledgeIndexDocument {
+                entity_id: logical_ref.clone(),
+                logical_ref,
+                entry: published_entry.entry,
+                visibility: "published".into(),
+                scope_hash: Some(scope_hash.clone()),
+                checkout_id: None,
+                snapshot_id: Some(published.publisher_commit.clone()),
+            }
+        }));
+    }
+    let mut docs = 0;
+    for document in documents
+        .iter()
+        .filter(|document| indexable_knowledge_entry(&document.entry))
     {
-        writer.add_document(build_knowledge_doc(entry, knowledge_path, fields))?;
+        writer.add_document(build_knowledge_index_doc(document, knowledge_path, fields))?;
         docs += 1;
     }
     match file_meta(knowledge_path) {
@@ -236,6 +367,26 @@ mod tests {
         let central = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         let repo_root = repo.path().canonicalize().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo_root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(repo_root.join("README.md"), "seed\n").unwrap();
+        git(&["add", "README.md"]);
+        git(&["commit", "-q", "-m", "seed"]);
+        bbox_config::config::ensure_recorded_repo_id(&repo_root).unwrap();
 
         // Committed project entry in the repo's .bbox/knowledge/ (project omitted).
         let kb_dir = repo_root.join(".bbox").join("knowledge");
@@ -272,6 +423,8 @@ mod tests {
             serde_json::to_string(&entry).unwrap(),
         )
         .unwrap();
+        git(&["add", ".bbox"]);
+        git(&["commit", "-q", "-m", "knowledge"]);
 
         // Empty central store + a sibling projects.json registering the repo.
         let kb_path = central.path().join("kb.json");

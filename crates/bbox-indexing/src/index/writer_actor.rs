@@ -32,6 +32,7 @@ use bbox_knowledge::knowledge::KnowledgeEntry;
 use bbox_stores::roadmap::RoadmapItem;
 use bbox_threads::threads::Thread;
 
+use super::knowledge_docs::KnowledgeIndexDocument;
 use super::reindex::{conservative_log_merge_policy, execute_reindex_pass};
 use super::{FieldHandles, ReindexConfig, StatsCache, TranscriptIndex};
 
@@ -39,6 +40,7 @@ use super::{FieldHandles, ReindexConfig, StatsCache, TranscriptIndex};
 pub enum IndexWriteOp {
     UpsertKnowledge(Box<KnowledgeEntry>),
     DeleteKnowledge(String),
+    ReplaceKnowledge(Vec<KnowledgeIndexDocument>),
     UpsertRoadmap(Box<RoadmapItem>),
     DeleteRoadmap(String),
     UpsertThread(Box<Thread>),
@@ -303,6 +305,15 @@ fn apply_small_op(ctx: &ActorCtx, writer: &mut IndexWriter, op: IndexWriteOp) {
         IndexWriteOp::DeleteKnowledge(id) => (
             "delete_knowledge",
             super::knowledge_docs::apply_knowledge_delete(writer, ctx.fields, &id),
+        ),
+        IndexWriteOp::ReplaceKnowledge(documents) => (
+            "replace_knowledge",
+            super::knowledge_docs::apply_knowledge_replace(
+                writer,
+                ctx.fields,
+                knowledge_path(&ctx.config),
+                &documents,
+            ),
         ),
         IndexWriteOp::UpsertRoadmap(item) => (
             "upsert_roadmap",

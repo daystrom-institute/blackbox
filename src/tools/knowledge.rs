@@ -27,6 +27,7 @@ fn has_runtime_knowledge_filter(p: &KnowledgeListParams) -> bool {
         || p.provider.is_some()
         || p.status.is_some()
         || p.approval.is_some()
+        || p.provisional.is_some()
 }
 
 /// Extract the top knowledge entry id from a `kb.list` entries block for the
@@ -48,9 +49,26 @@ fn entry_ids(entries_block: &str) -> Vec<String> {
             let rest = line.strip_prefix('[')?;
             let end = rest.find(']')?;
             let id = rest[..end].trim();
-            (!id.is_empty()).then(|| id.to_string())
+            if id.is_empty() {
+                return None;
+            }
+            match bbox_corpus_core::entity_ref::EntityRef::parse(id) {
+                Ok(bbox_corpus_core::entity_ref::EntityRef::ProvisionalKnowledge {
+                    entry_id,
+                    ..
+                }) => Some(entry_id),
+                _ => Some(id.to_string()),
+            }
         })
         .collect()
+}
+
+fn knowledge_entity_ref(id: &str) -> String {
+    if id.starts_with("provisional_knowledge:") {
+        id.to_string()
+    } else {
+        format!("knowledge:{id}")
+    }
 }
 
 fn log_tool_ok(tool: &'static str, start: std::time::Instant, bytes: usize) {
@@ -463,7 +481,16 @@ impl BlackboxServer {
                 rescope_project_filter(&mut p, &projects);
             }
 
-            let mut combined = server.state.kb.write().list(&p)?;
+            let mut view = server.session_knowledge_view(
+                p.project.as_deref(),
+                p.provisional.as_deref(),
+            )?;
+            let mut combined = view.knowledge.list(&p)?;
+            if let Some(diagnostics) = view.diagnostics_text() {
+                combined.push_str("\n\n");
+                combined.push_str(&diagnostics);
+                combined.push('\n');
+            }
             // Captured before packets/memories are appended, so it reflects the
             // top knowledge entry (not a packet/memory line).
             let top_entry_id = first_entry_id(&combined);
@@ -581,15 +608,16 @@ impl BlackboxServer {
             // the graph funnel. Packets and memories carry their own pointers
             // above; this completes the response-breadcrumb plane for entries.
             if let Some(id) = &top_entry_id {
+                let entity_ref = knowledge_entity_ref(id);
                 if !combined.ends_with('\n') {
                     combined.push('\n');
                 }
                 combined.push_str("\n── Next steps ───────────────────────────────\n");
                 combined.push_str(&format!(
-                    "  → Inspect the top entry's edges + provenance: bbox_inspect_entity(entity_ref=\"knowledge:{id}\")\n"
+                    "  → Inspect the top entry's edges + provenance: bbox_inspect_entity(entity_ref=\"{entity_ref}\")\n"
                 ));
                 combined.push_str(&format!(
-                    "  → Package an answer: bbox_bundle_evidence(question=<q>, entity_refs=[\"knowledge:{id}\"])\n"
+                    "  → Package an answer: bbox_bundle_evidence(question=<q>, entity_refs=[\"{entity_ref}\"])\n"
                 ));
             }
             Ok(combined)
@@ -1051,6 +1079,10 @@ mod tests {
             Some(bbox_knowledge::overlay::OverlayValue::Upsert { .. })
         ));
         drop(overlays);
+
+        // Tool arguments cannot grant own-checkout visibility. Model the MCP
+        // transport authority that a real worktree session records at init.
+        server.set_session_checkout_for_test(scope, checkout_id, wt_canon.clone());
 
         // The other half of the gap: render from the worktree sees the entry.
         let render = server

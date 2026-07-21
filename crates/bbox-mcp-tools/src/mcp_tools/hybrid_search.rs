@@ -55,6 +55,9 @@ pub struct HybridSearchParams {
     /// vocabulary like "voyage" or "embed").
     #[serde(default)]
     pub project: Option<String>,
+    /// Knowledge visibility policy: published, own, or all.
+    #[serde(default)]
+    pub provisional: Option<String>,
     /// Operator-probe override for the combined rerank multiplier cap
     /// (default 1.5, clamped to [1.0, 4.0]). Exists so eval sweeps can
     /// measure ranking quality per candidate cap (gap-39b3ce16 protocol in
@@ -190,12 +193,38 @@ pub fn hybrid_search_typed(
     // single chunk is competitive.
     let bm25_fetch = (limit * 32).max(fetch);
     let (bm25_weight, vector_weight) = fusion_weights(p.vector_weight);
-    let bm25_hits_full = index.hybrid_bm25_hits(query, bm25_fetch, p.doc_type.as_deref())?;
+    let bm25_hits_full =
+        index.hybrid_bm25_hits_filtered(query, bm25_fetch, p.doc_type.as_deref(), true)?;
     // Truncate the chunk-level list to `fetch` so it doesn't dilute RRF with
     // tail chunks that rank too low to matter. The full set still feeds
     // file-level aggregation below.
     let bm25_hits: Vec<_> = bm25_hits_full.iter().take(fetch).cloned().collect();
-    let mut features = features_from_bm25(&bm25_hits);
+    let knowledge_hits = if p
+        .doc_type
+        .as_deref()
+        .is_none_or(|doc_type| doc_type == "knowledge")
+    {
+        knowledge
+            .search_hits(query, fetch)
+            .into_iter()
+            .enumerate()
+            .map(|(rank, hit)| HybridBm25Hit {
+                entity_id: hit.entity_id,
+                score: hit.score,
+                rank: rank + 1,
+                doc_type: "knowledge".into(),
+                chunk_kind: "knowledge_entry".into(),
+                role: String::new(),
+                title: Some(hit.title),
+                excerpt: hit.excerpt,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let mut ranked_hits = bm25_hits.clone();
+    ranked_hits.extend(knowledge_hits.iter().cloned());
+    let mut features = features_from_bm25(&ranked_hits);
 
     let mut lists = vec![RankedList {
         source: "bm25".into(),
@@ -210,6 +239,21 @@ pub fn hybrid_search_typed(
             })
             .collect(),
     }];
+    if !knowledge_hits.is_empty() {
+        lists.push(RankedList {
+            source: "knowledge".into(),
+            weight: bm25_weight,
+            hits: knowledge_hits
+                .iter()
+                .map(|hit| RankedHit {
+                    entity_id: hit.entity_id.clone(),
+                    rank: hit.rank,
+                    score: hit.score,
+                    source: "knowledge".into(),
+                })
+                .collect(),
+        });
+    }
     // File-level BM25 aggregation: sum chunk scores per (project_id,
     // rel_path_hash) over the FULL bm25 fetch (not the truncated chunk
     // list) and contribute the file-level ranking as a separate signal
@@ -243,7 +287,7 @@ pub fn hybrid_search_typed(
         searched_partitions: Vec::new(),
     };
     if p.include_vectors.unwrap_or(true) && vector_weight > 0.0 {
-        let vector_lists = vector_ranked_lists(
+        let mut vector_lists = vector_ranked_lists(
             query,
             p.query_vector.as_deref(),
             fetch,
@@ -251,6 +295,15 @@ pub fn hybrid_search_typed(
             &vector_status.partitions,
             &mut degraded,
         )?;
+        // Knowledge vectors were built from the old daemon-wide aggregate and
+        // cannot establish session visibility. Drop them before fusion; the
+        // authorized request view contributes its own ranked knowledge lane.
+        for list in &mut vector_lists {
+            list.hits.retain(|hit| {
+                !hit.entity_id.starts_with("knowledge:")
+                    && !hit.entity_id.starts_with("provisional_knowledge:")
+            });
+        }
         vector_status.searched_partitions = vector_lists
             .iter()
             .map(|list| list.source.trim_start_matches("vector:").to_string())
@@ -283,7 +336,7 @@ pub fn hybrid_search_typed(
         match model_rerank_scores(
             query,
             &fused,
-            &bm25_hits,
+            &ranked_hits,
             &loaded_properties,
             &config,
             |q, docs| rerank_blocking(config.clone(), q, docs),
@@ -312,7 +365,7 @@ pub fn hybrid_search_typed(
                 now,
                 rerank_cap,
             );
-            let bm25 = bm25_hits
+            let bm25 = ranked_hits
                 .iter()
                 .find(|bm25| bm25.entity_id == hit.entity_id);
             HybridResult {
@@ -835,10 +888,7 @@ fn enrich_knowledge_features(
     features: &mut BTreeMap<String, RerankFeatures>,
 ) {
     for (entity_id, feature) in features {
-        let Some(id) = entity_id.strip_prefix("knowledge:") else {
-            continue;
-        };
-        let Some(entry) = knowledge.entry(id) else {
+        let Some(entry) = knowledge_entry_for_entity(knowledge, entity_id) else {
             continue;
         };
         if feature.doc_type.is_none() {
@@ -999,7 +1049,10 @@ fn enrich_fused_features<'a>(
             if let Some(properties) = indexed_properties {
                 loaded_properties.insert(entity_id.to_string(), properties);
             }
-            if entity_id.starts_with("knowledge:") && feature.doc_type.is_none() {
+            if (entity_id.starts_with("knowledge:")
+                || entity_id.starts_with("provisional_knowledge:"))
+                && feature.doc_type.is_none()
+            {
                 feature.doc_type = Some("knowledge".into());
             }
             if feature.doc_type.is_none() {
@@ -1033,8 +1086,7 @@ fn knowledge_properties(
     knowledge: &Knowledge,
     entity_id: &str,
 ) -> Option<BTreeMap<String, String>> {
-    let id = entity_id.strip_prefix("knowledge:")?;
-    let entry = knowledge.entry(id)?;
+    let entry = knowledge_entry_for_entity(knowledge, entity_id)?;
     let mut properties = BTreeMap::new();
     properties.insert("title".into(), entry.title.clone());
     properties.insert("doc_type".into(), "knowledge".into());
@@ -1044,6 +1096,19 @@ fn knowledge_properties(
         properties.insert("last_recalled".into(), last_recalled.clone());
     }
     Some(properties)
+}
+
+fn knowledge_entry_for_entity<'a>(
+    knowledge: &'a Knowledge,
+    entity_id: &str,
+) -> Option<&'a bbox_knowledge::knowledge::KnowledgeEntry> {
+    if let Some(id) = entity_id.strip_prefix("knowledge:") {
+        knowledge.entry(id)
+    } else if entity_id.starts_with("provisional_knowledge:") {
+        knowledge.entry(entity_id)
+    } else {
+        None
+    }
 }
 
 fn label_for_entity(

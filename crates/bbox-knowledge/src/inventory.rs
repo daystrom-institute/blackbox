@@ -137,11 +137,13 @@ pub fn inventory_project_entries(
         let project_path = Path::new(project);
         let inputs = resolve_inputs(project_path);
         let Some(repo_id) = resolve_repo_id(&inputs) else {
-            inv.quarantined.push(row(entry, QuarantineReason::NoResolvableRepoId));
+            inv.quarantined
+                .push(row(entry, QuarantineReason::NoResolvableRepoId));
             continue;
         };
         let Some(git_root) = git::git_root_for_path(project_path) else {
-            inv.quarantined.push(row(entry, QuarantineReason::NotAGitRepo));
+            inv.quarantined
+                .push(row(entry, QuarantineReason::NotAGitRepo));
             continue;
         };
         let Some(relpath) = bbox_root_relpath(&git_root, project_path) else {

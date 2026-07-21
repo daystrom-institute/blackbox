@@ -104,7 +104,8 @@ impl BlackboxServer {
                 None
             };
 
-            let kb = server.state.kb.read();
+            let knowledge_view =
+                server.session_knowledge_view(p.project.as_deref(), p.provisional.as_deref())?;
             let threads = server.state.threads.read();
             let notes = server.state.notes.read();
             let gaps = server.state.gaps.read();
@@ -113,7 +114,7 @@ impl BlackboxServer {
             let vector_alerts = collect_vector_connectivity_alerts();
             let cron_alerts = collect_cron_schedule_alerts(&server.state);
             let inbox = inbox::compute_inbox(
-                &kb,
+                &knowledge_view.knowledge,
                 &threads,
                 &notes,
                 &gaps,

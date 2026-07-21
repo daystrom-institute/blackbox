@@ -91,6 +91,9 @@ pub struct CorpusStores<'a> {
 
 pub struct ProviderContext<'a> {
     stores: Option<CorpusStores<'a>>,
+    /// Request-local knowledge visibility view. When present, knowledge
+    /// providers must use it instead of the daemon's mutable aggregate store.
+    knowledge_view: Option<&'a Knowledge>,
     /// Opaque daemon extension: providers registered via
     /// `register_extra_providers` (task, brofile) downcast this to the
     /// daemon state type they were registered with. Keeps per-call state
@@ -109,6 +112,7 @@ impl<'a> ProviderContext<'a> {
     pub fn new(stores: CorpusStores<'a>) -> Self {
         Self {
             stores: Some(stores),
+            knowledge_view: None,
             ext: None,
             edges: None,
         }
@@ -120,6 +124,7 @@ impl<'a> ProviderContext<'a> {
     ) -> Self {
         Self {
             stores: Some(stores),
+            knowledge_view: None,
             ext: Some(ext),
             edges: None,
         }
@@ -130,9 +135,15 @@ impl<'a> ProviderContext<'a> {
         self
     }
 
+    pub fn with_knowledge_view(mut self, knowledge: &'a Knowledge) -> Self {
+        self.knowledge_view = Some(knowledge);
+        self
+    }
+
     pub fn empty_for_tests() -> Self {
         Self {
             stores: None,
+            knowledge_view: None,
             ext: None,
             edges: None,
         }
@@ -140,6 +151,10 @@ impl<'a> ProviderContext<'a> {
 
     pub fn stores(&self) -> Option<&CorpusStores<'a>> {
         self.stores.as_ref()
+    }
+
+    pub fn knowledge_view(&self) -> Option<&Knowledge> {
+        self.knowledge_view
     }
 
     pub fn ext(&self) -> Option<&'a (dyn std::any::Any + Send + Sync)> {
@@ -213,6 +228,7 @@ fn registry() -> &'static Vec<Box<dyn InspectableEntityProvider>> {
     REGISTRY.get_or_init(|| {
         let mut providers: Vec<Box<dyn InspectableEntityProvider>> = vec![
             Box::new(knowledge::KnowledgeProvider),
+            Box::new(knowledge::ProvisionalKnowledgeProvider),
             Box::new(system_memory::SystemMemoryProvider),
             Box::new(file::FileProvider),
             Box::new(project_file::ProjectFileProvider),

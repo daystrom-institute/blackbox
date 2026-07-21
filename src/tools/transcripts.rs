@@ -115,11 +115,14 @@ impl BlackboxServer {
                     .build_index(false)
                     .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
+            let knowledge_view =
+                server.session_knowledge_view(p.project.as_deref(), p.provisional.as_deref())?;
             let provider_ctx =
-                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref());
+                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
+                    .with_knowledge_view(&knowledge_view.knowledge);
             mcp_tools::hybrid_search::hybrid_search(
                 &server.state.idx.read(),
-                &server.state.kb.read(),
+                &knowledge_view.knowledge,
                 &provider_ctx,
                 &p,
             )

@@ -514,6 +514,7 @@ name = "bbox-indexing"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bbox-config",
  "bbox-corpus-core",
  "bbox-corpus-index",
  "bbox-edge-index",

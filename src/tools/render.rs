@@ -53,7 +53,13 @@ impl BlackboxServer {
                 let projects = server.state.projects.read().list();
                 rescope_render_project(&mut p, &projects);
             }
-            server.state.kb.read().render(&p)
+            let scope_project = p.scope_project.as_deref().or(p.project.as_deref());
+            let view = server.session_knowledge_view(scope_project, p.provisional.as_deref())?;
+            let rendered = view.knowledge.render(&p)?;
+            match view.diagnostics_text() {
+                Some(diagnostics) => Ok(format!("{rendered}\n{diagnostics}")),
+                None => Ok(rendered),
+            }
         })
         .await
     }

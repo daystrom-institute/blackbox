@@ -77,9 +77,11 @@ impl BlackboxServer {
                     ));
                 }
             };
+            let knowledge_view = server.session_knowledge_view(None, p.provisional.as_deref())?;
             let edge_index = server.state.edge_index.read();
             let provider_ctx =
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
+                    .with_knowledge_view(&knowledge_view.knowledge)
                     .with_edge_index(&edge_index);
             mcp_tools::inspect::inspect_entity(&p, &provider_ctx, &entity_ref, &edge_index)
         })
@@ -141,9 +143,11 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_bundle_evidence", move || {
+            let knowledge_view = server.session_knowledge_view(None, p.provisional.as_deref())?;
             let edge_index = server.state.edge_index.read();
             let provider_ctx =
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
+                    .with_knowledge_view(&knowledge_view.knowledge)
                     .with_edge_index(&edge_index);
             mcp_tools::bundle_evidence::bundle_evidence(
                 &p,
@@ -304,6 +308,7 @@ mod tests {
                 let result = server
                     .bbox_inspect_entity(Parameters(InspectEntityParams {
                         entity_ref,
+                        provisional: None,
                         edge_types: None,
                         direction: None,
                         per_type_limit: Some(5),
@@ -548,6 +553,7 @@ mod tests {
                 let result = server
                     .bbox_inspect_entity(Parameters(InspectEntityParams {
                         entity_ref,
+                        provisional: None,
                         edge_types: None,
                         direction: None,
                         per_type_limit: Some(5),

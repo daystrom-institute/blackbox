@@ -114,6 +114,11 @@ pub struct KnowledgeListParams {
     /// Max rows to return.
     #[serde(default)]
     pub limit: Option<u64>,
+    /// Published knowledge only, the authoritative session checkout's view,
+    /// or every valid provisional variant. Defaults to own when the session
+    /// has checkout authority, otherwise published.
+    #[serde(default)]
+    pub provisional: Option<String>,
     /// Internal, not part of the MCP schema: an additional project path the
     /// project filter also matches. Set by the daemon adapter when `project`
     /// was a managed-worktree path resolved to its registered base, so entries
@@ -155,6 +160,9 @@ pub struct RenderParams {
     /// Preview without writing (default: false)
     #[serde(default)]
     pub dry_run: Option<bool>,
+    /// Provisional visibility policy: published, own, or all.
+    #[serde(default)]
+    pub provisional: Option<String>,
     /// Internal, not part of the MCP schema: the project path used to FILTER
     /// project-scoped entries when it differs from `project` (the directory
     /// the rendered files are written into). Set by the daemon adapter when
@@ -601,6 +609,23 @@ impl MatchEvidence {
 struct QueryMatch {
     score: f64,
     evidence: MatchEvidence,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct KnowledgeViewMetadata {
+    pub logical_ref: String,
+    pub published_scope: Option<bbox_corpus_core::identity::PublishedScope>,
+    pub checkout_id: Option<String>,
+    pub content_hash: Option<String>,
+    pub overlay_snapshot_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct KnowledgeSearchHit {
+    pub entity_id: String,
+    pub score: f32,
+    pub title: String,
+    pub excerpt: String,
 }
 
 fn matches_atom(atom: &QueryAtom, corpus: &SearchCorpus) -> Option<QueryMatch> {
@@ -1067,6 +1092,9 @@ pub struct Knowledge {
     /// redirected entries awaiting their worktree branch's merge. These
     /// roots tell `reload` which repos to spool project entries from.
     project_roots: Vec<PathBuf>,
+    /// Request-local identity and provenance for detached visibility views.
+    /// Empty on the mutable durable store.
+    view_metadata: BTreeMap<String, KnowledgeViewMetadata>,
 }
 
 impl Knowledge {
@@ -1075,6 +1103,7 @@ impl Knowledge {
             store_path: store_path.to_path_buf(),
             store: KnowledgeStore::new(),
             project_roots: Vec::new(),
+            view_metadata: BTreeMap::new(),
         };
         k.reload()?;
         Ok(k)
@@ -1384,6 +1413,61 @@ impl Knowledge {
 
     pub fn entry(&self, id: &str) -> Option<&KnowledgeEntry> {
         self.store.entries.iter().find(|entry| entry.id == id)
+    }
+
+    pub fn view_metadata(&self, id: &str) -> Option<&KnowledgeViewMetadata> {
+        self.view_metadata.get(id)
+    }
+
+    /// Rank the already-visible knowledge candidates for hybrid retrieval.
+    /// Visibility is intentionally outside this method; detached views contain
+    /// only authorized candidates, so no hidden item can consume a cutoff.
+    pub fn search_hits(&self, query: &str, limit: usize) -> Vec<KnowledgeSearchHit> {
+        let Some(ast) = parse_query(query) else {
+            return Vec::new();
+        };
+        let mut hits = self
+            .store
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(entry.status, Status::Active | Status::Superseded)
+                    && !Self::is_expired(entry)
+            })
+            .filter_map(|entry| {
+                let corpus = SearchCorpus {
+                    id: entry.id.to_lowercase(),
+                    title: entry.title.to_lowercase(),
+                    content: entry.content.to_lowercase(),
+                };
+                if !query_matches(&ast, &corpus) {
+                    return None;
+                }
+                let mut query_match = QueryMatch::default();
+                collect_positive_matches(&ast, &corpus, &mut query_match);
+                let entity_id = if entry.id.starts_with("provisional_knowledge:") {
+                    entry.id.clone()
+                } else {
+                    EntityRef::Knowledge {
+                        id: entry.id.clone(),
+                    }
+                    .to_string()
+                };
+                Some(KnowledgeSearchHit {
+                    entity_id,
+                    score: query_match.score.max(0.1) as f32,
+                    title: entry.title.clone(),
+                    excerpt: knowledge_excerpt(&entry.content, KNOWLEDGE_EXCERPT_BYTES),
+                })
+            })
+            .collect::<Vec<_>>();
+        hits.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.entity_id.cmp(&b.entity_id))
+        });
+        hits.truncate(limit);
+        hits
     }
 
     pub fn append_link(&mut self, p: &KnowledgeLinkParams) -> Result<KnowledgeEdge> {
@@ -2815,6 +2899,23 @@ const BOOTSTRAP_CANDIDATES: &[&str] = &[
 ];
 
 impl Knowledge {
+    /// Build a read-only request view. Callers must not persist or mutate this
+    /// detached value; it exists to reuse ranking and render semantics over an
+    /// already-authorized candidate set.
+    pub fn detached_view(
+        entries: Vec<KnowledgeEntry>,
+        view_metadata: BTreeMap<String, KnowledgeViewMetadata>,
+    ) -> Self {
+        let mut store = KnowledgeStore::new();
+        store.entries = entries;
+        Self {
+            store_path: PathBuf::new(),
+            store,
+            project_roots: Vec::new(),
+            view_metadata,
+        }
+    }
+
     /// Bootstrap: scan a project for existing instruction files and return their
     /// contents for the agent to decompose into PROJECT.md + knowledge entries.
     pub fn bootstrap(&self, p: &BootstrapParams) -> Result<String> {
@@ -3328,6 +3429,7 @@ mod tests {
                 project: Some(worktree_root.to_string_lossy().into_owned()),
                 scope: Some("project".into()),
                 dry_run: Some(false),
+                provisional: None,
                 scope_project: Some("/registry/base".into()),
             })
             .expect("render should succeed");
@@ -5136,7 +5238,9 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         kb.set_project_roots(vec![root.clone()]).unwrap();
 
         assert_eq!(
-            kb.built_from().get(root.to_str().unwrap()).map(String::as_str),
+            kb.built_from()
+                .get(root.to_str().unwrap())
+                .map(String::as_str),
             Some(head.as_str()),
             "built_from must map the root to its HEAD commit"
         );

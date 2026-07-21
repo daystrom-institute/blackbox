@@ -17,6 +17,44 @@ use sha2::{Digest, Sha256};
 
 use crate::knowledge::KnowledgeEntry;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvisionalMode {
+    Published,
+    Own,
+    All,
+}
+
+impl ProvisionalMode {
+    pub fn parse(raw: Option<&str>, has_session_checkout: bool) -> Result<Self> {
+        match raw {
+            None if has_session_checkout => Ok(Self::Own),
+            None => Ok(Self::Published),
+            Some("published") => Ok(Self::Published),
+            Some("own") if has_session_checkout => Ok(Self::Own),
+            Some("own") => Ok(Self::Published),
+            Some("all") => Ok(Self::All),
+            Some(other) => {
+                anyhow::bail!("invalid provisional mode {other:?}; expected published, own, or all")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PublishedKnowledgeEntry {
+    pub entry: KnowledgeEntry,
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublishedKnowledgeSnapshot {
+    pub published_scope: PublishedScope,
+    pub published_ref: String,
+    pub publisher_commit: String,
+    pub entries: BTreeMap<String, PublishedKnowledgeEntry>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct OverlayKey {
     pub published_scope: PublishedScope,
@@ -106,6 +144,79 @@ impl KnowledgeOverlayStore {
     pub fn snapshots(&self) -> impl Iterator<Item = &OverlaySnapshot> {
         self.snapshots.values()
     }
+}
+
+pub fn published_scope_hash(scope: &PublishedScope) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"bbox-published-scope-v1\0");
+    hasher.update((scope.repo_id.len() as u64).to_be_bytes());
+    hasher.update(scope.repo_id.as_bytes());
+    hasher.update((scope.bbox_root_relpath.len() as u64).to_be_bytes());
+    hasher.update(scope.bbox_root_relpath.as_bytes());
+    hex_digest(hasher.finalize())
+}
+
+pub fn provisional_entity_ref(scope: &PublishedScope, checkout_id: &str, entry_id: &str) -> String {
+    bbox_corpus_core::entity_ref::EntityRef::ProvisionalKnowledge {
+        scope_hash: published_scope_hash(scope),
+        checkout_id: checkout_id.to_string(),
+        entry_id: entry_id.to_string(),
+    }
+    .to_string()
+}
+
+/// Load published knowledge only from the committed tree selected by the
+/// pinned ref. Working-tree bytes are never consulted.
+pub fn load_published_snapshot(
+    publisher_root: &Path,
+    published_ref: &str,
+    scope: &PublishedScope,
+    durable_project: &str,
+) -> Result<PublishedKnowledgeSnapshot> {
+    let publisher_commit =
+        git::resolve_commit(publisher_root, published_ref).with_context(|| {
+            format!(
+                "published ref {published_ref} does not resolve in {}",
+                publisher_root.display()
+            )
+        })?;
+    let tree_dir = knowledge_tree_dir(scope);
+    let files = read_committed_map(publisher_root, &publisher_commit, &tree_dir)?;
+    let mut entries = BTreeMap::new();
+    for (filename, bytes) in files {
+        let mut entry: KnowledgeEntry = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing published knowledge file {filename}"))?;
+        let stem = Path::new(&filename)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .with_context(|| format!("knowledge filename is not UTF-8: {filename}"))?;
+        if stem != entry.id {
+            anyhow::bail!(
+                "published knowledge filename/id mismatch: {filename} contains id {}",
+                entry.id
+            );
+        }
+        entry.project = Some(durable_project.to_string());
+        let id = entry.id.clone();
+        if entries
+            .insert(
+                id.clone(),
+                PublishedKnowledgeEntry {
+                    entry,
+                    content_hash: sha256(&bytes),
+                },
+            )
+            .is_some()
+        {
+            anyhow::bail!("duplicate published knowledge id: {id}");
+        }
+    }
+    Ok(PublishedKnowledgeSnapshot {
+        published_scope: scope.clone(),
+        published_ref: published_ref.to_string(),
+        publisher_commit,
+        entries,
+    })
 }
 
 /// Recompute one checkout overlay. Every failure becomes an invalid empty

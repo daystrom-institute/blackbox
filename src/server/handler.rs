@@ -113,7 +113,7 @@ impl ServerHandler for BlackboxServer {
         // canonical path packets are scoped by, falling back to the literal
         // value for parity with bbox_mcp_surface. Blocking fs (canonicalize
         // / git probes) → blocking pool.
-        let project = match project_raw {
+        let project = match project_raw.clone() {
             Some(raw) => {
                 let server = self.clone();
                 let resolved = tokio::task::spawn_blocking(move || {
@@ -142,8 +142,32 @@ impl ServerHandler for BlackboxServer {
                 None,
             ));
         }
+        // Checkout authority is derived only after the surface decision and
+        // only through the conservative write resolver. The raw transport
+        // project is trusted session context; later tool arguments are not.
+        let session_checkout = match project_raw {
+            Some(raw) => {
+                let server = self.clone();
+                tokio::task::spawn_blocking(move || {
+                    server
+                        .resolve_project_write(&raw)
+                        .ok()
+                        .and_then(|resolved| resolved.checkout_scope)
+                        .map(Arc::new)
+                })
+                .await
+                .map_err(|e| {
+                    ErrorData::internal_error(
+                        format!("checkout authority resolution failed: {e}"),
+                        None,
+                    )
+                })?
+            }
+            None => None,
+        };
         let _ = self.surface.set(Arc::from(surface_str));
         let _ = self.surface_project.set(project.map(Arc::from));
+        let _ = self.session_checkout.set(session_checkout);
         if context.peer.peer_info().is_none() {
             context.peer.set_peer_info(request);
         }

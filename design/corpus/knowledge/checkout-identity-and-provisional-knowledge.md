@@ -694,7 +694,7 @@ sequence begins with a repair gate:
    `learn`/`remember`/`decide`. Compute published maps from the pinned committed
    ref, but keep both maps out of every live query/index/render consumer.
    Diagnostics prove recomputation without changing visible behavior.
-3. **3.4 committed view + session-authoritative visibility.** Replace the
+3. **3.4 committed view + session-authoritative visibility (implemented in the current working tree).** Replace the
    working-base loader with the committed published map plus base overlay;
    carry `ResolvedCheckoutScope` on the MCP session; add
    `provisional=published|own|all`; add compound provisional entity refs and

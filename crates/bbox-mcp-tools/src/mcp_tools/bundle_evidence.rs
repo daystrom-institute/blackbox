@@ -21,6 +21,9 @@ pub struct BundleEvidenceParams {
     pub question: String,
     pub entity_refs: Vec<String>,
     pub path_ids: Vec<String>,
+    /// Knowledge visibility policy: published, own, or all.
+    #[serde(default)]
+    pub provisional: Option<String>,
     /// Entity property payload mode. `full` preserves legacy behavior.
     /// `summary` truncates long string properties. `none` omits properties.
     #[serde(default)]
@@ -363,6 +366,7 @@ mod tests {
             question: "what changed?".into(),
             entity_refs: vec!["knowledge:abc123".into()],
             path_ids: vec!["P999".into()],
+            provisional: None,
             property_mode: None,
         };
         let rendered = bundle_evidence(
@@ -391,6 +395,7 @@ mod tests {
                 "also-not-a-ref".into(),
             ],
             path_ids: Vec::new(),
+            provisional: None,
             property_mode: None,
         };
         let rendered = bundle_evidence(
@@ -432,6 +437,7 @@ mod tests {
             question: "what changed?".into(),
             entity_refs: vec!["not-a-ref".into()],
             path_ids: Vec::new(),
+            provisional: None,
             property_mode: None,
         };
         let rendered = bundle_evidence(
@@ -458,6 +464,7 @@ mod tests {
             question: "what is the opening sequence?".into(),
             entity_refs: vec!["system_memory:sm-agentic-opening-sequence".into()],
             path_ids: Vec::new(),
+            provisional: None,
             property_mode: None,
         };
         let rendered = bundle_evidence(
@@ -515,6 +522,7 @@ mod tests {
             question: "what is the opening sequence?".into(),
             entity_refs: vec!["system_memory:sm-agentic-opening-sequence".into()],
             path_ids: Vec::new(),
+            provisional: None,
             property_mode: Some("summary".into()),
         };
 
