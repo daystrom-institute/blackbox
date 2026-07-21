@@ -23,32 +23,31 @@
 //! inventory, so the daemon supplies `bbox_config::read_repo_id_inputs` and this
 //! stays unit-testable with a fake resolver.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use bbox_corpus_core::identity::{RepoIdInputs, bbox_root_relpath, resolve_repo_id};
-use bbox_corpus_core::project_record::ProjectRecord;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
 use bbox_corpus_core::git;
+use bbox_corpus_core::identity::{RepoIdInputs, bbox_root_relpath, resolve_recorded_repo_id};
+use bbox_corpus_core::json_store::atomic_write_json_locked;
+use bbox_corpus_core::project_record::ProjectRecord;
 
-/// The durable key of a published knowledge scope: repo-family id plus the
-/// monorepo discriminator.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PublishedScope {
-    pub repo_id: String,
-    pub bbox_root_relpath: String,
-}
+pub use bbox_corpus_core::identity::PublishedScope;
 
 /// Resolve the published scope a registered project publishes into, if any.
 ///
-/// `None` when the project has no resolvable `repo_id` (no override, recorded
-/// id, aka, or computed hint) or its root is not in a git repo — such a project
-/// cannot be a durable-scope publisher. `resolve_inputs` supplies the
-/// config-derived [`RepoIdInputs`] for the project root.
+/// `None` when the project has no operator-supplied or recorded `repo_id`, or
+/// its root is not in a git repo. Migration aliases and computed bootstrap
+/// hints are deliberately insufficient for live publisher admission.
+/// `resolve_inputs` supplies the config-derived [`RepoIdInputs`] for the
+/// project root.
 pub fn project_published_scope(
     project: &ProjectRecord,
     resolve_inputs: impl Fn(&Path) -> RepoIdInputs,
 ) -> Option<PublishedScope> {
     let root = Path::new(&project.canonical_path);
-    let repo_id = resolve_repo_id(&resolve_inputs(root))?;
+    let repo_id = resolve_recorded_repo_id(&resolve_inputs(root))?;
     let git_root = git::git_root_for_path(root)?;
     let relpath = bbox_root_relpath(&git_root, root)?;
     Some(PublishedScope {
@@ -67,6 +66,110 @@ pub enum PublisherResolution {
     /// Two or more registered clones claim this scope. Reads must FAIL CLOSED
     /// and surface these paths, never pick one by scan order.
     Duplicate(Vec<String>),
+}
+
+/// Host-local pinned branch ref for one published scope. The path claiming the
+/// scope may move or be re-registered; the symbolic branch ref remains the
+/// definition of published truth until an explicit repin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublisherRefRow {
+    pub scope: PublishedScope,
+    pub branch_ref: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PublisherRefData {
+    version: u32,
+    #[serde(default)]
+    refs: Vec<PublisherRefRow>,
+}
+
+impl Default for PublisherRefData {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            refs: Vec::new(),
+        }
+    }
+}
+
+/// Durable host state for symbolic publisher refs.
+pub struct PublisherRefStore {
+    path: PathBuf,
+    data: PublisherRefData,
+}
+
+impl PublisherRefStore {
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        let data = if path.exists() {
+            let raw = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?
+        } else {
+            PublisherRefData::default()
+        };
+        Ok(Self { path, data })
+    }
+
+    pub fn pinned(&self, scope: &PublishedScope) -> Option<&PublisherRefRow> {
+        self.data.refs.iter().find(|row| &row.scope == scope)
+    }
+
+    /// Seed a pin from the publisher's current symbolic branch. Existing pins
+    /// are immutable here, so switching checkout branches cannot redefine
+    /// published truth.
+    pub fn ensure_pinned(
+        &mut self,
+        scope: &PublishedScope,
+        publisher_root: &Path,
+    ) -> Result<PublisherRefRow> {
+        if let Some(existing) = self.pinned(scope) {
+            return Ok(existing.clone());
+        }
+        let branch = git::current_branch(publisher_root).with_context(|| {
+            format!(
+                "publisher {} is detached; an explicit full branch ref is required",
+                publisher_root.display()
+            )
+        })?;
+        let row = PublisherRefRow {
+            scope: scope.clone(),
+            branch_ref: format!("refs/heads/{branch}"),
+        };
+        let mut next = self.data.clone();
+        next.refs.push(row.clone());
+        next.refs.sort_by(|a, b| a.scope.cmp(&b.scope));
+        self.replace_data(next)?;
+        Ok(row)
+    }
+
+    /// Explicit operator-authority primitive. Tool/API exposure is a later
+    /// slice; callers must supply a full local branch ref.
+    pub fn repin(&mut self, scope: &PublishedScope, branch_ref: &str) -> Result<PublisherRefRow> {
+        if !branch_ref.starts_with("refs/heads/") {
+            anyhow::bail!("publisher ref must be a full refs/heads/... name");
+        }
+        let row = PublisherRefRow {
+            scope: scope.clone(),
+            branch_ref: branch_ref.to_string(),
+        };
+        let mut next = self.data.clone();
+        if let Some(existing) = next.refs.iter_mut().find(|item| &item.scope == scope) {
+            *existing = row.clone();
+        } else {
+            next.refs.push(row.clone());
+            next.refs.sort_by(|a, b| a.scope.cmp(&b.scope));
+        }
+        self.replace_data(next)?;
+        Ok(row)
+    }
+
+    fn replace_data(&mut self, next: PublisherRefData) -> Result<()> {
+        atomic_write_json_locked(&self.path, &next)?;
+        self.data = next;
+        Ok(())
+    }
 }
 
 /// Elect the single publisher for `scope` among the registered `projects`.
@@ -226,5 +329,90 @@ mod tests {
             }
             other => panic!("expected Duplicate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn publisher_ref_pin_survives_checkout_branch_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        init_repo(&root);
+        let state = tempfile::tempdir().unwrap();
+        let scope = PublishedScope {
+            repo_id: "fam".into(),
+            bbox_root_relpath: ".".into(),
+        };
+        let mut store = PublisherRefStore::open(state.path().join("publisher-refs.json")).unwrap();
+        let first = store.ensure_pinned(&scope, &root).unwrap();
+        assert!(first.branch_ref.starts_with("refs/heads/"));
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["switch", "-q", "-c", "other"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let second = store.ensure_pinned(&scope, &root).unwrap();
+        assert_eq!(second.branch_ref, first.branch_ref);
+
+        drop(store);
+        let reopened = PublisherRefStore::open(state.path().join("publisher-refs.json")).unwrap();
+        assert_eq!(reopened.pinned(&scope), Some(&first));
+    }
+
+    #[test]
+    fn detached_publisher_cannot_seed_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        init_repo(&root);
+        let head = git::current_head(&root).unwrap();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["checkout", "-q", "--detach", &head])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let scope = PublishedScope {
+            repo_id: "fam".into(),
+            bbox_root_relpath: ".".into(),
+        };
+        let state = tempfile::tempdir().unwrap();
+        let mut store = PublisherRefStore::open(state.path().join("publisher-refs.json")).unwrap();
+
+        assert!(store.ensure_pinned(&scope, &root).is_err());
+        assert!(store.pinned(&scope).is_none());
+    }
+
+    #[test]
+    fn failed_pin_save_does_not_change_in_memory_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        init_repo(&root);
+        let state = tempfile::tempdir().unwrap();
+        let blocked_parent = state.path().join("not-a-directory");
+        let path = blocked_parent.join("publisher-refs.json");
+        let mut store = PublisherRefStore::open(&path).unwrap();
+        std::fs::write(&blocked_parent, "blocked").unwrap();
+        let scope = PublishedScope {
+            repo_id: "fam".into(),
+            bbox_root_relpath: ".".into(),
+        };
+
+        assert!(store.ensure_pinned(&scope, &root).is_err());
+        assert!(store.pinned(&scope).is_none());
+    }
+
+    #[test]
+    fn repin_requires_full_branch_ref() {
+        let state = tempfile::tempdir().unwrap();
+        let scope = PublishedScope {
+            repo_id: "fam".into(),
+            bbox_root_relpath: ".".into(),
+        };
+        let mut store = PublisherRefStore::open(state.path().join("publisher-refs.json")).unwrap();
+        assert!(store.repin(&scope, "main").is_err());
+        let row = store.repin(&scope, "refs/heads/main").unwrap();
+        assert_eq!(row.branch_ref, "refs/heads/main");
     }
 }

@@ -807,6 +807,114 @@ pub fn load_project(project_root: &Path) -> Result<ProjectConfig> {
     Ok(raw)
 }
 
+/// Result of ensuring the committed repo-family authority in project config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedRepoId {
+    pub repo_id: String,
+    pub newly_recorded: bool,
+}
+
+/// Read or atomically record `[project].repo_id` without rewriting unrelated
+/// TOML tables, values, ordering, or comments.
+///
+/// The read-modify-write is serialized on the config path. Existing ids are
+/// immutable and returned verbatim. Missing ids are minted from the enclosing
+/// repository by the fail-closed identity primitive, so shallow clones and
+/// non-git directories return an error rather than recording a weak hint.
+// Called only by blocking project init/eject paths; config merge and atomic
+// replacement are inherently synchronous filesystem work.
+#[allow(clippy::disallowed_methods)]
+pub fn ensure_recorded_repo_id(project_root: &Path) -> Result<RecordedRepoId> {
+    use bbox_corpus_core::json_store::{atomic_write_bytes_from_dir_locked, with_store_lock};
+    use toml_edit::{DocumentMut, Item, Table, value};
+
+    let config_path = project_root.join(".bbox").join("config.toml");
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let local_dir = project_root.join(".bbox").join("local");
+    std::fs::create_dir_all(&local_dir)
+        .with_context(|| format!("creating {}", local_dir.display()))?;
+    let local_gitignore = local_dir.join(".gitignore");
+    if !local_gitignore.exists() {
+        std::fs::write(&local_gitignore, "*\n!.gitignore\n")
+            .with_context(|| format!("writing {}", local_gitignore.display()))?;
+    }
+    // The lock is host-local operational state. Anchoring it under local/
+    // avoids leaving a repo-visible `config.json.lock` beside committed config.
+    let lock_anchor = local_dir.join("config");
+
+    with_store_lock(&lock_anchor, || {
+        let source = match std::fs::read_to_string(&config_path) {
+            Ok(source) => source,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(err) => {
+                return Err(err).with_context(|| format!("reading {}", config_path.display()));
+            }
+        };
+        let mut document = if source.trim().is_empty() {
+            DocumentMut::new()
+        } else {
+            source
+                .parse::<DocumentMut>()
+                .with_context(|| format!("parsing {}", config_path.display()))?
+        };
+
+        if let Some(item) = document.get("project") {
+            let table = item.as_table().with_context(|| {
+                format!(
+                    "[project] in {} must be a TOML table",
+                    config_path.display()
+                )
+            })?;
+            if let Some(existing) = table.get("repo_id") {
+                let existing = existing.as_str().with_context(|| {
+                    format!(
+                        "project.repo_id in {} must be a string",
+                        config_path.display()
+                    )
+                })?;
+                if !existing.trim().is_empty() {
+                    return Ok(RecordedRepoId {
+                        repo_id: existing.trim().to_string(),
+                        newly_recorded: false,
+                    });
+                }
+            }
+        }
+
+        let git_root =
+            bbox_corpus_core::git::git_root_for_path(project_root).with_context(|| {
+                format!("{} is not inside a git repository", project_root.display())
+            })?;
+        let repo_id = bbox_corpus_core::identity::mint_repo_id(&git_root)
+            .map_err(anyhow::Error::new)?
+            .into_value();
+
+        if !document.as_table().contains_key("project") {
+            document["project"] = Item::Table(Table::new());
+        }
+        let project = document["project"].as_table_mut().with_context(|| {
+            format!(
+                "[project] in {} must be a TOML table",
+                config_path.display()
+            )
+        })?;
+        project["repo_id"] = value(repo_id.clone());
+
+        let mut rendered = document.to_string();
+        if !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
+        atomic_write_bytes_from_dir_locked(&config_path, &local_dir, rendered.as_bytes())?;
+        Ok(RecordedRepoId {
+            repo_id,
+            newly_recorded: true,
+        })
+    })
+}
+
 /// Gather the durable `repo_id` resolution inputs for a project root by
 /// reading its committed `.bbox/config.toml` `[project]` table and pairing the
 /// recorded authority with the bootstrap-computed hint.
@@ -1161,6 +1269,54 @@ mod tests {
     use super::*;
     use std::env;
     use tempfile::tempdir;
+
+    fn init_repo(root: &Path) {
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(root.join("seed.txt"), "seed").unwrap();
+        run(&["add", "seed.txt"]);
+        run(&["commit", "-q", "-m", "seed"]);
+    }
+
+    #[test]
+    fn ensure_repo_id_preserves_existing_project_config() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        init_repo(&root);
+        let bbox = root.join(".bbox");
+        std::fs::create_dir_all(&bbox).unwrap();
+        let path = bbox.join("config.toml");
+        std::fs::write(
+            &path,
+            "# retained comment\n[project]\naliases = [\"docs\"]\n\n[mcp]\nenabled = false\n",
+        )
+        .unwrap();
+
+        let first = ensure_recorded_repo_id(&root).unwrap();
+        assert!(first.newly_recorded);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# retained comment"));
+        assert!(text.contains("aliases = [\"docs\"]"));
+        assert!(text.contains("[mcp]\n"));
+        assert!(text.contains("enabled = false"));
+        assert!(!bbox.join("config.json.lock").exists());
+        assert!(bbox.join("local/config.json.lock").exists());
+
+        let second = ensure_recorded_repo_id(&root).unwrap();
+        assert_eq!(second.repo_id, first.repo_id);
+        assert!(!second.newly_recorded);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
 
     #[test]
     fn config_defaults_match_current_daemon_behavior() {

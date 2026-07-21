@@ -79,6 +79,19 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         pins_persister,
         projects,
         projects_persister,
+        checkout_registry: RwLock::new(
+            bbox_indexing::checkout_registry::CheckoutRegistry::open(
+                &tmp.path().join("checkout-registry.json"),
+            )
+            .unwrap(),
+        ),
+        publisher_refs: RwLock::new(
+            bbox_indexing::publisher::PublisherRefStore::open(
+                tmp.path().join("publisher-refs.json"),
+            )
+            .unwrap(),
+        ),
+        knowledge_overlays: RwLock::new(bbox_knowledge::overlay::KnowledgeOverlayStore::default()),
         packets: RwLock::new(packets),
         surface_decisions: crate::server::surface::SurfaceDecisionCache::default(),
         artifacts: RwLock::new(artifacts),

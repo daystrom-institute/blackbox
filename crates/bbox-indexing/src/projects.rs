@@ -469,6 +469,25 @@ fn resolve_managed_fleet_worktree<'a>(
 ) -> Option<(&'a ProjectRecord, PathBuf)> {
     let project_dir = project_dir?;
     let worktree = fs::canonicalize(project_dir).ok()?;
+    // A linked worktree nested under the enclosing repository remains an
+    // in-tree managed checkout even when only monorepo subprojects are
+    // registered. Resolve the checkout first, then select the deepest
+    // registered bbox_root_relpath containing the requested path.
+    if let Some(checkout_top) = bbox_corpus_core::git::git_root_for_path(&worktree)
+        && checkout_top.join(".git").is_file()
+        && let Some(base_repo) = bbox_corpus_core::git::linked_worktree_base(&checkout_top)
+    {
+        let base_repo = fs::canonicalize(base_repo).ok()?;
+        if checkout_top.starts_with(&base_repo)
+            && let Some(project) =
+                select_checkout_project(&worktree, &checkout_top, projects, |p| {
+                    bbox_corpus_core::git::git_root_for_path(Path::new(&p.canonical_path))
+                        .is_some_and(|root| root == base_repo)
+                })
+        {
+            return Some((project, checkout_top));
+        }
+    }
     if let Some(owner) = projects.iter().find(|project| {
         let root = Path::new(&project.canonical_path);
         worktree == root || worktree.starts_with(root)
@@ -479,11 +498,21 @@ fn resolve_managed_fleet_worktree<'a>(
         return in_tree_linked_worktree_top(&worktree, &root).map(|top| (owner, top));
     }
     if let Some(checkout) = bbox_corpus_core::git::managed_checkout_root(&worktree) {
-        let checkout_str = checkout.to_str()?;
-        let base = bbox_corpus_core::project_record::resolve_base_project_for_scope(
-            checkout_str,
-            projects,
-        )?;
+        let repo_id = bbox_corpus_core::entity_ref::repo_id_for_root(&checkout).ok()?;
+        let claiming = projects
+            .iter()
+            .filter(|project| project.repo_id.as_deref() == Some(repo_id.as_str()))
+            .collect::<Vec<_>>();
+        // A missing claimant cannot be assigned a monorepo relpath, so it must
+        // remain part of the ambiguity instead of being silently skipped.
+        if claiming.iter().any(|project| {
+            bbox_corpus_core::git::git_root_for_path(Path::new(&project.canonical_path)).is_none()
+        }) {
+            return None;
+        }
+        let base = select_checkout_project(&worktree, &checkout, projects, |project| {
+            project.repo_id.as_deref() == Some(repo_id.as_str())
+        })?;
         return Some((base, checkout));
     }
     let fleet_branch = bbox_corpus_core::git::current_branch(&worktree)
@@ -496,11 +525,52 @@ fn resolve_managed_fleet_worktree<'a>(
         return None;
     }
     let worktree_common = bbox_corpus_core::git::git_common_dir(&worktree)?;
-    let base = projects.iter().find(|project| {
+    let checkout_top = bbox_corpus_core::git::git_root_for_path(&worktree)?;
+    let base = select_checkout_project(&worktree, &checkout_top, projects, |project| {
         bbox_corpus_core::git::git_common_dir(Path::new(&project.canonical_path))
             .is_some_and(|common| common == worktree_common)
     })?;
-    Some((base, worktree))
+    Some((base, checkout_top))
+}
+
+fn select_checkout_project<'a>(
+    requested: &Path,
+    checkout_top: &Path,
+    projects: &'a [ProjectRecord],
+    eligible: impl Fn(&ProjectRecord) -> bool,
+) -> Option<&'a ProjectRecord> {
+    let requested_rel = requested.strip_prefix(checkout_top).ok()?;
+    let mut matches = projects
+        .iter()
+        .filter(|project| eligible(project))
+        .filter_map(|project| {
+            let project_root = Path::new(&project.canonical_path);
+            let git_root = bbox_corpus_core::git::git_root_for_path(project_root)?;
+            let relpath = bbox_corpus_core::identity::bbox_root_relpath(&git_root, project_root)?;
+            let rel = (relpath != ".").then(|| PathBuf::from(relpath));
+            if rel
+                .as_ref()
+                .is_some_and(|relpath| !requested_rel.starts_with(relpath))
+            {
+                return None;
+            }
+            Some((
+                rel.as_ref()
+                    .map(|relpath| relpath.components().count())
+                    .unwrap_or(0),
+                project,
+            ))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|(depth, _)| *depth);
+    let (depth, selected) = matches.pop()?;
+    if matches
+        .last()
+        .is_some_and(|(other_depth, _)| *other_depth == depth)
+    {
+        return None;
+    }
+    Some(selected)
 }
 
 /// If `path` (canonical) lies inside a linked git worktree nested under the
@@ -1666,6 +1736,65 @@ mod tests {
         assert!(
             fleet_worktree_scope_and_dir(foreign_wt.to_string_lossy().as_ref(), &registered)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn write_resolution_selects_deepest_monorepo_scope_in_linked_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        fs::create_dir_all(&base).unwrap();
+        init_git_repo(&base);
+        for service in ["api", "web"] {
+            let knowledge = base
+                .join("services")
+                .join(service)
+                .join(".bbox")
+                .join("knowledge");
+            fs::create_dir_all(&knowledge).unwrap();
+            fs::write(knowledge.join(".gitkeep"), "").unwrap();
+        }
+        let add = Command::new("git")
+            .arg("-C")
+            .arg(&base)
+            .args(["add", "services"])
+            .status()
+            .unwrap();
+        assert!(add.success());
+        let commit = Command::new("git")
+            .arg("-C")
+            .arg(&base)
+            .args([
+                "-c",
+                "user.name=Blackbox Test",
+                "-c",
+                "user.email=blackbox@example.invalid",
+                "commit",
+                "-m",
+                "services",
+            ])
+            .status()
+            .unwrap();
+        assert!(commit.success());
+        let base = base.canonicalize().unwrap();
+        let api = base.join("services/api").canonicalize().unwrap();
+        let web = base.join("services/web").canonicalize().unwrap();
+        let registered = vec![record_for(&api, "api"), record_for(&web, "web")];
+
+        let worktree = base.join(".claude/worktrees/mono");
+        fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+        add_worktree(&base, "feature-monorepo", &worktree);
+        let web_in_worktree = worktree.join("services/web").canonicalize().unwrap();
+        let context = resolve_project_context(
+            web_in_worktree.to_string_lossy().as_ref(),
+            &registered,
+            ResolveIntent::Write,
+        )
+        .expect("monorepo worktree scope");
+        assert_eq!(context.project_id, "web");
+        assert_eq!(
+            context.checkout.unwrap().checkout_dir,
+            worktree.canonicalize().unwrap().to_string_lossy()
         );
     }
 }

@@ -24,6 +24,8 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::git;
 
@@ -133,6 +135,17 @@ pub struct RepoIdInputs {
     pub computed: Option<String>,
 }
 
+/// The durable identity of one repo-owned project scope. `repo_id` identifies
+/// the repository family across hosts; `bbox_root_relpath` distinguishes
+/// independently-owned `.bbox/` roots inside one monorepo checkout.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+pub struct PublishedScope {
+    pub repo_id: String,
+    pub bbox_root_relpath: String,
+}
+
 /// Resolve the authoritative durable `repo_id` for a project, walking the
 /// fixed precedence ladder (design §3.1):
 ///
@@ -156,6 +169,17 @@ pub fn resolve_repo_id(inputs: &RepoIdInputs) -> Option<String> {
         return Some(v);
     }
     non_empty(inputs.computed.as_deref())
+}
+
+/// Resolve only an operator-supplied or recorded durable authority.
+///
+/// Unlike [`resolve_repo_id`], this deliberately excludes `aka_repo_ids` and
+/// the computed bootstrap hint. Live publisher and overlay admission must not
+/// turn either migration aid into a new durable scope merely because the
+/// implementation reached the checkout before its committed config upgrade.
+pub fn resolve_recorded_repo_id(inputs: &RepoIdInputs) -> Option<String> {
+    non_empty(inputs.project_key_override.as_deref())
+        .or_else(|| non_empty(inputs.recorded.as_deref()))
 }
 
 /// True when `candidate` names the same repo family as `inputs` — the resolved
@@ -420,6 +444,27 @@ mod tests {
             computed: None,
         };
         assert_eq!(resolve_repo_id(&inputs).as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn recorded_resolution_excludes_migration_hints() {
+        let inputs = RepoIdInputs {
+            project_key_override: None,
+            recorded: None,
+            aka_repo_ids: vec!["old".into()],
+            computed: Some("weak".into()),
+        };
+        assert_eq!(resolve_recorded_repo_id(&inputs), None);
+
+        let inputs = RepoIdInputs {
+            project_key_override: Some("operator".into()),
+            recorded: Some("recorded".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_recorded_repo_id(&inputs).as_deref(),
+            Some("operator")
+        );
     }
 
     #[test]

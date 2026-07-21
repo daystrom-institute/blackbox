@@ -33,6 +33,8 @@ struct ProjectInitResult {
     canonical: String,
     created: Vec<String>,
     skipped: Vec<String>,
+    repo_id: Option<String>,
+    repo_id_recorded: bool,
 }
 
 // migration debt: project-init scaffolding writes inline; run_blocking conversion tracked in thread-935b467d.
@@ -122,10 +124,13 @@ fn init_project_path(project_dir: &Path, force: bool) -> anyhow::Result<ProjectI
         }
     }
 
+    let config_path = bbox_dir.join("config.toml");
+    // Project config carries identity and operator-owned declarations. Even a
+    // forced skeleton refresh must merge it, never replace it wholesale.
     write_or_skip_file(
-        &bbox_dir.join("config.toml"),
+        &config_path,
         "# Project-local blackbox configuration.\n[roadmap]\n[mcp]\n[artifacts]\n",
-        force,
+        false,
         &mut created,
         &mut skipped,
     )?;
@@ -143,10 +148,18 @@ fn init_project_path(project_dir: &Path, force: bool) -> anyhow::Result<ProjectI
         &mut skipped,
     )?;
 
+    let recorded = if bbox_corpus_core::git::git_root_for_path(&project_dir).is_some() {
+        Some(config::ensure_recorded_repo_id(&project_dir)?)
+    } else {
+        None
+    };
+
     Ok(ProjectInitResult {
         canonical: project_dir.to_string_lossy().into_owned(),
         created,
         skipped,
+        repo_id: recorded.as_ref().map(|recorded| recorded.repo_id.clone()),
+        repo_id_recorded: recorded.is_some_and(|recorded| recorded.newly_recorded),
     })
 }
 
@@ -317,7 +330,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_init",
-        description = "Initialize a project-local .bbox workspace. Creates `.bbox/config.toml`, `.bbox/mcp.json`, `.bbox/local/.gitignore` and default subdirectories. Idempotent by default; set force=true to overwrite skeleton files while preserving subdirectory contents."
+        description = "Initialize a project-local .bbox workspace. Creates `.bbox/config.toml`, `.bbox/mcp.json`, `.bbox/local/.gitignore` and default subdirectories, and records the durable repo_id for Git projects. Idempotent by default; force=true refreshes replaceable skeleton files but always merge-preserves identity-bearing config.toml."
     )]
     pub(crate) async fn bbox_project_init(
         &self,
@@ -336,6 +349,8 @@ impl BlackboxServer {
                 "project": result.canonical,
                 "created": result.created,
                 "skipped": result.skipped,
+                "repo_id": result.repo_id,
+                "repo_id_recorded": result.repo_id_recorded,
             }))?)
         })
         .await
@@ -562,6 +577,11 @@ impl BlackboxServer {
                 .with_context(|| format!("project not registered: {}", p.project))?;
             let dir = record.canonical_path.clone();
             let dry_run = p.dry_run.unwrap_or(false);
+            let recorded_repo_id = if !dry_run && record.is_git_repo {
+                Some(config::ensure_recorded_repo_id(Path::new(&dir))?)
+            } else {
+                None
+            };
 
             // Ensure the project's repo is in kb roots so already-ejected files
             // are accounted for and the post-eject reload loads from the repo.
@@ -573,14 +593,14 @@ impl BlackboxServer {
                 server.state.kb.write().eject_project_to_repo(&dir)?
             };
 
-            Ok::<_, anyhow::Error>((record, dir, dry_run, entries))
+            Ok::<_, anyhow::Error>((record, dir, dry_run, entries, recorded_repo_id))
         })
         .await
         .map_err(|e| anyhow::anyhow!("blocking task failed: {e}"))
         .and_then(std::convert::identity);
 
         match fs_result {
-            Ok((record, dir, dry_run, entries)) => {
+            Ok((record, dir, dry_run, entries, recorded_repo_id)) => {
                 // Phase 2: await the kb persister durable ack on the runtime.
                 if !dry_run && let Err(e) = self.state.kb_persister.request_durable().await {
                     let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -592,6 +612,8 @@ impl BlackboxServer {
                     "project_id": record.project_id,
                     "canonical_path": dir,
                     "entries": entries,
+                    "repo_id": recorded_repo_id.as_ref().map(|recorded| &recorded.repo_id),
+                    "repo_id_recorded": recorded_repo_id.as_ref().is_some_and(|recorded| recorded.newly_recorded),
                     "target": format!("{}/.bbox/knowledge", dir),
                     "detail": if dry_run {
                         "preview only; re-run without dry_run to write repo files and drop central copies"
@@ -769,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn project_init_force_overwrites_skeleton_files() {
+    fn project_init_force_preserves_identity_bearing_config() {
         let dir = tempdir().unwrap();
         let dir_path = dir.path().join("project");
         std::fs::create_dir_all(&dir_path).unwrap();
@@ -783,11 +805,52 @@ mod tests {
         let result = init_project_path(&dir_path, true).unwrap();
 
         let contents = std::fs::read_to_string(&cfg_path).unwrap();
-        assert!(!contents.contains("# custom"));
+        assert_eq!(contents, "# custom\n");
         assert!(
             result
+                .skipped
+                .contains(&cfg_path.to_string_lossy().to_string())
+        );
+        assert!(
+            !result
                 .created
                 .contains(&cfg_path.to_string_lossy().to_string())
+        );
+    }
+
+    #[test]
+    fn project_init_records_repo_id_and_force_never_remints_it() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(root.join("seed"), "x").unwrap();
+        run(&["add", "seed"]);
+        run(&["commit", "-q", "-m", "seed"]);
+        let root = root.canonicalize().unwrap();
+
+        let first = init_project_path(&root, false).unwrap();
+        assert!(first.repo_id_recorded);
+        let repo_id = first.repo_id.unwrap();
+        let config_before = std::fs::read_to_string(root.join(".bbox/config.toml")).unwrap();
+
+        let second = init_project_path(&root, true).unwrap();
+        assert_eq!(second.repo_id.as_deref(), Some(repo_id.as_str()));
+        assert!(!second.repo_id_recorded);
+        assert_eq!(
+            std::fs::read_to_string(root.join(".bbox/config.toml")).unwrap(),
+            config_before
         );
     }
 

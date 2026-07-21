@@ -273,6 +273,13 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         pins_persister,
         projects: projects_store,
         projects_persister,
+        checkout_registry: RwLock::new(bbox_indexing::checkout_registry::CheckoutRegistry::open(
+            &store_dir.join("checkout-registry.json"),
+        )?),
+        publisher_refs: RwLock::new(bbox_indexing::publisher::PublisherRefStore::open(
+            store_dir.join("publisher-refs.json"),
+        )?),
+        knowledge_overlays: RwLock::new(bbox_knowledge::overlay::KnowledgeOverlayStore::default()),
         packets: RwLock::new(packets_store),
         surface_decisions: crate::server::surface::SurfaceDecisionCache::default(),
         artifacts: RwLock::new(artifacts_store),

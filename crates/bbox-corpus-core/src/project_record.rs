@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::identity::PublishedScope;
 use crate::language::Language;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -84,6 +85,20 @@ pub struct CheckoutContext {
     /// overlay consumes this (design §3.2). Host-local — never travels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_id: Option<String>,
+}
+
+/// Scope-aware checkout descriptor consumed by the provisional overlay.
+/// Paths are host-local; `published_scope` and `checkout_id` are the stable
+/// keys. The checkout top owns the reuse-safe marker while
+/// `checkout_project_dir` projects a monorepo subproject into that checkout.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ResolvedCheckoutScope {
+    pub published_scope: PublishedScope,
+    pub checkout_id: String,
+    pub checkout_dir: String,
+    pub checkout_project_dir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_ref: Option<String>,
 }
 
 /// Resolve a caller-supplied filesystem path to the registered project that

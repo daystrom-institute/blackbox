@@ -353,6 +353,7 @@ dependencies = [
  "regex",
  "serde",
  "tempfile",
+ "toml_edit 0.22.27",
 ]
 
 [[package]]
@@ -551,6 +552,7 @@ dependencies = [
  "schemars 0.8.22",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "strum 0.26.3",
  "tempfile",
  "tokio",

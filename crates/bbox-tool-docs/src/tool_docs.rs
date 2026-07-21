@@ -343,8 +343,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_project_init",
         category: ToolCategory::Projects,
-        summary: "Initialize a project-local .bbox workspace. Creates `.bbox/config.toml`, `.bbox/mcp.json`, `.bbox/local/.gitignore` and default subdirectories. Idempotent by default; set force=true to overwrite skeleton files while preserving subdirectory contents.",
-        when_to_use: "Run once for a new repo before local config edits or project-scoped MCP overlays; it is safe to run repeatedly and only touches empty files by default.",
+        summary: "Initialize a project-local .bbox workspace. Creates `.bbox/config.toml`, `.bbox/mcp.json`, `.bbox/local/.gitignore` and default subdirectories, and records the durable repo_id for Git projects. Idempotent by default; force=true refreshes replaceable skeleton files but always merge-preserves identity-bearing config.toml.",
+        when_to_use: "Run once for a new repo before local config edits or project-scoped MCP overlays. It is safe to run repeatedly; config declarations and the recorded repo_id are preserved.",
         example: Some(r#"bbox_project_init(path="/home/me/repos/blackbox", force=true)"#),
     },
     ToolDoc {

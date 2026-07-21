@@ -131,6 +131,23 @@ pub fn current_head(root: &Path) -> Option<String> {
     }
 }
 
+/// Resolve a ref or SHA to its full commit id, failing closed when the name is
+/// missing or does not peel to a commit.
+pub fn resolve_commit(root: &Path, r#ref: &str) -> Option<String> {
+    let spec = format!("{}^{{commit}}", r#ref);
+    let output = git_output(
+        root,
+        &["rev-parse", "--verify", &spec],
+        "resolving commit ref",
+    )?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(output.stdout).ok()?;
+    let sha = sha.trim();
+    (!sha.is_empty()).then(|| sha.to_string())
+}
+
 pub fn current_branch(root: &Path) -> Option<String> {
     let output = git_output(
         root,
@@ -231,12 +248,18 @@ pub fn list_worktree_paths(root: &Path) -> Vec<PathBuf> {
 /// false-positive. Bytes are decoded lossily; knowledge/gap entries are UTF-8
 /// JSON so this is exact for the intended callers.
 pub fn read_committed_file(root: &Path, r#ref: &str, repo_rel: &str) -> Option<String> {
+    read_committed_file_bytes(root, r#ref, repo_rel)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Byte-exact counterpart to [`read_committed_file`].
+pub fn read_committed_file_bytes(root: &Path, r#ref: &str, repo_rel: &str) -> Option<Vec<u8>> {
     let spec = format!("{}:{}", r#ref, repo_rel);
     let output = git_output(root, &["show", &spec], "reading committed file")?;
     if !output.status.success() {
         return None;
     }
-    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    Some(output.stdout)
 }
 
 /// List the files under a directory in a COMMITTED tree via
@@ -248,24 +271,34 @@ pub fn read_committed_file(root: &Path, r#ref: &str, repo_rel: &str) -> Option<S
 /// tree. Empty vec when the dir is absent at that ref, the ref is unknown, or
 /// `root` is not a git repo.
 pub fn list_committed_dir(root: &Path, r#ref: &str, dir_rel: &str) -> Vec<String> {
-    let Some(output) = git_output(
+    list_committed_dir_result(root, r#ref, dir_rel).unwrap_or_default()
+}
+
+/// Strict counterpart to [`list_committed_dir`]. A missing directory is a
+/// successful empty result, while spawn, timeout, ref, and decoding failures
+/// remain distinguishable errors for fail-closed snapshot builders.
+pub fn list_committed_dir_result(root: &Path, r#ref: &str, dir_rel: &str) -> Result<Vec<String>> {
+    let output = git_output(
         root,
         &["ls-tree", "-r", "--name-only", r#ref, "--", dir_rel],
         "listing committed dir",
-    ) else {
-        return Vec::new();
-    };
+    )
+    .with_context(|| format!("listing committed directory in {}", root.display()))?;
     if !output.status.success() {
-        return Vec::new();
+        anyhow::bail!(
+            "git ls-tree failed in {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
-    let Ok(text) = String::from_utf8(output.stdout) else {
-        return Vec::new();
-    };
-    text.lines()
+    let text = String::from_utf8(output.stdout)
+        .with_context(|| format!("decoding committed directory in {}", root.display()))?;
+    Ok(text
+        .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(str::to_string)
-        .collect()
+        .collect())
 }
 
 /// The best common ancestor of two commit-ishes via `git merge-base <a> <b>`,
@@ -979,6 +1012,10 @@ mod tests {
                 ".bbox/knowledge/e1.json".to_string(),
                 ".bbox/knowledge/e2.json".to_string(),
             ]
+        );
+        assert!(
+            list_committed_dir_result(&root, "refs/heads/missing", ".bbox/knowledge").is_err(),
+            "strict callers must not mistake an invalid ref for an empty tree"
         );
     }
 

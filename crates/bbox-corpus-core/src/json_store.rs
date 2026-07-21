@@ -36,9 +36,36 @@ pub fn with_store_lock<T>(store_path: &Path, f: impl FnOnce() -> Result<T>) -> R
 /// Atomically write `value` to `store_path` using a unique temporary file.
 /// This function does NOT acquire the lock; callers should wrap it in `with_store_lock`.
 pub fn atomic_write_json_locked<T: serde::Serialize>(store_path: &Path, value: &T) -> Result<()> {
+    let bytes = to_vec_pretty_newline(value)?;
+    atomic_write_bytes_locked(store_path, &bytes)
+}
+
+/// Atomically replace `store_path` with caller-provided bytes.
+///
+/// This shares the JSON store's unique temporary-file and fsync discipline but
+/// performs no serialization. Callers must hold [`with_store_lock`] when the
+/// write participates in a read-modify-write transaction.
+pub fn atomic_write_bytes_locked(store_path: &Path, bytes: &[u8]) -> Result<()> {
+    let temp_dir = store_path.parent().unwrap_or_else(|| Path::new("."));
+    atomic_write_bytes_from_dir_locked(store_path, temp_dir, bytes)
+}
+
+/// Atomically replace `store_path` using a temporary file in `temp_dir`.
+/// `temp_dir` must be on the same filesystem as the destination. This lets a
+/// caller keep crash debris in ignored operational state while preserving an
+/// atomic cross-directory rename into a committed path.
+pub fn atomic_write_bytes_from_dir_locked(
+    store_path: &Path,
+    temp_dir: &Path,
+    bytes: &[u8],
+) -> Result<()> {
     let pid = std::process::id();
     let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
-    let tmp_path = store_path.with_extension(format!("json.{pid}.{nonce}.tmp"));
+    let name = store_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("store");
+    let tmp_path = temp_dir.join(format!(".{name}.{pid}.{nonce}.tmp"));
 
     if let Some(parent) = tmp_path.parent() {
         fs::create_dir_all(parent)?;
@@ -47,10 +74,9 @@ pub fn atomic_write_json_locked<T: serde::Serialize>(store_path: &Path, value: &
     {
         let mut f = fs::File::create(&tmp_path)
             .with_context(|| format!("failed to create temp file {}", tmp_path.display()))?;
-        let bytes = to_vec_pretty_newline(value)?;
         use std::io::Write;
-        f.write_all(&bytes)
-            .with_context(|| format!("failed to serialize JSON to {}", tmp_path.display()))?;
+        f.write_all(bytes)
+            .with_context(|| format!("failed to write temp file {}", tmp_path.display()))?;
         f.sync_all()?;
     }
 
@@ -105,6 +131,17 @@ mod tests {
         let text = fs::read_to_string(&store_path).unwrap();
         assert!(text.ends_with('\n'));
         assert!(!text.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn byte_store_preserves_exact_content() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("config.toml");
+        atomic_write_bytes_locked(&store_path, b"# keep\n[project]\nname = \"x\"\n").unwrap();
+        assert_eq!(
+            fs::read(&store_path).unwrap(),
+            b"# keep\n[project]\nname = \"x\"\n"
+        );
     }
 
     #[test]

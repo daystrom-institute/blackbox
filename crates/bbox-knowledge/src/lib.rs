@@ -4,4 +4,5 @@
 
 pub mod inventory;
 pub mod knowledge;
+pub mod overlay;
 pub mod render;

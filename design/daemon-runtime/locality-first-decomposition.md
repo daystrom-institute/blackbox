@@ -14,7 +14,11 @@ brief: "Split the system on LOCALITY (checkout-coupled vs shared/append-only), n
 
 # Locality-first decomposition: the checkout plane and the corpus plane
 
-> **Status: proposed.** Nothing here is landed. The evidence base is the
+> **Status: proposed, with the knowledge seam partially implemented.** The
+> identity foundation is landed, while the prerequisite repair and dark
+> provisional-overlay slice are implemented and lane-verified in the current
+> working tree but are not yet committed. The decomposition itself and every
+> visibility or off-host behavior remain proposed. The evidence base is the
 > satellite-arc post-mortem (section 1), the shipped harness process boundary
 > ([harness-process-boundary.md](../bro-harness/harness-process-boundary.md)),
 > and a code-verified inventory of the daemon's remaining checkout-coupled
@@ -215,16 +219,19 @@ of scope here.
   checkout_dir>` persisted only in the central host store
   (`crates/bbox-knowledge/src/knowledge.rs`), with a hand-patched purge
   exclusion, dropped per-id when the merged file is observed at base.
-- **Worktree `.bbox/` is otherwise invisible**: `load_project_entries`
-  iterates registered base roots only, and the `.bbox/` watcher watches
-  registered roots only. A worktree agent sees its own write via the
-  central in-memory copy, not from disk; a peer in another worktree cannot
-  see it at all until merge.
-- **Unimplemented from the repo-owned design**
+- **Worktree `.bbox/` is invisible on disk but globally shadowed in memory**:
+  `load_project_entries` iterates registered base roots only, and the
+  `.bbox/` watcher watches registered roots only. The write path nevertheless
+  rescopes the entry to the base project, replaces the central in-memory copy,
+  and immediately syncs that same logical entry to the index. Other callers
+  can therefore see an unlabeled provisional version, while restart recovery
+  still depends on `write_redirects` and `kb.json`.
+- **Partially implemented from the repo-owned design**
   ([repo-owned-project-state.md](../corpus/knowledge/repo-owned-project-state.md)):
-  the `(repo_id, bbox_root_relpath)` identity model (scope still keys on
-  absolute path strings), `render --check`, and `bbox_lint` as a merge
-  gate.
+  additive `repo_id`, checkout-registry, `built_from`, and inventory
+  primitives have landed, but production does not yet record durable repo
+  authority, key checkout records by published scope, build overlays, or run
+  `render --check` and `bbox_lint` as a merge gate.
 - Live measurement at time of writing: 17 nested worktrees under
   `.claude/worktrees/`, with up to 10 gap files and 5 knowledge files per
   worktree diverging from base. That divergence is branch state and is
@@ -242,61 +249,53 @@ principle is already written down for code.
 `.bbox/` in a worktree is branch state. Treat it exactly like the code next
 to it:
 
-1. **Published knowledge truth** = base-branch `.bbox/` (committed) plus
-   the central store's global lane. This is what the corpus indexes as
-   authoritative, what renders derive from on other machines, and what
-   `verified` can mean.
+1. **Published knowledge truth** = the unique registered publisher's
+   `.bbox/` at a host-locally pinned full branch ref, plus the central store's
+   global lane. A moving checkout `HEAD` does not redefine published truth.
+   This is what the corpus indexes as authoritative, what renders derive from
+   on other machines, and what `verified` can mean.
 2. **Working-set knowledge truth** = the worktree's `.bbox/` at its
    branch. The writing harness reads its own files; read-your-writes is
    local and free. **Merge is the integration boundary for knowledge**,
    the same gate code goes through.
-3. **A provisional lane replaces the redirect map.** Managed-checkout
-   `.bbox/` entries (the same recognition set as write aliasing today:
-   in-tree linked worktrees, cockpit-managed roots, marker+repo_id lanes)
-   are indexed as *provisional*, stamped with checkout identity and
-   generation, never as verified project truth. Peers and the operator see
-   in-flight knowledge labeled as unmerged branch knowledge; queries can
-   include or exclude the provisional lane explicitly. **Default
-   visibility (decided 2026-07-19): hybrid.** A caller always sees
-   published entries plus its own checkout's provisional entries
-   (read-your-writes preserved; the daemon already resolves the caller's
-   checkout for scoping); other checkouts' provisional entries appear only
-   behind an explicit query flag. **Promotion (decided 2026-07-19):
-   passive merge-observation first.** When the entry file is observed at a
-   base root, the provisional entry promotes to published and the
-   checkout-stamped copy is dropped: today's redirect-drop trigger,
-   generalized, and the correctness backstop that catches every merge
-   regardless of how it happened. An explicit closeout promotion hook
-   (announcing "branch merged, promote now" and hosting the `bbox_lint` /
-   `render --check` gates) arrives with the merge-gate slice, removing the
-   pull-lag on remote merges; until then a merged-but-unpulled base
-   checkout leaves entries provisional, which self-heals on pull. When a
-   checkout disappears (worktree removed, lane released), its provisional
-   entries vanish with it. `write_redirects` retires: the daemon no longer
-   needs host-only bookkeeping to interpret repo files, and knowledge
-   state rebuilds from disk (base roots + live managed checkouts) after
-   store loss.
+3. **A provisional lane replaces the redirect map.** Every admitted checkout
+   contributes a merge-base working-tree overlay, including untracked files
+   and tombstones, under a compound `(published_scope, checkout_id, entry_id)`
+   identity. Each materialized view carries a `built_from` snapshot; an
+   invalid checkout overlay fails as a whole and never reuses a stale prior
+   snapshot. Visibility is explicit: `provisional=published|own|all`.
+   `own` is the default only when the server has an authoritative session
+   checkout; otherwise the default is `published`. Model-supplied arguments
+   and an unproven request cwd cannot establish own-checkout authority, and
+   orchestrators do not receive implicit `all` visibility. Promotion is
+   content equality against the pinned published commit, not mere observation
+   at a moving base checkout. When equality is observed, only that matching
+   provisional variant is dropped and the published document is rebuilt.
+   Checkout removal tears down its overlay. `write_redirects` then retires,
+   and knowledge state rebuilds from the pinned publisher plus admitted live
+   checkouts. The detailed identity, failure, and lifecycle contract lives in
+   [checkout-identity-and-provisional-knowledge.md](../corpus/knowledge/checkout-identity-and-provisional-knowledge.md).
 4. **The alternative, named:** branch-private pre-merge knowledge (no
    provisional lane; entries are simply invisible outside their worktree
    until merge). It is the purest reading of "the corpus indexes published
    truth" and strictly less machinery, but it regresses today's
-   cross-fleet read-your-writes, which multi-agent campaigns actually use.
-   The provisional lane keeps that visibility while making its epistemic
-   status explicit instead of implicit in a host-local map. If the lane
-   proves noisy in practice, demoting to branch-private is a deletion, not
-   a redesign.
+   daemon-wide in-flight visibility. The provisional lane keeps explicit,
+   authorized access to that visibility while making its epistemic status
+   and checkout identity queryable. If the lane proves noisy in practice,
+   demoting to branch-private is a deletion, not a redesign.
 5. **Semantic merge defense.** One-file-per-entry makes textual conflicts
    rare and semantic conflicts silent; `bbox_lint` at the merge gate (CI
    or closeout) is required, not hygiene, once many branches carry
    knowledge deltas. `render --check` rides the same gate so a stale
    committed render is caught where it is created.
-6. **Identity before motion.** `(repo_id, bbox_root_relpath)` keying and
-   generation stamps land before anything moves off-host, so no plane ever
+6. **Identity before motion.** Persisted `repo_id` authority,
+   `(repo_id, bbox_root_relpath)` keying, checkout identity, and per-view
+   `built_from` stamps land before anything moves off-host, so no plane ever
    again keys knowledge or index state by an absolute path that does not
-   travel (post-mortem items 1 and 4). This also makes pool lanes
-   first-class rather than marker-special-cased, and it is the same
-   workspace-identity contract remote-worker-boundary.md wants in
-   `bro-core` for artifact envelopes.
+   travel (post-mortem items 1 and 4). This also makes pool lanes first-class
+   rather than marker-special-cased, and it is the same workspace-identity
+   contract remote-worker-boundary.md wants in `bro-core` for artifact
+   envelopes.
 
 Pins, live threads, and notes are unaffected: they are host-local activity
 by design (`.bbox/local/`, central stores) and never had a code-plane twin.
@@ -350,7 +349,8 @@ monolith:
 
 1. **Contract slice.** `(repo_id, bbox_root_relpath)` identity for
    project-scoped stores; checkout/workspace identity in `bro-core`;
-   generation stamps on knowledge and indexed-lane responses. Additive.
+   per-view `built_from` stamps on knowledge and indexed-lane responses.
+   Additive.
 2. **Harness-ward moves.** Provenance bindings; blame binding (hybrid);
    checkout-local render via the shared `bbox-knowledge` render crate,
    plus `render --check`. Daemon adapters stay live during overlap

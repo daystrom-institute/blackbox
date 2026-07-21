@@ -56,6 +56,13 @@ pub(crate) struct SharedState {
     pub(crate) pins_persister: StorePersister<Pins>,
     pub(crate) projects: Arc<RwLock<ProjectRegistry>>,
     pub(crate) projects_persister: StorePersister<ProjectRegistry>,
+    /// Host-local discovery index for scope-aware checkout overlays.
+    pub(crate) checkout_registry: RwLock<bbox_indexing::checkout_registry::CheckoutRegistry>,
+    /// Host-local symbolic branch pins defining published truth per scope.
+    pub(crate) publisher_refs: RwLock<bbox_indexing::publisher::PublisherRefStore>,
+    /// Dark provisional snapshots. These are deliberately not consulted by
+    /// live retrieval until the session-authoritative visibility slice lands.
+    pub(crate) knowledge_overlays: RwLock<bbox_knowledge::overlay::KnowledgeOverlayStore>,
     pub(crate) packets: RwLock<Packets>,
     /// Generation-validated cache of MCP surface decisions; see
     /// `server::surface::SurfaceDecisionCache`. Keeps the wire head from
@@ -452,6 +459,21 @@ impl SharedState {
             pins_persister,
             projects: projects_store,
             projects_persister,
+            checkout_registry: RwLock::new(
+                bbox_indexing::checkout_registry::CheckoutRegistry::open(
+                    &store_dir.join("checkout-registry.json"),
+                )
+                .unwrap(),
+            ),
+            publisher_refs: RwLock::new(
+                bbox_indexing::publisher::PublisherRefStore::open(
+                    store_dir.join("publisher-refs.json"),
+                )
+                .unwrap(),
+            ),
+            knowledge_overlays: RwLock::new(
+                bbox_knowledge::overlay::KnowledgeOverlayStore::default(),
+            ),
             packets: RwLock::new(Packets::open(store_dir).unwrap()),
             surface_decisions: crate::server::surface::SurfaceDecisionCache::default(),
             artifacts: RwLock::new(artifacts::ArtifactCatalog::open(store_dir).unwrap()),
