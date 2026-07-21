@@ -148,16 +148,24 @@ impl ServerHandler for BlackboxServer {
             Some(raw) => {
                 let server = self.clone();
                 tokio::task::spawn_blocking(move || {
-                    server
-                        .resolve_project_write(&raw)
-                        .ok()
-                        .and_then(|resolved| resolved.checkout_scope)
-                        .map(Arc::new)
+                    let resolved = server.resolve_project_write(&raw)?;
+                    let Some(checkout) = resolved.checkout_scope else {
+                        return Ok::<_, anyhow::Error>(None);
+                    };
+                    server.register_dark_knowledge_checkout(&checkout)?;
+                    server.refresh_dark_knowledge_overlay(&checkout);
+                    Ok(Some(Arc::new(checkout)))
                 })
                 .await
                 .map_err(|e| {
                     ErrorData::internal_error(
                         format!("checkout authority resolution failed: {e}"),
+                        None,
+                    )
+                })?
+                .map_err(|e| {
+                    ErrorData::internal_error(
+                        format!("checkout authority initialization failed: {e:#}"),
                         None,
                     )
                 })?

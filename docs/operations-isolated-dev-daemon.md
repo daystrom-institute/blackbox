@@ -40,9 +40,9 @@ port will route to this instance automatically.
 ### State isolation
 
 Set `BLACKBOX_STATE_DIR` to a throwaway directory. The daemon's per-store
-paths and vector store resolve below this directory. The launcher also sets
-isolated HOME and XDG directories because dependencies may resolve auxiliary
-state outside the daemon's explicit path configuration:
+paths resolve below this directory. The launcher also sets isolated HOME and
+XDG directories so the vector store and dependencies that use platform paths
+cannot resolve auxiliary state outside the throwaway root:
 
 | Env var | Default (relative to state_dir) | Effect |
 |---|---|---|

@@ -36,6 +36,10 @@ pub struct DiscoverSeedParams {
     /// parameter — see that tool's docs.
     #[serde(default)]
     pub project: Option<String>,
+    /// Knowledge visibility: published, own, or all. Defaults to own only
+    /// when the MCP session has authoritative checkout context.
+    #[serde(default)]
+    pub provisional: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -86,7 +90,7 @@ pub fn discover_seed_entities(
             vector_weight: p.vector_weight,
             query_vector: p.query_vector.clone(),
             project: p.project.clone(),
-            provisional: None,
+            provisional: p.provisional.clone(),
             rerank_cap: None,
             rerank: None,
         },

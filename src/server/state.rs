@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};
@@ -60,9 +60,16 @@ pub(crate) struct SharedState {
     pub(crate) checkout_registry: RwLock<bbox_indexing::checkout_registry::CheckoutRegistry>,
     /// Host-local symbolic branch pins defining published truth per scope.
     pub(crate) publisher_refs: RwLock<bbox_indexing::publisher::PublisherRefStore>,
-    /// Dark provisional snapshots. These are deliberately not consulted by
-    /// live retrieval until the session-authoritative visibility slice lands.
+    /// Session-authorized provisional snapshots keyed by scope and checkout.
     pub(crate) knowledge_overlays: RwLock<bbox_knowledge::overlay::KnowledgeOverlayStore>,
+    /// Published committed-tree snapshots. Symbolic refs are rechecked on a
+    /// short TTL and blob maps are rebuilt only when the resolved commit moves.
+    pub(crate) knowledge_published_cache: RwLock<
+        BTreeMap<
+            bbox_corpus_core::identity::PublishedScope,
+            super::knowledge_view::PublishedKnowledgeCacheEntry,
+        >,
+    >,
     pub(crate) packets: RwLock<Packets>,
     /// Generation-validated cache of MCP surface decisions; see
     /// `server::surface::SurfaceDecisionCache`. Keeps the wire head from
@@ -474,6 +481,7 @@ impl SharedState {
             knowledge_overlays: RwLock::new(
                 bbox_knowledge::overlay::KnowledgeOverlayStore::default(),
             ),
+            knowledge_published_cache: RwLock::new(BTreeMap::new()),
             packets: RwLock::new(Packets::open(store_dir).unwrap()),
             surface_decisions: crate::server::surface::SurfaceDecisionCache::default(),
             artifacts: RwLock::new(artifacts::ArtifactCatalog::open(store_dir).unwrap()),

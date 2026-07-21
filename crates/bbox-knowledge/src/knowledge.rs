@@ -1423,9 +1423,7 @@ impl Knowledge {
     /// Visibility is intentionally outside this method; detached views contain
     /// only authorized candidates, so no hidden item can consume a cutoff.
     pub fn search_hits(&self, query: &str, limit: usize) -> Vec<KnowledgeSearchHit> {
-        let Some(ast) = parse_query(query) else {
-            return Vec::new();
-        };
+        let ast = parse_query(query);
         let mut hits = self
             .store
             .entries
@@ -1440,11 +1438,15 @@ impl Knowledge {
                     title: entry.title.to_lowercase(),
                     content: entry.content.to_lowercase(),
                 };
-                if !query_matches(&ast, &corpus) {
-                    return None;
-                }
-                let mut query_match = QueryMatch::default();
-                collect_positive_matches(&ast, &corpus, &mut query_match);
+                let query_match = match ast.as_ref() {
+                    Some(ast) if query_matches(ast, &corpus) => {
+                        let mut query_match = QueryMatch::default();
+                        collect_positive_matches(ast, &corpus, &mut query_match);
+                        query_match
+                    }
+                    Some(_) => return None,
+                    None => substring_match(query, &corpus)?,
+                };
                 let entity_id = if entry.id.starts_with("provisional_knowledge:") {
                     entry.id.clone()
                 } else {
@@ -3254,6 +3256,22 @@ mod tests {
             content: "legacy escape hatch".into(),
         };
         assert!(!query_matches(&ast, &excluded));
+    }
+
+    #[test]
+    fn search_hits_falls_back_to_literal_matching_when_smart_parse_fails() {
+        let entry = entry(
+            "literal01",
+            "Operator AND fallback",
+            "free text containing AND remains discoverable",
+            Scope::Global,
+        );
+        let view = Knowledge::detached_view(vec![entry], BTreeMap::new());
+
+        let hits = view.search_hits("AND", 10);
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entity_id, "knowledge:literal01");
     }
 
     #[test]

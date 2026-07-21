@@ -438,6 +438,9 @@ pub fn extract_decoded_query_param(query: Option<&str>, key: &str) -> Option<Str
             let low = *bytes.get(index + 2)?;
             decoded.push((hex_nibble(high)? << 4) | hex_nibble(low)?);
             index += 3;
+        } else if bytes[index] == b'+' {
+            decoded.push(b' ');
+            index += 1;
         } else {
             decoded.push(bytes[index]);
             index += 1;
@@ -1131,6 +1134,14 @@ mod tests {
                 "project"
             ),
             Some("/tmp/repo with spaces".into())
+        );
+        assert_eq!(
+            extract_decoded_query_param(Some("project=%2Ftmp%2Frepo+with+spaces"), "project"),
+            Some("/tmp/repo with spaces".into())
+        );
+        assert_eq!(
+            extract_decoded_query_param(Some("project=%2Ftmp%2Frepo%2Bplus"), "project"),
+            Some("/tmp/repo+plus".into())
         );
         assert_eq!(
             extract_decoded_query_param(Some("project=%2Ftmp%2Frepo%2"), "project"),

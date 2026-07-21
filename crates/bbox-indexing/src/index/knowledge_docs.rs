@@ -116,6 +116,26 @@ pub fn apply_knowledge_replace(
     Ok(())
 }
 
+/// Replace every published or provisional document for one logical knowledge
+/// ref while leaving unrelated knowledge documents untouched.
+pub fn apply_knowledge_logical_replace(
+    writer: &mut IndexWriter,
+    fields: FieldHandles,
+    knowledge_path: &Path,
+    logical_ref: &str,
+    documents: &[KnowledgeIndexDocument],
+) -> Result<()> {
+    writer.delete_term(Term::from_field_text(fields.logical_ref, logical_ref));
+    for document in documents
+        .iter()
+        .filter(|document| document.logical_ref == logical_ref)
+        .filter(|document| indexable_knowledge_entry(&document.entry))
+    {
+        writer.add_document(build_knowledge_index_doc(document, knowledge_path, fields))?;
+    }
+    Ok(())
+}
+
 pub fn indexable_knowledge_entry(entry: &KnowledgeEntry) -> bool {
     // Superseded entries remain searchable so history queries can find the
     // original decision; H1 rerank should downweight them by status.
@@ -245,7 +265,7 @@ pub fn apply_knowledge_upsert(
     entry: &KnowledgeEntry,
 ) -> Result<()> {
     let entity_id = knowledge_entity_id(&entry.id);
-    writer.delete_term(Term::from_field_text(fields.entity_id, &entity_id));
+    writer.delete_term(Term::from_field_text(fields.logical_ref, &entity_id));
     if indexable_knowledge_entry(entry) {
         writer.add_document(build_knowledge_doc(entry, knowledge_path, fields))?;
     }
@@ -259,7 +279,7 @@ pub fn apply_knowledge_delete(
     entry_id: &str,
 ) -> Result<()> {
     writer.delete_term(Term::from_field_text(
-        fields.entity_id,
+        fields.logical_ref,
         &knowledge_entity_id(entry_id),
     ));
     Ok(())

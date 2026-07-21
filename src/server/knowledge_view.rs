@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bbox_corpus_core::entity_ref::EntityRef;
@@ -9,11 +10,22 @@ use bbox_corpus_core::project_record::{ProjectRecord, ResolvedCheckoutScope};
 use bbox_indexing::publisher::{PublisherResolution, elect_publisher, project_published_scope};
 use bbox_knowledge::knowledge::{Knowledge, KnowledgeEntry, KnowledgeViewMetadata, Scope};
 use bbox_knowledge::overlay::{
-    OverlaySnapshot, OverlayStatus, OverlayValue, ProvisionalMode, load_published_snapshot,
-    provisional_entity_ref,
+    OverlaySnapshot, OverlayStatus, OverlayValue, ProvisionalMode, PublishedKnowledgeSnapshot,
+    load_published_snapshot_at_commit, provisional_entity_ref,
 };
 
 use super::BlackboxServer;
+
+const PUBLISHED_REF_CACHE_TTL: Duration = Duration::from_millis(250);
+
+#[derive(Clone)]
+pub(crate) struct PublishedKnowledgeCacheEntry {
+    publisher_root: String,
+    published_ref: String,
+    durable_project: String,
+    checked_at: Instant,
+    snapshot: PublishedKnowledgeSnapshot,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct KnowledgeViewItem {
@@ -125,21 +137,6 @@ impl BlackboxServer {
             }
         }
 
-        // The trusted session checkout is the authority for `own`. Recompute
-        // it at read time so edits made outside bbox_learn/remember/decide and
-        // dirty knowledge present before project registration are visible on
-        // the first request, without minting identities for unrelated clean
-        // checkouts during daemon startup.
-        if mode == ProvisionalMode::Own
-            && let Some(own) = session_checkout.as_deref()
-            && selected_scopes.contains_key(&own.published_scope)
-        {
-            self.register_dark_knowledge_checkout(own)
-                .context("registering authoritative knowledge checkout")?;
-            self.refresh_dark_knowledge_overlay(own);
-        }
-
-        let overlays = self.state.knowledge_overlays.read();
         let mut diagnostics = Vec::new();
         for (scope, project) in selected_scopes {
             let publisher_root =
@@ -179,7 +176,7 @@ impl BlackboxServer {
                     continue;
                 }
             };
-            let published = load_published_snapshot(
+            let published = self.cached_published_knowledge_snapshot(
                 Path::new(&publisher_root),
                 &pin.branch_ref,
                 &scope,
@@ -211,21 +208,36 @@ impl BlackboxServer {
                     else {
                         continue;
                     };
-                    if let Some(snapshot) = overlays.get(&scope, &own.checkout_id) {
-                        if snapshot.status != OverlayStatus::Valid {
-                            anyhow::bail!(
-                                "own checkout overlay is invalid for scope {scope:?}: {}",
-                                snapshot.diagnostics.join("; ")
-                            );
-                        }
-                        apply_own_overlay(&mut items, snapshot, &project.canonical_path);
+                    let snapshot = self
+                        .state
+                        .knowledge_overlays
+                        .read()
+                        .get(&scope, &own.checkout_id)
+                        .cloned()
+                        .with_context(|| {
+                            format!(
+                                "own checkout overlay is missing for scope {scope:?} and checkout {}",
+                                own.checkout_id
+                            )
+                        })?;
+                    if snapshot.status != OverlayStatus::Valid {
+                        anyhow::bail!(
+                            "own checkout overlay is invalid for scope {scope:?}: {}",
+                            snapshot.diagnostics.join("; ")
+                        );
                     }
+                    apply_own_overlay(&mut items, &snapshot, &project.canonical_path);
                 }
                 ProvisionalMode::All => {
-                    for snapshot in overlays
+                    let snapshots = self
+                        .state
+                        .knowledge_overlays
+                        .read()
                         .snapshots()
                         .filter(|snapshot| snapshot.key.published_scope == scope)
-                    {
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for snapshot in snapshots {
                         if snapshot.status != OverlayStatus::Valid {
                             diagnostics.push(format!(
                                 "checkout {} in scope {scope:?}: {}",
@@ -242,12 +254,11 @@ impl BlackboxServer {
                                 ));
                             }
                         }
-                        add_overlay_upserts(&mut items, snapshot, &project.canonical_path);
+                        add_overlay_upserts(&mut items, &snapshot, &project.canonical_path);
                     }
                 }
             }
         }
-        drop(overlays);
 
         let items = items.into_values().collect::<Vec<_>>();
         let mut metadata = BTreeMap::new();
@@ -267,6 +278,63 @@ impl BlackboxServer {
             items,
             diagnostics,
         })
+    }
+
+    fn cached_published_knowledge_snapshot(
+        &self,
+        publisher_root: &Path,
+        published_ref: &str,
+        scope: &PublishedScope,
+        durable_project: &str,
+    ) -> Result<PublishedKnowledgeSnapshot> {
+        let publisher_root = publisher_root.to_string_lossy().into_owned();
+        let now = Instant::now();
+        let cached = self
+            .state
+            .knowledge_published_cache
+            .read()
+            .get(scope)
+            .filter(|entry| {
+                entry.publisher_root == publisher_root
+                    && entry.published_ref == published_ref
+                    && entry.durable_project == durable_project
+            })
+            .cloned();
+        if let Some(cached) = &cached
+            && now.duration_since(cached.checked_at) < PUBLISHED_REF_CACHE_TTL
+        {
+            return Ok(cached.snapshot.clone());
+        }
+
+        let publisher_commit =
+            bbox_corpus_core::git::resolve_commit(Path::new(&publisher_root), published_ref)
+                .with_context(|| {
+                    format!("published ref {published_ref} does not resolve in {publisher_root}")
+                })?;
+        let snapshot = if let Some(cached) = cached
+            && cached.snapshot.publisher_commit == publisher_commit
+        {
+            cached.snapshot
+        } else {
+            load_published_snapshot_at_commit(
+                Path::new(&publisher_root),
+                published_ref,
+                &publisher_commit,
+                scope,
+                durable_project,
+            )?
+        };
+        self.state.knowledge_published_cache.write().insert(
+            scope.clone(),
+            PublishedKnowledgeCacheEntry {
+                publisher_root,
+                published_ref: published_ref.to_string(),
+                durable_project: durable_project.to_string(),
+                checked_at: now,
+                snapshot: snapshot.clone(),
+            },
+        );
+        Ok(snapshot)
     }
 }
 
@@ -512,15 +580,16 @@ mod tests {
             values: BTreeMap::new(),
             diagnostics: vec!["malformed entry".into()],
         });
+        let own_checkout = ResolvedCheckoutScope {
+            published_scope: scope.clone(),
+            checkout_id: own_id.into(),
+            checkout_dir: base.to_string_lossy().into_owned(),
+            checkout_project_dir: base.to_string_lossy().into_owned(),
+            branch_ref: Some("refs/heads/main".into()),
+        };
         server
             .session_checkout
-            .set(Some(Arc::new(ResolvedCheckoutScope {
-                published_scope: scope.clone(),
-                checkout_id: own_id.into(),
-                checkout_dir: base.to_string_lossy().into_owned(),
-                checkout_project_dir: base.to_string_lossy().into_owned(),
-                branch_ref: Some("refs/heads/main".into()),
-            })))
+            .set(Some(Arc::new(own_checkout.clone())))
             .unwrap();
 
         let published = server
@@ -531,6 +600,21 @@ mod tests {
             "PUBLISHED_CONTENT"
         );
         assert!(published.knowledge.entry("deleted").is_some());
+
+        let missing = server
+            .session_knowledge_view(Some(base.to_str().unwrap()), Some("own"))
+            .err()
+            .expect("missing own overlay must fail closed");
+        assert!(
+            missing
+                .to_string()
+                .contains("own checkout overlay is missing"),
+            "{missing:#}"
+        );
+        server
+            .register_dark_knowledge_checkout(&own_checkout)
+            .unwrap();
+        server.refresh_dark_knowledge_overlay(&own_checkout);
 
         // A model-supplied peer checkout path scopes the published project but
         // cannot replace the session's own checkout authority.
@@ -570,16 +654,21 @@ mod tests {
 
         std::fs::write(peer_path.join(".bbox/knowledge/shared.json"), "not-json").unwrap();
         let invalid_server = BlackboxServer::new(state);
+        let invalid_checkout = ResolvedCheckoutScope {
+            published_scope: scope,
+            checkout_id: "invalid-peer".into(),
+            checkout_dir: peer_path.to_string_lossy().into_owned(),
+            checkout_project_dir: peer_path.to_string_lossy().into_owned(),
+            branch_ref: Some("refs/heads/peer-branch".into()),
+        };
         invalid_server
             .session_checkout
-            .set(Some(Arc::new(ResolvedCheckoutScope {
-                published_scope: scope,
-                checkout_id: "invalid-peer".into(),
-                checkout_dir: peer_path.to_string_lossy().into_owned(),
-                checkout_project_dir: peer_path.to_string_lossy().into_owned(),
-                branch_ref: Some("refs/heads/peer-branch".into()),
-            })))
+            .set(Some(Arc::new(invalid_checkout.clone())))
             .unwrap();
+        invalid_server
+            .register_dark_knowledge_checkout(&invalid_checkout)
+            .unwrap();
+        invalid_server.refresh_dark_knowledge_overlay(&invalid_checkout);
         let error = invalid_server
             .session_knowledge_view(Some(base.to_str().unwrap()), Some("own"))
             .err()
@@ -588,6 +677,21 @@ mod tests {
             error
                 .to_string()
                 .contains("own checkout overlay is invalid")
+        );
+
+        write_entry(&base, &entry("shared", "NEW_PUBLISHED_CONTENT"));
+        git(&base, &["add", ".bbox/knowledge"]);
+        git(
+            &base,
+            &["commit", "-q", "-m", "advance published knowledge"],
+        );
+        std::thread::sleep(PUBLISHED_REF_CACHE_TTL + Duration::from_millis(25));
+        let refreshed = server
+            .session_knowledge_view(Some(base.to_str().unwrap()), Some("published"))
+            .unwrap();
+        assert_eq!(
+            refreshed.knowledge.entry("shared").unwrap().content,
+            "NEW_PUBLISHED_CONTENT"
         );
     }
 }

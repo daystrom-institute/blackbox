@@ -280,6 +280,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
             store_dir.join("publisher-refs.json"),
         )?),
         knowledge_overlays: RwLock::new(bbox_knowledge::overlay::KnowledgeOverlayStore::default()),
+        knowledge_published_cache: RwLock::new(Default::default()),
         packets: RwLock::new(packets_store),
         surface_decisions: crate::server::surface::SurfaceDecisionCache::default(),
         artifacts: RwLock::new(artifacts_store),

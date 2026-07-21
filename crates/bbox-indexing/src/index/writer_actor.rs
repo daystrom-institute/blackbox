@@ -41,6 +41,10 @@ pub enum IndexWriteOp {
     UpsertKnowledge(Box<KnowledgeEntry>),
     DeleteKnowledge(String),
     ReplaceKnowledge(Vec<KnowledgeIndexDocument>),
+    ReplaceKnowledgeLogical {
+        logical_ref: String,
+        documents: Vec<KnowledgeIndexDocument>,
+    },
     UpsertRoadmap(Box<RoadmapItem>),
     DeleteRoadmap(String),
     UpsertThread(Box<Thread>),
@@ -315,6 +319,19 @@ fn apply_small_op(ctx: &ActorCtx, writer: &mut IndexWriter, op: IndexWriteOp) {
                 &documents,
             ),
         ),
+        IndexWriteOp::ReplaceKnowledgeLogical {
+            logical_ref,
+            documents,
+        } => (
+            "replace_knowledge_logical",
+            super::knowledge_docs::apply_knowledge_logical_replace(
+                writer,
+                ctx.fields,
+                knowledge_path(&ctx.config),
+                &logical_ref,
+                &documents,
+            ),
+        ),
         IndexWriteOp::UpsertRoadmap(item) => (
             "upsert_roadmap",
             super::roadmap_docs::apply_roadmap_upsert(
@@ -539,6 +556,41 @@ mod tests {
             !hits.contains("quux"),
             "delete in the same batch must win: {hits}"
         );
+    }
+
+    #[test]
+    fn logical_replace_removes_every_prior_visibility_variant() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = test_index(dir.path());
+        let actor = IndexWriterActor::spawn_for(&index);
+        let logical_ref = super::super::knowledge_docs::knowledge_entity_id("scope0001");
+        let published =
+            KnowledgeIndexDocument::published(test_entry("scope0001", "published obsolete marker"));
+        let mut provisional = published.clone();
+        provisional.entity_id = "provisional_knowledge:scope:checkout:scope0001".into();
+        provisional.entry.content = "provisional obsolete marker".into();
+        provisional.visibility = "provisional".into();
+
+        actor.enqueue(IndexWriteOp::ReplaceKnowledgeLogical {
+            logical_ref: logical_ref.clone(),
+            documents: vec![published, provisional],
+        });
+        actor.flush_blocking().unwrap();
+        assert!(search(&index, "published obsolete").contains("published"));
+        assert!(search(&index, "provisional obsolete").contains("provisional"));
+
+        actor.enqueue(IndexWriteOp::ReplaceKnowledgeLogical {
+            logical_ref,
+            documents: vec![KnowledgeIndexDocument::published(test_entry(
+                "scope0001",
+                "replacement current marker",
+            ))],
+        });
+        actor.flush_blocking().unwrap();
+
+        assert!(!search(&index, "published obsolete").contains("published"));
+        assert!(!search(&index, "provisional obsolete").contains("provisional"));
+        assert!(search(&index, "replacement current").contains("replacement"));
     }
 
     #[test]

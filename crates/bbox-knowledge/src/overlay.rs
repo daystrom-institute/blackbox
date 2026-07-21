@@ -180,8 +180,27 @@ pub fn load_published_snapshot(
                 publisher_root.display()
             )
         })?;
+    load_published_snapshot_at_commit(
+        publisher_root,
+        published_ref,
+        &publisher_commit,
+        scope,
+        durable_project,
+    )
+}
+
+/// Load a published snapshot at an already-resolved commit. Callers that
+/// cache symbolic-ref resolution use this to avoid rereading every blob when
+/// the ref still names the same commit.
+pub fn load_published_snapshot_at_commit(
+    publisher_root: &Path,
+    published_ref: &str,
+    publisher_commit: &str,
+    scope: &PublishedScope,
+    durable_project: &str,
+) -> Result<PublishedKnowledgeSnapshot> {
     let tree_dir = knowledge_tree_dir(scope);
-    let files = read_committed_map(publisher_root, &publisher_commit, &tree_dir)?;
+    let files = read_committed_map(publisher_root, publisher_commit, &tree_dir)?;
     let mut entries = BTreeMap::new();
     for (filename, bytes) in files {
         let mut entry: KnowledgeEntry = serde_json::from_slice(&bytes)
@@ -214,7 +233,7 @@ pub fn load_published_snapshot(
     Ok(PublishedKnowledgeSnapshot {
         published_scope: scope.clone(),
         published_ref: published_ref.to_string(),
-        publisher_commit,
+        publisher_commit: publisher_commit.to_string(),
         entries,
     })
 }
