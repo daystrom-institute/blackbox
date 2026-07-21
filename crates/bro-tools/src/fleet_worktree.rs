@@ -744,6 +744,7 @@ struct KnowledgeCloseoutClaim {
     bytes: Vec<u8>,
 }
 
+#[allow(clippy::disallowed_methods)]
 impl KnowledgeCloseoutClaim {
     fn acquire(req: &CloseoutRequest) -> anyhow::Result<Option<Self>> {
         if req.disposition == "discard" {
@@ -777,6 +778,7 @@ impl KnowledgeCloseoutClaim {
     }
 }
 
+#[allow(clippy::disallowed_methods)]
 impl Drop for KnowledgeCloseoutClaim {
     fn drop(&mut self) {
         if std::fs::read(&self.path).ok().as_deref() == Some(self.bytes.as_slice()) {
@@ -791,6 +793,7 @@ impl Drop for KnowledgeCloseoutClaim {
 /// Prove that the candidate target contains the terminal state named by every
 /// completed checkout-local knowledge transaction. Later transactions win for
 /// a path, matching the order in which their canonical writes completed.
+#[allow(clippy::disallowed_methods)]
 fn verify_knowledge_transaction_closeout(req: &CloseoutRequest) -> HookRun {
     let completed = req
         .worktree

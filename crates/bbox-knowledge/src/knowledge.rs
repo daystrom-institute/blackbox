@@ -1252,13 +1252,15 @@ impl Knowledge {
             );
         }
         let project_dir = Path::new(write_dir);
-        let checkout_dir =
-            bbox_corpus_core::git::git_root_for_path(project_dir).with_context(|| {
+        let checkout_dir = match bbox_corpus_core::git::git_root_for_path(project_dir) {
+            Some(root) => root,
+            None => project_dir.canonicalize().with_context(|| {
                 format!(
-                    "resolving checkout root for knowledge transaction at {}",
+                    "resolving non-git knowledge transaction root at {}",
                     project_dir.display()
                 )
-            })?;
+            })?,
+        };
         let mut writes = Vec::new();
         let mut stats = load_repo_kb_stats(project_dir);
         for entry in entries {
@@ -1621,7 +1623,8 @@ impl Knowledge {
         from_agent: bool,
         write_dir: Option<&str>,
     ) -> Result<LearnWriteResult> {
-        self.learn_result_locked(p, from_agent, write_dir, None)
+        let seed = p.id.as_deref().and_then(|id| self.entry(id)).cloned();
+        self.learn_result_locked(p, from_agent, write_dir, seed.as_ref())
     }
 
     /// Checkout-scoped learn/create-or-update with the visible generation of
@@ -1633,6 +1636,9 @@ impl Knowledge {
         write_dir: Option<&str>,
         checkout_entry: Option<&KnowledgeEntry>,
     ) -> Result<LearnWriteResult> {
+        if write_dir.is_some() && p.id.is_some() && checkout_entry.is_none() {
+            anyhow::bail!("checkout-scoped knowledge update requires its visible entry seed");
+        }
         self.learn_result_locked(p, from_agent, write_dir, checkout_entry)
     }
 
@@ -1689,9 +1695,11 @@ impl Knowledge {
         } else {
             Approval::UserConfirmed
         };
-        let update_restore = match p.id.as_deref() {
-            Some(id) => self.install_checkout_mutation_seed(id, checkout_entry, write_dir)?,
-            None => None,
+        let update_restore = match (p.id.as_deref(), checkout_entry) {
+            (Some(id), Some(seed)) => {
+                self.install_checkout_mutation_seed(id, Some(seed), write_dir)?
+            }
+            _ => None,
         };
 
         // Update existing entry if id given and found. Snapshot the pre-mutation
