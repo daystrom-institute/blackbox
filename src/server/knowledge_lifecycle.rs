@@ -1,13 +1,14 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bbox_corpus_core::identity::{
     PublishedScope, bbox_root_relpath, read_checkout_id, resolve_recorded_repo_id,
 };
 use bbox_corpus_core::project_record::{ProjectRecord, ResolvedCheckoutScope};
 use bbox_indexing::checkout_registry::{CheckoutRow, discover_checkout_dirs};
 use bbox_indexing::publisher::{PublisherResolution, elect_publisher};
+use bbox_knowledge::knowledge::{KnowledgeEntry, Scope};
 
 use super::BlackboxServer;
 
@@ -18,7 +19,126 @@ pub(crate) struct KnowledgeCheckoutReconcileReport {
     pub(crate) refreshed: usize,
 }
 
+pub(crate) struct ExistingKnowledgeMutation {
+    pub(crate) id: String,
+    pub(crate) carrier: Option<String>,
+    pub(crate) seed: Option<KnowledgeEntry>,
+    pub(crate) checkout: Option<ResolvedCheckoutScope>,
+}
+
 impl BlackboxServer {
+    pub(crate) fn prepare_existing_knowledge_mutation(
+        &self,
+        raw_ref: &str,
+    ) -> Result<ExistingKnowledgeMutation> {
+        let parsed = bbox_corpus_core::entity_ref::EntityRef::parse(raw_ref);
+        let (id, provisional_checkout) = match parsed {
+            Ok(bbox_corpus_core::entity_ref::EntityRef::Knowledge { id }) => (id, None),
+            Ok(bbox_corpus_core::entity_ref::EntityRef::ProvisionalKnowledge {
+                checkout_id,
+                entry_id,
+                ..
+            }) => (entry_id, Some(checkout_id)),
+            Ok(other) => anyhow::bail!("knowledge mutation requires a knowledge ref, got {other}"),
+            Err(_) => (
+                raw_ref.trim_start_matches("knowledge:").trim().to_string(),
+                None,
+            ),
+        };
+        if id.is_empty() {
+            anyhow::bail!("knowledge entry id is required");
+        }
+        let Some(checkout) = self.authoritative_session_checkout() else {
+            if provisional_checkout.is_some() {
+                anyhow::bail!("provisional knowledge mutation requires session checkout authority");
+            }
+            return Ok(ExistingKnowledgeMutation {
+                id,
+                carrier: None,
+                seed: None,
+                checkout: None,
+            });
+        };
+        if provisional_checkout
+            .as_deref()
+            .is_some_and(|candidate| candidate != checkout.checkout_id)
+        {
+            anyhow::bail!("provisional knowledge ref does not belong to the session checkout");
+        }
+        if bbox_knowledge::transaction::has_pending_transaction(Path::new(&checkout.checkout_dir)) {
+            anyhow::bail!(
+                "checkout {} has a pending knowledge transaction; restart recovery or finish it before mutating",
+                checkout.checkout_id
+            );
+        }
+        self.refresh_dark_knowledge_overlay(&checkout);
+        let view =
+            self.session_knowledge_view(Some(&checkout.checkout_project_dir), Some("own"))?;
+        let item = view
+            .items
+            .into_iter()
+            .find(|item| item.entry.id == id)
+            .with_context(|| format!("knowledge entry not visible in session checkout: {id}"))?;
+        if item.entry.scope != Scope::Project || item.metadata.published_scope.is_none() {
+            return Ok(ExistingKnowledgeMutation {
+                id,
+                carrier: None,
+                seed: None,
+                checkout: None,
+            });
+        }
+        if item.metadata.published_scope.as_ref() != Some(&checkout.published_scope) {
+            anyhow::bail!("knowledge entry {id} belongs to a different published scope");
+        }
+        Ok(ExistingKnowledgeMutation {
+            id,
+            carrier: Some(checkout.checkout_project_dir.clone()),
+            seed: Some(item.entry),
+            checkout: Some((*checkout).clone()),
+        })
+    }
+
+    pub(crate) fn finish_existing_knowledge_mutation(
+        &self,
+        checkout: Option<&ResolvedCheckoutScope>,
+    ) {
+        if let Some(checkout) = checkout {
+            self.refresh_dark_knowledge_overlay(checkout);
+        }
+    }
+
+    pub(crate) fn recover_dark_knowledge_transactions(&self) -> usize {
+        let projects = self.state.projects.read().list();
+        let mut checkout_dirs = discover_checkout_dirs(&projects)
+            .into_iter()
+            .map(|path| canonical_or_original(&path))
+            .collect::<BTreeSet<_>>();
+        checkout_dirs.extend(
+            self.state
+                .checkout_registry
+                .read()
+                .rows()
+                .iter()
+                .map(|row| canonical_or_original(Path::new(&row.checkout_dir))),
+        );
+        let mut recovered = 0;
+        for checkout_dir in checkout_dirs {
+            if !bbox_knowledge::transaction::has_pending_transaction(&checkout_dir) {
+                continue;
+            }
+            match bbox_knowledge::transaction::recover_pending_transaction(&checkout_dir) {
+                Ok(Some(_)) => recovered += 1,
+                Ok(None) => {}
+                Err(err) => tracing::warn!(
+                    checkout = %checkout_dir.display(),
+                    error = %err,
+                    "knowledge transaction recovery failed; checkout remains pending"
+                ),
+            }
+        }
+        recovered
+    }
+
     /// Rebuild the host-local checkout census from live authority.
     ///
     /// Persisted rows are hints only. Every row must still exist, carry the
@@ -121,6 +241,11 @@ impl BlackboxServer {
             let Some(checkout) = self.resolve_registered_checkout(&row) else {
                 continue;
             };
+            if bbox_knowledge::transaction::has_pending_transaction(Path::new(
+                &checkout.checkout_dir,
+            )) {
+                continue;
+            }
             self.watch_dark_knowledge_checkout(Path::new(&checkout.checkout_project_dir));
             self.refresh_dark_knowledge_overlay(&checkout);
             refreshed += 1;
@@ -225,6 +350,13 @@ impl BlackboxServer {
 
     pub(crate) fn watch_resolved_dark_knowledge_checkout(&self, checkout: &ResolvedCheckoutScope) {
         self.watch_dark_knowledge_checkout(Path::new(&checkout.checkout_project_dir));
+    }
+
+    pub(crate) fn resolved_dark_knowledge_carrier(
+        &self,
+        checkout: &ResolvedCheckoutScope,
+    ) -> String {
+        checkout.checkout_project_dir.clone()
     }
 
     fn resolve_registered_checkout(&self, row: &CheckoutRow) -> Option<ResolvedCheckoutScope> {

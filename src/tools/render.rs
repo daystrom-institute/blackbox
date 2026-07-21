@@ -102,7 +102,27 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_review", move || {
-            let out = server.state.kb.write().review(&p)?;
+            let mut p = p;
+            let target = match p.action.as_deref().unwrap_or("list") {
+                "approve" | "reject" => Some(
+                    server
+                        .prepare_existing_knowledge_mutation(p.id.as_deref().unwrap_or_default())?,
+                ),
+                _ => None,
+            };
+            let out = if let Some(target) = &target {
+                p.id = Some(target.id.clone());
+                server.state.kb.write().review_with_write_dir(
+                    &p,
+                    target.carrier.as_deref(),
+                    target.seed.as_ref(),
+                )?
+            } else {
+                server.state.kb.write().review(&p)?
+            };
+            server.finish_existing_knowledge_mutation(
+                target.as_ref().and_then(|target| target.checkout.as_ref()),
+            );
             // Central KB persistence is write-behind here: this body runs on
             // the blocking pool where the durable ack can't be awaited.
             server.state.kb_persister.request();

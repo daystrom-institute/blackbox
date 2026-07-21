@@ -144,8 +144,11 @@ impl BlackboxServer {
         };
         let resolution = self.resolve_project_write(&raw)?;
         let durable_scope = resolution.durable_scope;
-        let write_dir = resolution.write_dir;
         let checkout = resolution.checkout_scope;
+        let write_dir = checkout
+            .as_ref()
+            .map(|checkout| self.resolved_dark_knowledge_carrier(checkout))
+            .or(resolution.write_dir);
         let managed_repo_owned = checkout.is_none()
             && self
                 .state
@@ -335,9 +338,40 @@ impl BlackboxServer {
         let server = self.clone();
         let write_result = tokio::task::spawn_blocking(move || {
             let mut p = p;
+            let update = match p.id.as_deref() {
+                Some(existing_ref) => {
+                    let existing = server.prepare_existing_knowledge_mutation(existing_ref)?;
+                    if p.project
+                        .as_deref()
+                        .is_none_or(|project| project.trim().is_empty())
+                    {
+                        p.project = existing
+                            .seed
+                            .as_ref()
+                            .and_then(|entry| entry.project.clone());
+                    }
+                    p.id = Some(existing.id.clone());
+                    Some(existing)
+                }
+                None => None,
+            };
             let (write_dir, checkout) = server.prepare_knowledge_write(&mut p.project)?;
+            if let Some(update) = &update
+                && (update.carrier.as_deref() != write_dir.as_deref()
+                    || update.checkout.as_ref().map(|scope| &scope.checkout_id)
+                        != checkout.as_ref().map(|scope| &scope.checkout_id))
+            {
+                anyhow::bail!(
+                    "an updated knowledge entry must use the same checkout authority as the write"
+                );
+            }
             let mut kb = server.state.kb.write();
-            let result = kb.learn_result_with_write_dir(&p, false, write_dir.as_deref())?;
+            let result = kb.learn_result_with_checkout(
+                &p,
+                false,
+                write_dir.as_deref(),
+                update.as_ref().and_then(|update| update.seed.as_ref()),
+            )?;
             let rider = kb.repo_record_rider_at(&result.id, write_dir.as_deref());
             drop(kb);
             let overlay_refreshed = checkout.is_some();
@@ -471,8 +505,29 @@ impl BlackboxServer {
         let write_result = tokio::task::spawn_blocking(move || {
             let mut p = p;
             let (write_dir, checkout) = server.prepare_knowledge_write(&mut p.project)?;
+            let superseded = match p.supersedes.as_deref() {
+                Some(old_ref) => {
+                    let existing = server.prepare_existing_knowledge_mutation(old_ref)?;
+                    if existing.carrier.as_deref() != write_dir.as_deref()
+                        || existing.checkout.as_ref().map(|scope| &scope.checkout_id)
+                            != checkout.as_ref().map(|scope| &scope.checkout_id)
+                    {
+                        anyhow::bail!(
+                            "a superseding decision and its predecessor must use the same checkout authority"
+                        );
+                    }
+                    p.supersedes = Some(existing.id);
+                    existing.seed
+                }
+                None => None,
+            };
             let mut kb = server.state.kb.write();
-            let result = kb.decide_result_with_write_dir(&p, false, write_dir.as_deref())?;
+            let result = kb.decide_result_with_checkout(
+                &p,
+                false,
+                write_dir.as_deref(),
+                superseded.as_ref(),
+            )?;
             let rider = kb.repo_record_rider_at(&result.id, write_dir.as_deref());
             drop(kb);
             let overlay_refreshed = checkout.is_some();
@@ -687,21 +742,32 @@ impl BlackboxServer {
         let start = std::time::Instant::now();
         let server = self.clone();
         let write_result = tokio::task::spawn_blocking(move || {
-            let edge = server.state.kb.write().append_link(&p)?;
-            Ok::<_, anyhow::Error>(serde_json::to_string_pretty(&json!({
-                "status": "linked",
-                "source": p.source,
-                "target": p.target,
-                "kind": edge.kind.edge_kind(),
-                "confidence": edge.confidence,
-            }))?)
+            let mut p = p;
+            let target = server.prepare_existing_knowledge_mutation(&p.source)?;
+            p.source = format!("knowledge:{}", target.id);
+            let edge = server.state.kb.write().append_link_with_write_dir(
+                &p,
+                target.carrier.as_deref(),
+                target.seed.as_ref(),
+            )?;
+            server.finish_existing_knowledge_mutation(target.checkout.as_ref());
+            Ok::<_, anyhow::Error>((
+                serde_json::to_string_pretty(&json!({
+                    "status": "linked",
+                    "source": p.source,
+                    "target": p.target,
+                    "kind": edge.kind.edge_kind(),
+                    "confidence": edge.confidence,
+                }))?,
+                target.checkout.is_some(),
+            ))
         })
         .await
         .map_err(|e| anyhow::anyhow!("knowledge link task failed: {e}"))
         .and_then(std::convert::identity);
 
         match write_result {
-            Ok(text) => {
+            Ok((text, _provisional)) => {
                 if let Err(e) = self.state.kb_persister.request_durable().await {
                     log_tool_err("bbox_knowledge_link", start, &e);
                     return Self::err_text(&format!("Error: {e:#}"));
@@ -722,20 +788,30 @@ impl BlackboxServer {
         Parameters(p): Parameters<ForgetParams>,
     ) -> CallToolResult {
         let start = std::time::Instant::now();
-        let id = p.id.clone();
         let server = self.clone();
-        let write_result = tokio::task::spawn_blocking(move || server.state.kb.write().forget(&p))
-            .await
-            .map_err(|e| anyhow::anyhow!("knowledge forget task failed: {e}"))
-            .and_then(std::convert::identity);
+        let write_result = tokio::task::spawn_blocking(move || {
+            let mut p = p;
+            let target = server.prepare_existing_knowledge_mutation(&p.id)?;
+            p.id = target.id.clone();
+            let message = server.state.kb.write().forget_with_write_dir(
+                &p,
+                target.carrier.as_deref(),
+                target.seed.as_ref(),
+            )?;
+            server.finish_existing_knowledge_mutation(target.checkout.as_ref());
+            Ok::<_, anyhow::Error>((message, target.id, target.checkout.is_some()))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("knowledge forget task failed: {e}"))
+        .and_then(std::convert::identity);
 
         match write_result {
-            Ok(message) => {
+            Ok((message, id, provisional)) => {
                 if let Err(e) = self.state.kb_persister.request_durable().await {
                     log_tool_err("bbox_forget", start, &e);
                     return Self::err_text(&format!("Error: {e:#}"));
                 }
-                if let Err(err) = self.tombstone_knowledge_entry_in_index(&id) {
+                if !provisional && let Err(err) = self.tombstone_knowledge_entry_in_index(&id) {
                     tracing::warn!(error = %err, entry = %id, "knowledge index tombstone failed; will reconstruct on next reindex cycle");
                 }
                 log_tool_ok("bbox_forget", start, message.len());

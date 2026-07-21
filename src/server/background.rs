@@ -23,7 +23,7 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     spawn_runtime_metrics_sampler();
     spawn_task_completed_router(shared.clone());
     spawn_system_event_signal_bridge(shared.clone());
-    run_knowledge_lifecycle_pass(shared.clone()).await;
+    run_knowledge_lifecycle_pass(shared.clone(), true).await;
     start_bbox_watcher(&shared);
     spawn_knowledge_lifecycle_reconciler(shared.clone());
     restore_runtime_state(&shared).await;
@@ -35,17 +35,22 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     Ok(())
 }
 
-async fn run_knowledge_lifecycle_pass(shared: Arc<SharedState>) {
+async fn run_knowledge_lifecycle_pass(shared: Arc<SharedState>, recover_pending: bool) {
     let result = tokio::task::spawn_blocking(move || {
         let server = crate::server::BlackboxServer::new(shared);
+        let recovered = recover_pending.then(|| server.recover_dark_knowledge_transactions());
         (
+            recovered,
             server.run_knowledge_schema_epoch_inventory(),
             server.reconcile_dark_knowledge_checkouts(),
         )
     })
     .await;
     match result {
-        Ok((inventory, reconciliation)) => {
+        Ok((recovered, inventory, reconciliation)) => {
+            if let Some(recovered) = recovered {
+                tracing::info!(recovered, "knowledge transaction recovery completed");
+            }
             match inventory {
                 Ok(inventory) => tracing::info!(
                     resolved = inventory.inventory.resolved.len(),
@@ -84,7 +89,7 @@ fn spawn_knowledge_lifecycle_reconciler(shared: Arc<SharedState>) {
         let interval = std::time::Duration::from_secs(interval_secs);
         loop {
             tokio::time::sleep(interval).await;
-            run_knowledge_lifecycle_pass(shared.clone()).await;
+            run_knowledge_lifecycle_pass(shared.clone(), false).await;
         }
     });
 }

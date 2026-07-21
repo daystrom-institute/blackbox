@@ -9,7 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -580,6 +580,24 @@ pub fn run_closeout_phases(req: &CloseoutRequest) -> CloseoutOutcome {
     }
     results.push(preflight);
 
+    // Knowledge writes and closeout contend on the same per-checkout claim.
+    // Holding this guard prevents a new canonical mutation from starting
+    // while stage/rebase/candidate verification is in flight.
+    let _knowledge_claim = match KnowledgeCloseoutClaim::acquire(req) {
+        Ok(claim) => claim,
+        Err(err) => {
+            return CloseoutOutcome::Failed(PhaseResult {
+                phase: CloseoutPhase::Preflight,
+                repo_cwd: req.worktree.clone(),
+                ok: false,
+                error_class: CloseoutErrorClass::Other,
+                content: json!({
+                    "error": format!("claiming checkout for knowledge-safe closeout failed: {err:#}"),
+                }),
+            });
+        }
+    };
+
     // Phase 2: stage/commit (publish only).
     if req.disposition == "publish" {
         let stage = phase_stage_commit(req);
@@ -609,6 +627,16 @@ pub fn run_closeout_phases(req: &CloseoutRequest) -> CloseoutOutcome {
             return CloseoutOutcome::Failed(ff_merge);
         }
         results.push(ff_merge);
+
+        // Repo-owned knowledge files may have been written by several tool
+        // calls, but each completed transaction records the exact terminal
+        // blobs expected in the candidate commit. Prove those blobs are in the
+        // locally folded target before any push or worktree removal.
+        match verify_knowledge_transaction_closeout(req) {
+            HookRun::Blocked(p) => return CloseoutOutcome::Failed(p),
+            HookRun::Ran(p) => results.push(p),
+            HookRun::None => {}
+        }
 
         if base_diverged {
             // The LOCAL fold is complete. Pushing a diverged branch cannot
@@ -691,6 +719,257 @@ pub fn run_closeout_phases(req: &CloseoutRequest) -> CloseoutOutcome {
     }
 
     CloseoutOutcome::Success { phases: results }
+}
+
+#[derive(Debug, Deserialize)]
+struct CloseoutKnowledgeManifest {
+    version: u32,
+    kind: String,
+    transaction_id: String,
+    created_at: String,
+    files: Vec<CloseoutKnowledgeFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloseoutKnowledgeFile {
+    relative_path: String,
+    #[serde(default)]
+    new_ref: Option<String>,
+    #[serde(default)]
+    new_sha256: Option<String>,
+}
+
+struct KnowledgeCloseoutClaim {
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+impl KnowledgeCloseoutClaim {
+    fn acquire(req: &CloseoutRequest) -> anyhow::Result<Option<Self>> {
+        if req.disposition == "discard" {
+            return Ok(None);
+        }
+        let local = req.worktree.join(".bbox/local");
+        let root = local.join("knowledge-transactions");
+        if !local.join("checkout-id").is_file() && !root.exists() {
+            return Ok(None);
+        }
+        std::fs::create_dir_all(&root)?;
+        let path = root.join("pending.json");
+        let transaction_id = format!(
+            "closeout-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        );
+        let bytes = serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "transaction_id": transaction_id,
+            "state": "closeout",
+        }))?;
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::File::open(&root)?.sync_all()?;
+        Ok(Some(Self { path, bytes }))
+    }
+}
+
+impl Drop for KnowledgeCloseoutClaim {
+    fn drop(&mut self) {
+        if std::fs::read(&self.path).ok().as_deref() == Some(self.bytes.as_slice()) {
+            let _ = std::fs::remove_file(&self.path);
+            if let Some(parent) = self.path.parent() {
+                let _ = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
+            }
+        }
+    }
+}
+
+/// Prove that the candidate target contains the terminal state named by every
+/// completed checkout-local knowledge transaction. Later transactions win for
+/// a path, matching the order in which their canonical writes completed.
+fn verify_knowledge_transaction_closeout(req: &CloseoutRequest) -> HookRun {
+    let completed = req
+        .worktree
+        .join(".bbox/local/knowledge-transactions/completed");
+    if !completed.is_dir() {
+        return HookRun::None;
+    }
+    let entries = match std::fs::read_dir(&completed) {
+        Ok(entries) => entries,
+        Err(err) => {
+            return knowledge_closeout_blocked(
+                req,
+                format!(
+                    "reading completed knowledge transactions at {} failed: {err}",
+                    completed.display()
+                ),
+            );
+        }
+    };
+    let mut manifests = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                return knowledge_closeout_blocked(
+                    req,
+                    format!("reading a completed knowledge transaction entry failed: {err}"),
+                );
+            }
+        };
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return knowledge_closeout_blocked(
+                    req,
+                    format!("reading {} failed: {err}", path.display()),
+                );
+            }
+        };
+        let manifest: CloseoutKnowledgeManifest = match serde_json::from_slice(&bytes) {
+            Ok(manifest) => manifest,
+            Err(err) => {
+                return knowledge_closeout_blocked(
+                    req,
+                    format!("parsing {} failed: {err}", path.display()),
+                );
+            }
+        };
+        if manifest.version != 1
+            || manifest.kind != "knowledge_transaction_v1"
+            || manifest.transaction_id.trim().is_empty()
+        {
+            return knowledge_closeout_blocked(
+                req,
+                format!(
+                    "{} has an invalid knowledge transaction identity",
+                    path.display()
+                ),
+            );
+        }
+        manifests.push(manifest);
+    }
+    if manifests.is_empty() {
+        return HookRun::None;
+    }
+    manifests.sort_by(|left, right| {
+        (&left.created_at, &left.transaction_id).cmp(&(&right.created_at, &right.transaction_id))
+    });
+
+    let manifest_count = manifests.len();
+    let mut expected = BTreeMap::<String, Option<String>>::new();
+    for manifest in manifests {
+        for file in manifest.files {
+            if file.relative_path.is_empty()
+                || !is_safe_pathspec(&file.relative_path)
+                || file.new_ref.is_some() != file.new_sha256.is_some()
+            {
+                return knowledge_closeout_blocked(
+                    req,
+                    format!(
+                        "transaction {} has invalid terminal metadata for {}",
+                        manifest.transaction_id, file.relative_path
+                    ),
+                );
+            }
+            expected.insert(file.relative_path, file.new_sha256);
+        }
+    }
+
+    for (relative_path, expected_sha) in &expected {
+        let spec = format!("{}:{relative_path}", req.target);
+        let actual = match git_blob(&req.base_repo, &spec) {
+            Ok(actual) => actual,
+            Err(err) => {
+                return knowledge_closeout_blocked(
+                    req,
+                    format!("reading candidate blob {spec} failed: {err:#}"),
+                );
+            }
+        };
+        match (expected_sha, actual) {
+            (Some(expected_sha), Some(actual))
+                if crate::slice_core::sha256_hex(&actual) == *expected_sha => {}
+            (None, None) => {}
+            (Some(expected_sha), Some(actual)) => {
+                return knowledge_closeout_blocked(
+                    req,
+                    format!(
+                        "candidate blob {relative_path} has sha256 {}, expected {expected_sha}",
+                        crate::slice_core::sha256_hex(&actual)
+                    ),
+                );
+            }
+            (Some(_), None) => {
+                return knowledge_closeout_blocked(
+                    req,
+                    format!("candidate commit is missing {relative_path}"),
+                );
+            }
+            (None, Some(_)) => {
+                return knowledge_closeout_blocked(
+                    req,
+                    format!("candidate commit still contains deleted path {relative_path}"),
+                );
+            }
+        }
+    }
+
+    HookRun::Ran(PhaseResult {
+        phase: CloseoutPhase::Hook,
+        repo_cwd: req.base_repo.clone(),
+        ok: true,
+        error_class: CloseoutErrorClass::None,
+        content: json!({
+            "event": "knowledge_transaction_completeness",
+            "manifests": manifest_count,
+            "terminal_paths": expected.len(),
+        }),
+    })
+}
+
+fn knowledge_closeout_blocked(req: &CloseoutRequest, detail: String) -> HookRun {
+    HookRun::Blocked(PhaseResult {
+        phase: CloseoutPhase::Hook,
+        repo_cwd: req.base_repo.clone(),
+        ok: false,
+        error_class: CloseoutErrorClass::HookBlocked,
+        content: json!({
+            "event": "knowledge_transaction_completeness",
+            "error": format!("knowledge transaction closeout proof failed: {detail}"),
+        }),
+    })
+}
+
+// closeout/worktree git runs on the blocking pool via /control/closeout.
+#[allow(clippy::disallowed_methods)]
+fn git_blob(cwd: &Path, spec: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    let exists = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["cat-file", "-e", spec])
+        .output()?;
+    if !exists.status.success() {
+        return Ok(None);
+    }
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["show", spec])
+        .output()?;
+    if out.status.success() {
+        Ok(Some(out.stdout))
+    } else {
+        anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim())
+    }
 }
 
 /// Run the `closeout_hooks` scriptlets bound to `event`, in order, if any.
@@ -951,6 +1230,24 @@ fn phase_preflight(req: &CloseoutRequest) -> PhaseResult {
     let base_repo = &req.base_repo;
     let target = &req.target;
     let branch = &req.branch;
+
+    if req.disposition != "discard" {
+        let pending = worktree.join(".bbox/local/knowledge-transactions/pending.json");
+        if pending.is_file() {
+            return PhaseResult {
+                phase: CloseoutPhase::Preflight,
+                repo_cwd: worktree.clone(),
+                ok: false,
+                error_class: CloseoutErrorClass::Other,
+                content: json!({
+                    "error": format!(
+                        "closeout found a pending knowledge transaction at {}; restart recovery before folding this worktree",
+                        pending.display()
+                    ),
+                }),
+            };
+        }
+    }
 
     match req.disposition.as_str() {
         "discard" => PhaseResult {
@@ -3717,6 +4014,158 @@ mod tests {
         run_git(&cwd, &["add", "README.md"]);
         run_git(&cwd, &["commit", "-m", "worktree commit"]);
         (repo, origin, value, cwd, branch)
+    }
+
+    fn install_knowledge_closeout_fixture(cwd: &Path, expected_sha: Option<&str>) {
+        let knowledge_dir = cwd.join(".bbox/knowledge");
+        let local_dir = cwd.join(".bbox/local");
+        std::fs::create_dir_all(&knowledge_dir).unwrap();
+        std::fs::create_dir_all(&local_dir).unwrap();
+        let knowledge_bytes = b"{\"id\":\"decision-one\"}\n";
+        std::fs::write(knowledge_dir.join("decision-one.json"), knowledge_bytes).unwrap();
+        std::fs::write(local_dir.join(".gitignore"), "*\n!.gitignore\n").unwrap();
+        run_git(
+            cwd,
+            &[
+                "add",
+                ".bbox/knowledge/decision-one.json",
+                ".bbox/local/.gitignore",
+            ],
+        );
+        run_git(cwd, &["commit", "-m", "record decision"]);
+
+        let completed = local_dir.join("knowledge-transactions/completed");
+        std::fs::create_dir_all(&completed).unwrap();
+        let expected_sha = expected_sha
+            .map(str::to_string)
+            .unwrap_or_else(|| crate::slice_core::sha256_hex(knowledge_bytes));
+        let manifest = json!({
+            "version": 1,
+            "kind": "knowledge_transaction_v1",
+            "transaction_id": "fixture-transaction",
+            "created_at": "2026-07-21T12:00:00Z",
+            "files": [{
+                "relative_path": ".bbox/knowledge/decision-one.json",
+                "new_ref": "new/0",
+                "new_sha256": expected_sha,
+            }],
+        });
+        std::fs::write(
+            completed.join("fixture-transaction.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn closeout_proves_completed_knowledge_transaction_blobs() {
+        let (repo, _origin, value, cwd, branch) = seed_foldable_worktree().await;
+        install_knowledge_closeout_fixture(&cwd, None);
+        let req = CloseoutRequest {
+            worktree: cwd.clone(),
+            base_repo: repo.path().canonicalize().unwrap(),
+            branch,
+            target: "main".to_string(),
+            disposition: "adopt".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+            dry_run: false,
+            closeout_hooks: None,
+        };
+        let phases = match run_closeout_phases(&req) {
+            CloseoutOutcome::Success { phases } => phases,
+            CloseoutOutcome::Failed(p) => panic!("closeout failed: {:?}", p.content),
+        };
+        let proof = phases
+            .iter()
+            .find(|phase| {
+                phase.content.get("event").and_then(Value::as_str)
+                    == Some("knowledge_transaction_completeness")
+            })
+            .expect("knowledge transaction proof phase");
+        assert_eq!(proof.content["manifests"], json!(1));
+        assert_eq!(proof.content["terminal_paths"], json!(1));
+        assert!(!cwd.exists(), "successful closeout removes the worktree");
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
+    }
+
+    #[tokio::test]
+    async fn closeout_blocks_when_candidate_misses_transaction_terminal_blob() {
+        let (repo, origin, value, cwd, branch) = seed_foldable_worktree().await;
+        install_knowledge_closeout_fixture(&cwd, Some(&"0".repeat(64)));
+        let origin_before = git_capture(origin.path(), &["rev-parse", "main"]).unwrap();
+        let req = CloseoutRequest {
+            worktree: cwd.clone(),
+            base_repo: repo.path().canonicalize().unwrap(),
+            branch,
+            target: "main".to_string(),
+            disposition: "adopt".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+            dry_run: false,
+            closeout_hooks: None,
+        };
+        match run_closeout_phases(&req) {
+            CloseoutOutcome::Failed(phase) => {
+                assert_eq!(phase.phase, CloseoutPhase::Hook);
+                assert_eq!(phase.error_class, CloseoutErrorClass::HookBlocked);
+                assert!(
+                    phase.content["error"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("expected"))
+                );
+            }
+            CloseoutOutcome::Success { .. } => panic!("mismatched terminal blob must block"),
+        }
+        assert_eq!(
+            git_capture(origin.path(), &["rev-parse", "main"]).unwrap(),
+            origin_before,
+            "failed proof must block before push"
+        );
+        assert!(cwd.exists(), "failed proof preserves the worktree");
+        run_git(
+            repo.path(),
+            &["worktree", "remove", "--force", cwd.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
+    }
+
+    #[tokio::test]
+    async fn closeout_preflight_rejects_pending_knowledge_transaction() {
+        let (repo, _origin, value, cwd, branch) = seed_foldable_worktree().await;
+        let pending = cwd.join(".bbox/local/knowledge-transactions/pending.json");
+        std::fs::create_dir_all(pending.parent().unwrap()).unwrap();
+        std::fs::write(&pending, "{}\n").unwrap();
+        let req = CloseoutRequest {
+            worktree: cwd.clone(),
+            base_repo: repo.path().canonicalize().unwrap(),
+            branch,
+            target: "main".to_string(),
+            disposition: "adopt".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+            dry_run: false,
+            closeout_hooks: None,
+        };
+        match run_closeout_phases(&req) {
+            CloseoutOutcome::Failed(phase) => {
+                assert_eq!(phase.phase, CloseoutPhase::Preflight);
+                assert!(
+                    phase.content["error"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("pending knowledge transaction"))
+                );
+            }
+            CloseoutOutcome::Success { .. } => panic!("pending transaction must block closeout"),
+        }
+        run_git(
+            repo.path(),
+            &["worktree", "remove", "--force", cwd.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
     }
 
     fn hooks_for(event: &str, scripts: Vec<String>, on_fail: HookOnFail) -> CloseoutHooks {

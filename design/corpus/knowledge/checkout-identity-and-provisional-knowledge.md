@@ -15,9 +15,8 @@ brief: "Retire write_redirects, the host-local map that makes kb.json required t
 
 > **Status: partial.** The additive foundation, prerequisite repair, dark
 > overlay, session-authoritative committed view, promotion, and registry
-> lifecycle through slice 3.6 are landed on `beta/blackbox-v2`. Mutation
-> coverage, the merge gate, gap convergence, and the final path-fallback cut
-> remain.
+> lifecycle through slice 3.7 are landed on `beta/blackbox-v2`. The merge gate,
+> gap convergence, and the final path-fallback cut remain.
 > Anchors were re-verified against that branch after the
 > slice-3.2 checkpoint and this design was repaired against the live loader,
 > resolver, index, and entity-ref paths on 2026-07-20. Line cites rot, so grep
@@ -83,9 +82,17 @@ P/H/B overlay afterward. Session-authoritative `published|own|all` visibility
 now drives list, hybrid search, inspection, render, graph, inbox, discover
 seed, and logical-ref-scoped index replacement.
 
-Still not implemented: response-level `built_from` and the later mutation,
-merge-gate, gap-convergence, and path-fallback-cut slices. Section 6 is the
-authoritative remaining sequence.
+Mutation coverage and crash consistency are also landed. `forget`, `review`,
+`knowledge_link`, and both sides of a superseding `decide` resolve through the
+authoritative checkout. Repo-owned writes use an exclusive pending claim,
+staged old/new bytes, a recoverable manifest, loader/watcher exclusion, and
+startup roll-forward. Fleet closeout takes the same claim and proves every
+completed manifest's terminal blobs against the locally folded candidate tree
+before push.
+
+Still not implemented: response-level `built_from`, the merge-gate,
+gap-convergence, and path-fallback-cut slices. Section 6 is the authoritative
+remaining sequence.
 
 When this document and an additive primitive disagree, the contract here wins
 and the primitive is repaired before live wiring.
@@ -664,6 +671,13 @@ machinery, preserves local file-level read-your-writes but removes the current
 daemon-wide in-flight visibility used by multi-agent campaigns. Demoting to it
 is a deletion, not a redesign.
 
+**Landed implementation anchors (slice 3.7).** The transaction protocol lives
+in `bbox_knowledge::transaction`; checkout mutation seeding and restoration
+live beside `persist_repo_owned_mutation_at`; lifecycle startup owns stale
+pending recovery; and `bro_tools::fleet_worktree` owns the closeout claim plus
+candidate-blob proof. These are named anchors rather than line cites so this
+design survives mechanical movement during later decomposition.
+
 ## 5. What retires, and the gap-store twin (closes round 1, finding 11)
 
 Retires: `write_redirects`, its purge-exclusion, `repo_owned_carrier`'s
@@ -711,7 +725,7 @@ sequence begins with a repair gate:
    rows after registry loss, and dynamic watcher coverage rooted at
    `checkout_project_dir`. Complete the pure inventory runner, committed
    `.schema-epoch` markers, and local quarantine ledger.
-6. **Mutation coverage + crash-consistent writes.** Route all mutation verbs;
+6. **Mutation coverage + crash-consistent writes (landed).** Route all mutation verbs;
    in particular, a superseding `decide` applies the same checkout target to
    both the new and old entry. Add host-local staging + recoverable manifest +
    pending pointer for multi-file atomicity, with closeout proving same-commit
@@ -756,7 +770,7 @@ Each slice lands on the monolith and gets the full lane gate.
 
 ## 8. Open questions
 
-No open question blocks knowledge slices 3.3 through 3.6. Publisher ref,
+No open question blocks knowledge slices 3.3 through 3.7. Publisher ref,
 provisional identity, visibility policy, failure behavior, and `built_from`
 granularity are decided above. Remaining questions belong to later slices or a
 later locality rung:

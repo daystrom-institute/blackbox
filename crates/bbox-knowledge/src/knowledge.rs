@@ -800,6 +800,16 @@ fn project_is_repo_owned(project_dir: &Path) -> bool {
 fn load_repo_kb_entries(
     project_dir: &Path,
 ) -> Result<(Vec<KnowledgeEntry>, BTreeMap<String, EntryProvenance>)> {
+    if bbox_corpus_core::git::git_root_for_path(project_dir)
+        .as_deref()
+        .is_some_and(crate::transaction::has_pending_transaction)
+    {
+        tracing::debug!(
+            project = %project_dir.display(),
+            "kb load skipped checkout with pending knowledge transaction"
+        );
+        return Ok((Vec::new(), BTreeMap::new()));
+    }
     let dir = repo_kb_dir(project_dir);
     if !dir.exists() {
         return Ok((Vec::new(), BTreeMap::new()));
@@ -1081,7 +1091,64 @@ pub struct Knowledge {
     view_metadata: BTreeMap<String, KnowledgeViewMetadata>,
 }
 
+struct CheckoutMutationRestore {
+    id: String,
+    prior: Option<KnowledgeEntry>,
+}
+
 impl Knowledge {
+    fn install_checkout_mutation_seed(
+        &mut self,
+        id: &str,
+        seed: Option<&KnowledgeEntry>,
+        write_dir: Option<&str>,
+    ) -> Result<Option<CheckoutMutationRestore>> {
+        if write_dir.is_none() {
+            return Ok(None);
+        }
+        let seed = seed.with_context(|| {
+            format!("checkout-scoped knowledge mutation has no visible seed for {id}")
+        })?;
+        if seed.id != id {
+            anyhow::bail!(
+                "checkout mutation seed id mismatch: expected {id}, got {}",
+                seed.id
+            );
+        }
+        let prior =
+            if let Some(existing) = self.store.entries.iter_mut().find(|entry| entry.id == id) {
+                Some(std::mem::replace(existing, seed.clone()))
+            } else {
+                self.store.entries.push(seed.clone());
+                None
+            };
+        Ok(Some(CheckoutMutationRestore {
+            id: id.to_string(),
+            prior,
+        }))
+    }
+
+    fn restore_checkout_mutation_seed(&mut self, restore: Option<CheckoutMutationRestore>) {
+        let Some(restore) = restore else {
+            return;
+        };
+        match restore.prior {
+            Some(prior) => {
+                if let Some(entry) = self
+                    .store
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.id == restore.id)
+                {
+                    *entry = prior;
+                } else {
+                    self.store.entries.push(prior);
+                }
+            }
+            None => self.store.entries.retain(|entry| entry.id != restore.id),
+        }
+    }
+
     pub fn open(store_path: &Path) -> Result<Self> {
         let mut k = Self {
             store_path: store_path.to_path_buf(),
@@ -1184,7 +1251,45 @@ impl Knowledge {
                 "checkout knowledge carrier is unavailable at {write_dir}; refusing to retain provisional bytes centrally"
             );
         }
-        persist_repo_kb_entries(Path::new(write_dir), &entries, false)
+        let project_dir = Path::new(write_dir);
+        let checkout_dir =
+            bbox_corpus_core::git::git_root_for_path(project_dir).with_context(|| {
+                format!(
+                    "resolving checkout root for knowledge transaction at {}",
+                    project_dir.display()
+                )
+            })?;
+        let mut writes = Vec::new();
+        let mut stats = load_repo_kb_stats(project_dir);
+        for entry in entries {
+            if entry.recall_count > 0 || entry.last_recalled.is_some() {
+                stats.insert(
+                    entry.id.clone(),
+                    RecallStat {
+                        recall_count: entry.recall_count,
+                        last_recalled: entry.last_recalled.clone(),
+                    },
+                );
+            }
+            let mut on_disk = entry.clone();
+            on_disk.project = None;
+            on_disk.recall_count = 0;
+            on_disk.last_recalled = None;
+            let path = repo_kb_dir(project_dir).join(format!("{}.json", entry.id));
+            let new_bytes = bbox_corpus_core::json_store::to_vec_pretty_newline(&on_disk)?;
+            if fs::read(&path)
+                .map(|current| current == new_bytes)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            writes.push(crate::transaction::TransactionWrite {
+                target: path,
+                new_bytes: Some(new_bytes),
+            });
+        }
+        crate::transaction::apply_transaction(&checkout_dir, writes)?;
+        persist_repo_kb_stats(project_dir, &stats)
     }
 
     #[cfg(test)]
@@ -1420,6 +1525,24 @@ impl Knowledge {
     }
 
     pub fn append_link(&mut self, p: &KnowledgeLinkParams) -> Result<KnowledgeEdge> {
+        self.append_link_locked(p, None, None)
+    }
+
+    pub fn append_link_with_write_dir(
+        &mut self,
+        p: &KnowledgeLinkParams,
+        write_dir: Option<&str>,
+        checkout_entry: Option<&KnowledgeEntry>,
+    ) -> Result<KnowledgeEdge> {
+        self.append_link_locked(p, write_dir, checkout_entry)
+    }
+
+    fn append_link_locked(
+        &mut self,
+        p: &KnowledgeLinkParams,
+        write_dir: Option<&str>,
+        checkout_entry: Option<&KnowledgeEntry>,
+    ) -> Result<KnowledgeEdge> {
         let source_id = match EntityRef::parse(&p.source) {
             Ok(EntityRef::Knowledge { id }) => id,
             Ok(other) => anyhow::bail!("source must be a knowledge ref, got {other}"),
@@ -1439,6 +1562,7 @@ impl Knowledge {
             source_arc: p.source_arc.clone(),
             confidence,
         };
+        let restore = self.install_checkout_mutation_seed(&source_id, checkout_entry, write_dir)?;
         let now = Self::now_iso();
         let entry = self
             .store
@@ -1454,7 +1578,11 @@ impl Knowledge {
         if !duplicate {
             entry.links.push(edge.clone());
             entry.updated_at = now;
-            self.persist_repo_owned_entries()?;
+            let persisted = self.persist_repo_owned_mutation_at(&[&source_id], write_dir);
+            self.restore_checkout_mutation_seed(restore);
+            persisted?;
+        } else {
+            self.restore_checkout_mutation_seed(restore);
         }
         Ok(edge)
     }
@@ -1480,7 +1608,7 @@ impl Knowledge {
     // ── CRUD ───────────────────────────────────────────────────────
 
     pub fn learn_result(&mut self, p: &LearnParams, from_agent: bool) -> Result<LearnWriteResult> {
-        self.learn_result_locked(p, from_agent, None)
+        self.learn_result_locked(p, from_agent, None, None)
     }
 
     /// `learn_result` with an explicit checkout carrier. The entry keeps
@@ -1493,7 +1621,19 @@ impl Knowledge {
         from_agent: bool,
         write_dir: Option<&str>,
     ) -> Result<LearnWriteResult> {
-        self.learn_result_locked(p, from_agent, write_dir)
+        self.learn_result_locked(p, from_agent, write_dir, None)
+    }
+
+    /// Checkout-scoped learn/create-or-update with the visible generation of
+    /// an explicitly addressed existing entry.
+    pub fn learn_result_with_checkout(
+        &mut self,
+        p: &LearnParams,
+        from_agent: bool,
+        write_dir: Option<&str>,
+        checkout_entry: Option<&KnowledgeEntry>,
+    ) -> Result<LearnWriteResult> {
+        self.learn_result_locked(p, from_agent, write_dir, checkout_entry)
     }
 
     /// Commit-this rider for a just-written entry, when it persisted into a
@@ -1527,6 +1667,7 @@ impl Knowledge {
         p: &LearnParams,
         from_agent: bool,
         write_dir: Option<&str>,
+        checkout_entry: Option<&KnowledgeEntry>,
     ) -> Result<LearnWriteResult> {
         let category = Category::from_str(&p.category)
             .map_err(|_| anyhow::anyhow!("invalid category: {}", p.category))?;
@@ -1548,6 +1689,10 @@ impl Knowledge {
         } else {
             Approval::UserConfirmed
         };
+        let update_restore = match p.id.as_deref() {
+            Some(id) => self.install_checkout_mutation_seed(id, checkout_entry, write_dir)?,
+            None => None,
+        };
 
         // Update existing entry if id given and found. Snapshot the pre-mutation
         // state so we can render a one-line diff of changed fields in the return
@@ -1555,7 +1700,6 @@ impl Knowledge {
         // wrong entry. Unchanged fields are omitted from the summary.
         if let Some(id) = p.id.as_deref() {
             if let Some(entry) = self.store.entries.iter_mut().find(|e| e.id == id) {
-                let prior_entry = entry.clone();
                 let old_title = entry.title.clone();
                 let old_content = entry.content.clone();
                 let old_content_len = entry.content.len();
@@ -1649,11 +1793,7 @@ impl Knowledge {
                 }
 
                 let persisted = self.persist_repo_owned_mutation_at(&[id], write_dir);
-                if write_dir.is_some()
-                    && let Some(entry) = self.store.entries.iter_mut().find(|e| e.id == id)
-                {
-                    *entry = prior_entry;
-                }
+                self.restore_checkout_mutation_seed(update_restore);
                 persisted?;
                 let summary = if changes.is_empty() {
                     "no-op (all fields unchanged)".to_string()
@@ -1671,6 +1811,8 @@ impl Knowledge {
                 });
             }
         }
+
+        self.restore_checkout_mutation_seed(update_restore);
 
         let id = Self::gen_id();
         let entry = KnowledgeEntry {
@@ -1838,7 +1980,7 @@ impl Knowledge {
         p: &DecideParams,
         from_agent: bool,
     ) -> Result<KnowledgeWriteResult> {
-        self.decide_result_locked(p, from_agent, None)
+        self.decide_result_locked(p, from_agent, None, None)
     }
 
     /// `decide_result` with an explicit checkout carrier (see
@@ -1849,7 +1991,19 @@ impl Knowledge {
         from_agent: bool,
         write_dir: Option<&str>,
     ) -> Result<KnowledgeWriteResult> {
-        self.decide_result_locked(p, from_agent, write_dir)
+        self.decide_result_locked(p, from_agent, write_dir, None)
+    }
+
+    /// Checkout-scoped decision write with the visible generation of the
+    /// superseded entry. Both files are persisted by one knowledge transaction.
+    pub fn decide_result_with_checkout(
+        &mut self,
+        p: &DecideParams,
+        from_agent: bool,
+        write_dir: Option<&str>,
+        superseded_entry: Option<&KnowledgeEntry>,
+    ) -> Result<KnowledgeWriteResult> {
+        self.decide_result_locked(p, from_agent, write_dir, superseded_entry)
     }
 
     fn decide_result_locked(
@@ -1857,6 +2011,7 @@ impl Knowledge {
         p: &DecideParams,
         from_agent: bool,
         write_dir: Option<&str>,
+        superseded_entry: Option<&KnowledgeEntry>,
     ) -> Result<KnowledgeWriteResult> {
         if p.content.trim().is_empty() {
             anyhow::bail!("'content' is required");
@@ -1872,22 +2027,24 @@ impl Knowledge {
         let priority = Priority::parse_optional(p.priority.as_deref())?;
         let render_flag = p.render.unwrap_or(true);
 
-        // Validate supersedes target exists before we create anything.
+        let superseded_restore = match p.supersedes.as_deref() {
+            Some(old_id) => {
+                self.install_checkout_mutation_seed(old_id, superseded_entry, write_dir)?
+            }
+            None => None,
+        };
+
+        // Validate the checkout-visible supersedes target before creating the
+        // new decision. Restore the published generation on every exit path.
         if let Some(old_id) = p.supersedes.as_deref() {
             if !self.store.entries.iter().any(|e| e.id == old_id) {
+                self.restore_checkout_mutation_seed(superseded_restore);
                 anyhow::bail!("Supersedes target not found: {old_id}");
             }
         }
 
         let now = Self::now_iso();
         let id = Self::gen_id();
-        let superseded_before = p.supersedes.as_deref().and_then(|old_id| {
-            self.store
-                .entries
-                .iter()
-                .find(|entry| entry.id == old_id)
-                .cloned()
-        });
 
         self.store.entries.push(KnowledgeEntry {
             id: id.clone(),
@@ -1941,16 +2098,8 @@ impl Knowledge {
         let persisted = self.persist_repo_owned_mutation_at(&changed_ids, write_dir);
         if write_dir.is_some() {
             self.store.entries.retain(|entry| entry.id != id);
-            if let Some(prior) = superseded_before
-                && let Some(entry) = self
-                    .store
-                    .entries
-                    .iter_mut()
-                    .find(|entry| entry.id == prior.id)
-            {
-                *entry = prior;
-            }
         }
+        self.restore_checkout_mutation_seed(superseded_restore);
         persisted?;
         let message = if let Some(old_id) = p.supersedes.as_deref() {
             format!("Decided entry {id} (supersedes {old_id})")
@@ -1970,7 +2119,26 @@ impl Knowledge {
     }
 
     pub fn forget(&mut self, p: &ForgetParams) -> Result<String> {
+        self.forget_locked(p, None, None)
+    }
+
+    pub fn forget_with_write_dir(
+        &mut self,
+        p: &ForgetParams,
+        write_dir: Option<&str>,
+        checkout_entry: Option<&KnowledgeEntry>,
+    ) -> Result<String> {
+        self.forget_locked(p, write_dir, checkout_entry)
+    }
+
+    fn forget_locked(
+        &mut self,
+        p: &ForgetParams,
+        write_dir: Option<&str>,
+        checkout_entry: Option<&KnowledgeEntry>,
+    ) -> Result<String> {
         let id = &p.id;
+        let restore = self.install_checkout_mutation_seed(id, checkout_entry, write_dir)?;
 
         if let Some(entry) = self.store.entries.iter_mut().find(|e| &e.id == id) {
             if let Some(by) = p.superseded_by.as_deref() {
@@ -1980,9 +2148,12 @@ impl Knowledge {
                 entry.status = Status::Deleted;
             }
             entry.updated_at = Self::now_iso();
-            self.persist_repo_owned_entries()?;
+            let persisted = self.persist_repo_owned_mutation_at(&[id], write_dir);
+            self.restore_checkout_mutation_seed(restore);
+            persisted?;
             Ok(format!("Removed entry {id}"))
         } else {
+            self.restore_checkout_mutation_seed(restore);
             Ok(format!("Entry {id} not found"))
         }
     }
@@ -2639,10 +2810,24 @@ impl Knowledge {
     // ── Review ─────────────────────────────────────────────────────
 
     pub fn review(&mut self, p: &ReviewParams) -> Result<String> {
-        self.review_locked(p)
+        self.review_locked(p, None, None)
     }
 
-    fn review_locked(&mut self, p: &ReviewParams) -> Result<String> {
+    pub fn review_with_write_dir(
+        &mut self,
+        p: &ReviewParams,
+        write_dir: Option<&str>,
+        checkout_entry: Option<&KnowledgeEntry>,
+    ) -> Result<String> {
+        self.review_locked(p, write_dir, checkout_entry)
+    }
+
+    fn review_locked(
+        &mut self,
+        p: &ReviewParams,
+        write_dir: Option<&str>,
+        checkout_entry: Option<&KnowledgeEntry>,
+    ) -> Result<String> {
         let action = p.action.as_deref().unwrap_or("list");
         let id = p.id.as_deref();
 
@@ -2681,23 +2866,31 @@ impl Knowledge {
             }
             "approve" => {
                 let id = id.context("'id' required for approve")?;
+                let restore = self.install_checkout_mutation_seed(id, checkout_entry, write_dir)?;
                 if let Some(entry) = self.store.entries.iter_mut().find(|e| e.id == id) {
                     entry.approval = Approval::UserConfirmed;
                     entry.updated_at = Self::now_iso();
-                    self.persist_repo_owned_entries()?;
+                    let persisted = self.persist_repo_owned_mutation_at(&[id], write_dir);
+                    self.restore_checkout_mutation_seed(restore);
+                    persisted?;
                     Ok(format!("Approved entry {}", id))
                 } else {
+                    self.restore_checkout_mutation_seed(restore);
                     Ok(format!("Entry {} not found", id))
                 }
             }
             "reject" => {
                 let id = id.context("'id' required for reject")?;
+                let restore = self.install_checkout_mutation_seed(id, checkout_entry, write_dir)?;
                 if let Some(entry) = self.store.entries.iter_mut().find(|e| e.id == id) {
                     entry.status = Status::Deleted;
                     entry.updated_at = Self::now_iso();
-                    self.persist_repo_owned_entries()?;
+                    let persisted = self.persist_repo_owned_mutation_at(&[id], write_dir);
+                    self.restore_checkout_mutation_seed(restore);
+                    persisted?;
                     Ok(format!("Rejected entry {}", id))
                 } else {
+                    self.restore_checkout_mutation_seed(restore);
                     Ok(format!("Entry {} not found", id))
                 }
             }
@@ -4097,6 +4290,235 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
     }
 
     #[test]
+    fn checkout_supersession_persists_both_decisions_in_one_transaction() {
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        git_init_commit(&root);
+        std::fs::create_dir_all(repo_kb_dir(&root)).unwrap();
+        let project = root.to_string_lossy().into_owned();
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        kb.set_project_roots(vec![root.clone()]).unwrap();
+
+        let first = kb
+            .decide_result_with_write_dir(
+                &DecideParams {
+                    content: "use the first storage engine".into(),
+                    rationale: "it is already deployed".into(),
+                    supersedes: None,
+                    title: None,
+                    scope: Some("project".into()),
+                    project: Some(project.clone()),
+                    priority: None,
+                    render: None,
+                },
+                false,
+                Some(&project),
+            )
+            .unwrap();
+        kb.reload().unwrap();
+        let old_seed = kb.entry(&first.id).unwrap().clone();
+
+        let second = kb
+            .decide_result_with_checkout(
+                &DecideParams {
+                    content: "use the replacement storage engine".into(),
+                    rationale: "it supports the required concurrency".into(),
+                    supersedes: Some(first.id.clone()),
+                    title: None,
+                    scope: Some("project".into()),
+                    project: Some(project.clone()),
+                    priority: None,
+                    render: None,
+                },
+                false,
+                Some(&project),
+                Some(&old_seed),
+            )
+            .unwrap();
+
+        let old_on_disk: KnowledgeEntry = serde_json::from_slice(
+            &std::fs::read(repo_kb_dir(&root).join(format!("{}.json", first.id))).unwrap(),
+        )
+        .unwrap();
+        let new_on_disk: KnowledgeEntry = serde_json::from_slice(
+            &std::fs::read(repo_kb_dir(&root).join(format!("{}.json", second.id))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(old_on_disk.status, Status::Superseded);
+        assert_eq!(old_on_disk.supersedes.as_deref(), Some(second.id.as_str()));
+        assert_eq!(new_on_disk.status, Status::Active);
+        assert!(
+            kb.entry(&first.id)
+                .is_some_and(|entry| entry.status == Status::Active),
+            "checkout mutation must restore the published in-memory generation"
+        );
+        assert!(kb.entry(&second.id).is_none());
+
+        let completed = root.join(".bbox/local/knowledge-transactions/completed");
+        let manifests = std::fs::read_dir(completed)
+            .unwrap()
+            .map(|entry| {
+                let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+                serde_json::from_slice::<crate::transaction::KnowledgeTransactionManifest>(&bytes)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            manifests.iter().any(|manifest| manifest.files.len() == 2),
+            "supersession must record one terminal manifest for both files"
+        );
+    }
+
+    #[test]
+    fn checkout_mutations_accumulate_without_touching_published_carrier() {
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let worktrees = tempfile::tempdir().unwrap();
+        let base = repo.path().canonicalize().unwrap();
+        git_init_commit(&base);
+        let id = "checkout-mutation";
+        let mut published = KnowledgeEntry {
+            id: id.into(),
+            title: "checkout mutation".into(),
+            content: "mutate only the checkout generation".into(),
+            cluster: None,
+            variants: HashMap::new(),
+            category: Category::Convention,
+            scope: Scope::Project,
+            project: None,
+            providers: Vec::new(),
+            priority: Priority::Standard,
+            weight: 100,
+            render: true,
+            decay: true,
+            review_at: None,
+            status: Status::Active,
+            approval: Approval::AgentInferred,
+            supersedes: None,
+            links: Vec::new(),
+            rationale: None,
+            expires_at: None,
+            source: "agent".into(),
+            created_at: "2026-07-21T00:00:00Z".into(),
+            updated_at: "2026-07-21T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        };
+        std::fs::create_dir_all(repo_kb_dir(&base)).unwrap();
+        std::fs::create_dir_all(base.join(".bbox/local")).unwrap();
+        std::fs::write(base.join(".bbox/local/.gitignore"), "*\n!.gitignore\n").unwrap();
+        std::fs::write(
+            repo_kb_dir(&base).join(format!("{id}.json")),
+            bbox_corpus_core::json_store::to_vec_pretty_newline(&published).unwrap(),
+        )
+        .unwrap();
+        git_run(&base, &["add", ".bbox"]);
+        git_run(&base, &["commit", "-q", "-m", "seed knowledge"]);
+        let checkout = worktrees.path().join("checkout");
+        git_run(
+            &base,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature/knowledge-mutation",
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let checkout = checkout.canonicalize().unwrap();
+        let checkout_path = checkout.to_string_lossy().into_owned();
+        let durable_project = base.to_string_lossy().into_owned();
+        published.project = Some(durable_project.clone());
+
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        kb.set_project_roots(vec![base.clone()]).unwrap();
+        let read_checkout_seed = || {
+            let mut entry: KnowledgeEntry = serde_json::from_slice(
+                &std::fs::read(repo_kb_dir(&checkout).join(format!("{id}.json"))).unwrap(),
+            )
+            .unwrap();
+            entry.project = Some(durable_project.clone());
+            entry
+        };
+        kb.learn_result_with_checkout(
+            &LearnParams {
+                content: "updated only in the checkout generation".into(),
+                category: "convention".into(),
+                format: None,
+                title: Some("checkout mutation updated".into()),
+                scope: Some("project".into()),
+                project: Some(durable_project.clone()),
+                providers: None,
+                priority: None,
+                weight: None,
+                expires_at: None,
+                cluster: None,
+                id: Some(id.into()),
+            },
+            false,
+            Some(&checkout_path),
+            Some(&published),
+        )
+        .unwrap();
+        let updated = read_checkout_seed();
+        assert_eq!(updated.content, "updated only in the checkout generation");
+        kb.append_link_with_write_dir(
+            &KnowledgeLinkParams {
+                source: format!("knowledge:{id}"),
+                target: "knowledge:related".into(),
+                kind: "related".into(),
+                note: None,
+                source_arc: None,
+                confidence: None,
+            },
+            Some(&checkout_path),
+            Some(&updated),
+        )
+        .unwrap();
+
+        let linked = read_checkout_seed();
+        assert_eq!(linked.links.len(), 1);
+        kb.review_with_write_dir(
+            &ReviewParams {
+                action: Some("approve".into()),
+                id: Some(id.into()),
+            },
+            Some(&checkout_path),
+            Some(&linked),
+        )
+        .unwrap();
+        let approved = read_checkout_seed();
+        assert_eq!(approved.approval, Approval::UserConfirmed);
+        kb.forget_with_write_dir(
+            &ForgetParams {
+                id: id.into(),
+                superseded_by: None,
+            },
+            Some(&checkout_path),
+            Some(&approved),
+        )
+        .unwrap();
+        let retired = read_checkout_seed();
+        assert_eq!(retired.status, Status::Deleted);
+        assert_eq!(retired.links.len(), 1);
+
+        let base_entry: KnowledgeEntry = serde_json::from_slice(
+            &std::fs::read(repo_kb_dir(&base).join(format!("{id}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(base_entry.status, Status::Active);
+        assert_eq!(base_entry.approval, Approval::AgentInferred);
+        assert!(base_entry.links.is_empty());
+        git_run(
+            &base,
+            &["worktree", "remove", "--force", checkout.to_str().unwrap()],
+        );
+    }
+
+    #[test]
     fn project_scope_entry_persists_to_repo_bbox_not_central() {
         // A project-scoped entry is owned by its repo: it lands in the repo's
         // .bbox/knowledge/ (not the central store), the committed file omits the
@@ -5291,6 +5713,27 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             kb.built_from().is_empty(),
             "a non-git root has no HEAD, so no built_from stamp"
         );
+    }
+
+    #[test]
+    fn loader_skips_checkout_with_pending_knowledge_transaction() {
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        git_init_commit(&root);
+        std::fs::create_dir_all(repo_kb_dir(&root)).unwrap();
+        std::fs::write(
+            repo_kb_dir(&root).join("pending-entry.json"),
+            entry_json("pending-entry", "must not be partially observed"),
+        )
+        .unwrap();
+        let pending = root.join(".bbox/local/knowledge-transactions/pending.json");
+        std::fs::create_dir_all(pending.parent().unwrap()).unwrap();
+        std::fs::write(&pending, "{}\n").unwrap();
+
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        kb.set_project_roots(vec![root]).unwrap();
+        assert!(kb.entry("pending-entry").is_none());
     }
 
     #[test]
