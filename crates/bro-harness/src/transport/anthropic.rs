@@ -71,6 +71,19 @@ impl AnthropicTransport {
         self.base_url.to_ascii_lowercase().contains("minimax")
     }
 
+    /// True when this transport points at Kimi's Anthropic-compatible endpoint
+    /// (`https://api.kimi.com/coding`). Kimi's compat layer accepts the
+    /// server-side web_search tool but streams degenerate blocks for it: a
+    /// `server_tool_use` with an empty `id` and a `web_search_tool_result`
+    /// with no `tool_use_id`, then rejects any replay of its own turn
+    /// with 400 "tool call id web_search:0 is not found", killing the session
+    /// at the first search. The tool is therefore never advertised to Kimi
+    /// (see [`Self::build_body`]); keyed off the dispatch base URL like
+    /// [`Self::is_minimax`].
+    fn is_kimi(&self) -> bool {
+        self.base_url.to_ascii_lowercase().contains("kimi")
+    }
+
     /// Build the Messages request body (pure; no I/O), so the wire shape —
     /// notably the system-block cache-control placement — is unit-testable.
     fn build_body(&self, tools: &[super::ToolSpec], opts: &TurnOpts) -> Value {
@@ -84,7 +97,7 @@ impl AnthropicTransport {
                 })
             })
             .collect();
-        if opts.web_search {
+        if opts.web_search && !self.is_kimi() {
             // Server-side; provider executes it and returns results inline.
             // The `input_schema` is redundant for Anthropic/GLM/DeepSeek (which
             // ignore it on a typed server tool) but REQUIRED by MiniMax, whose
@@ -416,7 +429,10 @@ fn parse_tool_input(block: &SseBlock) -> Result<Value> {
 /// `tool_result`/`web_search_tool_result` they produce) are preserved verbatim
 /// into `content` so the turn replays faithfully and a paused turn can be
 /// resumed — but they are NOT surfaced as client `tool_calls` (the server
-/// already executed them). A `thinking` block IS persisted into `content` (with
+/// already executed them). Degenerate server blocks (a `server_tool_use` with
+/// an empty id, a `*tool_result` referencing no tool call) are dropped rather
+/// than preserved: they cannot replay on any endpoint and Kimi's compat layer
+/// hard-rejects them. A `thinking` block IS persisted into `content` (with
 /// its `signature_delta` when the stream provided one) so a thinking-native
 /// model sees the prior turn's reasoning on a continuation; `thinking_out` is
 /// the same text surfaced separately for display.
@@ -459,7 +475,16 @@ fn reconstruct_segment(
                 });
             }
             "server_tool_use" => {
-                // Server-executed: preserve for replay, do not dispatch.
+                // Server-executed: preserve for replay, do not dispatch. A
+                // degenerate block with an empty id is unreplayable on every
+                // endpoint (no result block can ever reference it, and
+                // normalization would synthesize a tool_result with an empty
+                // tool_use_id for it), so it is dropped instead of stored.
+                // Kimi's compat layer emits exactly this shape and then 400s
+                // on any replay of its own turn.
+                if b.tool_id.is_empty() {
+                    continue;
+                }
                 content.push(json!({
                     "type": "server_tool_use",
                     "id": b.tool_id,
@@ -468,8 +493,19 @@ fn reconstruct_segment(
                 }));
             }
             _ => {
-                // Server-produced result block captured verbatim.
+                // Server-produced result block captured verbatim. A result
+                // block that references no tool call (missing or empty
+                // `tool_use_id`; Kimi's `web_search_tool_result` blocks
+                // arrive this way) is unreplayable and dropped; non-result
+                // block kinds pass through untouched.
                 if let Some(raw) = &b.raw {
+                    let orphan_result = raw["type"]
+                        .as_str()
+                        .is_some_and(|t| t.ends_with("tool_result"))
+                        && !raw["tool_use_id"].as_str().is_some_and(|id| !id.is_empty());
+                    if orphan_result {
+                        continue;
+                    }
                     content.push(raw.clone());
                 }
             }
@@ -1100,6 +1136,30 @@ mod tests {
             .expect("web_search tool present when web_search enabled");
         assert_eq!(ws["input_schema"]["type"], "object");
         assert!(ws["input_schema"].get("properties").is_some());
+    }
+
+    #[test]
+    fn web_search_tool_never_advertised_to_kimi() {
+        // Kimi's Anthropic-compatible endpoint (api.kimi.com/coding) accepts
+        // the server tool but streams degenerate blocks for it (empty
+        // server_tool_use id, web_search_tool_result without tool_use_id) and
+        // then 400s any replay of its own turn ("tool call id web_search:0 is
+        // not found"), killing the session at the first search. Fail closed:
+        // never advertise it there, even with web_search enabled.
+        let mut tx = transport();
+        tx.base_url = "https://api.kimi.com/coding".into();
+        let mut o = opts(SystemPrompt::default());
+        o.web_search = true;
+        let body = tx.build_body(&[], &o);
+        // With the gate active and no client tools, the tools array is empty
+        // (and may be omitted from the body entirely).
+        let has_ws = body["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|t| t["type"] == "web_search_20250305"));
+        assert!(
+            !has_ws,
+            "kimi endpoint must not receive the server-side web_search tool"
+        );
     }
 
     #[test]
@@ -2032,6 +2092,83 @@ mod tests {
         // ...but only the CLIENT tool_use is surfaced for dispatch.
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].name, "read_file");
+    }
+
+    #[test]
+    fn reconstruct_segment_drops_degenerate_kimi_server_blocks() {
+        // Exact shape captured live from a Kimi (model k3) web_search turn: a
+        // stray text block, a server_tool_use with an
+        // EMPTY id and empty input, and a web_search_tool_result with empty
+        // content and NO tool_use_id. Replaying those blocks makes Kimi 400
+        // ("tool call id web_search:0 is not found"); they carry nothing a
+        // model needs, so they are dropped at buffer-commit time. Mid-turn
+        // requests replay before normalize_for_prompt ever runs, so this
+        // cannot live in normalization.
+        let blocks = vec![
+            SseBlock {
+                kind: "text".into(),
+                text: "Search results for query: ".into(),
+                ..Default::default()
+            },
+            SseBlock {
+                kind: "server_tool_use".into(),
+                tool_id: String::new(),
+                tool_name: "web_search".into(),
+                ..Default::default()
+            },
+            SseBlock {
+                kind: "web_search_tool_result".into(),
+                raw: Some(json!({"type":"web_search_tool_result","content":[]})),
+                ..Default::default()
+            },
+            SseBlock {
+                kind: "text".into(),
+                text: "I'll inspect the diff.".into(),
+                ..Default::default()
+            },
+            SseBlock {
+                kind: "tool_use".into(),
+                tool_id: "t1".into(),
+                tool_name: "exec".into(),
+                tool_json: "{\"source\":\"1\"}".into(),
+                ..Default::default()
+            },
+        ];
+        let (content, text, _thinking, tool_calls) = reconstruct_segment(&blocks).unwrap();
+        let kinds: Vec<&str> = content.iter().filter_map(|b| b["type"].as_str()).collect();
+        assert_eq!(kinds, vec!["text", "text", "tool_use"]);
+        assert_eq!(text, "Search results for query: I'll inspect the diff.");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "exec");
+    }
+
+    #[test]
+    fn reconstruct_segment_keeps_wellformed_server_result_with_id() {
+        // The GLM live shape (non-empty ids on both sides) must keep replaying
+        // verbatim. The degenerate-block drop is keyed on the missing ids,
+        // not on server blocks generally.
+        let blocks = vec![
+            SseBlock {
+                kind: "server_tool_use".into(),
+                tool_id: "call_1".into(),
+                tool_name: "web_search".into(),
+                tool_json: "{\"search_query\":\"x\"}".into(),
+                ..Default::default()
+            },
+            SseBlock {
+                kind: "web_search_tool_result".into(),
+                raw: Some(
+                    json!({"type":"web_search_tool_result","tool_use_id":"call_1","content":[{"title":"x"}]}),
+                ),
+                ..Default::default()
+            },
+        ];
+        let (content, _text, _thinking, tool_calls) = reconstruct_segment(&blocks).unwrap();
+        assert_eq!(content[0]["type"], "server_tool_use");
+        assert_eq!(content[0]["id"], "call_1");
+        assert_eq!(content[1]["type"], "web_search_tool_result");
+        assert_eq!(content[1]["tool_use_id"], "call_1");
+        assert!(tool_calls.is_empty());
     }
 
     /// LIVE: validates the §3 task-local credential path end-to-end against the
