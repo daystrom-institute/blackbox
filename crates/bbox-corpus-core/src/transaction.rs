@@ -1,4 +1,4 @@
-//! Crash-consistent host-local transactions for repo-owned knowledge files.
+//! Crash-consistent host-local transactions for repo-owned corpus files.
 //!
 //! Git commit is the traveling transaction. This module only protects the
 //! daemon's uncommitted multi-file apply window inside one checkout. The
@@ -11,14 +11,16 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Context, Result};
-use bbox_corpus_core::json_store::{
+use crate::json_store::{
     atomic_write_bytes_from_dir_locked, atomic_write_json_locked, to_vec_pretty_newline,
 };
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const TRANSACTION_VERSION: u32 = 1;
+// These knowledge-era names are part of the durable v1 layout and manifest
+// identity. Gaps share the lane without rewriting existing closeout proofs.
 const TRANSACTION_KIND: &str = "knowledge_transaction_v1";
 const TRANSACTION_ROOT: &str = "knowledge-transactions";
 const PENDING_FILE: &str = "pending.json";
@@ -46,16 +48,16 @@ enum TransactionState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KnowledgeTransactionManifest {
+pub struct RepoTransactionManifest {
     pub version: u32,
     pub kind: String,
     pub transaction_id: String,
     pub created_at: String,
-    pub files: Vec<KnowledgeTransactionFile>,
+    pub files: Vec<RepoTransactionFile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KnowledgeTransactionFile {
+pub struct RepoTransactionFile {
     pub relative_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub old_ref: Option<String>,
@@ -67,7 +69,12 @@ pub struct KnowledgeTransactionFile {
     pub new_sha256: Option<String>,
 }
 
-/// True while a daemon knowledge transaction owns this checkout.
+/// Compatibility names for callers and persisted tests from the original
+/// knowledge-only transaction lane. The wire format remains version 1.
+pub type KnowledgeTransactionManifest = RepoTransactionManifest;
+pub type KnowledgeTransactionFile = RepoTransactionFile;
+
+/// True while a daemon repo-file transaction owns this checkout.
 pub fn has_pending_transaction(checkout_dir: &Path) -> bool {
     pending_path(checkout_dir).is_file()
 }
@@ -78,7 +85,7 @@ pub fn has_pending_transaction(checkout_dir: &Path) -> bool {
 pub fn apply_transaction(
     checkout_dir: &Path,
     writes: Vec<TransactionWrite>,
-) -> Result<Option<KnowledgeTransactionManifest>> {
+) -> Result<Option<RepoTransactionManifest>> {
     if writes.is_empty() {
         return Ok(None);
     }
@@ -145,9 +152,7 @@ pub fn apply_transaction(
 /// without a complete manifest touched no canonical files and are discarded.
 /// Any complete manifest rolls forward idempotently, then records the closeout
 /// proof and clears the pointer.
-pub fn recover_pending_transaction(
-    checkout_dir: &Path,
-) -> Result<Option<KnowledgeTransactionManifest>> {
+pub fn recover_pending_transaction(checkout_dir: &Path) -> Result<Option<RepoTransactionManifest>> {
     let pointer_path = pending_path(checkout_dir);
     if !pointer_path.exists() {
         return Ok(None);
@@ -179,7 +184,7 @@ pub fn recover_pending_transaction(
         clear_pointer(&pointer_path)?;
         return Ok(None);
     }
-    let manifest: KnowledgeTransactionManifest =
+    let manifest: RepoTransactionManifest =
         serde_json::from_slice(&fs::read(&manifest_path).with_context(|| {
             format!("reading transaction manifest {}", manifest_path.display())
         })?)
@@ -195,7 +200,7 @@ fn prepare_manifest(
     transaction_dir: &Path,
     transaction_id: &str,
     writes: Vec<TransactionWrite>,
-) -> Result<KnowledgeTransactionManifest> {
+) -> Result<RepoTransactionManifest> {
     fs::create_dir_all(transaction_dir.join("old"))?;
     fs::create_dir_all(transaction_dir.join("new"))?;
     let mut files = Vec::with_capacity(writes.len());
@@ -230,7 +235,7 @@ fn prepare_manifest(
         if let Some((name, bytes)) = &new_ref {
             write_sync(&transaction_dir.join(name), bytes)?;
         }
-        files.push(KnowledgeTransactionFile {
+        files.push(RepoTransactionFile {
             relative_path,
             old_ref: old_ref.as_ref().map(|(name, _)| name.clone()),
             new_ref: new_ref.as_ref().map(|(name, _)| name.clone()),
@@ -240,11 +245,11 @@ fn prepare_manifest(
     }
     sync_dir(&transaction_dir.join("old"))?;
     sync_dir(&transaction_dir.join("new"))?;
-    Ok(KnowledgeTransactionManifest {
+    Ok(RepoTransactionManifest {
         version: TRANSACTION_VERSION,
         kind: TRANSACTION_KIND.to_string(),
         transaction_id: transaction_id.to_string(),
-        created_at: bbox_util::util::now_iso(),
+        created_at: chrono::Utc::now().to_rfc3339(),
         files,
     })
 }
@@ -252,7 +257,7 @@ fn prepare_manifest(
 fn apply_manifest(
     checkout_dir: &Path,
     transaction_dir: &Path,
-    manifest: &KnowledgeTransactionManifest,
+    manifest: &RepoTransactionManifest,
 ) -> Result<()> {
     validate_manifest(manifest, &manifest.transaction_id)?;
     for file in &manifest.files {
@@ -285,7 +290,7 @@ fn apply_manifest(
 fn rollback_manifest(
     checkout_dir: &Path,
     transaction_dir: &Path,
-    manifest: &KnowledgeTransactionManifest,
+    manifest: &RepoTransactionManifest,
 ) -> Result<()> {
     for file in &manifest.files {
         let target = checkout_dir.join(&file.relative_path);
@@ -318,7 +323,7 @@ fn complete_transaction(
     root: &Path,
     transaction_dir: &Path,
     pointer_path: &Path,
-    manifest: &KnowledgeTransactionManifest,
+    manifest: &RepoTransactionManifest,
 ) -> Result<()> {
     let completed = root
         .join("completed")
@@ -331,7 +336,7 @@ fn complete_transaction(
     Ok(())
 }
 
-fn validate_manifest(manifest: &KnowledgeTransactionManifest, transaction_id: &str) -> Result<()> {
+fn validate_manifest(manifest: &RepoTransactionManifest, transaction_id: &str) -> Result<()> {
     validate_transaction_id(transaction_id)?;
     if manifest.version != TRANSACTION_VERSION
         || manifest.kind != TRANSACTION_KIND

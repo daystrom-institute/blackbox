@@ -1,5 +1,6 @@
 mod background;
 pub mod dispatch;
+mod gap_view;
 pub mod handler;
 mod knowledge_lifecycle;
 mod knowledge_merge_gate;

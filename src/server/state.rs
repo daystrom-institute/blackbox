@@ -62,6 +62,8 @@ pub(crate) struct SharedState {
     pub(crate) publisher_refs: RwLock<bbox_indexing::publisher::PublisherRefStore>,
     /// Session-authorized provisional snapshots keyed by scope and checkout.
     pub(crate) knowledge_overlays: RwLock<bbox_knowledge::overlay::KnowledgeOverlayStore>,
+    /// Gap-store provisional snapshots using the same scope and checkout keys.
+    pub(crate) gap_overlays: RwLock<bbox_gaps::overlay::GapOverlayStore>,
     /// Published committed-tree snapshots. Symbolic refs are rechecked on a
     /// short TTL and blob maps are rebuilt only when the resolved commit moves.
     pub(crate) knowledge_published_cache: RwLock<
@@ -481,6 +483,7 @@ impl SharedState {
             knowledge_overlays: RwLock::new(
                 bbox_knowledge::overlay::KnowledgeOverlayStore::default(),
             ),
+            gap_overlays: RwLock::new(bbox_gaps::overlay::GapOverlayStore::default()),
             knowledge_published_cache: RwLock::new(BTreeMap::new()),
             packets: RwLock::new(Packets::open(store_dir).unwrap()),
             surface_decisions: crate::server::surface::SurfaceDecisionCache::default(),

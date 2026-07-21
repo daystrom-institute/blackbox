@@ -106,9 +106,10 @@ impl BlackboxServer {
 
             let knowledge_view =
                 server.session_knowledge_view(p.project.as_deref(), p.provisional.as_deref())?;
+            let gap_view =
+                server.session_gap_view(p.project.as_deref(), p.provisional.as_deref())?;
             let threads = server.state.threads.read();
             let notes = server.state.notes.read();
-            let gaps = server.state.gaps.read();
             let task_store = server.state.task_store.read();
             let failed_rows = collect_failed_tasks(&task_store);
             let vector_alerts = collect_vector_connectivity_alerts();
@@ -117,7 +118,7 @@ impl BlackboxServer {
                 &knowledge_view.knowledge,
                 &threads,
                 &notes,
-                &gaps,
+                &gap_view.gaps,
                 &failed_rows,
                 &vector_alerts,
                 &cron_alerts,

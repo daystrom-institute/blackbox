@@ -2,8 +2,9 @@
 //!
 //! Extracted from the root `blackbox` crate as stage 0 of the
 //! code-intelligence cluster split (gap-fe4dd97f). Holds the entity-ref
-//! identity/parse types and the git porcelain helpers that the cluster
-//! (chunker, lsp, refactor, code_nav, macros) depends on downward.
+//! identity/parse types, repo-file transaction protocol, and git porcelain
+//! helpers that the cluster (chunker, lsp, refactor, code_nav, macros) depends
+//! on downward.
 //!
 //! Invariant: this crate must NOT depend on `blackbox` (that would be a
 //! workspace cycle). The one former upward reach — `git::notes_namespace`
@@ -22,4 +23,5 @@ pub mod project_record;
 pub mod query;
 pub mod search;
 pub mod template;
+pub mod transaction;
 pub mod util;

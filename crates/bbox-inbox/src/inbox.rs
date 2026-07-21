@@ -890,6 +890,7 @@ mod tests {
             resolution,
             project: project.map(ToOwned::to_owned),
             write_dir: None,
+            provisional_checkout_id: None,
             task_id: None,
             session_id: None,
             provider: None,

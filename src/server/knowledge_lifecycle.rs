@@ -173,6 +173,14 @@ impl BlackboxServer {
                 }
             }
         }
+        {
+            let mut overlays = self.state.gap_overlays.write();
+            for row in &dropped {
+                if let Some(scope) = row.published_scope() {
+                    overlays.remove(&scope, &row.checkout_id);
+                }
+            }
+        }
         if let Some(watcher) = self.state.bbox_watcher.lock().unwrap().as_mut() {
             for row in &dropped {
                 let Some(scope) = row.published_scope() else {
@@ -248,6 +256,7 @@ impl BlackboxServer {
             }
             self.watch_dark_knowledge_checkout(Path::new(&checkout.checkout_project_dir));
             self.refresh_dark_knowledge_overlay(&checkout);
+            self.refresh_dark_gap_overlay(&checkout);
             refreshed += 1;
         }
         for scope in affected_scopes {
@@ -308,6 +317,9 @@ impl BlackboxServer {
         {
             affected_scopes.insert(snapshot.key.published_scope);
         }
+        for snapshot in self.state.gap_overlays.write().remove_checkout(checkout_id) {
+            affected_scopes.insert(snapshot.key.published_scope);
+        }
         for scope in affected_scopes {
             // A successful closeout may have advanced the publisher ref. Drop
             // the committed-tree cache before rebuilding so promotion is
@@ -321,16 +333,25 @@ impl BlackboxServer {
     /// Force the next published view to observe a target ref advanced by
     /// closeout even when push or worktree removal has not completed yet.
     pub(crate) fn refresh_published_knowledge_for_checkout(&self, checkout_id: &str) -> usize {
-        let scopes = self
+        let rows = self
             .state
             .checkout_registry
             .read()
             .rows_for_checkout(checkout_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let scopes = rows
+            .iter()
             .filter_map(CheckoutRow::published_scope)
             .collect::<BTreeSet<_>>();
         for scope in &scopes {
             self.invalidate_published_knowledge_cache(scope);
             self.reconcile_knowledge_scope_index(scope);
+        }
+        for row in rows {
+            if let Some(checkout) = self.resolve_registered_checkout(&row) {
+                self.refresh_dark_gap_overlay(&checkout);
+            }
         }
         scopes.len()
     }

@@ -15,8 +15,9 @@ brief: "Retire write_redirects, the host-local map that makes kb.json required t
 
 > **Status: partial.** The additive foundation, prerequisite repair, dark
 > overlay, session-authoritative committed view, promotion, and registry
-> lifecycle and the candidate-tree merge gate through slice 3.8 are landed on
-> `beta/blackbox-v2`. Gap convergence and the final path-fallback cut remain.
+> lifecycle, candidate-tree merge gate, and gap-store convergence through
+> slice 3.9 are landed on `beta/blackbox-v2`. The final path-fallback cut
+> remains.
 > Anchors were re-verified against that branch after the
 > slice-3.2 checkpoint and this design was repaired against the live loader,
 > resolver, index, and entity-ref paths on 2026-07-20. Line cites rot, so grep
@@ -100,13 +101,24 @@ returns; successful teardown does the same while deregistering the checkout.
 The next view therefore observes any completed local integration and promotion
 without waiting for the cache TTL, even if a later push or removal failed.
 
-Still not implemented: response-level `built_from`, gap-convergence, and the
-path-fallback-cut slices. Section 6 is the authoritative remaining sequence.
+The gap-store twin is also landed as a named migration. It shares checkout
+identity, publisher pins, merge-base overlays, content-equality promotion,
+watcher/reconciliation lifecycle, and the crash-consistent transaction claim.
+Checkout gap variants are no longer retained in the host-global store. Gap
+lists and inbox views now read pinned published records plus
+session-authoritative `published|own|all` overlays.
+
+Still not implemented: response-level `built_from` and the path-fallback-cut
+slices. Section 6 is the authoritative remaining sequence.
 
 When this document and an additive primitive disagree, the contract here wins
 and the primitive is repaired before live wiring.
 
-## 1. Present state (verified)
+## 1. Pre-migration state (verified baseline)
+
+This section records the failure mode the landed slices replaced. It is kept
+as the evidence baseline for the design, not as a description of the current
+runtime.
 
 Two identity functions, opposite behavior
 (`crates/bbox-corpus-core/src/entity_ref.rs`):
@@ -139,14 +151,15 @@ or by managed-root location, only independent clones use
 `projects.rs:438-503`), so any verification must re-run the gate, not test the
 marker (review round 2, finding 3).
 
-The resolver is not yet monorepo-complete for checkout writes. A managed
+Before slice 3.3, the resolver was not monorepo-complete for checkout writes. A managed
 worktree resolution returns the checkout top, while a registered subproject's
 repo-owned carrier is `checkout_top/bbox_root_relpath`; matching by git common
 dir can also select the wrong registered subproject when one repository has
-several registered `.bbox` roots. Slice 3.3 must resolve the published scope
-first, then derive the corresponding checkout project root from that relpath.
+several registered `.bbox` roots. Slice 3.3 repaired this by resolving the
+published scope first, then deriving the corresponding checkout project root
+from that relpath.
 
-Loading reads the base WORKING tree directly, not the committed tree
+The old loader read the base WORKING tree directly, not the committed tree
 (`crates/bbox-knowledge/src/knowledge.rs:773-827`, `fs::read_dir` /
 `fs::read_to_string`), which is why "published = committed" needs an explicit
 committed-tree read (finding 4). Durable scope keys on `project:
@@ -165,8 +178,9 @@ A worktree write is NOT peer-invisible today. The adapter rewrites its
 knowledge index. Every caller can therefore see a new provisional entry, and
 an edit of an existing id globally shadows the published version, with no
 checkout label. The worktree file itself remains invisible to reload, which is
-why the central retention copy and `write_redirects` are required across a
-daemon restart.
+why the old implementation required a central retention copy and
+`write_redirects` across a daemon restart. The landed overlay path reconstructs
+that state from the checkout carrier instead.
 
 ## 2. The two defects this closes
 
@@ -684,12 +698,14 @@ machinery, preserves local file-level read-your-writes but removes the current
 daemon-wide in-flight visibility used by multi-agent campaigns. Demoting to it
 is a deletion, not a redesign.
 
-**Landed implementation anchors (slice 3.7).** The transaction protocol lives
-in `bbox_knowledge::transaction`; checkout mutation seeding and restoration
-live beside `persist_repo_owned_mutation_at`; lifecycle startup owns stale
-pending recovery; and `bro_tools::fleet_worktree` owns the closeout claim plus
-candidate-blob proof. These are named anchors rather than line cites so this
-design survives mechanical movement during later decomposition.
+**Landed implementation anchors (slices 3.7 and 3.9).** The shared repo-file
+transaction protocol lives in `bbox_corpus_core::transaction`, with a
+compatibility re-export from `bbox_knowledge::transaction`; checkout knowledge
+mutation seeding and restoration live beside `persist_repo_owned_mutation_at`;
+lifecycle startup owns stale pending recovery; and
+`bro_tools::fleet_worktree` owns the closeout claim plus candidate-blob proof.
+These are named anchors rather than line cites so this design survives
+mechanical movement during later decomposition.
 
 ## 5. What retires, and the gap-store twin (closes round 1, finding 11)
 
@@ -698,11 +714,24 @@ redirect branch, the "host store required to interpret repo files" property,
 and the path-string scope key as durable authority (kept as an
 inventory-bounded read fallback through migration, then dropped).
 
-The **gap store is a parallel twin** (same host-only carrier,
-`gaps.rs:175-187`, shared watcher/reload). This design either **generalizes
-the overlay to cover gaps** (preferred: one overlay model, one registry, one
-promotion rule, one host-local staged-write path) or **sequences a named gap
-migration** (§6 slice 8). Not left implicit.
+The **gap store is a parallel twin**. Slice 3.9 chose and landed the named gap
+migration because gaps have a typed record but no search index or rendered
+provider projection. The twin uses the same checkout registry, published scope
+and branch pin, exact merge-base working-tree diff, content-equality promotion,
+watcher/reconciliation lifecycle, and host-local transaction claim. Its typed
+overlay stays in `bbox-gaps`; it does not force gap records through knowledge
+index/render machinery.
+
+The migration removes `write_dir` as durable state. That field is now only a
+transient adapter-to-store write target, and repo-owned persistence clears it
+from both central and committed records. A restart reconstructs live checkout
+variants from registered checkout bytes. A vanished checkout drops its
+provisional gaps just like provisional knowledge; the daemon does not invent a
+second durability store. Pinned published plus `published|own|all` provisional
+views drive `bbox_gaps` and inbox/closeout checks. Successive mutations seed
+from the checkout's own gap file, and multi-file supersession uses the same
+exclusive pending claim, recoverable manifest, and candidate-blob closeout
+proof as knowledge.
 
 ## 6. Sequencing
 
@@ -746,8 +775,10 @@ sequence begins with a repair gate:
 7. **Merge gate (landed).** `git merge-tree` candidate tree; shared-render
    projection check; exact-subject opposing-polarity contradiction lint; and
    explicit published-cache invalidation for immediate promotion observation.
-8. **Gap-store convergence.** Generalize the overlay to gaps, or the sequenced
-   gap migration.
+8. **Gap-store convergence (landed).** Named typed gap overlay reusing checkout
+   registry, publisher pins, promotion, watcher lifecycle, and staged
+   transactions; remove central retention of checkout variants and use
+   session-authoritative published/own/all views.
 9. **Cut the path fallback** once the epoch marker plus empty local quarantine
    confirm coverage.
 
@@ -791,8 +822,6 @@ later locality rung:
 
 - **Contradiction-lint semantics.** How far past the §4.5 opposing-polarity
   first cut to push (scope overlap, entailment) before diminishing returns.
-- **Gap convergence shape.** One generalized overlay vs a gap-specific
-  migration reusing the registry, promotion, and staged-write path.
 - **Portable publisher-ref policy.** Whether the remote rung requires a
   committed default-ref field so hosts converge without an operator-created
   host-local pin. The monolithic rung is fully specified by the pin above.

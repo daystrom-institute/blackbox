@@ -176,15 +176,16 @@ pub struct GapNote {
     //    scope, exactly like knowledge entries omit `project`). ──
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
-    /// Committed-file write target. Used when a managed fleet worktree
-    /// should carry the repo-owned gap file while `project` remains the
-    /// durable base scope. Persisted in the CENTRAL store only — so a
-    /// redirected gap survives a daemon restart before its worktree branch
-    /// merges (gap-ee8c4373) — and always cleared from committed gap records
-    /// (`persist_repo_gap_entries` / `load_repo_gap_entries`): on-disk
-    /// location encodes the carrier, exactly like `project`.
+    /// Transient committed-file write target. A managed checkout carries the
+    /// repo-owned gap file while `project` remains the durable base scope.
+    /// Never retained in the central store or committed record; the checkout
+    /// registry reconstructs its provisional overlay after restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_dir: Option<String>,
+    /// Checkout identity for a provisional variant in a detached read view.
+    /// Never persisted in either the central store or repo-owned files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provisional_checkout_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -350,6 +351,7 @@ impl GapNote {
             resolution: GapResolution::Unresolved,
             project: None,
             write_dir: None,
+            provisional_checkout_id: None,
             task_id: None,
             session_id: None,
             provider: None,
@@ -458,6 +460,9 @@ pub struct GapListParams {
     /// Filter by project substring.
     #[serde(default)]
     pub project: Option<String>,
+    /// Provisional visibility policy: published, own, or all.
+    #[serde(default)]
+    pub provisional: Option<String>,
     /// Free-text substring over title/domain/wanted_capability.
     #[serde(default)]
     pub query: Option<String>,
@@ -560,6 +565,10 @@ fn repo_gaps_dir(project_dir: &Path) -> PathBuf {
     project_dir.join(".bbox").join("gaps")
 }
 
+fn is_checkout_redirect(project: Option<&str>, write_dir: Option<&str>) -> bool {
+    matches!((project, write_dir), (Some(project), Some(write_dir)) if project != write_dir)
+}
+
 /// A project is "repo-owned" for gaps once its `.bbox/gaps/` dir exists — via a
 /// clone that carries it, `bbox_project_init`, the spool dropping a file, or the
 /// first project-scoped `bbox_gap`.
@@ -571,6 +580,13 @@ pub fn project_is_repo_owned(project_dir: &Path) -> bool {
 /// stamping each with `project = project_dir` (absent on disk). Top-level
 /// `*.json` only; tolerant skip-and-continue per file.
 fn load_repo_gap_entries(project_dir: &Path) -> Result<Vec<GapNote>> {
+    if bbox_corpus_core::transaction::has_pending_transaction(project_dir) {
+        tracing::debug!(
+            project = %project_dir.display(),
+            "gaps load skipped while a repo-owned transaction is pending"
+        );
+        return Ok(Vec::new());
+    }
     let dir = repo_gaps_dir(project_dir);
     if !dir.exists() {
         return Ok(Vec::new());
@@ -621,6 +637,7 @@ fn load_repo_gap_entries(project_dir: &Path) -> Result<Vec<GapNote>> {
         // root's file the merge-observation signal that drops a retained
         // redirect (the load overwrites the central copy by id).
         entry.write_dir = None;
+        entry.provisional_checkout_id = None;
         if entry.updated_at.is_empty() {
             entry.updated_at = entry.created_at.clone();
         }
@@ -661,8 +678,11 @@ fn persist_repo_gap_entries(
     known_ids: &BTreeSet<&str>,
     redirected_ids: &BTreeSet<&str>,
 ) -> Result<()> {
+    use bbox_corpus_core::transaction::TransactionWrite;
+
     let dir = repo_gaps_dir(project_dir);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let mut writes = Vec::new();
 
     if purge {
         let keep: BTreeSet<&str> = entries.iter().map(|e| e.id.as_str()).collect();
@@ -688,7 +708,10 @@ fn persist_repo_gap_entries(
                     );
                     continue;
                 }
-                let _ = fs::remove_file(&path);
+                writes.push(TransactionWrite {
+                    target: path,
+                    new_bytes: None,
+                });
             }
         }
     }
@@ -697,13 +720,18 @@ fn persist_repo_gap_entries(
         let mut on_disk = (*entry).clone();
         on_disk.project = None;
         on_disk.write_dir = None;
+        on_disk.provisional_checkout_id = None;
         let path = dir.join(format!("{}.json", entry.id));
         let new_bytes = bbox_corpus_core::json_store::to_vec_pretty_newline(&on_disk)?;
         if fs::read(&path).map(|cur| cur == new_bytes).unwrap_or(false) {
             continue;
         }
-        bbox_corpus_core::json_store::atomic_write_json_locked(&path, &on_disk)?;
+        writes.push(TransactionWrite {
+            target: path,
+            new_bytes: Some(new_bytes),
+        });
     }
+    bbox_corpus_core::transaction::apply_transaction(project_dir, writes)?;
     Ok(())
 }
 
@@ -773,6 +801,34 @@ impl GapStore {
         Ok(())
     }
 
+    /// Seed checkout-local variants before a mutation. Reload reconstructs the
+    /// published/base store first; this replaces those records with the
+    /// session checkout's own files so successive updates never overwrite an
+    /// earlier provisional edit with stale published bytes.
+    fn seed_checkout_entries(
+        &mut self,
+        durable_project: Option<&str>,
+        write_dir: Option<&str>,
+    ) -> Result<()> {
+        let (Some(durable_project), Some(write_dir)) = (durable_project, write_dir) else {
+            return Ok(());
+        };
+        if durable_project == write_dir {
+            return Ok(());
+        }
+        for mut gap in load_repo_gap_entries(Path::new(write_dir))? {
+            gap.project = Some(durable_project.to_string());
+            gap.write_dir = Some(write_dir.to_string());
+            gap.provisional_checkout_id = None;
+            if let Some(existing) = self.data.gaps.iter_mut().find(|item| item.id == gap.id) {
+                *existing = gap;
+            } else {
+                self.data.gaps.push(gap);
+            }
+        }
+        Ok(())
+    }
+
     fn save(&self) -> Result<()> {
         // Central store owns only global (project-less or not-yet-repo-owned)
         // gaps; project-scoped gaps are written under their owning repo's
@@ -783,10 +839,10 @@ impl GapStore {
             gaps: Vec::new(),
         };
         let mut by_project: HashMap<PathBuf, Vec<&GapNote>> = HashMap::new();
-        // Per durable-project dir: ids whose rewrite was redirected into a
-        // worktree (`write_dir != project`). Their committed base files are
-        // protected from the generation purge — redirection is not
-        // reassignment (the branch, not the daemon, updates the base).
+        // Per durable-project dir: ids whose rewrite is targeted into a
+        // checkout (`write_dir != project`). Their committed base files are
+        // protected from generation purge while the checkout carries the
+        // provisional variant.
         let mut redirected: HashMap<PathBuf, BTreeSet<&str>> = HashMap::new();
         for g in &self.data.gaps {
             match g.project.as_deref() {
@@ -796,14 +852,9 @@ impl GapStore {
                         .as_deref()
                         .filter(|d| !d.is_empty() && *d != dir)
                     {
-                        // Redirected gap: the worktree file carries it, but
-                        // that file is invisible to reload until the branch
-                        // merges into a registered base root — so central
-                        // RETAINS the gap (write_dir included) across daemon
-                        // restarts (gap-ee8c4373). Loading the base root's
-                        // committed file later overwrites the retained copy
-                        // (write_dir cleared at load) and the next save
-                        // drops it from central.
+                        // The checkout file is the only provisional carrier.
+                        // Registry discovery reconstructs its overlay after a
+                        // restart, so the central store never retains a copy.
                         Some(write_dir) if project_is_repo_owned(Path::new(write_dir)) => {
                             by_project
                                 .entry(PathBuf::from(write_dir))
@@ -813,13 +864,12 @@ impl GapStore {
                                 .entry(PathBuf::from(dir))
                                 .or_default()
                                 .insert(g.id.as_str());
-                            central.gaps.push(g.clone());
                         }
-                        // Redirect target gone (worktree removed before
-                        // merging): central-only. Never fall back to writing
-                        // the base checkout — the daemon does not update the
-                        // base on a branch's behalf.
-                        Some(_) => central.gaps.push(g.clone()),
+                        Some(write_dir) => tracing::warn!(
+                            gap = %g.id,
+                            target = write_dir,
+                            "dropping legacy central gap redirect whose checkout is gone"
+                        ),
                         None if project_is_repo_owned(Path::new(dir)) => {
                             by_project.entry(PathBuf::from(dir)).or_default().push(g);
                         }
@@ -828,6 +878,10 @@ impl GapStore {
                 }
                 _ => central.gaps.push(g.clone()),
             }
+        }
+        for gap in &mut central.gaps {
+            gap.write_dir = None;
+            gap.provisional_checkout_id = None;
         }
         bbox_corpus_core::json_store::atomic_write_json_locked(&self.store_path, &central)?;
         let loaded: HashSet<&Path> = self.project_roots.iter().map(|p| p.as_path()).collect();
@@ -865,6 +919,16 @@ impl GapStore {
         &self.data.gaps
     }
 
+    /// Read-only store assembled by the daemon from pinned published trees and
+    /// selected checkout overlays.
+    pub fn detached_view(gaps: Vec<GapNote>) -> Self {
+        Self {
+            store_path: PathBuf::new(),
+            data: GapStoreData { version: 1, gaps },
+            project_roots: Vec::new(),
+        }
+    }
+
     /// Open (non-addressed) gap with a matching `dedupe_key` in the same scope.
     fn open_duplicate(&self, dedupe_key: &str, project: Option<&str>) -> Option<&GapNote> {
         self.data.gaps.iter().find(|g| {
@@ -883,7 +947,23 @@ impl GapStore {
         let path = self.store_path.clone();
         bbox_corpus_core::json_store::with_store_lock(&path, || {
             self.reload()?;
-            self.file_locked(p)
+            let result = self.file_locked(p);
+            let reloaded = is_checkout_redirect(p.project.as_deref(), p.write_dir.as_deref())
+                .then(|| self.reload());
+            match result {
+                Ok(value) => {
+                    if let Some(reloaded) = reloaded {
+                        reloaded?;
+                    }
+                    Ok(value)
+                }
+                Err(err) => {
+                    if reloaded.is_none() {
+                        let _ = self.reload();
+                    }
+                    Err(err)
+                }
+            }
         })
     }
 
@@ -915,6 +995,7 @@ impl GapStore {
             ),
             other => anyhow::bail!("scope must be `project` or `global`, got `{other}`"),
         };
+        self.seed_checkout_entries(project.as_deref(), write_dir.as_deref())?;
 
         let allow_recurrence = p.allow_recurrence.unwrap_or(false);
         if !allow_recurrence {
@@ -961,6 +1042,7 @@ impl GapStore {
             resolution: GapResolution::Unresolved,
             project,
             write_dir,
+            provisional_checkout_id: None,
             task_id: p.task_id.clone(),
             session_id: p.session_id.clone(),
             provider: p.provider.clone(),
@@ -1031,10 +1113,11 @@ impl GapStore {
             return Ok(());
         }
         let path = Path::new(dir);
-        if path.is_dir() {
-            fs::create_dir_all(repo_gaps_dir(path))
-                .with_context(|| format!("creating .bbox/gaps under {dir}"))?;
+        if !path.is_dir() {
+            anyhow::bail!("gap checkout write target is unavailable: {dir}");
         }
+        fs::create_dir_all(repo_gaps_dir(path))
+            .with_context(|| format!("creating .bbox/gaps under {dir}"))?;
         gap.write_dir = Some(dir.to_string());
         Ok(())
     }
@@ -1043,7 +1126,24 @@ impl GapStore {
         let path = self.store_path.clone();
         bbox_corpus_core::json_store::with_store_lock(&path, || {
             self.reload()?;
-            self.resolve_locked(p)
+            self.seed_checkout_entries(p.project.as_deref(), p.write_dir.as_deref())?;
+            let result = self.resolve_locked(p);
+            let reloaded = is_checkout_redirect(p.project.as_deref(), p.write_dir.as_deref())
+                .then(|| self.reload());
+            match result {
+                Ok(value) => {
+                    if let Some(reloaded) = reloaded {
+                        reloaded?;
+                    }
+                    Ok(value)
+                }
+                Err(err) => {
+                    if reloaded.is_none() {
+                        let _ = self.reload();
+                    }
+                    Err(err)
+                }
+            }
         })
     }
 
@@ -1122,7 +1222,24 @@ impl GapStore {
         let path = self.store_path.clone();
         bbox_corpus_core::json_store::with_store_lock(&path, || {
             self.reload()?;
-            self.update_locked(p)
+            self.seed_checkout_entries(p.project.as_deref(), p.write_dir.as_deref())?;
+            let result = self.update_locked(p);
+            let reloaded = is_checkout_redirect(p.project.as_deref(), p.write_dir.as_deref())
+                .then(|| self.reload());
+            match result {
+                Ok(value) => {
+                    if let Some(reloaded) = reloaded {
+                        reloaded?;
+                    }
+                    Ok(value)
+                }
+                Err(err) => {
+                    if reloaded.is_none() {
+                        let _ = self.reload();
+                    }
+                    Err(err)
+                }
+            }
         })
     }
 
@@ -1333,8 +1450,13 @@ impl GapStore {
             let scope = g.project.as_deref().map_or("global".to_string(), |p| {
                 p.rsplit('/').next().unwrap_or(p).to_string()
             });
+            let provisional = g
+                .provisional_checkout_id
+                .as_deref()
+                .map(|checkout| format!("  checkout={checkout}"))
+                .unwrap_or_default();
             out.push_str(&format!(
-                "{id}  [{kind}/{impact}/{res}]  {ts}  scope={scope}  dedupe={dedupe}\n  {title}\n  want: {want}\n",
+                "{id}  [{kind}/{impact}/{res}]  {ts}  scope={scope}{provisional}  dedupe={dedupe}\n  {title}\n  want: {want}\n",
                 id = g.id,
                 kind = g.gap_kind.as_ref(),
                 impact = g.impact.as_ref(),
@@ -1688,14 +1810,11 @@ mod tests {
         );
     }
 
-    /// A redirected gap survives a daemon restart via central retention
-    /// (gap-ee8c4373): the worktree file is invisible to reload until the
-    /// branch merges, so central keeps the gap (write_dir included). Once
-    /// the base root's committed file appears, the load overwrites the
-    /// retained copy (write_dir cleared) and the next save drops it from
-    /// central.
+    /// Checkout-targeted gaps never leak into the host-global store. Registry
+    /// overlay reconstruction owns restart visibility; after merge the base
+    /// project loader observes the same committed record normally.
     #[test]
-    fn redirected_gap_survives_reopen_and_heals_on_base_merge() {
+    fn redirected_gap_stays_out_of_central_and_loads_after_base_merge() {
         let base_dir = tempdir().unwrap();
         let root = base_dir.path().canonicalize().unwrap();
         let wt_dir = tempdir().unwrap();
@@ -1717,17 +1836,17 @@ mod tests {
         assert!(!base_file.exists(), "base checkout must stay untouched");
         drop(store);
 
-        // Daemon restart before the merge: the gap must still be there.
+        let central_raw = fs::read_to_string(&store_path).unwrap();
+        assert!(
+            !central_raw.contains(&id),
+            "checkout variant must not be retained centrally"
+        );
+
+        // A bare store reopen cannot see checkout-private bytes. The daemon's
+        // registry overlay supplies that view instead.
         let mut store = GapStore::open(&store_path).unwrap();
         store.set_project_roots(vec![root.clone()]).unwrap();
-        let g = store
-            .data
-            .gaps
-            .iter()
-            .find(|g| g.id == id)
-            .expect("redirected gap retained in central across reopen");
-        assert_eq!(g.write_dir.as_deref(), Some(wt.to_str().unwrap()));
-        assert_eq!(g.project.as_deref(), Some(root.to_str().unwrap()));
+        assert!(!store.data.gaps.iter().any(|gap| gap.id == id));
 
         // Merge lands: base root now carries the committed file.
         fs::copy(&wt_file, &base_file).unwrap();
@@ -1737,20 +1856,14 @@ mod tests {
             g.write_dir.is_none(),
             "observing the base file must drop the redirect"
         );
-        store.save().unwrap();
-        let central_raw = fs::read_to_string(&store_path).unwrap();
-        assert!(
-            !central_raw.contains(&id),
-            "merged gap must leave the central store"
-        );
         assert!(base_file.exists());
     }
 
-    /// A redirect whose worktree disappeared before merging keeps the gap
-    /// central-only: the daemon never falls back to writing the base
-    /// checkout on a branch's behalf.
+    /// A checkout removed before merging drops its provisional bytes with the
+    /// branch checkout. The daemon neither retains a host-global copy nor
+    /// falls back to rewriting the base checkout.
     #[test]
-    fn dead_worktree_redirect_stays_central_and_never_writes_base() {
+    fn dead_worktree_redirect_drops_without_writing_base_or_central() {
         let base_dir = tempdir().unwrap();
         let root = base_dir.path().canonicalize().unwrap();
         let wt_dir = tempdir().unwrap();
@@ -1777,8 +1890,60 @@ mod tests {
         );
         let central_raw = fs::read_to_string(&store_path).unwrap();
         assert!(
-            central_raw.contains(&id),
-            "dead-worktree redirect must stay central-retained"
+            !central_raw.contains(&id),
+            "dead checkout variant must not remain centrally retained"
+        );
+    }
+
+    #[test]
+    fn supersession_uses_one_shared_repo_transaction() {
+        let root_dir = tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join(".bbox/gaps")).unwrap();
+        let central = tempdir().unwrap();
+        let mut store = GapStore::open(&central.path().join("gaps.json")).unwrap();
+        store.set_project_roots(vec![root.clone()]).unwrap();
+        let (old_id, _) = store
+            .file(&project_params(
+                "old",
+                "tooling/test-domain/transaction-old",
+                &root,
+            ))
+            .unwrap();
+        let (new_id, _) = store
+            .file(&project_params(
+                "new",
+                "tooling/test-domain/transaction-new",
+                &root,
+            ))
+            .unwrap();
+
+        let completed = root.join(".bbox/local/knowledge-transactions/completed");
+        fs::remove_dir_all(&completed).unwrap();
+        fs::create_dir_all(&completed).unwrap();
+        store
+            .resolve(&GapResolveParams {
+                id: old_id,
+                resolution: "addressed".into(),
+                superseded_by: Some(new_id),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let manifests = fs::read_dir(&completed)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .collect::<Vec<_>>();
+        assert_eq!(manifests.len(), 1);
+        let manifest: bbox_corpus_core::transaction::RepoTransactionManifest =
+            serde_json::from_slice(&fs::read(&manifests[0]).unwrap()).unwrap();
+        assert_eq!(manifest.files.len(), 2);
+        assert!(
+            manifest
+                .files
+                .iter()
+                .all(|file| file.relative_path.starts_with(".bbox/gaps/"))
         );
     }
 

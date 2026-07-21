@@ -1,0 +1,549 @@
+//! Checkout-scoped provisional overlays for repo-owned gap notes.
+//!
+//! Gap records share the knowledge lane's checkout registry, publisher pin,
+//! merge-base model, and content-equality promotion rule. The typed snapshot
+//! stays in this crate because gaps have no search or render projection.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use bbox_corpus_core::git;
+use bbox_corpus_core::identity::PublishedScope;
+use bbox_corpus_core::project_record::ResolvedCheckoutScope;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::gaps::GapNote;
+
+#[derive(Debug, Clone)]
+pub struct PublishedGapEntry {
+    pub gap: GapNote,
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublishedGapSnapshot {
+    pub published_scope: PublishedScope,
+    pub published_ref: String,
+    pub publisher_commit: String,
+    pub gaps: BTreeMap<String, PublishedGapEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct GapOverlayKey {
+    pub published_scope: PublishedScope,
+    pub checkout_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GapOverlayStamp {
+    pub published_scope: PublishedScope,
+    pub checkout_id: String,
+    pub published_ref: String,
+    pub publisher_commit: String,
+    pub checkout_head: String,
+    pub merge_base: String,
+    pub working_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GapOverlayValue {
+    Upsert {
+        gap: Box<GapNote>,
+        content_hash: String,
+    },
+    Tombstone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GapOverlayStatus {
+    Valid,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GapOverlaySnapshot {
+    pub snapshot_id: String,
+    pub key: GapOverlayKey,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stamp: Option<GapOverlayStamp>,
+    pub status: GapOverlayStatus,
+    #[serde(default)]
+    pub values: BTreeMap<String, GapOverlayValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
+}
+
+impl GapOverlaySnapshot {
+    pub fn invalid(checkout: &ResolvedCheckoutScope, diagnostic: impl Into<String>) -> Self {
+        Self {
+            snapshot_id: String::new(),
+            key: GapOverlayKey {
+                published_scope: checkout.published_scope.clone(),
+                checkout_id: checkout.checkout_id.clone(),
+            },
+            stamp: None,
+            status: GapOverlayStatus::Invalid,
+            values: BTreeMap::new(),
+            diagnostics: vec![diagnostic.into()],
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct GapOverlayStore {
+    snapshots: BTreeMap<GapOverlayKey, GapOverlaySnapshot>,
+}
+
+impl GapOverlayStore {
+    pub fn publish(&mut self, snapshot: GapOverlaySnapshot) {
+        self.snapshots.insert(snapshot.key.clone(), snapshot);
+    }
+
+    pub fn get(
+        &self,
+        published_scope: &PublishedScope,
+        checkout_id: &str,
+    ) -> Option<&GapOverlaySnapshot> {
+        self.snapshots.get(&GapOverlayKey {
+            published_scope: published_scope.clone(),
+            checkout_id: checkout_id.to_string(),
+        })
+    }
+
+    pub fn snapshots(&self) -> impl Iterator<Item = &GapOverlaySnapshot> {
+        self.snapshots.values()
+    }
+
+    pub fn remove(
+        &mut self,
+        published_scope: &PublishedScope,
+        checkout_id: &str,
+    ) -> Option<GapOverlaySnapshot> {
+        self.snapshots.remove(&GapOverlayKey {
+            published_scope: published_scope.clone(),
+            checkout_id: checkout_id.to_string(),
+        })
+    }
+
+    pub fn remove_checkout(&mut self, checkout_id: &str) -> Vec<GapOverlaySnapshot> {
+        let keys = self
+            .snapshots
+            .keys()
+            .filter(|key| key.checkout_id == checkout_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.into_iter()
+            .filter_map(|key| self.snapshots.remove(&key))
+            .collect()
+    }
+}
+
+pub fn load_published_snapshot(
+    publisher_root: &Path,
+    published_ref: &str,
+    scope: &PublishedScope,
+    durable_project: &str,
+) -> Result<PublishedGapSnapshot> {
+    let publisher_commit =
+        git::resolve_commit(publisher_root, published_ref).with_context(|| {
+            format!(
+                "published ref {published_ref} does not resolve in {}",
+                publisher_root.display()
+            )
+        })?;
+    load_published_snapshot_at_commit(
+        publisher_root,
+        published_ref,
+        &publisher_commit,
+        scope,
+        durable_project,
+    )
+}
+
+pub fn load_published_snapshot_at_commit(
+    publisher_root: &Path,
+    published_ref: &str,
+    publisher_commit: &str,
+    scope: &PublishedScope,
+    durable_project: &str,
+) -> Result<PublishedGapSnapshot> {
+    let tree_dir = gaps_tree_dir(scope);
+    let files = read_committed_map(publisher_root, publisher_commit, &tree_dir)?;
+    let mut gaps = BTreeMap::new();
+    for (filename, bytes) in files {
+        let mut gap: GapNote = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing published gap file {filename}"))?;
+        validate_filename_id(&filename, &gap.id, "published gap")?;
+        stamp_gap(&mut gap, durable_project);
+        let id = gap.id.clone();
+        if gaps
+            .insert(
+                id.clone(),
+                PublishedGapEntry {
+                    gap,
+                    content_hash: sha256(&bytes),
+                },
+            )
+            .is_some()
+        {
+            anyhow::bail!("duplicate published gap id: {id}");
+        }
+    }
+    Ok(PublishedGapSnapshot {
+        published_scope: scope.clone(),
+        published_ref: published_ref.to_string(),
+        publisher_commit: publisher_commit.to_string(),
+        gaps,
+    })
+}
+
+pub fn recompute_overlay(
+    publisher_root: &Path,
+    published_ref: &str,
+    checkout: &ResolvedCheckoutScope,
+) -> GapOverlaySnapshot {
+    match recompute_overlay_inner(publisher_root, published_ref, checkout) {
+        Ok(snapshot) => snapshot,
+        Err(err) => GapOverlaySnapshot::invalid(checkout, format!("{err:#}")),
+    }
+}
+
+fn recompute_overlay_inner(
+    publisher_root: &Path,
+    published_ref: &str,
+    checkout: &ResolvedCheckoutScope,
+) -> Result<GapOverlaySnapshot> {
+    let checkout_root = Path::new(&checkout.checkout_dir);
+    let publisher_commit =
+        git::resolve_commit(publisher_root, published_ref).with_context(|| {
+            format!(
+                "published ref {published_ref} does not resolve in {}",
+                publisher_root.display()
+            )
+        })?;
+    let checkout_head = git::current_head(checkout_root)
+        .with_context(|| format!("checkout {} has no HEAD", checkout_root.display()))?;
+    let merge_base = git::merge_base(checkout_root, &checkout_head, &publisher_commit)
+        .with_context(|| {
+            format!(
+                "no merge base between checkout {} and published commit {}",
+                checkout_root.display(),
+                publisher_commit
+            )
+        })?;
+    let tree_dir = gaps_tree_dir(&checkout.published_scope);
+    let baseline = read_committed_map(checkout_root, &merge_base, &tree_dir)?;
+    let published = read_committed_map(publisher_root, &publisher_commit, &tree_dir)?;
+    let working = read_working_map(Path::new(&checkout.checkout_project_dir))?;
+    let working_fingerprint = fingerprint_map(&working);
+
+    let mut paths = BTreeSet::new();
+    paths.extend(baseline.keys().cloned());
+    paths.extend(working.keys().cloned());
+    let mut values = BTreeMap::new();
+    let mut seen_ids = BTreeSet::new();
+    for filename in paths {
+        match (baseline.get(&filename), working.get(&filename)) {
+            (Some(before), Some(after)) if before == after => {}
+            (_, Some(after)) => {
+                if published.get(&filename) == Some(after) {
+                    continue;
+                }
+                let mut gap: GapNote = serde_json::from_slice(after)
+                    .with_context(|| format!("parsing working gap file {filename}"))?;
+                validate_filename_id(&filename, &gap.id, "working gap")?;
+                if !seen_ids.insert(gap.id.clone()) {
+                    anyhow::bail!("duplicate gap id in checkout overlay: {}", gap.id);
+                }
+                stamp_gap(&mut gap, &checkout.checkout_project_dir);
+                values.insert(
+                    gap.id.clone(),
+                    GapOverlayValue::Upsert {
+                        gap: Box::new(gap),
+                        content_hash: sha256(after),
+                    },
+                );
+            }
+            (Some(before), None) => {
+                let gap: GapNote = serde_json::from_slice(before)
+                    .with_context(|| format!("parsing baseline gap file {filename}"))?;
+                validate_filename_id(&filename, &gap.id, "baseline gap")?;
+                if published.contains_key(&filename) {
+                    values.insert(gap.id, GapOverlayValue::Tombstone);
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
+    let stamp = GapOverlayStamp {
+        published_scope: checkout.published_scope.clone(),
+        checkout_id: checkout.checkout_id.clone(),
+        published_ref: published_ref.to_string(),
+        publisher_commit,
+        checkout_head,
+        merge_base,
+        working_fingerprint,
+    };
+    let snapshot_id = snapshot_id(&stamp, &values);
+    Ok(GapOverlaySnapshot {
+        snapshot_id,
+        key: GapOverlayKey {
+            published_scope: checkout.published_scope.clone(),
+            checkout_id: checkout.checkout_id.clone(),
+        },
+        stamp: Some(stamp),
+        status: GapOverlayStatus::Valid,
+        values,
+        diagnostics: Vec::new(),
+    })
+}
+
+fn stamp_gap(gap: &mut GapNote, project: &str) {
+    gap.project = Some(project.to_string());
+    gap.write_dir = None;
+    gap.provisional_checkout_id = None;
+    if gap.updated_at.is_empty() {
+        gap.updated_at = gap.created_at.clone();
+    }
+}
+
+fn validate_filename_id(filename: &str, id: &str, label: &str) -> Result<()> {
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .with_context(|| format!("gap filename is not UTF-8: {filename}"))?;
+    if stem != id {
+        anyhow::bail!("{label} filename/id mismatch: {filename} contains id {id}");
+    }
+    Ok(())
+}
+
+fn gaps_tree_dir(scope: &PublishedScope) -> String {
+    if scope.bbox_root_relpath == "." {
+        ".bbox/gaps".to_string()
+    } else {
+        format!("{}/.bbox/gaps", scope.bbox_root_relpath)
+    }
+}
+
+fn read_committed_map(
+    root: &Path,
+    commit: &str,
+    tree_dir: &str,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    let prefix = format!("{tree_dir}/");
+    let mut files = BTreeMap::new();
+    for repo_path in git::list_committed_dir_result(root, commit, tree_dir)? {
+        let Some(filename) = repo_path.strip_prefix(&prefix) else {
+            continue;
+        };
+        if filename.contains('/') || !filename.ends_with(".json") {
+            continue;
+        }
+        let bytes = git::read_committed_file_bytes(root, commit, &repo_path)
+            .with_context(|| format!("reading committed gap file {repo_path} at {commit}"))?;
+        files.insert(filename.to_string(), bytes);
+    }
+    Ok(files)
+}
+
+fn read_working_map(project_root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+    let dir = project_root.join(".bbox/gaps");
+    if !dir.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let mut files = BTreeMap::new();
+    for entry in std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| format!("gap filename is not UTF-8: {}", path.display()))?;
+        files.insert(filename.to_string(), std::fs::read(&path)?);
+    }
+    Ok(files)
+}
+
+fn fingerprint_map(files: &BTreeMap<String, Vec<u8>>) -> String {
+    let mut hasher = Sha256::new();
+    for (path, bytes) in files {
+        hasher.update(path.as_bytes());
+        hasher.update([0]);
+        hasher.update(bytes);
+        hasher.update([0xff]);
+    }
+    hex_digest(hasher.finalize())
+}
+
+fn snapshot_id(stamp: &GapOverlayStamp, values: &BTreeMap<String, GapOverlayValue>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"bbox-gap-overlay-v1\0");
+    hasher.update(serde_json::to_vec(stamp).unwrap_or_default());
+    for (id, value) in values {
+        hasher.update((id.len() as u64).to_be_bytes());
+        hasher.update(id.as_bytes());
+        match value {
+            GapOverlayValue::Upsert { content_hash, .. } => {
+                hasher.update([1]);
+                hasher.update(content_hash.as_bytes());
+            }
+            GapOverlayValue::Tombstone => hasher.update([2]),
+        }
+    }
+    hex_digest(hasher.finalize())
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex_digest(hasher.finalize())
+}
+
+fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
+    bytes
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gaps::{BlockingLevel, GapImpact, GapKind, GapResolution};
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn gap(id: &str, title: &str) -> GapNote {
+        GapNote {
+            id: id.into(),
+            title: title.into(),
+            gap_kind: GapKind::Tooling,
+            domain: "overlay-test".into(),
+            wanted_capability: "preserve checkout-local gap state".into(),
+            missing_primitive: None,
+            fallback_used: None,
+            evidence: Vec::new(),
+            impact: GapImpact::Medium,
+            blocking_level: BlockingLevel::WorkaroundAvailable,
+            dedupe_key: format!("tooling/overlay-test/{id}"),
+            suggested_owner: None,
+            notes: None,
+            supersedes: None,
+            superseded_by: None,
+            resolution: GapResolution::Unresolved,
+            project: None,
+            write_dir: None,
+            provisional_checkout_id: None,
+            task_id: None,
+            session_id: None,
+            provider: None,
+            bro: None,
+            thread_id: None,
+            created_at: "2026-07-21T00:00:00Z".into(),
+            updated_at: "2026-07-21T00:00:00Z".into(),
+            resolved_at: None,
+            resolution_note: None,
+        }
+    }
+
+    fn write_gap(root: &Path, gap: &GapNote) {
+        let dir = root.join(".bbox/gaps");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{}.json", gap.id)),
+            serde_json::to_vec_pretty(gap).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn overlay_captures_gap_upserts_and_tombstones() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("repo");
+        std::fs::create_dir_all(&base).unwrap();
+        git(&base, &["init", "-q", "-b", "main"]);
+        git(&base, &["config", "user.email", "test@example.com"]);
+        git(&base, &["config", "user.name", "Test"]);
+        write_gap(&base, &gap("gap-11111111", "old"));
+        write_gap(&base, &gap("gap-22222222", "remove"));
+        git(&base, &["add", ".bbox/gaps"]);
+        git(&base, &["commit", "-q", "-m", "seed"]);
+
+        let worktree = temp.path().join("worktree");
+        git(
+            &base,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        write_gap(&worktree, &gap("gap-11111111", "changed"));
+        write_gap(&worktree, &gap("gap-33333333", "new"));
+        std::fs::remove_file(worktree.join(".bbox/gaps/gap-22222222.json")).unwrap();
+
+        let checkout = ResolvedCheckoutScope {
+            published_scope: PublishedScope {
+                repo_id: "repo".into(),
+                bbox_root_relpath: ".".into(),
+            },
+            checkout_id: "checkout".into(),
+            checkout_dir: worktree.to_string_lossy().into_owned(),
+            checkout_project_dir: worktree.to_string_lossy().into_owned(),
+            branch_ref: Some("refs/heads/feature".into()),
+        };
+        let snapshot = recompute_overlay(&base, "refs/heads/main", &checkout);
+        assert_eq!(snapshot.status, GapOverlayStatus::Valid, "{snapshot:?}");
+        assert!(matches!(
+            snapshot.values.get("gap-11111111"),
+            Some(GapOverlayValue::Upsert { .. })
+        ));
+        assert!(matches!(
+            snapshot.values.get("gap-33333333"),
+            Some(GapOverlayValue::Upsert { .. })
+        ));
+        assert!(matches!(
+            snapshot.values.get("gap-22222222"),
+            Some(GapOverlayValue::Tombstone)
+        ));
+        assert_eq!(snapshot.snapshot_id.len(), 64);
+
+        write_gap(&base, &gap("gap-11111111", "changed"));
+        std::fs::remove_file(base.join(".bbox/gaps/gap-22222222.json")).unwrap();
+        git(&base, &["add", ".bbox/gaps"]);
+        git(&base, &["commit", "-q", "-m", "promote"]);
+        let promoted = recompute_overlay(&base, "refs/heads/main", &checkout);
+        assert_eq!(promoted.status, GapOverlayStatus::Valid);
+        assert!(!promoted.values.contains_key("gap-11111111"));
+        assert!(!promoted.values.contains_key("gap-22222222"));
+        assert!(promoted.values.contains_key("gap-33333333"));
+    }
+}

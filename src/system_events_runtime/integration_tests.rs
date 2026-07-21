@@ -92,6 +92,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
             .unwrap(),
         ),
         knowledge_overlays: RwLock::new(bbox_knowledge::overlay::KnowledgeOverlayStore::default()),
+        gap_overlays: RwLock::new(bbox_gaps::overlay::GapOverlayStore::default()),
         knowledge_published_cache: RwLock::new(Default::default()),
         packets: RwLock::new(packets),
         surface_decisions: crate::server::surface::SurfaceDecisionCache::default(),

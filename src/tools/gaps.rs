@@ -14,8 +14,25 @@ impl BlackboxServer {
     /// committed-file write target — for filing and for the resolve/update
     /// rewrites alike. Delegates to the store-shared resolution in
     /// [`BlackboxServer::resolve_project_write_scope`] (`src/tools/scope.rs`).
-    fn resolve_gap_project(&self, raw: &str) -> (String, Option<String>) {
-        self.resolve_project_write_scope(raw)
+    fn resolve_gap_project(
+        &self,
+        raw: &str,
+    ) -> anyhow::Result<(
+        String,
+        Option<String>,
+        Option<bbox_corpus_core::project_record::ResolvedCheckoutScope>,
+    )> {
+        let resolution = self.resolve_project_write(raw)?;
+        let durable_scope = resolution.durable_scope;
+        let checkout = resolution.checkout_scope;
+        let write_dir = checkout
+            .as_ref()
+            .map(|checkout| checkout.checkout_project_dir.clone())
+            .or(resolution.write_dir);
+        if let Some(checkout) = checkout.as_ref() {
+            self.register_dark_knowledge_checkout(checkout)?;
+        }
+        Ok((durable_scope, write_dir, checkout))
     }
 }
 
@@ -33,12 +50,27 @@ impl BlackboxServer {
         // under a flock. Run on the blocking pool, not a tokio worker.
         let server = self.clone();
         Self::run_blocking("bbox_gap", move || {
-            if let Some(raw) = p.project.clone().filter(|s| !s.trim().is_empty()) {
-                let (project, write_dir) = server.resolve_gap_project(&raw);
+            let mut checkout = None;
+            let raw_project = p
+                .project
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| {
+                    (p.scope.as_deref() != Some("global"))
+                        .then(|| server.authoritative_session_checkout())
+                        .flatten()
+                        .map(|checkout| checkout.checkout_project_dir.clone())
+                });
+            if let Some(raw) = raw_project {
+                let (project, write_dir, resolved_checkout) = server.resolve_gap_project(&raw)?;
                 p.project = Some(project);
                 p.write_dir = write_dir;
+                checkout = resolved_checkout;
             }
             let (id, created) = server.state.gaps.write().file(&p)?;
+            if let Some(checkout) = checkout.as_ref() {
+                server.refresh_dark_gap_overlay(checkout);
+            }
             if created {
                 Ok(format!("Gap {id} filed (dedupe_key={})", p.dedupe_key))
             } else {
@@ -56,21 +88,22 @@ impl BlackboxServer {
     )]
     pub(crate) fn bbox_gaps(&self, Parameters(p): Parameters<GapListParams>) -> CallToolResult {
         Self::run("bbox_gaps", || {
-            let normalized = p.project.as_deref().and_then(|proj| {
-                crate::projects::fleet_worktree_scope_and_dir(
-                    proj,
-                    &self.state.projects.read().list(),
-                )
-                .map(|(base, _worktree)| base)
-            });
-            match normalized {
-                Some(base) => {
-                    let mut p = p;
-                    p.project = Some(base);
-                    self.state.gaps.read().list_rendered(&p)
-                }
-                None => self.state.gaps.read().list_rendered(&p),
+            let mut p = p;
+            let requested_project = p.project.clone();
+            let view =
+                self.session_gap_view(requested_project.as_deref(), p.provisional.as_deref())?;
+            if let Some(base) = requested_project
+                .as_deref()
+                .and_then(|raw| self.rescope_project_filter_value(raw))
+            {
+                p.project = Some(base);
             }
+            let mut rendered = view.gaps.list_rendered(&p)?;
+            if !p.json.unwrap_or(false) && !view.diagnostics.is_empty() {
+                rendered.push_str("\n\nProvisional gap diagnostics:\n- ");
+                rendered.push_str(&view.diagnostics.join("\n- "));
+            }
+            Ok(rendered)
         })
     }
 
@@ -88,12 +121,27 @@ impl BlackboxServer {
             // path as filing so a recognized worktree redirects the rewritten
             // repo-owned file into the session's checkout. The gap's durable
             // project scope never changes; absent → today's behavior.
-            if let Some(raw) = p.project.clone().filter(|s| !s.trim().is_empty()) {
-                let (project, write_dir) = server.resolve_gap_project(&raw);
+            let mut checkout = None;
+            let raw_project = p
+                .project
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| {
+                    server
+                        .authoritative_session_checkout()
+                        .map(|checkout| checkout.checkout_project_dir.clone())
+                });
+            if let Some(raw) = raw_project {
+                let (project, write_dir, resolved_checkout) = server.resolve_gap_project(&raw)?;
                 p.project = Some(project);
                 p.write_dir = write_dir;
+                checkout = resolved_checkout;
             }
-            server.state.gaps.write().resolve(&p)
+            let result = server.state.gaps.write().resolve(&p)?;
+            if let Some(checkout) = checkout.as_ref() {
+                server.refresh_dark_gap_overlay(checkout);
+            }
+            Ok(result)
         })
         .await
     }
@@ -109,12 +157,27 @@ impl BlackboxServer {
         let server = self.clone();
         Self::run_blocking("bbox_gap_update", move || {
             // Same write-targeting resolution as bbox_gap_resolve.
-            if let Some(raw) = p.project.clone().filter(|s| !s.trim().is_empty()) {
-                let (project, write_dir) = server.resolve_gap_project(&raw);
+            let mut checkout = None;
+            let raw_project = p
+                .project
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| {
+                    server
+                        .authoritative_session_checkout()
+                        .map(|checkout| checkout.checkout_project_dir.clone())
+                });
+            if let Some(raw) = raw_project {
+                let (project, write_dir, resolved_checkout) = server.resolve_gap_project(&raw)?;
                 p.project = Some(project);
                 p.write_dir = write_dir;
+                checkout = resolved_checkout;
             }
-            server.state.gaps.write().update(&p)
+            let result = server.state.gaps.write().update(&p)?;
+            if let Some(checkout) = checkout.as_ref() {
+                server.refresh_dark_gap_overlay(checkout);
+            }
+            Ok(result)
         })
         .await
     }
@@ -266,6 +329,19 @@ mod tests {
             base_before,
             "base checkout copy must be untouched"
         );
+
+        let updated = server
+            .bbox_gap_update(Parameters(GapUpdateParams {
+                id: id.clone(),
+                notes: Some("follow-up in the same checkout".into()),
+                project: Some(wt_canon.to_string_lossy().into_owned()),
+                ..Default::default()
+            }))
+            .await;
+        assert_ne!(updated.is_error, Some(true), "update failed: {updated:?}");
+        let twice_mutated = std::fs::read_to_string(gap_file(&wt_canon, &id)).unwrap();
+        assert!(twice_mutated.contains("addressed"));
+        assert!(twice_mutated.contains("follow-up in the same checkout"));
     }
 
     /// (a, update flavor) update with project=<in-tree worktree> redirects too.
@@ -513,6 +589,9 @@ mod tests {
         run_git(&base, &["add", "."]);
         run_git(&base, &["commit", "-m", "init"]);
         let base_canon = base.canonicalize().unwrap();
+        crate::config::ensure_recorded_repo_id(&base_canon).unwrap();
+        run_git(&base, &["add", ".bbox/config.toml"]);
+        run_git(&base, &["commit", "-m", "record identity"]);
 
         let worktree = tmp.path().join("wt");
         run_git(
@@ -540,20 +619,49 @@ mod tests {
         let filed = server.bbox_gap(Parameters(gap_params(wt.clone()))).await;
         assert_ne!(filed.is_error, Some(true), "bbox_gap failed: {filed:?}");
 
-        let (id, project, write_dir) = {
-            let gaps = server.state.gaps.read();
-            let gap = gaps.all().first().expect("one gap").clone();
-            (gap.id, gap.project, gap.write_dir)
+        assert!(
+            server.state.gaps.read().all().is_empty(),
+            "checkout gap must not be retained in the central store"
+        );
+        let row = server
+            .state
+            .checkout_registry
+            .read()
+            .rows()
+            .iter()
+            .find(|row| row.checkout_dir == wt)
+            .cloned()
+            .expect("worktree registered for gap overlay");
+        let scope = row.published_scope().unwrap();
+        let snapshot = server
+            .state
+            .gap_overlays
+            .read()
+            .get(&scope, &row.checkout_id)
+            .cloned()
+            .expect("gap overlay published");
+        let id = snapshot.values.keys().next().unwrap().clone();
+        server.set_session_checkout_for_test(
+            scope,
+            row.checkout_id.clone(),
+            worktree_canon.clone(),
+        );
+        let gap = {
+            let view = server.session_gap_view(Some(&wt), Some("own")).unwrap();
+            view.gaps.all().first().expect("one own gap").clone()
         };
         assert_eq!(
-            project.as_deref(),
+            gap.project.as_deref(),
             Some(base_canon.to_string_lossy().as_ref()),
             "logical scope must be the registered base"
         );
+        assert!(
+            gap.write_dir.is_none(),
+            "read view must not expose a host-local redirect"
+        );
         assert_eq!(
-            write_dir.as_deref(),
-            Some(wt.as_str()),
-            "committed write target must be the worktree"
+            gap.provisional_checkout_id.as_deref(),
+            Some(row.checkout_id.as_str())
         );
         assert!(
             worktree_canon
@@ -572,8 +680,36 @@ mod tests {
             "gap must not be written into the base checkout"
         );
 
+        let updated = server
+            .bbox_gap_update(Parameters(GapUpdateParams {
+                id: id.clone(),
+                notes: Some("session-authoritative update".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert_ne!(updated.is_error, Some(true), "update failed: {updated:?}");
+        assert!(
+            std::fs::read_to_string(gap_file(&worktree_canon, &id))
+                .unwrap()
+                .contains("session-authoritative update")
+        );
+
+        let published = server.bbox_gaps(Parameters(GapListParams {
+            project: Some(wt.clone()),
+            provisional: Some("published".into()),
+            include_addressed: Some(true),
+            ..Default::default()
+        }));
+        assert_ne!(
+            published.is_error,
+            Some(true),
+            "published list failed: {published:?}"
+        );
+        assert!(format!("{:?}", published.content).contains("No gaps found"));
+
         let list = server.bbox_gaps(Parameters(GapListParams {
             project: Some(wt),
+            provisional: Some("own".into()),
             include_addressed: Some(true),
             ..Default::default()
         }));
