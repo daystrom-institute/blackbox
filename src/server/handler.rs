@@ -103,8 +103,7 @@ impl ServerHandler for BlackboxServer {
             if let Some(parts) = context.extensions.get::<http::request::Parts>() {
                 (
                     server::surface::extract_surface_from_uri(parts.uri.query()),
-                    server::surface::extract_query_param(parts.uri.query(), "project")
-                        .map(str::to_string),
+                    server::surface::extract_decoded_query_param(parts.uri.query(), "project"),
                 )
             } else {
                 ("default", None)

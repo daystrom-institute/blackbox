@@ -39,9 +39,10 @@ port will route to this instance automatically.
 
 ### State isolation
 
-Set `BLACKBOX_STATE_DIR` to a throwaway directory. All per-store path vars
-fall back to files under state_dir, so overriding just `BLACKBOX_STATE_DIR`
-is sufficient for full isolation:
+Set `BLACKBOX_STATE_DIR` to a throwaway directory. The daemon's per-store
+paths and vector store resolve below this directory. The launcher also sets
+isolated HOME and XDG directories because dependencies may resolve auxiliary
+state outside the daemon's explicit path configuration:
 
 | Env var | Default (relative to state_dir) | Effect |
 |---|---|---|
@@ -57,8 +58,9 @@ is sufficient for full isolation:
 | `BLACKBOX_ARTIFACTS_DIR` | `<state_dir>/artifacts` | Artifact catalog |
 | `BRO_HOME` | `<state_dir>/bro` | Bro orchestration state |
 
-The script sets only `BLACKBOX_STATE_DIR`; the rest inherit the default
-resolution under that root.
+The script sets `BLACKBOX_STATE_DIR`, isolated HOME/XDG directories, and the
+corpus paths below. The remaining store paths inherit the default resolution
+under the state root.
 
 ### Skipping heavy startup work
 
@@ -80,8 +82,9 @@ To avoid scanning the full prod transcript set, set a narrow or empty root:
 | `TRANSCRIPT_SEARCH_CODEX_ROOT` | Override Codex-specific transcript root |
 | `TRANSCRIPT_SEARCH_INDEX_PATH` | Override tantivy index directory (default: XDG data dir) |
 
-For a truly empty daemon, omit these — the daemon starts with no transcript
-data, which is fine for probing dispatch, fleet, and HTTP routes.
+The launcher points all three variables at empty directories below its
+throwaway state root. Omitting them can select host transcript roots or the
+host index through platform defaults.
 
 ### Config file selection
 
@@ -148,6 +151,15 @@ BBOX_PORT=7299 \
 BBOX_BIND=127.0.0.1 \
 BLACKBOX_MCP_NAME=blackbox-dev-throwaway \
 BLACKBOX_STATE_DIR=/tmp/blackbox-dev-throwaway \
+BLACKBOX_DEFAULTS_DIR=/path/to/transcript-search/system-defaults \
+TRANSCRIPT_SEARCH_INDEX_PATH=/tmp/blackbox-dev-throwaway/index \
+TRANSCRIPT_SEARCH_ROOTS=throwaway=/tmp/blackbox-dev-throwaway/transcripts \
+TRANSCRIPT_SEARCH_CODEX_ROOT=/tmp/blackbox-dev-throwaway/codex \
+HOME=/tmp/blackbox-dev-throwaway/home \
+XDG_CONFIG_HOME=/tmp/blackbox-dev-throwaway/config \
+XDG_CACHE_HOME=/tmp/blackbox-dev-throwaway/cache \
+XDG_DATA_HOME=/tmp/blackbox-dev-throwaway/data \
+XDG_STATE_HOME=/tmp/blackbox-dev-throwaway/xdg-state \
 BLACKBOX_REINDEX_INTERVAL_SECS=999999 \
 BLACKBOX_EDGE_INDEX_BOOT_REBUILD=false \
 RUST_LOG=blackbox=info \

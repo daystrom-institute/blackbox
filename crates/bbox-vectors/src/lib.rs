@@ -312,6 +312,12 @@ pub fn self_recall_probe(route: &str, sample_every: usize, k: usize) -> Result<O
 }
 
 pub fn default_vectors_dir() -> PathBuf {
+    if let Some(state_dir) = std::env::var_os("BLACKBOX_STATE_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        return state_dir.join("vectors");
+    }
     dirs::state_dir()
         .unwrap_or_else(|| {
             dirs::home_dir()

@@ -425,6 +425,36 @@ pub fn extract_query_param<'a>(query: Option<&'a str>, key: &str) -> Option<&'a 
     None
 }
 
+/// Decode a UTF-8 query parameter for consumers that treat the value as a
+/// filesystem selector. Invalid percent escapes fail closed.
+pub fn extract_decoded_query_param(query: Option<&str>, key: &str) -> Option<String> {
+    let raw = extract_query_param(query, key)?;
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = *bytes.get(index + 1)?;
+            let low = *bytes.get(index + 2)?;
+            decoded.push((hex_nibble(high)? << 4) | hex_nibble(low)?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1091,6 +1121,25 @@ mod tests {
         assert_eq!(extract_query_param(q, "missing"), None);
         // Empty values do not count as set.
         assert_eq!(extract_query_param(Some("project="), "project"), None);
+    }
+
+    #[test]
+    fn extract_decoded_project_accepts_encoded_paths_and_rejects_bad_escapes() {
+        assert_eq!(
+            extract_decoded_query_param(
+                Some("surface=default&project=%2Ftmp%2Frepo%20with%20spaces"),
+                "project"
+            ),
+            Some("/tmp/repo with spaces".into())
+        );
+        assert_eq!(
+            extract_decoded_query_param(Some("project=%2Ftmp%2Frepo%2"), "project"),
+            None
+        );
+        assert_eq!(
+            extract_decoded_query_param(Some("project=%FF"), "project"),
+            None
+        );
     }
 
     #[test]
