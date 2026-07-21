@@ -4677,7 +4677,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
     }
 
     #[test]
-    fn checkout_supersession_persists_both_decisions_in_one_transaction() {
+    fn base_supersession_persists_both_decisions_in_one_transaction() {
         let central = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         let root = repo.path().canonicalize().unwrap();
@@ -4737,10 +4737,14 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         assert_eq!(new_on_disk.status, Status::Active);
         assert!(
             kb.entry(&first.id)
-                .is_some_and(|entry| entry.status == Status::Active),
-            "checkout mutation must restore the published in-memory generation"
+                .is_some_and(|entry| entry.status == Status::Superseded),
+            "a base-carrier mutation must update the published in-memory generation"
         );
-        assert!(kb.entry(&second.id).is_none());
+        assert!(
+            kb.entry(&second.id)
+                .is_some_and(|entry| entry.status == Status::Active),
+            "a base-carrier mutation must retain the new published decision"
+        );
 
         let completed = root.join(".bbox/local/knowledge-transactions/completed");
         let manifests = std::fs::read_dir(completed)

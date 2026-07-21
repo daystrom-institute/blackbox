@@ -1188,7 +1188,7 @@ impl GapStore {
             return Ok(());
         };
         if let Some(project) = project
-            && project != owner
+            && !Self::project_authority_matches_owner(project, owner)
         {
             anyhow::bail!(
                 "gap {} belongs to project {owner}; supplied checkout authority is for {project}",
@@ -1201,6 +1201,19 @@ impl GapStore {
             );
         }
         Ok(())
+    }
+
+    fn project_authority_matches_owner(project: &str, owner: &str) -> bool {
+        if project == owner {
+            return true;
+        }
+        match (
+            Path::new(project).canonicalize(),
+            Path::new(owner).canonicalize(),
+        ) {
+            (Ok(project), Ok(owner)) => project.starts_with(owner),
+            _ => false,
+        }
     }
 
     pub fn resolve(&mut self, p: &GapResolveParams) -> Result<String> {

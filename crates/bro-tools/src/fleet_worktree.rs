@@ -2001,7 +2001,22 @@ fn phase_remove(req: &CloseoutRequest) -> PhaseResult {
     let base_repo = &req.base_repo;
     let worktree = &req.worktree;
     let branch = &req.branch;
-    let force = req.disposition == "discard";
+    let force = if req.disposition == "discard" {
+        true
+    } else {
+        match closeout_claim_is_only_worktree_change(worktree) {
+            Ok(force) => force,
+            Err(err) => {
+                return PhaseResult {
+                    phase: CloseoutPhase::Remove,
+                    repo_cwd: base_repo.clone(),
+                    ok: false,
+                    error_class: CloseoutErrorClass::RemoveFailed,
+                    content: json!({"error": format!("{err:#}")}),
+                };
+            }
+        }
+    };
     let mut remove_args: Vec<&str> = vec!["worktree", "remove"];
     if force {
         remove_args.push("--force");
@@ -2052,6 +2067,35 @@ fn phase_remove(req: &CloseoutRequest) -> PhaseResult {
         error_class: CloseoutErrorClass::None,
         content,
     }
+}
+
+/// A closeout claim is deliberately held until the worktree is gone, so a
+/// corpus writer cannot enter between candidate verification and removal. In
+/// repositories that do not yet carry `.bbox/local/.gitignore`, that claim is
+/// the one untracked path that makes ordinary `git worktree remove` refuse.
+/// Recheck immediately before removal and authorize `--force` only for that
+/// exact generated path. Any user or agent change remains a hard stop.
+fn closeout_claim_is_only_worktree_change(worktree: &Path) -> anyhow::Result<bool> {
+    let status = git_capture(
+        worktree,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
+    let changes = status
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    if changes.is_empty() {
+        return Ok(false);
+    }
+    const CLOSEOUT_CLAIM_STATUS: &str = "?? .bbox/local/knowledge-transactions/pending.json";
+    if changes.as_slice() == [CLOSEOUT_CLAIM_STATUS] {
+        return Ok(true);
+    }
+    anyhow::bail!(
+        "refusing to force-remove worktree {}; changes beyond the generated closeout claim are present:\n{}",
+        worktree.display(),
+        status.trim_end()
+    )
 }
 
 /// Delete the worktree branch and record the outcome on the Remove phase
@@ -3382,6 +3426,53 @@ mod tests {
         assert!(
             branch_exists(repo.path(), "bro-fleet/test-branch"),
             "non-discard closeout must keep unmerged branch"
+        );
+    }
+
+    #[test]
+    fn phase_remove_never_forces_past_user_changes() {
+        let repo = seed_repo();
+        let worktrees = tempfile::tempdir().unwrap();
+        let cwd = worktrees.path().join("wt-user-change");
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                cwd.to_str().unwrap(),
+                "-b",
+                "bro-fleet/user-change",
+            ],
+        );
+        let req = CloseoutRequest {
+            worktree: cwd.clone(),
+            base_repo: repo.path().canonicalize().unwrap(),
+            branch: "bro-fleet/user-change".to_string(),
+            target: "main".to_string(),
+            disposition: "merge".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+            dry_run: false,
+            closeout_hooks: None,
+        };
+        let claim = KnowledgeCloseoutClaim::acquire(&req).unwrap();
+        std::fs::write(cwd.join("untracked-user-note.txt"), "keep me\n").unwrap();
+
+        let result = phase_remove(&req);
+
+        assert!(!result.ok, "user changes must block forced removal");
+        assert!(cwd.exists(), "blocked removal must retain the worktree");
+        assert!(
+            result.content["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("changes beyond the generated closeout claim"))
+        );
+        drop(claim);
+        std::fs::remove_file(cwd.join("untracked-user-note.txt")).unwrap();
+        run_git(
+            repo.path(),
+            &["worktree", "remove", "--force", cwd.to_str().unwrap()],
         );
     }
 
