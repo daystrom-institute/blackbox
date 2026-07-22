@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -17,11 +18,27 @@ pub struct RefSizeParams {
     /// Entity refs to measure. Successful refs are returned in canonical form;
     /// unresolved refs retain the caller-supplied string for diagnosis.
     pub refs: Vec<String>,
-    /// Optional project root for resolving `file:` refs before falling back to
-    /// registered project roots. This lets workflow-local worktrees measure
-    /// newly-created files that have not been indexed under the canonical repo.
+    /// Optional exact project or checkout root used by the daemon adapter when
+    /// selecting checkout authority for relative `file:` refs. This lower
+    /// module never opens the directory directly.
     pub project_dir: Option<String>,
 }
+
+/// Caller-resolved filesystem input for one `file:` ref. The daemon must keep
+/// the lease that produced this path alive for the complete `ref_size` call.
+/// This lower layer deliberately has no project registry or checkout authority.
+#[derive(Debug, Clone)]
+pub struct ValidatedFileInput {
+    pub file_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub enum FileInputResolution {
+    Validated(ValidatedFileInput),
+    Rejected(String),
+}
+
+pub type ValidatedFileInputs = HashMap<String, FileInputResolution>;
 
 #[derive(Debug, Clone, Serialize)]
 struct RefSizeEntry {
@@ -40,12 +57,20 @@ struct UnresolvedRef {
 }
 
 pub fn ref_size(p: &RefSizeParams, ctx: &ProviderContext<'_>) -> Result<String> {
+    ref_size_with_validated_files(p, ctx, &ValidatedFileInputs::new())
+}
+
+pub fn ref_size_with_validated_files(
+    p: &RefSizeParams,
+    ctx: &ProviderContext<'_>,
+    validated_files: &ValidatedFileInputs,
+) -> Result<String> {
     let omitted_refs = p.refs.len().saturating_sub(REF_CAP);
     let mut per_ref = Vec::new();
     let mut unresolved_refs = Vec::new();
 
     for raw in p.refs.iter().take(REF_CAP) {
-        match size_one_ref(raw, ctx, p.project_dir.as_deref()) {
+        match size_one_ref(raw, ctx, validated_files) {
             Ok(entry) => per_ref.push(entry),
             Err(err) => unresolved_refs.push(UnresolvedRef {
                 entity_ref: raw.clone(),
@@ -76,7 +101,7 @@ pub fn ref_size(p: &RefSizeParams, ctx: &ProviderContext<'_>) -> Result<String> 
 fn size_one_ref(
     raw: &str,
     ctx: &ProviderContext<'_>,
-    project_dir: Option<&str>,
+    validated_files: &ValidatedFileInputs,
 ) -> Result<RefSizeEntry> {
     let entity_ref = EntityRef::parse(raw)?;
     let (bytes, source) = match entity_ref.entity_type() {
@@ -95,7 +120,7 @@ fn size_one_ref(
             let EntityRef::File { path } = &entity_ref else {
                 unreachable!();
             };
-            size_file_ref(ctx, path, project_dir)?
+            size_file_ref(path, validated_files)?
         }
         _ => {
             let view = entity_loader::load(ctx, &entity_ref)?;
@@ -119,52 +144,17 @@ fn size_one_ref(
     })
 }
 
-fn size_file_ref(
-    ctx: &ProviderContext<'_>,
-    path: &str,
-    project_dir: Option<&str>,
-) -> Result<(u64, &'static str)> {
-    if let Some(project_dir) = project_dir {
-        if let Ok(entry) = size_file_from_project_dir(path, project_dir) {
-            return Ok(entry);
-        }
-    }
-
-    let resolved = bbox_providers::providers::file::resolve_file(ctx, path)?;
-    Ok((resolved.content.len() as u64, "file_content"))
-}
-
-fn size_file_from_project_dir(path: &str, project_dir: &str) -> Result<(u64, &'static str)> {
-    let project_root = fs::canonicalize(project_dir)
-        .with_context(|| format!("canonicalizing project_dir {project_dir}"))?;
-    if !project_root.is_dir() {
-        bail!(
-            "project_dir `{}` is not a directory",
-            project_root.display()
-        );
-    }
-
-    let raw = Path::new(path);
-    let candidate = if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        project_root.join(raw)
+fn size_file_ref(path: &str, validated_files: &ValidatedFileInputs) -> Result<(u64, &'static str)> {
+    let input = validated_files.get(path).ok_or_else(|| {
+        anyhow!("error.checkout_access_required: file ref has no validated checkout attachment")
+    })?;
+    let input = match input {
+        FileInputResolution::Validated(input) => input,
+        FileInputResolution::Rejected(error) => return Err(anyhow!(error.clone())),
     };
-    let canonical = fs::canonicalize(&candidate)
-        .with_context(|| format!("canonicalizing file {}", candidate.display()))?;
-    if !canonical.starts_with(&project_root) {
-        bail!(
-            "file ref `{}` is outside project_dir {}",
-            path,
-            project_root.display()
-        );
-    }
-    if !canonical.is_file() {
-        bail!("file ref `{}` is not a file", path);
-    }
-
-    let content =
-        fs::read(&canonical).with_context(|| format!("reading file {}", canonical.display()))?;
+    let content = fs::read(&input.file_path).map_err(|_| {
+        anyhow!("error.checkout_io_failed: validated checkout file could not be read")
+    })?;
     Ok((content.len() as u64, "file_content"))
 }
 
@@ -218,6 +208,30 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn raw_project_dir_never_grants_lower_layer_file_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("secret.txt");
+        std::fs::write(&file, "must not be read").unwrap();
+        let ctx = ProviderContext::empty_for_tests();
+        let out = ref_size(
+            &RefSizeParams {
+                refs: vec![format!("file:{}", file.display())],
+                project_dir: Some(dir.path().to_string_lossy().into_owned()),
+            },
+            &ctx,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["status"], "degraded");
+        assert!(
+            value["degraded"]["unresolved_refs"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("error.checkout_access_required")
         );
     }
 

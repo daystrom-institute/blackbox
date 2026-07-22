@@ -8,7 +8,6 @@ use crate::config;
 use crate::edge_index;
 use crate::index;
 use crate::mcp_tools;
-use crate::mcp_tools::provenance::ProvenanceParams;
 use crate::orchestration;
 use crate::projects::{
     ProjectEjectParams, ProjectInitParams, ProjectListResponse, ProjectRegisterParams,
@@ -23,6 +22,11 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router};
 use serde_json::json;
+
+use bbox_indexing::checkout_access::{
+    CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest, CheckoutAccessSourceLane,
+    CheckoutAttachmentSelector,
+};
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::projects_tools()
@@ -244,14 +248,75 @@ impl BlackboxServer {
                 }
             }
             let edges_dir = edge_index::edges_dir_from_bro_store(&server.state.store_dir);
-            let provenance_params = ProvenanceParams {
-                project_id: Some(record.project_id.clone()),
+            let broker = crate::server::checkout_access::checkout_access_broker(&server.state);
+            let scope_discovery_lease = broker
+                .acquire(CheckoutAccessRequest {
+                    project_id: record.project_id.clone(),
+                    attachment: CheckoutAttachmentSelector::Selected,
+                    expected_scope: None,
+                    kind: CheckoutAccessKind::PublisherConfigTreeRead,
+                    intent: CheckoutAccessIntent::Read,
+                    source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+                })
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "error.checkout_access.{}: {}",
+                        error.code.as_str(),
+                        error.diagnostic
+                    )
+                })?;
+            let expected_scope = scope_discovery_lease.published_scope().cloned();
+            let provenance_lease = broker
+                .acquire(CheckoutAccessRequest {
+                    project_id: record.project_id.clone(),
+                    attachment: CheckoutAttachmentSelector::Selected,
+                    expected_scope,
+                    kind: CheckoutAccessKind::ProvenanceNoteIo,
+                    intent: CheckoutAccessIntent::Read,
+                    source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+                })
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "error.checkout_access.{}: {}",
+                        error.code.as_str(),
+                        error.diagnostic
+                    )
+                })?;
+            drop(scope_discovery_lease);
+            let provenance_project = mcp_tools::provenance::ProvenanceProject {
+                project_id: record.project_id.clone(),
+                project_root: provenance_lease.project_root().to_path_buf(),
             };
+            let resolve_legacy_target =
+                |project_id: &str,
+                 root: &Path,
+                 absolute_path: &Path,
+                 byte_range: Option<(u64, u64)>| {
+                    if project_id != record.project_id {
+                        anyhow::bail!(
+                            "error.project_mismatch: provenance target belongs to another project"
+                        );
+                    }
+                    bbox_indexing::index::resolve_current_project_chunk_entity(
+                        &record,
+                        root,
+                        absolute_path,
+                        byte_range,
+                    )
+                };
             mcp_tools::provenance::import_provenance_to_edges_dir(
-                &provenance_params,
-                std::slice::from_ref(&record),
+                std::slice::from_ref(&provenance_project),
                 &edges_dir,
+                &resolve_legacy_target,
             )?;
+            broker.revalidate(&provenance_lease).map_err(|error| {
+                anyhow::anyhow!(
+                    "error.checkout_access.{}: {}",
+                    error.code.as_str(),
+                    error.diagnostic
+                )
+            })?;
+            drop(provenance_lease);
             // Register with the live .bbox/ watcher so future file changes
             // are picked up without a daemon restart.
             if let Ok(mut guard) = server.state.bbox_watcher.lock() {
