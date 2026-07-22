@@ -1196,13 +1196,14 @@ mod tests {
         state.kb.write().upsert_generated(second_entry).unwrap();
 
         let server = BlackboxServer::new(state);
+        let compatibility_diagnostic =
+            "legacy_compatibility knowledge rows have no provable built_from stamp";
         let aggregate = server.session_knowledge_view(None, None).unwrap();
         assert!(aggregate.knowledge.entry("first-legacy").is_some());
         assert!(aggregate.knowledge.entry("second-legacy").is_some());
-        assert!(
-            aggregate.diagnostics.is_empty(),
-            "{:?}",
-            aggregate.diagnostics
+        assert_eq!(
+            aggregate.diagnostics,
+            vec![compatibility_diagnostic.to_owned()]
         );
 
         let explicit = server
@@ -1213,10 +1214,9 @@ mod tests {
             explicit.knowledge.entry("second-legacy").is_none(),
             "an explicit read must not expose another registered legacy scope"
         );
-        assert!(
-            explicit.diagnostics.is_empty(),
-            "{:?}",
-            explicit.diagnostics
+        assert_eq!(
+            explicit.diagnostics,
+            vec![compatibility_diagnostic.to_owned()]
         );
     }
 }
