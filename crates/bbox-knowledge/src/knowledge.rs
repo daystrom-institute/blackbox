@@ -3426,7 +3426,20 @@ impl Knowledge {
     /// Bootstrap: scan a project for existing instruction files and return their
     /// contents for the agent to decompose into PROJECT.md + knowledge entries.
     pub fn bootstrap(&self, p: &BootstrapParams) -> Result<String> {
+        self.bootstrap_with_scope(p, None)
+    }
+
+    /// Bootstrap using a separately resolved durable project scope for the
+    /// existing-entry check while continuing to scan the caller's checkout.
+    /// Managed worktrees write and read knowledge under the registered base
+    /// path, but their instruction files remain checkout-local.
+    pub fn bootstrap_with_scope(
+        &self,
+        p: &BootstrapParams,
+        scope_project: Option<&str>,
+    ) -> Result<String> {
         let project_dir = p.project.as_str();
+        let scope_project = scope_project.unwrap_or(project_dir);
         let dir = Path::new(project_dir);
         if !dir.exists() {
             anyhow::bail!("project directory does not exist: {project_dir}");
@@ -3442,7 +3455,7 @@ impl Knowledge {
             .filter(|e| {
                 e.status == Status::Active
                     && e.scope == Scope::Project
-                    && e.project.as_deref() == Some(project_dir)
+                    && e.project.as_deref() == Some(scope_project)
             })
             .count();
 

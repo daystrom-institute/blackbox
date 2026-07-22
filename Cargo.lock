@@ -587,11 +587,13 @@ dependencies = [
  "bbox-embed",
  "bbox-indexing",
  "bbox-knowledge",
+ "bbox-provenance",
  "bbox-providers",
  "bbox-system-memory",
  "bbox-util",
  "bbox-vectors",
  "chrono",
+ "hex",
  "rmcp",
  "schemars 0.8.22",
  "serde",
@@ -615,6 +617,21 @@ dependencies = [
  "strum 0.26.3",
  "tempfile",
  "tracing",
+]
+
+[[package]]
+name = "bbox-provenance"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-config",
+ "bbox-corpus-core",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1019,6 +1036,7 @@ name = "bro-cli"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bbox-provenance",
  "bro-fleet-client",
  "clap",
  "crossterm",

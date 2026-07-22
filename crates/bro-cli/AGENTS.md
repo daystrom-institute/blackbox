@@ -82,11 +82,23 @@ verify shapes against code, but do not violate these without explicit design.
     cockpit auto-reruns the fold as adopt.
   - Base-repo state (diverged from origin, terminal push failures): the
     OPERATOR's history, the operator's call. The agent is resumed
-    assess-only (inspect read-only, summarize, recommend, flag needs-input)
-    and nothing mutates or auto-retries.
+  assess-only (inspect read-only, summarize, recommend, flag needs-input)
+  and nothing mutates or auto-retries.
 - Pending handshakes are polled on task-status turn boundaries; a failed
   resume must abort the pending handshake loudly (otherwise the poll fires
   against the old task's stale last message).
+
+## Checkout-local composites
+
+- A CLI composite may combine a typed MCP result with checkout-local work,
+  but it must not link the daemon runtime. Shared validation and write logic
+  belongs in a dependency-clean leaf such as `bbox-provenance`.
+- Canonicalize an explicit checkout root before MCP initialization and pass it
+  as session transport context. Tool arguments must not provide a second
+  project selector that can disagree with the admitted session checkout.
+- Generation-bound pagination must restart from page one on the daemon's
+  structured stale-generation error. Local application must be idempotent so
+  a written prefix remains safe during that restart.
 
 ## UX defaults
 

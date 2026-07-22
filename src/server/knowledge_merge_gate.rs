@@ -77,24 +77,110 @@ fn discover_project_roots(tree: &Path) -> Result<Vec<PathBuf>> {
         {
             let entry = entry?;
             let file_type = entry.file_type()?;
-            if !file_type.is_dir() || file_type.is_symlink() {
-                continue;
-            }
             let path = entry.path();
             if entry.file_name() == ".bbox" {
+                reject_candidate_symlink(tree, &path)?;
+                if !file_type.is_dir() {
+                    continue;
+                }
+                reject_symlinks_beneath(tree, &path.join("knowledge"))?;
+                reject_symlinks_beneath(tree, &path.join("gaps"))?;
                 if path.join("config.toml").is_file() || path.join("knowledge").is_dir() {
                     if let Some(project) = path.parent() {
+                        for provider_file in ["AGENTS.md", "CLAUDE.md", "GEMINI.md"] {
+                            reject_candidate_symlink(tree, &project.join(provider_file))?;
+                        }
                         roots.push(project.to_path_buf());
                     }
                 }
                 continue;
             }
-            pending.push(path);
+            if file_type.is_dir() && !file_type.is_symlink() {
+                pending.push(path);
+            }
         }
     }
     roots.sort();
     roots.dedup();
     Ok(roots)
+}
+
+#[allow(clippy::disallowed_methods)]
+fn reject_symlinks_beneath(candidate_root: &Path, path: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "inspecting candidate path {}",
+                    candidate_relative_path(candidate_root, path)
+                )
+            });
+        }
+    };
+    reject_candidate_symlink_with_metadata(candidate_root, path, &metadata)?;
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(path).with_context(|| {
+        format!(
+            "reading candidate directory {}",
+            candidate_relative_path(candidate_root, path)
+        )
+    })? {
+        let entry = entry?;
+        let child = entry.path();
+        let metadata = std::fs::symlink_metadata(&child).with_context(|| {
+            format!(
+                "inspecting candidate path {}",
+                candidate_relative_path(candidate_root, &child)
+            )
+        })?;
+        reject_candidate_symlink_with_metadata(candidate_root, &child, &metadata)?;
+        if metadata.is_dir() {
+            reject_symlinks_beneath(candidate_root, &child)?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::disallowed_methods)]
+fn reject_candidate_symlink(candidate_root: &Path, path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => reject_candidate_symlink_with_metadata(candidate_root, path, &metadata),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "inspecting candidate path {}",
+                candidate_relative_path(candidate_root, path)
+            )
+        }),
+    }
+}
+
+fn reject_candidate_symlink_with_metadata(
+    candidate_root: &Path,
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<()> {
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "candidate path contains symlink: {}",
+            candidate_relative_path(candidate_root, path)
+        );
+    }
+    Ok(())
+}
+
+fn candidate_relative_path(candidate_root: &Path, path: &Path) -> String {
+    let relative = path.strip_prefix(candidate_root).unwrap_or(path);
+    let rendered = relative.to_string_lossy().replace('\\', "/");
+    if rendered.is_empty() {
+        ".".to_string()
+    } else {
+        rendered
+    }
 }
 
 #[cfg(test)]
@@ -192,5 +278,52 @@ mod tests {
         let stale = evaluate(&candidate(&root)).unwrap();
         assert!(!stale.ok);
         assert_eq!(stale.content["render_mismatches"], serde_json::json!(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_gate_rejects_repo_owned_and_provider_symlinks_without_target_disclosure() {
+        use std::os::unix::fs::symlink;
+
+        for candidate_path in [
+            ".bbox/knowledge/rule.json",
+            ".bbox/gaps/gap.json",
+            "AGENTS.md",
+            "CLAUDE.md",
+            "GEMINI.md",
+        ] {
+            let repo = tempfile::tempdir().unwrap();
+            let root = repo.path().canonicalize().unwrap();
+            git(&root, &["init", "-q", "-b", "main"]);
+            git(&root, &["config", "user.email", "test@example.com"]);
+            git(&root, &["config", "user.name", "Test"]);
+            std::fs::create_dir_all(root.join(".bbox/knowledge")).unwrap();
+            std::fs::create_dir_all(root.join(".bbox/gaps")).unwrap();
+            std::fs::write(
+                root.join(".bbox/config.toml"),
+                "[project]\nrepo_id = \"merge-gate-symlink-fixture\"\n",
+            )
+            .unwrap();
+            let link = root.join(candidate_path);
+            if let Some(parent) = link.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            symlink("../../outside-secret", &link).unwrap();
+            git(&root, &["add", "."]);
+            git(&root, &["commit", "-q", "-m", "candidate symlink"]);
+
+            let err = evaluate(&candidate(&root)).unwrap_err();
+            let diagnostic = format!("{err:#}");
+            assert!(
+                diagnostic.contains(&format!(
+                    "candidate path contains symlink: {candidate_path}"
+                )),
+                "{candidate_path}: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains("outside-secret"),
+                "symlink target leaked for {candidate_path}: {diagnostic}"
+            );
+        }
     }
 }

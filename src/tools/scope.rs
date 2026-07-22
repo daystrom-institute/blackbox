@@ -125,6 +125,7 @@ impl BlackboxServer {
                     let branch_ref = bbox_corpus_core::git::current_branch(&checkout_dir)
                         .map(|branch| format!("refs/heads/{branch}"));
                     Some(ResolvedCheckoutScope {
+                        project_id: record.project_id.clone(),
                         published_scope: PublishedScope {
                             repo_id,
                             bbox_root_relpath: relpath,

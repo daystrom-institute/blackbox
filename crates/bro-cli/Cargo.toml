@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 bro-fleet-client = { path = "../bro-fleet-client" }
+bbox-provenance = { path = "../bbox-provenance" }
 
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.28"

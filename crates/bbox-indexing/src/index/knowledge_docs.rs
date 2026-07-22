@@ -239,9 +239,39 @@ pub fn reindex_knowledge_store_standalone(
                 continue;
             }
         };
+        let Some(commit) = bbox_corpus_core::git::resolve_commit(root, &pin.branch_ref) else {
+            tracing::warn!(
+                scope = ?scope,
+                published_ref = %pin.branch_ref,
+                "knowledge reindex omitted unresolved publisher ref"
+            );
+            continue;
+        };
+        let pinned_inputs = match bbox_config::config::read_repo_id_inputs_at_ref(root, &commit) {
+            Ok(inputs) => inputs,
+            Err(err) => {
+                tracing::warn!(
+                    scope = ?scope,
+                    published_ref = %pin.branch_ref,
+                    error = %err,
+                    "knowledge reindex omitted publisher with unreadable committed authority"
+                );
+                continue;
+            }
+        };
+        if crate::publisher::project_published_scope(project, |_| pinned_inputs.clone()).as_ref()
+            != Some(&scope)
+        {
+            tracing::warn!(
+                scope = ?scope,
+                published_ref = %pin.branch_ref,
+                "knowledge reindex omitted publisher whose pinned config changed scope"
+            );
+            continue;
+        }
         let published = match load_published_snapshot(
             root,
-            &pin.branch_ref,
+            &commit,
             &scope,
             &project.canonical_path,
         ) {

@@ -635,6 +635,7 @@ mod tests {
             bbox_root_relpath: ".".into(),
         };
         let checkout = ResolvedCheckoutScope {
+            project_id: "test-project".into(),
             published_scope: scope,
             checkout_id: "checkout".into(),
             checkout_dir: worktree.to_string_lossy().into_owned(),
@@ -687,6 +688,7 @@ mod tests {
         write_entry(&worktree, &entry("same", "promoted"));
 
         let checkout = ResolvedCheckoutScope {
+            project_id: "test-project".into(),
             published_scope: PublishedScope {
                 repo_id: "repo".into(),
                 bbox_root_relpath: ".".into(),
@@ -731,6 +733,7 @@ mod tests {
         run(&base, &["commit", "-q", "-m", "publish deletion"]);
 
         let checkout = ResolvedCheckoutScope {
+            project_id: "test-project".into(),
             published_scope: PublishedScope {
                 repo_id: "repo".into(),
                 bbox_root_relpath: ".".into(),
@@ -773,6 +776,7 @@ mod tests {
         let worktree_project = worktree.join("services/web");
         write_entry(&worktree_project, &entry("web", "changed"));
         let checkout = ResolvedCheckoutScope {
+            project_id: "test-project".into(),
             published_scope: PublishedScope {
                 repo_id: "repo".into(),
                 bbox_root_relpath: "services/web".into(),
@@ -794,6 +798,7 @@ mod tests {
     #[test]
     fn invalid_snapshot_replaces_previous_valid_state() {
         let checkout = ResolvedCheckoutScope {
+            project_id: "test-project".into(),
             published_scope: PublishedScope {
                 repo_id: "repo".into(),
                 bbox_root_relpath: ".".into(),
@@ -819,6 +824,7 @@ mod tests {
     #[test]
     fn stale_refresh_cannot_overwrite_newer_snapshot() {
         let checkout = ResolvedCheckoutScope {
+            project_id: "test-project".into(),
             published_scope: PublishedScope {
                 repo_id: "repo".into(),
                 bbox_root_relpath: ".".into(),

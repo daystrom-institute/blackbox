@@ -598,6 +598,28 @@ impl EmbedQueueHandle {
         Self::start_default_with_optional_store(None)
     }
 
+    /// Build an isolated single-route queue for cross-crate tests.
+    ///
+    /// The production process always uses the configured router constructors
+    /// above. This constructor deliberately requires both an explicit provider
+    /// and an explicit vector store so regression tests cannot fall through to
+    /// operator configuration or the process-global vector store.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn isolated_for_test(
+        route: &str,
+        provider: Arc<dyn EmbeddingProvider>,
+        vector_store: Arc<bbox_vectors::VectorStore>,
+    ) -> Self {
+        Self::from_providers(
+            vec![(route.to_string(), provider, None, route.to_string())],
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+            None,
+            Some(vector_store),
+        )
+    }
+
     fn start_default_with_optional_store(
         vector_store: Option<Arc<bbox_vectors::VectorStore>>,
     ) -> Self {

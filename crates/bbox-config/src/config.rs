@@ -798,13 +798,34 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
     })
 }
 
+/// Load mutable working-tree project configuration for editing and
+/// checkout-local operational behavior. Live identity and alias authority
+/// must use [`load_project_at_ref`].
 pub fn load_project(project_root: &Path) -> Result<ProjectConfig> {
     let config_path = project_root.join(".bbox").join("config.toml");
     if !config_path.exists() {
         return Ok(ProjectConfig::default());
     }
-    let raw: ProjectConfig = Figment::new().merge(Toml::file(config_path)).extract()?;
-    Ok(raw)
+    let source = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("reading {}", config_path.display()))?;
+    parse_project_config(&source).with_context(|| format!("parsing {}", config_path.display()))
+}
+
+fn parse_project_config(source: &str) -> Result<ProjectConfig> {
+    Figment::new()
+        .merge(Toml::string(source))
+        .extract()
+        .map_err(anyhow::Error::from)
+}
+
+/// Load project configuration from the immutable commit named by `reference`.
+/// Live identity and alias authority must use this reader rather than working
+/// tree bytes.
+pub fn load_project_at_ref(project_root: &Path, reference: &str) -> Result<ProjectConfig> {
+    let (source, config_relpath, commit) =
+        committed_project_config_source(project_root, reference)?;
+    parse_project_config(&source)
+        .with_context(|| format!("parsing committed project config {config_relpath}@{commit}"))
 }
 
 /// Result of ensuring the committed repo-family authority in project config.
@@ -915,9 +936,77 @@ pub fn ensure_recorded_repo_id(project_root: &Path) -> Result<RecordedRepoId> {
     })
 }
 
-/// Gather the durable `repo_id` resolution inputs for a project root by
-/// reading its committed `.bbox/config.toml` `[project]` table and pairing the
-/// recorded authority with the bootstrap-computed hint.
+/// Gather repo-id inputs from the working tree.
+///
+/// This reader is for editing and initialization flows that intentionally need
+/// uncommitted bytes. Live authority decisions must use
+/// [`read_repo_id_inputs_at_ref`] or [`read_repo_id_inputs`].
+pub fn read_working_tree_repo_id_inputs(
+    project_root: &Path,
+) -> bbox_corpus_core::identity::RepoIdInputs {
+    let project = load_project(project_root)
+        .map(|c| c.project)
+        .unwrap_or_default();
+    repo_id_inputs(project_root, project)
+}
+
+/// Gather the durable `repo_id` resolution inputs from the version of
+/// `.bbox/config.toml` committed at `reference`.
+///
+/// The ref is first resolved to a full commit, then the config is read from
+/// that immutable commit. Missing or malformed committed config fails closed.
+/// The computed id remains only a bootstrap hint; callers establishing live
+/// authority must continue to use `resolve_recorded_repo_id`.
+pub fn read_repo_id_inputs_at_ref(
+    project_root: &Path,
+    reference: &str,
+) -> Result<bbox_corpus_core::identity::RepoIdInputs> {
+    let project = load_project_at_ref(project_root, reference)?.project;
+    Ok(repo_id_inputs(project_root, project))
+}
+
+fn committed_project_config_source(
+    project_root: &Path,
+    reference: &str,
+) -> Result<(String, String, String)> {
+    let git_root = bbox_corpus_core::git::git_root_for_path(project_root)
+        .with_context(|| format!("{} is not inside a git repository", project_root.display()))?;
+    let commit =
+        bbox_corpus_core::git::resolve_commit(&git_root, reference).with_context(|| {
+            format!(
+                "project authority ref {reference} does not resolve to a commit in {}",
+                git_root.display()
+            )
+        })?;
+    let bbox_root_relpath = bbox_corpus_core::identity::bbox_root_relpath(&git_root, project_root)
+        .with_context(|| {
+            format!(
+                "project root {} is outside git root {}",
+                project_root.display(),
+                git_root.display()
+            )
+        })?;
+    let config_relpath = if bbox_root_relpath == "." {
+        ".bbox/config.toml".to_string()
+    } else {
+        format!("{bbox_root_relpath}/.bbox/config.toml")
+    };
+    let bytes =
+        bbox_corpus_core::git::read_committed_file_bytes(&git_root, &commit, &config_relpath)
+            .with_context(|| {
+                format!("committed project config {config_relpath} is missing at {commit}")
+            })?;
+    let source = String::from_utf8(bytes)
+        .with_context(|| format!("decoding committed project config {config_relpath}@{commit}"))?;
+    Ok((source, config_relpath, commit))
+}
+
+/// Gather live repo-id inputs from committed `HEAD`.
+///
+/// This preserves the historical infallible signature used by injected
+/// resolver callbacks. Any Git, absence, or parse error returns empty inputs,
+/// so recorded-authority resolution fails closed rather than consulting the
+/// working tree.
 ///
 /// This is the config-side half of the identity contract (design §3.1): it
 /// reads `repo_id` / `project_key_override` / `aka_repo_ids` and computes the
@@ -927,9 +1016,13 @@ pub fn ensure_recorded_repo_id(project_root: &Path) -> Result<RecordedRepoId> {
 /// config table is config's job; `bbox-corpus-core` owns only the identity
 /// types and the precedence rule.
 pub fn read_repo_id_inputs(project_root: &Path) -> bbox_corpus_core::identity::RepoIdInputs {
-    let project = load_project(project_root)
-        .map(|c| c.project)
-        .unwrap_or_default();
+    read_repo_id_inputs_at_ref(project_root, "HEAD").unwrap_or_default()
+}
+
+fn repo_id_inputs(
+    project_root: &Path,
+    project: ProjectIdentityConfig,
+) -> bbox_corpus_core::identity::RepoIdInputs {
     let computed = bbox_corpus_core::git::git_root_for_path(project_root)
         .and_then(|root| bbox_corpus_core::entity_ref::repo_id_for_root(&root).ok());
     bbox_corpus_core::identity::RepoIdInputs {
@@ -2250,6 +2343,94 @@ state_dir = "~"
         )
         .unwrap();
         assert!(load_project(&project_root).is_err());
+    }
+
+    #[test]
+    fn committed_repo_id_reader_ignores_working_tree_edits_and_honors_named_ref() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        init_repo(&root);
+        std::fs::create_dir_all(root.join(".bbox")).unwrap();
+        std::fs::write(
+            root.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"committed-one\"\nproject_key_override = \"override-one\"\naliases = [\"committed-alias\"]\n",
+        )
+        .unwrap();
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        run(&["add", ".bbox/config.toml"]);
+        run(&["commit", "-q", "-m", "record first authority"]);
+        let first_commit = run(&["rev-parse", "HEAD"]);
+
+        std::fs::write(
+            root.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"working-only\"\nproject_key_override = \"working-override\"\naliases = [\"working-alias\"]\n",
+        )
+        .unwrap();
+        let working = read_working_tree_repo_id_inputs(&root);
+        assert_eq!(working.recorded.as_deref(), Some("working-only"));
+        assert_eq!(
+            working.project_key_override.as_deref(),
+            Some("working-override")
+        );
+        let committed = read_repo_id_inputs(&root);
+        assert_eq!(committed.recorded.as_deref(), Some("committed-one"));
+        assert_eq!(
+            committed.project_key_override.as_deref(),
+            Some("override-one")
+        );
+        assert_eq!(
+            load_project_at_ref(&root, "HEAD").unwrap().project.aliases,
+            vec!["committed-alias".to_string()]
+        );
+
+        std::fs::write(
+            root.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"committed-two\"\n",
+        )
+        .unwrap();
+        run(&["add", ".bbox/config.toml"]);
+        run(&["commit", "-q", "-m", "record second authority"]);
+        assert_eq!(
+            read_repo_id_inputs_at_ref(&root, &first_commit)
+                .unwrap()
+                .recorded
+                .as_deref(),
+            Some("committed-one")
+        );
+        assert_eq!(
+            read_repo_id_inputs_at_ref(&root, "HEAD")
+                .unwrap()
+                .recorded
+                .as_deref(),
+            Some("committed-two")
+        );
+    }
+
+    #[test]
+    fn committed_repo_id_reader_requires_config_at_selected_ref() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        init_repo(&root);
+
+        let err = read_repo_id_inputs_at_ref(&root, "HEAD").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("committed project config .bbox/config.toml is missing")
+        );
+        assert_eq!(read_repo_id_inputs(&root), Default::default());
     }
 
     #[test]

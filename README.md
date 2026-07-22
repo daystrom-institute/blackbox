@@ -339,7 +339,8 @@ full protocol + question-type checklist.
 | `bbox_find_paths` | Direction-preserving BFS chains. Pass `path_ids` from this directly into `bbox_bundle_evidence`. |
 | `bbox_bundle_evidence` | Package selected refs + cached path IDs into a structured answer kit with content_previews + 1-hop intra-bundle edges + 2-hop convergences (shared session/commit). |
 | `bbox_blame` | Walk a code line back to the producing commit + (when bbox-anchored) the originating session/brofile/arc. |
-| `bbox_provenance_export` / `bbox_provenance_import` | Round-trip provenance via `refs/notes/bbox/provenance` git notes. |
+| `bro provenance export` | Export the current checkout's tracked provenance to Git notes. The daemon plans from corpus state; the CLI validates and writes locally. |
+| `bbox_provenance_export` / `bbox_provenance_import` | Legacy overlap adapters for all-project export and note import via `refs/notes/bbox/provenance`. |
 
 ### Transcript search (`bbox_*`)
 

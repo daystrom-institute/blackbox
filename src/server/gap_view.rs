@@ -9,7 +9,7 @@ use bbox_gaps::overlay::{
     GapOverlayKey, GapOverlaySnapshot, GapOverlayStatus, GapOverlayValue, load_published_snapshot,
     recompute_overlay,
 };
-use bbox_indexing::publisher::{PublisherResolution, elect_publisher, project_published_scope};
+use bbox_indexing::publisher::project_published_scope;
 use bbox_knowledge::overlay::ProvisionalMode;
 
 use super::BlackboxServer;
@@ -33,32 +33,11 @@ impl BlackboxServer {
                 checkout_id: checkout.checkout_id.clone(),
             });
         let projects = self.state.projects.read().list();
-        let snapshot = match elect_publisher(
-            &projects,
-            &checkout.published_scope,
-            crate::config::read_repo_id_inputs,
-        ) {
-            PublisherResolution::None => GapOverlaySnapshot::invalid(
-                checkout,
-                format!("no publisher for scope {:?}", checkout.published_scope),
-            ),
-            PublisherResolution::Duplicate(paths) => GapOverlaySnapshot::invalid(
-                checkout,
-                format!(
-                    "duplicate publishers for scope {:?}: {}",
-                    checkout.published_scope,
-                    paths.join(", ")
-                ),
-            ),
-            PublisherResolution::One(root) => match self
-                .state
-                .publisher_refs
-                .write()
-                .ensure_pinned(&checkout.published_scope, Path::new(&root))
-            {
-                Ok(pin) => stable_gap_overlay(Path::new(&root), &pin.branch_ref, checkout),
-                Err(err) => GapOverlaySnapshot::invalid(checkout, format!("{err:#}")),
-            },
+        let snapshot = match self.authorize_publisher(&projects, &checkout.published_scope) {
+            Ok(publisher) => {
+                stable_gap_overlay(Path::new(&publisher.root), &publisher.commit, checkout)
+            }
+            Err(err) => GapOverlaySnapshot::invalid(checkout, format!("{err:#}")),
         };
         self.state
             .gap_overlays
@@ -148,37 +127,8 @@ impl BlackboxServer {
             }
         }
         for (scope, project) in selected_scopes {
-            let publisher_root =
-                match elect_publisher(&projects, &scope, crate::config::read_repo_id_inputs) {
-                    PublisherResolution::One(root) => root,
-                    PublisherResolution::None => {
-                        let message = format!("no publisher for scope {scope:?}");
-                        if explicit_managed_scope {
-                            anyhow::bail!(message);
-                        }
-                        diagnostics.push(message);
-                        continue;
-                    }
-                    PublisherResolution::Duplicate(paths) => {
-                        let message = format!(
-                            "duplicate publishers for scope {scope:?}: {}",
-                            paths.join(", ")
-                        );
-                        if explicit_managed_scope {
-                            anyhow::bail!(message);
-                        }
-                        diagnostics.push(message);
-                        continue;
-                    }
-                };
-            let pin = self
-                .state
-                .publisher_refs
-                .write()
-                .ensure_pinned(&scope, Path::new(&publisher_root))
-                .with_context(|| format!("pinning publisher for gap scope {scope:?}"));
-            let pin = match pin {
-                Ok(pin) => pin,
+            let publisher = match self.authorize_publisher(&projects, &scope) {
+                Ok(publisher) => publisher,
                 Err(err) if explicit_managed_scope => return Err(err),
                 Err(err) => {
                     diagnostics.push(format!("scope {scope:?}: {err:#}"));
@@ -186,8 +136,8 @@ impl BlackboxServer {
                 }
             };
             let published = load_published_snapshot(
-                Path::new(&publisher_root),
-                &pin.branch_ref,
+                Path::new(&publisher.root),
+                &publisher.commit,
                 &scope,
                 &project.canonical_path,
             );

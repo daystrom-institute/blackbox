@@ -5,6 +5,7 @@ use crate::mcp_tools::describe_schema::DescribeSchemaOptions;
 use crate::mcp_tools::find_paths::FindPathsParams;
 use crate::mcp_tools::inspect::InspectEntityParams;
 use crate::mcp_tools::provenance::ProvenanceParams;
+use crate::mcp_tools::provenance_plan::ProvenanceExportPlanParams;
 use crate::mcp_tools::ref_size::RefSizeParams;
 use crate::providers::ProviderContext;
 use crate::server::BlackboxServer;
@@ -226,7 +227,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_provenance_export",
-        description = "Write bbox provenance git notes for commits with tracked tool-call anchors."
+        description = "Legacy overlap adapter that writes bbox provenance Git notes from blackboxd. Prefer bro provenance export for checkout-local application; retain this tool when one call must cover all registered projects."
     )]
     pub(crate) async fn bbox_provenance_export(
         &self,
@@ -236,6 +237,51 @@ impl BlackboxServer {
         Self::run_blocking("bbox_provenance_export", move || {
             let projects = server.state.projects.read().list();
             mcp_tools::provenance::export_provenance(&p, &server.state.edge_index.read(), &projects)
+        })
+        .await
+    }
+
+    #[tool(
+        name = "bbox_provenance_export_plan",
+        description = "Return one deterministic, generation-bound provenance-note page for this MCP session's authoritative checkout. Project selection comes only from session context; callers may pass only cursor and generation pagination controls. Used by bro provenance export so Git-note writes stay checkout-local."
+    )]
+    pub(crate) async fn bbox_provenance_export_plan(
+        &self,
+        Parameters(p): Parameters<ProvenanceExportPlanParams>,
+    ) -> CallToolResult {
+        let server = self.clone();
+        Self::run_blocking("bbox_provenance_export_plan", move || {
+            let checkout = server.authoritative_session_checkout().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "error.no_authoritative_checkout: initialize MCP with an admitted project context"
+                )
+            })?;
+            if checkout.project_id.trim().is_empty()
+                || checkout.published_scope.repo_id.trim().is_empty()
+                || checkout.published_scope.bbox_root_relpath.trim().is_empty()
+            {
+                anyhow::bail!(
+                    "error.invalid_checkout_scope: authoritative checkout has no durable project scope"
+                );
+            }
+            let projects = server.state.projects.read().list();
+            if !projects
+                .iter()
+                .any(|project| project.project_id == checkout.project_id)
+            {
+                anyhow::bail!(
+                    "error.project_not_registered: authoritative checkout project is absent from the registry"
+                );
+            }
+            let notes_ref = git::notes_ref("provenance");
+            let page = mcp_tools::provenance_plan::export_plan_page(
+                &p,
+                checkout.published_scope.clone(),
+                &checkout.project_id,
+                &notes_ref,
+                &server.state.edge_index.read(),
+            )?;
+            Ok(serde_json::to_string(&page)?)
         })
         .await
     }
@@ -580,5 +626,36 @@ mod tests {
         // not_found -- do not fabricate entities for arbitrary offsets.
         let missing = inspect("transcript:claude:sess-1:999:0".to_string()).await;
         assert_eq!(missing["status"], "error.not_found");
+    }
+
+    #[tokio::test]
+    async fn provenance_export_plan_requires_authoritative_session_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let result = server
+            .bbox_provenance_export_plan(Parameters(ProvenanceExportPlanParams::default()))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(extract_text(&result).contains("error.no_authoritative_checkout"));
+    }
+
+    #[tokio::test]
+    async fn provenance_export_plan_requires_session_project_to_remain_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        server.set_session_checkout_for_test(
+            bbox_corpus_core::identity::PublishedScope {
+                repo_id: "repo".into(),
+                bbox_root_relpath: ".".into(),
+            },
+            "checkout".into(),
+            root,
+        );
+        let result = server
+            .bbox_provenance_export_plan(Parameters(ProvenanceExportPlanParams::default()))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(extract_text(&result).contains("error.project_not_registered"));
     }
 }

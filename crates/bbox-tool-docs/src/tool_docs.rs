@@ -321,8 +321,15 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_provenance_export",
         category: ToolCategory::Graph,
-        summary: "Write bbox provenance git notes for commits with tracked tool-call anchors.",
-        when_to_use: "Use after committing bbox-tracked edits when provenance should travel with git history.",
+        summary: "Legacy overlap adapter that writes bbox provenance Git notes from blackboxd. Prefer bro provenance export for checkout-local application; retain this tool when one call must cover all registered projects.",
+        when_to_use: "Use only when the legacy all-registered-project export is required. For one checkout, run `bro provenance export` from that checkout instead.",
+        example: None,
+    },
+    ToolDoc {
+        name: "bbox_provenance_export_plan",
+        category: ToolCategory::Graph,
+        summary: "Return one deterministic, generation-bound provenance-note page for this MCP session's authoritative checkout. Project selection comes only from session context; callers may pass only cursor and generation pagination controls. Used by bro provenance export so Git-note writes stay checkout-local.",
+        when_to_use: "Used by `bro provenance export`. The project is fixed by MCP session context; callers may supply only the returned cursor and generation for later pages.",
         example: None,
     },
     ToolDoc {

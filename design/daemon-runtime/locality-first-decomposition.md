@@ -14,11 +14,13 @@ brief: "Split the system on LOCALITY (checkout-coupled vs shared/append-only), n
 
 # Locality-first decomposition: the checkout plane and the corpus plane
 
-> **Status: proposed, with the knowledge seam partially implemented.** The
-> identity foundation is landed, while the prerequisite repair and dark
-> provisional-overlay slice are implemented and lane-verified in the current
-> working tree but are not yet committed. The decomposition itself and every
-> visibility or off-host behavior remain proposed. The evidence base is the
+> **Status: proposed, with the knowledge seam and checkout-local provenance
+> export implemented.** The identity foundation, prerequisite repairs, and
+> dark provisional overlay are landed. Provenance planning now stays in the
+> corpus while `bro provenance export` validates and writes Git notes in its
+> own checkout. The legacy daemon export remains during overlap; provenance
+> import, blame, render, checkout collectors, and all off-host behavior remain
+> proposed. The evidence base is the
 > satellite-arc post-mortem (section 1), the shipped harness process boundary
 > ([harness-process-boundary.md](../bro-harness/harness-process-boundary.md)),
 > and a code-verified inventory of the daemon's remaining checkout-coupled
@@ -174,7 +176,8 @@ Inventory of the daemon's remaining checkout-coupled surfaces, split by
 
 | Concern | Today | Move |
 |---|---|---|
-| Provenance git notes (`bbox_provenance_export/import`) | `crates/bbox-mcp-tools/src/mcp_tools/provenance.rs`; pure repo git-notes I/O, no central-store dependency | Move whole: harness bindings and/or `bro` CLI verbs. The strongest single candidate. |
+| Provenance export | `bbox_provenance_export_plan` builds generation-bound documents from corpus edges; `bro provenance export` applies them through the dependency-clean `bbox-provenance` leaf. The legacy daemon writer remains for overlap. | Landed for operator checkouts. Retire the legacy adapter only after overlap use is measured. |
+| Provenance import | `bbox_provenance_import` still reads checkout notes and publishes central edges inside blackboxd. | Pending a separately reviewed authenticated checkout-source channel. Do not accept caller-supplied note JSON as central graph authority. |
 | `bbox_blame` | `crates/bbox-mcp-tools/src/mcp_tools/blame.rs`; shells `git blame`, reads files, then joins against the transcript index | Hybrid: blame executes where the checkout is (harness binding); the turn-join is a corpus query the harness makes over MCP. |
 | Project-scope render | `crates/bbox-knowledge/src/render.rs` + `src/tools/render.rs` rescope; daemon writes managed-marker files into the caller's checkout | Checkout-local by construction: render is a pure function of the checkout's `.bbox/` plus global-scope entries fetched over MCP. The satellite arc's byte-for-byte fork is unnecessary now because render lives in `bbox-knowledge`, which is daemon-independent; a harness binding or `bro render` links the same crate (peel a `bbox-render` leaf if the dep tree needs slimming). |
 | Project source indexing | `crates/bbox-corpus-index/src/index/project_files.rs` walks registered roots, reads bytes, chunks, writes tantivy | Split at write authority: walk+read+hash is checkout-local; chunking and the tantivy write stay with the corpus (decided 2026-07-19, see section 5). |

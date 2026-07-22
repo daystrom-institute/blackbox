@@ -97,14 +97,16 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     // resolution fails closed by absence. Records are sorted by
     // canonical_path, so first-claim-wins is deterministic across boots.
     for record in projects_store.list() {
-        let declared: std::collections::BTreeSet<String> =
-            match crate::config::load_project(std::path::Path::new(&record.canonical_path)) {
-                Ok(cfg) => cfg.project.aliases.into_iter().collect(),
-                Err(e) => {
-                    tracing::warn!("project config for {}: {e:#}", record.project_id);
-                    continue;
-                }
-            };
+        let declared: std::collections::BTreeSet<String> = match crate::config::load_project_at_ref(
+            std::path::Path::new(&record.canonical_path),
+            "HEAD",
+        ) {
+            Ok(cfg) => cfg.project.aliases.into_iter().collect(),
+            Err(e) => {
+                tracing::warn!("project config for {}: {e:#}", record.project_id);
+                std::collections::BTreeSet::new()
+            }
+        };
         match projects_store.sync_declared_aliases(&record.project_id, &declared) {
             Ok(dirty) => projects_needs_persist |= dirty,
             Err(e) => tracing::warn!("alias sync for {}: {e:#}", record.project_id),

@@ -1,64 +1,26 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use anyhow::Result;
 use rmcp::schemars;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 
 use bbox_chunker::{EdgeConfidence, EdgeProvenance};
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_edge_index::edge_index::{Edge, EdgeIndex};
 use bbox_indexing::projects::ProjectRecord;
+use bbox_provenance::{
+    GitProvenanceNote, MAX_NOTE_DOCUMENT_BYTES, NoteToolCall, fragment_note, parse_note_document,
+    serialize_note, split_note_documents,
+};
+
+use super::provenance_plan::note_from_edges;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ProvenanceParams {
     #[serde(default)]
     pub project_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct GitProvenanceNote {
-    commit: String,
-    produced_by: ProducedBy,
-    tool_calls: Vec<NoteToolCall>,
-    #[serde(default)]
-    knowledge_writes: Vec<KnowledgeWrite>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-struct ProducedBy {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    provider: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    session_ids: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    brofiles: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    arc_thread_ids: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    trigger: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct NoteToolCall {
-    tool: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    edge_kind: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    source_ref: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    file: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    byte_range: Option<[u64; 2]>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    turn: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct KnowledgeWrite {
-    id: String,
-    kind: String,
 }
 
 pub fn export_provenance(
@@ -107,8 +69,10 @@ pub fn export_provenance(
             }
         }
         let note = note_from_edges(&commit, &edges, edge_index);
-        let body = serde_json::to_string_pretty(&note)? + "\n";
-        bbox_corpus_core::git::write_note(root, &notes_ref, &commit, &body)?;
+        for part in fragment_note(&note, MAX_NOTE_DOCUMENT_BYTES)? {
+            let body = serialize_note(&part)? + "\n";
+            bbox_corpus_core::git::write_note(root, &notes_ref, &commit, &body)?;
+        }
         notes_written += 1;
     }
 
@@ -134,7 +98,7 @@ pub fn import_provenance_to_edges_dir(
                 continue;
             };
             for raw_note in split_note_documents(&raw) {
-                let Ok(note) = serde_json::from_str::<GitProvenanceNote>(raw_note) else {
+                let Ok(note) = parse_note_document(raw_note) else {
                     continue;
                 };
                 let edges = edges_from_note(project, root, &note)?;
@@ -149,13 +113,6 @@ pub fn import_provenance_to_edges_dir(
     Ok(edges_imported)
 }
 
-fn split_note_documents(raw: &str) -> Vec<&str> {
-    raw.split(bbox_corpus_core::git::NOTE_DOCUMENT_SEPARATOR)
-        .map(str::trim)
-        .filter(|doc| !doc.is_empty())
-        .collect()
-}
-
 fn project_map<'a>(
     projects: &'a [ProjectRecord],
     project_id: Option<&str>,
@@ -165,98 +122,6 @@ fn project_map<'a>(
         .filter(|project| project_id.is_none_or(|id| id == project.project_id))
         .map(|project| (project.project_id.clone(), project))
         .collect()
-}
-
-fn note_from_edges(commit: &str, edges: &[&Edge], edge_index: &EdgeIndex) -> GitProvenanceNote {
-    let produced_by = produced_by_from_edges(edges, edge_index);
-    GitProvenanceNote {
-        commit: commit.to_string(),
-        produced_by,
-        tool_calls: edges.iter().map(|edge| tool_call_from_edge(edge)).collect(),
-        knowledge_writes: Vec::new(),
-    }
-}
-
-fn produced_by_from_edges(edges: &[&Edge], edge_index: &EdgeIndex) -> ProducedBy {
-    let mut providers = BTreeSet::new();
-    let mut session_ids = BTreeSet::new();
-    let mut brofiles = BTreeSet::new();
-    let mut arc_thread_ids = BTreeSet::new();
-    for edge in edges {
-        let EntityRef::Transcript {
-            provider,
-            session_id,
-            ..
-        } = &edge.source
-        else {
-            continue;
-        };
-        providers.insert(provider.clone());
-        session_ids.insert(session_id.clone());
-        let session_ref = EntityRef::Session {
-            provider: provider.clone(),
-            session_id: session_id.clone(),
-        };
-        brofiles.extend(
-            edge_index
-                .forward_edges(&session_ref)
-                .iter()
-                .filter(|edge| edge.kind == "SESSION_USED_BROFILE")
-                .map(|edge| edge.target.to_string()),
-        );
-        arc_thread_ids.extend(
-            edge_index
-                .reverse_edges(&session_ref)
-                .iter()
-                .filter(|edge| edge.kind == "THREAD_HAS_SESSION")
-                .map(|edge| edge.source.to_string()),
-        );
-    }
-    ProducedBy {
-        provider: providers.into_iter().next(),
-        session_ids: session_ids.into_iter().collect(),
-        brofiles: brofiles.into_iter().collect(),
-        arc_thread_ids: arc_thread_ids.into_iter().collect(),
-        trigger: None,
-    }
-}
-
-fn tool_call_from_edge(edge: &Edge) -> NoteToolCall {
-    let file = edge.metadata.get("anchor.file_path").cloned();
-    let tool = edge
-        .metadata
-        .get("tool.name")
-        .cloned()
-        .unwrap_or_else(|| edge.kind.clone());
-    NoteToolCall {
-        tool,
-        edge_kind: Some(edge.kind.clone()),
-        source_ref: Some(edge.source.to_string()),
-        file,
-        byte_range: byte_range_from_metadata(&edge.metadata),
-        turn: transcript_turn(&edge.source),
-    }
-}
-
-fn byte_range_from_metadata(metadata: &BTreeMap<String, String>) -> Option<[u64; 2]> {
-    Some([
-        metadata.get("anchor.byte_start")?.parse().ok()?,
-        metadata.get("anchor.byte_end")?.parse().ok()?,
-    ])
-}
-
-fn transcript_turn(source: &EntityRef) -> Option<u32> {
-    let EntityRef::Transcript {
-        line_offset,
-        event_idx,
-        ..
-    } = source
-    else {
-        return None;
-    };
-    u32::try_from(*line_offset)
-        .ok()
-        .map(|line| line.saturating_add(*event_idx))
 }
 
 fn edges_from_note(
@@ -275,22 +140,35 @@ fn edges_from_note(
         let Ok(source) = EntityRef::parse(source_ref) else {
             continue;
         };
-        let Some(file) = call.file.as_deref() else {
-            continue;
+        let file = call.file.as_deref();
+        let target = if note.schema_version >= bbox_provenance::SCHEMA_VERSION_V2 {
+            validated_target_for_project(call, &project.project_id)
+        } else {
+            None
         };
-        let absolute_path = root.join(file);
-        let target = match bbox_indexing::index::resolve_current_project_chunk_entity(
-            project,
-            root,
-            &absolute_path,
-            call.byte_range.map(|range| (range[0], range[1])),
-        )? {
+        let target = match target {
             Some(target) => target,
-            None => continue,
+            None => {
+                let Some(file) = file else {
+                    continue;
+                };
+                let absolute_path = root.join(file);
+                match bbox_indexing::index::resolve_current_project_chunk_entity(
+                    project,
+                    root,
+                    &absolute_path,
+                    call.byte_range.map(|range| (range[0], range[1])),
+                )? {
+                    Some(target) => target,
+                    None => continue,
+                }
+            }
         };
         let mut metadata = BTreeMap::new();
         metadata.insert("anchor.project_id".into(), project.project_id.clone());
-        metadata.insert("anchor.file_path".into(), file.to_string());
+        if let Some(file) = file {
+            metadata.insert("anchor.file_path".into(), file.to_string());
+        }
         metadata.insert("anchor.commit_sha_at_edit".into(), note.commit.clone());
         metadata.insert("tool.name".into(), call.tool.clone());
         if let Some([start, end]) = call.byte_range {
@@ -309,6 +187,21 @@ fn edges_from_note(
     Ok(edges)
 }
 
+fn validated_target_for_project(call: &NoteToolCall, project_id: &str) -> Option<EntityRef> {
+    let target = EntityRef::parse(call.target_ref.as_deref()?).ok()?;
+    match &target {
+        EntityRef::ProjectFile {
+            project_id: target_project_id,
+            ..
+        }
+        | EntityRef::ProjectFileV2 {
+            project_id: target_project_id,
+            ..
+        } if target_project_id == project_id => Some(target),
+        _ => None,
+    }
+}
+
 fn edge_kind_for_call(call: &NoteToolCall) -> Option<&str> {
     if let Some(kind) = call.edge_kind.as_deref() {
         return Some(kind);
@@ -323,31 +216,33 @@ fn edge_kind_for_call(call: &NoteToolCall) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bbox_provenance::ProducedBy;
 
     #[test]
     fn provenance_note_json_round_trips() {
-        let note = GitProvenanceNote {
-            commit: "abc123".into(),
-            produced_by: ProducedBy {
+        let note = GitProvenanceNote::new_v2(
+            "abc123",
+            ProducedBy {
                 provider: Some("claude".into()),
                 session_ids: vec!["sess".into()],
                 brofiles: vec!["brofile:keystone".into()],
                 arc_thread_ids: Vec::new(),
                 trigger: None,
             },
-            tool_calls: vec![NoteToolCall {
+            vec![NoteToolCall {
                 tool: "Edit".into(),
                 edge_kind: Some("EDITED_FILE".into()),
                 source_ref: Some("transcript:claude:sess:10:0".into()),
+                target_ref: Some(format!("project_file:proj1234:path:{}:0", "a".repeat(64))),
                 file: Some("src/main.rs".into()),
                 byte_range: Some([10, 20]),
                 turn: Some(10),
             }],
-            knowledge_writes: Vec::new(),
-        };
+            Vec::new(),
+        );
 
-        let raw = serde_json::to_string(&note).unwrap();
-        let parsed: GitProvenanceNote = serde_json::from_str(&raw).unwrap();
+        let raw = serialize_note(&note).unwrap();
+        let parsed = parse_note_document(&raw).unwrap();
 
         assert_eq!(parsed, note);
     }
@@ -404,5 +299,7 @@ mod tests {
         let note = note_from_edges("abc123", &[&edge_a, &edge_b], &edge_index);
 
         assert_eq!(note.produced_by.session_ids, vec!["sess-a", "sess-b"]);
+        assert_eq!(note.schema_version, bbox_provenance::SCHEMA_VERSION_V2);
+        assert!(note.tool_calls.iter().all(|call| call.target_ref.is_some()));
     }
 }

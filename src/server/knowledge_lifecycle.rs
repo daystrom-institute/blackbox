@@ -33,7 +33,83 @@ pub(crate) struct ExistingKnowledgeMutation {
     pub(crate) checkout: Option<ResolvedCheckoutScope>,
 }
 
+#[derive(Debug)]
+pub(crate) struct AuthorizedPublisher {
+    pub(crate) root: String,
+    pub(crate) branch_ref: String,
+    pub(crate) commit: String,
+}
+
 impl BlackboxServer {
+    /// Resolve the one publisher using committed-HEAD scope claims, then bind
+    /// the read to the immutable commit named by the host-local publisher pin.
+    /// The pinned commit must carry the same committed scope as the HEAD
+    /// candidate that selected the pin.
+    pub(crate) fn authorize_publisher(
+        &self,
+        projects: &[ProjectRecord],
+        scope: &PublishedScope,
+    ) -> Result<AuthorizedPublisher> {
+        let root = match elect_publisher(projects, scope, crate::config::read_repo_id_inputs) {
+            PublisherResolution::One(root) => root,
+            PublisherResolution::None => anyhow::bail!("no publisher for scope {scope:?}"),
+            PublisherResolution::Duplicate(paths) => anyhow::bail!(
+                "duplicate publishers for scope {scope:?}: {}",
+                paths.join(", ")
+            ),
+        };
+        let pin = self
+            .state
+            .publisher_refs
+            .write()
+            .ensure_pinned(scope, Path::new(&root))
+            .with_context(|| format!("pinning publisher for scope {scope:?}"))?;
+        let commit = bbox_corpus_core::git::resolve_commit(Path::new(&root), &pin.branch_ref)
+            .with_context(|| {
+                format!(
+                    "publisher ref {} does not resolve in {}",
+                    pin.branch_ref, root
+                )
+            })?;
+        let project = projects
+            .iter()
+            .find(|project| project.canonical_path == root)
+            .with_context(|| format!("publisher {root} vanished during authority resolution"))?;
+        let project_root = Path::new(&project.canonical_path);
+        let pinned_inputs = crate::config::read_repo_id_inputs_at_ref(project_root, &commit)
+            .with_context(|| {
+                format!(
+                    "reading publisher authority from {} at {}",
+                    pin.branch_ref, commit
+                )
+            })?;
+        let pinned_repo_id = resolve_recorded_repo_id(&pinned_inputs).with_context(|| {
+            format!(
+                "publisher ref {} has no recorded repo authority at {}",
+                pin.branch_ref, commit
+            )
+        })?;
+        let git_root = bbox_corpus_core::git::git_root_for_path(project_root)
+            .with_context(|| format!("publisher {root} is not inside a git repository"))?;
+        let pinned_scope = PublishedScope {
+            repo_id: pinned_repo_id,
+            bbox_root_relpath: bbox_root_relpath(&git_root, project_root)
+                .with_context(|| format!("publisher {root} is outside its git root"))?,
+        };
+        if &pinned_scope != scope {
+            anyhow::bail!(
+                "publisher ref {} resolves to commit {} whose committed project scope does not match {scope:?}",
+                pin.branch_ref,
+                commit
+            );
+        }
+        Ok(AuthorizedPublisher {
+            root,
+            branch_ref: pin.branch_ref,
+            commit,
+        })
+    }
+
     pub(crate) fn path_fallback_is_cut(&self) -> bool {
         self.state
             .path_fallback_cut
@@ -130,12 +206,6 @@ impl BlackboxServer {
         if let Some(checkout) = checkout {
             self.refresh_dark_knowledge_overlay(checkout);
         }
-    }
-
-    pub(crate) fn recover_dark_knowledge_transactions(&self) -> usize {
-        self.recover_dark_knowledge_transactions_with(
-            bbox_knowledge::transaction::recover_pending_transaction,
-        )
     }
 
     pub(crate) fn recover_abandoned_dark_knowledge_transactions(&self) -> usize {
@@ -463,42 +533,24 @@ impl BlackboxServer {
             }
         }
         for scope in scopes {
-            let publisher_root =
-                match elect_publisher(&projects, &scope, crate::config::read_repo_id_inputs) {
-                    PublisherResolution::One(root) => root,
-                    PublisherResolution::None => {
-                        blockers.push(format!("scope {scope:?} has no publisher"));
-                        continue;
-                    }
-                    PublisherResolution::Duplicate(paths) => {
-                        blockers.push(format!(
-                            "scope {scope:?} has duplicate publishers: {}",
-                            paths.join(", ")
-                        ));
-                        continue;
-                    }
-                };
-            let pin = match self
-                .state
-                .publisher_refs
-                .write()
-                .ensure_pinned(&scope, Path::new(&publisher_root))
-            {
-                Ok(pin) => pin,
+            let publisher = match self.authorize_publisher(&projects, &scope) {
+                Ok(publisher) => publisher,
                 Err(err) => {
-                    blockers.push(format!("scope {scope:?} publisher pin failed: {err:#}"));
+                    blockers.push(format!(
+                        "scope {scope:?} publisher authority failed: {err:#}"
+                    ));
                     continue;
                 }
             };
             let marker_path = schema_epoch_repo_path(&scope);
             let Some(raw) = bbox_corpus_core::git::read_committed_file(
-                Path::new(&publisher_root),
-                &pin.branch_ref,
+                Path::new(&publisher.root),
+                &publisher.commit,
                 &marker_path,
             ) else {
                 blockers.push(format!(
                     "scope {scope:?} has no committed schema epoch marker at {}",
-                    pin.branch_ref
+                    publisher.branch_ref
                 ));
                 continue;
             };
@@ -618,9 +670,9 @@ impl BlackboxServer {
 
     fn reconcile_knowledge_scope_index(&self, scope: &PublishedScope) {
         let projects = self.state.projects.read().list();
-        match elect_publisher(&projects, scope, crate::config::read_repo_id_inputs) {
-            PublisherResolution::One(project) => {
-                if let Err(err) = self.sync_knowledge_scope_to_index(scope, &project) {
+        match self.authorize_publisher(&projects, scope) {
+            Ok(publisher) => {
+                if let Err(err) = self.sync_knowledge_scope_to_index(scope, &publisher.root) {
                     tracing::warn!(
                         error = %err,
                         scope = ?scope,
@@ -629,7 +681,7 @@ impl BlackboxServer {
                     self.clear_knowledge_scope_in_index(scope);
                 }
             }
-            PublisherResolution::None | PublisherResolution::Duplicate(_) => {
+            Err(_) => {
                 self.clear_knowledge_scope_in_index(scope);
             }
         }
@@ -847,6 +899,77 @@ mod tests {
                 .read()
                 .get(&scope, &checkout_id)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn live_scope_ignores_uncommitted_config_edits() {
+        let (_temp, server, base, _worktree, scope) = fixture();
+        std::fs::write(
+            base.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"working-tree-only\"\n",
+        )
+        .unwrap();
+
+        let project = server.state.projects.read().list().pop().unwrap();
+        assert_eq!(recorded_scope(&project), Some(scope.clone()));
+        assert!(server.authorize_publisher(&[project], &scope).is_ok());
+    }
+
+    #[test]
+    fn pinned_config_scope_mismatch_fails_closed() {
+        let (_temp, server, base, _worktree, scope) = fixture();
+        let project = server.state.projects.read().list().pop().unwrap();
+        let pin = server.authorize_publisher(std::slice::from_ref(&project), &scope);
+        assert!(pin.is_ok(), "initial publisher authority: {pin:?}");
+
+        let pinned_branch = bbox_corpus_core::git::current_branch(&base).unwrap();
+        git(&base, &["switch", "-q", "-c", "candidate-head"]);
+        git(&base, &["switch", "-q", &pinned_branch]);
+        std::fs::write(
+            base.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"different-committed-scope\"\n",
+        )
+        .unwrap();
+        git(&base, &["add", ".bbox/config.toml"]);
+        git(&base, &["commit", "-q", "-m", "move pinned scope"]);
+        git(&base, &["switch", "-q", "candidate-head"]);
+
+        let err = server.authorize_publisher(&[project], &scope).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("committed project scope does not match")
+        );
+    }
+
+    #[test]
+    fn startup_recovery_does_not_wait_for_a_live_transaction_lane() {
+        use fs2::FileExt;
+
+        let (_temp, server, _base, worktree, _scope) = fixture();
+        let transaction_root = worktree.join(".bbox/local/knowledge-transactions");
+        std::fs::create_dir_all(&transaction_root).unwrap();
+        let pending = transaction_root.join("pending.json");
+        std::fs::write(&pending, b"{\"version\":").unwrap();
+        let lane = std::fs::File::open(&transaction_root).unwrap();
+        lane.lock_exclusive().unwrap();
+
+        let started = std::time::Instant::now();
+        assert_eq!(server.recover_abandoned_dark_knowledge_transactions(), 0);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "startup recovery waited for a live transaction lane"
+        );
+        assert!(
+            pending.exists(),
+            "the live owner's pointer must remain intact"
+        );
+
+        drop(lane);
+        assert_eq!(server.recover_abandoned_dark_knowledge_transactions(), 0);
+        assert!(
+            !pending.exists(),
+            "a later periodic pass must clear the abandoned pointer"
         );
     }
 

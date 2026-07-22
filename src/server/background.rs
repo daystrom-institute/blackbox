@@ -23,7 +23,7 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     spawn_runtime_metrics_sampler();
     spawn_task_completed_router(shared.clone());
     spawn_system_event_signal_bridge(shared.clone());
-    run_knowledge_lifecycle_pass(shared.clone(), true).await;
+    run_knowledge_lifecycle_pass(shared.clone()).await;
     start_bbox_watcher(&shared);
     spawn_knowledge_lifecycle_reconciler(shared.clone());
     restore_runtime_state(&shared).await;
@@ -35,17 +35,13 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     Ok(())
 }
 
-async fn run_knowledge_lifecycle_pass(shared: Arc<SharedState>, startup: bool) {
+async fn run_knowledge_lifecycle_pass(shared: Arc<SharedState>) {
     let result = tokio::task::spawn_blocking(move || {
         let server = crate::server::BlackboxServer::new(shared);
-        // Recovery is part of every lifecycle pass. Startup may wait because
-        // no request work exists yet; periodic passes only recover abandoned
-        // lanes and never steal an advisory lock from a live writer/closeout.
-        let recovered = if startup {
-            server.recover_dark_knowledge_transactions()
-        } else {
-            server.recover_abandoned_dark_knowledge_transactions()
-        };
+        // Recovery is nonblocking even during startup. A live writer or
+        // closeout retains its advisory lane; the periodic pass retries after
+        // that owner releases it instead of delaying listener availability.
+        let recovered = server.recover_abandoned_dark_knowledge_transactions();
         let inventory = server.run_knowledge_schema_epoch_inventory();
         let path_fallback = inventory
             .as_ref()
@@ -122,7 +118,7 @@ fn spawn_knowledge_lifecycle_reconciler(shared: Arc<SharedState>) {
         let interval = std::time::Duration::from_secs(interval_secs);
         loop {
             tokio::time::sleep(interval).await;
-            run_knowledge_lifecycle_pass(shared.clone(), false).await;
+            run_knowledge_lifecycle_pass(shared.clone()).await;
         }
     });
 }

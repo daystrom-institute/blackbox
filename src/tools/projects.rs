@@ -180,7 +180,7 @@ impl BlackboxServer {
         // lock so the persisted record carries them; a conflicting alias
         // claim fails the call (fail closed) while the registration itself
         // stands — fix the config and re-register to converge.
-        let declared_aliases = config::load_project(Path::new(&p.path))
+        let declared_aliases = config::load_project_at_ref(Path::new(&p.path), "HEAD")
             .map(|cfg| cfg.project.aliases.into_iter().collect::<BTreeSet<_>>())
             .unwrap_or_default();
         let res = {

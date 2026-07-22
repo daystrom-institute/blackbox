@@ -11,6 +11,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "0.8"
 anyhow = "1"
+hex = "0.4"
 bbox-vectors = { path = "../bbox-vectors" }
 bbox-corpus-core = { path = "../bbox-corpus-core" }
 bbox-chunker = { path = "../bbox-chunker" }
@@ -40,6 +41,7 @@ bbox-edge-index = { path = "../bbox-edge-index" }
 bbox-indexing = { path = "../bbox-indexing" }
 bbox-providers = { path = "../bbox-providers" }
 bbox-embed = { path = "../bbox-embed" }
+bbox-provenance = { path = "../bbox-provenance" }
 
 [dev-dependencies]
 bbox-vectors = { path = "../bbox-vectors", features = ["test-support"] }

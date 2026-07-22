@@ -41,6 +41,7 @@ impl BlackboxServer {
                 .into_iter()
                 .collect()
         };
+        enqueue_knowledge_documents(&documents);
         self.state
             .index_writer
             .enqueue(crate::index::IndexWriteOp::ReplaceKnowledgeLogical {
@@ -59,6 +60,7 @@ impl BlackboxServer {
     ) -> anyhow::Result<()> {
         let logical_ref = crate::index::knowledge_entity_id(entry_id);
         let documents = self.knowledge_documents_for_project(project, Some(&logical_ref))?;
+        enqueue_knowledge_documents(&documents);
         self.state
             .index_writer
             .enqueue(crate::index::IndexWriteOp::ReplaceKnowledgeLogical {
@@ -81,7 +83,8 @@ impl BlackboxServer {
             .knowledge_documents_for_project(project, None)?
             .into_iter()
             .filter(|document| document.scope_hash.as_deref() == Some(scope_hash.as_str()))
-            .collect();
+            .collect::<Vec<_>>();
+        enqueue_knowledge_documents(&documents);
         self.state
             .index_writer
             .enqueue(crate::index::IndexWriteOp::ReplaceKnowledgeScope {
@@ -193,11 +196,32 @@ impl BlackboxServer {
     }
 }
 
+fn enqueue_knowledge_documents(documents: &[crate::index::KnowledgeIndexDocument]) {
+    for document in documents
+        .iter()
+        .filter(|document| crate::index::indexable_knowledge_entry(&document.entry))
+    {
+        embed_queue::enqueue_knowledge(
+            &document.entry,
+            &document.entity_id,
+            &crate::index::knowledge_chunk_hash(&document.entry),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, HashMap};
+    use std::path::Path;
+    use std::process::Command;
     use std::sync::Arc;
 
+    use bbox_corpus_core::identity::PublishedScope;
+    use bbox_knowledge::knowledge::{Approval, Category, KnowledgeEntry, Priority, Scope, Status};
+    use bbox_knowledge::overlay::{
+        OverlayKey, OverlaySnapshot, OverlayStatus, OverlayValue, provisional_entity_ref,
+    };
     use serde_json::json;
 
     use crate::packets::CompileParams;
@@ -205,6 +229,233 @@ mod tests {
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn knowledge_entry(id: &str, content: &str) -> KnowledgeEntry {
+        KnowledgeEntry {
+            id: id.into(),
+            title: id.into(),
+            content: content.into(),
+            cluster: None,
+            variants: HashMap::new(),
+            category: Category::Memory,
+            scope: Scope::Project,
+            project: None,
+            providers: Vec::new(),
+            priority: Priority::Standard,
+            weight: 100,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            render: true,
+            decay: false,
+            review_at: None,
+            supersedes: None,
+            links: Vec::new(),
+            rationale: None,
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        }
+    }
+
+    fn write_entry(root: &Path, entry: &KnowledgeEntry) {
+        let dir = root.join(".bbox/knowledge");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{}.json", entry.id)),
+            serde_json::to_vec_pretty(entry).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn managed_overlay_fixture(
+        temp: &tempfile::TempDir,
+    ) -> (BlackboxServer, PublishedScope, String, String, String) {
+        let root = temp.path().canonicalize().unwrap();
+        let project = root.join("repo");
+        std::fs::create_dir_all(&project).unwrap();
+        git(&project, &["init", "-q", "-b", "main"]);
+        git(&project, &["config", "user.email", "test@example.com"]);
+        git(&project, &["config", "user.name", "Test"]);
+        std::fs::write(project.join("README.md"), "seed\n").unwrap();
+        git(&project, &["add", "README.md"]);
+        git(&project, &["commit", "-q", "-m", "seed"]);
+        let repo_id = crate::config::ensure_recorded_repo_id(&project).unwrap();
+        write_entry(
+            &project,
+            &knowledge_entry("shared", "published embedding marker"),
+        );
+        write_entry(
+            &project,
+            &knowledge_entry("survivor", "scope survivor embedding marker"),
+        );
+        git(&project, &["add", ".bbox"]);
+        git(&project, &["commit", "-q", "-m", "published knowledge"]);
+        let project = project.canonicalize().unwrap();
+
+        let state_dir = root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let state = Arc::new(SharedState::for_test(&state_dir));
+        state.projects.write().register_path(&project).unwrap();
+        let server = BlackboxServer::new(state.clone());
+        let scope = PublishedScope {
+            repo_id: repo_id.repo_id,
+            bbox_root_relpath: ".".into(),
+        };
+        let checkout_id = "embedding-checkout";
+        let provisional = knowledge_entry("shared", "provisional embedding marker");
+        let mut values = BTreeMap::new();
+        values.insert(
+            provisional.id.clone(),
+            OverlayValue::Upsert {
+                content_hash: crate::index::knowledge_chunk_hash(&provisional),
+                entry: Box::new(provisional),
+            },
+        );
+        state.knowledge_overlays.write().publish(OverlaySnapshot {
+            snapshot_id: "embedding-snapshot".into(),
+            key: OverlayKey {
+                published_scope: scope.clone(),
+                checkout_id: checkout_id.into(),
+            },
+            stamp: None,
+            status: OverlayStatus::Valid,
+            values,
+            diagnostics: Vec::new(),
+        });
+        let project = project.to_string_lossy().into_owned();
+        let published_ref = crate::index::knowledge_entity_id("shared");
+        let provisional_ref = provisional_entity_ref(&scope, checkout_id, "shared");
+        (server, scope, project, published_ref, provisional_ref)
+    }
+
+    struct FixedProvider;
+
+    #[async_trait::async_trait]
+    impl crate::embed::EmbeddingProvider for FixedProvider {
+        async fn embed_batch(
+            &self,
+            inputs: &[crate::embed::EmbedInput],
+            _input_type: crate::embed::EmbedInputType,
+        ) -> anyhow::Result<Vec<crate::embed::EmbedOutput>> {
+            Ok(inputs
+                .iter()
+                .map(|_| crate::embed::EmbedOutput::single(vec![1.0, 0.0, 0.0, 0.0]))
+                .collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+
+        fn document_model(&self) -> &str {
+            "fixed-test"
+        }
+
+        fn endpoint_kind(&self) -> crate::embed::EmbedEndpointKind {
+            crate::embed::EmbedEndpointKind::Text
+        }
+
+        fn id(&self) -> &str {
+            "fixed-test"
+        }
+    }
+
+    fn install_isolated_knowledge_queue(
+        root: &Path,
+    ) -> (
+        crate::embed::queue::EmbedQueueHandle,
+        Arc<crate::vectors::VectorStore>,
+    ) {
+        let vectors = Arc::new(crate::vectors::VectorStore::open(root).unwrap());
+        let queue = crate::embed::queue::EmbedQueueHandle::isolated_for_test(
+            "knowledge",
+            Arc::new(FixedProvider),
+            vectors.clone(),
+        );
+        crate::embed_queue::install(queue.clone());
+        (queue, vectors)
+    }
+
+    fn wait_for_vector_entities(
+        vectors: &crate::vectors::VectorStore,
+        expected: &[&str],
+    ) -> Vec<String> {
+        for _ in 0..100 {
+            let ids = vectors
+                .search("knowledge", &[1.0, 0.0, 0.0, 0.0], 32)
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.id)
+                .collect::<Vec<_>>();
+            if expected
+                .iter()
+                .all(|expected| ids.iter().any(|id| id == expected))
+            {
+                return ids;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        vectors
+            .search("knowledge", &[1.0, 0.0, 0.0, 0.0], 32)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect()
+    }
+
+    #[test]
+    fn logical_ref_sync_enqueues_exact_published_and_provisional_entities() {
+        let temp = tempfile::tempdir().unwrap();
+        let (server, _scope, project, published_ref, provisional_ref) =
+            managed_overlay_fixture(&temp);
+        let (queue, vectors) = install_isolated_knowledge_queue(&temp.path().join("vectors"));
+
+        server
+            .sync_knowledge_logical_ref_for_project("shared", &project)
+            .unwrap();
+
+        let ids = wait_for_vector_entities(&vectors, &[&published_ref, &provisional_ref]);
+        assert!(ids.contains(&published_ref), "{ids:?}");
+        assert!(ids.contains(&provisional_ref), "{ids:?}");
+        queue.shutdown();
+    }
+
+    #[test]
+    fn scope_sync_enqueues_every_surviving_exact_entity() {
+        let temp = tempfile::tempdir().unwrap();
+        let (server, scope, project, published_ref, provisional_ref) =
+            managed_overlay_fixture(&temp);
+        let survivor_ref = crate::index::knowledge_entity_id("survivor");
+        let (queue, vectors) = install_isolated_knowledge_queue(&temp.path().join("vectors"));
+
+        server
+            .sync_knowledge_scope_to_index(&scope, &project)
+            .unwrap();
+
+        let ids =
+            wait_for_vector_entities(&vectors, &[&published_ref, &provisional_ref, &survivor_ref]);
+        assert!(ids.contains(&published_ref), "{ids:?}");
+        assert!(ids.contains(&provisional_ref), "{ids:?}");
+        assert!(ids.contains(&survivor_ref), "{ids:?}");
+        queue.shutdown();
     }
 
     #[test]

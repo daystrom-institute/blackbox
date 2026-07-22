@@ -243,7 +243,6 @@ impl BlackboxServer {
         &self,
         checkout: &bbox_corpus_core::project_record::ResolvedCheckoutScope,
     ) {
-        use bbox_indexing::publisher::{PublisherResolution, elect_publisher};
         use bbox_knowledge::overlay::{OverlayKey, OverlaySnapshot};
 
         let _refresh = self.state.knowledge_overlay_refresh.lock();
@@ -263,41 +262,16 @@ impl BlackboxServer {
             .get(&checkout.published_scope, &checkout.checkout_id)
             .cloned();
         let mut publisher_project = None;
-        let snapshot = match elect_publisher(
-            &projects,
-            &checkout.published_scope,
-            crate::config::read_repo_id_inputs,
-        ) {
-            PublisherResolution::None => OverlaySnapshot::invalid(
-                checkout,
-                format!("no publisher for scope {:?}", checkout.published_scope),
-            ),
-            PublisherResolution::Duplicate(paths) => OverlaySnapshot::invalid(
-                checkout,
-                format!(
-                    "duplicate publishers for scope {:?}: {}",
-                    checkout.published_scope,
-                    paths.join(", ")
-                ),
-            ),
-            PublisherResolution::One(root) => {
-                let pin = self
-                    .state
-                    .publisher_refs
-                    .write()
-                    .ensure_pinned(&checkout.published_scope, std::path::Path::new(&root));
-                match pin {
-                    Ok(pin) => {
-                        publisher_project = Some(root.clone());
-                        stable_knowledge_overlay(
-                            std::path::Path::new(&root),
-                            &pin.branch_ref,
-                            checkout,
-                        )
-                    }
-                    Err(err) => OverlaySnapshot::invalid(checkout, format!("{err:#}")),
-                }
+        let snapshot = match self.authorize_publisher(&projects, &checkout.published_scope) {
+            Ok(publisher) => {
+                publisher_project = Some(publisher.root.clone());
+                stable_knowledge_overlay(
+                    std::path::Path::new(&publisher.root),
+                    &publisher.commit,
+                    checkout,
+                )
             }
+            Err(err) => OverlaySnapshot::invalid(checkout, format!("{err:#}")),
         };
         let prior_commit = prior
             .as_ref()

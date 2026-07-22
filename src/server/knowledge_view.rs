@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_record::{ProjectRecord, ResolvedCheckoutScope};
-use bbox_indexing::publisher::{PublisherResolution, elect_publisher, project_published_scope};
+use bbox_indexing::publisher::project_published_scope;
 use bbox_knowledge::knowledge::{Knowledge, KnowledgeEntry, KnowledgeViewMetadata, Scope};
 use bbox_knowledge::overlay::{
     OverlaySnapshot, OverlayStatus, OverlayValue, ProvisionalMode, PublishedKnowledgeSnapshot,
@@ -49,6 +49,13 @@ impl SessionKnowledgeView {
             )
         })
     }
+
+    pub(crate) fn append_diagnostics(&self, output: String) -> String {
+        match self.diagnostics_text() {
+            Some(diagnostics) => format!("{output}\n{diagnostics}"),
+            None => output,
+        }
+    }
 }
 
 impl BlackboxServer {
@@ -71,6 +78,7 @@ impl BlackboxServer {
     ) {
         self.session_checkout
             .set(Some(Arc::new(ResolvedCheckoutScope {
+                project_id: "test-project".into(),
                 published_scope,
                 checkout_id,
                 checkout_project_dir: checkout_dir.to_string_lossy().into_owned(),
@@ -147,37 +155,8 @@ impl BlackboxServer {
 
         let mut diagnostics = Vec::new();
         for (scope, project) in selected_scopes {
-            let publisher_root =
-                match elect_publisher(&projects, &scope, crate::config::read_repo_id_inputs) {
-                    PublisherResolution::One(root) => root,
-                    PublisherResolution::None => {
-                        let message = format!("no publisher for scope {scope:?}");
-                        if explicit_managed_scope {
-                            anyhow::bail!(message);
-                        }
-                        diagnostics.push(message);
-                        continue;
-                    }
-                    PublisherResolution::Duplicate(paths) => {
-                        let message = format!(
-                            "duplicate publishers for scope {scope:?}: {}",
-                            paths.join(", ")
-                        );
-                        if explicit_managed_scope {
-                            anyhow::bail!(message);
-                        }
-                        diagnostics.push(message);
-                        continue;
-                    }
-                };
-            let pin = self
-                .state
-                .publisher_refs
-                .write()
-                .ensure_pinned(&scope, Path::new(&publisher_root))
-                .with_context(|| format!("pinning publisher for scope {scope:?}"));
-            let pin = match pin {
-                Ok(pin) => pin,
+            let publisher = match self.authorize_publisher(&projects, &scope) {
+                Ok(publisher) => publisher,
                 Err(err) if explicit_managed_scope => return Err(err),
                 Err(err) => {
                     diagnostics.push(format!("scope {scope:?}: {err:#}"));
@@ -185,8 +164,8 @@ impl BlackboxServer {
                 }
             };
             let published = self.cached_published_knowledge_snapshot(
-                Path::new(&publisher_root),
-                &pin.branch_ref,
+                Path::new(&publisher.root),
+                &publisher.commit,
                 &scope,
                 &project.canonical_path,
             );
@@ -589,6 +568,7 @@ mod tests {
             diagnostics: vec!["malformed entry".into()],
         });
         let own_checkout = ResolvedCheckoutScope {
+            project_id: "test-project".into(),
             published_scope: scope.clone(),
             checkout_id: own_id.into(),
             checkout_dir: base.to_string_lossy().into_owned(),
@@ -663,6 +643,7 @@ mod tests {
         std::fs::write(peer_path.join(".bbox/knowledge/shared.json"), "not-json").unwrap();
         let invalid_server = BlackboxServer::new(state);
         let invalid_checkout = ResolvedCheckoutScope {
+            project_id: "test-project".into(),
             published_scope: scope,
             checkout_id: "invalid-peer".into(),
             checkout_dir: peer_path.to_string_lossy().into_owned(),

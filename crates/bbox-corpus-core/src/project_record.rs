@@ -93,6 +93,12 @@ pub struct CheckoutContext {
 /// `checkout_project_dir` projects a monorepo subproject into that checkout.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct ResolvedCheckoutScope {
+    /// Host-local project registry identity selected by the same conservative
+    /// write resolution that admitted this checkout. It is routing context,
+    /// not durable cross-host authority; `published_scope` remains that
+    /// authority.
+    #[serde(default)]
+    pub project_id: String,
     pub published_scope: PublishedScope,
     pub checkout_id: String,
     pub checkout_dir: String,

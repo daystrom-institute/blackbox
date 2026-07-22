@@ -546,6 +546,7 @@ mod tests {
         std::fs::remove_file(worktree.join(".bbox/gaps/gap-22222222.json")).unwrap();
 
         let checkout = ResolvedCheckoutScope {
+            project_id: "test-project".into(),
             published_scope: PublishedScope {
                 repo_id: "repo".into(),
                 bbox_root_relpath: ".".into(),
@@ -585,6 +586,7 @@ mod tests {
     #[test]
     fn stale_refresh_cannot_overwrite_newer_snapshot() {
         let checkout = ResolvedCheckoutScope {
+            project_id: "test-project".into(),
             published_scope: PublishedScope {
                 repo_id: "repo".into(),
                 bbox_root_relpath: ".".into(),

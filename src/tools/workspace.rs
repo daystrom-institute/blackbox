@@ -554,7 +554,10 @@ fn impl_work_tool_calls(idx: &TranscriptIndex, p: &WorkToolCallsParams) -> anyho
 
 // false positive: called from work_smart_read's run_blocking closure.
 #[allow(clippy::disallowed_methods)]
-fn impl_work_smart_read(state: &SharedState, p: &WorkSmartReadParams) -> anyhow::Result<String> {
+pub(crate) fn impl_work_smart_read(
+    server: &BlackboxServer,
+    p: &WorkSmartReadParams,
+) -> anyhow::Result<String> {
     let path = Path::new(&p.file_path);
     if !path.exists() {
         anyhow::bail!("file not found: {}", p.file_path);
@@ -599,7 +602,8 @@ fn impl_work_smart_read(state: &SharedState, p: &WorkSmartReadParams) -> anyhow:
     out.push_str("\n── Enrichment ──────────────────────────────────────────────\n");
 
     // Related knowledge entries
-    let kb_result = state.kb.write().list(&KnowledgeListParams {
+    let mut knowledge_view = server.session_knowledge_view(None, None)?;
+    let kb_result = knowledge_view.knowledge.list(&KnowledgeListParams {
         query: Some(p.file_path.clone()),
         limit: Some(3),
         ..Default::default()
@@ -613,7 +617,7 @@ fn impl_work_smart_read(state: &SharedState, p: &WorkSmartReadParams) -> anyhow:
     }
 
     // Unresolved notes mentioning this path
-    let notes_result = state.notes.read().list(&NoteListParams {
+    let notes_result = server.state.notes.read().list(&NoteListParams {
         id: None,
         query: Some(p.file_path.clone()),
         resolution: Some("unresolved".to_string()),
@@ -634,6 +638,12 @@ fn impl_work_smart_read(state: &SharedState, p: &WorkSmartReadParams) -> anyhow:
             out.push_str(&notes);
         }
         _ => {}
+    }
+
+    if let Some(diagnostics) = knowledge_view.diagnostics_text() {
+        out.push_str("\n## Knowledge visibility diagnostics\n");
+        out.push_str(&diagnostics);
+        out.push('\n');
     }
 
     Ok(out)
@@ -997,10 +1007,7 @@ impl BlackboxServer {
         Parameters(p): Parameters<WorkSmartReadParams>,
     ) -> CallToolResult {
         let server = self.clone();
-        Self::run_blocking("work_smart_read", move || {
-            impl_work_smart_read(&server.state, &p)
-        })
-        .await
+        Self::run_blocking("work_smart_read", move || impl_work_smart_read(&server, &p)).await
     }
 
     #[tool(

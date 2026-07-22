@@ -1,7 +1,10 @@
 use anyhow::{Context, bail};
 use clap::{Args, Subcommand};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap};
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use std::fmt;
+use std::path::Path;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 const MCP_SESSION_ID: &str = "mcp-session-id";
@@ -43,40 +46,122 @@ pub(crate) async fn run(args: McpArgs) -> anyhow::Result<()> {
 async fn call(args: McpCallArgs) -> anyhow::Result<()> {
     let arguments = parse_arguments(&args.json_args)?;
     let base_url = args.daemon_url.unwrap_or_else(default_base_url);
-    let mcp_url = format!("{}/mcp", base_url.trim_end_matches('/'));
-    let client = reqwest::Client::new();
-
-    let initialize = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": MCP_PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": {
-                "name": "bro-cli",
-                "version": env!("CARGO_PKG_VERSION"),
-            },
-        },
-    });
-    let (init_response, session_id) = post_json_rpc(&client, &mcp_url, None, &initialize).await?;
-    ensure_json_rpc_success(&init_response, "initialize")?;
-
-    let tool_call = json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
-            "name": args.tool_name,
-            "arguments": arguments,
-        },
-    });
-    let (call_response, _) =
-        post_json_rpc(&client, &mcp_url, session_id.as_deref(), &tool_call).await?;
+    let mut client = McpClient::connect(&base_url, None).await?;
+    let call_response = client
+        .call_tool_response(&args.tool_name, arguments)
+        .await?;
     print_tool_response(&call_response)
 }
 
-fn default_base_url() -> String {
+pub(crate) struct McpClient {
+    client: reqwest::Client,
+    mcp_url: String,
+    session_id: Option<String>,
+    next_id: u64,
+}
+
+#[derive(Debug)]
+struct McpToolError {
+    message: String,
+}
+
+impl fmt::Display for McpToolError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "MCP tool returned an error result: {}",
+            self.message
+        )
+    }
+}
+
+impl std::error::Error for McpToolError {}
+
+pub(crate) fn tool_error_has_code(error: &anyhow::Error, code: &str) -> bool {
+    error
+        .downcast_ref::<McpToolError>()
+        .is_some_and(|tool_error| tool_error.message.contains(code))
+}
+
+impl McpClient {
+    pub(crate) async fn connect(
+        base_url: &str,
+        project_root: Option<&Path>,
+    ) -> anyhow::Result<Self> {
+        let raw_url = format!("{}/mcp", base_url.trim_end_matches('/'));
+        let mut mcp_url = reqwest::Url::parse(&raw_url)
+            .with_context(|| format!("parsing daemon MCP URL {raw_url}"))?;
+        if let Some(root) = project_root {
+            let root = root.to_str().context("project root is not valid UTF-8")?;
+            mcp_url.query_pairs_mut().append_pair("project", root);
+        }
+        let mcp_url = mcp_url.to_string();
+        let client = reqwest::Client::new();
+
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "bro-cli",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            },
+        });
+        let (init_response, session_id) =
+            post_json_rpc(&client, &mcp_url, None, &initialize).await?;
+        ensure_json_rpc_success(&init_response, "initialize")?;
+
+        Ok(Self {
+            client,
+            mcp_url,
+            session_id,
+            next_id: 2,
+        })
+    }
+
+    pub(crate) async fn call_tool_json<T: DeserializeOwned>(
+        &mut self,
+        tool_name: &str,
+        arguments: Value,
+    ) -> anyhow::Result<T> {
+        let response = self.call_tool_response(tool_name, arguments).await?;
+        let value = tool_response_json(&response)?;
+        serde_json::from_value(value)
+            .with_context(|| format!("decoding {tool_name} response payload"))
+    }
+
+    async fn call_tool_response(
+        &mut self,
+        tool_name: &str,
+        arguments: Value,
+    ) -> anyhow::Result<Value> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let tool_call = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": arguments,
+            },
+        });
+        let (response, _) = post_json_rpc(
+            &self.client,
+            &self.mcp_url,
+            self.session_id.as_deref(),
+            &tool_call,
+        )
+        .await?;
+        Ok(response)
+    }
+}
+
+pub(crate) fn default_base_url() -> String {
     format!("http://127.0.0.1:{}", bro_fleet_client::daemon_port())
 }
 
@@ -161,6 +246,37 @@ fn ensure_json_rpc_success(value: &Value, method: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn tool_response_json(value: &Value) -> anyhow::Result<Value> {
+    if let Some(error) = value.get("error") {
+        bail!("MCP tools/call failed: {}", pretty_json(error)?);
+    }
+    let result = value
+        .get("result")
+        .context("MCP tools/call response had no result")?;
+    let text = result
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|content| {
+            content.iter().find_map(|item| {
+                (item.get("type").and_then(Value::as_str) == Some("text"))
+                    .then(|| item.get("text").and_then(Value::as_str))
+                    .flatten()
+            })
+        });
+    if result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(McpToolError {
+            message: text.unwrap_or("missing error text").to_string(),
+        }
+        .into());
+    }
+    let text = text.context("MCP tool response had no text content")?;
+    serde_json::from_str(text).context("parsing MCP tool text as JSON")
+}
+
 fn print_tool_response(value: &Value) -> anyhow::Result<()> {
     if let Some(error) = value.get("error") {
         eprintln!("{}", pretty_json(error)?);
@@ -234,5 +350,32 @@ mod tests {
     fn rejects_non_object_arguments() {
         let err = parse_arguments("[]").unwrap_err().to_string();
         assert!(err.contains("JSON_ARGS must be a JSON object"));
+    }
+
+    #[test]
+    fn extracts_json_tool_payload() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "content": [{"type": "text", "text": "{\"value\":7}"}],
+                "isError": false,
+            },
+        });
+        assert_eq!(tool_response_json(&response).unwrap()["value"], 7);
+    }
+
+    #[test]
+    fn preserves_structured_tool_error_code() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "content": [{"type": "text", "text": "error.stale_generation: retry"}],
+                "isError": true,
+            },
+        });
+        let error = tool_response_json(&response).unwrap_err();
+        assert!(tool_error_has_code(&error, "error.stale_generation"));
     }
 }

@@ -28,6 +28,7 @@ mod fleet_classifier;
 mod fleet_tui;
 mod logging;
 mod mcp_call;
+mod provenance;
 #[cfg(test)]
 mod test_backend;
 
@@ -58,6 +59,8 @@ enum BroCommand {
     Orchestrate(OrchestrateArgs),
     /// MCP helpers - call daemon tools over streamable HTTP
     Mcp(mcp_call::McpArgs),
+    /// Checkout-local provenance commands
+    Provenance(provenance::ProvenanceArgs),
     /// Fleet cockpit — dispatch and live-drive many top-level agents
     Fleet(FleetArgs),
     /// Single-agent cockpit — launch one agent into the Fleet transcript view
@@ -688,6 +691,7 @@ fn main() -> anyhow::Result<()> {
         BroCommand::Tail(args) => rt.block_on(run_tail_stream_printer(TailSelectors::from(args))),
         BroCommand::Orchestrate(args) => rt.block_on(run_orchestrate(args)),
         BroCommand::Mcp(args) => rt.block_on(mcp_call::run(args)),
+        BroCommand::Provenance(args) => rt.block_on(provenance::run(args)),
         BroCommand::Fleet(args) => {
             default_fleet_harness_tee();
             rt.block_on(fleet_tui::run(args.cwd, args.daemon_url, args.force))
@@ -890,5 +894,17 @@ mod tests {
         };
         assert_eq!(args.provider, Provider::Brodex);
         assert!(args.prompt.is_empty());
+    }
+
+    #[test]
+    fn clap_routes_provenance_export() {
+        let cli = BroCli::parse_from([
+            "bro",
+            "provenance",
+            "export",
+            "--project-root",
+            "/tmp/project",
+        ]);
+        assert!(matches!(cli.command, BroCommand::Provenance(_)));
     }
 }
