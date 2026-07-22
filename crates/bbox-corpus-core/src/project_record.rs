@@ -14,9 +14,9 @@ pub struct ProjectRecord {
     pub canonical_path: String,
     pub registered_at: String,
     pub is_git_repo: bool,
-    /// Languages auto-detected at registration. Empty when the
-    /// directory predates the polyglot field — `ProjectRegistry::open`
-    /// re-detects empty entries on load and persists the result.
+    /// Languages auto-detected at registration. Empty when the directory
+    /// predates the polyglot field; daemon startup backfills it only through
+    /// an explicit local-project-walk lease.
     #[serde(default)]
     pub languages: BTreeSet<Language>,
     /// Alias selectors resolving to this project (taxonomy slice 2).
