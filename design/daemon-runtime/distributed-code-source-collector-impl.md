@@ -396,6 +396,14 @@ metadata checks. Verification runs off Tokio workers, exposes bytes and
 duration, warns after 60 seconds, and has no correctness timeout. The previous
 generation stays active until verification completes.
 
+This cache accepts a bounded bit-rot detection window when bytes change without
+observable metadata changing. A low-priority scrub rehashes every blob
+referenced by an active generation at least once per 24 hours. A mismatch
+quarantines the blob, marks the source generation degraded, and requests the
+hash on the producer's next negotiation. Already materialized search documents
+remain readable while the prior verified source is repaired; no rebuild from
+the corrupt blob is allowed.
+
 ## 9. Corpus-side source abstraction and indexing
 
 ### 9.1 Project-file sources
@@ -434,11 +442,14 @@ Turn on `ProjectFileV2` and `SymbolV2` for collected generations regardless of
 Legacy local behavior remains compatible during overlap.
 
 Every project-file document also carries an exact
-`code_source_entry_key = hash(selector, relative_path)` term. Local incremental
-replacement and deletion use that term, never the shared compatibility
-`file_path`. Collected staging deletes only the exact collected selector before
-re-adding it. The compatibility path remains a stored/searchable display value,
-not a lifecycle key.
+`code_source_entry_key = SHA-256(selector, relative_path)` term encoded as the
+full 64-character lowercase hexadecimal digest. It must not reuse the existing
+four-byte `short_hash`. Local indexing unconditionally deletes the exact entry
+key before every add, even when metadata has been lost, and local deletion uses
+the same term. It never uses the shared compatibility `file_path`. Collected
+staging deletes only the exact collected selector before re-adding it. The
+compatibility path remains a stored/searchable display value, not a lifecycle
+key.
 
 ### 9.2 Active search selector
 
@@ -576,6 +587,15 @@ collected generation. The local Git reader can therefore preserve and refresh
 HEAD and collected HEAD separately and warns when the local clone does not
 contain the collected HEAD. Reindex summaries report local-history and
 collected-current-file work separately.
+
+A lagging local clone does not fail collected-file activation. The Git phase
+indexes only commits reachable in that clone up to its local HEAD and joins
+their paths to the collected current-chunk map; commits the clone lacks remain
+absent until an operator fetches them. Checkout-local inspection paths that
+still read filesystem bytes may therefore disagree with collected current-file
+search during this overlap slice. Health names that condition, and the later
+checkout-plane extraction gate removes it. No API may silently present the
+local file bytes as the collected generation.
 
 ### 9.5 Schema migration and rollout
 
