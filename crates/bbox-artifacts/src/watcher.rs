@@ -457,11 +457,14 @@ fn handle_create(path: &Path, project_id: &str, bbox_root: &Path, catalog: &Arti
         Some(k) => k,
         None => return,
     };
+    let Some(source) = logical_artifact_source(&path, bbox_root) else {
+        return;
+    };
     let scope = ArtifactScope::Project { project_id, local };
     match catalog.install_value_scoped(
         scope,
         kind,
-        path.to_string_lossy().into_owned(),
+        source.to_string_lossy().into_owned(),
         &value,
         None,
         None,
@@ -492,13 +495,16 @@ fn handle_remove(path: &Path, project_id: &str, bbox_root: &Path, catalog: &Arti
     }) {
         return;
     }
+    let Some(source) = logical_artifact_source(path, bbox_root) else {
+        return;
+    };
     let local = is_local_path(path, bbox_root);
     let kind = match path_to_artifact_kind(path, bbox_root) {
         Some(k) => k,
         None => return,
     };
     let scope = ArtifactScope::Project { project_id, local };
-    match catalog.mark_removed_by_source(scope, kind, path) {
+    match catalog.mark_removed_by_source(scope, kind, &source) {
         Ok(Some(meta)) => tracing::info!(
             "watcher: marked removed {}/{} (project {})",
             kind.as_str(),
@@ -550,6 +556,23 @@ fn path_to_artifact_kind(path: &Path, bbox_root: &Path) -> Option<crate::artifac
         first
     };
     crate::artifacts::artifact_kind_from_dir_pub(kind_str)
+}
+
+fn logical_artifact_source(path: &Path, bbox_root: &Path) -> Option<PathBuf> {
+    let relative = path.strip_prefix(bbox_root).ok()?;
+    if relative.as_os_str().is_empty()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return None;
+    }
+    Some(PathBuf::from(".bbox").join(relative))
 }
 
 #[cfg(test)]
@@ -659,6 +682,15 @@ mod tests {
         access.insert(carrier.clone(), project_dir.clone());
         let registrations = vec![registration(carrier, &project_dir, true)];
         handle_event_batch(&[event], &registrations, &access, &catalog, None);
+        assert_eq!(
+            logical_artifact_source(
+                &wf_dir.join("watch-flow.json").canonicalize().unwrap(),
+                &bbox_dir.canonicalize().unwrap(),
+            )
+            .unwrap(),
+            PathBuf::from(".bbox/workflows/watch-flow.json"),
+            "catalog source identity must not retain the checkout path"
+        );
 
         // Artifact should be installed under the registered project_id.
         let scoped = catalog
