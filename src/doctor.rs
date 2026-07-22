@@ -737,6 +737,7 @@ mod tests {
             vec![
                 "daemon",
                 "index",
+                "code_sources",
                 "vectors",
                 "graph",
                 "projects",

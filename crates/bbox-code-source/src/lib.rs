@@ -245,7 +245,11 @@ pub fn validate_relative_path(value: &str) -> Result<(), ContractError> {
             .as_bytes()
             .get(1)
             .is_some_and(|byte| *byte == b':' && value.as_bytes()[0].is_ascii_alphabetic())
-        || value.split('/').any(str::is_empty)
+        || value.split('/').any(|component| {
+            component.is_empty()
+                || matches!(component, "." | "..")
+                || component.len() > MAX_PATH_COMPONENT_BYTES
+        })
         || value.contains('\\')
         || value
             .bytes()

@@ -1250,11 +1250,30 @@ impl CodeSourceStore {
         if offset > missing.len() {
             bail!("missing-blob cursor is out of range");
         }
-        let end = (offset + MISSING_PAGE_SIZE).min(missing.len());
-        let next_cursor = (end < missing.len()).then(|| encode_cursor(generation, end));
+        let stored = self.find_generation(generation)?;
+        let sizes = self
+            .load_generation_entries(&stored.descriptor.scope, generation)?
+            .into_iter()
+            .map(|entry| (entry.content_sha256, entry.size))
+            .collect::<BTreeMap<_, _>>();
+        let mut hashes = Vec::with_capacity(MISSING_PAGE_SIZE.min(missing.len() - offset));
+        let mut position = offset;
+        while position < missing.len() && hashes.len() < MISSING_PAGE_SIZE {
+            let hash = &missing[position];
+            let size = sizes
+                .get(hash)
+                .copied()
+                .ok_or_else(|| anyhow!("missing-set hash is absent from generation manifest"))?;
+            let path = self.blob_path(hash);
+            if !path.is_file() || verify_blob(&path, hash, size).is_err() {
+                hashes.push(hash.clone());
+            }
+            position += 1;
+        }
+        let next_cursor = (position < missing.len()).then(|| encode_cursor(generation, position));
         Ok(MissingBlobsPage {
             generation_id: generation.to_string(),
-            hashes: missing[offset..end].to_vec(),
+            hashes,
             next_cursor,
         })
     }

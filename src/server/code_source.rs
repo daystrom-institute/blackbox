@@ -1223,9 +1223,7 @@ fn previous_retirement_record(
     previous: Option<bbox_edge_sidecar::manifest::WorkspaceIndexEntry>,
     active_selector: &str,
 ) -> Option<RetirementRecord> {
-    let Some(previous) = previous else {
-        return None;
-    };
+    let previous = previous?;
     let (Some(selector), Some(snapshot_id)) = (
         previous.code_source_selector,
         previous

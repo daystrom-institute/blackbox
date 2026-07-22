@@ -1070,9 +1070,17 @@ mod tests {
         chunk.add_text(fields.file_path, "src/flux.rs");
         chunk.add_text(fields.content, "quantum flux capacitor alignment");
         chunk.add_text(fields.entity_id, "project_file:proj1234:aa:bb:0");
+        chunk.add_text(
+            fields.code_source_selector,
+            bbox_code_source::local_selector("proj1234"),
+        );
         writer.add_document(chunk).unwrap();
         writer.commit().unwrap();
         index.reader_reload_for_test();
+        index.replace_active_code_selectors(BTreeMap::from([(
+            "proj1234".to_string(),
+            bbox_code_source::local_selector("proj1234"),
+        )]));
 
         let hits = index
             .hybrid_bm25_hits("quantum flux capacitor", 10, None)
@@ -1264,6 +1272,10 @@ mod tests {
         writer.add_document(doc).unwrap();
         writer.commit().unwrap();
         index.reader.reload().unwrap();
+        index.replace_active_code_selectors(BTreeMap::from([(
+            project.project_id.clone(),
+            bbox_code_source::local_selector(&project.project_id),
+        )]));
 
         let result = index
             .search(&SearchParams {
