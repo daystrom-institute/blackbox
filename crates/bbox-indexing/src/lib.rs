@@ -4,5 +4,6 @@
 
 pub mod checkout_registry;
 pub mod index;
+pub mod project_catalog_migration_lock;
 pub mod projects;
 pub mod publisher;
