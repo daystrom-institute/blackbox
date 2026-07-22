@@ -1,5 +1,6 @@
 use super::startup::{configure_dispatch_mcp_env, discover_transcript_roots, resolve_codex_root};
 use super::{SIGNAL_LOG_CAP, SharedState, WEBHOOK_LOG_CAP, is_loopback_bind};
+use anyhow::Context;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -239,6 +240,23 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
 
     let (tail_tx, _) = broadcast::channel::<TailEvent>(1024);
     let (roster_tx, _) = broadcast::channel::<bro_protocol::RosterDelta>(1024);
+    let code_sources = Arc::new(super::code_source::CodeSourceRuntime::open(
+        &cfg,
+        &projects_store.read().list(),
+    )?);
+    if idx.schema_was_reset() {
+        tracing::info!(
+            schema = crate::index::INDEX_SCHEMA_VERSION,
+            "running synchronous full rebuild after index schema migration"
+        );
+        index_writer
+            .run_reindex_pass(true, true)
+            .context("synchronous schema-migration rebuild failed")?;
+        idx.reader_reload_for_test();
+        idx.complete_schema_migration()
+            .context("committing schema-migration version marker failed")?;
+    }
+
     // Shared reindex trigger. Initialized `true` so the first background pass
     // runs once after startup and indexes repo-owned `.bbox/knowledge` that may
     // have changed while the daemon was down (no watcher event fires for those,
@@ -260,7 +278,10 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         &store_dir,
         &projects_store.read(),
     );
-
+    let code_read_view = super::CodeReadView {
+        active_selectors: idx.active_code_selectors(),
+        edge_index: Arc::new(edge_index),
+    };
     let (edge_rebuild_nudge_tx, edge_rebuild_nudge_rx) = std::sync::mpsc::sync_channel(1);
     let shared = Arc::new(SharedState {
         idx: RwLock::new(idx),
@@ -297,7 +318,8 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         artifacts: RwLock::new(artifacts_store),
         bbox_watcher: std::sync::Mutex::new(None),
         reindex_dirty,
-        edge_index: RwLock::new(edge_index),
+        code_read_view: RwLock::new(Arc::new(code_read_view)),
+        code_sources,
         edge_rebuild_nudge_tx,
         edge_rebuild_nudge_rx: std::sync::Mutex::new(Some(edge_rebuild_nudge_rx)),
         path_cache: RwLock::new(path_cache::PathCache::default()),

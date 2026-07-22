@@ -48,11 +48,18 @@ impl BlackboxServer {
                     .build_index(false)
                     .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
-            let hits = server.state.idx.read().hybrid_bm25_hits(
-                query,
-                p.limit.unwrap_or(10).clamp(1, 100),
-                None,
-            )?;
+            let read_view = server.state.code_read_view.read().clone();
+            let hits = server
+                .state
+                .idx
+                .read()
+                .hybrid_bm25_hits_filtered_with_active_selectors(
+                    query,
+                    p.limit.unwrap_or(10).clamp(1, 100),
+                    None,
+                    false,
+                    &read_view.active_selectors,
+                )?;
             Ok(serde_json::to_string(&json!({
                 "hits": hits
                     .into_iter()
@@ -87,7 +94,12 @@ impl BlackboxServer {
                     .build_index(false)
                     .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
-            server.state.idx.read().search(&p)
+            let read_view = server.state.code_read_view.read().clone();
+            server
+                .state
+                .idx
+                .read()
+                .search_with_active_selectors(&p, &read_view.active_selectors)
         })
         .await
     }
@@ -120,11 +132,13 @@ impl BlackboxServer {
             let provider_ctx =
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
                     .with_knowledge_view(&knowledge_view.knowledge);
-            mcp_tools::hybrid_search::hybrid_search(
+            let read_view = server.state.code_read_view.read().clone();
+            mcp_tools::hybrid_search::hybrid_search_with_active_selectors(
                 &server.state.idx.read(),
                 &knowledge_view.knowledge,
                 &provider_ctx,
                 &p,
+                &read_view.active_selectors,
             )
         })
         .await
@@ -153,11 +167,13 @@ impl BlackboxServer {
             let provider_ctx =
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
                     .with_knowledge_view(&knowledge_view.knowledge);
+            let read_view = server.state.code_read_view.read().clone();
             mcp_tools::discover_seed::discover_seed_entities(
                 &server.state.idx.read(),
                 &knowledge_view.knowledge,
                 &provider_ctx,
-                &server.state.edge_index.read(),
+                read_view.edge_index.as_ref(),
+                &read_view.active_selectors,
                 &p,
             )
         })

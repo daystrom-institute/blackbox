@@ -1,0 +1,18 @@
+[package]
+name = "bbox-code-source-store"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+bbox-code-source = { path = "../bbox-code-source" }
+bbox-corpus-core = { path = "../bbox-corpus-core" }
+hex = "0.4"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

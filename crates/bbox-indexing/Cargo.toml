@@ -13,7 +13,10 @@ serde_json = "1"
 schemars = "0.8"
 anyhow = "1"
 bbox-corpus-core = { path = "../bbox-corpus-core" }
+bbox-code-source = { path = "../bbox-code-source" }
+bbox-code-source-store = { path = "../bbox-code-source-store" }
 bbox-corpus-index = { path = "../bbox-corpus-index" }
+bbox-edge-sidecar = { path = "../bbox-edge-sidecar" }
 bro-core = { path = "../bro-core" }
 bro-transcript = { path = "../bro-transcript" }
 parking_lot = "0.12"
@@ -44,3 +47,4 @@ bbox-knowledge = { path = "../bbox-knowledge" }
 bbox-config = { path = "../bbox-config" }
 bbox-threads = { path = "../bbox-threads" }
 bbox-edge-index = { path = "../bbox-edge-index" }
+bbox-vectors = { path = "../bbox-vectors" }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::BufRead;
 use std::path::Path;
@@ -229,6 +229,15 @@ impl TranscriptIndex {
     // ── Search ──────────────────────────────────────────────────────
 
     pub fn search(&self, p: &SearchParams) -> Result<String> {
+        let selectors = self.active_code_selectors();
+        self.search_with_active_selectors(p, &selectors)
+    }
+
+    pub fn search_with_active_selectors(
+        &self,
+        p: &SearchParams,
+        active_selectors: &BTreeMap<String, String>,
+    ) -> Result<String> {
         let raw_query = p.query.as_str();
         let mode = TranscriptSearchMode::parse_optional(p.mode.as_deref())?;
         let query_str = match mode {
@@ -264,6 +273,9 @@ impl TranscriptIndex {
         // Build filter clauses
         let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> =
             vec![(Occur::Must, text_query.box_clone())];
+        if let Some(active) = self.active_code_source_query_for(active_selectors) {
+            clauses.push((Occur::Must, active));
+        }
 
         if !include_subagents {
             clauses.push((
@@ -420,6 +432,24 @@ impl TranscriptIndex {
         doc_type: Option<&str>,
         exclude_knowledge: bool,
     ) -> Result<Vec<HybridBm25Hit>> {
+        let selectors = self.active_code_selectors();
+        self.hybrid_bm25_hits_filtered_with_active_selectors(
+            query,
+            limit,
+            doc_type,
+            exclude_knowledge,
+            &selectors,
+        )
+    }
+
+    pub fn hybrid_bm25_hits_filtered_with_active_selectors(
+        &self,
+        query: &str,
+        limit: usize,
+        doc_type: Option<&str>,
+        exclude_knowledge: bool,
+        active_selectors: &BTreeMap<String, String>,
+    ) -> Result<Vec<HybridBm25Hit>> {
         if self.is_empty() || query.trim().is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
@@ -446,6 +476,9 @@ impl TranscriptIndex {
         let text_query = qp.parse_query(&query_str)?;
         let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> =
             vec![(Occur::Must, text_query.box_clone())];
+        if let Some(active) = self.active_code_source_query_for(active_selectors) {
+            clauses.push((Occur::Must, active));
+        }
         // Symbol-defining-file boost: when the user issues a single-token
         // query that looks like a code symbol (snake_case, CamelCase, dotted
         // path, or just one word), add an additional SHOULD clause that
@@ -1547,9 +1580,22 @@ impl TranscriptIndex {
             HashMap::new()
         };
 
+        let preserved_collected = if full {
+            project_files::collect_preserved_collected_documents(
+                &self.index,
+                &self.config,
+                self.fields,
+            )?
+        } else {
+            project_files::PreservedCollectedDocuments::default()
+        };
+
         if full {
             tracing::info!("Full reindex — clearing existing index");
             writer.delete_all_documents()?;
+            for document in &preserved_collected.documents {
+                writer.add_document(document.clone())?;
+            }
             // Don't commit yet — let the rebuild work and the trailing
             // commit atomically commit delete+adds together.
         }
@@ -1579,6 +1625,7 @@ impl TranscriptIndex {
             &mut writer,
             &mut meta,
             full,
+            &preserved_collected.project_ids,
         )?;
         if project_stats.emitted_edges > 0 {
             tracing::debug!(
@@ -1613,9 +1660,18 @@ impl TranscriptIndex {
             .filter(|p| !current_paths.contains(p.as_str()))
             .cloned()
             .collect();
+        let active_collected = project_files::active_collected_sources(&self.config)?;
         for path in &stale_paths {
-            let term = Term::from_field_text(f.file_path, path);
-            writer.delete_term(term);
+            match meta.get(path).map(|row| row.source.clone()) {
+                Some(super::FileMetaSource::LocalProjectFile { project_id, .. })
+                    if active_collected.contains_key(&project_id) => {}
+                Some(super::FileMetaSource::LocalProjectFile { entry_key, .. }) => {
+                    writer.delete_term(Term::from_field_text(f.code_source_entry_key, &entry_key));
+                }
+                _ => {
+                    writer.delete_term(Term::from_field_text(f.file_path, path));
+                }
+            }
             meta.remove(path.as_str());
             purged += 1;
         }

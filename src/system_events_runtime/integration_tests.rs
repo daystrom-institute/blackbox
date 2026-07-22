@@ -63,6 +63,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
     let artifacts = artifacts::ArtifactCatalog::open(tmp.path().join("artifacts")).unwrap();
     let (tail_tx, _) = broadcast::channel::<TailEvent>(16);
     let (roster_tx, _) = broadcast::channel::<bro_protocol::RosterDelta>(16);
+    let active_code_selectors = index.active_code_selectors();
     let state = Arc::new(SharedState {
         idx: RwLock::new(index),
         index_writer,
@@ -104,7 +105,13 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         artifacts: RwLock::new(artifacts),
         bbox_watcher: std::sync::Mutex::new(None),
         reindex_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        edge_index: RwLock::new(edge_index::EdgeIndex::default()),
+        code_read_view: RwLock::new(Arc::new(crate::server::CodeReadView {
+            active_selectors: active_code_selectors,
+            edge_index: Arc::new(edge_index::EdgeIndex::default()),
+        })),
+        code_sources: Arc::new(crate::server::code_source::CodeSourceRuntime::for_test(
+            tmp.path(),
+        )),
         edge_rebuild_nudge_tx: std::sync::mpsc::sync_channel(1).0,
         edge_rebuild_nudge_rx: std::sync::Mutex::new(None),
         path_cache: RwLock::new(path_cache::PathCache::default()),

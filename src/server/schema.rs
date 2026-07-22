@@ -5,8 +5,8 @@ use crate::{artifacts, mcp_tools, orchestration};
 
 impl BlackboxServer {
     pub(crate) fn describe_schema_counts(&self) -> BTreeMap<String, usize> {
-        let mut counts = match self.state.edge_index.try_read() {
-            Some(edge_index) => edge_index.entity_type_counts_active(),
+        let mut counts = match self.state.code_read_view.try_read() {
+            Some(view) => view.edge_index.entity_type_counts_active(),
             None => {
                 tracing::warn!(
                     target: "blackbox::tool",

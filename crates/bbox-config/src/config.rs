@@ -109,6 +109,8 @@ pub struct RoadmapOverrides {
 struct RawConfig {
     pub daemon: RawDaemonConfig,
     pub index: RawIndexConfig,
+    #[serde(default)]
+    pub code_collection: RawCodeCollectionConfig,
     pub provenance: RawProvenanceConfig,
     pub providers: RawProviderConfig,
     pub lsp: RawLspConfig,
@@ -116,6 +118,66 @@ struct RawConfig {
     #[serde(default)]
     pub paths: RawPathsConfig,
     pub roadmap: RawRoadmapConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCodeCollectionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_code_collection_max_manifest_files")]
+    pub max_manifest_files: u64,
+    #[serde(default = "default_code_collection_max_manifest_logical_bytes")]
+    pub max_manifest_logical_bytes: u64,
+    #[serde(default = "default_code_collection_max_open_uploads")]
+    pub max_open_uploads_per_producer: usize,
+    #[serde(default = "default_code_collection_retained_generations")]
+    pub retained_generations: usize,
+    #[serde(default = "default_code_collection_blob_grace_hours")]
+    pub unreferenced_blob_grace_hours: u64,
+    #[serde(default = "default_code_collection_stale_warning_hours")]
+    pub stale_warning_hours: u64,
+    #[serde(default)]
+    pub producers: Vec<CodeCollectionProducerConfig>,
+}
+
+impl Default for RawCodeCollectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_manifest_files: default_code_collection_max_manifest_files(),
+            max_manifest_logical_bytes: default_code_collection_max_manifest_logical_bytes(),
+            max_open_uploads_per_producer: default_code_collection_max_open_uploads(),
+            retained_generations: default_code_collection_retained_generations(),
+            unreferenced_blob_grace_hours: default_code_collection_blob_grace_hours(),
+            stale_warning_hours: default_code_collection_stale_warning_hours(),
+            producers: Vec::new(),
+        }
+    }
+}
+
+fn default_code_collection_max_manifest_files() -> u64 {
+    250_000
+}
+
+fn default_code_collection_max_manifest_logical_bytes() -> u64 {
+    5 * 1024 * 1024 * 1024
+}
+
+fn default_code_collection_max_open_uploads() -> usize {
+    2
+}
+
+fn default_code_collection_retained_generations() -> usize {
+    2
+}
+
+fn default_code_collection_blob_grace_hours() -> u64 {
+    168
+}
+
+fn default_code_collection_stale_warning_hours() -> u64 {
+    24
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -402,6 +464,27 @@ pub struct IndexConfig {
     pub edge_index_boot_rebuild: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeCollectionConfig {
+    pub enabled: bool,
+    pub max_manifest_files: u64,
+    pub max_manifest_logical_bytes: u64,
+    pub max_open_uploads_per_producer: usize,
+    pub retained_generations: usize,
+    pub unreferenced_blob_grace_hours: u64,
+    pub stale_warning_hours: u64,
+    pub producers: Vec<CodeCollectionProducerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CodeCollectionProducerConfig {
+    pub producer_id: String,
+    pub token_file: PathBuf,
+    #[serde(default)]
+    pub scopes: Vec<bbox_corpus_core::identity::PublishedScope>,
+}
+
 /// Provenance configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvenanceConfig {
@@ -441,6 +524,7 @@ pub struct RoadmapConfig {
 pub struct Config {
     pub daemon: DaemonConfig,
     pub index: IndexConfig,
+    pub code_collection: CodeCollectionConfig,
     pub provenance: ProvenanceConfig,
     pub providers: ProviderConfig,
     pub lsp: LspConfig,
@@ -472,6 +556,7 @@ impl Config {
                 background_full_reindex_ticks: None,
                 edge_index_boot_rebuild: default_index_edge_index_boot_rebuild(),
             },
+            code_collection: RawCodeCollectionConfig::default(),
             provenance: RawProvenanceConfig {
                 git_notes_namespace: default_provenance_git_notes_namespace(),
             },
@@ -744,6 +829,16 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
 
     // Resolve paths
     let paths = resolve_paths(&raw, &home, config_path.as_deref())?;
+    let code_collection_producers = raw
+        .code_collection
+        .producers
+        .iter()
+        .cloned()
+        .map(|mut producer| {
+            producer.token_file = expand_tilde(&producer.token_file.to_string_lossy(), &home)?;
+            Ok(producer)
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     // Build final config
     Ok(Config {
@@ -762,6 +857,16 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             reindex_startup_delay_secs: raw.index.reindex_startup_delay_secs,
             background_full_reindex_ticks: raw.index.background_full_reindex_ticks,
             edge_index_boot_rebuild: raw.index.edge_index_boot_rebuild,
+        },
+        code_collection: CodeCollectionConfig {
+            enabled: raw.code_collection.enabled,
+            max_manifest_files: raw.code_collection.max_manifest_files,
+            max_manifest_logical_bytes: raw.code_collection.max_manifest_logical_bytes,
+            max_open_uploads_per_producer: raw.code_collection.max_open_uploads_per_producer,
+            retained_generations: raw.code_collection.retained_generations,
+            unreferenced_blob_grace_hours: raw.code_collection.unreferenced_blob_grace_hours,
+            stale_warning_hours: raw.code_collection.stale_warning_hours,
+            producers: code_collection_producers,
         },
         provenance: ProvenanceConfig {
             git_notes_namespace: raw.provenance.git_notes_namespace,
@@ -2442,6 +2547,24 @@ state_dir = "~"
                 .contains("committed project config .bbox/config.toml is missing")
         );
         assert_eq!(read_repo_id_inputs(&root), Default::default());
+    }
+
+    #[test]
+    fn code_collection_rejects_unknown_fields() {
+        assert!(
+            Figment::new()
+                .merge(Toml::string("enabled = true\nenabeld = false\n"))
+                .extract::<RawCodeCollectionConfig>()
+                .is_err()
+        );
+        assert!(
+            Figment::new()
+                .merge(Toml::string(
+                    "producer_id = \"host-a\"\ntoken_file = \"/tmp/token\"\nunknown = true\n"
+                ))
+                .extract::<CodeCollectionProducerConfig>()
+                .is_err()
+        );
     }
 
     #[test]

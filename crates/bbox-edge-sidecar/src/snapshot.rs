@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
@@ -17,6 +18,19 @@ use bbox_corpus_core::entity_ref::EntityRef;
 const INDEXER_VERSION: &str = "project-index-v1";
 const CHUNKER_VERSION: &str = "chunker-v1";
 const DIRTY_OVERLAY_DIRNAME: &str = "dirty-current";
+static MANIFEST_COORDINATOR: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn lock_manifest_coordinator() -> Result<MutexGuard<'static, ()>> {
+    MANIFEST_COORDINATOR
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("manifest coordinator lock poisoned"))
+}
+
+pub fn with_manifest_coordinator<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _coordinator = lock_manifest_coordinator()?;
+    operation()
+}
 
 /// Combined version stamp that gates per-file re-chunk in the project indexer.
 /// `clean_snapshot_id` folds INDEXER_VERSION/CHUNKER_VERSION, so a bump produces
@@ -55,6 +69,167 @@ pub fn nongit_snapshot_id(project_id: &str, source_tree_fingerprint: &str) -> St
     format!("nongit-{}", hex::encode(&hash[..16]))
 }
 
+pub fn collected_snapshot_id(project_id: &str, generation_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"bbox-collected-snapshot-v1");
+    hasher.update(project_id.as_bytes());
+    hasher.update(generation_id.as_bytes());
+    hasher.update(current_materialization_version().as_bytes());
+    format!("collected-{}", hex::encode(&hasher.finalize()[..16]))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn activate_collected_snapshot(
+    edges_dir: &Path,
+    project_id: &str,
+    repo_id: &str,
+    head_sha: &str,
+    generation_id: &str,
+    selector: &str,
+    snapshot_id: &str,
+) -> Result<()> {
+    activate_collected_snapshot_with(
+        edges_dir,
+        project_id,
+        repo_id,
+        head_sha,
+        generation_id,
+        selector,
+        snapshot_id,
+        || Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn activate_collected_snapshot_with<T>(
+    edges_dir: &Path,
+    project_id: &str,
+    repo_id: &str,
+    head_sha: &str,
+    generation_id: &str,
+    selector: &str,
+    snapshot_id: &str,
+    after_activation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    with_manifest_coordinator(|| {
+        activate_source_snapshot(
+            edges_dir,
+            project_id,
+            repo_id,
+            head_sha,
+            generation_id,
+            selector,
+            snapshot_id,
+            false,
+            None,
+        )?;
+        after_activation()
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn activate_local_snapshot(
+    edges_dir: &Path,
+    project_id: &str,
+    repo_id: &str,
+    head_sha: &str,
+    selector: &str,
+    snapshot_id: &str,
+    dirty: bool,
+    dirty_fingerprint: Option<&str>,
+) -> Result<()> {
+    activate_local_snapshot_with(
+        edges_dir,
+        project_id,
+        repo_id,
+        head_sha,
+        selector,
+        snapshot_id,
+        dirty,
+        dirty_fingerprint,
+        || Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn activate_local_snapshot_with<T>(
+    edges_dir: &Path,
+    project_id: &str,
+    repo_id: &str,
+    head_sha: &str,
+    selector: &str,
+    snapshot_id: &str,
+    dirty: bool,
+    dirty_fingerprint: Option<&str>,
+    after_activation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    with_manifest_coordinator(|| {
+        activate_source_snapshot(
+            edges_dir,
+            project_id,
+            repo_id,
+            head_sha,
+            "local",
+            selector,
+            snapshot_id,
+            dirty,
+            dirty_fingerprint,
+        )?;
+        after_activation()
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn activate_source_snapshot(
+    edges_dir: &Path,
+    project_id: &str,
+    repo_id: &str,
+    head_sha: &str,
+    generation_id: &str,
+    selector: &str,
+    snapshot_id: &str,
+    dirty: bool,
+    dirty_fingerprint: Option<&str>,
+) -> Result<()> {
+    if !snapshot_dir(edges_dir, project_id, snapshot_id).is_dir() {
+        anyhow::bail!("code-source edge snapshot is not staged");
+    }
+    let manifest = WorkspaceManifest {
+        version: 1,
+        project_id: project_id.to_string(),
+        repo_id: Some(repo_id.to_string()),
+        canonical_path: None,
+        git_common_dir: None,
+        git_worktree_dir: None,
+        branch: None,
+        head_sha: Some(head_sha.to_string()),
+        dirty,
+        dirty_fingerprint: dirty_fingerprint.map(str::to_string),
+        active_snapshot_id: Some(snapshot_id.to_string()),
+        active_dirty_overlay_id: None,
+        updated_at: None,
+    };
+    WorkspaceManifest::write_to(edges_dir, &manifest)?;
+
+    let mut index = ManifestIndex::load_or_new(edges_dir)?;
+    let repo_materialization = index
+        .workspaces
+        .get(project_id)
+        .and_then(|entry| entry.repo_materialization.clone());
+    index.upsert_workspace(
+        project_id,
+        WorkspaceIndexEntry {
+            manifest: format!("workspace/{project_id}/manifest.json"),
+            active_snapshot: Some(active_snapshot_rel(project_id, snapshot_id)),
+            dirty_overlay: None,
+            repo_materialization,
+            code_source_selector: Some(selector.to_string()),
+            code_source_generation: Some(generation_id.to_string()),
+        },
+    );
+    index.write_atomic(edges_dir)
+}
+
 pub fn snapshot_dir(edges_dir: &Path, project_id: &str, snapshot_id: &str) -> PathBuf {
     materialized_dir(edges_dir)
         .join("workspace")
@@ -90,6 +265,13 @@ pub fn write_snapshot_files(
     files: &[(&str, &[Edge])],
 ) -> Result<()> {
     let snap_dir = snapshot_dir(edges_dir, project_id, snapshot_id);
+    if snap_dir.is_dir() {
+        for (filename, edges) in files {
+            write_edges_file_atomic(&snap_dir, filename, edges)?;
+        }
+        fs::File::open(&snap_dir)?.sync_all()?;
+        return Ok(());
+    }
     let tmp_dir = snap_dir.with_extension("write-tmp");
 
     if tmp_dir.is_dir() {
@@ -97,23 +279,39 @@ pub fn write_snapshot_files(
     }
     fs::create_dir_all(&tmp_dir)?;
     for (filename, edges) in files {
-        let path = tmp_dir.join(*filename);
-        let file = fs::File::create(&path)?;
-        // Buffered: one syscall per ~8KiB instead of one per serialized
-        // fragment (unbuffered writes dominated snapshot rewrites;
-        // thread-935b467d).
-        let mut writer = std::io::BufWriter::new(file);
-        for edge in *edges {
-            serde_json::to_writer(&mut writer, edge)?;
-            writer.write_all(b"\n")?;
-        }
-        let file = writer.into_inner().map_err(|err| err.into_error())?;
-        file.sync_all()?;
+        write_edges_file(&tmp_dir.join(*filename), edges)?;
     }
-    if snap_dir.is_dir() {
-        let _ = fs::remove_dir_all(&snap_dir);
-    }
+    fs::File::open(&tmp_dir)?.sync_all()?;
     fs::rename(&tmp_dir, &snap_dir)?;
+    fs::File::open(
+        snap_dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("snapshot directory has no parent"))?,
+    )?
+    .sync_all()?;
+    Ok(())
+}
+
+fn write_edges_file_atomic(directory: &Path, filename: &str, edges: &[Edge]) -> Result<()> {
+    let path = directory.join(filename);
+    let temporary = path.with_extension("jsonl.tmp");
+    write_edges_file(&temporary, edges)?;
+    fs::rename(&temporary, &path)?;
+    Ok(())
+}
+
+fn write_edges_file(path: &Path, edges: &[Edge]) -> Result<()> {
+    let file = fs::File::create(path)?;
+    // Buffered: one syscall per ~8KiB instead of one per serialized
+    // fragment (unbuffered writes dominated snapshot rewrites;
+    // thread-935b467d).
+    let mut writer = std::io::BufWriter::new(file);
+    for edge in edges {
+        serde_json::to_writer(&mut writer, edge)?;
+        writer.write_all(b"\n")?;
+    }
+    let file = writer.into_inner().map_err(|err| err.into_error())?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -384,6 +582,7 @@ fn update_manifest_for_snapshot(
     snapshot_id: &str,
     dirty_overlay_rel: Option<&str>,
 ) -> Result<()> {
+    let _coordinator = lock_manifest_coordinator()?;
     let manifest = WorkspaceManifest {
         version: 1,
         project_id: project_id.to_string(),
@@ -401,7 +600,7 @@ fn update_manifest_for_snapshot(
     };
     WorkspaceManifest::write_to(edges_dir, &manifest)?;
 
-    let mut idx = ManifestIndex::load(edges_dir).unwrap_or_else(|_| ManifestIndex::new());
+    let mut idx = ManifestIndex::load_or_new(edges_dir)?;
 
     let snap_rel = active_snapshot_rel(project_id, snapshot_id);
     idx.upsert_workspace(
@@ -411,6 +610,8 @@ fn update_manifest_for_snapshot(
             active_snapshot: Some(snap_rel),
             dirty_overlay: dirty_overlay_rel.map(|r| r.to_string()),
             repo_materialization: None,
+            code_source_selector: Some(bbox_code_source::local_selector(project_id)),
+            code_source_generation: Some("local".to_string()),
         },
     );
     idx.write_atomic(edges_dir)?;

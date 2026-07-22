@@ -14,7 +14,7 @@ pub use super::passes::*;
 use super::project_files;
 use super::tool_edges::ToolEdgeContext;
 use super::writer_actor::IndexWriterActor;
-use super::{FieldHandles, ReindexConfig};
+use super::{FieldHandles, FileMetaSource, ReindexConfig};
 use crate::projects::ProjectRecord;
 use bbox_corpus_index::transcripts::adapters::{TranscriptAdapterRegistry, TranscriptScanTarget};
 
@@ -131,6 +131,11 @@ pub(super) fn execute_reindex_pass(
     } else {
         Vec::new()
     };
+    let preserved_collected = if full {
+        project_files::collect_preserved_collected_documents(index, config, fields)?
+    } else {
+        project_files::PreservedCollectedDocuments::default()
+    };
     // Reload meta at pass start (a prior pass may have committed since the
     // scheduler's speculative scan).
     let mut meta = if full {
@@ -138,6 +143,9 @@ pub(super) fn execute_reindex_pass(
         writer.delete_all_documents()?;
         for document in provisional_documents {
             writer.add_document(document)?;
+        }
+        for document in &preserved_collected.documents {
+            writer.add_document(document.clone())?;
         }
         // Don't commit yet — let the rebuild work and the trailing
         // writer.commit() atomically commit delete+adds together.
@@ -184,6 +192,7 @@ pub(super) fn execute_reindex_pass(
         &mut *writer,
         &mut meta,
         full,
+        &preserved_collected.project_ids,
     )?;
     indexed_files += project_stats.indexed_files;
     indexed_docs += project_stats.indexed_docs;
@@ -269,9 +278,21 @@ pub(super) fn execute_reindex_pass(
         .filter(|p| !current_paths.contains(p.as_str()))
         .cloned()
         .collect();
+    let active_collected = project_files::active_collected_sources(config)?;
     for path in &stale_paths {
-        let term = Term::from_field_text(fields.file_path, path);
-        writer.delete_term(term);
+        match meta.get(path).map(|row| row.source.clone()) {
+            Some(FileMetaSource::LocalProjectFile { project_id, .. })
+                if active_collected.contains_key(&project_id) => {}
+            Some(FileMetaSource::LocalProjectFile { entry_key, .. }) => {
+                writer.delete_term(Term::from_field_text(
+                    fields.code_source_entry_key,
+                    &entry_key,
+                ));
+            }
+            _ => {
+                writer.delete_term(Term::from_field_text(fields.file_path, path));
+            }
+        }
         meta.remove(path.as_str());
         purged += 1;
     }

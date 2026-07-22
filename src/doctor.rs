@@ -175,6 +175,7 @@ pub(crate) fn run(server: &crate::server::BlackboxServer) -> anyhow::Result<Doct
     let sections = vec![
         daemon_section(state),
         index_section(state),
+        code_sources_section(state),
         vectors_section(state),
         graph_section(server),
         projects_section(state),
@@ -183,6 +184,126 @@ pub(crate) fn run(server: &crate::server::BlackboxServer) -> anyhow::Result<Doct
         attention_section(state),
     ];
     Ok(DoctorReport::from_sections(sections))
+}
+
+fn code_sources_section(state: &crate::server::state::SharedState) -> SectionReport {
+    let store = state.code_sources.store();
+    let mut findings = Vec::new();
+    match store.health_records() {
+        Ok(records) => {
+            for record in records {
+                let finding = match record.code.as_str() {
+                    "preservation_failed" => Finding::blocked(format!(
+                        "project `{}` full-rebuild preservation failed: {}",
+                        record.project_id, record.diagnostic
+                    ))
+                    .with_next(
+                        "re-ship the active generation or remove its collector assignment to complete an explicit local cutback",
+                    ),
+                    "missing_blob_data" => Finding::blocked(format!(
+                        "project `{}` has missing or corrupt collected blobs: {}",
+                        record.project_id, record.diagnostic
+                    ))
+                    .with_next(
+                        "re-run the collector to repair the generation, or remove its assignment for an explicit local cutback",
+                    ),
+                    "cutback_pending" => Finding::action(
+                        format!(
+                            "project `{}` local cutback is pending: {}",
+                            record.project_id, record.diagnostic
+                        ),
+                        "restore the registered checkout and reload configuration to retry cutback",
+                    ),
+                    "activation_failed" => Finding::action(
+                        format!(
+                            "project `{}` collected activation failed: {}",
+                            record.project_id, record.diagnostic
+                        ),
+                        "repair the reported source/store condition and publish the checkout again",
+                    ),
+                    _ => Finding::warn(format!(
+                        "project `{}` code-source health issue `{}`: {}",
+                        record.project_id, record.code, record.diagnostic
+                    )),
+                };
+                findings.push(finding);
+            }
+        }
+        Err(error) => findings.push(Finding::blocked(format!(
+            "code-source health records are unreadable: {error:#}"
+        ))),
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let stale_hours = state.config.read().code_collection.stale_warning_hours;
+    match store.activation_records() {
+        Ok(activations) => {
+            for activation in activations {
+                let generation = match store.find_generation(&activation.generation_id) {
+                    Ok(generation) => generation,
+                    Err(error) => {
+                        findings.push(Finding::blocked(format!(
+                            "project `{}` active collected generation is unreadable: {error:#}",
+                            activation.project_id
+                        )));
+                        continue;
+                    }
+                };
+                let age_hours = now
+                    .saturating_sub(activation.activated_unix_secs)
+                    .checked_div(3_600)
+                    .unwrap_or_default();
+                if age_hours >= stale_hours {
+                    findings.push(Finding::warn(format!(
+                        "project `{}` collected generation is {} hours old",
+                        activation.project_id, age_hours
+                    )));
+                } else if generation.state == bbox_code_source::GenerationState::Active {
+                    findings.push(Finding::ok(format!(
+                        "project `{}` collected generation active ({} files, {} bytes, age {}h)",
+                        activation.project_id,
+                        generation.descriptor.file_count,
+                        generation.descriptor.logical_bytes,
+                        age_hours
+                    )));
+                }
+                if let Some(project) = state
+                    .projects
+                    .read()
+                    .list()
+                    .into_iter()
+                    .find(|project| project.project_id == activation.project_id)
+                {
+                    let local_head = bbox_corpus_core::git::current_head(std::path::Path::new(
+                        &project.canonical_path,
+                    ));
+                    if local_head.as_deref() != Some(generation.descriptor.head_commit.as_str()) {
+                        findings.push(Finding::warn(format!(
+                            "project `{}` local Git-history HEAD differs from collected current files",
+                            activation.project_id
+                        )));
+                    }
+                }
+            }
+        }
+        Err(error) => findings.push(Finding::blocked(format!(
+            "code-source activation records are unreadable: {error:#}"
+        ))),
+    }
+    if findings.is_empty() {
+        findings.push(if state.config.read().code_collection.enabled {
+            Finding::info("code collection enabled with no active collected generations")
+        } else {
+            Finding::ok("code collection disabled; project sources are local")
+        });
+    }
+    SectionReport {
+        section: "code_sources",
+        findings,
+    }
 }
 
 fn daemon_section(state: &crate::server::state::SharedState) -> SectionReport {

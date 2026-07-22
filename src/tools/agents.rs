@@ -1905,8 +1905,10 @@ mod tests {
             name: "distilled-reviewer".into(),
             version: 1,
         };
-        let edge_index = server.state.edge_index.read();
-        let edges = edge_index.forward_edges_filtered(&agent_ref, &["DERIVED_FROM"]);
+        let read_view = server.state.code_read_view.read().clone();
+        let edges = read_view
+            .edge_index
+            .forward_edges_filtered(&agent_ref, &["DERIVED_FROM"]);
         assert_eq!(edges.len(), 2);
         assert!(edges.iter().any(|edge| {
             edge.target

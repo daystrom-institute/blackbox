@@ -1,51 +1,21 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
 use ignore::{DirEntry, WalkBuilder};
 use sha2::{Digest, Sha256};
-use tantivy::{IndexWriter, TantivyDocument, Term};
+use tantivy::collector::{Count, TopDocs};
+use tantivy::query::TermQuery;
+use tantivy::schema::IndexRecordOption;
+use tantivy::{Index, IndexWriter, TantivyDocument, Term};
 
-use super::{FieldHandles, FileMeta, ReindexConfig};
+use super::{FieldHandles, FileMeta, FileMetaSource, ReindexConfig};
 use bbox_chunker::{self as chunker, Chunk, Edge, EdgeConfidence, EdgeProvenance};
 use bbox_corpus_core::entity_ref::{self, EntityRef};
 use bbox_corpus_core::project_record::{ProjectRecord, load_project_records};
-
-const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
-/// Binary document containers (PDF, OOXML, spreadsheets) get a larger
-/// byte budget: their size is dominated by embedded images/fonts, not
-/// extractable text, so the 2 MiB text-file guard silently dropped
-/// real-world documents (a 5 MB scanned-letterhead PDF can carry 20 KB
-/// of text). The chunkers bound their own OUTPUT (per-sheet row/char
-/// caps, per-page chunks, catch_unwind degradation), so the input budget
-/// only guards parse cost, not index bloat.
-const MAX_DOCUMENT_FILE_BYTES: u64 = 25 * 1024 * 1024;
-/// X-IMG standalone images. Capped at the multimodal provider's own
-/// per-image byte limit (design/corpus/agentic-corpus/
-/// multimodal-embedding-routing.md: "image <= 20 MB and <= 16M pixels"):
-/// admitting a larger file through the walker only to have
-/// `voyage_multimodal`'s local preflight guard reject it later is wasted
-/// disk I/O and a wasted visual-payload-store write for a chunk that can
-/// never embed.
-const MAX_IMAGE_FILE_BYTES: u64 = 20 * 1024 * 1024;
-
-fn max_bytes_for_path(path: &Path) -> u64 {
-    match path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("pdf" | "docx" | "pptx" | "xlsx" | "xlsm" | "xlam" | "xlsb" | "xls" | "ods") => {
-            MAX_DOCUMENT_FILE_BYTES
-        }
-        Some("png" | "jpg" | "jpeg" | "gif" | "webp") => MAX_IMAGE_FILE_BYTES,
-        _ => MAX_FILE_BYTES,
-    }
-}
-const SKIP_DIRS: &[&str] = &["target", "node_modules", "_build", ".worktrees"];
 
 #[derive(Debug, Default)]
 pub struct ProjectIndexStats {
@@ -56,6 +26,181 @@ pub struct ProjectIndexStats {
     pub indexed_commits: u64,
     pub call_edges: u64,
     pub resolved_call_edges: u64,
+    pub skipped_symlinks: u64,
+    pub skipped_special: u64,
+    pub skipped_unsupported: u64,
+    pub skipped_oversize: u64,
+}
+
+#[derive(Debug)]
+pub struct CollectedIndexResult {
+    pub snapshot_id: String,
+    pub selector: String,
+    pub document_count: u64,
+    pub entity_inventory_sha256: String,
+    pub current_chunk_targets: HashMap<String, EntityRef>,
+    pub staged_edges: Vec<bbox_edge_sidecar::edge_sidecar::Edge>,
+    pub head_commit: String,
+    pub dirty_fingerprint: String,
+    pub worktree_dirty: bool,
+}
+
+pub fn collected_materialization_selector(project_id: &str, generation_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"bbox-collected-selector-materialization-v1");
+    hasher.update(bbox_edge_sidecar::snapshot::current_materialization_version().as_bytes());
+    format!(
+        "{}:m{}",
+        bbox_code_source::source_selector(project_id, generation_id),
+        hex::encode(&hasher.finalize()[..8])
+    )
+}
+
+#[derive(Debug, Default)]
+struct ProjectFileScanStats {
+    skipped_symlinks: u64,
+    skipped_special: u64,
+    skipped_unsupported: u64,
+    skipped_oversize: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveCollectedSource {
+    pub selector: String,
+    pub generation_id: String,
+}
+
+#[derive(Debug, Default)]
+pub struct PreservedCollectedDocuments {
+    pub project_ids: BTreeSet<String>,
+    pub documents: Vec<TantivyDocument>,
+}
+
+pub fn active_collected_sources(
+    config: &ReindexConfig,
+) -> Result<BTreeMap<String, ActiveCollectedSource>> {
+    let edges_dir =
+        bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&config.projects_path);
+    let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)?;
+    Ok(manifest
+        .workspaces
+        .into_iter()
+        .filter_map(|(project_id, entry)| {
+            let selector = entry.code_source_selector?;
+            let generation_id = entry.code_source_generation?;
+            selector.starts_with("collected:").then_some((
+                project_id,
+                ActiveCollectedSource {
+                    selector,
+                    generation_id,
+                },
+            ))
+        })
+        .collect())
+}
+
+pub fn collect_preserved_collected_documents(
+    index: &Index,
+    config: &ReindexConfig,
+    f: FieldHandles,
+) -> Result<PreservedCollectedDocuments> {
+    let active = active_collected_sources(config)?;
+    if active.is_empty() {
+        return Ok(PreservedCollectedDocuments::default());
+    }
+    let store = bbox_code_source_store::CodeSourceStore::open(
+        config
+            .projects_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("code-sources"),
+        bbox_code_source_store::StoreLimits::default(),
+    )?;
+    let searcher = index.reader()?.searcher();
+    let mut preserved = PreservedCollectedDocuments::default();
+    for (project_id, source) in active {
+        let Some(activation) = store.load_activation(&project_id)? else {
+            let diagnostic = "active collected source has no activation record";
+            store.record_health_failure(&project_id, "preservation_failed", diagnostic)?;
+            anyhow::bail!(diagnostic);
+        };
+        if activation.selector != source.selector
+            || activation.generation_id != source.generation_id
+        {
+            let diagnostic = "active collected source disagrees with its activation record";
+            store.record_health_failure(&project_id, "preservation_failed", diagnostic)?;
+            anyhow::bail!(diagnostic);
+        }
+        let generation = store.find_generation(&source.generation_id)?;
+        if generation.materialized_doc_count != Some(activation.document_count)
+            || generation.entity_inventory_sha256.as_deref()
+                != Some(activation.entity_inventory_sha256.as_str())
+        {
+            let diagnostic = "active collected materialization metadata is incomplete";
+            store.record_health_failure(&project_id, "preservation_failed", diagnostic)?;
+            anyhow::bail!(diagnostic);
+        }
+        let query = TermQuery::new(
+            Term::from_field_text(f.code_source_selector, &source.selector),
+            IndexRecordOption::Basic,
+        );
+        let count = searcher.search(&query, &Count)?;
+        if count as u64 != activation.document_count {
+            store.record_health_failure(
+                &project_id,
+                "preservation_failed",
+                &format!(
+                    "active collected document count mismatch: expected {}, observed {}",
+                    activation.document_count, count
+                ),
+            )?;
+            anyhow::bail!(
+                "active collected document count mismatch: expected {}, observed {}",
+                activation.document_count,
+                count
+            );
+        }
+        let mut entity_ids = Vec::with_capacity(count);
+        let mut documents = Vec::with_capacity(count);
+        for (_score, address) in searcher.search(&query, &TopDocs::with_limit(count))? {
+            let document = searcher.doc::<TantivyDocument>(address)?;
+            let entity_id = document
+                .get_first(f.entity_id)
+                .and_then(|value| match value {
+                    tantivy::schema::OwnedValue::Str(value) => Some(value.clone()),
+                    _ => None,
+                })
+                .ok_or_else(|| anyhow::anyhow!("preserved collected document has no entity id"))?;
+            entity_ids.push(entity_id);
+            documents.push(document);
+        }
+        entity_ids.sort();
+        let mut inventory = Sha256::new();
+        for entity_id in entity_ids {
+            inventory.update((entity_id.len() as u64).to_be_bytes());
+            inventory.update(entity_id.as_bytes());
+        }
+        let observed = hex::encode(inventory.finalize());
+        if observed != activation.entity_inventory_sha256 {
+            store.record_health_failure(
+                &project_id,
+                "preservation_failed",
+                &format!(
+                    "active collected entity inventory mismatch: expected {}, observed {}",
+                    activation.entity_inventory_sha256, observed
+                ),
+            )?;
+            anyhow::bail!(
+                "active collected entity inventory mismatch: expected {}, observed {}",
+                activation.entity_inventory_sha256,
+                observed
+            );
+        }
+        store.clear_health_failure(&project_id, "preservation_failed")?;
+        preserved.project_ids.insert(project_id);
+        preserved.documents.extend(documents);
+    }
+    Ok(preserved)
 }
 
 struct PendingProjectFile {
@@ -115,9 +260,12 @@ fn ref_snapshot_id(
 
 pub fn scan_registered_project_files(config: &ReindexConfig) -> Result<Vec<(String, u64, u64)>> {
     let mut files = Vec::new();
+    let collected = active_collected_sources(config)?;
     for project in load_project_records(&config.projects_path)? {
         let root = PathBuf::from(&project.canonical_path);
-        scan_project_files(&root, &mut files)?;
+        if !collected.contains_key(&project.project_id) {
+            let _ = scan_project_files(&root, &mut files)?;
+        }
         if project.repo_id.is_some() {
             if let Some(head) = bbox_corpus_core::git::head_fingerprint(&root) {
                 files.push((
@@ -137,13 +285,47 @@ pub fn index_registered_projects_standalone(
     writer: &mut IndexWriter,
     meta: &mut HashMap<String, FileMeta>,
     force_git_full: bool,
+    preserved_collected: &BTreeSet<String>,
 ) -> Result<ProjectIndexStats> {
     let mut stats = ProjectIndexStats::default();
     let edges_dir =
         bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&config.projects_path);
     let git_meta_dir = super::git_history::git_meta_dir_from_projects_path(&config.projects_path);
+    let collected = active_collected_sources(config)?;
+    let collected_store = (!collected.is_empty()).then(|| {
+        bbox_code_source_store::CodeSourceStore::open(
+            config
+                .projects_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("code-sources"),
+            bbox_code_source_store::StoreLimits::default(),
+        )
+    });
     for project in load_project_records(&config.projects_path)? {
         let root = PathBuf::from(&project.canonical_path);
+        if let Some(active) = collected.get(&project.project_id) {
+            let store = collected_store
+                .as_ref()
+                .expect("collected store exists when collected sources exist")
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            index_active_collected_project(
+                &project,
+                &root,
+                active,
+                store,
+                f,
+                writer,
+                meta,
+                &edges_dir,
+                &git_meta_dir,
+                force_git_full,
+                preserved_collected.contains(&project.project_id),
+                &mut stats,
+            )?;
+            continue;
+        }
         if !root.exists() {
             continue;
         }
@@ -161,12 +343,449 @@ pub fn index_registered_projects_standalone(
     Ok(stats)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn index_active_collected_project(
+    project: &ProjectRecord,
+    root: &Path,
+    active: &ActiveCollectedSource,
+    store: &bbox_code_source_store::CodeSourceStore,
+    f: FieldHandles,
+    writer: &mut IndexWriter,
+    meta: &mut HashMap<String, FileMeta>,
+    edges_dir: &Path,
+    git_meta_dir: &Path,
+    force_full: bool,
+    preserved_documents_are_staged: bool,
+    stats: &mut ProjectIndexStats,
+) -> Result<()> {
+    let activation = store
+        .load_activation(&project.project_id)?
+        .ok_or_else(|| anyhow::anyhow!("active collected selector has no activation record"))?;
+    if activation.generation_id != active.generation_id || activation.selector != active.selector {
+        anyhow::bail!("active collected selector disagrees with its activation record");
+    }
+    let expected_selector =
+        collected_materialization_selector(&project.project_id, &active.generation_id);
+    if active.selector != expected_selector {
+        anyhow::bail!("active collected selector requires materialization migration");
+    }
+    let expected_snapshot = bbox_edge_sidecar::snapshot::collected_snapshot_id(
+        &project.project_id,
+        &active.generation_id,
+    );
+    if activation.snapshot_id != expected_snapshot {
+        anyhow::bail!("active collected materialization version requires an explicit migration");
+    }
+    let stored = store.find_generation(&active.generation_id)?;
+    let entries = store.load_generation_entries(&stored.descriptor.scope, &active.generation_id)?;
+    let blobs_available = !force_full
+        || entries.iter().all(|entry| {
+            store
+                .verified_blob_file(&entry.content_sha256, entry.size)
+                .is_ok()
+        });
+    if force_full && !blobs_available {
+        store.mark_generation_state(
+            &stored.descriptor.scope,
+            &active.generation_id,
+            bbox_code_source::GenerationState::MissingBlobData,
+            Some("one or more active source blobs are missing or corrupt".to_string()),
+        )?;
+        store.record_health_failure(
+            &project.project_id,
+            "missing_blob_data",
+            "one or more active source blobs are missing or corrupt",
+        )?;
+    } else if force_full && stored.state == bbox_code_source::GenerationState::MissingBlobData {
+        store.mark_generation_state(
+            &stored.descriptor.scope,
+            &active.generation_id,
+            bbox_code_source::GenerationState::Active,
+            None,
+        )?;
+        store.clear_health_failure(&project.project_id, "missing_blob_data")?;
+    }
+    let staged = if force_full && blobs_available {
+        Some(stage_collected_project_generation(
+            project,
+            &stored.descriptor,
+            &active.generation_id,
+            &entries,
+            f,
+            writer,
+            edges_dir,
+            |entry| {
+                let mut file = store.verified_blob_file(&entry.content_sha256, entry.size)?;
+                let mut bytes = Vec::with_capacity(entry.size as usize);
+                file.read_to_end(&mut bytes)?;
+                Ok(bytes)
+            },
+        )?)
+    } else if force_full && !preserved_documents_are_staged {
+        anyhow::bail!(
+            "active collected generation has unavailable blobs and no verified read-back"
+        );
+    } else {
+        if force_full && !blobs_available {
+            tracing::warn!(
+                project_id = %project.project_id,
+                generation = %active.generation_id,
+                "full rebuild preserved active collected documents because source blobs are unavailable"
+            );
+        }
+        None
+    };
+    let current_chunk_targets = staged
+        .as_ref()
+        .map(|result| result.current_chunk_targets.clone())
+        .unwrap_or_else(|| {
+            activation
+                .current_chunk_targets
+                .clone()
+                .into_iter()
+                .collect()
+        });
+    let mut git_ctx = super::git_history::GitIndexContext {
+        f,
+        writer,
+        meta,
+        edges_dir,
+        git_meta_dir,
+        force_full,
+    };
+    let git_stats = super::git_history::index_git_history_for_project(
+        project,
+        root,
+        &current_chunk_targets,
+        &mut git_ctx,
+    )?;
+    stats.indexed_commits += git_stats.indexed_commits;
+    stats.indexed_docs += git_stats.indexed_commits;
+    stats.emitted_edges += git_stats.emitted_edges;
+    let git_edges = bbox_edge_sidecar::edge_sidecar::read_managed_derived_edges(
+        edges_dir,
+        "git",
+        &project.project_id,
+    )?
+    .into_iter()
+    .map(|edge| bbox_edge_sidecar::edge_sidecar::Edge {
+        source: edge.source,
+        kind: edge.kind,
+        target: edge.target,
+        provenance: edge.provenance,
+        confidence: edge.confidence,
+        metadata: Default::default(),
+    })
+    .collect::<Vec<_>>();
+    if let Some(staged) = staged {
+        bbox_edge_sidecar::snapshot::write_snapshot_files(
+            edges_dir,
+            &project.project_id,
+            &staged.snapshot_id,
+            &[
+                ("project.jsonl", staged.staged_edges.as_slice()),
+                ("git-current.jsonl", git_edges.as_slice()),
+            ],
+        )?;
+        stats.indexed_docs += staged.document_count;
+        stats.indexed_files += stored.descriptor.file_count;
+    } else {
+        bbox_edge_sidecar::snapshot::write_snapshot_files(
+            edges_dir,
+            &project.project_id,
+            &activation.snapshot_id,
+            &[("git-current.jsonl", git_edges.as_slice())],
+        )?;
+    }
+    Ok(())
+}
+
 pub fn build_project_file_doc(
     chunk: &Chunk,
     project: &ProjectRecord,
     absolute_path: &Path,
     commit_sha: Option<&str>,
     snapshot_id: Option<&str>,
+    f: FieldHandles,
+) -> TantivyDocument {
+    let selector = bbox_code_source::local_selector(&project.project_id);
+    let relative_path = chunk.file_path.to_string_lossy();
+    let entry_key = bbox_code_source::source_entry_key(&selector, &relative_path);
+    build_project_file_doc_for_source(
+        chunk,
+        project,
+        absolute_path,
+        commit_sha,
+        snapshot_id,
+        &selector,
+        "local",
+        &entry_key,
+        f,
+    )
+}
+
+pub fn stage_collected_project_generation<F>(
+    project: &ProjectRecord,
+    descriptor: &bbox_code_source::GenerationDescriptor,
+    generation_id: &str,
+    entries: &[bbox_code_source::ManifestEntry],
+    f: FieldHandles,
+    writer: &mut IndexWriter,
+    edges_dir: &Path,
+    open_bytes: F,
+) -> Result<CollectedIndexResult>
+where
+    F: FnMut(&bbox_code_source::ManifestEntry) -> Result<Vec<u8>>,
+{
+    descriptor.validate_manifest(entries, u64::MAX, u64::MAX)?;
+    let snapshot_id =
+        bbox_edge_sidecar::snapshot::collected_snapshot_id(&project.project_id, generation_id);
+    let selector = collected_materialization_selector(&project.project_id, generation_id);
+    stage_project_file_generation(
+        project,
+        descriptor,
+        generation_id,
+        entries,
+        &selector,
+        &snapshot_id,
+        false,
+        f,
+        writer,
+        edges_dir,
+        open_bytes,
+    )
+}
+
+pub fn stage_local_project_generation(
+    project: &ProjectRecord,
+    scope: &bbox_corpus_core::identity::PublishedScope,
+    f: FieldHandles,
+    writer: &mut IndexWriter,
+    edges_dir: &Path,
+) -> Result<CollectedIndexResult> {
+    let root = PathBuf::from(&project.canonical_path)
+        .canonicalize()
+        .with_context(|| format!("canonicalizing local project {}", project.project_id))?;
+    if !root.is_dir() {
+        anyhow::bail!("registered local project root is not a directory");
+    }
+    let head_commit = bbox_corpus_core::git::current_head(&root)
+        .ok_or_else(|| anyhow::anyhow!("registered local project has no readable Git HEAD"))?;
+    let mut scanned = Vec::new();
+    let _scan_stats = scan_project_files(&root, &mut scanned)?;
+    let mut entries = Vec::with_capacity(scanned.len());
+    for (absolute_path, _mtime, declared_size) in scanned {
+        let absolute_path = PathBuf::from(absolute_path);
+        let relative_path = absolute_path
+            .strip_prefix(&root)
+            .context("scanned local source escaped its registered root")?
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("local source path is not valid UTF-8"))?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        let bytes = read_regular_file_confined(&root, Path::new(&relative_path))
+            .with_context(|| format!("reading local source {relative_path}"))?;
+        if bytes.len() as u64 != declared_size {
+            anyhow::bail!("local source changed while preparing cutback");
+        }
+        entries.push(bbox_code_source::ManifestEntry {
+            relative_path,
+            content_sha256: full_hash(&bytes),
+            size: declared_size,
+        });
+    }
+    entries.sort_by(|left, right| {
+        left.relative_path
+            .as_bytes()
+            .cmp(right.relative_path.as_bytes())
+    });
+    let logical_bytes = entries.iter().try_fold(0_u64, |total, entry| {
+        total
+            .checked_add(entry.size)
+            .ok_or_else(|| anyhow::anyhow!("local source byte count overflow"))
+    })?;
+    let dirty_fingerprint = bbox_code_source::dirty_fingerprint(&head_commit, &entries);
+    let descriptor = bbox_code_source::GenerationDescriptor {
+        schema_version: bbox_code_source::SCHEMA_VERSION,
+        walker_policy_version: bbox_code_source::WALKER_POLICY_VERSION.to_string(),
+        scope: scope.clone(),
+        head_commit: head_commit.clone(),
+        dirty_fingerprint: dirty_fingerprint.clone(),
+        manifest_sha256: bbox_code_source::manifest_sha256(&entries),
+        file_count: entries.len() as u64,
+        logical_bytes,
+    };
+    descriptor.validate_manifest(&entries, u64::MAX, u64::MAX)?;
+    let selector = bbox_code_source::local_selector(&project.project_id);
+    let worktree_dirty = bbox_corpus_core::git::is_worktree_dirty(&root);
+    let snapshot_id = if worktree_dirty {
+        bbox_edge_sidecar::snapshot::nongit_snapshot_id(&project.project_id, &dirty_fingerprint)
+    } else {
+        bbox_edge_sidecar::snapshot::clean_snapshot_id(
+            &scope.repo_id,
+            &project.project_id,
+            &head_commit,
+        )
+    };
+    stage_project_file_generation(
+        project,
+        &descriptor,
+        "local",
+        &entries,
+        &selector,
+        &snapshot_id,
+        worktree_dirty,
+        f,
+        writer,
+        edges_dir,
+        |entry| {
+            read_regular_file_confined(&root, Path::new(&entry.relative_path))
+                .with_context(|| format!("re-reading local source {}", entry.relative_path))
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_project_file_generation<F>(
+    project: &ProjectRecord,
+    descriptor: &bbox_code_source::GenerationDescriptor,
+    generation_id: &str,
+    entries: &[bbox_code_source::ManifestEntry],
+    selector: &str,
+    snapshot_id: &str,
+    worktree_dirty: bool,
+    f: FieldHandles,
+    writer: &mut IndexWriter,
+    edges_dir: &Path,
+    mut open_bytes: F,
+) -> Result<CollectedIndexResult>
+where
+    F: FnMut(&bbox_code_source::ManifestEntry) -> Result<Vec<u8>>,
+{
+    let registry = chunker::default_registry();
+    let mut pending = Vec::new();
+    let mut project_edges = Vec::new();
+    for entry in entries {
+        let relative_path = Path::new(&entry.relative_path);
+        let display_path = Path::new(&project.canonical_path).join(relative_path);
+        let bytes = open_bytes(entry)
+            .with_context(|| format!("opening collected source {}", entry.relative_path))?;
+        if bytes.len() as u64 != entry.size || full_hash(&bytes) != entry.content_sha256 {
+            anyhow::bail!("collected source blob failed manifest verification");
+        }
+        if is_binary(relative_path, &bytes) {
+            continue;
+        }
+        let sniff_len = bytes.len().min(4096);
+        let Some(format) = registry
+            .iter()
+            .find(|chunker| chunker.claims(relative_path, &bytes[..sniff_len]))
+        else {
+            continue;
+        };
+        let (chunks, edges) = format.chunk(relative_path, &bytes).with_context(|| {
+            format!(
+                "chunking collected source {} as {}",
+                entry.relative_path,
+                format.format_id()
+            )
+        })?;
+        let chunks = bound_chunks(&finalize_chunks(project, relative_path, chunks));
+        project_edges.extend(derive_edges(&chunks, edges, Some(snapshot_id)));
+        pending.push(PendingProjectFile {
+            path_str: entry.relative_path.clone(),
+            absolute_path: display_path,
+            mtime: 0,
+            size: entry.size,
+            chunks,
+        });
+    }
+
+    writer.delete_term(Term::from_field_text(f.code_source_selector, selector));
+
+    let mut stats = ProjectIndexStats::default();
+    let symbol_table = build_symbol_table(&pending, Some(snapshot_id));
+    let mut entity_ids = Vec::new();
+    let mut current_chunk_targets = HashMap::new();
+    for file in pending {
+        project_edges.extend(derive_code_edges(
+            &file.chunks,
+            &symbol_table,
+            &mut stats,
+            Some(snapshot_id),
+        ));
+        current_chunk_targets.extend(git_targets_for_scope(
+            &descriptor.scope.bbox_root_relpath,
+            &file.chunks,
+            Some(snapshot_id),
+        ));
+        let entry_key = bbox_code_source::source_entry_key(&selector, &file.path_str);
+        for chunk in file.chunks {
+            let entity_id =
+                super::embed_hook::project_file_entity_id_for_snapshot(&chunk, Some(snapshot_id));
+            let doc = build_project_file_doc_for_source(
+                &chunk,
+                project,
+                &file.absolute_path,
+                Some(&descriptor.head_commit),
+                Some(snapshot_id),
+                &selector,
+                generation_id,
+                &entry_key,
+                f,
+            );
+            super::embed_hook::emit_project_file(&chunk, &entity_id);
+            writer.add_document(doc)?;
+            entity_ids.push(entity_id);
+        }
+    }
+
+    let sidecar_edges = project_edges
+        .into_iter()
+        .map(|edge| bbox_edge_sidecar::edge_sidecar::Edge {
+            source: edge.source,
+            kind: edge.kind,
+            target: edge.target,
+            provenance: edge.provenance,
+            confidence: edge.confidence,
+            metadata: Default::default(),
+        })
+        .collect::<Vec<_>>();
+    bbox_edge_sidecar::snapshot::write_snapshot_files(
+        edges_dir,
+        &project.project_id,
+        snapshot_id,
+        &[("project.jsonl", &sidecar_edges)],
+    )?;
+
+    entity_ids.sort();
+    let mut inventory = Sha256::new();
+    for entity_id in &entity_ids {
+        inventory.update((entity_id.len() as u64).to_be_bytes());
+        inventory.update(entity_id.as_bytes());
+    }
+    Ok(CollectedIndexResult {
+        snapshot_id: snapshot_id.to_string(),
+        selector: selector.to_string(),
+        document_count: entity_ids.len() as u64,
+        entity_inventory_sha256: hex::encode(inventory.finalize()),
+        current_chunk_targets,
+        staged_edges: sidecar_edges,
+        head_commit: descriptor.head_commit.clone(),
+        dirty_fingerprint: descriptor.dirty_fingerprint.clone(),
+        worktree_dirty,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_project_file_doc_for_source(
+    chunk: &Chunk,
+    project: &ProjectRecord,
+    display_path: &Path,
+    commit_sha: Option<&str>,
+    snapshot_id: Option<&str>,
+    selector: &str,
+    generation: &str,
+    entry_key: &str,
     f: FieldHandles,
 ) -> TantivyDocument {
     let entity_id = super::embed_hook::project_file_entity_id_for_snapshot(chunk, snapshot_id);
@@ -181,8 +800,11 @@ pub fn build_project_file_doc(
     doc.add_text(f.account, "project_file");
     doc.add_text(f.project, &project.canonical_path);
     doc.add_text(f.role, "file");
-    let path_str = absolute_path.to_string_lossy();
+    let path_str = display_path.to_string_lossy();
     doc.add_text(f.file_path, &*path_str);
+    doc.add_text(f.code_source_selector, selector);
+    doc.add_text(f.code_source_generation, generation);
+    doc.add_text(f.code_source_entry_key, entry_key);
     // Reuse the same string for the tokenized path field; the code tokenizer
     // splits on `/`, `_`, `.`, etc., so /home/x/src/embed/voyage.rs becomes
     // tokens [home, x, src, embed, voyage, rs] available to BM25 ranking.
@@ -235,7 +857,8 @@ pub fn resolve_current_chunk_entity(
     absolute_path: &Path,
     byte_range: Option<(u64, u64)>,
 ) -> Result<Option<EntityRef>> {
-    let bytes = match fs::read(absolute_path) {
+    let relative_path = absolute_path.strip_prefix(root).unwrap_or(absolute_path);
+    let bytes = match read_regular_file_confined(root, relative_path) {
         Ok(bytes) => bytes,
         Err(_) => return Ok(None),
     };
@@ -251,8 +874,7 @@ pub fn resolve_current_chunk_entity(
         return Ok(None);
     };
     let (chunks, _edges) = format.chunk(absolute_path, &bytes)?;
-    let rel_path = absolute_path.strip_prefix(root).unwrap_or(absolute_path);
-    let chunks = bound_chunks(&finalize_chunks(project, rel_path, chunks));
+    let chunks = bound_chunks(&finalize_chunks(project, relative_path, chunks));
     let selected = byte_range
         .and_then(|(start, _end)| {
             chunks
@@ -272,9 +894,6 @@ pub fn resolve_current_chunk_entity(
 enum ProjectFileAction {
     /// mtime+size+materialization version all match — leave as-is.
     Skip,
-    /// mtime+size match but the stored version is unknown (pre-field entry):
-    /// stamp the current version without re-chunking.
-    AdoptVersion,
     /// New file, changed content, or a known-different materialization version
     /// (a real indexer/chunker/parser bump) — must re-chunk.
     Reindex,
@@ -282,10 +901,9 @@ enum ProjectFileAction {
 
 /// Decide what to do with a scanned project file given its previously indexed
 /// metadata. The version dimension forces a re-chunk after an
-/// indexer/chunker/parser bump even when the file is byte-for-byte unchanged,
-/// while an unknown stored version is adopted rather than re-chunked so that
-/// introducing the field never triggers a full re-chunk of an already-current
-/// corpus.
+/// indexer/chunker/parser bump even when the file is byte-for-byte unchanged.
+/// An unknown stored version is re-chunked because it cannot prove either the
+/// current materialization algorithm or a V2 snapshot identity.
 fn classify_project_file(
     prev: Option<&FileMeta>,
     mtime: u64,
@@ -300,7 +918,7 @@ fn classify_project_file(
     }
     match prev.mat_version.as_deref() {
         Some(v) if v == mat_version => ProjectFileAction::Skip,
-        None => ProjectFileAction::AdoptVersion,
+        None => ProjectFileAction::Reindex,
         Some(_) => ProjectFileAction::Reindex,
     }
 }
@@ -315,9 +933,18 @@ fn index_project(
     let mut files = Vec::new();
     let mut pending = Vec::new();
     let mut project_edges = Vec::new();
-    scan_project_files(root, &mut files)?;
+    let scan_stats = scan_project_files(root, &mut files)?;
+    ctx.stats.skipped_symlinks += scan_stats.skipped_symlinks;
+    ctx.stats.skipped_special += scan_stats.skipped_special;
+    ctx.stats.skipped_unsupported += scan_stats.skipped_unsupported;
+    ctx.stats.skipped_oversize += scan_stats.skipped_oversize;
     let snapshot_id = ref_snapshot_id(project, root, &files, commit_sha.as_deref());
-    let mat_version = bbox_edge_sidecar::snapshot::current_materialization_version();
+    let base_mat_version = bbox_edge_sidecar::snapshot::current_materialization_version();
+    let mat_version = snapshot_id
+        .as_ref()
+        .map_or(base_mat_version.clone(), |snapshot_id| {
+            format!("{base_mat_version}+ref-snapshot:{snapshot_id}")
+        });
     // On-disk text-file set for this project, captured before `files` is moved.
     // Used to detect tracked-file deletions (in meta, absent on disk) so their
     // derived edges are purged rather than lingering in the materialized graph.
@@ -329,37 +956,23 @@ fn index_project(
                 ctx.stats.skipped += 1;
                 continue;
             }
-            ProjectFileAction::AdoptVersion => {
-                // Identical content (mtime+size) but the stored materialization
-                // version is unknown (entry predates this field). Stamp the
-                // current version WITHOUT re-chunking: the deployed
-                // indexer/chunker/parser is what produced these edges, so a
-                // re-chunk would only reproduce byte-identical edges. Persisting
-                // the stamp means a genuine *future* version bump records a
-                // different version and falls through to Reindex. (To force a
-                // true full re-chunk after a suspected past untracked bump, bump
-                // INDEX_SCHEMA_VERSION or clear _meta.json.)
-                ctx.meta.insert(
-                    path_str,
-                    FileMeta {
-                        mtime,
-                        size,
-                        mat_version: Some(mat_version.clone()),
-                    },
-                );
-                ctx.stats.skipped += 1;
-                continue;
-            }
             ProjectFileAction::Reindex => {
-                if ctx.meta.contains_key(path_str.as_str()) {
-                    ctx.writer
-                        .delete_term(Term::from_field_text(ctx.f.file_path, &path_str));
-                }
+                let relative_path = Path::new(&path_str)
+                    .strip_prefix(root)
+                    .unwrap_or_else(|_| Path::new(&path_str));
+                let selector = bbox_code_source::local_selector(&project.project_id);
+                let entry_key =
+                    bbox_code_source::source_entry_key(&selector, &relative_path.to_string_lossy());
+                ctx.writer.delete_term(Term::from_field_text(
+                    ctx.f.code_source_entry_key,
+                    &entry_key,
+                ));
             }
         }
 
         let path = PathBuf::from(&path_str);
-        let bytes = match fs::read(&path) {
+        let relative_path = path.strip_prefix(root).unwrap_or(&path);
+        let bytes = match read_regular_file_confined(root, relative_path) {
             Ok(bytes) => bytes,
             Err(err) => {
                 tracing::warn!(path = %path.display(), error = %err, "failed to read project file");
@@ -381,8 +994,7 @@ fn index_project(
         let (chunks, edges) = format
             .chunk(&path, &bytes)
             .with_context(|| format!("chunking {} as {}", path.display(), format.format_id()))?;
-        let rel_path = path.strip_prefix(root).unwrap_or(&path);
-        let chunks = finalize_chunks(project, rel_path, chunks);
+        let chunks = finalize_chunks(project, relative_path, chunks);
         let bounded_chunks = bound_chunks(&chunks);
         let edges = derive_edges(&bounded_chunks, edges, snapshot_id.as_deref());
         ctx.stats.emitted_edges += edges.len() as u64;
@@ -402,6 +1014,9 @@ fn index_project(
     let files_changed = !pending.is_empty();
     let symbol_table = build_symbol_table(&pending, snapshot_id.as_deref());
     let mut current_chunk_targets = HashMap::new();
+    let scope_relpath = bbox_corpus_core::git::git_root_for_path(root)
+        .and_then(|git_root| bbox_corpus_core::identity::bbox_root_relpath(&git_root, root))
+        .unwrap_or_else(|| ".".to_string());
     for file in pending {
         let code_edges = derive_code_edges(
             &file.chunks,
@@ -411,7 +1026,8 @@ fn index_project(
         );
         ctx.stats.emitted_edges += code_edges.len() as u64;
         project_edges.extend(code_edges);
-        current_chunk_targets.extend(super::git_history::current_chunk_targets(
+        current_chunk_targets.extend(git_targets_for_scope(
+            &scope_relpath,
             &file.chunks,
             snapshot_id.as_deref(),
         ));
@@ -433,12 +1049,15 @@ fn index_project(
             ctx.stats.indexed_docs += 1;
         }
         ctx.meta.insert(
-            file.path_str,
-            FileMeta {
-                mtime: file.mtime,
-                size: file.size,
-                mat_version: Some(mat_version.clone()),
-            },
+            file.path_str.clone(),
+            local_file_meta(
+                project,
+                root,
+                Path::new(&file.path_str),
+                file.mtime,
+                file.size,
+                Some(mat_version.clone()),
+            ),
         );
         ctx.stats.indexed_files += 1;
     }
@@ -528,24 +1147,37 @@ fn index_project(
     Ok(())
 }
 
-fn scan_project_files(root: &Path, out: &mut Vec<(String, u64, u64)>) -> Result<()> {
+fn scan_project_files(
+    root: &Path,
+    out: &mut Vec<(String, u64, u64)>,
+) -> Result<ProjectFileScanStats> {
+    let mut stats = ProjectFileScanStats::default();
     let walker = WalkBuilder::new(root)
         .hidden(false)
-        .filter_entry(|entry| !is_skipped_entry(entry))
+        .filter_entry(|entry| entry.depth() == 0 || !is_skipped_entry(entry))
         .build();
     for entry in walker.filter_map(|entry| entry.ok()) {
         let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if !is_supported_text_path(path) {
-            continue;
-        }
-        let meta = match entry.metadata() {
+        let meta = match fs::symlink_metadata(path) {
             Ok(meta) => meta,
             Err(_) => continue,
         };
-        if meta.len() > max_bytes_for_path(path) {
+        if meta.file_type().is_symlink() {
+            stats.skipped_symlinks += 1;
+            continue;
+        }
+        if !meta.is_file() {
+            if path != root {
+                stats.skipped_special += 1;
+            }
+            continue;
+        }
+        let Some(max_bytes) = bbox_code_source::max_bytes_for_path(path) else {
+            stats.skipped_unsupported += 1;
+            continue;
+        };
+        if meta.len() > max_bytes {
+            stats.skipped_oversize += 1;
             continue;
         }
         let mtime = meta
@@ -554,9 +1186,13 @@ fn scan_project_files(root: &Path, out: &mut Vec<(String, u64, u64)>) -> Result<
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_secs())
             .unwrap_or_default();
-        out.push((path.to_string_lossy().to_string(), mtime, meta.len()));
+        let Some(path) = path.to_str() else {
+            stats.skipped_unsupported += 1;
+            continue;
+        };
+        out.push((path.to_string(), mtime, meta.len()));
     }
-    Ok(())
+    Ok(stats)
 }
 
 fn is_skipped_entry(entry: &DirEntry) -> bool {
@@ -569,55 +1205,120 @@ fn is_skipped_entry(entry: &DirEntry) -> bool {
     entry
         .file_name()
         .to_str()
-        .is_some_and(|name| SKIP_DIRS.contains(&name) || name.starts_with('.'))
+        .is_some_and(bbox_code_source::is_skipped_component)
 }
 
+#[cfg(test)]
 fn is_supported_text_path(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|ext| ext.to_str()),
-        Some(
-            "md" | "markdown"
-                | "mdown"
-                | "json"
-                | "toml"
-                | "yaml"
-                | "yml"
-                | "txt"
-                | "text"
-                | "log"
-                | "pdf"
-                | "ipynb"
-                // X-XLSX (crates/bbox-chunker/src/xlsx.rs): the whole
-                // spreadsheet family calamine's open_workbook_auto_from_rs
-                // auto-detects, same reasoning as the chunker's own
-                // extension gate.
-                | "xlsx"
-                | "xlsm"
-                | "xlam"
-                | "xlsb"
-                | "xls"
-                | "ods"
-                | "docx"
-                | "pptx"
-                | "vtt"
-                | "srt"
-                // .html/.htm are already admitted below via
-                // `code::language_for_path` (mapped to the "html"
-                // tree-sitter grammar); .xhtml is not, so it is listed
-                // explicitly here for the X-HTML chunker
-                // (design/corpus/agentic-corpus/agentic-corpus-multimodal-chunkers.md).
-                | "xhtml"
-                // X-IMG (crates/bbox-chunker/src/ximg.rs): standalone
-                // image files. The chunker's own magic-byte scan is the
-                // real content gate; extension only decides whether the
-                // walker even reads the file.
-                | "png"
-                | "jpg"
-                | "jpeg"
-                | "gif"
-                | "webp"
-        )
-    ) || bbox_chunker::code::language_for_path(path).is_some()
+    bbox_code_source::is_supported_source_path(path)
+}
+
+#[cfg(unix)]
+fn read_regular_file_confined(root: &Path, relative_path: &Path) -> Result<Vec<u8>> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    bbox_code_source::validate_relative_path(
+        relative_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("source path is not valid UTF-8"))?,
+    )?;
+    let max_bytes = bbox_code_source::max_bytes_for_path(relative_path)
+        .ok_or_else(|| anyhow::anyhow!("unsupported source path"))?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut directory = options.open(root)?;
+    let components = relative_path.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(name) = component else {
+            anyhow::bail!("source path has a non-normal component");
+        };
+        let name = CString::new(name.as_bytes()).context("source path contains NUL")?;
+        let last = index + 1 == components.len();
+        let flags = if last {
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        } else {
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        };
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let opened = unsafe { fs::File::from_raw_fd(fd) };
+        if last {
+            let metadata = opened.metadata()?;
+            if !metadata.is_file() || metadata.len() > max_bytes {
+                anyhow::bail!("source is not a regular bounded file");
+            }
+            let mut bytes = Vec::new();
+            opened
+                .take(max_bytes.saturating_add(1))
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > max_bytes {
+                anyhow::bail!("source exceeds its byte cap");
+            }
+            return Ok(bytes);
+        }
+        directory = opened;
+    }
+    anyhow::bail!("source path is empty")
+}
+
+#[cfg(not(unix))]
+fn read_regular_file_confined(root: &Path, relative_path: &Path) -> Result<Vec<u8>> {
+    let max_bytes = bbox_code_source::max_bytes_for_path(relative_path)
+        .ok_or_else(|| anyhow::anyhow!("unsupported source path"))?;
+    let path = root.join(relative_path);
+    let canonical_parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("source path has no parent"))?
+        .canonicalize()?;
+    if !canonical_parent.starts_with(root) {
+        anyhow::bail!("source path escaped configured root");
+    }
+    let file = fs::OpenOptions::new().read(true).open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        anyhow::bail!("source is not a regular bounded file");
+    }
+    let mut bytes = Vec::with_capacity(metadata.len().min(max_bytes) as usize);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        anyhow::bail!("source exceeds its byte cap");
+    }
+    Ok(bytes)
+}
+
+fn local_file_meta(
+    project: &ProjectRecord,
+    root: &Path,
+    path: &Path,
+    mtime: u64,
+    size: u64,
+    mat_version: Option<String>,
+) -> FileMeta {
+    let relative_path = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    let selector = bbox_code_source::local_selector(&project.project_id);
+    let entry_key = bbox_code_source::source_entry_key(&selector, &relative_path);
+    FileMeta {
+        mtime,
+        size,
+        mat_version,
+        source: FileMetaSource::LocalProjectFile {
+            project_id: project.project_id.clone(),
+            selector,
+            relative_path,
+            entry_key,
+        },
+    }
 }
 
 fn finalize_chunks(project: &ProjectRecord, rel_path: &Path, chunks: Vec<Chunk>) -> Vec<Chunk> {
@@ -633,6 +1334,24 @@ fn finalize_chunks(project: &ProjectRecord, rel_path: &Path, chunks: Vec<Chunk>)
             chunk.chunk_hash = chunk_hash;
             chunk.occurrence_idx = idx as u32;
             chunk
+        })
+        .collect()
+}
+
+fn git_targets_for_scope(
+    bbox_root_relpath: &str,
+    chunks: &[Chunk],
+    snapshot_id: Option<&str>,
+) -> HashMap<String, EntityRef> {
+    super::git_history::current_chunk_targets(chunks, snapshot_id)
+        .into_iter()
+        .map(|(relative_path, entity)| {
+            let git_path = if bbox_root_relpath == "." {
+                relative_path
+            } else {
+                format!("{bbox_root_relpath}/{relative_path}")
+            };
+            (git_path, entity)
         })
         .collect()
 }
@@ -1191,15 +1910,21 @@ mod tests {
     fn document_containers_get_the_larger_byte_budget() {
         use std::path::Path;
         assert_eq!(
-            max_bytes_for_path(Path::new("deck.pdf")),
-            MAX_DOCUMENT_FILE_BYTES
+            bbox_code_source::max_bytes_for_path(Path::new("deck.pdf")),
+            Some(bbox_code_source::MAX_DOCUMENT_FILE_BYTES)
         );
         assert_eq!(
-            max_bytes_for_path(Path::new("Board.DOCX")),
-            MAX_DOCUMENT_FILE_BYTES
+            bbox_code_source::max_bytes_for_path(Path::new("Board.DOCX")),
+            Some(bbox_code_source::MAX_DOCUMENT_FILE_BYTES)
         );
-        assert_eq!(max_bytes_for_path(Path::new("main.rs")), MAX_FILE_BYTES);
-        assert_eq!(max_bytes_for_path(Path::new("notes.md")), MAX_FILE_BYTES);
+        assert_eq!(
+            bbox_code_source::max_bytes_for_path(Path::new("main.rs")),
+            Some(bbox_code_source::MAX_TEXT_FILE_BYTES)
+        );
+        assert_eq!(
+            bbox_code_source::max_bytes_for_path(Path::new("notes.md")),
+            Some(bbox_code_source::MAX_TEXT_FILE_BYTES)
+        );
     }
 
     #[test]
@@ -1213,8 +1938,8 @@ mod tests {
             "icon.webp",
         ] {
             assert_eq!(
-                max_bytes_for_path(Path::new(name)),
-                MAX_IMAGE_FILE_BYTES,
+                bbox_code_source::max_bytes_for_path(Path::new(name)),
+                Some(bbox_code_source::MAX_IMAGE_FILE_BYTES),
                 "{name}"
             );
         }
@@ -1574,12 +2299,13 @@ mod tests {
     }
 
     #[test]
-    fn classify_project_file_covers_skip_adopt_reindex() {
+    fn classify_project_file_covers_skip_and_reindex() {
         let v = bbox_edge_sidecar::snapshot::current_materialization_version();
         let current = FileMeta {
             mtime: 100,
             size: 200,
             mat_version: Some(v.clone()),
+            source: FileMetaSource::LegacyFilesystem,
         };
         // Fully current → skip.
         assert_eq!(
@@ -1600,21 +2326,22 @@ mod tests {
             mtime: 100,
             size: 200,
             mat_version: Some("older-version".into()),
+            source: FileMetaSource::LegacyFilesystem,
         };
         assert_eq!(
             classify_project_file(Some(&stale), 100, 200, &v),
             ProjectFileAction::Reindex
         );
-        // Unknown stored version with identical content → adopt, NOT reindex.
-        // This is what keeps introducing the field from forcing a full re-chunk.
+        // Unknown stored version cannot prove the current materialization.
         let legacy = FileMeta {
             mtime: 100,
             size: 200,
             mat_version: None,
+            source: FileMetaSource::LegacyFilesystem,
         };
         assert_eq!(
             classify_project_file(Some(&legacy), 100, 200, &v),
-            ProjectFileAction::AdoptVersion
+            ProjectFileAction::Reindex
         );
         // Unknown version but content drift → reindex (content wins).
         assert_eq!(

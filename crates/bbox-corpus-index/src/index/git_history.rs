@@ -77,6 +77,7 @@ pub fn index_git_history_for_project(
                 mtime: 0,
                 size: bbox_corpus_core::git::head_fingerprint(root).unwrap_or_default(),
                 mat_version: None,
+                source: Default::default(),
             },
         );
         return Ok(GitIndexStats::default());
@@ -97,6 +98,7 @@ pub fn index_git_history_for_project(
                 mtime: 0,
                 size: bbox_corpus_core::git::head_fingerprint(root).unwrap_or_default(),
                 mat_version: None,
+                source: Default::default(),
             },
         );
         return Ok(GitIndexStats::default());
@@ -146,6 +148,7 @@ pub fn index_git_history_for_project(
             mtime: 0,
             size: bbox_corpus_core::git::head_fingerprint(root).unwrap_or_default(),
             mat_version: None,
+            source: Default::default(),
         },
     );
     Ok(stats)

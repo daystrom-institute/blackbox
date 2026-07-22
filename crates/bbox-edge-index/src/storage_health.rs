@@ -1538,6 +1538,8 @@ mod tests {
                 )),
                 dirty_overlay: None,
                 repo_materialization: None,
+                code_source_selector: None,
+                code_source_generation: None,
             },
         );
         idx.write_atomic(edges_dir).unwrap();

@@ -2588,6 +2588,8 @@ mod tests {
                 active_snapshot: Some("workspace/p1/snapshots/head-abc".into()),
                 dirty_overlay: None,
                 repo_materialization: None,
+                code_source_selector: None,
+                code_source_generation: None,
             },
         );
         idx.write_atomic(edges_dir).unwrap();
@@ -2682,6 +2684,8 @@ mod tests {
                 active_snapshot: None,
                 dirty_overlay: Some("workspace/p1/dirty-overlay/does-not-exist".into()),
                 repo_materialization: None,
+                code_source_selector: None,
+                code_source_generation: None,
             },
         );
         idx.write_atomic(edges_dir).unwrap();
@@ -3432,6 +3436,8 @@ mod tests {
                 active_snapshot: Some(snap_rel),
                 dirty_overlay: Some(overlay_rel),
                 repo_materialization: None,
+                code_source_selector: None,
+                code_source_generation: None,
             },
         );
         idx.write_atomic(edges_dir).unwrap();

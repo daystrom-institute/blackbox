@@ -20,6 +20,7 @@ sha2 = "0.10"
 tracing = "0.1"
 
 bbox-chunker = { path = "../bbox-chunker" }
+bbox-code-source = { path = "../bbox-code-source" }
 bbox-corpus-core = { path = "../bbox-corpus-core" }
 
 [dev-dependencies]

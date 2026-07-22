@@ -166,11 +166,34 @@ pub fn hybrid_search(
     )?)?)
 }
 
+pub fn hybrid_search_with_active_selectors(
+    index: &TranscriptIndex,
+    knowledge: &Knowledge,
+    ctx: &ProviderContext<'_>,
+    p: &HybridSearchParams,
+    active_selectors: &BTreeMap<String, String>,
+) -> Result<String> {
+    Ok(serde_json::to_string_pretty(
+        &hybrid_search_typed_with_active_selectors(index, knowledge, ctx, p, active_selectors)?,
+    )?)
+}
+
 pub fn hybrid_search_typed(
     index: &TranscriptIndex,
     knowledge: &Knowledge,
     ctx: &ProviderContext<'_>,
     p: &HybridSearchParams,
+) -> Result<HybridSearchResponse> {
+    let active_selectors = index.active_code_selectors();
+    hybrid_search_typed_with_active_selectors(index, knowledge, ctx, p, &active_selectors)
+}
+
+pub fn hybrid_search_typed_with_active_selectors(
+    index: &TranscriptIndex,
+    knowledge: &Knowledge,
+    ctx: &ProviderContext<'_>,
+    p: &HybridSearchParams,
+    active_selectors: &BTreeMap<String, String>,
 ) -> Result<HybridSearchResponse> {
     let query = p.query.trim();
     if query.is_empty() {
@@ -193,8 +216,13 @@ pub fn hybrid_search_typed(
     // single chunk is competitive.
     let bm25_fetch = (limit * 32).max(fetch);
     let (bm25_weight, vector_weight) = fusion_weights(p.vector_weight);
-    let bm25_hits_full =
-        index.hybrid_bm25_hits_filtered(query, bm25_fetch, p.doc_type.as_deref(), true)?;
+    let bm25_hits_full = index.hybrid_bm25_hits_filtered_with_active_selectors(
+        query,
+        bm25_fetch,
+        p.doc_type.as_deref(),
+        true,
+        active_selectors,
+    )?;
     // Truncate the chunk-level list to `fetch` so it doesn't dilute RRF with
     // tail chunks that rank too low to matter. The full set still feeds
     // file-level aggregation below.
@@ -297,6 +325,8 @@ pub fn hybrid_search_typed(
         )?;
         for list in &mut vector_lists {
             retain_authorized_knowledge_vectors(list, knowledge);
+            retain_active_code_vectors(list, index, active_selectors);
+            list.hits.truncate(fetch);
         }
         vector_status.searched_partitions = vector_lists
             .iter()
@@ -455,6 +485,15 @@ fn retain_authorized_knowledge_vectors(list: &mut RankedList, knowledge: &Knowle
         });
 }
 
+fn retain_active_code_vectors(
+    list: &mut RankedList,
+    index: &TranscriptIndex,
+    active_selectors: &BTreeMap<String, String>,
+) {
+    list.hits
+        .retain(|hit| index.is_active_code_entity_for(&hit.entity_id, active_selectors));
+}
+
 /// Pre-fusion doc_type scoping: the BM25 lane is already filtered at the
 /// tantivy query, but the vector lanes are not, so without this the fused
 /// pool (capped at `fetch`) fills with off-type vector hits and the
@@ -476,7 +515,10 @@ fn retain_authorized_knowledge_vectors(list: &mut RankedList, knowledge: &Knowle
 fn scope_lists_to_doc_type(lists: &mut [RankedList], doc_type: &str) {
     let prefix = format!("{doc_type}:");
     for list in lists {
-        list.hits.retain(|hit| hit.entity_id.starts_with(&prefix));
+        list.hits.retain(|hit| {
+            hit.entity_id.starts_with(&prefix)
+                || (doc_type == "project_file" && hit.entity_id.starts_with("project_file_v2:"))
+        });
     }
 }
 
@@ -626,7 +668,7 @@ fn keep_under_project_filter(
 ) -> bool {
     let mut parts = entity_id.split(':');
     match parts.next() {
-        Some("project_file") => parts.next() == Some(target_project_id),
+        Some("project_file" | "project_file_v2") => parts.next() == Some(target_project_id),
         Some("thread") => thread_matches_project_filter(parts.next(), target_project_id, ctx),
         _ => true,
     }
@@ -657,12 +699,22 @@ fn thread_matches_project_filter(
 /// without being collapsed against each other.
 fn file_dedup_key(entity_id: &str) -> Option<String> {
     let mut parts = entity_id.split(':');
-    if parts.next()? != "project_file" {
-        return None;
+    match parts.next()? {
+        "project_file" => {
+            let project = parts.next()?;
+            let relative_path_hash = parts.next()?;
+            Some(format!("project_file:{project}:{relative_path_hash}"))
+        }
+        "project_file_v2" => {
+            let project = parts.next()?;
+            let snapshot = parts.next()?;
+            let relative_path_hash = parts.next()?;
+            Some(format!(
+                "project_file_v2:{project}:{snapshot}:{relative_path_hash}"
+            ))
+        }
+        _ => None,
     }
-    let proj = parts.next()?;
-    let rel_path_hash = parts.next()?;
-    Some(format!("project_file:{proj}:{rel_path_hash}"))
 }
 
 /// Promotes the highest-scoring entry of each chunk_kind into the top-`limit`
@@ -851,7 +903,8 @@ fn vector_ranked_lists(
             );
             continue;
         };
-        let hits = vectors::search(route, &query_vector, fetch)
+        let candidate_fetch = fetch.saturating_mul(8).min(10_000);
+        let hits = vectors::search(route, &query_vector, candidate_fetch)
             .with_context(|| format!("searching vector partition {route}"))?;
         lists.push(RankedList {
             source: format!("vector:{route}"),
@@ -2147,5 +2200,30 @@ pdf_figure = "voyage_visual"
         );
         // An unknown non-path selector resolves to nothing.
         assert_eq!(resolve_project_filter_path("not-an-alias", &aliased), None);
+    }
+
+    #[test]
+    fn project_file_v2_vectors_share_project_file_scope_and_file_collapse() {
+        let hit = |entity_id: &str, rank| RankedHit {
+            entity_id: entity_id.into(),
+            rank,
+            score: 1.0,
+            source: "vector:test".into(),
+        };
+        let mut lists = vec![RankedList {
+            source: "vector:test".into(),
+            weight: 1.0,
+            hits: vec![
+                hit("project_file:p:pathhash:chunk:0", 1),
+                hit("project_file_v2:p:snapshot:pathhash:chunk:0", 2),
+                hit("transcript:codex:s:0:0", 3),
+            ],
+        }];
+        scope_lists_to_doc_type(&mut lists, "project_file");
+        assert_eq!(lists[0].hits.len(), 2);
+        assert_eq!(
+            file_dedup_key("project_file_v2:p:snapshot:pathhash:chunk:0").as_deref(),
+            Some("project_file_v2:p:snapshot:pathhash")
+        );
     }
 }

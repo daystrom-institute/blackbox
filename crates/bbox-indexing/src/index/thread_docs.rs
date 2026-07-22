@@ -244,6 +244,7 @@ pub fn reindex_threads_store_standalone(
             mtime,
             size: file_meta.len(),
             mat_version: None,
+            source: Default::default(),
         },
     );
     Ok(threads.all().len() as u64)

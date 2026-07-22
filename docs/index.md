@@ -39,6 +39,7 @@ The crate is `blackbox`. It produces four binaries:
 | [Knowledge Store](knowledge-store.md) | Learn, decide, remember, pin, render, review, notes, and inbox |
 | [Transcript Retrieval](transcript-retrieval.md) | Search, cite, context, sessions, messages, topics, and freshness checks |
 | [Projects And Code Indexing](projects-code-indexing.md) | Project registration, `.bbox`, code navigation, reindex, and reembed |
+| [Code Source Collector](code-source-collector.md) | Publish checkout-owned current files to a corpus daemon and operate source transitions |
 | [Artifact Catalog](artifact-catalog.md) | Install, list, supersede, and reason about `system-defaults/` |
 | [Agent System](agent-system.md) | Legacy registered-agent compatibility surface |
 | [Badgey](badgey.md) | Evidence-carrying corpus consultant, persistent instances, and proposals |

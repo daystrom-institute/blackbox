@@ -1923,6 +1923,23 @@ pub(crate) fn rebuild_edge_index_from_shared(
     state: &SharedState,
     include_tantivy_projection: bool,
 ) {
+    if let Err(error) = bbox_edge_sidecar::snapshot::with_manifest_coordinator(|| {
+        let rebuilt = build_edge_index_from_shared(state, include_tantivy_projection);
+        let selectors = state.idx.read().refresh_active_code_selectors()?;
+        *state.code_read_view.write() = std::sync::Arc::new(super::CodeReadView {
+            active_selectors: selectors,
+            edge_index: std::sync::Arc::new(rebuilt),
+        });
+        Ok(())
+    }) {
+        tracing::error!(%error, "edge-index rebuild manifest coordination failed");
+    }
+}
+
+pub(crate) fn build_edge_index_from_shared(
+    state: &SharedState,
+    include_tantivy_projection: bool,
+) -> edge_index::EdgeIndex {
     let started = std::time::Instant::now();
     let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
     let registered_project_ids: std::collections::HashSet<String> = state
@@ -1973,7 +1990,7 @@ pub(crate) fn rebuild_edge_index_from_shared(
     };
     rebuilt.load_sidecar_edges(&edges_dir, Some(&registered_project_ids), &mut seen, true);
     rebuilt.log_rebuilt(include_tantivy_projection, started);
-    *state.edge_index.write() = rebuilt;
+    rebuilt
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3082,8 +3099,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = Arc::new(SharedState::for_test(tmp.path()));
 
-        // Hold a reader on edge_index so the rebuild's final write blocks.
-        let held = state.edge_index.read();
+        // Hold a reader on the combined view so the rebuild's final write blocks.
+        let held = state.code_read_view.read();
 
         let st = state.clone();
         let handle = std::thread::spawn(move || {

@@ -105,8 +105,8 @@ pub(crate) struct SharedState {
     /// `needs_reindex` does not track still drive one incremental search pass.
     /// Shared with the reindex thread (same `Arc`).
     pub(crate) reindex_dirty: Arc<std::sync::atomic::AtomicBool>,
-    #[allow(dead_code)]
-    pub(crate) edge_index: RwLock<edge_index::EdgeIndex>,
+    pub(crate) code_read_view: RwLock<Arc<CodeReadView>>,
+    pub(crate) code_sources: Arc<super::code_source::CodeSourceRuntime>,
     /// Out-of-band wake for the edge-index rebuild watcher. Async tool
     /// handlers whose store mutations change projected edges (bbox_thread
     /// link, project unregister) nudge instead of rebuilding inline — a
@@ -230,6 +230,11 @@ pub(crate) struct SharedState {
     #[allow(dead_code)]
     pub(crate) vector_store: std::sync::Arc<crate::vectors::VectorStore>,
     pub(crate) system_events: system_events::SharedEventHub,
+}
+
+pub(crate) struct CodeReadView {
+    pub(crate) active_selectors: BTreeMap<String, String>,
+    pub(crate) edge_index: Arc<edge_index::EdgeIndex>,
 }
 
 pub(crate) const SIGNAL_LOG_CAP: usize = 200;
@@ -477,6 +482,7 @@ impl SharedState {
         }
 
         let (edge_rebuild_nudge_tx, edge_rebuild_nudge_rx) = std::sync::mpsc::sync_channel(1);
+        let active_code_selectors = idx.active_code_selectors();
         SharedState {
             idx: RwLock::new(idx),
             index_writer,
@@ -520,7 +526,11 @@ impl SharedState {
             artifacts: RwLock::new(artifacts::ArtifactCatalog::open(store_dir).unwrap()),
             bbox_watcher: std::sync::Mutex::new(None),
             reindex_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            edge_index: RwLock::new(edge_index::EdgeIndex::default()),
+            code_read_view: RwLock::new(Arc::new(CodeReadView {
+                active_selectors: active_code_selectors,
+                edge_index: Arc::new(edge_index::EdgeIndex::default()),
+            })),
+            code_sources: Arc::new(super::code_source::CodeSourceRuntime::for_test(store_dir)),
             edge_rebuild_nudge_tx,
             edge_rebuild_nudge_rx: std::sync::Mutex::new(Some(edge_rebuild_nudge_rx)),
             path_cache: RwLock::new(path_cache::PathCache::default()),

@@ -149,6 +149,7 @@ impl WorkspaceManifest {
         file.sync_all()?;
         drop(file);
         fs::rename(tmp_path, path)?;
+        fs::File::open(&dir)?.sync_all()?;
         Ok(())
     }
 
@@ -179,6 +180,10 @@ pub struct WorkspaceIndexEntry {
     pub dirty_overlay: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_materialization: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_source_selector: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_source_generation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -212,6 +217,22 @@ impl ManifestIndex {
         Ok(idx)
     }
 
+    pub fn load_or_new(edges_dir: &Path) -> Result<Self> {
+        match Self::load(edges_dir) {
+            Ok(index) => Ok(index),
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                }) =>
+            {
+                Ok(Self::new())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn write_atomic(&self, edges_dir: &Path) -> Result<()> {
         let dir = materialized_dir(edges_dir);
         fs::create_dir_all(&dir)?;
@@ -222,6 +243,7 @@ impl ManifestIndex {
         file.sync_all()?;
         drop(file);
         fs::rename(tmp_path, path)?;
+        fs::File::open(&dir)?.sync_all()?;
         Ok(())
     }
 
@@ -545,6 +567,8 @@ mod tests {
                 active_snapshot: Some("workspace/proj1234/snapshots/head-abc".into()),
                 dirty_overlay: None,
                 repo_materialization: None,
+                code_source_selector: None,
+                code_source_generation: None,
             },
         );
         idx.write_atomic(edges_dir).unwrap();
@@ -595,6 +619,8 @@ mod tests {
                 active_snapshot: None,
                 dirty_overlay: None,
                 repo_materialization: None,
+                code_source_selector: None,
+                code_source_generation: None,
             },
         );
         idx.write_atomic(edges_dir).unwrap();
@@ -652,6 +678,8 @@ mod tests {
                 active_snapshot: None,
                 dirty_overlay: None,
                 repo_materialization: None,
+                code_source_selector: None,
+                code_source_generation: None,
             },
         );
 
@@ -695,6 +723,8 @@ mod tests {
                 active_snapshot: Some("workspace/p1/snapshots/head-active".into()),
                 dirty_overlay: None,
                 repo_materialization: None,
+                code_source_selector: None,
+                code_source_generation: None,
             },
         );
 
@@ -738,6 +768,8 @@ mod tests {
                 active_snapshot: Some("workspace/p1/snapshots/head-abc".into()),
                 dirty_overlay: None,
                 repo_materialization: None,
+                code_source_selector: None,
+                code_source_generation: None,
             },
         );
 

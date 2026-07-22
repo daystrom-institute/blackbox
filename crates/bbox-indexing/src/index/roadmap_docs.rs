@@ -114,6 +114,7 @@ fn file_meta(path: &Path) -> Option<FileMeta> {
         mtime,
         size: meta.len(),
         mat_version: None,
+        source: Default::default(),
     })
 }
 

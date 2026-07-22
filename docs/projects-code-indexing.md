@@ -108,3 +108,10 @@ bbox_reembed(route="code")
 
 Graph edges are rebuilt from sidecars and live stores. If a legacy sidecar grows
 large, `bbox_edge_compact` can compact one project at a time.
+
+## Checkout On Another Host
+
+The [Code Source Collector](code-source-collector.md) can publish current files
+from the machine that owns a checkout while the corpus daemon remains the only
+index and graph authority. This overlap mode still requires one matching local
+project registration on the corpus host for project identity and Git history.

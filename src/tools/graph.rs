@@ -79,12 +79,28 @@ impl BlackboxServer {
                 }
             };
             let knowledge_view = server.session_knowledge_view(None, p.provisional.as_deref())?;
-            let edge_index = server.state.edge_index.read();
+            let read_view = server.state.code_read_view.read().clone();
+            let edge_index = read_view.edge_index.as_ref();
+            if matches!(
+                &entity_ref,
+                entity_ref::EntityRef::ProjectFile { .. }
+                    | entity_ref::EntityRef::ProjectFileV2 { .. }
+            ) && !server
+                .state
+                .idx
+                .read()
+                .is_active_code_entity_for(&p.entity_ref, &read_view.active_selectors)
+            {
+                return Ok(mcp_tools::inspect::not_found(
+                    &entity_ref,
+                    mcp_tools::inspect::similar_refs(edge_index, &entity_ref),
+                ));
+            }
             let provider_ctx =
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
                     .with_knowledge_view(&knowledge_view.knowledge)
-                    .with_edge_index(&edge_index);
-            mcp_tools::inspect::inspect_entity(&p, &provider_ctx, &entity_ref, &edge_index)
+                    .with_edge_index(edge_index);
+            mcp_tools::inspect::inspect_entity(&p, &provider_ctx, &entity_ref, edge_index)
         })
         .await
     }
@@ -120,14 +136,15 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_find_paths", move || {
-            let edge_index = server.state.edge_index.read();
+            let read_view = server.state.code_read_view.read().clone();
+            let edge_index = read_view.edge_index.as_ref();
             let provider_ctx =
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
-                    .with_edge_index(&edge_index);
+                    .with_edge_index(edge_index);
             mcp_tools::find_paths::find_paths(
                 &p,
                 &provider_ctx,
-                &edge_index,
+                edge_index,
                 &mut server.state.path_cache.write(),
             )
         })
@@ -145,15 +162,16 @@ impl BlackboxServer {
         let server = self.clone();
         Self::run_blocking("bbox_bundle_evidence", move || {
             let knowledge_view = server.session_knowledge_view(None, p.provisional.as_deref())?;
-            let edge_index = server.state.edge_index.read();
+            let read_view = server.state.code_read_view.read().clone();
+            let edge_index = read_view.edge_index.as_ref();
             let provider_ctx =
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
                     .with_knowledge_view(&knowledge_view.knowledge)
-                    .with_edge_index(&edge_index);
+                    .with_edge_index(edge_index);
             mcp_tools::bundle_evidence::bundle_evidence(
                 &p,
                 &provider_ctx,
-                &edge_index,
+                edge_index,
                 &mut server.state.path_cache.write(),
             )
         })
@@ -170,10 +188,11 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_ref_size", move || {
-            let edge_index = server.state.edge_index.read();
+            let read_view = server.state.code_read_view.read().clone();
+            let edge_index = read_view.edge_index.as_ref();
             let provider_ctx =
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
-                    .with_edge_index(&edge_index);
+                    .with_edge_index(edge_index);
             mcp_tools::ref_size::ref_size(&p, &provider_ctx)
         })
         .await
@@ -215,12 +234,13 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_blame", move || {
-            let edge_index = server.state.edge_index.read();
+            let read_view = server.state.code_read_view.read().clone();
+            let edge_index = read_view.edge_index.as_ref();
             let provider_ctx =
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
-                    .with_edge_index(&edge_index);
+                    .with_edge_index(edge_index);
             let projects = server.state.projects.read().list();
-            mcp_tools::blame::blame(&p, &provider_ctx, &edge_index, &projects)
+            mcp_tools::blame::blame(&p, &provider_ctx, edge_index, &projects)
         })
         .await
     }
@@ -236,7 +256,8 @@ impl BlackboxServer {
         let server = self.clone();
         Self::run_blocking("bbox_provenance_export", move || {
             let projects = server.state.projects.read().list();
-            mcp_tools::provenance::export_provenance(&p, &server.state.edge_index.read(), &projects)
+            let read_view = server.state.code_read_view.read().clone();
+            mcp_tools::provenance::export_provenance(&p, read_view.edge_index.as_ref(), &projects)
         })
         .await
     }
@@ -279,7 +300,12 @@ impl BlackboxServer {
                 checkout.published_scope.clone(),
                 &checkout.project_id,
                 &notes_ref,
-                &server.state.edge_index.read(),
+                server
+                    .state
+                    .code_read_view
+                    .read()
+                    .edge_index
+                    .as_ref(),
             )?;
             Ok(serde_json::to_string(&page)?)
         })
@@ -339,14 +365,18 @@ mod tests {
         let server = test_server(&tmp);
         let symbol = "symbol:d723917f:KnowledgeStore:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let file = "project_file:d723917f:31d088f0:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:163";
-        *server.state.edge_index.write() = EdgeIndex::from_edges_for_tests(vec![Edge {
-            source: crate::entity_ref::EntityRef::parse(symbol).unwrap(),
-            kind: "DEFINED_IN".into(),
-            target: crate::entity_ref::EntityRef::parse(file).unwrap(),
-            provenance: EdgeProvenance::Derived,
-            confidence: EdgeConfidence::Exact,
-            metadata: Default::default(),
-        }]);
+        let selectors = server.state.idx.read().active_code_selectors();
+        *server.state.code_read_view.write() = std::sync::Arc::new(crate::server::CodeReadView {
+            active_selectors: selectors,
+            edge_index: std::sync::Arc::new(EdgeIndex::from_edges_for_tests(vec![Edge {
+                source: crate::entity_ref::EntityRef::parse(symbol).unwrap(),
+                kind: "DEFINED_IN".into(),
+                target: crate::entity_ref::EntityRef::parse(file).unwrap(),
+                provenance: EdgeProvenance::Derived,
+                confidence: EdgeConfidence::Exact,
+                metadata: Default::default(),
+            }])),
+        });
 
         let inspect = |entity_ref: String| {
             let server = server.clone();

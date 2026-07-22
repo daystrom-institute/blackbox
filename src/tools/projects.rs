@@ -205,6 +205,7 @@ impl BlackboxServer {
             tracing::warn!(target: "blackbox::tool", tool = "bbox_project_register", elapsed_ms = ms, error = %e, "err");
             return Self::err_text(&format!("Error: {e:#}"));
         }
+        self.state.nudge_edge_index_rebuild();
         // Phase 2: heavy fs work (MCP migration, config load, artifact discovery,
         // provenance import, watcher, kb sync) on the blocking pool.
         let server = self.clone();

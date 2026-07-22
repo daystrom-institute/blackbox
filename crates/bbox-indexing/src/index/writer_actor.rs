@@ -21,13 +21,18 @@
 //!   ops at phase boundaries into the same writer, so mid-pass writes land in
 //!   the pass's own commit instead of waiting behind it.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
+use tantivy::collector::{Count, TopDocs};
+use tantivy::query::TermQuery;
+use tantivy::schema::{IndexRecordOption, Term};
 use tantivy::{Index, IndexReader, IndexWriter};
 
+use bbox_corpus_core::project_record::ProjectRecord;
 use bbox_knowledge::knowledge::KnowledgeEntry;
 use bbox_stores::roadmap::RoadmapItem;
 use bbox_threads::threads::Thread;
@@ -60,6 +65,26 @@ pub enum IndexWriteOp {
         dirty: bool,
         ack: mpsc::SyncSender<Result<String>>,
     },
+    StageCollectedGeneration {
+        project: Box<ProjectRecord>,
+        descriptor: Box<bbox_code_source::GenerationDescriptor>,
+        generation_id: String,
+        entries: Vec<bbox_code_source::ManifestEntry>,
+        store: std::sync::Arc<bbox_code_source_store::CodeSourceStore>,
+        ack: mpsc::SyncSender<Result<super::project_files::CollectedIndexResult>>,
+        release: mpsc::Receiver<()>,
+    },
+    StageLocalGeneration {
+        project: Box<ProjectRecord>,
+        scope: Box<bbox_corpus_core::identity::PublishedScope>,
+        ack: mpsc::SyncSender<Result<super::project_files::CollectedIndexResult>>,
+        release: mpsc::Receiver<()>,
+    },
+    RetireCodeSelector {
+        selector: String,
+        ack: mpsc::SyncSender<Result<u64>>,
+        release: mpsc::Receiver<()>,
+    },
     /// Barrier: acked once every previously-enqueued op has been applied and
     /// committed. Drained-queue semantics, not durability.
     Flush(mpsc::SyncSender<()>),
@@ -69,6 +94,40 @@ pub enum IndexWriteOp {
 #[derive(Clone)]
 pub struct IndexWriterActor {
     tx: mpsc::Sender<IndexWriteOp>,
+}
+
+pub struct StagedIndexGeneration {
+    result: super::project_files::CollectedIndexResult,
+    release: Option<mpsc::SyncSender<()>>,
+}
+
+pub struct RetiredCodeSelector {
+    pub document_count: u64,
+    release: Option<mpsc::SyncSender<()>>,
+}
+
+impl Drop for RetiredCodeSelector {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+impl std::ops::Deref for StagedIndexGeneration {
+    type Target = super::project_files::CollectedIndexResult;
+
+    fn deref(&self) -> &Self::Target {
+        &self.result
+    }
+}
+
+impl Drop for StagedIndexGeneration {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
 }
 
 /// Everything the actor thread needs to apply ops and publish commits.
@@ -155,6 +214,79 @@ impl IndexWriterActor {
             .map_err(|_| anyhow!("index writer actor dropped the reindex ack"))?
     }
 
+    pub fn stage_collected_generation(
+        &self,
+        project: ProjectRecord,
+        descriptor: bbox_code_source::GenerationDescriptor,
+        generation_id: String,
+        entries: Vec<bbox_code_source::ManifestEntry>,
+        store: std::sync::Arc<bbox_code_source_store::CodeSourceStore>,
+    ) -> Result<StagedIndexGeneration> {
+        let (ack, ack_rx) = mpsc::sync_channel(1);
+        let (release, release_rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(IndexWriteOp::StageCollectedGeneration {
+                project: Box::new(project),
+                descriptor: Box::new(descriptor),
+                generation_id,
+                entries,
+                store,
+                ack,
+                release: release_rx,
+            })
+            .map_err(|_| anyhow!("index writer actor unavailable"))?;
+        let result = ack_rx
+            .recv()
+            .map_err(|_| anyhow!("index writer actor dropped the collected-stage ack"))??;
+        Ok(StagedIndexGeneration {
+            result,
+            release: Some(release),
+        })
+    }
+
+    pub fn stage_local_generation(
+        &self,
+        project: ProjectRecord,
+        scope: bbox_corpus_core::identity::PublishedScope,
+    ) -> Result<StagedIndexGeneration> {
+        let (ack, ack_rx) = mpsc::sync_channel(1);
+        let (release, release_rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(IndexWriteOp::StageLocalGeneration {
+                project: Box::new(project),
+                scope: Box::new(scope),
+                ack,
+                release: release_rx,
+            })
+            .map_err(|_| anyhow!("index writer actor unavailable"))?;
+        let result = ack_rx
+            .recv()
+            .map_err(|_| anyhow!("index writer actor dropped the local-stage ack"))??;
+        Ok(StagedIndexGeneration {
+            result,
+            release: Some(release),
+        })
+    }
+
+    pub fn retire_code_selector(&self, selector: String) -> Result<RetiredCodeSelector> {
+        let (ack, ack_rx) = mpsc::sync_channel(1);
+        let (release, release_rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(IndexWriteOp::RetireCodeSelector {
+                selector,
+                ack,
+                release: release_rx,
+            })
+            .map_err(|_| anyhow!("index writer actor unavailable"))?;
+        let document_count = ack_rx
+            .recv()
+            .map_err(|_| anyhow!("index writer actor dropped the selector-retirement ack"))??;
+        Ok(RetiredCodeSelector {
+            document_count,
+            release: Some(release),
+        })
+    }
+
     /// Block until every op enqueued before this call has been applied and
     /// committed. Test/shutdown determinism helper.
     pub fn flush_blocking(&self) -> Result<()> {
@@ -185,12 +317,72 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
                 let result = run_pass(&ctx, &rx, full, dirty);
                 let _ = ack.send(result);
             }
+            IndexWriteOp::StageCollectedGeneration {
+                project,
+                descriptor,
+                generation_id,
+                entries,
+                store,
+                ack,
+                release,
+            } => {
+                let result = run_collected_stage(
+                    &ctx,
+                    &project,
+                    &descriptor,
+                    &generation_id,
+                    &entries,
+                    &store,
+                );
+                let should_hold = result.is_ok();
+                let _ = ack.send(result);
+                if should_hold {
+                    let _ = release.recv();
+                }
+            }
+            IndexWriteOp::StageLocalGeneration {
+                project,
+                scope,
+                ack,
+                release,
+            } => {
+                let result = run_local_stage(&ctx, &project, &scope);
+                let should_hold = result.is_ok();
+                let _ = ack.send(result);
+                if should_hold {
+                    let _ = release.recv();
+                }
+            }
+            IndexWriteOp::RetireCodeSelector {
+                selector,
+                ack,
+                release,
+            } => {
+                let result = run_selector_retirement(&ctx, &selector);
+                let should_hold = result.is_ok();
+                let _ = ack.send(result);
+                if should_hold {
+                    let _ = release.recv();
+                }
+            }
             first => {
                 let mut batch = vec![first];
                 while batch.len() < MAX_BATCH_OPS {
                     match rx.try_recv() {
                         Ok(pass @ IndexWriteOp::ReindexPass { .. }) => {
                             deferred = Some(pass);
+                            break;
+                        }
+                        Ok(stage @ IndexWriteOp::StageCollectedGeneration { .. }) => {
+                            deferred = Some(stage);
+                            break;
+                        }
+                        Ok(stage @ IndexWriteOp::StageLocalGeneration { .. }) => {
+                            deferred = Some(stage);
+                            break;
+                        }
+                        Ok(retirement @ IndexWriteOp::RetireCodeSelector { .. }) => {
+                            deferred = Some(retirement);
                             break;
                         }
                         Ok(op) => batch.push(op),
@@ -202,6 +394,150 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
         }
     }
     tracing::info!("index writer actor stopped");
+}
+
+fn run_collected_stage(
+    ctx: &ActorCtx,
+    project: &ProjectRecord,
+    descriptor: &bbox_code_source::GenerationDescriptor,
+    generation_id: &str,
+    entries: &[bbox_code_source::ManifestEntry],
+    store: &bbox_code_source_store::CodeSourceStore,
+) -> Result<super::project_files::CollectedIndexResult> {
+    let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
+    writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
+    let edges_dir =
+        bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&ctx.config.projects_path);
+    let result = super::project_files::stage_collected_project_generation(
+        project,
+        descriptor,
+        generation_id,
+        entries,
+        ctx.fields,
+        &mut writer,
+        &edges_dir,
+        |entry| {
+            let mut file = store.verified_blob_file(&entry.content_sha256, entry.size)?;
+            let mut bytes = Vec::with_capacity(entry.size as usize);
+            std::io::Read::read_to_end(&mut file, &mut bytes)?;
+            Ok(bytes)
+        },
+    )?;
+    stage_git_current_edges(ctx, project, &result, &mut writer, &edges_dir)?;
+    writer.commit()?;
+    post_commit(ctx);
+    Ok(result)
+}
+
+fn run_local_stage(
+    ctx: &ActorCtx,
+    project: &ProjectRecord,
+    scope: &bbox_corpus_core::identity::PublishedScope,
+) -> Result<super::project_files::CollectedIndexResult> {
+    let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
+    writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
+    let edges_dir =
+        bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&ctx.config.projects_path);
+    let result = super::project_files::stage_local_project_generation(
+        project,
+        scope,
+        ctx.fields,
+        &mut writer,
+        &edges_dir,
+    )?;
+    stage_git_current_edges(ctx, project, &result, &mut writer, &edges_dir)?;
+    writer.commit()?;
+    post_commit(ctx);
+    Ok(result)
+}
+
+fn stage_git_current_edges(
+    ctx: &ActorCtx,
+    project: &ProjectRecord,
+    result: &super::project_files::CollectedIndexResult,
+    writer: &mut IndexWriter,
+    edges_dir: &Path,
+) -> Result<()> {
+    let root = Path::new(&project.canonical_path);
+    let git_meta_dir =
+        super::git_history::git_meta_dir_from_projects_path(&ctx.config.projects_path);
+    let mut meta = HashMap::new();
+    let mut git_ctx = super::git_history::GitIndexContext {
+        f: ctx.fields,
+        writer,
+        meta: &mut meta,
+        edges_dir,
+        git_meta_dir: &git_meta_dir,
+        force_full: true,
+    };
+    super::git_history::index_git_history_for_project(
+        project,
+        root,
+        &result.current_chunk_targets,
+        &mut git_ctx,
+    )?;
+    let git_edges = bbox_edge_sidecar::edge_sidecar::read_managed_derived_edges(
+        edges_dir,
+        "git",
+        &project.project_id,
+    )?
+    .into_iter()
+    .map(|edge| bbox_edge_sidecar::edge_sidecar::Edge {
+        source: edge.source,
+        kind: edge.kind,
+        target: edge.target,
+        provenance: edge.provenance,
+        confidence: edge.confidence,
+        metadata: Default::default(),
+    })
+    .collect::<Vec<_>>();
+    bbox_edge_sidecar::snapshot::write_snapshot_files(
+        edges_dir,
+        &project.project_id,
+        &result.snapshot_id,
+        &[
+            ("project.jsonl", result.staged_edges.as_slice()),
+            ("git-current.jsonl", git_edges.as_slice()),
+        ],
+    )
+}
+
+fn run_selector_retirement(ctx: &ActorCtx, selector: &str) -> Result<u64> {
+    let edges_dir =
+        bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&ctx.config.projects_path);
+    let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)?;
+    if manifest
+        .workspaces
+        .values()
+        .any(|entry| entry.code_source_selector.as_deref() == Some(selector))
+    {
+        anyhow::bail!("code-source selector became active before retirement");
+    }
+    ctx.reader.reload()?;
+    let searcher = ctx.reader.searcher();
+    let query = TermQuery::new(
+        Term::from_field_text(ctx.fields.code_source_selector, selector),
+        IndexRecordOption::Basic,
+    );
+    let count = searcher.search(&query, &Count)?;
+    let vectors = bbox_vectors::try_global()
+        .context("vector store is still warming up; retry selector retirement shortly")?;
+    for (_score, address) in searcher.search(&query, &TopDocs::with_limit(count))? {
+        let document = searcher.doc::<tantivy::TantivyDocument>(address)?;
+        if let Some(tantivy::schema::OwnedValue::Str(entity_id)) =
+            document.get_first(ctx.fields.entity_id)
+        {
+            vectors.delete_entity_all_routes(entity_id)?;
+        }
+    }
+    let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
+    writer.delete_term(Term::from_field_text(
+        ctx.fields.code_source_selector,
+        selector,
+    ));
+    writer.commit()?;
+    post_commit(ctx);
+    Ok(count as u64)
 }
 
 /// Apply a batch of small ops under one writer and one commit.
@@ -265,6 +601,21 @@ fn run_pass(
                     IndexWriteOp::ReindexPass { ack, .. } => {
                         let _ = ack.send(Err(anyhow!(
                             "a reindex pass is already running; retry after it completes"
+                        )));
+                    }
+                    IndexWriteOp::StageCollectedGeneration { ack, .. } => {
+                        let _ = ack.send(Err(anyhow!(
+                            "a reindex pass is already running; retry collected activation"
+                        )));
+                    }
+                    IndexWriteOp::StageLocalGeneration { ack, .. } => {
+                        let _ = ack.send(Err(anyhow!(
+                            "a reindex pass is already running; retry local cutback"
+                        )));
+                    }
+                    IndexWriteOp::RetireCodeSelector { ack, .. } => {
+                        let _ = ack.send(Err(anyhow!(
+                            "a reindex pass is already running; retry selector retirement"
                         )));
                     }
                     IndexWriteOp::Flush(ack) => pending_flushes.push(ack),
@@ -380,7 +731,11 @@ fn apply_small_op(ctx: &ActorCtx, writer: &mut IndexWriter, op: IndexWriteOp) {
                 &threads,
             ),
         ),
-        IndexWriteOp::ReindexPass { .. } | IndexWriteOp::Flush(_) => {
+        IndexWriteOp::ReindexPass { .. }
+        | IndexWriteOp::StageCollectedGeneration { .. }
+        | IndexWriteOp::StageLocalGeneration { .. }
+        | IndexWriteOp::RetireCodeSelector { .. }
+        | IndexWriteOp::Flush(_) => {
             debug_assert!(false, "control ops are routed before apply_small_op");
             return;
         }

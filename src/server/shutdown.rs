@@ -29,6 +29,17 @@ fn spawn_config_reload_handler(shared: Arc<SharedState>) {
             let _ = sighup.recv().await;
             match config::load() {
                 Ok(new_cfg) => {
+                    let projects = shared.projects.read().list();
+                    let transitions = match shared.code_sources.reload(&new_cfg, &projects) {
+                        Ok(transitions) => transitions,
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "SIGHUP code-collection reload rejected"
+                            );
+                            continue;
+                        }
+                    };
                     let old_cfg = shared.config.read();
                     if old_cfg.daemon.port != new_cfg.daemon.port
                         || old_cfg.daemon.bind != new_cfg.daemon.bind
@@ -37,6 +48,7 @@ fn spawn_config_reload_handler(shared: Arc<SharedState>) {
                     }
                     drop(old_cfg);
                     *shared.config.write() = new_cfg;
+                    super::code_source::apply_source_transitions(shared.clone(), transitions);
                 }
                 Err(e) => {
                     tracing::warn!("SIGHUP reload failed: {e}");

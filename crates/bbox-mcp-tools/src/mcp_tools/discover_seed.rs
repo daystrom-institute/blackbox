@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
 use rmcp::schemars;
@@ -75,10 +75,11 @@ pub fn discover_seed_entities(
     knowledge: &Knowledge,
     ctx: &ProviderContext<'_>,
     edge_index: &EdgeIndex,
+    active_selectors: &BTreeMap<String, String>,
     p: &DiscoverSeedParams,
 ) -> Result<String> {
     let limit = p.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-    let hybrid = hybrid_search::hybrid_search_typed(
+    let hybrid = hybrid_search::hybrid_search_typed_with_active_selectors(
         index,
         knowledge,
         ctx,
@@ -94,6 +95,7 @@ pub fn discover_seed_entities(
             rerank_cap: None,
             rerank: None,
         },
+        active_selectors,
     )?;
     let seeds = hybrid
         .results

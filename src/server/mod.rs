@@ -1,4 +1,5 @@
 mod background;
+pub(crate) mod code_source;
 pub mod dispatch;
 mod gap_view;
 pub mod handler;

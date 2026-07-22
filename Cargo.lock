@@ -342,6 +342,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-code-collector"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-code-source",
+ "bbox-config",
+ "bbox-corpus-core",
+ "bro-rpc",
+ "clap",
+ "hex",
+ "ignore",
+ "libc",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "bbox-code-source"
+version = "0.0.1"
+dependencies = [
+ "bbox-corpus-core",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bbox-code-source-store"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-code-source",
+ "bbox-corpus-core",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "bbox-config"
 version = "0.0.1"
 dependencies = [
@@ -380,6 +432,8 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "bbox-chunker",
+ "bbox-code-source",
+ "bbox-code-source-store",
  "bbox-corpus-core",
  "bbox-edge-sidecar",
  "bro-core",
@@ -387,6 +441,7 @@ dependencies = [
  "dirs",
  "hex",
  "ignore",
+ "libc",
  "parking_lot",
  "regex",
  "schemars 1.2.1",
@@ -427,6 +482,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "bbox-chunker",
+ "bbox-code-source",
  "bbox-corpus-core",
  "hex",
  "serde",
@@ -514,14 +570,18 @@ name = "bbox-indexing"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bbox-code-source",
+ "bbox-code-source-store",
  "bbox-config",
  "bbox-corpus-core",
  "bbox-corpus-index",
  "bbox-edge-index",
+ "bbox-edge-sidecar",
  "bbox-knowledge",
  "bbox-stores",
  "bbox-threads",
  "bbox-util",
+ "bbox-vectors",
  "bro-core",
  "bro-transcript",
  "hex",
@@ -919,6 +979,8 @@ dependencies = [
  "axum",
  "bbox-artifacts",
  "bbox-chunker",
+ "bbox-code-source",
+ "bbox-code-source-store",
  "bbox-config",
  "bbox-corpus-core",
  "bbox-corpus-index",

@@ -378,6 +378,7 @@ pub fn index_adapter_location(
             mtime,
             size,
             mat_version: None,
+            source: Default::default(),
         },
     );
     *indexed_files += 1;

@@ -4,19 +4,19 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::Result;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tantivy::collector::{Count, DocSetCollector, TopDocs};
-use tantivy::query::{BooleanQuery, Occur, Query as QueryTrait, TermQuery};
+use tantivy::query::{AllQuery, BooleanQuery, Occur, Query as QueryTrait, TermQuery};
 use tantivy::schema::*;
 use tantivy::tokenizer::TextAnalyzer;
 use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, Term};
 
-pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g9-knowledge-visibility";
+pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g10-code-source-selectors";
 const SCHEMA_VERSION_FILE: &str = "schema_version.txt";
 
 /// Metadata about an indexed file, for incremental updates.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileMeta {
     pub mtime: u64,
     pub size: u64,
@@ -28,6 +28,21 @@ pub struct FileMeta {
     /// version bump never leaves stale edges in a freshly-keyed snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mat_version: Option<String>,
+    #[serde(default)]
+    pub source: FileMetaSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileMetaSource {
+    #[default]
+    LegacyFilesystem,
+    LocalProjectFile {
+        project_id: String,
+        selector: String,
+        relative_path: String,
+        entry_key: String,
+    },
 }
 
 /// Field handles extracted for sharing with the background reindex thread.
@@ -41,6 +56,9 @@ pub struct FieldHandles {
     pub role: Field,
     pub timestamp: Field,
     pub file_path: Field,
+    pub code_source_selector: Field,
+    pub code_source_generation: Field,
+    pub code_source_entry_key: Field,
     /// Tokenized variant of `file_path` indexed with the code tokenizer so
     /// path components like `src/embed/voyage.rs` split into `src`, `embed`,
     /// `voyage`, `rs`. Lets BM25 boost results whose file/symbol path matches
@@ -151,6 +169,7 @@ pub struct ReindexConfig {
 }
 
 pub struct TranscriptIndex {
+    index_path: PathBuf,
     index: Index,
     reader: IndexReader,
     #[allow(dead_code)]
@@ -164,6 +183,8 @@ pub struct TranscriptIndex {
     /// (the whole struct is already behind RwLock in SharedState), and
     /// in an Arc so the IndexWriterActor can invalidate it post-commit.
     pub stats_cache: StatsCache,
+    active_code_selectors: std::sync::Arc<RwLock<BTreeMap<String, String>>>,
+    schema_was_reset: bool,
 }
 
 /// Shared stats TTL cache; the writer actor clears it after every commit.
@@ -220,7 +241,7 @@ impl TranscriptIndex {
         threads_path: PathBuf,
         roadmap_path: PathBuf,
     ) -> Result<Self> {
-        reset_index_on_schema_mismatch(index_path)?;
+        let schema_was_reset = reset_index_on_schema_mismatch(index_path, &projects_path)?;
         let meta_path = index_path.join("_meta.json");
 
         let (schema, fields) = build_schema();
@@ -239,7 +260,9 @@ impl TranscriptIndex {
             }
         };
         register_code_tokenizer(&index);
-        write_schema_version_marker(index_path)?;
+        if !schema_was_reset {
+            write_schema_version_marker(index_path)?;
+        }
 
         let reader = index
             .reader_builder()
@@ -257,14 +280,18 @@ impl TranscriptIndex {
             harness_sessions_dir: None,
             gemini_tmp_root: None,
         };
+        let active_code_selectors = load_active_code_selectors(&config.projects_path)?;
 
         Ok(Self {
+            index_path: index_path.to_path_buf(),
             index,
             reader,
             schema,
             fields,
             config,
             stats_cache: std::sync::Arc::new(Mutex::new(None)),
+            active_code_selectors: std::sync::Arc::new(RwLock::new(active_code_selectors)),
+            schema_was_reset,
         })
     }
 
@@ -308,6 +335,100 @@ impl TranscriptIndex {
     /// Get the field handles for the background thread.
     pub fn field_handles(&self) -> FieldHandles {
         self.fields
+    }
+
+    pub fn active_code_selectors(&self) -> BTreeMap<String, String> {
+        self.active_code_selectors.read().clone()
+    }
+
+    pub fn schema_was_reset(&self) -> bool {
+        self.schema_was_reset
+    }
+
+    pub fn complete_schema_migration(&self) -> Result<()> {
+        write_schema_version_marker(&self.index_path)
+    }
+
+    pub fn refresh_active_code_selectors(&self) -> Result<BTreeMap<String, String>> {
+        let selectors = load_active_code_selectors(&self.config.projects_path)?;
+        self.replace_active_code_selectors(selectors.clone());
+        Ok(selectors)
+    }
+
+    pub fn replace_active_code_selectors(&self, selectors: BTreeMap<String, String>) {
+        *self.active_code_selectors.write() = selectors;
+    }
+
+    pub fn active_code_selector(&self, project_id: &str) -> Option<String> {
+        self.active_code_selectors.read().get(project_id).cloned()
+    }
+
+    pub fn active_code_source_query(&self) -> Option<Box<dyn QueryTrait>> {
+        let selectors = self.active_code_selectors.read().clone();
+        self.active_code_source_query_for(&selectors)
+    }
+
+    pub fn active_code_source_query_for(
+        &self,
+        selectors: &BTreeMap<String, String>,
+    ) -> Option<Box<dyn QueryTrait>> {
+        let mut lanes: Vec<(Occur, Box<dyn QueryTrait>)> = vec![(
+            Occur::Should,
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Must, Box::new(AllQuery)),
+                (
+                    Occur::MustNot,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(self.fields.doc_type, "project_file"),
+                        IndexRecordOption::Basic,
+                    )),
+                ),
+            ])),
+        )];
+        lanes.extend(selectors.values().map(|selector| {
+            (
+                Occur::Should,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.code_source_selector, selector),
+                    IndexRecordOption::Basic,
+                )) as Box<dyn QueryTrait>,
+            )
+        }));
+        Some(Box::new(BooleanQuery::new(lanes)))
+    }
+
+    pub fn is_active_code_entity(&self, entity_id: &str) -> bool {
+        let selectors = self.active_code_selectors.read().clone();
+        self.is_active_code_entity_for(entity_id, &selectors)
+    }
+
+    pub fn is_active_code_entity_for(
+        &self,
+        entity_id: &str,
+        selectors: &BTreeMap<String, String>,
+    ) -> bool {
+        use bbox_corpus_core::entity_ref::EntityRef;
+
+        match EntityRef::parse(entity_id) {
+            Ok(EntityRef::ProjectFile { project_id, .. })
+            | Ok(EntityRef::Symbol { project_id, .. }) => {
+                selectors.get(&project_id).is_some_and(|selector| {
+                    selector.as_str() == bbox_code_source::local_selector(&project_id)
+                })
+            }
+            Ok(EntityRef::ProjectFileV2 { project_id, .. })
+            | Ok(EntityRef::SymbolV2 { project_id, .. }) => {
+                let Some(active) = selectors.get(&project_id) else {
+                    return false;
+                };
+                self.entity_properties(entity_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|properties| properties.get("code_source_selector").cloned())
+                    .is_some_and(|selector| selector == active.as_str())
+            }
+            _ => true,
+        }
     }
 
     /// Get the reindex config for the background thread.
@@ -413,7 +534,7 @@ impl TranscriptIndex {
             return Ok(0);
         }
         let searcher = self.reader.searcher();
-        let query: Box<dyn QueryTrait> = if doc_types.len() == 1 {
+        let mut query: Box<dyn QueryTrait> = if doc_types.len() == 1 {
             Box::new(TermQuery::new(
                 Term::from_field_text(self.fields.doc_type, doc_types[0]),
                 IndexRecordOption::Basic,
@@ -434,6 +555,12 @@ impl TranscriptIndex {
                     .collect(),
             ))
         };
+        if let Some(active) = self.active_code_source_query() {
+            query = Box::new(BooleanQuery::new(vec![
+                (Occur::Must, query),
+                (Occur::Must, active),
+            ]));
+        }
         let limit = match max_docs {
             Some(n) => n,
             None => searcher.search(&*query, &Count)?,
@@ -595,6 +722,8 @@ impl TranscriptIndex {
             ("symbol", self.fields.symbol),
             ("symbol_exact", self.fields.symbol_exact),
             ("file_path", self.fields.file_path),
+            ("code_source_selector", self.fields.code_source_selector),
+            ("code_source_generation", self.fields.code_source_generation),
             ("repo_id", self.fields.repo_id),
             ("commit_sha", self.fields.commit_sha),
             ("commit_author_name", self.fields.commit_author_name),
@@ -648,6 +777,26 @@ pub fn first_u64(doc: &TantivyDocument, field: Field) -> u64 {
         .unwrap_or_default()
 }
 
+fn load_active_code_selectors(projects_path: &Path) -> Result<BTreeMap<String, String>> {
+    let mut selectors = BTreeMap::new();
+    for project in bbox_corpus_core::project_record::load_project_records(projects_path)? {
+        selectors.insert(
+            project.project_id.clone(),
+            bbox_code_source::local_selector(&project.project_id),
+        );
+    }
+    let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(projects_path);
+    let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)?;
+    for (project_id, entry) in manifest.workspaces {
+        if selectors.contains_key(&project_id)
+            && let Some(selector) = entry.code_source_selector
+        {
+            selectors.insert(project_id, selector);
+        }
+    }
+    Ok(selectors)
+}
+
 pub fn build_schema() -> (Schema, FieldHandles) {
     let mut builder = Schema::builder();
     let code_options = TextOptions::default()
@@ -665,6 +814,9 @@ pub fn build_schema() -> (Schema, FieldHandles) {
         role: builder.add_text_field("role", STRING | STORED),
         timestamp: builder.add_text_field("timestamp", STRING | STORED),
         file_path: builder.add_text_field("file_path", STRING | STORED),
+        code_source_selector: builder.add_text_field("code_source_selector", STRING | STORED),
+        code_source_generation: builder.add_text_field("code_source_generation", STRING | STORED),
+        code_source_entry_key: builder.add_text_field("code_source_entry_key", STRING | STORED),
         path_tokens: builder.add_text_field("path_tokens", code_options.clone()),
         byte_offset: builder.add_u64_field("byte_offset", STORED),
         byte_end: builder.add_u64_field("byte_end", STORED),
@@ -721,9 +873,9 @@ pub fn register_code_tokenizer(index: &Index) {
 
 // one-time boot path before the runtime serves traffic.
 #[allow(clippy::disallowed_methods)]
-fn reset_index_on_schema_mismatch(index_path: &Path) -> Result<()> {
+fn reset_index_on_schema_mismatch(index_path: &Path, projects_path: &Path) -> Result<bool> {
     if !index_path.exists() {
-        return Ok(());
+        return Ok(false);
     }
     let marker_path = index_path.join(SCHEMA_VERSION_FILE);
     let should_reset = match fs::read_to_string(&marker_path) {
@@ -734,6 +886,19 @@ fn reset_index_on_schema_mismatch(index_path: &Path) -> Result<()> {
         Err(err) => return Err(err.into()),
     };
     if should_reset {
+        let edges_dir =
+            bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(projects_path);
+        let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)?;
+        if manifest.workspaces.values().any(|entry| {
+            entry
+                .code_source_selector
+                .as_deref()
+                .is_some_and(|selector| selector.starts_with("collected:"))
+        }) {
+            anyhow::bail!(
+                "schema migration cannot discard an active collected code source without an explicit cross-schema migration"
+            );
+        }
         tracing::info!(
             path = %index_path.display(),
             schema_version = INDEX_SCHEMA_VERSION,
@@ -741,7 +906,7 @@ fn reset_index_on_schema_mismatch(index_path: &Path) -> Result<()> {
         );
         fs::remove_dir_all(index_path)?;
     }
-    Ok(())
+    Ok(should_reset)
 }
 
 fn write_schema_version_marker(index_path: &Path) -> Result<()> {
@@ -777,14 +942,14 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_mismatch_drops_existing_index_directory() {
+    fn schema_version_mismatch_waits_for_rebuild_before_writing_marker() {
         let dir = tempfile::tempdir().unwrap();
         let index_path = dir.path().join("index");
         fs::create_dir_all(&index_path).unwrap();
         fs::write(index_path.join(SCHEMA_VERSION_FILE), "old-schema\n").unwrap();
         fs::write(index_path.join("stale-file"), "stale").unwrap();
 
-        let _index = TranscriptIndex::open_or_create(
+        let index = TranscriptIndex::open_or_create(
             &index_path,
             Vec::new(),
             None,
@@ -796,6 +961,8 @@ mod tests {
         .unwrap();
 
         assert!(!index_path.join("stale-file").exists());
+        assert!(!index_path.join(SCHEMA_VERSION_FILE).exists());
+        index.complete_schema_migration().unwrap();
         let marker = fs::read_to_string(index_path.join(SCHEMA_VERSION_FILE)).unwrap();
         assert_eq!(marker.trim(), INDEX_SCHEMA_VERSION);
     }

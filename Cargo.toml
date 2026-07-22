@@ -29,6 +29,9 @@ members = [
     # into the daemon under their original module path.
     "crates/bbox-vectors",
     "crates/bbox-corpus-core",
+    "crates/bbox-code-source",
+    "crates/bbox-code-source-store",
+    "crates/bbox-code-collector",
     "crates/bbox-provenance",
     "crates/bbox-corpus-index",
     "crates/bbox-edge-sidecar",
@@ -94,6 +97,8 @@ anyhow = "1"
 bbox-vectors = { path = "crates/bbox-vectors" }
 # Foundation crate (entity_ref + git) extracted from the root crate (stage 0).
 bbox-corpus-core = { path = "crates/bbox-corpus-core" }
+bbox-code-source = { path = "crates/bbox-code-source" }
+bbox-code-source-store = { path = "crates/bbox-code-source-store" }
 bbox-corpus-index = { path = "crates/bbox-corpus-index" }
 bbox-edge-sidecar = { path = "crates/bbox-edge-sidecar" }
 # Chunking + tree-sitter symbol extraction, extracted from the root crate (stage 1).
