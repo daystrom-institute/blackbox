@@ -64,6 +64,42 @@ pub enum GapOverlayStatus {
     Invalid,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GapOverlayRecomputeErrorKind {
+    InvalidContent,
+    Transient,
+}
+
+#[derive(Debug)]
+pub struct GapOverlayRecomputeError {
+    pub kind: GapOverlayRecomputeErrorKind,
+    diagnostic: String,
+}
+
+impl GapOverlayRecomputeError {
+    pub fn invalid_content(error: anyhow::Error) -> Self {
+        Self {
+            kind: GapOverlayRecomputeErrorKind::InvalidContent,
+            diagnostic: format!("{error:#}"),
+        }
+    }
+
+    pub fn transient(error: anyhow::Error) -> Self {
+        Self {
+            kind: GapOverlayRecomputeErrorKind::Transient,
+            diagnostic: format!("{error:#}"),
+        }
+    }
+}
+
+impl std::fmt::Display for GapOverlayRecomputeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.diagnostic)
+    }
+}
+
+impl std::error::Error for GapOverlayRecomputeError {}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GapOverlaySnapshot {
     pub snapshot_id: String,
@@ -232,27 +268,29 @@ pub fn recompute_overlay(
     published_ref: &str,
     checkout: &ResolvedCheckoutScope,
 ) -> GapOverlaySnapshot {
-    match recompute_overlay_inner(publisher_root, published_ref, checkout) {
+    match recompute_overlay_result(publisher_root, published_ref, checkout) {
         Ok(snapshot) => snapshot,
         Err(err) => GapOverlaySnapshot::invalid(checkout, format!("{err:#}")),
     }
 }
 
-fn recompute_overlay_inner(
+pub fn recompute_overlay_result(
     publisher_root: &Path,
     published_ref: &str,
     checkout: &ResolvedCheckoutScope,
-) -> Result<GapOverlaySnapshot> {
+) -> std::result::Result<GapOverlaySnapshot, GapOverlayRecomputeError> {
     let checkout_root = Path::new(&checkout.checkout_dir);
-    let publisher_commit =
-        git::resolve_commit(publisher_root, published_ref).with_context(|| {
+    let publisher_commit = git::resolve_commit(publisher_root, published_ref)
+        .with_context(|| {
             format!(
                 "published ref {published_ref} does not resolve in {}",
                 publisher_root.display()
             )
-        })?;
+        })
+        .map_err(GapOverlayRecomputeError::transient)?;
     let checkout_head = git::current_head(checkout_root)
-        .with_context(|| format!("checkout {} has no HEAD", checkout_root.display()))?;
+        .with_context(|| format!("checkout {} has no HEAD", checkout_root.display()))
+        .map_err(GapOverlayRecomputeError::transient)?;
     let merge_base = git::merge_base_with_alternate(
         checkout_root,
         &checkout_head,
@@ -265,11 +303,18 @@ fn recompute_overlay_inner(
             checkout_root.display(),
             publisher_commit
         )
-    })?;
+    })
+    .map_err(GapOverlayRecomputeError::transient)?;
     let tree_dir = gaps_tree_dir(&checkout.published_scope);
-    let baseline = read_committed_map(checkout_root, &merge_base, &tree_dir, Some(publisher_root))?;
-    let published = read_committed_map(publisher_root, &publisher_commit, &tree_dir, None)?;
-    let working = read_working_map(Path::new(&checkout.checkout_project_dir))?;
+    let baseline = read_committed_map(checkout_root, &merge_base, &tree_dir, Some(publisher_root))
+        .map_err(GapOverlayRecomputeError::transient)?;
+    let published = read_committed_map(publisher_root, &publisher_commit, &tree_dir, None)
+        .map_err(GapOverlayRecomputeError::transient)?;
+    let working = read_working_map(Path::new(&checkout.checkout_project_dir))
+        .map_err(GapOverlayRecomputeError::transient)?;
+    validate_gap_map(&baseline, "baseline").map_err(GapOverlayRecomputeError::invalid_content)?;
+    validate_gap_map(&published, "published").map_err(GapOverlayRecomputeError::invalid_content)?;
+    validate_gap_map(&working, "working").map_err(GapOverlayRecomputeError::invalid_content)?;
     let working_fingerprint = fingerprint_map(&working);
 
     let mut paths = BTreeSet::new();
@@ -285,10 +330,15 @@ fn recompute_overlay_inner(
                     continue;
                 }
                 let mut gap: GapNote = serde_json::from_slice(after)
-                    .with_context(|| format!("parsing working gap file {filename}"))?;
-                validate_filename_id(&filename, &gap.id, "working gap")?;
+                    .with_context(|| format!("parsing working gap file {filename}"))
+                    .map_err(GapOverlayRecomputeError::invalid_content)?;
+                validate_filename_id(&filename, &gap.id, "working gap")
+                    .map_err(GapOverlayRecomputeError::invalid_content)?;
                 if !seen_ids.insert(gap.id.clone()) {
-                    anyhow::bail!("duplicate gap id in checkout overlay: {}", gap.id);
+                    return Err(GapOverlayRecomputeError::invalid_content(anyhow::anyhow!(
+                        "duplicate gap id in checkout overlay: {}",
+                        gap.id
+                    )));
                 }
                 stamp_gap(&mut gap, &checkout.checkout_project_dir);
                 values.insert(
@@ -301,8 +351,10 @@ fn recompute_overlay_inner(
             }
             (Some(before), None) => {
                 let gap: GapNote = serde_json::from_slice(before)
-                    .with_context(|| format!("parsing baseline gap file {filename}"))?;
-                validate_filename_id(&filename, &gap.id, "baseline gap")?;
+                    .with_context(|| format!("parsing baseline gap file {filename}"))
+                    .map_err(GapOverlayRecomputeError::invalid_content)?;
+                validate_filename_id(&filename, &gap.id, "baseline gap")
+                    .map_err(GapOverlayRecomputeError::invalid_content)?;
                 if published.contains_key(&filename) {
                     values.insert(gap.id, GapOverlayValue::Tombstone);
                 }
@@ -350,6 +402,19 @@ fn validate_filename_id(filename: &str, id: &str, label: &str) -> Result<()> {
         .with_context(|| format!("gap filename is not UTF-8: {filename}"))?;
     if stem != id {
         anyhow::bail!("{label} filename/id mismatch: {filename} contains id {id}");
+    }
+    Ok(())
+}
+
+fn validate_gap_map(files: &BTreeMap<String, Vec<u8>>, label: &str) -> Result<()> {
+    let mut ids = BTreeSet::new();
+    for (filename, bytes) in files {
+        let gap: GapNote = serde_json::from_slice(bytes)
+            .with_context(|| format!("parsing {label} gap file {filename}"))?;
+        validate_filename_id(filename, &gap.id, &format!("{label} gap"))?;
+        if !ids.insert(gap.id.clone()) {
+            anyhow::bail!("duplicate {label} gap id: {}", gap.id);
+        }
     }
     Ok(())
 }
@@ -581,6 +646,55 @@ mod tests {
         assert!(!promoted.values.contains_key("gap-11111111"));
         assert!(!promoted.values.contains_key("gap-22222222"));
         assert!(promoted.values.contains_key("gap-33333333"));
+    }
+
+    #[test]
+    fn recompute_classifies_invalid_content_separately_from_git_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let base = root.join("repo");
+        std::fs::create_dir_all(&base).unwrap();
+        git(&base, &["init", "-q", "-b", "main"]);
+        git(&base, &["config", "user.email", "test@example.com"]);
+        git(&base, &["config", "user.name", "Test"]);
+        write_gap(&base, &gap("gap-11111111", "published"));
+        git(&base, &["add", ".bbox/gaps"]);
+        git(&base, &["commit", "-q", "-m", "seed"]);
+
+        let worktree = root.join("worktree");
+        git(
+            &base,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature-classification",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        let checkout = ResolvedCheckoutScope {
+            project_id: "test-project".into(),
+            published_scope: PublishedScope {
+                repo_id: "repo".into(),
+                bbox_root_relpath: ".".into(),
+            },
+            checkout_id: "checkout".into(),
+            checkout_dir: worktree.to_string_lossy().into_owned(),
+            checkout_project_dir: worktree.to_string_lossy().into_owned(),
+            branch_ref: Some("refs/heads/feature-classification".into()),
+        };
+
+        std::fs::write(worktree.join(".bbox/gaps/broken.json"), b"{").unwrap();
+        let malformed = recompute_overlay_result(&base, "refs/heads/main", &checkout).unwrap_err();
+        assert_eq!(malformed.kind, GapOverlayRecomputeErrorKind::InvalidContent);
+
+        let mut missing_checkout = checkout;
+        missing_checkout.checkout_dir = root.join("missing").to_string_lossy().into_owned();
+        missing_checkout.checkout_project_dir = missing_checkout.checkout_dir.clone();
+        let transient =
+            recompute_overlay_result(&base, "refs/heads/main", &missing_checkout).unwrap_err();
+        assert_eq!(transient.kind, GapOverlayRecomputeErrorKind::Transient);
     }
 
     #[test]

@@ -89,6 +89,42 @@ pub enum OverlayStatus {
     Invalid,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayRecomputeErrorKind {
+    InvalidContent,
+    Transient,
+}
+
+#[derive(Debug)]
+pub struct OverlayRecomputeError {
+    pub kind: OverlayRecomputeErrorKind,
+    diagnostic: String,
+}
+
+impl OverlayRecomputeError {
+    pub fn invalid_content(error: anyhow::Error) -> Self {
+        Self {
+            kind: OverlayRecomputeErrorKind::InvalidContent,
+            diagnostic: format!("{error:#}"),
+        }
+    }
+
+    pub fn transient(error: anyhow::Error) -> Self {
+        Self {
+            kind: OverlayRecomputeErrorKind::Transient,
+            diagnostic: format!("{error:#}"),
+        }
+    }
+}
+
+impl std::fmt::Display for OverlayRecomputeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.diagnostic)
+    }
+}
+
+impl std::error::Error for OverlayRecomputeError {}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverlaySnapshot {
     pub snapshot_id: String,
@@ -256,6 +292,33 @@ pub fn load_published_snapshot_at_commit(
     scope: &PublishedScope,
     durable_project: &str,
 ) -> Result<PublishedKnowledgeSnapshot> {
+    let mut snapshot = load_published_snapshot_at_commit_unhydrated(
+        publisher_root,
+        published_ref,
+        publisher_commit,
+        scope,
+        durable_project,
+    )?;
+    crate::knowledge::hydrate_repo_recall_stats(
+        publisher_root,
+        snapshot
+            .entries
+            .values_mut()
+            .map(|published| &mut published.entry),
+    );
+    Ok(snapshot)
+}
+
+/// Load immutable committed blobs without merging host-local recall telemetry.
+/// Commit-keyed caches store this form and hydrate each returned clone so
+/// ranking observes the latest sidecar without rereading Git objects.
+pub fn load_published_snapshot_at_commit_unhydrated(
+    publisher_root: &Path,
+    published_ref: &str,
+    publisher_commit: &str,
+    scope: &PublishedScope,
+    durable_project: &str,
+) -> Result<PublishedKnowledgeSnapshot> {
     let tree_dir = knowledge_tree_dir(scope);
     let files = read_committed_map(publisher_root, publisher_commit, &tree_dir, None)?;
     let mut entries = BTreeMap::new();
@@ -287,10 +350,6 @@ pub fn load_published_snapshot_at_commit(
             anyhow::bail!("duplicate published knowledge id: {id}");
         }
     }
-    crate::knowledge::hydrate_repo_recall_stats(
-        publisher_root,
-        entries.values_mut().map(|published| &mut published.entry),
-    );
     Ok(PublishedKnowledgeSnapshot {
         published_scope: scope.clone(),
         published_ref: published_ref.to_string(),
@@ -306,27 +365,31 @@ pub fn recompute_overlay(
     published_ref: &str,
     checkout: &ResolvedCheckoutScope,
 ) -> OverlaySnapshot {
-    match recompute_overlay_inner(publisher_root, published_ref, checkout) {
+    match recompute_overlay_result(publisher_root, published_ref, checkout) {
         Ok(snapshot) => snapshot,
         Err(err) => OverlaySnapshot::invalid(checkout, format!("{err:#}")),
     }
 }
 
-fn recompute_overlay_inner(
+/// Recompute one checkout overlay while preserving whether a failure came
+/// from invalid repository content or from transient Git and filesystem work.
+pub fn recompute_overlay_result(
     publisher_root: &Path,
     published_ref: &str,
     checkout: &ResolvedCheckoutScope,
-) -> Result<OverlaySnapshot> {
+) -> std::result::Result<OverlaySnapshot, OverlayRecomputeError> {
     let checkout_root = Path::new(&checkout.checkout_dir);
-    let publisher_commit =
-        git::resolve_commit(publisher_root, published_ref).with_context(|| {
+    let publisher_commit = git::resolve_commit(publisher_root, published_ref)
+        .with_context(|| {
             format!(
                 "published ref {published_ref} does not resolve in {}",
                 publisher_root.display()
             )
-        })?;
+        })
+        .map_err(OverlayRecomputeError::transient)?;
     let checkout_head = git::current_head(checkout_root)
-        .with_context(|| format!("checkout {} has no HEAD", checkout_root.display()))?;
+        .with_context(|| format!("checkout {} has no HEAD", checkout_root.display()))
+        .map_err(OverlayRecomputeError::transient)?;
     let merge_base = git::merge_base_with_alternate(
         checkout_root,
         &checkout_head,
@@ -339,11 +402,20 @@ fn recompute_overlay_inner(
             checkout_root.display(),
             publisher_commit
         )
-    })?;
+    })
+    .map_err(OverlayRecomputeError::transient)?;
     let tree_dir = knowledge_tree_dir(&checkout.published_scope);
-    let baseline = read_committed_map(checkout_root, &merge_base, &tree_dir, Some(publisher_root))?;
-    let published = read_committed_map(publisher_root, &publisher_commit, &tree_dir, None)?;
-    let working = read_working_map(Path::new(&checkout.checkout_project_dir))?;
+    let baseline = read_committed_map(checkout_root, &merge_base, &tree_dir, Some(publisher_root))
+        .map_err(OverlayRecomputeError::transient)?;
+    let published = read_committed_map(publisher_root, &publisher_commit, &tree_dir, None)
+        .map_err(OverlayRecomputeError::transient)?;
+    let working = read_working_map(Path::new(&checkout.checkout_project_dir))
+        .map_err(OverlayRecomputeError::transient)?;
+    validate_knowledge_map(&baseline, "baseline")
+        .map_err(OverlayRecomputeError::invalid_content)?;
+    validate_knowledge_map(&published, "published")
+        .map_err(OverlayRecomputeError::invalid_content)?;
+    validate_knowledge_map(&working, "working").map_err(OverlayRecomputeError::invalid_content)?;
     let working_fingerprint = fingerprint_map(&working);
 
     let mut paths = BTreeSet::new();
@@ -362,19 +434,24 @@ fn recompute_overlay_inner(
                     continue;
                 }
                 let entry: KnowledgeEntry = serde_json::from_slice(after)
-                    .with_context(|| format!("parsing working knowledge file {filename}"))?;
+                    .with_context(|| format!("parsing working knowledge file {filename}"))
+                    .map_err(OverlayRecomputeError::invalid_content)?;
                 let stem = Path::new(&filename)
                     .file_stem()
                     .and_then(|stem| stem.to_str())
-                    .with_context(|| format!("knowledge filename is not UTF-8: {filename}"))?;
+                    .with_context(|| format!("knowledge filename is not UTF-8: {filename}"))
+                    .map_err(OverlayRecomputeError::invalid_content)?;
                 if stem != entry.id {
-                    anyhow::bail!(
+                    return Err(OverlayRecomputeError::invalid_content(anyhow::anyhow!(
                         "knowledge filename/id mismatch: {filename} contains id {}",
                         entry.id
-                    );
+                    )));
                 }
                 if !seen_ids.insert(entry.id.clone()) {
-                    anyhow::bail!("duplicate knowledge id in checkout overlay: {}", entry.id);
+                    return Err(OverlayRecomputeError::invalid_content(anyhow::anyhow!(
+                        "duplicate knowledge id in checkout overlay: {}",
+                        entry.id
+                    )));
                 }
                 values.insert(
                     entry.id.clone(),
@@ -388,14 +465,16 @@ fn recompute_overlay_inner(
                 let stem = Path::new(&filename)
                     .file_stem()
                     .and_then(|stem| stem.to_str())
-                    .with_context(|| format!("knowledge filename is not UTF-8: {filename}"))?;
+                    .with_context(|| format!("knowledge filename is not UTF-8: {filename}"))
+                    .map_err(OverlayRecomputeError::invalid_content)?;
                 let entry: KnowledgeEntry = serde_json::from_slice(before)
-                    .with_context(|| format!("parsing baseline knowledge file {filename}"))?;
+                    .with_context(|| format!("parsing baseline knowledge file {filename}"))
+                    .map_err(OverlayRecomputeError::invalid_content)?;
                 if stem != entry.id {
-                    anyhow::bail!(
+                    return Err(OverlayRecomputeError::invalid_content(anyhow::anyhow!(
                         "baseline knowledge filename/id mismatch: {filename} contains id {}",
                         entry.id
-                    );
+                    )));
                 }
                 if published.contains_key(&filename) {
                     values.insert(entry.id, OverlayValue::Tombstone);
@@ -414,7 +493,7 @@ fn recompute_overlay_inner(
         merge_base,
         working_fingerprint,
     };
-    let snapshot_id = snapshot_id(&stamp, &values)?;
+    let snapshot_id = snapshot_id(&stamp, &values).map_err(OverlayRecomputeError::transient)?;
     Ok(OverlaySnapshot {
         snapshot_id,
         key: OverlayKey {
@@ -426,6 +505,28 @@ fn recompute_overlay_inner(
         values,
         diagnostics: Vec::new(),
     })
+}
+
+fn validate_knowledge_map(files: &BTreeMap<String, Vec<u8>>, label: &str) -> Result<()> {
+    let mut ids = BTreeSet::new();
+    for (filename, bytes) in files {
+        let entry: KnowledgeEntry = serde_json::from_slice(bytes)
+            .with_context(|| format!("parsing {label} knowledge file {filename}"))?;
+        let stem = Path::new(filename)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .with_context(|| format!("knowledge filename is not UTF-8: {filename}"))?;
+        if stem != entry.id {
+            anyhow::bail!(
+                "{label} knowledge filename/id mismatch: {filename} contains id {}",
+                entry.id
+            );
+        }
+        if !ids.insert(entry.id.clone()) {
+            anyhow::bail!("duplicate {label} knowledge id: {}", entry.id);
+        }
+    }
+    Ok(())
 }
 
 fn knowledge_tree_dir(scope: &PublishedScope) -> String {
@@ -819,6 +920,55 @@ mod tests {
             .unwrap();
         assert_eq!(current.status, OverlayStatus::Invalid);
         assert!(current.values.is_empty());
+    }
+
+    #[test]
+    fn recompute_classifies_invalid_content_separately_from_git_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let base = root.join("repo");
+        std::fs::create_dir_all(&base).unwrap();
+        run(&base, &["init", "-q", "-b", "main"]);
+        run(&base, &["config", "user.email", "test@example.com"]);
+        run(&base, &["config", "user.name", "Test"]);
+        write_entry(&base, &entry("seed", "published"));
+        run(&base, &["add", ".bbox/knowledge"]);
+        run(&base, &["commit", "-q", "-m", "seed"]);
+
+        let worktree = root.join("worktree");
+        run(
+            &base,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature-classification",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        let checkout = ResolvedCheckoutScope {
+            project_id: "test-project".into(),
+            published_scope: PublishedScope {
+                repo_id: "repo".into(),
+                bbox_root_relpath: ".".into(),
+            },
+            checkout_id: "checkout".into(),
+            checkout_dir: worktree.to_string_lossy().into_owned(),
+            checkout_project_dir: worktree.to_string_lossy().into_owned(),
+            branch_ref: Some("refs/heads/feature-classification".into()),
+        };
+
+        std::fs::write(worktree.join(".bbox/knowledge/broken.json"), b"{").unwrap();
+        let malformed = recompute_overlay_result(&base, "refs/heads/main", &checkout).unwrap_err();
+        assert_eq!(malformed.kind, OverlayRecomputeErrorKind::InvalidContent);
+
+        let mut missing_checkout = checkout;
+        missing_checkout.checkout_dir = root.join("missing").to_string_lossy().into_owned();
+        missing_checkout.checkout_project_dir = missing_checkout.checkout_dir.clone();
+        let transient =
+            recompute_overlay_result(&base, "refs/heads/main", &missing_checkout).unwrap_err();
+        assert_eq!(transient.kind, OverlayRecomputeErrorKind::Transient);
     }
 
     #[test]

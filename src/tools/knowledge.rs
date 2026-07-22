@@ -75,36 +75,34 @@ fn stable_knowledge_overlay(
     publisher_root: &std::path::Path,
     published_ref: &str,
     checkout: &bbox_corpus_core::project_record::ResolvedCheckoutScope,
-) -> bbox_knowledge::overlay::OverlaySnapshot {
-    use bbox_knowledge::overlay::{OverlaySnapshot, recompute_overlay};
+) -> Result<bbox_knowledge::overlay::OverlaySnapshot, bbox_knowledge::overlay::OverlayRecomputeError>
+{
+    use bbox_knowledge::overlay::{OverlayRecomputeError, recompute_overlay_result};
 
     let checkout_root = std::path::Path::new(&checkout.checkout_dir);
     if bbox_knowledge::transaction::has_pending_transaction(checkout_root) {
-        return OverlaySnapshot::invalid(
-            checkout,
-            "checkout transaction is pending; provisional overlay refresh deferred",
-        );
+        return Err(OverlayRecomputeError::transient(anyhow::anyhow!(
+            "checkout transaction is pending; provisional overlay refresh deferred"
+        )));
     }
-    let mut candidate = recompute_overlay(publisher_root, published_ref, checkout);
+    let mut candidate = recompute_overlay_result(publisher_root, published_ref, checkout)?;
     for _ in 0..2 {
         if bbox_knowledge::transaction::has_pending_transaction(checkout_root) {
-            return OverlaySnapshot::invalid(
-                checkout,
-                "checkout transaction began during provisional overlay refresh",
-            );
+            return Err(OverlayRecomputeError::transient(anyhow::anyhow!(
+                "checkout transaction began during provisional overlay refresh"
+            )));
         }
-        let next = recompute_overlay(publisher_root, published_ref, checkout);
+        let next = recompute_overlay_result(publisher_root, published_ref, checkout)?;
         if same_knowledge_snapshot(&candidate, &next)
             && !bbox_knowledge::transaction::has_pending_transaction(checkout_root)
         {
-            return next;
+            return Ok(next);
         }
         candidate = next;
     }
-    OverlaySnapshot::invalid(
-        checkout,
-        "checkout state changed repeatedly during provisional overlay refresh",
-    )
+    Err(OverlayRecomputeError::transient(anyhow::anyhow!(
+        "checkout state changed repeatedly during provisional overlay refresh"
+    )))
 }
 
 fn same_knowledge_snapshot(
@@ -242,8 +240,11 @@ impl BlackboxServer {
     pub(crate) fn refresh_dark_knowledge_overlay(
         &self,
         checkout: &bbox_corpus_core::project_record::ResolvedCheckoutScope,
-    ) {
-        use bbox_knowledge::overlay::{OverlayKey, OverlaySnapshot};
+    ) -> crate::server::KnowledgeOverlayRefreshOutcome {
+        use crate::server::KnowledgeOverlayRefreshOutcome;
+        use bbox_knowledge::overlay::{
+            OverlayKey, OverlayRecomputeErrorKind, OverlaySnapshot, OverlayStatus,
+        };
 
         let _refresh = self.state.knowledge_overlay_refresh.lock();
         let generation = self
@@ -261,18 +262,69 @@ impl BlackboxServer {
             .read()
             .get(&checkout.published_scope, &checkout.checkout_id)
             .cloned();
+        let prior_is_valid = prior
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.status == OverlayStatus::Valid);
         let mut publisher_project = None;
-        let snapshot = match self.authorize_publisher(&projects, &checkout.published_scope) {
+        let snapshot = match self
+            .authorize_publisher_classified(&projects, &checkout.published_scope)
+        {
             Ok(publisher) => {
                 publisher_project = Some(publisher.root.clone());
-                stable_knowledge_overlay(
+                match stable_knowledge_overlay(
                     std::path::Path::new(&publisher.root),
                     &publisher.commit,
                     checkout,
-                )
+                ) {
+                    Ok(snapshot) => snapshot,
+                    Err(err)
+                        if err.kind == OverlayRecomputeErrorKind::Transient && prior_is_valid =>
+                    {
+                        tracing::warn!(
+                            error = %err,
+                            checkout = %checkout.checkout_id,
+                            scope = ?checkout.published_scope,
+                            "knowledge overlay refresh degraded; preserving prior valid snapshot"
+                        );
+                        let mut preserved = prior.clone().expect("prior valid snapshot");
+                        preserved.diagnostics = vec![format!("refresh degraded: {err:#}")];
+                        let published = self
+                            .state
+                            .knowledge_overlays
+                            .write()
+                            .publish_if_latest(generation, preserved);
+                        return if published {
+                            KnowledgeOverlayRefreshOutcome::PreservedTransient
+                        } else {
+                            KnowledgeOverlayRefreshOutcome::Superseded
+                        };
+                    }
+                    Err(err) => OverlaySnapshot::invalid(checkout, format!("{err:#}")),
+                }
+            }
+            Err(err) if err.is_transient() && prior_is_valid => {
+                tracing::warn!(
+                    error = %err,
+                    checkout = %checkout.checkout_id,
+                    scope = ?checkout.published_scope,
+                    "knowledge publisher refresh degraded; preserving prior valid snapshot"
+                );
+                let mut preserved = prior.clone().expect("prior valid snapshot");
+                preserved.diagnostics = vec![format!("publisher refresh degraded: {err:#}")];
+                let published = self
+                    .state
+                    .knowledge_overlays
+                    .write()
+                    .publish_if_latest(generation, preserved);
+                return if published {
+                    KnowledgeOverlayRefreshOutcome::PreservedTransient
+                } else {
+                    KnowledgeOverlayRefreshOutcome::Superseded
+                };
             }
             Err(err) => OverlaySnapshot::invalid(checkout, format!("{err:#}")),
         };
+        let invalid = snapshot.status == OverlayStatus::Invalid;
         let prior_commit = prior
             .as_ref()
             .and_then(|snapshot| snapshot.stamp.as_ref())
@@ -299,16 +351,25 @@ impl BlackboxServer {
             .write()
             .publish_if_latest(generation, snapshot)
         {
-            return;
+            return KnowledgeOverlayRefreshOutcome::Superseded;
         }
         if unchanged {
-            return;
+            return if invalid {
+                KnowledgeOverlayRefreshOutcome::Invalid
+            } else {
+                KnowledgeOverlayRefreshOutcome::Converged
+            };
         }
-        self.invalidate_published_knowledge_cache(&checkout.published_scope);
+        self.invalidate_published_snapshot_caches(&checkout.published_scope);
+
+        if invalid {
+            self.clear_knowledge_scope_in_index(&checkout.published_scope);
+            return KnowledgeOverlayRefreshOutcome::Invalid;
+        }
 
         let Some(project) = publisher_project else {
             self.clear_knowledge_scope_in_index(&checkout.published_scope);
-            return;
+            return KnowledgeOverlayRefreshOutcome::Invalid;
         };
         if publisher_moved {
             if let Err(err) =
@@ -321,7 +382,7 @@ impl BlackboxServer {
                 );
                 self.clear_knowledge_scope_in_index(&checkout.published_scope);
             }
-            return;
+            return KnowledgeOverlayRefreshOutcome::Converged;
         }
         for entry_id in affected {
             if let Err(err) = self.sync_knowledge_logical_ref_for_project(&entry_id, &project) {
@@ -332,6 +393,7 @@ impl BlackboxServer {
                 );
             }
         }
+        KnowledgeOverlayRefreshOutcome::Converged
     }
 }
 

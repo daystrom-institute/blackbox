@@ -1,5 +1,6 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bbox_corpus_core::identity::{
@@ -7,10 +8,10 @@ use bbox_corpus_core::identity::{
 };
 use bbox_corpus_core::project_record::{ProjectRecord, ResolvedCheckoutScope};
 use bbox_indexing::checkout_registry::{CheckoutRow, discover_checkout_dirs};
-use bbox_indexing::publisher::{PublisherResolution, elect_publisher, project_published_scope};
+use bbox_indexing::publisher::project_published_scope;
 use bbox_knowledge::knowledge::{KnowledgeEntry, Scope};
 
-use super::BlackboxServer;
+use super::{BlackboxServer, KnowledgeOverlayRefreshOutcome};
 
 #[derive(Debug, Default)]
 pub(crate) struct KnowledgeCheckoutReconcileReport {
@@ -33,11 +34,116 @@ pub(crate) struct ExistingKnowledgeMutation {
     pub(crate) checkout: Option<ResolvedCheckoutScope>,
 }
 
-#[derive(Debug)]
+const PUBLISHER_AUTHORIZATION_CACHE_TTL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone)]
 pub(crate) struct AuthorizedPublisher {
     pub(crate) root: String,
     pub(crate) branch_ref: String,
     pub(crate) commit: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublisherAuthorizationErrorKind {
+    InvalidAuthority,
+    Transient,
+}
+
+#[derive(Debug)]
+pub(crate) struct PublisherAuthorizationError {
+    pub(crate) kind: PublisherAuthorizationErrorKind,
+    diagnostic: String,
+}
+
+impl PublisherAuthorizationError {
+    fn invalid(diagnostic: impl Into<String>) -> Self {
+        Self {
+            kind: PublisherAuthorizationErrorKind::InvalidAuthority,
+            diagnostic: diagnostic.into(),
+        }
+    }
+
+    fn transient(error: anyhow::Error) -> Self {
+        Self {
+            kind: PublisherAuthorizationErrorKind::Transient,
+            diagnostic: format!("{error:#}"),
+        }
+    }
+
+    pub(crate) fn is_transient(&self) -> bool {
+        self.kind == PublisherAuthorizationErrorKind::Transient
+    }
+}
+
+impl std::fmt::Display for PublisherAuthorizationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.diagnostic)
+    }
+}
+
+impl std::error::Error for PublisherAuthorizationError {}
+
+#[derive(Clone)]
+pub(crate) struct PublisherAuthorizationCacheEntry {
+    project_inventory: Vec<(String, String)>,
+    checked_at: Instant,
+    publisher: AuthorizedPublisher,
+}
+
+#[derive(Default)]
+pub(crate) struct PublisherAuthorizationCache {
+    entries: BTreeMap<PublishedScope, PublisherAuthorizationCacheEntry>,
+    generations: BTreeMap<PublishedScope, u64>,
+}
+
+impl PublisherAuthorizationCache {
+    fn generation(&self, scope: &PublishedScope) -> u64 {
+        self.generations.get(scope).copied().unwrap_or_default()
+    }
+
+    fn cached(
+        &self,
+        scope: &PublishedScope,
+        project_inventory: &[(String, String)],
+    ) -> Option<AuthorizedPublisher> {
+        let now = Instant::now();
+        self.entries
+            .get(scope)
+            .filter(|entry| {
+                entry.project_inventory == project_inventory
+                    && now.duration_since(entry.checked_at) < PUBLISHER_AUTHORIZATION_CACHE_TTL
+            })
+            .map(|entry| entry.publisher.clone())
+    }
+
+    fn insert_if_generation(
+        &mut self,
+        scope: PublishedScope,
+        expected_generation: u64,
+        entry: PublisherAuthorizationCacheEntry,
+    ) -> bool {
+        if self.generation(&scope) != expected_generation {
+            return false;
+        }
+        self.entries.insert(scope, entry);
+        true
+    }
+
+    pub(crate) fn invalidate(&mut self, scope: &PublishedScope) {
+        let generation = self.generation(scope).checked_add(1).unwrap_or(1);
+        self.generations.insert(scope.clone(), generation);
+        self.entries.remove(scope);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 impl BlackboxServer {
@@ -50,64 +156,102 @@ impl BlackboxServer {
         projects: &[ProjectRecord],
         scope: &PublishedScope,
     ) -> Result<AuthorizedPublisher> {
-        let root = match elect_publisher(projects, scope, crate::config::read_repo_id_inputs) {
-            PublisherResolution::One(root) => root,
-            PublisherResolution::None => anyhow::bail!("no publisher for scope {scope:?}"),
-            PublisherResolution::Duplicate(paths) => anyhow::bail!(
-                "duplicate publishers for scope {scope:?}: {}",
-                paths.join(", ")
-            ),
+        self.authorize_publisher_classified(projects, scope)
+            .map_err(anyhow::Error::new)
+    }
+
+    pub(crate) fn authorize_publisher_classified(
+        &self,
+        projects: &[ProjectRecord],
+        scope: &PublishedScope,
+    ) -> std::result::Result<AuthorizedPublisher, PublisherAuthorizationError> {
+        let project_inventory = publisher_project_inventory(projects);
+        loop {
+            let generation = {
+                let cache = self.state.publisher_authorization_cache.read();
+                if let Some(publisher) = cache.cached(scope, &project_inventory) {
+                    return Ok(publisher);
+                }
+                cache.generation(scope)
+            };
+
+            let publisher = self.resolve_authorized_publisher(projects, scope)?;
+            let mut cache = self.state.publisher_authorization_cache.write();
+            if !cache.insert_if_generation(
+                scope.clone(),
+                generation,
+                PublisherAuthorizationCacheEntry {
+                    project_inventory: project_inventory.clone(),
+                    checked_at: Instant::now(),
+                    publisher: publisher.clone(),
+                },
+            ) {
+                continue;
+            }
+            return Ok(publisher);
+        }
+    }
+
+    fn resolve_authorized_publisher(
+        &self,
+        projects: &[ProjectRecord],
+        scope: &PublishedScope,
+    ) -> std::result::Result<AuthorizedPublisher, PublisherAuthorizationError> {
+        let mut matches = Vec::new();
+        for project in projects {
+            if committed_project_scope_at_ref(project, "HEAD")?.as_ref() == Some(scope) {
+                matches.push(project.canonical_path.clone());
+            }
+        }
+        matches.sort();
+        let root = match matches.as_slice() {
+            [] => {
+                return Err(PublisherAuthorizationError::invalid(format!(
+                    "no publisher for scope {scope:?}"
+                )));
+            }
+            [root] => root.clone(),
+            _ => {
+                return Err(PublisherAuthorizationError::invalid(format!(
+                    "duplicate publishers for scope {scope:?}: {}",
+                    matches.join(", ")
+                )));
+            }
         };
         let pin = self
             .state
             .publisher_refs
             .write()
             .ensure_pinned(scope, Path::new(&root))
-            .with_context(|| format!("pinning publisher for scope {scope:?}"))?;
-        let commit = bbox_corpus_core::git::resolve_commit(Path::new(&root), &pin.branch_ref)
-            .with_context(|| {
-                format!(
-                    "publisher ref {} does not resolve in {}",
-                    pin.branch_ref, root
-                )
-            })?;
+            .with_context(|| format!("pinning publisher for scope {scope:?}"))
+            .map_err(PublisherAuthorizationError::transient)?;
+        let commit = resolve_pinned_commit(Path::new(&root), &pin.branch_ref)?;
         let project = projects
             .iter()
             .find(|project| project.canonical_path == root)
-            .with_context(|| format!("publisher {root} vanished during authority resolution"))?;
-        let project_root = Path::new(&project.canonical_path);
-        let pinned_inputs = crate::config::read_repo_id_inputs_at_ref(project_root, &commit)
-            .with_context(|| {
-                format!(
-                    "reading publisher authority from {} at {}",
-                    pin.branch_ref, commit
-                )
+            .ok_or_else(|| {
+                PublisherAuthorizationError::invalid(format!(
+                    "publisher {root} vanished during authority resolution"
+                ))
             })?;
-        let pinned_repo_id = resolve_recorded_repo_id(&pinned_inputs).with_context(|| {
-            format!(
+        let pinned_scope = committed_project_scope_at_ref(project, &commit)?.ok_or_else(|| {
+            PublisherAuthorizationError::invalid(format!(
                 "publisher ref {} has no recorded repo authority at {}",
                 pin.branch_ref, commit
-            )
+            ))
         })?;
-        let git_root = bbox_corpus_core::git::git_root_for_path(project_root)
-            .with_context(|| format!("publisher {root} is not inside a git repository"))?;
-        let pinned_scope = PublishedScope {
-            repo_id: pinned_repo_id,
-            bbox_root_relpath: bbox_root_relpath(&git_root, project_root)
-                .with_context(|| format!("publisher {root} is outside its git root"))?,
-        };
         if &pinned_scope != scope {
-            anyhow::bail!(
+            return Err(PublisherAuthorizationError::invalid(format!(
                 "publisher ref {} resolves to commit {} whose committed project scope does not match {scope:?}",
-                pin.branch_ref,
-                commit
-            );
+                pin.branch_ref, commit
+            )));
         }
-        Ok(AuthorizedPublisher {
+        let publisher = AuthorizedPublisher {
             root,
             branch_ref: pin.branch_ref,
             commit,
-        })
+        };
+        Ok(publisher)
     }
 
     pub(crate) fn path_fallback_is_cut(&self) -> bool {
@@ -456,12 +600,28 @@ impl BlackboxServer {
             .collect::<BTreeSet<_>>();
         for scope in &scopes {
             self.invalidate_published_knowledge_cache(scope);
-            self.reconcile_knowledge_scope_index(scope);
         }
+        let mut refreshed_scopes = BTreeSet::new();
+        let mut fallback_scopes = BTreeSet::new();
         for row in rows {
             if let Some(checkout) = self.resolve_registered_checkout(&row) {
+                refreshed_scopes.insert(checkout.published_scope.clone());
+                let outcome = self.refresh_dark_knowledge_overlay(&checkout);
+                if matches!(
+                    outcome,
+                    KnowledgeOverlayRefreshOutcome::PreservedTransient
+                        | KnowledgeOverlayRefreshOutcome::Superseded
+                ) {
+                    fallback_scopes.insert(checkout.published_scope.clone());
+                }
                 self.refresh_dark_gap_overlay(&checkout);
             }
+        }
+        for scope in scopes.difference(&refreshed_scopes) {
+            fallback_scopes.insert(scope.clone());
+        }
+        for scope in fallback_scopes {
+            self.reconcile_knowledge_scope_index(&scope);
         }
         scopes.len()
     }
@@ -670,7 +830,7 @@ impl BlackboxServer {
 
     fn reconcile_knowledge_scope_index(&self, scope: &PublishedScope) {
         let projects = self.state.projects.read().list();
-        match self.authorize_publisher(&projects, scope) {
+        match self.authorize_publisher_classified(&projects, scope) {
             Ok(publisher) => {
                 if let Err(err) = self.sync_knowledge_scope_to_index(scope, &publisher.root) {
                     tracing::warn!(
@@ -681,11 +841,146 @@ impl BlackboxServer {
                     self.clear_knowledge_scope_in_index(scope);
                 }
             }
+            Err(err) if err.is_transient() => {
+                tracing::warn!(
+                    error = %err,
+                    scope = ?scope,
+                    "checkout lifecycle index convergence degraded; preserving prior scope index"
+                );
+            }
             Err(_) => {
                 self.clear_knowledge_scope_in_index(scope);
             }
         }
     }
+}
+
+fn publisher_project_inventory(projects: &[ProjectRecord]) -> Vec<(String, String)> {
+    let mut inventory = projects
+        .iter()
+        .map(|project| (project.project_id.clone(), project.canonical_path.clone()))
+        .collect::<Vec<_>>();
+    inventory.sort();
+    inventory
+}
+
+fn committed_project_scope_at_ref(
+    project: &ProjectRecord,
+    reference: &str,
+) -> std::result::Result<Option<PublishedScope>, PublisherAuthorizationError> {
+    let project_root = Path::new(&project.canonical_path);
+    let output = bbox_corpus_core::git::git_output(
+        project_root,
+        &["rev-parse", "--show-toplevel"],
+        "resolving publisher repository root",
+    )
+    .ok_or_else(|| {
+        PublisherAuthorizationError::transient(anyhow::anyhow!(
+            "publisher repository root could not be checked at {}",
+            project_root.display()
+        ))
+    })?;
+    if !output.status.success() {
+        return Err(PublisherAuthorizationError::invalid(format!(
+            "registered publisher candidate {} is not inside a Git repository: {}",
+            project_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let git_root = String::from_utf8(output.stdout).map_err(|err| {
+        PublisherAuthorizationError::invalid(format!(
+            "publisher repository root is not UTF-8 for {}: {err}",
+            project_root.display()
+        ))
+    })?;
+    let git_root = std::fs::canonicalize(git_root.trim()).map_err(|err| {
+        PublisherAuthorizationError::transient(anyhow::anyhow!(
+            "canonicalizing publisher repository root for {}: {err}",
+            project_root.display()
+        ))
+    })?;
+    let bbox_root_relpath = bbox_root_relpath(&git_root, project_root).ok_or_else(|| {
+        PublisherAuthorizationError::invalid(format!(
+            "publisher candidate {} is outside its Git root {}",
+            project_root.display(),
+            git_root.display()
+        ))
+    })?;
+    let config_relpath = if bbox_root_relpath == "." {
+        ".bbox/config.toml".to_string()
+    } else {
+        format!("{bbox_root_relpath}/.bbox/config.toml")
+    };
+    let spec = format!("{reference}:{config_relpath}");
+    let output = bbox_corpus_core::git::git_output(
+        &git_root,
+        &["show", &spec],
+        "reading committed publisher authority",
+    )
+    .ok_or_else(|| {
+        PublisherAuthorizationError::transient(anyhow::anyhow!(
+            "committed publisher authority could not be read from {}",
+            project_root.display()
+        ))
+    })?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let source = String::from_utf8(output.stdout).map_err(|err| {
+        PublisherAuthorizationError::invalid(format!(
+            "committed publisher config {config_relpath} is not UTF-8: {err}"
+        ))
+    })?;
+    let inputs = crate::config::repo_id_inputs_from_project_config_source(project_root, &source)
+        .map_err(|err| {
+            PublisherAuthorizationError::invalid(format!(
+                "parsing committed publisher config {config_relpath}: {err:#}"
+            ))
+        })?;
+    let Some(repo_id) = resolve_recorded_repo_id(&inputs) else {
+        return Ok(None);
+    };
+    Ok(Some(PublishedScope {
+        repo_id,
+        bbox_root_relpath,
+    }))
+}
+
+fn resolve_pinned_commit(
+    root: &Path,
+    branch_ref: &str,
+) -> std::result::Result<String, PublisherAuthorizationError> {
+    let spec = format!("{branch_ref}^{{commit}}");
+    let output = bbox_corpus_core::git::git_output(
+        root,
+        &["rev-parse", "--verify", &spec],
+        "resolving pinned publisher ref",
+    )
+    .ok_or_else(|| {
+        PublisherAuthorizationError::transient(anyhow::anyhow!(
+            "publisher ref {branch_ref} could not be checked in {}",
+            root.display()
+        ))
+    })?;
+    if !output.status.success() {
+        return Err(PublisherAuthorizationError::invalid(format!(
+            "publisher ref {branch_ref} does not resolve in {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let commit = String::from_utf8(output.stdout).map_err(|err| {
+        PublisherAuthorizationError::invalid(format!(
+            "publisher ref {branch_ref} returned a non-UTF-8 commit id: {err}"
+        ))
+    })?;
+    let commit = commit.trim();
+    if commit.is_empty() {
+        return Err(PublisherAuthorizationError::invalid(format!(
+            "publisher ref {branch_ref} resolved to an empty commit id"
+        )));
+    }
+    Ok(commit.to_string())
 }
 
 fn registry_key(row: &CheckoutRow) -> (String, PublishedScope) {
@@ -742,6 +1037,9 @@ fn canonical_or_original(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use crate::server::state::SharedState;
+    use bbox_knowledge::knowledge::{Approval, Category, Priority, Status};
+    use bbox_knowledge::overlay::{OverlayStatus, OverlayValue};
+    use std::collections::HashMap;
 
     fn git(root: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")
@@ -755,6 +1053,43 @@ mod tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn write_test_knowledge(root: &Path, id: &str, content: &str) {
+        let entry = KnowledgeEntry {
+            id: id.into(),
+            title: id.into(),
+            content: content.into(),
+            cluster: None,
+            variants: HashMap::new(),
+            category: Category::Memory,
+            scope: Scope::Project,
+            project: None,
+            providers: Vec::new(),
+            priority: Priority::Standard,
+            weight: 100,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            render: false,
+            decay: false,
+            review_at: None,
+            supersedes: None,
+            links: Vec::new(),
+            rationale: None,
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-07-21T00:00:00Z".into(),
+            updated_at: "2026-07-21T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        };
+        let dir = root.join(".bbox/knowledge");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{id}.json")),
+            serde_json::to_vec_pretty(&entry).unwrap(),
+        )
+        .unwrap();
     }
 
     fn fixture() -> (
@@ -903,6 +1238,276 @@ mod tests {
     }
 
     #[test]
+    fn closeout_refresh_recomputes_knowledge_overlay_after_publisher_advances() {
+        let (_temp, server, base, worktree, scope) = fixture();
+        server.reconcile_dark_knowledge_checkouts().unwrap();
+        let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&worktree).unwrap();
+
+        write_test_knowledge(&worktree, "closeout-refresh", "closeout convergence");
+        let row = server
+            .state
+            .checkout_registry
+            .read()
+            .get(&checkout_id, &scope)
+            .cloned()
+            .unwrap();
+        let checkout = server.resolve_registered_checkout(&row).unwrap();
+        server.refresh_dark_knowledge_overlay(&checkout);
+        assert!(matches!(
+            server
+                .state
+                .knowledge_overlays
+                .read()
+                .get(&scope, &checkout_id)
+                .and_then(|snapshot| snapshot.values.get("closeout-refresh")),
+            Some(OverlayValue::Upsert { .. })
+        ));
+
+        git(&worktree, &["add", ".bbox/knowledge/closeout-refresh.json"]);
+        git(&worktree, &["commit", "-q", "-m", "publish knowledge"]);
+        git(&base, &["merge", "-q", "--ff-only", "bro-fleet/lifecycle"]);
+
+        assert_eq!(
+            server.refresh_published_knowledge_for_checkout(&checkout_id),
+            1
+        );
+        let refreshed = server
+            .state
+            .knowledge_overlays
+            .read()
+            .get(&scope, &checkout_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(refreshed.status, OverlayStatus::Valid);
+        assert!(
+            refreshed.values.is_empty(),
+            "promoted knowledge must leave the provisional overlay immediately"
+        );
+    }
+
+    #[test]
+    fn closeout_transient_overlay_refresh_reconciles_current_publisher_index() {
+        let (_temp, server, base, worktree, scope) = fixture();
+        server.reconcile_dark_knowledge_checkouts().unwrap();
+        let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&worktree).unwrap();
+        let row = server
+            .state
+            .checkout_registry
+            .read()
+            .get(&checkout_id, &scope)
+            .cloned()
+            .unwrap();
+        let checkout = server.resolve_registered_checkout(&row).unwrap();
+
+        write_test_knowledge(&worktree, "closeout-fallback", "CURRENT PUBLISHER FALLBACK");
+        server.refresh_dark_knowledge_overlay(&checkout);
+        git(
+            &worktree,
+            &["add", ".bbox/knowledge/closeout-fallback.json"],
+        );
+        git(&worktree, &["commit", "-q", "-m", "publish fallback"]);
+        git(&base, &["merge", "-q", "--ff-only", "bro-fleet/lifecycle"]);
+
+        let transaction_root = worktree.join(".bbox/local/knowledge-transactions");
+        std::fs::create_dir_all(&transaction_root).unwrap();
+        std::fs::write(transaction_root.join("pending.json"), b"{}").unwrap();
+        assert_eq!(
+            server.refresh_published_knowledge_for_checkout(&checkout_id),
+            1
+        );
+        server.state.index_writer.flush_blocking().unwrap();
+
+        let preserved = server
+            .state
+            .knowledge_overlays
+            .read()
+            .get(&scope, &checkout_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(preserved.status, OverlayStatus::Valid);
+        assert!(
+            preserved
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("refresh degraded"))
+        );
+        let hits = server
+            .state
+            .idx
+            .read()
+            .hybrid_bm25_hits("CURRENT PUBLISHER FALLBACK", 10, Some("knowledge"))
+            .unwrap();
+        assert!(
+            hits.iter().any(|hit| {
+                hit.entity_id == crate::index::knowledge_entity_id("closeout-fallback")
+            }),
+            "fallback reconcile must index the current publisher commit: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn transient_refresh_preserves_valid_overlay_but_malformed_content_replaces_it() {
+        let (_temp, server, base, worktree, scope) = fixture();
+        server.reconcile_dark_knowledge_checkouts().unwrap();
+        let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&worktree).unwrap();
+        let row = server
+            .state
+            .checkout_registry
+            .read()
+            .get(&checkout_id, &scope)
+            .cloned()
+            .unwrap();
+        let checkout = server.resolve_registered_checkout(&row).unwrap();
+        let prior = server
+            .state
+            .knowledge_overlays
+            .read()
+            .get(&scope, &checkout_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(prior.status, OverlayStatus::Valid);
+
+        let unavailable = worktree.with_extension("unavailable");
+        std::fs::rename(&worktree, &unavailable).unwrap();
+        assert_eq!(
+            server.refresh_dark_knowledge_overlay(&checkout),
+            KnowledgeOverlayRefreshOutcome::PreservedTransient
+        );
+        let preserved = server
+            .state
+            .knowledge_overlays
+            .read()
+            .get(&scope, &checkout_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(preserved.status, OverlayStatus::Valid);
+        assert_eq!(preserved.snapshot_id, prior.snapshot_id);
+        assert_eq!(preserved.values.len(), prior.values.len());
+        assert!(
+            preserved
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("refresh degraded"))
+        );
+        std::fs::rename(&unavailable, &worktree).unwrap();
+        let degraded_view = server
+            .session_knowledge_view(Some(base.to_str().unwrap()), Some("all"))
+            .unwrap();
+        assert!(
+            degraded_view
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("refresh degraded"))
+        );
+
+        std::fs::write(worktree.join(".bbox/knowledge/broken.json"), b"{").unwrap();
+        assert_eq!(
+            server.refresh_dark_knowledge_overlay(&checkout),
+            KnowledgeOverlayRefreshOutcome::Invalid
+        );
+        let invalid = server
+            .state
+            .knowledge_overlays
+            .read()
+            .get(&scope, &checkout_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(invalid.status, OverlayStatus::Invalid);
+        assert!(invalid.values.is_empty());
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("broken.json"))
+        );
+    }
+
+    #[test]
+    fn invalid_publisher_authority_replaces_prior_valid_overlay() {
+        let (_temp, server, base, worktree, scope) = fixture();
+        server.reconcile_dark_knowledge_checkouts().unwrap();
+        let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&worktree).unwrap();
+        let row = server
+            .state
+            .checkout_registry
+            .read()
+            .get(&checkout_id, &scope)
+            .cloned()
+            .unwrap();
+        let checkout = server.resolve_registered_checkout(&row).unwrap();
+        assert_eq!(
+            server
+                .state
+                .knowledge_overlays
+                .read()
+                .get(&scope, &checkout_id)
+                .unwrap()
+                .status,
+            OverlayStatus::Valid
+        );
+
+        write_test_knowledge(&base, "authority-visible", "AUTHORITY VISIBLE CONTENT");
+        git(&base, &["add", ".bbox/knowledge/authority-visible.json"]);
+        git(&base, &["commit", "-q", "-m", "publish authority fixture"]);
+        server.invalidate_published_knowledge_cache(&scope);
+        server
+            .sync_knowledge_scope_to_index(&scope, base.to_str().unwrap())
+            .unwrap();
+        server.state.index_writer.flush_blocking().unwrap();
+        let before = server
+            .state
+            .idx
+            .read()
+            .hybrid_bm25_hits("AUTHORITY VISIBLE CONTENT", 10, Some("knowledge"))
+            .unwrap();
+        assert!(before.iter().any(|hit| {
+            hit.entity_id == crate::index::knowledge_entity_id("authority-visible")
+        }));
+
+        std::fs::write(
+            base.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"different-publisher-scope\"\n",
+        )
+        .unwrap();
+        git(&base, &["add", ".bbox/config.toml"]);
+        git(&base, &["commit", "-q", "-m", "change publisher scope"]);
+        server.invalidate_published_knowledge_cache(&scope);
+
+        assert_eq!(
+            server.refresh_dark_knowledge_overlay(&checkout),
+            KnowledgeOverlayRefreshOutcome::Invalid
+        );
+        let invalid = server
+            .state
+            .knowledge_overlays
+            .read()
+            .get(&scope, &checkout_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(invalid.status, OverlayStatus::Invalid);
+        assert!(invalid.values.is_empty());
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("no publisher"))
+        );
+        server.state.index_writer.flush_blocking().unwrap();
+        let after = server
+            .state
+            .idx
+            .read()
+            .hybrid_bm25_hits("AUTHORITY VISIBLE CONTENT", 10, Some("knowledge"))
+            .unwrap();
+        assert!(
+            after.iter().all(|hit| {
+                hit.entity_id != crate::index::knowledge_entity_id("authority-visible")
+            }),
+            "invalid publisher authority must clear static scope documents: {after:?}"
+        );
+    }
+
+    #[test]
     fn live_scope_ignores_uncommitted_config_edits() {
         let (_temp, server, base, _worktree, scope) = fixture();
         std::fs::write(
@@ -935,11 +1540,61 @@ mod tests {
         git(&base, &["commit", "-q", "-m", "move pinned scope"]);
         git(&base, &["switch", "-q", "candidate-head"]);
 
+        server.invalidate_published_knowledge_cache(&scope);
         let err = server.authorize_publisher(&[project], &scope).unwrap_err();
         assert!(
             err.to_string()
                 .contains("committed project scope does not match")
         );
+    }
+
+    #[test]
+    fn missing_pinned_branch_is_invalid_authority_not_transient() {
+        let (_temp, server, base, _worktree, scope) = fixture();
+        let project = server.state.projects.read().list().pop().unwrap();
+        let publisher = server
+            .authorize_publisher(std::slice::from_ref(&project), &scope)
+            .unwrap();
+        let pinned_branch = publisher
+            .branch_ref
+            .strip_prefix("refs/heads/")
+            .unwrap()
+            .to_string();
+        git(&base, &["switch", "-q", "-c", "replacement-publisher"]);
+        git(&base, &["branch", "-D", &pinned_branch]);
+        server.invalidate_published_knowledge_cache(&scope);
+
+        let error = server
+            .authorize_publisher_classified(&[project], &scope)
+            .unwrap_err();
+        assert!(!error.is_transient(), "{error:#}");
+        assert!(error.to_string().contains("does not resolve"), "{error:#}");
+    }
+
+    #[test]
+    fn authority_cache_rejects_insert_from_pre_invalidation_generation() {
+        let scope = PublishedScope {
+            repo_id: "repo-generation".into(),
+            bbox_root_relpath: ".".into(),
+        };
+        let mut cache = PublisherAuthorizationCache::default();
+        let stale_generation = cache.generation(&scope);
+        cache.invalidate(&scope);
+        let inserted = cache.insert_if_generation(
+            scope,
+            stale_generation,
+            PublisherAuthorizationCacheEntry {
+                project_inventory: vec![("project".into(), "/repo".into())],
+                checked_at: Instant::now(),
+                publisher: AuthorizedPublisher {
+                    root: "/repo".into(),
+                    branch_ref: "refs/heads/main".into(),
+                    commit: "a".repeat(40),
+                },
+            },
+        );
+        assert!(!inserted);
+        assert!(cache.is_empty());
     }
 
     #[test]

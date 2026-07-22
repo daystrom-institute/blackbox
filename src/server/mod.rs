@@ -29,6 +29,14 @@ pub(crate) use routes::*;
 pub use run::run;
 pub(crate) use state::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KnowledgeOverlayRefreshOutcome {
+    Converged,
+    PreservedTransient,
+    Invalid,
+    Superseded,
+}
+
 impl BlackboxServer {
     pub(crate) const MCP_RESPONSE_CAP_BYTES: usize = 80 * 1024;
 

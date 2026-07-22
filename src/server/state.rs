@@ -71,14 +71,28 @@ pub(crate) struct SharedState {
     /// Monotonic local migration gate. Once true, path strings remain input
     /// selectors only and can never regain project-scope authority.
     pub(crate) path_fallback_cut: AtomicBool,
-    /// Published committed-tree snapshots. Symbolic refs are rechecked on a
-    /// short TTL and blob maps are rebuilt only when the resolved commit moves.
+    /// Published committed-tree snapshots keyed by the immutable commit
+    /// returned from publisher authorization. A moved ref changes that key,
+    /// while explicit convergence invalidates the affected scope immediately.
     pub(crate) knowledge_published_cache: RwLock<
         BTreeMap<
             bbox_corpus_core::identity::PublishedScope,
             super::knowledge_view::PublishedKnowledgeCacheEntry,
         >,
     >,
+    /// Published gap snapshots use the same immutable-commit cache as
+    /// knowledge so hot read surfaces do not spawn one Git process per file.
+    pub(crate) gap_published_cache: RwLock<
+        BTreeMap<
+            bbox_corpus_core::identity::PublishedScope,
+            super::gap_view::PublishedGapCacheEntry,
+        >,
+    >,
+    /// Successful publisher authority resolutions are memoized briefly.
+    /// The project inventory is part of each cache entry, so registry changes
+    /// bypass the cached decision immediately.
+    pub(crate) publisher_authorization_cache:
+        RwLock<super::knowledge_lifecycle::PublisherAuthorizationCache>,
     pub(crate) packets: RwLock<Packets>,
     /// Generation-validated cache of MCP surface decisions; see
     /// `server::surface::SurfaceDecisionCache`. Keeps the wire head from
@@ -499,6 +513,8 @@ impl SharedState {
             gap_overlay_refresh: Mutex::new(()),
             path_fallback_cut: AtomicBool::new(path_fallback_cut),
             knowledge_published_cache: RwLock::new(BTreeMap::new()),
+            gap_published_cache: RwLock::new(BTreeMap::new()),
+            publisher_authorization_cache: RwLock::new(Default::default()),
             packets: RwLock::new(Packets::open(store_dir).unwrap()),
             surface_decisions: crate::server::surface::SurfaceDecisionCache::default(),
             artifacts: RwLock::new(artifacts::ArtifactCatalog::open(store_dir).unwrap()),

@@ -818,6 +818,17 @@ fn parse_project_config(source: &str) -> Result<ProjectConfig> {
         .map_err(anyhow::Error::from)
 }
 
+/// Parse repo-identity inputs from an already-authorized project config
+/// source. Callers that perform typed Git error handling use this to keep
+/// malformed committed content distinct from transient process failures.
+pub fn repo_id_inputs_from_project_config_source(
+    project_root: &Path,
+    source: &str,
+) -> Result<bbox_corpus_core::identity::RepoIdInputs> {
+    let project = parse_project_config(source)?.project;
+    Ok(repo_id_inputs(project_root, project))
+}
+
 /// Load project configuration from the immutable commit named by `reference`.
 /// Live identity and alias authority must use this reader rather than working
 /// tree bytes.

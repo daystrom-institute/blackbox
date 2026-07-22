@@ -580,7 +580,9 @@ pub fn project_is_repo_owned(project_dir: &Path) -> bool {
 /// stamping each with `project = project_dir` (absent on disk). Top-level
 /// `*.json` only; tolerant skip-and-continue per file.
 fn load_repo_gap_entries(project_dir: &Path) -> Result<Vec<GapNote>> {
-    if bbox_corpus_core::transaction::has_pending_transaction(project_dir) {
+    let git_root = bbox_corpus_core::git::git_root_for_path(project_dir);
+    let transaction_root = git_root.as_deref().unwrap_or(project_dir);
+    if bbox_corpus_core::transaction::has_pending_transaction(transaction_root) {
         tracing::debug!(
             project = %project_dir.display(),
             "gaps load skipped while a repo-owned transaction is pending"
@@ -2148,6 +2150,53 @@ mod tests {
                 .files
                 .iter()
                 .all(|file| { file.relative_path.starts_with("services/api/.bbox/gaps/") })
+        );
+    }
+
+    #[test]
+    fn monorepo_gap_loader_checks_checkout_root_for_pending_transaction() {
+        let root_dir = tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let project = root.join("services/api");
+        let gaps_dir = project.join(".bbox/gaps");
+        fs::create_dir_all(&gaps_dir).unwrap();
+        fs::write(
+            gaps_dir.join("gap-deadbeef.json"),
+            r#"{
+  "id": "gap-deadbeef",
+  "title": "Pending transaction gap",
+  "gap_kind": "tooling",
+  "domain": "test-domain",
+  "wanted_capability": "remain hidden during the transaction",
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/test-domain/pending-transaction",
+  "resolution": "unresolved",
+  "created_at": "2026-07-21T00:00:00Z"
+}"#,
+        )
+        .unwrap();
+        let pending = root.join(".bbox/local/knowledge-transactions/pending.json");
+        fs::create_dir_all(pending.parent().unwrap()).unwrap();
+        fs::write(&pending, "{}\n").unwrap();
+        assert!(
+            !project.join(".bbox/local/knowledge-transactions").exists(),
+            "subproject must use the checkout transaction lane"
+        );
+
+        let central = tempdir().unwrap();
+        let mut store = GapStore::open(&central.path().join("gaps.json")).unwrap();
+        store.set_project_roots(vec![project]).unwrap();
+
+        assert!(
+            !store.all().iter().any(|gap| gap.id == "gap-deadbeef"),
+            "loader must not observe a subproject gap while the checkout transaction is pending"
         );
     }
 
