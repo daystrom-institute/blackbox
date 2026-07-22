@@ -23,7 +23,7 @@ pub(crate) struct DoctorParams {
 impl BlackboxServer {
     #[tool(
         name = "bbox_doctor",
-        description = "Read-only health aggregation across daemon, index, vectors, graph, projects, memories, knowledge, and attention. Findings are classified ok/info/warn/action/blocked with suggested next commands; format=summary (compact text) or json."
+        description = "Read-only health aggregation across daemon, index, code sources, vectors, graph, projects, checkout access, memories, knowledge, and attention. Findings are classified ok/info/warn/action/blocked with suggested next commands; format=summary (compact text) or json (including bounded checkout-access counters)."
     )]
     pub(crate) async fn bbox_doctor(
         &self,

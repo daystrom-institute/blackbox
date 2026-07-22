@@ -5,7 +5,8 @@
 //! emits inbox items.
 //!
 //! v0 ships the substrate-independent sections only: daemon, index,
-//! vectors, graph, projects, memories, knowledge, attention. The
+//! code sources, vectors, graph, projects, checkout access, memories,
+//! knowledge, and attention. The
 //! artifact/inlet/workflow drift sections stay deferred until the bundle
 //! and activator phases land (they need catalog machinery that does not
 //! exist yet).
@@ -113,6 +114,11 @@ impl SectionReport {
 pub(crate) struct DoctorReport {
     pub(crate) status: FindingLevel,
     pub(crate) sections: Vec<SectionReport>,
+    /// Complete path-free checkout observation projection for programmatic
+    /// consumers. The compact summary remains finding-oriented, while JSON
+    /// exposes every closed operation kind and bounded counter dimension.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) checkout_access: Option<bbox_indexing::checkout_access::CheckoutAccessHealth>,
 }
 
 impl DoctorReport {
@@ -122,7 +128,19 @@ impl DoctorReport {
             .map(SectionReport::worst)
             .max()
             .unwrap_or(FindingLevel::Ok);
-        Self { status, sections }
+        Self {
+            status,
+            sections,
+            checkout_access: None,
+        }
+    }
+
+    fn with_checkout_access(
+        mut self,
+        health: bbox_indexing::checkout_access::CheckoutAccessHealth,
+    ) -> Self {
+        self.checkout_access = Some(health);
+        self
     }
 
     /// Compact operator-facing text: status line, then findings grouped
@@ -172,23 +190,27 @@ impl DoctorReport {
 /// path probes are blocking I/O).
 pub(crate) fn run(server: &crate::server::BlackboxServer) -> anyhow::Result<DoctorReport> {
     let state = &server.state;
-    let sections = vec![
+    let mut sections = vec![
         daemon_section(state),
         index_section(state),
         code_sources_section(state),
         vectors_section(state),
         graph_section(server),
         projects_section(state),
-        checkout_access_section(state),
+    ];
+    let checkout_access = state.checkout_access_observations.health();
+    sections.push(checkout_access_section(&checkout_access));
+    sections.extend([
         memories_section(state),
         knowledge_section(state),
         attention_section(state),
-    ];
-    Ok(DoctorReport::from_sections(sections))
+    ]);
+    Ok(DoctorReport::from_sections(sections).with_checkout_access(checkout_access))
 }
 
-fn checkout_access_section(state: &crate::server::state::SharedState) -> SectionReport {
-    let health = state.checkout_access_observations.health();
+fn checkout_access_section(
+    health: &bbox_indexing::checkout_access::CheckoutAccessHealth,
+) -> SectionReport {
     let mut findings = Vec::new();
     if health.sequence == 0 {
         findings.push(Finding::info(
@@ -836,6 +858,130 @@ mod tests {
         serde_json::to_string(&report).expect("report serializes");
         // Renders without panicking and leads with the status line.
         assert!(report.render_summary().starts_with("status: "));
+    }
+
+    #[test]
+    fn checkout_access_json_is_complete_bounded_and_path_free() {
+        use bbox_indexing::checkout_access::{
+            CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest,
+            CheckoutAccessSourceLane, CheckoutAttachmentSelector,
+        };
+
+        crate::init_system_memory_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let project_root = root.join("project");
+        std::fs::create_dir(&project_root).unwrap();
+        let state = std::sync::Arc::new(crate::server::state::SharedState::for_test(&root));
+        let project = state.projects.write().register_path(&project_root).unwrap();
+        let request = |project_id: String, kind| CheckoutAccessRequest {
+            project_id,
+            attachment: CheckoutAttachmentSelector::Selected,
+            expected_scope: None,
+            kind,
+            intent: CheckoutAccessIntent::Read,
+            source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+        };
+        state
+            .checkout_access
+            .acquire(request(
+                project.project_id.clone(),
+                CheckoutAccessKind::LocalProjectWalk,
+            ))
+            .unwrap();
+        state
+            .checkout_access
+            .acquire(request("missing-project".into(), CheckoutAccessKind::Blame))
+            .unwrap_err();
+
+        let server = crate::server::BlackboxServer::new(state);
+        let report = run(&server).unwrap();
+        let health = report.checkout_access.as_ref().unwrap();
+        assert_eq!(health.sequence, 2);
+        assert_eq!(
+            health
+                .operations
+                .iter()
+                .map(|operation| operation.kind)
+                .collect::<Vec<_>>(),
+            CheckoutAccessKind::ALL.to_vec()
+        );
+        let local = health
+            .operations
+            .iter()
+            .find(|operation| operation.kind == CheckoutAccessKind::LocalProjectWalk)
+            .unwrap();
+        assert_eq!(local.granted, 1);
+        assert_eq!(local.denied, 0);
+        assert!(local.last_success_unix_secs.is_some());
+        let blame = health
+            .operations
+            .iter()
+            .find(|operation| operation.kind == CheckoutAccessKind::Blame)
+            .unwrap();
+        assert_eq!(blame.granted, 0);
+        assert_eq!(blame.denied, 1);
+        assert_eq!(blame.last_success_unix_secs, None);
+        assert_eq!(
+            health.active_compatibility_lanes,
+            vec![CheckoutAccessSourceLane::LegacyProjectRecord]
+        );
+        assert!(
+            health.counters.len()
+                <= CheckoutAccessKind::ALL.len() * CheckoutAccessSourceLane::ALL.len() * 2
+        );
+
+        let projection = serde_json::to_value(health).unwrap();
+        let allowed_counter_fields = std::collections::BTreeSet::from([
+            "kind",
+            "source_lane",
+            "outcome",
+            "count",
+            "last_sequence",
+            "last_unix_secs",
+        ]);
+        for counter in projection["counters"].as_array().unwrap() {
+            assert_eq!(
+                counter
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<std::collections::BTreeSet<_>>(),
+                allowed_counter_fields
+            );
+        }
+        let serialized = serde_json::to_string(&projection).unwrap();
+        assert!(!serialized.contains(root.to_string_lossy().as_ref()));
+        assert!(!serialized.contains(&project.project_id));
+        assert!(!serialized.contains("missing-project"));
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["checkout_access"],
+            projection
+        );
+
+        let checkout_section = report
+            .sections
+            .iter()
+            .find(|section| section.section == "checkout_access")
+            .unwrap();
+        assert!(
+            checkout_section
+                .findings
+                .iter()
+                .any(|finding| finding.message.contains("1 granted, 0 denied"))
+        );
+        assert!(
+            checkout_section
+                .findings
+                .iter()
+                .any(|finding| finding.message.contains("0 granted, 1 denied"))
+        );
+        assert!(checkout_section.findings.iter().any(|finding| {
+            finding
+                .message
+                .contains("active checkout compatibility lanes: legacy_project_record")
+        }));
     }
 
     #[test]
