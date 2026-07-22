@@ -1,4 +1,5 @@
 mod background;
+pub(crate) mod checkout_access;
 pub(crate) mod code_source;
 pub mod dispatch;
 mod gap_view;

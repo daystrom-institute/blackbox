@@ -57,7 +57,7 @@ pub(crate) struct SharedState {
     pub(crate) projects: Arc<RwLock<ProjectRegistry>>,
     pub(crate) projects_persister: StorePersister<ProjectRegistry>,
     /// Host-local discovery index for scope-aware checkout overlays.
-    pub(crate) checkout_registry: RwLock<bbox_indexing::checkout_registry::CheckoutRegistry>,
+    pub(crate) checkout_registry: Arc<RwLock<bbox_indexing::checkout_registry::CheckoutRegistry>>,
     /// Bounded, path-free evidence for every checkout lease acquisition and
     /// denial. Broker instances share this handle while authority adapters
     /// remain owned by the consumer being migrated.
@@ -533,12 +533,12 @@ impl SharedState {
             pins_persister,
             projects: projects_store,
             projects_persister,
-            checkout_registry: RwLock::new(
+            checkout_registry: Arc::new(RwLock::new(
                 bbox_indexing::checkout_registry::CheckoutRegistry::open(
                     &store_dir.join("checkout-registry.json"),
                 )
                 .unwrap(),
-            ),
+            )),
             checkout_access_observations:
                 bbox_indexing::checkout_access::CheckoutAccessObservations::open(
                     store_dir.join("checkout-access-observations.json"),
