@@ -20,7 +20,10 @@ pub(crate) fn extra_providers() -> Vec<Box<dyn InspectableEntityProvider>> {
 mod tests {
     use std::fs;
 
-    use crate::mcp_tools::ref_size::{RefSizeParams, ref_size};
+    use crate::mcp_tools::ref_size::{
+        FileInputResolution, RefSizeParams, ValidatedFileInput, ValidatedFileInputs, ref_size,
+        ref_size_with_validated_files,
+    };
     use crate::providers::{ProviderContext, all_providers, provider_for};
 
     use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
@@ -126,12 +129,19 @@ mod tests {
             .register_path(project.path())
             .unwrap();
         let ctx = crate::providers::ProviderContext::new_with_ext(stores.corpus_stores(), &stores);
-        let out = ref_size(
+        let files = ValidatedFileInputs::from([(
+            "docs/design.md".into(),
+            FileInputResolution::Validated(ValidatedFileInput {
+                file_path: file_path.clone(),
+            }),
+        )]);
+        let out = ref_size_with_validated_files(
             &RefSizeParams {
                 refs: vec!["file:docs/design.md".into()],
                 project_dir: None,
             },
             &ctx,
+            &files,
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -143,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn file_ref_project_dir_resolves_worktree_only_file() {
+    fn file_ref_uses_only_caller_validated_worktree_file() {
         let store = tempfile::tempdir().unwrap();
         let registered = tempfile::tempdir().unwrap();
         let worktree = tempfile::tempdir().unwrap();
@@ -159,12 +169,19 @@ mod tests {
             .register_path(registered.path())
             .unwrap();
         let ctx = crate::providers::ProviderContext::new_with_ext(stores.corpus_stores(), &stores);
-        let out = ref_size(
+        let files = ValidatedFileInputs::from([(
+            "scripts/guard.py".into(),
+            FileInputResolution::Validated(ValidatedFileInput {
+                file_path: worktree.path().join("scripts/guard.py"),
+            }),
+        )]);
+        let out = ref_size_with_validated_files(
             &RefSizeParams {
                 refs: vec!["file:scripts/guard.py".into()],
                 project_dir: Some(worktree.path().to_string_lossy().into_owned()),
             },
             &ctx,
+            &files,
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();

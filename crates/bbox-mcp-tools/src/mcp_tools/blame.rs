@@ -8,7 +8,6 @@ use serde_json::json;
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_core::git::GitBlameLine;
 use bbox_edge_index::edge_index::{Edge, EdgeIndex};
-use bbox_indexing::projects::ProjectRecord;
 use bbox_providers::entity_loader;
 use bbox_providers::providers::ProviderContext;
 
@@ -22,17 +21,94 @@ pub struct BlameParams {
     pub entity_ref: Option<String>,
 }
 
-pub fn blame(
-    p: &BlameParams,
-    ctx: &ProviderContext<'_>,
-    edge_index: &EdgeIndex,
-    projects: &[ProjectRecord],
-) -> Result<String> {
-    let target = match resolve_target(p, ctx, projects) {
-        Ok(target) => target,
-        Err(err) => return Ok(bad_input(err.to_string())),
+/// Corpus identity and an untrusted indexed path hint extracted from caller
+/// input. The daemon resolves the hint through checkout authority before
+/// calling `blame`.
+#[derive(Debug, Clone)]
+pub enum BlameTargetIdentity {
+    ProjectFile {
+        project_id: String,
+        indexed_path_hint: PathBuf,
+        line: Option<u64>,
+        byte_offset: u64,
+    },
+    File {
+        input_path: String,
+        line: u64,
+    },
+}
+
+/// Caller-supplied file path produced by a validated checkout lease. The
+/// caller retains that lease for the complete blame operation.
+#[derive(Debug, Clone)]
+pub struct ValidatedBlameTarget {
+    pub file_path: PathBuf,
+    pub display_path: String,
+    pub line: Option<u64>,
+    pub byte_offset: Option<u64>,
+}
+
+pub fn target_identity(p: &BlameParams, ctx: &ProviderContext<'_>) -> Result<BlameTargetIdentity> {
+    if let Some(entity_ref) = p
+        .entity_ref
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let r = EntityRef::parse(entity_ref)?;
+        let project_id = match &r {
+            EntityRef::ProjectFile { project_id, .. }
+            | EntityRef::ProjectFileV2 { project_id, .. } => project_id.clone(),
+            _ => bail!("entity_ref must be a project_file ref"),
+        };
+        let entity = entity_loader::load(ctx, &r)
+            .with_context(|| format!("loading project_file entity {entity_ref}"))?;
+        let indexed_path_hint = entity
+            .properties
+            .get("file_path")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("project_file entity has no file_path property"))?;
+        let byte_offset = entity
+            .properties
+            .get("byte_offset")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_default();
+        return Ok(BlameTargetIdentity::ProjectFile {
+            project_id,
+            indexed_path_hint,
+            line: p.line,
+            byte_offset,
+        });
+    }
+
+    let input_path = p
+        .file
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("provide either entity_ref or file+line"))?
+        .to_string();
+    let line = p
+        .line
+        .ok_or_else(|| anyhow::anyhow!("line is required when file is provided"))?;
+    Ok(BlameTargetIdentity::File { input_path, line })
+}
+
+pub fn blame(target: ValidatedBlameTarget, edge_index: &EdgeIndex) -> Result<String> {
+    let line = match target.line {
+        Some(line) => line,
+        None => line_for_byte_offset(&target.file_path, target.byte_offset.unwrap_or_default())?,
     };
-    let Some(blame) = bbox_corpus_core::git::blame_for_line(&target.file_path, target.line)? else {
+    let target = BlameTarget {
+        file_path: target.file_path,
+        display_path: target.display_path,
+        line,
+    };
+    let blame =
+        bbox_corpus_core::git::blame_for_line(&target.file_path, target.line).map_err(|_| {
+            anyhow::anyhow!(
+                "error.checkout_io_failed: git blame could not read the validated checkout file"
+            )
+        })?;
+    let Some(blame) = blame else {
         return Ok(serde_json::to_string_pretty(&json!({
             "status": "error.not_found",
             "error": {
@@ -95,89 +171,12 @@ struct BlameTarget {
     line: u64,
 }
 
-fn resolve_target(
-    p: &BlameParams,
-    ctx: &ProviderContext<'_>,
-    projects: &[ProjectRecord],
-) -> Result<BlameTarget> {
-    if let Some(entity_ref) = p
-        .entity_ref
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        let r = EntityRef::parse(entity_ref)?;
-        if !matches!(
-            r,
-            EntityRef::ProjectFile { .. } | EntityRef::ProjectFileV2 { .. }
-        ) {
-            bail!("entity_ref must be a project_file ref");
-        }
-        let entity = entity_loader::load(ctx, &r)
-            .with_context(|| format!("loading project_file entity {entity_ref}"))?;
-        let file_path = entity
-            .properties
-            .get("file_path")
-            .ok_or_else(|| anyhow::anyhow!("project_file entity has no file_path property"))?;
-        let file_path = PathBuf::from(file_path);
-        let line = match p.line {
-            Some(line) => line,
-            None => {
-                let byte_offset = entity
-                    .properties
-                    .get("byte_offset")
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .unwrap_or_default();
-                line_for_byte_offset(&file_path, byte_offset)?
-            }
-        };
-        return Ok(BlameTarget {
-            display_path: display_path(&file_path, projects),
-            file_path,
-            line,
-        });
-    }
-
-    let file = p
-        .file
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("provide either entity_ref or file+line"))?;
-    let line = p
-        .line
-        .ok_or_else(|| anyhow::anyhow!("line is required when file is provided"))?;
-    Ok(BlameTarget {
-        file_path: resolve_file(file, projects)?,
-        display_path: file.to_string(),
-        line,
-    })
-}
-
-fn resolve_file(file: &str, projects: &[ProjectRecord]) -> Result<PathBuf> {
-    let input = Path::new(file);
-    if input.is_absolute() {
-        return Ok(std::fs::canonicalize(input)?);
-    }
-    for project in projects {
-        let candidate = Path::new(&project.canonical_path).join(input);
-        if candidate.exists() {
-            return Ok(std::fs::canonicalize(candidate)?);
-        }
-    }
-    Ok(std::fs::canonicalize(input)?)
-}
-
-fn display_path(path: &Path, projects: &[ProjectRecord]) -> String {
-    for project in projects {
-        let root = Path::new(&project.canonical_path);
-        if let Ok(rel) = path.strip_prefix(root) {
-            return rel.to_string_lossy().to_string();
-        }
-    }
-    path.to_string_lossy().to_string()
-}
-
 fn line_for_byte_offset(path: &Path, byte_offset: u64) -> Result<u64> {
-    let bytes = std::fs::read(path)?;
+    let bytes = std::fs::read(path).map_err(|_| {
+        anyhow::anyhow!(
+            "error.checkout_io_failed: validated checkout file could not be read for line resolution"
+        )
+    })?;
     let upto = (byte_offset as usize).min(bytes.len());
     Ok(bytes[..upto].iter().filter(|byte| **byte == b'\n').count() as u64 + 1)
 }
@@ -367,7 +366,7 @@ fn render_read(edge: &&Edge) -> serde_json::Value {
     })
 }
 
-fn bad_input(message: String) -> String {
+pub fn bad_input(message: String) -> String {
     json!({
         "status": "error.bad_input",
         "error": {

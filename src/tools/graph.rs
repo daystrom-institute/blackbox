@@ -1,3 +1,16 @@
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
+
+use anyhow::{Result, anyhow, bail};
+use bbox_corpus_core::identity::PublishedScope;
+use bbox_corpus_core::project_record::{ProjectRecord, ResolvedCheckoutScope};
+use bbox_indexing::checkout_access::{
+    CheckoutAccessBroker, CheckoutAccessError, CheckoutAccessIntent, CheckoutAccessKind,
+    CheckoutAccessRequest, CheckoutAccessSourceLane, CheckoutAttachmentSelector,
+    ValidatedCheckoutLease,
+};
+use bbox_indexing::checkout_registry::CheckoutRow;
+
 use crate::mcp_tools;
 use crate::mcp_tools::blame::BlameParams;
 use crate::mcp_tools::bundle_evidence::BundleEvidenceParams;
@@ -18,6 +31,415 @@ use rmcp::schemars;
 use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+
+const REF_SIZE_CAP: usize = 500;
+
+#[derive(Debug, Clone)]
+struct CheckoutFileSelection {
+    project: ProjectRecord,
+    attachment: CheckoutAttachmentSelector,
+    expected_scope: Option<PublishedScope>,
+    source_lane: CheckoutAccessSourceLane,
+    relative_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct AcquiredCheckoutFile {
+    #[allow(dead_code)]
+    lease: ValidatedCheckoutLease,
+    file_path: PathBuf,
+    relative_path: String,
+}
+
+fn checkout_access_error(error: CheckoutAccessError) -> anyhow::Error {
+    anyhow!(
+        "error.checkout_access.{}: {}",
+        error.code.as_str(),
+        error.diagnostic
+    )
+}
+
+fn acquire_selected_operation(
+    broker: &CheckoutAccessBroker,
+    project_id: &str,
+    kind: CheckoutAccessKind,
+    intent: CheckoutAccessIntent,
+) -> Result<ValidatedCheckoutLease> {
+    let discovery = acquire_scope_discovery(broker, project_id)?;
+    let expected_scope = discovery.published_scope().cloned();
+    let lease = broker
+        .acquire(CheckoutAccessRequest {
+            project_id: project_id.to_string(),
+            attachment: CheckoutAttachmentSelector::Selected,
+            expected_scope,
+            kind,
+            intent,
+            source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+        })
+        .map_err(checkout_access_error)?;
+    drop(discovery);
+    Ok(lease)
+}
+
+fn acquire_scope_discovery(
+    broker: &CheckoutAccessBroker,
+    project_id: &str,
+) -> Result<ValidatedCheckoutLease> {
+    broker
+        .acquire(CheckoutAccessRequest {
+            project_id: project_id.to_string(),
+            attachment: CheckoutAttachmentSelector::Selected,
+            expected_scope: None,
+            kind: CheckoutAccessKind::PublisherConfigTreeRead,
+            intent: CheckoutAccessIntent::Read,
+            source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+        })
+        .map_err(checkout_access_error)
+}
+
+fn unique_project(projects: &[ProjectRecord], project_id: &str) -> Result<ProjectRecord> {
+    let mut matches = projects
+        .iter()
+        .filter(|project| project.project_id == project_id);
+    let project = matches.next().cloned().ok_or_else(|| {
+        anyhow!("error.project_not_registered: requested project id is not registered")
+    })?;
+    if matches.next().is_some() {
+        bail!("error.project_ambiguous: requested project id is not unique");
+    }
+    Ok(project)
+}
+
+fn safe_scope_root(checkout_root: &Path, scope: &PublishedScope) -> Result<PathBuf> {
+    if scope.bbox_root_relpath == "." {
+        return Ok(checkout_root.to_path_buf());
+    }
+    let relative = Path::new(&scope.bbox_root_relpath);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("error.checkout_scope_invalid: project scope has an unsafe relative root");
+    }
+    Ok(checkout_root.join(relative))
+}
+
+fn selected_file_selection(
+    project: ProjectRecord,
+    relative_path: PathBuf,
+) -> CheckoutFileSelection {
+    CheckoutFileSelection {
+        expected_scope: None,
+        project,
+        attachment: CheckoutAttachmentSelector::Selected,
+        source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+        relative_path,
+    }
+}
+
+fn checkout_file_selection(
+    project: ProjectRecord,
+    scope: PublishedScope,
+    checkout_id: String,
+    relative_path: PathBuf,
+) -> CheckoutFileSelection {
+    CheckoutFileSelection {
+        project,
+        attachment: CheckoutAttachmentSelector::CheckoutId(checkout_id),
+        expected_scope: Some(scope),
+        source_lane: CheckoutAccessSourceLane::LegacyCheckoutRegistry,
+        relative_path,
+    }
+}
+
+fn relative_under(root: &Path, input: &Path) -> Result<PathBuf> {
+    let relative = input.strip_prefix(root).map_err(|_| {
+        anyhow!("error.checkout_path_mismatch: file is outside the selected project scope")
+    })?;
+    if relative.as_os_str().is_empty() {
+        bail!("error.checkout_path_invalid: file path must name an entry below the project root");
+    }
+    Ok(relative.to_path_buf())
+}
+
+fn lexical_absolute_selection(
+    broker: &CheckoutAccessBroker,
+    input: &Path,
+    projects: &[ProjectRecord],
+    rows: &[CheckoutRow],
+    root_only: bool,
+) -> Result<CheckoutFileSelection> {
+    if !input.is_absolute()
+        || input
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        bail!(
+            "error.checkout_path_invalid: selector must be an absolute lexical path without parent traversal"
+        );
+    }
+
+    let mut candidates = Vec::<(usize, bool, CheckoutFileSelection)>::new();
+    let mut discovered_scopes = HashMap::<String, Option<PublishedScope>>::new();
+    for project in projects {
+        let root = Path::new(&project.canonical_path);
+        let Ok(relative) = input.strip_prefix(root) else {
+            continue;
+        };
+        if root_only != relative.as_os_str().is_empty() {
+            continue;
+        }
+        candidates.push((
+            root.components().count(),
+            false,
+            selected_file_selection(project.clone(), relative.to_path_buf()),
+        ));
+    }
+    for row in rows {
+        let Some(scope) = row.published_scope() else {
+            continue;
+        };
+        let root = safe_scope_root(Path::new(&row.checkout_dir), &scope)?;
+        let Ok(relative) = input.strip_prefix(&root) else {
+            continue;
+        };
+        if root_only != relative.as_os_str().is_empty() {
+            continue;
+        }
+        for project in projects {
+            if !discovered_scopes.contains_key(&project.project_id) {
+                let discovery = acquire_scope_discovery(broker, &project.project_id)?;
+                discovered_scopes.insert(
+                    project.project_id.clone(),
+                    discovery.published_scope().cloned(),
+                );
+                drop(discovery);
+            }
+            if !discovered_scopes
+                .get(&project.project_id)
+                .is_some_and(|discovered| discovered.as_ref() == Some(&scope))
+            {
+                continue;
+            }
+            candidates.push((
+                root.components().count(),
+                true,
+                checkout_file_selection(
+                    project.clone(),
+                    scope.clone(),
+                    row.checkout_id.clone(),
+                    relative.to_path_buf(),
+                ),
+            ));
+        }
+    }
+
+    let deepest = candidates
+        .iter()
+        .map(|(depth, _, _)| *depth)
+        .max()
+        .ok_or_else(|| {
+            anyhow!(
+                "error.checkout_attachment_not_found: selector is not in an exact registered project or checkout root"
+            )
+        })?;
+    candidates.retain(|(depth, _, _)| *depth == deepest);
+    if candidates.iter().any(|(_, checkout, _)| *checkout) {
+        candidates.retain(|(_, checkout, _)| *checkout);
+    }
+    if candidates.len() != 1 {
+        bail!(
+            "error.checkout_attachment_ambiguous: selector matches more than one project attachment"
+        );
+    }
+    Ok(candidates.pop().expect("one candidate").2)
+}
+
+fn absolute_file_selection(
+    broker: &CheckoutAccessBroker,
+    input: &Path,
+    projects: &[ProjectRecord],
+    rows: &[CheckoutRow],
+) -> Result<CheckoutFileSelection> {
+    lexical_absolute_selection(broker, input, projects, rows, false)
+}
+
+fn relative_file_selection(
+    broker: &CheckoutAccessBroker,
+    relative: &Path,
+    project_dir: Option<&str>,
+    session_checkout: Option<&ResolvedCheckoutScope>,
+    projects: &[ProjectRecord],
+    rows: &[CheckoutRow],
+) -> Result<CheckoutFileSelection> {
+    if relative.is_absolute() || relative.as_os_str().is_empty() {
+        bail!("error.checkout_path_invalid: expected a non-empty relative file path");
+    }
+    if let Some(project_dir) = project_dir {
+        let selector = Path::new(project_dir);
+        let mut selection = lexical_absolute_selection(broker, selector, projects, rows, true)?;
+        selection.relative_path = relative.to_path_buf();
+        return Ok(selection);
+    }
+
+    if let Some(session) = session_checkout {
+        let project = unique_project(projects, &session.project_id)?;
+        return Ok(checkout_file_selection(
+            project,
+            session.published_scope.clone(),
+            session.checkout_id.clone(),
+            relative.to_path_buf(),
+        ));
+    }
+
+    match projects {
+        [project] => Ok(selected_file_selection(
+            project.clone(),
+            relative.to_path_buf(),
+        )),
+        [] => bail!("error.project_not_registered: no registered project can resolve the file"),
+        _ => bail!(
+            "error.project_ambiguous: relative file requires project_dir or authoritative session checkout"
+        ),
+    }
+}
+
+fn acquire_file_selection(
+    broker: &CheckoutAccessBroker,
+    selection: CheckoutFileSelection,
+    kind: CheckoutAccessKind,
+    intent: CheckoutAccessIntent,
+) -> Result<AcquiredCheckoutFile> {
+    let project_id = selection.project.project_id;
+    let lease = if selection.attachment == CheckoutAttachmentSelector::Selected {
+        acquire_selected_operation(broker, &project_id, kind, intent)?
+    } else {
+        broker
+            .acquire(CheckoutAccessRequest {
+                project_id,
+                attachment: selection.attachment,
+                expected_scope: selection.expected_scope,
+                kind,
+                intent,
+                source_lane: selection.source_lane,
+            })
+            .map_err(checkout_access_error)?
+    };
+    let file_path = lease
+        .resolve_existing(&selection.relative_path)
+        .map_err(checkout_access_error)?;
+    if !file_path.is_file() {
+        bail!("error.checkout_path_invalid: validated checkout entry is not a file");
+    }
+    Ok(AcquiredCheckoutFile {
+        lease,
+        file_path,
+        relative_path: selection.relative_path.to_string_lossy().into_owned(),
+    })
+}
+
+fn file_selection(
+    broker: &CheckoutAccessBroker,
+    input: &str,
+    project_dir: Option<&str>,
+    session_checkout: Option<&ResolvedCheckoutScope>,
+    projects: &[ProjectRecord],
+    rows: &[CheckoutRow],
+) -> Result<CheckoutFileSelection> {
+    let path = Path::new(input);
+    if path.is_absolute() {
+        absolute_file_selection(broker, path, projects, rows)
+    } else {
+        relative_file_selection(broker, path, project_dir, session_checkout, projects, rows)
+    }
+}
+
+fn acquire_project_file(
+    broker: &CheckoutAccessBroker,
+    project_id: &str,
+    indexed_path_hint: &Path,
+    projects: &[ProjectRecord],
+) -> Result<AcquiredCheckoutFile> {
+    let project = unique_project(projects, project_id)?;
+    let lease = acquire_selected_operation(
+        broker,
+        &project.project_id,
+        CheckoutAccessKind::Blame,
+        CheckoutAccessIntent::Read,
+    )?;
+    let relative = if indexed_path_hint.is_absolute() {
+        indexed_path_hint
+            .strip_prefix(Path::new(&project.canonical_path))
+            .map(Path::to_path_buf)
+            .map_err(|_| {
+                anyhow!(
+                    "error.indexed_path_mismatch: project_file path hint does not belong to its project"
+                )
+            })?
+    } else {
+        indexed_path_hint.to_path_buf()
+    };
+    if relative.as_os_str().is_empty() {
+        bail!("error.indexed_path_invalid: project_file path hint does not name a file");
+    }
+    let file_path = lease
+        .resolve_existing(&relative)
+        .map_err(checkout_access_error)?;
+    if !file_path.is_file() {
+        bail!("error.checkout_path_invalid: validated checkout entry is not a file");
+    }
+    Ok(AcquiredCheckoutFile {
+        lease,
+        file_path,
+        relative_path: relative.to_string_lossy().into_owned(),
+    })
+}
+
+fn requested_provenance_projects(
+    params: &ProvenanceParams,
+    projects: &[ProjectRecord],
+) -> Result<Vec<ProjectRecord>> {
+    if let Some(project_id) = params.project_id.as_deref() {
+        return Ok(vec![unique_project(projects, project_id)?]);
+    }
+    let mut seen = HashSet::new();
+    for project in projects {
+        if !seen.insert(project.project_id.as_str()) {
+            bail!("error.project_ambiguous: registered project ids are not unique");
+        }
+    }
+    Ok(projects.to_vec())
+}
+
+fn acquire_provenance_projects(
+    broker: &CheckoutAccessBroker,
+    params: &ProvenanceParams,
+    projects: &[ProjectRecord],
+    intent: CheckoutAccessIntent,
+) -> Result<(
+    Vec<ValidatedCheckoutLease>,
+    Vec<mcp_tools::provenance::ProvenanceProject>,
+)> {
+    let requested = requested_provenance_projects(params, projects)?;
+    let mut leases = Vec::with_capacity(requested.len());
+    let mut inputs = Vec::with_capacity(requested.len());
+    for project in requested {
+        let lease = acquire_selected_operation(
+            broker,
+            &project.project_id,
+            CheckoutAccessKind::ProvenanceNoteIo,
+            intent,
+        )?;
+        inputs.push(mcp_tools::provenance::ProvenanceProject {
+            project_id: project.project_id,
+            project_root: lease.project_root().to_path_buf(),
+        });
+        leases.push(lease);
+    }
+    Ok((leases, inputs))
+}
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::graph_tools()
@@ -190,7 +612,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_ref_size",
-        description = "Measure the byte payload size of entity refs. file refs resolve against optional project_dir first, then registered project file content; project_file and project_file_v2 refs resolve to full indexed chunk content; other refs resolve through entity providers and measure serialized provider-properties JSON. Accepts up to 500 refs; successful refs are canonicalized and unresolved/omitted refs are reported under degraded."
+        description = "Measure the byte payload size of entity refs. file refs resolve through a validated current checkout attachment selected by exact project_dir, authoritative session checkout, or an unambiguous registered project; project_file and project_file_v2 refs resolve to full indexed chunk content without checkout access; other refs resolve through entity providers and measure serialized provider-properties JSON. Accepts up to 500 refs; successful refs are canonicalized and unresolved/omitted refs are reported under degraded."
     )]
     pub(crate) async fn bbox_ref_size(
         &self,
@@ -198,13 +620,74 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_ref_size", move || {
+            let projects = server.state.projects.read().list();
+            let checkout_rows = server.state.checkout_registry.read().rows().to_vec();
+            let session_checkout = server.authoritative_session_checkout();
+            let broker = crate::server::checkout_access::checkout_access_broker(&server.state);
+            let mut acquired_files = Vec::new();
+            let mut validated_files = HashMap::new();
+            for raw in p.refs.iter().take(REF_SIZE_CAP) {
+                let Ok(entity_ref::EntityRef::File { path }) = entity_ref::EntityRef::parse(raw)
+                else {
+                    continue;
+                };
+                if validated_files.contains_key(&path) {
+                    continue;
+                }
+                let resolved = file_selection(
+                    &broker,
+                    &path,
+                    p.project_dir.as_deref(),
+                    session_checkout.as_deref(),
+                    &projects,
+                    &checkout_rows,
+                )
+                .and_then(|selection| {
+                    acquire_file_selection(
+                        &broker,
+                        selection,
+                        CheckoutAccessKind::RenderFileProvider,
+                        CheckoutAccessIntent::Read,
+                    )
+                });
+                match resolved {
+                    Ok(acquired) => {
+                        validated_files.insert(
+                            path,
+                            mcp_tools::ref_size::FileInputResolution::Validated(
+                                mcp_tools::ref_size::ValidatedFileInput {
+                                    file_path: acquired.file_path.clone(),
+                                },
+                            ),
+                        );
+                        acquired_files.push(acquired);
+                    }
+                    Err(error) => {
+                        validated_files.insert(
+                            path,
+                            mcp_tools::ref_size::FileInputResolution::Rejected(error.to_string()),
+                        );
+                    }
+                }
+            }
             let read_view = server.state.code_read_view.read().clone();
             let edge_index = read_view.edge_index.as_ref();
             let provider_ctx =
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
                     .with_edge_index(edge_index)
                     .with_searcher(&read_view.searcher);
-            mcp_tools::ref_size::ref_size(&p, &provider_ctx)
+            let output = mcp_tools::ref_size::ref_size_with_validated_files(
+                &p,
+                &provider_ctx,
+                &validated_files,
+            )?;
+            for acquired in &acquired_files {
+                broker
+                    .revalidate(&acquired.lease)
+                    .map_err(checkout_access_error)?;
+            }
+            drop(acquired_files);
+            Ok(output)
         })
         .await
     }
@@ -252,7 +735,55 @@ impl BlackboxServer {
                     .with_edge_index(edge_index)
                     .with_searcher(&read_view.searcher);
             let projects = server.state.projects.read().list();
-            mcp_tools::blame::blame(&p, &provider_ctx, edge_index, &projects)
+            let target = match mcp_tools::blame::target_identity(&p, &provider_ctx) {
+                Ok(target) => target,
+                Err(error) => return Ok(mcp_tools::blame::bad_input(error.to_string())),
+            };
+            let broker = crate::server::checkout_access::checkout_access_broker(&server.state);
+            let acquired = match target {
+                mcp_tools::blame::BlameTargetIdentity::ProjectFile {
+                    project_id,
+                    indexed_path_hint,
+                    line,
+                    byte_offset,
+                } => {
+                    let acquired =
+                        acquire_project_file(&broker, &project_id, &indexed_path_hint, &projects)?;
+                    (acquired, line, Some(byte_offset))
+                }
+                mcp_tools::blame::BlameTargetIdentity::File { input_path, line } => {
+                    let checkout_rows = server.state.checkout_registry.read().rows().to_vec();
+                    let selection = file_selection(
+                        &broker,
+                        &input_path,
+                        None,
+                        server.authoritative_session_checkout().as_deref(),
+                        &projects,
+                        &checkout_rows,
+                    )?;
+                    let acquired = acquire_file_selection(
+                        &broker,
+                        selection,
+                        CheckoutAccessKind::Blame,
+                        CheckoutAccessIntent::Read,
+                    )?;
+                    (acquired, Some(line), None)
+                }
+            };
+            let (acquired, line, byte_offset) = acquired;
+            let output = mcp_tools::blame::blame(
+                mcp_tools::blame::ValidatedBlameTarget {
+                    file_path: acquired.file_path.clone(),
+                    display_path: acquired.relative_path.clone(),
+                    line,
+                    byte_offset,
+                },
+                edge_index,
+            )?;
+            broker
+                .revalidate(&acquired.lease)
+                .map_err(checkout_access_error)?;
+            Ok(output)
         })
         .await
     }
@@ -268,8 +799,17 @@ impl BlackboxServer {
         let server = self.clone();
         Self::run_blocking("bbox_provenance_export", move || {
             let projects = server.state.projects.read().list();
+            let broker = crate::server::checkout_access::checkout_access_broker(&server.state);
+            let (leases, inputs) =
+                acquire_provenance_projects(&broker, &p, &projects, CheckoutAccessIntent::Write)?;
             let read_view = server.state.code_read_view.read().clone();
-            mcp_tools::provenance::export_provenance(&p, read_view.edge_index.as_ref(), &projects)
+            let output =
+                mcp_tools::provenance::export_provenance(read_view.edge_index.as_ref(), &inputs)?;
+            for lease in &leases {
+                broker.revalidate(lease).map_err(checkout_access_error)?;
+            }
+            drop(leases);
+            Ok(output)
         })
         .await
     }
@@ -335,9 +875,32 @@ impl BlackboxServer {
         let server = self.clone();
         Self::run_blocking("bbox_provenance_import", move || {
             let projects = server.state.projects.read().list();
+            let broker = crate::server::checkout_access::checkout_access_broker(&server.state);
+            let (leases, inputs) =
+                acquire_provenance_projects(&broker, &p, &projects, CheckoutAccessIntent::Read)?;
             let edges_dir = edge_index::edges_dir_from_bro_store(&server.state.store_dir);
-            let edges_imported =
-                mcp_tools::provenance::import_provenance_to_edges_dir(&p, &projects, &edges_dir)?;
+            let resolve_legacy_target =
+                |project_id: &str,
+                 root: &Path,
+                 absolute_path: &Path,
+                 byte_range: Option<(u64, u64)>| {
+                    let project = unique_project(&projects, project_id)?;
+                    bbox_indexing::index::resolve_current_project_chunk_entity(
+                        &project,
+                        root,
+                        absolute_path,
+                        byte_range,
+                    )
+                };
+            let edges_imported = mcp_tools::provenance::import_provenance_to_edges_dir(
+                &inputs,
+                &edges_dir,
+                &resolve_legacy_target,
+            )?;
+            for lease in &leases {
+                broker.revalidate(lease).map_err(checkout_access_error)?;
+            }
+            drop(leases);
             server.rebuild_edge_index_from_stores();
             Ok(serde_json::to_string_pretty(&json!({
                 "status": "ok",
@@ -354,7 +917,14 @@ mod tests {
     use super::*;
     use crate::artifacts;
     use crate::server::state::SharedState;
+    use bbox_indexing::checkout_access::{
+        CheckoutAccessAuthority, CheckoutAccessCandidate, CheckoutAccessError,
+        CheckoutAccessObservations, CheckoutAttachmentStatus, DenyCheckoutAccess,
+    };
+    use std::collections::{BTreeSet, HashMap};
     use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(&tmp.path().join("bro"))))
@@ -363,6 +933,337 @@ mod tests {
     fn extract_text(result: &CallToolResult) -> String {
         let wire = serde_json::to_value(result).unwrap();
         wire["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    #[derive(Clone)]
+    struct RecordingAuthority {
+        roots: Arc<HashMap<String, PathBuf>>,
+        published_scopes: Arc<HashMap<String, PublishedScope>>,
+        requests: Arc<Mutex<Vec<CheckoutAccessRequest>>>,
+        resolves: Arc<AtomicUsize>,
+    }
+
+    impl CheckoutAccessAuthority for RecordingAuthority {
+        fn resolve(
+            &self,
+            request: &CheckoutAccessRequest,
+        ) -> std::result::Result<CheckoutAccessCandidate, CheckoutAccessError> {
+            self.resolves.fetch_add(1, Ordering::SeqCst);
+            self.requests.lock().unwrap().push(request.clone());
+            let root = self
+                .roots
+                .get(&request.project_id)
+                .cloned()
+                .ok_or_else(|| {
+                    CheckoutAccessError::new(
+                        bbox_indexing::checkout_access::CheckoutAccessErrorCode::AttachmentNotFound,
+                        "test project has no attachment",
+                    )
+                })?;
+            let checkout_id = match &request.attachment {
+                CheckoutAttachmentSelector::CheckoutId(checkout_id) => checkout_id.clone(),
+                _ => format!("selected-{}", request.project_id),
+            };
+            Ok(CheckoutAccessCandidate {
+                project_id: request.project_id.clone(),
+                attachment_id: format!("attachment-{}", request.project_id),
+                checkout_id,
+                published_scope: self
+                    .published_scopes
+                    .get(&request.project_id)
+                    .cloned()
+                    .or_else(|| request.expected_scope.clone()),
+                checkout_root: root.clone(),
+                project_root: root,
+                status: CheckoutAttachmentStatus::Active,
+                capabilities: BTreeSet::from([request.kind]),
+            })
+        }
+
+        fn revalidate_conservative_path_gate(
+            &self,
+            _request: &CheckoutAccessRequest,
+            _candidate: &CheckoutAccessCandidate,
+        ) -> std::result::Result<(), CheckoutAccessError> {
+            Ok(())
+        }
+    }
+
+    fn test_record(root: &Path, project_id: &str) -> ProjectRecord {
+        ProjectRecord {
+            project_id: project_id.into(),
+            repo_id: None,
+            canonical_path: root.to_string_lossy().into_owned(),
+            registered_at: "2026-07-22T00:00:00Z".into(),
+            is_git_repo: false,
+            languages: BTreeSet::new(),
+            aliases: BTreeSet::new(),
+        }
+    }
+
+    fn recording_broker(
+        roots: HashMap<String, PathBuf>,
+    ) -> (
+        CheckoutAccessBroker,
+        Arc<Mutex<Vec<CheckoutAccessRequest>>>,
+        Arc<AtomicUsize>,
+    ) {
+        recording_broker_with_scopes(roots, HashMap::new())
+    }
+
+    fn recording_broker_with_scopes(
+        roots: HashMap<String, PathBuf>,
+        published_scopes: HashMap<String, PublishedScope>,
+    ) -> (
+        CheckoutAccessBroker,
+        Arc<Mutex<Vec<CheckoutAccessRequest>>>,
+        Arc<AtomicUsize>,
+    ) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let resolves = Arc::new(AtomicUsize::new(0));
+        let authority = RecordingAuthority {
+            roots: Arc::new(roots),
+            published_scopes: Arc::new(published_scopes),
+            requests: requests.clone(),
+            resolves: resolves.clone(),
+        };
+        (
+            CheckoutAccessBroker::new(Arc::new(authority), CheckoutAccessObservations::in_memory()),
+            requests,
+            resolves,
+        )
+    }
+
+    #[test]
+    fn selected_operation_discovers_then_pins_exact_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let scope = PublishedScope {
+            repo_id: "repo-one".into(),
+            bbox_root_relpath: ".".into(),
+        };
+        let (broker, requests, _) = recording_broker_with_scopes(
+            HashMap::from([("project-one".into(), root)]),
+            HashMap::from([("project-one".into(), scope.clone())]),
+        );
+
+        let lease = acquire_selected_operation(
+            &broker,
+            "project-one",
+            CheckoutAccessKind::Blame,
+            CheckoutAccessIntent::Read,
+        )
+        .unwrap();
+
+        assert_eq!(lease.published_scope(), Some(&scope));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].kind,
+            CheckoutAccessKind::PublisherConfigTreeRead
+        );
+        assert_eq!(requests[0].expected_scope, None);
+        assert_eq!(requests[1].kind, CheckoutAccessKind::Blame);
+        assert_eq!(requests[1].expected_scope, Some(scope));
+    }
+
+    #[test]
+    fn deny_checkout_access_returns_before_any_file_or_git_input_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("file.rs"), "not a repository").unwrap();
+        let broker = CheckoutAccessBroker::new(
+            Arc::new(DenyCheckoutAccess),
+            CheckoutAccessObservations::in_memory(),
+        );
+        let project = test_record(&root, "project-one");
+
+        let error = acquire_file_selection(
+            &broker,
+            selected_file_selection(project, PathBuf::from("file.rs")),
+            CheckoutAccessKind::Blame,
+            CheckoutAccessIntent::Read,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("denied_by_test_probe"));
+        let operation = broker
+            .health()
+            .operations
+            .into_iter()
+            .find(|operation| operation.kind == CheckoutAccessKind::PublisherConfigTreeRead)
+            .unwrap();
+        assert_eq!(operation.granted, 0);
+        assert_eq!(operation.denied, 1);
+    }
+
+    #[test]
+    fn session_relative_file_uses_exact_checkout_id_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("file.rs"), "fn main() {}\n").unwrap();
+        let project = test_record(&root, "project-one");
+        let (broker, requests, _) =
+            recording_broker(HashMap::from([(project.project_id.clone(), root.clone())]));
+        let session = ResolvedCheckoutScope {
+            project_id: project.project_id.clone(),
+            published_scope: PublishedScope {
+                repo_id: "repo-one".into(),
+                bbox_root_relpath: ".".into(),
+            },
+            checkout_id: "checkout-one".into(),
+            checkout_dir: root.to_string_lossy().into_owned(),
+            checkout_project_dir: root.to_string_lossy().into_owned(),
+            branch_ref: None,
+        };
+        let selection = relative_file_selection(
+            &broker,
+            Path::new("file.rs"),
+            None,
+            Some(&session),
+            std::slice::from_ref(&project),
+            &[],
+        )
+        .unwrap();
+
+        let acquired = acquire_file_selection(
+            &broker,
+            selection,
+            CheckoutAccessKind::RenderFileProvider,
+            CheckoutAccessIntent::Read,
+        )
+        .unwrap();
+
+        assert_eq!(acquired.relative_path, "file.rs");
+        let requests = requests.lock().unwrap();
+        assert!(requests.iter().all(|request| {
+            request.attachment == CheckoutAttachmentSelector::CheckoutId("checkout-one".into())
+                && request.source_lane == CheckoutAccessSourceLane::LegacyCheckoutRegistry
+        }));
+    }
+
+    #[test]
+    fn absolute_checkout_path_matches_row_by_discovered_full_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let base = root.join("base");
+        let checkout = root.join("checkout");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::create_dir(&checkout).unwrap();
+        std::fs::write(checkout.join("file.rs"), "fn main() {}\n").unwrap();
+        let project = test_record(&base, "project-one");
+        assert_eq!(
+            project.repo_id.as_deref(),
+            None,
+            "weak repo hint must not be required"
+        );
+        let scope = PublishedScope {
+            repo_id: "repo-one".into(),
+            bbox_root_relpath: ".".into(),
+        };
+        let row = CheckoutRow {
+            checkout_id: "checkout-one".into(),
+            checkout_dir: checkout.to_string_lossy().into_owned(),
+            repo_id: Some(scope.repo_id.clone()),
+            bbox_root_relpath: Some(scope.bbox_root_relpath.clone()),
+            branch_ref: None,
+        };
+        let (broker, requests, _) = recording_broker_with_scopes(
+            HashMap::from([(project.project_id.clone(), checkout.clone())]),
+            HashMap::from([(project.project_id.clone(), scope)]),
+        );
+
+        let selection = absolute_file_selection(
+            &broker,
+            &checkout.join("file.rs"),
+            std::slice::from_ref(&project),
+            std::slice::from_ref(&row),
+        )
+        .unwrap();
+        assert_eq!(
+            selection.attachment,
+            CheckoutAttachmentSelector::CheckoutId("checkout-one".into())
+        );
+        let acquired = acquire_file_selection(
+            &broker,
+            selection,
+            CheckoutAccessKind::RenderFileProvider,
+            CheckoutAccessIntent::Read,
+        )
+        .unwrap();
+        assert_eq!(acquired.relative_path, "file.rs");
+        assert!(requests.lock().unwrap().iter().any(|request| {
+            request.attachment == CheckoutAttachmentSelector::CheckoutId("checkout-one".into())
+        }));
+    }
+
+    #[test]
+    fn relative_path_escape_is_rejected_after_lease_acquisition() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = test_record(&root, "project-one");
+        let (broker, _, _) = recording_broker(HashMap::from([(project.project_id.clone(), root)]));
+
+        let error = acquire_file_selection(
+            &broker,
+            selected_file_selection(project, PathBuf::from("../escape.rs")),
+            CheckoutAccessKind::RenderFileProvider,
+            CheckoutAccessIntent::Read,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unsafe_relative_path"));
+    }
+
+    #[test]
+    fn provenance_all_projects_acquires_one_lease_per_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let projects = vec![
+            test_record(&first, "project-one"),
+            test_record(&second, "project-two"),
+        ];
+        let (broker, requests, resolves) = recording_broker(HashMap::from([
+            ("project-one".into(), first),
+            ("project-two".into(), second),
+        ]));
+
+        let (leases, inputs) = acquire_provenance_projects(
+            &broker,
+            &ProvenanceParams { project_id: None },
+            &projects,
+            CheckoutAccessIntent::Read,
+        )
+        .unwrap();
+
+        assert_eq!(leases.len(), 2);
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(resolves.load(Ordering::SeqCst), 4);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.kind == CheckoutAccessKind::PublisherConfigTreeRead)
+                .count(),
+            2
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.kind == CheckoutAccessKind::ProvenanceNoteIo)
+                .count(),
+            2
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.attachment == CheckoutAttachmentSelector::Selected)
+        );
     }
     /// Symbols are edge-projected vertices: the indexer derives their edges
     /// but writes no entity doc (gap-496fe07f). A symbol ref the edge

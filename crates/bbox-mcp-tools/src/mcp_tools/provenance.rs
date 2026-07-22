@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use rmcp::schemars;
@@ -9,7 +9,6 @@ use serde_json::json;
 use bbox_chunker::{EdgeConfidence, EdgeProvenance};
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_edge_index::edge_index::{Edge, EdgeIndex};
-use bbox_indexing::projects::ProjectRecord;
 use bbox_provenance::{
     GitProvenanceNote, MAX_NOTE_DOCUMENT_BYTES, NoteToolCall, fragment_note, parse_note_document,
     serialize_note, split_note_documents,
@@ -23,12 +22,19 @@ pub struct ProvenanceParams {
     pub project_id: Option<String>,
 }
 
-pub fn export_provenance(
-    p: &ProvenanceParams,
-    edge_index: &EdgeIndex,
-    projects: &[ProjectRecord],
-) -> Result<String> {
-    let project_map = project_map(projects, p.project_id.as_deref());
+/// One caller-authorized checkout root. Project identity and filesystem
+/// authority arrive as separate fields.
+#[derive(Debug, Clone)]
+pub struct ProvenanceProject {
+    pub project_id: String,
+    pub project_root: PathBuf,
+}
+
+pub type LegacyTargetResolver<'a> =
+    dyn Fn(&str, &Path, &Path, Option<(u64, u64)>) -> Result<Option<EntityRef>> + 'a;
+
+pub fn export_provenance(edge_index: &EdgeIndex, projects: &[ProvenanceProject]) -> Result<String> {
+    let project_map = project_map(projects);
     let mut grouped = BTreeMap::<(String, String), Vec<&Edge>>::new();
     for edge in edge_index.all_edges() {
         if !matches!(edge.kind.as_str(), "EDITED_FILE" | "READ_FILE") {
@@ -52,19 +58,18 @@ pub fn export_provenance(
     let notes_ref = bbox_corpus_core::git::notes_ref("provenance");
     let mut notes_written = 0u64;
     // Track which roots we've already configured to avoid redundant git calls.
-    let mut configured_roots: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut configured_roots: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for ((project_id, commit), edges) in grouped {
         let Some(project) = project_map.get(&project_id) else {
             continue;
         };
-        let root = Path::new(&project.canonical_path);
+        let root = project.project_root.as_path();
         // Auto-configure notes.mergeStrategy=union once per repo so
         // cross-machine provenance merges union rather than abort.
-        if configured_roots.insert(project.canonical_path.clone()) {
-            if let Err(e) = bbox_corpus_core::git::ensure_notes_merge_strategy_union(root) {
+        if configured_roots.insert(project.project_root.clone()) {
+            if bbox_corpus_core::git::ensure_notes_merge_strategy_union(root).is_err() {
                 tracing::warn!(
-                    path = %root.display(),
-                    "could not set notes.mergeStrategy union: {e:#}"
+                    "error.checkout_io_failed: could not set provenance note merge strategy"
                 );
             }
         }
@@ -73,8 +78,14 @@ pub fn export_provenance(
             .into_iter()
             .map(|part| serialize_note(&part))
             .collect::<Result<Vec<_>>>()?;
-        let applied =
-            bbox_provenance::append_note_documents_dedup(root, &notes_ref, &commit, &documents)?;
+        let applied = bbox_provenance::append_note_documents_dedup(
+            root, &notes_ref, &commit, &documents,
+        )
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "error.checkout_io_failed: provenance note could not be written to the validated checkout"
+            )
+        })?;
         notes_written += applied.written;
     }
 
@@ -86,50 +97,63 @@ pub fn export_provenance(
 }
 
 pub fn import_provenance_to_edges_dir(
-    p: &ProvenanceParams,
-    projects: &[ProjectRecord],
+    projects: &[ProvenanceProject],
     edges_dir: &Path,
+    resolve_legacy_target: &LegacyTargetResolver<'_>,
 ) -> Result<u64> {
-    let project_map = project_map(projects, p.project_id.as_deref());
     let notes_ref = bbox_corpus_core::git::notes_ref("provenance");
     let mut edges_imported = 0u64;
-    for project in project_map.values() {
-        let root = Path::new(&project.canonical_path);
-        for (_note_sha, commit) in bbox_corpus_core::git::list_notes(root, &notes_ref)? {
-            let Some(raw) = bbox_corpus_core::git::show_note(root, &notes_ref, &commit)? else {
+    for project in projects {
+        let root = project.project_root.as_path();
+        let notes = bbox_corpus_core::git::list_notes(root, &notes_ref).map_err(|_| {
+            anyhow::anyhow!(
+                "error.checkout_io_failed: provenance notes could not be listed from the validated checkout"
+            )
+        })?;
+        for (_note_sha, commit) in notes {
+            let Some(raw) = bbox_corpus_core::git::show_note(root, &notes_ref, &commit).map_err(
+                |_| {
+                    anyhow::anyhow!(
+                        "error.checkout_io_failed: provenance note could not be read from the validated checkout"
+                    )
+                },
+            )? else {
                 continue;
             };
             for raw_note in split_note_documents(&raw) {
                 let Ok(note) = parse_note_document(raw_note) else {
                     continue;
                 };
-                let edges = edges_from_note(project, root, &note)?;
+                let edges =
+                    edges_from_note(&project.project_id, root, &note, resolve_legacy_target)?;
                 edges_imported += bbox_edge_index::edge_index::append_explicit_edges(
                     edges_dir,
                     &project.project_id,
                     &edges,
-                )? as u64;
+                )
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "error.provenance_store_unavailable: imported provenance edges could not be persisted"
+                    )
+                })? as u64;
             }
         }
     }
     Ok(edges_imported)
 }
 
-fn project_map<'a>(
-    projects: &'a [ProjectRecord],
-    project_id: Option<&str>,
-) -> HashMap<String, &'a ProjectRecord> {
+fn project_map<'a>(projects: &'a [ProvenanceProject]) -> HashMap<String, &'a ProvenanceProject> {
     projects
         .iter()
-        .filter(|project| project_id.is_none_or(|id| id == project.project_id))
         .map(|project| (project.project_id.clone(), project))
         .collect()
 }
 
 fn edges_from_note(
-    project: &ProjectRecord,
+    project_id: &str,
     root: &Path,
     note: &GitProvenanceNote,
+    resolve_legacy_target: &LegacyTargetResolver<'_>,
 ) -> Result<Vec<Edge>> {
     let mut edges = Vec::new();
     for call in &note.tool_calls {
@@ -144,7 +168,7 @@ fn edges_from_note(
         };
         let file = call.file.as_deref();
         let target = if note.schema_version >= bbox_provenance::SCHEMA_VERSION_V2 {
-            validated_target_for_project(call, &project.project_id)
+            validated_target_for_project(call, project_id)
         } else {
             None
         };
@@ -155,19 +179,24 @@ fn edges_from_note(
                     continue;
                 };
                 let absolute_path = root.join(file);
-                match bbox_indexing::index::resolve_current_project_chunk_entity(
-                    project,
+                match resolve_legacy_target(
+                    project_id,
                     root,
                     &absolute_path,
                     call.byte_range.map(|range| (range[0], range[1])),
-                )? {
+                )
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "error.checkout_io_failed: provenance target could not be resolved in the validated checkout"
+                    )
+                })? {
                     Some(target) => target,
                     None => continue,
                 }
             }
         };
         let mut metadata = BTreeMap::new();
-        metadata.insert("anchor.project_id".into(), project.project_id.clone());
+        metadata.insert("anchor.project_id".into(), project_id.to_string());
         if let Some(file) = file {
             metadata.insert("anchor.file_path".into(), file.to_string());
         }
