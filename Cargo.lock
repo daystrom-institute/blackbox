@@ -584,6 +584,7 @@ dependencies = [
  "bbox-vectors",
  "bro-core",
  "bro-transcript",
+ "fs2",
  "hex",
  "parking_lot",
  "rmcp",
