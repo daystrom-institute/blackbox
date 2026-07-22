@@ -133,7 +133,10 @@ pub enum CheckoutAttachmentSelector {
 }
 
 /// Complete request presented to the broker. `expected_scope = None` is valid
-/// only for a legacy local project with no durable published scope.
+/// for a legacy local project with no durable published scope. The sole
+/// discovery exception is a `PublisherConfigTreeRead` request using
+/// `Selected` plus `LegacyProjectRecord`; its lease returns the validated
+/// scope that subsequent capability-specific requests must match exactly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckoutAccessRequest {
     pub project_id: String,
@@ -291,6 +294,8 @@ pub struct ValidatedCheckoutLease {
     checkout_root: PathBuf,
     project_root: PathBuf,
     acquisition_sequence: u64,
+    attachment_selector: CheckoutAttachmentSelector,
+    expected_scope: Option<PublishedScope>,
 }
 
 impl ValidatedCheckoutLease {
@@ -470,6 +475,8 @@ impl CheckoutAccessBroker {
                     checkout_root: candidate.checkout_root,
                     project_root: candidate.project_root,
                     acquisition_sequence: sequence,
+                    attachment_selector: request.attachment,
+                    expected_scope: request.expected_scope,
                 })
             }
             Err(error) => {
@@ -487,6 +494,37 @@ impl CheckoutAccessBroker {
 
     pub fn health(&self) -> CheckoutAccessHealth {
         self.observations.health()
+    }
+
+    /// Revalidate a lease immediately before a filesystem-derived result is
+    /// published. This closes detach, scope-change, and selector races without
+    /// treating the lease's cached roots as durable authority.
+    pub fn revalidate(
+        &self,
+        lease: &ValidatedCheckoutLease,
+    ) -> std::result::Result<(), CheckoutAccessError> {
+        let request = CheckoutAccessRequest {
+            project_id: lease.project_id.clone(),
+            attachment: lease.attachment_selector.clone(),
+            expected_scope: lease.expected_scope.clone(),
+            kind: lease.kind,
+            intent: lease.intent,
+            source_lane: lease.source_lane,
+        };
+        let candidate = self.acquire_unobserved(&request)?;
+        if candidate.project_id != lease.project_id
+            || candidate.attachment_id != lease.attachment_id
+            || candidate.checkout_id != lease.checkout_id
+            || candidate.published_scope != lease.published_scope
+            || candidate.checkout_root != lease.checkout_root
+            || candidate.project_root != lease.project_root
+        {
+            return Err(CheckoutAccessError::new(
+                CheckoutAccessErrorCode::ConservativePathGateDenied,
+                "checkout authority changed after lease acquisition",
+            ));
+        }
+        Ok(())
     }
 
     fn acquire_unobserved(
@@ -546,7 +584,11 @@ impl CheckoutAccessBroker {
                 "the resolved attachment is not active",
             ));
         }
-        if candidate.published_scope != request.expected_scope {
+        let scope_discovery = request.kind == CheckoutAccessKind::PublisherConfigTreeRead
+            && request.expected_scope.is_none()
+            && request.source_lane == CheckoutAccessSourceLane::LegacyProjectRecord
+            && matches!(&request.attachment, CheckoutAttachmentSelector::Selected);
+        if !scope_discovery && candidate.published_scope != request.expected_scope {
             return Err(CheckoutAccessError::new(
                 CheckoutAccessErrorCode::ScopeMismatch,
                 "the resolved attachment scope does not match the requested project scope",
@@ -892,6 +934,28 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct MutableAuthority {
+        candidate: Arc<Mutex<CheckoutAccessCandidate>>,
+    }
+
+    impl CheckoutAccessAuthority for MutableAuthority {
+        fn resolve(
+            &self,
+            _request: &CheckoutAccessRequest,
+        ) -> std::result::Result<CheckoutAccessCandidate, CheckoutAccessError> {
+            Ok(self.candidate.lock().clone())
+        }
+
+        fn revalidate_conservative_path_gate(
+            &self,
+            _request: &CheckoutAccessRequest,
+            _candidate: &CheckoutAccessCandidate,
+        ) -> std::result::Result<(), CheckoutAccessError> {
+            Ok(())
+        }
+    }
+
     fn scope() -> PublishedScope {
         PublishedScope {
             repo_id: "repo-1".into(),
@@ -960,6 +1024,34 @@ mod tests {
         assert_eq!(operation.granted, 1);
         assert_eq!(operation.denied, 0);
         assert!(operation.last_success_unix_secs.is_some());
+    }
+
+    #[test]
+    fn lease_revalidation_observes_detach_before_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("project")).unwrap();
+        let candidate = Arc::new(Mutex::new(
+            authority(&root, CheckoutAccessKind::LocalProjectWalk).candidate,
+        ));
+        let broker = CheckoutAccessBroker::new(
+            Arc::new(MutableAuthority {
+                candidate: candidate.clone(),
+            }),
+            CheckoutAccessObservations::in_memory(),
+        );
+        let lease = broker
+            .acquire(request(
+                CheckoutAccessKind::LocalProjectWalk,
+                CheckoutAccessIntent::Read,
+            ))
+            .unwrap();
+        candidate.lock().status = CheckoutAttachmentStatus::Detached;
+
+        assert_eq!(
+            broker.revalidate(&lease).unwrap_err().code,
+            CheckoutAccessErrorCode::AttachmentInactive
+        );
     }
 
     #[test]
@@ -1064,6 +1156,56 @@ mod tests {
         assert_eq!(
             error.code,
             CheckoutAccessErrorCode::ConservativePathGateDenied
+        );
+    }
+
+    #[test]
+    fn scope_discovery_is_restricted_to_the_publisher_selected_legacy_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("project")).unwrap();
+        let make_broker = || {
+            CheckoutAccessBroker::new(
+                Arc::new(authority(
+                    &root,
+                    CheckoutAccessKind::PublisherConfigTreeRead,
+                )),
+                CheckoutAccessObservations::in_memory(),
+            )
+        };
+        let discovery = CheckoutAccessRequest {
+            project_id: "project-1".into(),
+            attachment: CheckoutAttachmentSelector::Selected,
+            expected_scope: None,
+            kind: CheckoutAccessKind::PublisherConfigTreeRead,
+            intent: CheckoutAccessIntent::Read,
+            source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+        };
+        assert_eq!(
+            make_broker()
+                .acquire(discovery.clone())
+                .unwrap()
+                .published_scope(),
+            Some(&scope())
+        );
+
+        let mut wrong_kind = discovery.clone();
+        wrong_kind.kind = CheckoutAccessKind::LocalProjectWalk;
+        assert_eq!(
+            make_broker().acquire(wrong_kind).unwrap_err().code,
+            CheckoutAccessErrorCode::ScopeMismatch
+        );
+        let mut wrong_selector = discovery.clone();
+        wrong_selector.attachment = CheckoutAttachmentSelector::AttachmentId("attachment-1".into());
+        assert_eq!(
+            make_broker().acquire(wrong_selector).unwrap_err().code,
+            CheckoutAccessErrorCode::ScopeMismatch
+        );
+        let mut wrong_lane = discovery;
+        wrong_lane.source_lane = CheckoutAccessSourceLane::NativeAttachment;
+        assert_eq!(
+            make_broker().acquire(wrong_lane).unwrap_err().code,
+            CheckoutAccessErrorCode::ScopeMismatch
         );
     }
 
