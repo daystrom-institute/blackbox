@@ -155,7 +155,7 @@ case "$verb" in
       --allowedTools "${REVIEW_TOOLS[@]}" \
       --append-system-prompt-file "$plan_prompt_file" \
       --session-id "$session_id" \
-      --name "kimi-distributed-code-source-plan-review" \
+      --name "kimi-durable-project-catalog-plan-review" \
       --disallowedTools Edit Write NotebookEdit \
       -p "Perform the complete mandatory plan review now."; then
       if [[ -f "$plan_session_file" ]] && [[ "$(tr -d '[:space:]' <"$plan_session_file")" == "$session_id" ]]; then
