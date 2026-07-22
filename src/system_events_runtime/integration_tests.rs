@@ -87,6 +87,11 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
             )
             .unwrap(),
         ),
+        checkout_access_observations:
+            bbox_indexing::checkout_access::CheckoutAccessObservations::open(
+                tmp.path().join("checkout-access-observations.json"),
+            )
+            .unwrap(),
         publisher_refs: RwLock::new(
             bbox_indexing::publisher::PublisherRefStore::open(
                 tmp.path().join("publisher-refs.json"),
