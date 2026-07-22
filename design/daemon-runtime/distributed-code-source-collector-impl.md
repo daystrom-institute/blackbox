@@ -63,10 +63,12 @@ gate explicit avoids recreating the satellite arc's dead absolute-path bridge.
 
 The following are not smuggled into the file collector:
 
-- Git history, Git objects, blame, or provenance import. The current Git-history
-  indexer may continue using the registered local checkout during overlap. A
-  collected file generation contains current bytes only and never claims to be
-  a Git mirror.
+- Git history transport, Git objects, blame, or provenance import. The current
+  Git-history indexer continues reading the registered local checkout during
+  overlap. It joins that local history to the active source generation's
+  corpus-side current-chunk map, so file collection does not silently remove
+  `COMMIT_TOUCHED_FILE` edges. A collected generation still contains current
+  bytes only and never claims to be a Git mirror.
 - `.bbox/` knowledge, gaps, config, local state, or secrets. `.bbox/` remains a
   dedicated knowledge/config carrier and is excluded from generic source
   manifests.
@@ -155,6 +157,16 @@ At daemon open and SIGHUP reload:
 - every scope must resolve to exactly one current registered project;
 - the whole replacement auth table is built before one atomic swap. A reload
   error retains the previous table and reports the failure.
+
+Cold-open policy is fail closed. If code collection is enabled and any
+configured assignment cannot load its token or resolve exactly one local
+registered project, daemon startup fails before binding HTTP. This availability
+coupling is accepted for the overlap slice because a local registration is an
+explicit prerequisite, not an optional discovery hint. SIGHUP is less
+disruptive: an invalid replacement retains the complete prior auth and desired
+source tables. Disabling `code_collection` removes the cold-open scope
+resolution requirement but does not erase an already active collected
+generation; section 10's cutback still applies.
 
 Removing or changing an assignment is operator authority. It does not make a
 request from the former producer valid, and it does not instantly change the
@@ -332,6 +344,13 @@ exponential backoff and jitter, one scan per root at a time. Logs report scope
 hash, generation prefix, counts, bytes, and state, never bearer values or file
 contents. Normal shutdown may abandon an upload because replay is safe.
 
+The no-follow rule intentionally changes the local index during Phase 0. The
+current walker follows symlinked files through `Path::is_file`, entry metadata,
+and `fs::read`; the shared policy drops them. This is a security and parity
+migration, not an invisible refactor. The schema rebuild removes previously
+indexed symlink targets, and both local and collected walkers report the same
+bounded `skipped_symlinks` counter.
+
 ## 8. Durable corpus store
 
 All state derives from `Config.paths.state_dir`:
@@ -365,6 +384,17 @@ open uploads, ready generations, the active generation, and the configured
 number of retained prior generations. It sweeps only unmarked blobs older than
 the grace period, under a store GC lock, and reports reclaimed bytes. No
 automatic sweep may delete the sole active generation manifest.
+
+Blob verification is correctness-first but avoids rehashing an unchanged 5 GiB
+generation on every refresh. Upload installation always computes the complete
+hash. Activation uses a process-local verified cache keyed by content hash plus
+file identity, size, and modification stamp. A blob not verified in the current
+process, or whose metadata changed, is streamed and rehashed before use. The
+first activation after daemon restart can therefore read the full configured
+logical-byte cap; later generations composed from unchanged blobs pay bounded
+metadata checks. Verification runs off Tokio workers, exposes bytes and
+duration, warns after 60 seconds, and has no correctness timeout. The previous
+generation stays active until verification completes.
 
 ## 9. Corpus-side source abstraction and indexing
 
@@ -403,6 +433,13 @@ Turn on `ProjectFileV2` and `SymbolV2` for collected generations regardless of
 `BBOX_PROJECT_REFS_V2`. Their snapshot id names the exact materialization.
 Legacy local behavior remains compatible during overlap.
 
+Every project-file document also carries an exact
+`code_source_entry_key = hash(selector, relative_path)` term. Local incremental
+replacement and deletion use that term, never the shared compatibility
+`file_path`. Collected staging deletes only the exact collected selector before
+re-adding it. The compatibility path remains a stored/searchable display value,
+not a lifecycle key.
+
 ### 9.2 Active search selector
 
 Add exact Tantivy fields `code_source_selector` and
@@ -419,9 +456,13 @@ doc_type != project_file OR code_source_selector IN active_selectors
 
 This is a Tantivy query constraint, not only a post-filter, so stale generations
 cannot crowd active results out of TopDocs. Vector candidates use the same
-snapshot to reject inactive ProjectFileV2 and SymbolV2 refs, with bounded
-overfetch until the requested active-result limit or candidate exhaustion.
-Non-project-file corpus lanes are unaffected.
+snapshot with bounded overfetch until the requested active-result limit or
+candidate exhaustion. V2 project-file and symbol refs survive only when their
+project and snapshot map to the active selector. A V1 project-file or symbol
+ref survives only while that project's active selector is
+`local:<project_id>`; it is rejected as soon as the project activates any
+collected selector. This rule covers old vectors even before physical
+retirement. Non-project-file corpus lanes are unaffected.
 
 The daemon publishes an immutable `CodeReadView` containing the active selector
 map and an `Arc<EdgeIndex>` built from the same prospective manifest index.
@@ -453,9 +494,23 @@ Finalization does not immediately change readers. The indexing actor performs:
    atomically replace `manifest-index.json`, then atomically swap the in-memory
    `CodeReadView`. Requests that began earlier retain the old complete view;
    later requests receive the new complete view.
-6. Mark the journal active and asynchronously delete project-file documents,
-   vectors, and sidecar snapshots older than the retention policy by their
-   exact selector or snapshot id.
+6. At the first collected switch, atomically remove the project's local
+   project-file metadata rows without issuing document deletes. Mark the local
+   selector for retirement. It does not count against collected-generation
+   retention.
+7. Mark the journal active and asynchronously delete retired project-file
+   documents, vectors, and sidecar snapshots by exact selector or snapshot id.
+   A retired selector stays physically available until every request-held
+   `CodeReadView` that could select it has dropped. The active filter already
+   prevents new requests from observing it. Persisted retirement state lets a
+   restart, which has no pre-restart requests, finish the deletion safely.
+
+Vector retirement is entity-id based because the vector store has no selector
+delete primitive. Before deleting Tantivy documents for a retired selector,
+the cleanup pass streams their stored `entity_id` values and applies the
+idempotent all-route vector tombstone for each one. Only after that pass commits
+does it term-delete the selector's documents. A crash repeats the tombstones
+and scan safely while the documents still provide the retirement inventory.
 
 The persisted manifest index is written before the in-memory swap. A crash
 before that write boots the old generation. A crash after it boots the new
@@ -479,9 +534,26 @@ filtered. Embedding retry already derives from indexed documents.
 
 An ordinary incremental pass chooses exactly one source per project from the
 active manifest and desired source mode. A collector-active project does not
-call `scan_project_files` or open its source paths. Collected documents do not
-use filesystem `_meta.json` keys, so the global deleted-file sweep cannot purge
-them accidentally.
+call `scan_project_files` or open its source paths.
+
+The schema bump replaces `_meta.json`'s untyped deletion contract. Each
+`FileMeta` row records whether it is a legacy filesystem source or a local
+project-file source. Local project rows carry `project_id`, selector, relative
+path, and `code_source_entry_key`. A changed or deleted local project file
+deletes only that exact entry-key term. Transcript and store rows retain their
+existing file-path deletion behavior. Collected and staged generations never
+create `_meta.json` rows.
+
+At first collected activation, all local project rows for that project are
+removed from the next metadata snapshot without calling
+`delete_term(file_path)`. Old local documents retire by their selector after
+the read-view grace in section 9.3. If a crash leaves those rows behind,
+startup reconciliation and the next purge recognize that the active selector
+is collected, drop the rows without deleting documents, and persist the
+cleaned metadata. `needs_reindex` therefore does not rediscover phantom local
+deletions on every tick. During warming, a local file deletion targets only its
+local entry key and cannot damage a staged collected selector that shares the
+same compatibility path.
 
 A full rebuild deletes all documents, then reconstructs only:
 
@@ -495,9 +567,34 @@ restages it. The active generation remains reconstructible from immutable
 manifests and blobs.
 
 Git-history indexing stays a separately named local phase in this slice. It is
-not fed a synthetic checkout path or a collected current-chunk map. Health and
-reindex summaries report local-history and collected-current-file work
-separately so the remaining checkout dependency is visible.
+not fed a synthetic checkout path, but it does receive
+`current_chunk_targets` derived from whichever source snapshot is active. For a
+collected scope, the map contains repo-relative paths and V2 refs from the
+collected generation. The local Git reader can therefore preserve and refresh
+`COMMIT_TOUCHED_FILE` edges, including during `force_full`, while its remaining
+`.git` checkout dependency stays explicit. Health reports the local history
+HEAD and collected HEAD separately and warns when the local clone does not
+contain the collected HEAD. Reindex summaries report local-history and
+collected-current-file work separately.
+
+### 9.5 Schema migration and rollout
+
+The selector, generation, and entry-key fields require an
+`INDEX_SCHEMA_VERSION` bump. That bump invalidates the whole Tantivy index,
+including transcripts, and is an accepted one-time maintenance event for this
+development branch. It is not described as an online migration.
+
+The schema-change deployment is a separate Phase 0 rollout. Before deployment,
+the full rebuild is rehearsed on a project lane with production-scale copied
+state and its time, disk peak, and embedding enqueue volume recorded. On each
+corpus host the old daemon remains available until the maintenance starts. The
+new daemon does not bind its HTTP listener or report readiness after deleting
+the old schema until one synchronous full BM25 rebuild commits successfully.
+Failure leaves the daemon unready and retryable from durable sources rather
+than serving an empty index. Vector coverage may recover asynchronously and is
+reported as degraded until backfill catches up. Multi-host deployments roll
+one host at a time. This plan accepts the bounded service restart outage and
+does not claim zero downtime.
 
 ## 10. Overlap, cutover, and rollback
 
@@ -531,6 +628,11 @@ collected refresh and one full rebuild rehearsal, the operator may leave the
 scope collected. The old local adapter remains for unassigned scopes and
 cutback; there is no daemon runtime role or remote/local tool mask.
 
+The pre-cutover local generation is not one of
+`code_collection.retained_generations`. It is a transition artifact retired
+after the old `CodeReadView` quiesces. The retention count applies only to
+completed collected generations kept for replay, inspection, and rollback.
+
 ## 11. Error, concurrency, and observability contract
 
 HTTP errors use stable codes and appropriate statuses:
@@ -561,13 +663,17 @@ path, repo-id value, or content hash at unbounded cardinality.
 
 1. Add `bbox-code-source` and move current project-file extension, directory,
    and byte caps behind its versioned policy.
-2. Make the local walker use no-follow metadata and the shared policy without
-   changing its observable file set.
+2. Make the local walker use no-follow metadata and the shared policy. Document
+   and count the intentional removal of symlinked-file targets from the local
+   corpus.
 3. Add source selector/generation schema fields, active-selector query
-   constraints, vector filtering, and `CodeReadView` plumbing.
+   constraints, entry-key deletion, V1-aware vector filtering, and
+   `CodeReadView` plumbing.
 4. Make collected refs unconditionally V2 and add generation-specific delete
    helpers.
 5. Prove a schema rebuild preserves local search and graph behavior.
+6. Rehearse the whole-index schema migration and synchronous startup rebuild,
+   including transcript availability and vector-backfill health.
 
 ### Phase 1: Durable store and authenticated server API
 
@@ -614,16 +720,25 @@ Unit and integration coverage must include:
   count/byte cap, conflicting page replay, wrong upload owner, stale cursor,
   missing blob, wrong size/hash, corrupt cache entry, and expired upload;
 - scan-to-upload mutation, symlink swap, linked-worktree rejection, ignored
-  directories, large supported document caps, and unsupported files;
+  directories, large supported document caps, unsupported files, and both
+  walkers dropping and counting a supported-extension symlink;
 - finalize replay, out-of-order generations, concurrent finalize, restart at
   every upload/activation journal state, blob-cache loss, GC versus active/open
   references, and disk-write failure;
 - staged generations absent from lexical, code-symbol, hybrid-vector, inspect
   expansion, and graph discovery; old requests retaining the old read view;
   new requests receiving the new selector and edge snapshot together;
+- a vector-only hybrid query after cutover returning no V1 local project-file
+  or symbol hit, plus local-selector retirement waiting for old read views;
 - incremental and full rebuild from an active collected manifest, no local file
   open in collected mode, no global purge of collected docs, materialization
   version bump, and failed activation preserving old results;
+- the real purge lifecycle: local indexing, collected staging, a warming-state
+  local deletion, collected activation, and the next incremental pass retain
+  exact manifest document counts while removing local metadata rows; no
+  recurring `needs_reindex` trigger remains;
+- `COMMIT_TOUCHED_FILE` edges targeting active collected V2 refs before and
+  after incremental and forced-full Git-history refresh;
 - warming behavior, explicit cutback success, cutback failure preserving the
   collected generation, staleness reporting, and no implicit failover;
 - collector dependency ceiling and a binary smoke test against a temporary
