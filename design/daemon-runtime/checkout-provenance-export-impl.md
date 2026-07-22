@@ -247,9 +247,11 @@ first write in that page:
    distinct document. Re-reading is part of the new local apply function, not a
    claimed behavior of `bbox_corpus_core::git::write_note`.
 
-Only after the page validates does it set `notes.mergeStrategy=union` and write
-the notes. The result reports written, unchanged, and rejected counts without
-including full document bodies.
+Only after the page validates does it take an advisory lock in the repository's
+shared Git common directory, re-read existing notes under that lock, set
+`notes.mergeStrategy=union`, and write the notes. This serializes leaf users
+across linked worktrees. The result reports written, unchanged, and rejected
+counts without including full document bodies.
 
 The page is not globally atomic across multiple Git commits. That is acceptable
 because writes are deterministic and idempotent, generation restart is safe,

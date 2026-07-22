@@ -626,6 +626,7 @@ dependencies = [
  "anyhow",
  "bbox-config",
  "bbox-corpus-core",
+ "fs2",
  "hex",
  "serde",
  "serde_json",

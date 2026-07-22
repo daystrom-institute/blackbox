@@ -60,6 +60,20 @@ fn build_plan(
         let Some(commit) = edge.metadata.get("anchor.commit_sha_at_edit") else {
             continue;
         };
+        if !matches!(
+            &edge.target,
+            EntityRef::ProjectFile {
+                project_id: target_project_id,
+                ..
+            } | EntityRef::ProjectFileV2 {
+                project_id: target_project_id,
+                ..
+            } if target_project_id == project_id
+        ) {
+            bail!(
+                "error.invalid_provenance_target: tracked file edge does not target this project"
+            );
+        }
         grouped.entry(commit.clone()).or_default().push(edge);
     }
 
@@ -484,6 +498,31 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("error.tool_call_too_large"));
+    }
+
+    #[test]
+    fn cross_project_target_fails_during_planning() {
+        let mut wrong = edge("project", &commit(1), 1, 10);
+        wrong.target = EntityRef::ProjectFile {
+            project_id: "other-project".into(),
+            rel_path_hash: "path".into(),
+            chunk_hash: "a".repeat(64),
+            occurrence_idx: 0,
+        };
+        let index = EdgeIndex::from_edges_for_tests(vec![wrong]);
+        let error = export_plan_page(
+            &ProvenanceExportPlanParams::default(),
+            scope(),
+            "project",
+            "refs/notes/bbox/provenance",
+            &index,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("error.invalid_provenance_target")
+        );
     }
 
     #[test]

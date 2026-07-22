@@ -7,6 +7,7 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_core::identity::{PublishedScope, bbox_root_relpath, resolve_recorded_repo_id};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -345,6 +346,7 @@ pub fn apply_export_page(
 ) -> Result<ApplyExportPageResult> {
     let root = canonical_project_root(root)?;
     validate_page(&root, page)?;
+    let _repository_lock = lock_repository(&root)?;
 
     let mut known_hashes = BTreeMap::<String, BTreeSet<String>>::new();
     for document in &page.documents {
@@ -557,6 +559,21 @@ fn canonical_project_root(root: &Path) -> Result<PathBuf> {
         })
 }
 
+fn lock_repository(root: &Path) -> Result<std::fs::File> {
+    let common_dir = bbox_corpus_core::git::git_common_dir(root)
+        .ok_or_else(|| anyhow!("provenance project has no Git common directory"))?;
+    let lock_path = common_dir.join("blackbox-provenance.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening provenance repository lock {}", lock_path.display()))?;
+    FileExt::lock_exclusive(&lock)
+        .with_context(|| format!("locking provenance repository {}", common_dir.display()))?;
+    Ok(lock)
+}
+
 fn commit_exists(root: &Path, commit: &str) -> Result<bool> {
     if !is_commit_id(commit) {
         return Ok(false);
@@ -634,6 +651,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().canonicalize().expect("canonical temp root");
         git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.name", "Blackbox Test"]);
+        git(
+            &root,
+            &["config", "user.email", "blackbox-test@example.invalid"],
+        );
         fs::create_dir_all(root.join(".bbox")).expect("create bbox");
         fs::write(
             root.join(".bbox/config.toml"),
@@ -846,6 +868,36 @@ mod tests {
         assert_eq!(first.unchanged, 0);
         assert_eq!(second.written, 0);
         assert_eq!(second.unchanged, 1);
+        let raw = bbox_corpus_core::git::show_note(&root, &page.notes_ref, &commit)
+            .expect("show note")
+            .expect("note exists");
+        assert_eq!(split_note_documents(&raw).len(), 1);
+    }
+
+    #[test]
+    fn concurrent_page_application_serializes_and_stays_idempotent() {
+        let (_dir, root, commit) = init_repo("repo-a");
+        let page = page(&root, "repo-a", "project1", &commit);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let root = root.clone();
+            let page = page.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                apply_export_page(&root, &page).expect("concurrent apply")
+            }));
+        }
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("join apply worker"))
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().map(|result| result.written).sum::<u64>(), 1);
+        assert_eq!(
+            results.iter().map(|result| result.unchanged).sum::<u64>(),
+            1
+        );
         let raw = bbox_corpus_core::git::show_note(&root, &page.notes_ref, &commit)
             .expect("show note")
             .expect("note exists");

@@ -14,6 +14,8 @@
   commit object, document hash, document commit, part metadata, and every v2
   project-file target must agree.
 - Git-note writes are deterministic and idempotent, not globally atomic.
-  Exact existing documents are skipped, so callers may restart pagination.
+  Application takes an advisory lock in the shared Git common directory,
+  then re-reads exact existing documents before appending. Callers may safely
+  restart pagination, and concurrent leaf users serialize across worktrees.
 - Tests use isolated temporary repositories and canonicalize their roots
   before path-sensitive assertions or calls.
