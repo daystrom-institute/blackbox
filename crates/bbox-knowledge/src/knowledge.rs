@@ -3,6 +3,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
@@ -14,6 +15,8 @@ use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_stores::store_persister::StoreSnapshot;
 
 use bbox_corpus_core::query::{QueryAtom, QueryNode, parse_query};
+
+use crate::repo_io::{KnowledgeRepoCarrier, KnowledgeRepoRead, KnowledgeRepoWrite};
 
 // ── MCP parameter structs ─────────────────────────────────────────
 //
@@ -853,6 +856,7 @@ fn project_is_repo_owned(project_dir: &Path) -> bool {
 /// stamping each with `project = project_dir` (the field is absent on disk).
 fn load_repo_kb_entries(
     project_dir: &Path,
+    durable_project: &str,
 ) -> Result<(Vec<KnowledgeEntry>, BTreeMap<String, EntryProvenance>)> {
     let git_root = bbox_corpus_core::git::git_root_for_path(project_dir);
     let transaction_root = git_root.as_deref().unwrap_or(project_dir);
@@ -867,7 +871,6 @@ fn load_repo_kb_entries(
     if !dir.exists() {
         return Ok((Vec::new(), BTreeMap::new()));
     }
-    let project = project_dir.to_string_lossy().to_string();
     let mut out = Vec::new();
     let mut provenance = BTreeMap::new();
     // Committed-tree context for the published-vs-provisional label (slice 3.2),
@@ -920,7 +923,7 @@ fn load_repo_kb_entries(
                 continue;
             }
         };
-        entry.project = Some(project.clone());
+        entry.project = Some(durable_project.to_string());
         // Published-vs-provisional label (slice 3.2): a working file
         // byte-identical to its committed-tree blob is Published; anything else
         // (new, modified, or committed-read failed while the root IS a git repo
@@ -981,8 +984,8 @@ fn provenance_context(project_dir: &Path) -> Option<(PathBuf, String)> {
 ///
 /// `purge` enables generation semantics: committed files whose id is no longer
 /// present are deleted (so a removed entry deletes its file). Purge is only
-/// safe when the caller's in-memory set is AUTHORITATIVE for this project —
-/// i.e. the repo's entries were loaded (the project is in `project_roots`).
+/// safe when the caller's in-memory set is AUTHORITATIVE for this project,
+/// meaning its logical carrier was loaded through read authority.
 /// Purging against an incomplete view would delete committed entries that were
 /// never loaded; callers pass `purge=false` in that case (additive write only).
 fn persist_repo_kb_entries(
@@ -1068,7 +1071,7 @@ pub struct KnowledgeStore {
     /// consume. `#[serde(skip)]`: never persisted, recomputed each reload.
     #[serde(skip)]
     pub provenance: BTreeMap<String, EntryProvenance>,
-    /// Load-time provenance: canonical project-root path → the HEAD commit its
+    /// Load-time provenance: durable project scope → the HEAD commit its
     /// committed `.bbox/knowledge/` entries were built from at the last reload
     /// (design §3.4, "built_from" stamp). This is the commit a consumer reads
     /// to distinguish published from provisional once the overlay lands.
@@ -1116,7 +1119,7 @@ impl StoreSnapshot for Knowledge {
     type Snapshot = KnowledgeStore;
 
     fn snapshot(&self) -> Result<Self::Snapshot> {
-        Ok(self.central_snapshot())
+        self.central_snapshot()
     }
 }
 
@@ -1125,12 +1128,14 @@ impl StoreSnapshot for Knowledge {
 pub struct Knowledge {
     store_path: PathBuf,
     store: KnowledgeStore,
-    /// Repos whose committed `.bbox/knowledge/` is loaded into the query
-    /// surface. Project-scoped durable knowledge is repo-owned (it travels
-    /// with the checkout); the central store holds only global and legacy
-    /// non-repo-owned project entries. These roots tell `reload` which repos
-    /// to spool published project entries from.
-    project_roots: Vec<PathBuf>,
+    /// Logical carriers whose committed `.bbox/knowledge/` is loaded into the
+    /// query surface. Concrete roots exist only inside authority callbacks.
+    project_carriers: Vec<KnowledgeRepoCarrier>,
+    repo_read: Option<Arc<dyn KnowledgeRepoRead>>,
+    repo_write: Option<Arc<dyn KnowledgeRepoWrite>>,
+    /// Durable project scopes observed with a repo-owned knowledge directory
+    /// during the latest authorized reload or mutation.
+    repo_owned_projects: BTreeSet<String>,
     /// Request-local identity and provenance for detached visibility views.
     /// Empty on the mutable durable store.
     view_metadata: BTreeMap<String, KnowledgeViewMetadata>,
@@ -1146,31 +1151,71 @@ struct CheckoutMutationRestore {
     restore_after_write: bool,
 }
 
-fn mutation_uses_checkout_carrier(entry: &KnowledgeEntry, write_dir: Option<&str>) -> bool {
-    let Some(write_dir) = write_dir.map(str::trim).filter(|dir| !dir.is_empty()) else {
-        return false;
-    };
-    let Some(project) = entry
-        .project
-        .as_deref()
-        .map(str::trim)
-        .filter(|dir| !dir.is_empty())
-    else {
-        return true;
-    };
-    if write_dir == project {
-        return false;
-    }
-    match (
-        Path::new(write_dir).canonicalize(),
-        Path::new(project).canonicalize(),
-    ) {
-        (Ok(write_dir), Ok(project)) => write_dir != project,
-        _ => true,
-    }
-}
-
 impl Knowledge {
+    fn carrier_for_project(&self, project: &str) -> Option<&KnowledgeRepoCarrier> {
+        self.project_carriers
+            .iter()
+            .find(|carrier| carrier.project == project)
+    }
+
+    fn write_carrier(&self, project: &str, carrier_id: &str) -> Result<KnowledgeRepoCarrier> {
+        if let Some(base) = self
+            .carrier_for_project(project)
+            .filter(|base| base.carrier_id == carrier_id)
+        {
+            return Ok(base.clone());
+        }
+        KnowledgeRepoCarrier::new(project, carrier_id)
+    }
+
+    fn with_repo_read<T>(
+        &self,
+        carrier: &KnowledgeRepoCarrier,
+        mut operation: impl FnMut(&Path) -> Result<T>,
+    ) -> Result<T> {
+        let authority = self.repo_read.as_ref().with_context(|| {
+            format!(
+                "knowledge repository read authority is unavailable for carrier {}",
+                carrier.carrier_id
+            )
+        })?;
+        let mut result = None;
+        authority.with_read(carrier, &mut |root| {
+            result = Some(operation(root)?);
+            Ok(())
+        })?;
+        result.with_context(|| {
+            format!(
+                "knowledge repository read authority did not invoke operation for carrier {}",
+                carrier.carrier_id
+            )
+        })
+    }
+
+    fn with_repo_write<T>(
+        &self,
+        carrier: &KnowledgeRepoCarrier,
+        mut operation: impl FnMut(&Path) -> Result<T>,
+    ) -> Result<T> {
+        let authority = self.repo_write.as_ref().with_context(|| {
+            format!(
+                "knowledge repository write authority is unavailable for carrier {}",
+                carrier.carrier_id
+            )
+        })?;
+        let mut result = None;
+        authority.with_write(carrier, &mut |root| {
+            result = Some(operation(root)?);
+            Ok(())
+        })?;
+        result.with_context(|| {
+            format!(
+                "knowledge repository write authority did not invoke operation for carrier {}",
+                carrier.carrier_id
+            )
+        })
+    }
+
     fn install_checkout_mutation_seed(
         &mut self,
         id: &str,
@@ -1199,7 +1244,7 @@ impl Knowledge {
         Ok(Some(CheckoutMutationRestore {
             id: id.to_string(),
             prior,
-            restore_after_write: mutation_uses_checkout_carrier(seed, write_dir),
+            restore_after_write: self.mutation_uses_checkout_carrier_for_entry(seed, write_dir),
         }))
     }
 
@@ -1232,14 +1277,35 @@ impl Knowledge {
             .entries
             .iter()
             .find(|entry| entry.id == id)
-            .is_some_and(|entry| mutation_uses_checkout_carrier(entry, write_dir))
+            .is_some_and(|entry| self.mutation_uses_checkout_carrier_for_entry(entry, write_dir))
+    }
+
+    fn mutation_uses_checkout_carrier_for_entry(
+        &self,
+        entry: &KnowledgeEntry,
+        write_carrier_id: Option<&str>,
+    ) -> bool {
+        let Some(write_carrier_id) = write_carrier_id
+            .map(str::trim)
+            .filter(|carrier| !carrier.is_empty())
+        else {
+            return false;
+        };
+        let Some(project) = entry.project.as_deref() else {
+            return true;
+        };
+        self.carrier_for_project(project)
+            .is_none_or(|base| base.carrier_id != write_carrier_id)
     }
 
     pub fn open(store_path: &Path) -> Result<Self> {
         let mut k = Self {
             store_path: store_path.to_path_buf(),
             store: KnowledgeStore::new(),
-            project_roots: Vec::new(),
+            project_carriers: Vec::new(),
+            repo_read: None,
+            repo_write: None,
+            repo_owned_projects: BTreeSet::new(),
             view_metadata: BTreeMap::new(),
             path_fallback_cut: false,
         };
@@ -1247,20 +1313,50 @@ impl Knowledge {
         Ok(k)
     }
 
-    /// Register the repos whose committed `.bbox/knowledge/` should load into
-    /// the query surface, then reload so their entries are immediately visible.
-    /// Use `update_project_roots` instead when in-memory mutations are in flight
-    /// (e.g. during a rename migration) to avoid clobbering them with a reload.
-    pub fn set_project_roots(&mut self, roots: Vec<PathBuf>) -> Result<()> {
-        self.project_roots = roots;
+    /// Install repository I/O authorities and logical published carriers, then
+    /// reload so their entries are immediately visible.
+    pub fn configure_repo_io(
+        &mut self,
+        read: Arc<dyn KnowledgeRepoRead>,
+        write: Arc<dyn KnowledgeRepoWrite>,
+        carriers: Vec<KnowledgeRepoCarrier>,
+    ) -> Result<()> {
+        self.repo_read = Some(read);
+        self.repo_write = Some(write);
+        self.project_carriers = carriers;
         self.reload()
     }
 
-    /// Update the project roots list without reloading. Safe when the caller
-    /// has already adjusted in-memory entries to match the new roots (e.g. a
-    /// rename migration that just called `rename_project_refs`).
+    /// Update logical carriers without reloading. Safe when the caller has
+    /// already adjusted in-memory entries to match the new identities.
+    pub fn update_project_carriers(&mut self, carriers: Vec<KnowledgeRepoCarrier>) {
+        self.project_carriers = carriers;
+    }
+
+    #[cfg(test)]
+    pub fn set_project_roots(&mut self, roots: Vec<PathBuf>) -> Result<()> {
+        use crate::repo_io::test_support::TestKnowledgeRepoIo;
+
+        let carriers = roots
+            .into_iter()
+            .map(|root| {
+                let project = root.to_string_lossy().into_owned();
+                let carrier = KnowledgeRepoCarrier::new(project.clone(), project)?;
+                Ok((carrier, root))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let io = Arc::new(TestKnowledgeRepoIo::default());
+        io.replace(&carriers);
+        self.repo_read = Some(io.clone());
+        self.repo_write = Some(io);
+        self.project_carriers = carriers.into_iter().map(|(carrier, _)| carrier).collect();
+        self.reload()
+    }
+
+    #[cfg(test)]
     pub fn update_project_roots(&mut self, roots: Vec<PathBuf>) {
-        self.project_roots = roots;
+        self.set_project_roots(roots)
+            .expect("updating test knowledge project roots");
     }
 
     pub fn set_path_fallback_cut(&mut self, cut: bool) {
@@ -1317,7 +1413,7 @@ impl Knowledge {
         Ok(ids.len())
     }
 
-    fn central_snapshot(&self) -> KnowledgeStore {
+    fn central_snapshot(&self) -> Result<KnowledgeStore> {
         let mut central = KnowledgeStore::new();
         central.version = self.store.version;
         for e in &self.store.entries {
@@ -1334,16 +1430,18 @@ impl Knowledge {
         // consumers. `#[serde(skip)]` keeps it out of the persisted `kb.json`.
         central.built_from = self.store.built_from.clone();
         central.provenance = self.store.provenance.clone();
-        central
+        Ok(central)
     }
 
     /// The repo-owned directory that carries this entry's committed
     /// `.bbox/knowledge/<id>.json`, when one exists. Checkout-specific writes
     /// are routed explicitly by the mutation that owns them and never become
     /// a persistent carrier override here.
-    fn repo_owned_carrier(&self, e: &KnowledgeEntry) -> Option<String> {
+    fn repo_owned_carrier(&self, e: &KnowledgeEntry) -> Option<KnowledgeRepoCarrier> {
         let project = e.project.as_deref().filter(|d| !d.is_empty())?;
-        project_is_repo_owned(Path::new(project)).then(|| project.to_string())
+        self.repo_owned_projects
+            .contains(project)
+            .then(|| self.carrier_for_project(project).cloned())?
     }
 
     fn persist_repo_owned_entries(&self) -> Result<()> {
@@ -1351,24 +1449,26 @@ impl Knowledge {
         // (non-project) entries and is written by StorePersister. Project-scoped
         // entries for repo-owned projects stay synchronous one-file writes here,
         // grouped by their durable project directory.
-        let mut by_carrier: HashMap<PathBuf, Vec<&KnowledgeEntry>> = HashMap::new();
+        let mut by_carrier: BTreeMap<KnowledgeRepoCarrier, Vec<&KnowledgeEntry>> = BTreeMap::new();
         for e in &self.store.entries {
             let Some(carrier) = self.repo_owned_carrier(e) else {
                 continue;
             };
-            by_carrier
-                .entry(PathBuf::from(carrier))
-                .or_default()
-                .push(e);
+            by_carrier.entry(carrier).or_default().push(e);
         }
         // Purge only for projects whose repo entries we actually loaded (root is
         // tracked) — otherwise our in-memory set is not authoritative and
         // purging would delete committed entries that were never loaded.
-        let loaded: std::collections::HashSet<&Path> =
-            self.project_roots.iter().map(|p| p.as_path()).collect();
-        for (dir, entries) in &by_carrier {
-            let purge = loaded.contains(dir.as_path());
-            persist_repo_kb_entries(dir, entries, purge)?;
+        let loaded = self
+            .project_carriers
+            .iter()
+            .map(|carrier| carrier.carrier_id.as_str())
+            .collect::<BTreeSet<_>>();
+        for (carrier, entries) in &by_carrier {
+            let purge = loaded.contains(carrier.carrier_id.as_str());
+            self.with_repo_write(carrier, |root| {
+                persist_repo_kb_entries(root, entries, purge)
+            })?;
         }
         Ok(())
     }
@@ -1381,7 +1481,7 @@ impl Knowledge {
         ids: &[&str],
         write_dir: Option<&str>,
     ) -> Result<()> {
-        let Some(write_dir) = write_dir.map(str::trim).filter(|dir| !dir.is_empty()) else {
+        let Some(write_carrier_id) = write_dir.map(str::trim).filter(|dir| !dir.is_empty()) else {
             if self.path_fallback_cut
                 && ids.iter().any(|id| {
                     self.store
@@ -1412,70 +1512,86 @@ impl Knowledge {
         if entries.is_empty() {
             return Ok(());
         }
-        if !project_is_repo_owned(Path::new(write_dir)) {
-            anyhow::bail!(
-                "checkout knowledge carrier is unavailable at {write_dir}; refusing to retain provisional bytes centrally"
-            );
+        let project = entries[0]
+            .project
+            .as_deref()
+            .context("checkout knowledge mutation requires a durable project scope")?;
+        if entries
+            .iter()
+            .any(|entry| entry.project.as_deref() != Some(project))
+        {
+            anyhow::bail!("one knowledge mutation cannot span repository carriers");
         }
-        let project_dir = Path::new(write_dir);
-        let checkout_dir = match bbox_corpus_core::git::git_root_for_path(project_dir) {
-            Some(root) => root,
-            None => project_dir.canonicalize().with_context(|| {
-                format!(
-                    "resolving non-git knowledge transaction root at {}",
-                    project_dir.display()
-                )
-            })?,
-        };
-        let mut writes = Vec::new();
-        let mut stats = load_repo_kb_stats(project_dir);
-        for &entry in &entries {
-            if entry.recall_count > 0 || entry.last_recalled.is_some() {
-                stats.insert(
-                    entry.id.clone(),
-                    RecallStat {
-                        recall_count: entry.recall_count,
-                        last_recalled: entry.last_recalled.clone(),
-                    },
+        let carrier = self.write_carrier(project, write_carrier_id)?;
+        let persisted = self.with_repo_write(&carrier, |project_dir| {
+            if !project_is_repo_owned(project_dir) {
+                anyhow::bail!(
+                    "checkout knowledge carrier {} is unavailable; refusing to retain provisional bytes centrally",
+                    carrier.carrier_id
                 );
             }
-            let mut on_disk = entry.clone();
-            on_disk.project = None;
-            on_disk.recall_count = 0;
-            on_disk.last_recalled = None;
-            let path = repo_kb_dir(project_dir).join(format!("{}.json", entry.id));
-            let new_bytes = bbox_corpus_core::json_store::to_vec_pretty_newline(&on_disk)?;
-            if fs::read(&path)
-                .map(|current| current == new_bytes)
-                .unwrap_or(false)
-            {
-                continue;
+            let checkout_dir = match bbox_corpus_core::git::git_root_for_path(project_dir) {
+                Some(root) => root,
+                None => project_dir.canonicalize().with_context(|| {
+                    format!(
+                        "resolving non-git knowledge transaction root at {}",
+                        project_dir.display()
+                    )
+                })?,
+            };
+            let mut writes = Vec::new();
+            let mut stats = load_repo_kb_stats(project_dir);
+            for &entry in &entries {
+                if entry.recall_count > 0 || entry.last_recalled.is_some() {
+                    stats.insert(
+                        entry.id.clone(),
+                        RecallStat {
+                            recall_count: entry.recall_count,
+                            last_recalled: entry.last_recalled.clone(),
+                        },
+                    );
+                }
+                let mut on_disk = entry.clone();
+                on_disk.project = None;
+                on_disk.recall_count = 0;
+                on_disk.last_recalled = None;
+                let path = repo_kb_dir(project_dir).join(format!("{}.json", entry.id));
+                let new_bytes = bbox_corpus_core::json_store::to_vec_pretty_newline(&on_disk)?;
+                if fs::read(&path)
+                    .map(|current| current == new_bytes)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                writes.push(crate::transaction::TransactionWrite {
+                    target: path,
+                    new_bytes: Some(new_bytes),
+                });
             }
-            writes.push(crate::transaction::TransactionWrite {
-                target: path,
-                new_bytes: Some(new_bytes),
-            });
-        }
-        let persisted = crate::transaction::apply_transaction(&checkout_dir, writes);
+            crate::transaction::apply_transaction(&checkout_dir, writes)?;
+            persist_repo_kb_stats(project_dir, &stats)
+        });
         drop(entries);
-        if let Err(error) = persisted {
-            // The caller has already changed the mutable store. Reload the
-            // authoritative carriers before returning the write failure so a
-            // later unrelated save cannot publish a mutation that was reported
-            // as failed or race an unresolved transaction claim.
-            if let Err(reload_error) = self.reload() {
-                return Err(error.context(format!(
-                    "repo-owned knowledge transaction failed and in-memory rollback reload also failed: {reload_error:#}"
-                )));
+        match persisted {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // The caller has already changed the mutable store. Reload the
+                // authoritative carriers before returning the write failure so a
+                // later unrelated save cannot publish a mutation that was reported
+                // as failed or race an unresolved transaction claim.
+                if let Err(reload_error) = self.reload() {
+                    return Err(error.context(format!(
+                        "repo-owned knowledge transaction failed and in-memory rollback reload also failed: {reload_error:#}"
+                    )));
+                }
+                Err(error)
             }
-            return Err(error);
         }
-        persist_repo_kb_stats(project_dir, &stats)
     }
 
     #[cfg(test)]
     fn save(&self) -> Result<()> {
-        let central = self.central_snapshot();
+        let central = self.central_snapshot()?;
         bbox_corpus_core::json_store::atomic_write_json_locked(&self.store_path, &central)?;
         self.persist_repo_owned_entries()
     }
@@ -1505,9 +1621,9 @@ impl Knowledge {
     /// pre-migration central store that still carries project copies (they get
     /// dropped from central on the next save).
     fn load_project_entries(&mut self) -> Result<()> {
-        let roots = self.project_roots.clone();
+        let carriers = self.project_carriers.clone();
         // Fresh each reload: `built_from` is load-time provenance, so a root
-        // that dropped out of `project_roots` must not linger. `reload` already
+        // that dropped out of `project_carriers` must not linger. `reload` already
         // resets `self.store` (to a new store or a deserialized one whose
         // `built_from` is `#[serde(skip)]` → empty), so clearing here is belt +
         // suspenders against a caller that repopulates without a full reset.
@@ -1515,16 +1631,23 @@ impl Knowledge {
         // Provenance is load-time, per-reload state like built_from; clear so a
         // dropped root or a promoted entry does not keep a stale label.
         self.store.provenance.clear();
-        for root in &roots {
-            let durable_project = root.to_string_lossy().into_owned();
-            // The commit these committed entries were built from (design §3.4).
-            // Best-effort: `None` for a non-git root or a repo with no HEAD.
-            let head = bbox_corpus_core::git::current_head(root);
-            let (entries, prov) = load_repo_kb_entries(root)?;
+        self.repo_owned_projects.clear();
+        for carrier in &carriers {
+            let durable_project = carrier.project.clone();
+            let (head, entries, prov, repo_owned) = self.with_repo_read(carrier, |root| {
+                let (entries, provenance) = load_repo_kb_entries(root, &carrier.project)?;
+                Ok((
+                    bbox_corpus_core::git::current_head(root),
+                    entries,
+                    provenance,
+                    project_is_repo_owned(root),
+                ))
+            })?;
             // Repo-owned project state is reconstructed from its published
             // carrier. This also migrates old central snapshots that retained
             // worktree copies under the durable base project path.
-            if project_is_repo_owned(root) {
+            if repo_owned {
+                self.repo_owned_projects.insert(durable_project.clone());
                 self.store
                     .entries
                     .retain(|entry| entry.project.as_deref() != Some(durable_project.as_str()));
@@ -1538,9 +1661,7 @@ impl Knowledge {
                 }
             }
             if let Some(head) = head {
-                self.store
-                    .built_from
-                    .insert(root.to_string_lossy().into_owned(), head);
+                self.store.built_from.insert(durable_project, head);
             }
         }
         Ok(())
@@ -1586,7 +1707,7 @@ impl Knowledge {
         &self.store.entries
     }
 
-    /// Load-time `built_from` provenance: canonical project-root path → the
+    /// Load-time `built_from` provenance: durable project scope → the
     /// HEAD commit its committed entries were built from at the last reload
     /// (design §3.4). Recomputed each reload, never persisted. The commit a
     /// consumer reads to distinguish published from provisional.
@@ -1617,13 +1738,20 @@ impl Knowledge {
     /// `.bbox/knowledge/` dir is created first (this is what flips the
     /// `project_is_repo_owned` gate), then `save` routes the project's entries
     /// there and drops them from central. Idempotent. Returns the count moved.
-    pub fn eject_project_to_repo(&mut self, project_dir: &str) -> Result<usize> {
-        let count = self.count_project_entries(project_dir);
+    pub fn eject_project_to_repo(&mut self, project: &str) -> Result<usize> {
+        let count = self.count_project_entries(project);
         // Create .bbox/knowledge/ up front so the project is repo-owned and
         // `save` routes its entries there (even when there are zero to move,
         // this marks the project repo-owned for future writes).
-        fs::create_dir_all(repo_kb_dir(Path::new(project_dir)))
-            .with_context(|| format!("creating .bbox/knowledge under {project_dir}"))?;
+        let carrier = self
+            .carrier_for_project(project)
+            .cloned()
+            .with_context(|| format!("no knowledge repository carrier for project {project}"))?;
+        self.with_repo_write(&carrier, |root| {
+            fs::create_dir_all(repo_kb_dir(root))
+                .with_context(|| format!("creating repo-owned knowledge for {project}"))
+        })?;
+        self.repo_owned_projects.insert(project.to_string());
         self.persist_repo_owned_entries()?;
         Ok(count)
     }
@@ -1818,8 +1946,10 @@ impl Knowledge {
 
     /// `learn_result` with an explicit checkout carrier. The entry keeps
     /// `p.project` as its durable scope while its repo-owned file is written
-    /// under `write_dir`, then the provisional mutation is removed from the
-    /// central in-memory store. `None` preserves base/global behavior.
+    /// through the opaque logical id in `write_dir`, then the provisional
+    /// mutation is removed from the central in-memory store. The compatibility
+    /// parameter name is retained for callers; the value is never opened as a
+    /// path by this crate. `None` preserves base/global behavior.
     pub fn learn_result_with_write_dir(
         &mut self,
         p: &LearnParams,
@@ -1849,26 +1979,44 @@ impl Knowledge {
     /// repo-owned project's committed `.bbox/knowledge/`. Returns `None` for
     /// global/central entries (host-local, nothing to commit) or unknown ids.
     /// Read-only; safe to call after any learn/remember/decide write.
-    pub fn repo_record_rider(&self, id: &str) -> Option<String> {
-        let entry = self.store.entries.iter().find(|e| e.id == id)?;
+    pub fn repo_record_rider(&self, id: &str) -> Result<Option<String>> {
+        let Some(entry) = self.store.entries.iter().find(|e| e.id == id) else {
+            return Ok(None);
+        };
         if entry.scope != Scope::Project {
-            return None;
+            return Ok(None);
         }
-        let dir = self.repo_owned_carrier(entry)?;
-        let path = repo_kb_dir(Path::new(&dir)).join(format!("{id}.json"));
-        Some(bbox_util::util::repo_artifact_rider(&dir, &path))
+        let Some(carrier) = self.repo_owned_carrier(entry) else {
+            return Ok(None);
+        };
+        self.repo_record_rider_for_carrier(id, &carrier)
     }
 
     /// Commit-this rider for the explicit checkout that carried a just-written
     /// provisional entry. The file itself is the authority because checkout
     /// entries are intentionally absent from the central mutable store.
-    pub fn repo_record_rider_at(&self, id: &str, write_dir: Option<&str>) -> Option<String> {
-        let Some(dir) = write_dir.map(str::trim).filter(|dir| !dir.is_empty()) else {
+    pub fn repo_record_rider_at(
+        &self,
+        id: &str,
+        write_carrier: Option<&KnowledgeRepoCarrier>,
+    ) -> Result<Option<String>> {
+        let Some(carrier) = write_carrier else {
             return self.repo_record_rider(id);
         };
-        let path = repo_kb_dir(Path::new(dir)).join(format!("{id}.json"));
-        path.is_file()
-            .then(|| bbox_util::util::repo_artifact_rider(dir, &path))
+        self.repo_record_rider_for_carrier(id, carrier)
+    }
+
+    fn repo_record_rider_for_carrier(
+        &self,
+        id: &str,
+        carrier: &KnowledgeRepoCarrier,
+    ) -> Result<Option<String>> {
+        self.with_repo_read(carrier, |root| {
+            let path = repo_kb_dir(root).join(format!("{id}.json"));
+            Ok(path
+                .is_file()
+                .then(|| bbox_util::util::repo_artifact_rider(&root.to_string_lossy(), &path)))
+        })
     }
 
     fn learn_result_locked(
@@ -3503,7 +3651,10 @@ impl Knowledge {
         Self {
             store_path: PathBuf::new(),
             store,
-            project_roots: Vec::new(),
+            project_carriers: Vec::new(),
+            repo_read: None,
+            repo_write: None,
+            repo_owned_projects: BTreeSet::new(),
             view_metadata,
             path_fallback_cut: true,
         }
@@ -3683,6 +3834,39 @@ mod tests {
     use bbox_stores::store_persister::StorePersister;
     use parking_lot::RwLock;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingRepoIo {
+        root: PathBuf,
+        reads: AtomicUsize,
+        writes: AtomicUsize,
+        deny_writes: bool,
+    }
+
+    impl KnowledgeRepoRead for CountingRepoIo {
+        fn with_read(
+            &self,
+            _carrier: &KnowledgeRepoCarrier,
+            operation: &mut dyn FnMut(&Path) -> Result<()>,
+        ) -> Result<()> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            operation(&self.root)
+        }
+    }
+
+    impl KnowledgeRepoWrite for CountingRepoIo {
+        fn with_write(
+            &self,
+            _carrier: &KnowledgeRepoCarrier,
+            operation: &mut dyn FnMut(&Path) -> Result<()>,
+        ) -> Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            if self.deny_writes {
+                anyhow::bail!("test write authority denied");
+            }
+            operation(&self.root)
+        }
+    }
 
     fn mk_kb() -> (tempfile::TempDir, Knowledge) {
         let dir = tempfile::tempdir().unwrap();
@@ -3764,6 +3948,38 @@ mod tests {
             recall_count: 0,
             last_recalled: None,
         }
+    }
+
+    #[test]
+    fn recall_telemetry_requires_repository_write_authority() {
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let project = "project:test".to_string();
+        let carrier = KnowledgeRepoCarrier::new(&project, "checkout:test").unwrap();
+        let dir = repo_kb_dir(&root);
+        fs::create_dir_all(&dir).unwrap();
+        let on_disk = entry("recall001", "Recall", "content", Scope::Project);
+        bbox_corpus_core::json_store::atomic_write_json_locked(
+            &dir.join("recall001.json"),
+            &on_disk,
+        )
+        .unwrap();
+        let io = Arc::new(CountingRepoIo {
+            root,
+            reads: AtomicUsize::new(0),
+            writes: AtomicUsize::new(0),
+            deny_writes: true,
+        });
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        kb.configure_repo_io(io.clone(), io.clone(), vec![carrier])
+            .unwrap();
+
+        let error = kb.record_recall(&["recall001".into()]).unwrap_err();
+
+        assert!(error.to_string().contains("write authority denied"));
+        assert_eq!(io.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(io.writes.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -4137,11 +4353,15 @@ mod tests {
 
         // The central store and mutable base view do not retain provisional
         // bytes. The commit rider is derived from the explicit checkout file.
-        let central = kb.central_snapshot();
+        let central = kb.central_snapshot().unwrap();
         assert!(!central.entries.iter().any(|e| e.id == id));
         assert!(kb.entry(&id).is_none());
+        let worktree_carrier =
+            KnowledgeRepoCarrier::new(base_root.to_string_lossy(), wt_root.to_string_lossy())
+                .unwrap();
         let rider = kb
-            .repo_record_rider_at(&id, Some(wt_root.to_str().unwrap()))
+            .repo_record_rider_at(&id, Some(&worktree_carrier))
+            .expect("rider access should succeed")
             .expect("rider for repo-owned entry");
         assert!(
             rider.contains(&format!("{id}.json")),
@@ -4411,7 +4631,7 @@ mod tests {
         std::fs::copy(&wt_file, &base_file).unwrap();
         kb.reload().unwrap();
         assert!(kb.entry(&id).is_some());
-        let central_snapshot = kb.central_snapshot();
+        let central_snapshot = kb.central_snapshot().unwrap();
         assert!(
             !central_snapshot.entries.iter().any(|e| e.id == id),
             "merged entry must leave the central store"
@@ -4456,6 +4676,7 @@ mod tests {
         assert!(kb.entry(&id).is_none());
         assert!(
             !kb.central_snapshot()
+                .unwrap()
                 .entries
                 .iter()
                 .any(|entry| entry.id == id)
@@ -4500,7 +4721,11 @@ mod tests {
             "dead-worktree redirect must not fall back to a base-checkout write"
         );
         assert!(
-            !kb.central_snapshot().entries.iter().any(|e| e.id == id),
+            !kb.central_snapshot()
+                .unwrap()
+                .entries
+                .iter()
+                .any(|e| e.id == id),
             "dead checkout must not leave a central retention copy"
         );
     }
@@ -5328,6 +5553,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         // Rider is repo-relative — actionable from the worktree cwd, no absolute leak.
         let rider = kb
             .repo_record_rider(&id)
+            .expect("rider access should succeed")
             .expect("committed entry should rider");
         assert!(
             rider.contains(&format!("git add .bbox/knowledge/{id}.json")),
@@ -5370,6 +5596,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             .id;
         let rider = kb
             .repo_record_rider(&proj_id)
+            .expect("rider access should succeed")
             .expect("committed project entry should rider");
         let rel = format!(".bbox/knowledge/{proj_id}.json");
         assert!(
@@ -5407,10 +5634,10 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             .unwrap()
             .id;
         assert!(
-            kb.repo_record_rider(&global_id).is_none(),
+            kb.repo_record_rider(&global_id).unwrap().is_none(),
             "global entry must not rider a commit"
         );
-        assert!(kb.repo_record_rider("nonexistent").is_none());
+        assert!(kb.repo_record_rider("nonexistent").unwrap().is_none());
     }
 
     #[test]
@@ -5594,7 +5821,8 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         );
 
         // Reload merges telemetry back onto the recall-free committed entry.
-        let (loaded, _prov) = load_repo_kb_entries(&repo_root).unwrap();
+        let (loaded, _prov) =
+            load_repo_kb_entries(&repo_root, &repo_root.to_string_lossy()).unwrap();
         let e = loaded.iter().find(|e| e.id == "recl0001").unwrap();
         assert_eq!(e.recall_count, 99);
         assert_eq!(e.last_recalled.as_deref(), Some("2026-05-31T00:00:00Z"));

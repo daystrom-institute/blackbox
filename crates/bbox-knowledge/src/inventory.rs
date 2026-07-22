@@ -32,6 +32,7 @@ use bbox_corpus_core::json_store::atomic_write_json_locked;
 use serde::{Deserialize, Serialize};
 
 use crate::knowledge::{KnowledgeEntry, Scope};
+use crate::repo_io::{KnowledgeRepoCarrier, KnowledgeRepoRead, KnowledgeRepoWrite};
 
 /// The current identity schema epoch. Bumped only when the durable-key scheme
 /// changes in a way that requires a fresh inventory. Epoch 1 is the
@@ -52,6 +53,10 @@ pub struct ResolvedKey {
 pub enum QuarantineReason {
     /// A project-scoped entry with no `project` path — nothing to resolve.
     NoProjectPath,
+    /// No logical repository carrier was configured for the durable project.
+    NoProjectCarrier,
+    /// The repository authority refused or could not resolve the carrier.
+    RepoAccessUnavailable,
     /// No durable `repo_id` reachable: no override, no recorded id, no aka id,
     /// and no computed bootstrap hash (e.g. the project root is gone).
     NoResolvableRepoId,
@@ -79,6 +84,8 @@ impl QuarantineReason {
     pub fn as_str(&self) -> &'static str {
         match self {
             QuarantineReason::NoProjectPath => "no_project_path",
+            QuarantineReason::NoProjectCarrier => "no_project_carrier",
+            QuarantineReason::RepoAccessUnavailable => "repo_access_unavailable",
             QuarantineReason::NoResolvableRepoId => "no_resolvable_repo_id",
             QuarantineReason::NotAGitRepo => "not_a_git_repo",
             QuarantineReason::ProjectRootOutsideGitRoot => "project_root_outside_git_root",
@@ -261,6 +268,8 @@ pub fn persist_path_fallback_cut(state_dir: &Path) -> Result<PathBuf> {
 /// persisted flag.
 pub fn inventory_project_entries(
     entries: &[KnowledgeEntry],
+    carriers: &[KnowledgeRepoCarrier],
+    repo_read: &dyn KnowledgeRepoRead,
     resolve_inputs: impl Fn(&Path) -> RepoIdInputs,
 ) -> KnowledgeInventory {
     let mut inv = KnowledgeInventory {
@@ -281,30 +290,41 @@ pub fn inventory_project_entries(
             });
             continue;
         };
-        let project_path = Path::new(project);
-        let inputs = resolve_inputs(project_path);
-        let Some(repo_id) = resolve_repo_id(&inputs) else {
+        let Some(carrier) = carriers.iter().find(|carrier| carrier.project == project) else {
             inv.quarantined
-                .push(row(entry, QuarantineReason::NoResolvableRepoId));
+                .push(row(entry, QuarantineReason::NoProjectCarrier));
             continue;
         };
-        let Some(git_root) = git::git_root_for_path(project_path) else {
-            inv.quarantined
-                .push(row(entry, QuarantineReason::NotAGitRepo));
-            continue;
-        };
-        let Some(relpath) = bbox_root_relpath(&git_root, project_path) else {
-            inv.quarantined
-                .push(row(entry, QuarantineReason::ProjectRootOutsideGitRoot));
-            continue;
-        };
-        inv.resolved.insert(
-            entry.id.clone(),
-            ResolvedKey {
+        let mut resolution = None;
+        let access = repo_read.with_read(carrier, &mut |project_root| {
+            let inputs = resolve_inputs(project_root);
+            let Some(repo_id) = resolve_repo_id(&inputs) else {
+                resolution = Some(Err(QuarantineReason::NoResolvableRepoId));
+                return Ok(());
+            };
+            let Some(git_root) = git::git_root_for_path(project_root) else {
+                resolution = Some(Err(QuarantineReason::NotAGitRepo));
+                return Ok(());
+            };
+            let Some(relpath) = bbox_root_relpath(&git_root, project_root) else {
+                resolution = Some(Err(QuarantineReason::ProjectRootOutsideGitRoot));
+                return Ok(());
+            };
+            resolution = Some(Ok(ResolvedKey {
                 repo_id,
                 bbox_root_relpath: relpath,
-            },
-        );
+            }));
+            Ok(())
+        });
+        match (access, resolution) {
+            (Ok(()), Some(Ok(key))) => {
+                inv.resolved.insert(entry.id.clone(), key);
+            }
+            (Ok(()), Some(Err(reason))) => inv.quarantined.push(row(entry, reason)),
+            _ => inv
+                .quarantined
+                .push(row(entry, QuarantineReason::RepoAccessUnavailable)),
+        }
     }
     inv
 }
@@ -322,11 +342,20 @@ pub fn inventory_project_entries(
 /// [`persist_schema_epoch_inventory_read_only`] instead.
 pub fn persist_schema_epoch_inventory(
     entries: &[KnowledgeEntry],
-    project_roots: &[PathBuf],
+    carriers: &[KnowledgeRepoCarrier],
     state_dir: &Path,
+    repo_read: &dyn KnowledgeRepoRead,
+    repo_write: &dyn KnowledgeRepoWrite,
     resolve_inputs: impl Fn(&Path) -> RepoIdInputs,
 ) -> Result<PersistedInventoryReport> {
-    persist_schema_epoch_inventory_inner(entries, project_roots, state_dir, resolve_inputs, true)
+    persist_schema_epoch_inventory_inner(
+        entries,
+        carriers,
+        state_dir,
+        repo_read,
+        Some(repo_write),
+        resolve_inputs,
+    )
 }
 
 /// Persist host-local inventory and quarantine ledgers without modifying any
@@ -334,21 +363,31 @@ pub fn persist_schema_epoch_inventory(
 /// missing marker remains an explicit operator migration task.
 pub fn persist_schema_epoch_inventory_read_only(
     entries: &[KnowledgeEntry],
-    project_roots: &[PathBuf],
+    carriers: &[KnowledgeRepoCarrier],
     state_dir: &Path,
+    repo_read: &dyn KnowledgeRepoRead,
     resolve_inputs: impl Fn(&Path) -> RepoIdInputs,
 ) -> Result<PersistedInventoryReport> {
-    persist_schema_epoch_inventory_inner(entries, project_roots, state_dir, resolve_inputs, false)
+    persist_schema_epoch_inventory_inner(
+        entries,
+        carriers,
+        state_dir,
+        repo_read,
+        None,
+        resolve_inputs,
+    )
 }
 
 fn persist_schema_epoch_inventory_inner(
     entries: &[KnowledgeEntry],
-    project_roots: &[PathBuf],
+    carriers: &[KnowledgeRepoCarrier],
     state_dir: &Path,
+    repo_read: &dyn KnowledgeRepoRead,
+    repo_write: Option<&dyn KnowledgeRepoWrite>,
     resolve_inputs: impl Fn(&Path) -> RepoIdInputs,
-    write_repo_markers: bool,
 ) -> Result<PersistedInventoryReport> {
-    let mut inventory = inventory_project_entries(entries, |path| resolve_inputs(path));
+    let mut inventory =
+        inventory_project_entries(entries, carriers, repo_read, |path| resolve_inputs(path));
     let quarantine_entries = inventory
         .quarantined
         .iter()
@@ -369,29 +408,93 @@ fn persist_schema_epoch_inventory_inner(
     let quarantine_path = state_dir.join(QUARANTINE_LEDGER);
     let mut quarantined_files = Vec::new();
     let mut marked_scopes = Vec::new();
-    for project_root in project_roots {
-        let project_root = project_root
-            .canonicalize()
-            .unwrap_or_else(|_| project_root.clone());
-        let knowledge_dir = project_root.join(".bbox").join("knowledge");
-        if !knowledge_dir.is_dir() {
+    for carrier in carriers {
+        let mut outcome = None;
+        let mut operation = |project_root: &Path| -> Result<()> {
+            let knowledge_dir = project_root.join(".bbox").join("knowledge");
+            if !knowledge_dir.is_dir() {
+                outcome = Some(None);
+                return Ok(());
+            }
+            let inputs = resolve_inputs(project_root);
+            let Some(repo_id) = resolve_recorded_repo_id(&inputs) else {
+                outcome = Some(None);
+                return Ok(());
+            };
+            let Some(git_root) = git::git_root_for_path(project_root) else {
+                outcome = Some(None);
+                return Ok(());
+            };
+            let Some(relpath) = bbox_root_relpath(&git_root, project_root) else {
+                outcome = Some(None);
+                return Ok(());
+            };
+            let scope = PublishedScope {
+                repo_id,
+                bbox_root_relpath: relpath,
+            };
+            let scope_file_quarantine =
+                inspect_repo_owned_files(project_root, &carrier.project, entries);
+            let files_clean = scope_file_quarantine.is_empty();
+            let clean = files_clean
+                && entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.scope == Scope::Project
+                            && entry.project.as_deref() == Some(carrier.project.as_str())
+                    })
+                    .all(|entry| {
+                        inventory.resolved.get(&entry.id)
+                            == Some(&ResolvedKey {
+                                repo_id: scope.repo_id.clone(),
+                                bbox_root_relpath: scope.bbox_root_relpath.clone(),
+                            })
+                    });
+            if !clean {
+                outcome = Some(Some((scope, scope_file_quarantine, false)));
+                return Ok(());
+            }
+            let marker_path = knowledge_dir.join(SCHEMA_EPOCH_MARKER);
+            let marker = SchemaEpochMarker {
+                schema_epoch: SCHEMA_EPOCH,
+                repo_id: scope.repo_id.clone(),
+                bbox_root_relpath: scope.bbox_root_relpath.clone(),
+            };
+            let marker_present = if repo_write.is_some() {
+                write_json_if_changed(&marker_path, &marker)?;
+                true
+            } else {
+                std::fs::read(&marker_path)
+                    .ok()
+                    .and_then(|raw| serde_json::from_slice::<SchemaEpochMarker>(&raw).ok())
+                    .is_some_and(|existing| existing == marker)
+            };
+            outcome = Some(Some((scope, scope_file_quarantine, marker_present)));
+            Ok(())
+        };
+        let access = match repo_write {
+            Some(write) => write.with_write(carrier, &mut operation),
+            None => repo_read.with_read(carrier, &mut operation),
+        };
+        drop(operation);
+        if let Err(err) = access {
+            let file = QuarantinedKnowledgeFile {
+                project: carrier.project.clone(),
+                path: ".bbox/knowledge".into(),
+                reason: QuarantineReason::RepoAccessUnavailable,
+                detail: err.to_string(),
+            };
+            inventory.quarantined.push(QuarantineRow {
+                entry_id: "<repo-scope>".into(),
+                project: Some(carrier.project.clone()),
+                reason: file.reason.clone(),
+            });
+            quarantined_files.push(file);
             continue;
         }
-        let inputs = resolve_inputs(&project_root);
-        let Some(repo_id) = resolve_recorded_repo_id(&inputs) else {
+        let Some(Some((scope, scope_file_quarantine, marker_present))) = outcome else {
             continue;
         };
-        let Some(git_root) = git::git_root_for_path(&project_root) else {
-            continue;
-        };
-        let Some(relpath) = bbox_root_relpath(&git_root, &project_root) else {
-            continue;
-        };
-        let scope = PublishedScope {
-            repo_id,
-            bbox_root_relpath: relpath,
-        };
-        let scope_file_quarantine = inspect_repo_owned_files(&project_root, entries);
         for file in &scope_file_quarantine {
             inventory.quarantined.push(QuarantineRow {
                 entry_id: Path::new(&file.path)
@@ -403,41 +506,7 @@ fn persist_schema_epoch_inventory_inner(
                 reason: file.reason.clone(),
             });
         }
-        let files_clean = scope_file_quarantine.is_empty();
         quarantined_files.extend(scope_file_quarantine);
-        let scoped_entries = entries.iter().filter(|entry| {
-            entry.scope == Scope::Project
-                && entry
-                    .project
-                    .as_deref()
-                    .is_some_and(|project| project_path_matches(project, &project_root))
-        });
-        let clean = files_clean
-            && scoped_entries.into_iter().all(|entry| {
-                inventory.resolved.get(&entry.id)
-                    == Some(&ResolvedKey {
-                        repo_id: scope.repo_id.clone(),
-                        bbox_root_relpath: scope.bbox_root_relpath.clone(),
-                    })
-            });
-        if !clean {
-            continue;
-        }
-        let marker_path = knowledge_dir.join(SCHEMA_EPOCH_MARKER);
-        let marker = SchemaEpochMarker {
-            schema_epoch: SCHEMA_EPOCH,
-            repo_id: scope.repo_id.clone(),
-            bbox_root_relpath: scope.bbox_root_relpath.clone(),
-        };
-        let marker_present = if write_repo_markers {
-            write_json_if_changed(&marker_path, &marker)?;
-            true
-        } else {
-            std::fs::read(&marker_path)
-                .ok()
-                .and_then(|raw| serde_json::from_slice::<SchemaEpochMarker>(&raw).ok())
-                .is_some_and(|existing| existing == marker)
-        };
         if marker_present {
             marked_scopes.push(scope);
         }
@@ -494,16 +563,17 @@ fn persist_schema_epoch_inventory_inner(
 
 fn inspect_repo_owned_files(
     project_root: &Path,
+    durable_project: &str,
     loaded_entries: &[KnowledgeEntry],
 ) -> Vec<QuarantinedKnowledgeFile> {
     let knowledge_dir = project_root.join(".bbox").join("knowledge");
-    let project = project_root.to_string_lossy().into_owned();
+    let project = durable_project.to_string();
     let read_dir = match std::fs::read_dir(&knowledge_dir) {
         Ok(read_dir) => read_dir,
         Err(err) => {
             return vec![QuarantinedKnowledgeFile {
                 project,
-                path: knowledge_dir.to_string_lossy().into_owned(),
+                path: ".bbox/knowledge".into(),
                 reason: QuarantineReason::UnreadableRepoEntry,
                 detail: err.to_string(),
             }];
@@ -516,7 +586,7 @@ fn inspect_repo_owned_files(
             Err(err) => {
                 quarantined.push(QuarantinedKnowledgeFile {
                     project: project.clone(),
-                    path: knowledge_dir.to_string_lossy().into_owned(),
+                    path: ".bbox/knowledge".into(),
                     reason: QuarantineReason::UnreadableRepoEntry,
                     detail: err.to_string(),
                 });
@@ -527,7 +597,11 @@ fn inspect_repo_owned_files(
         if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
             continue;
         }
-        let path_string = path.to_string_lossy().into_owned();
+        let path_string = path
+            .strip_prefix(project_root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) if !metadata.file_type().is_symlink() => metadata,
             Ok(_) => {
@@ -616,10 +690,7 @@ fn inspect_repo_owned_files(
         if !loaded_entries.iter().any(|entry| {
             entry.id == parsed.id
                 && entry.scope == Scope::Project
-                && entry
-                    .project
-                    .as_deref()
-                    .is_some_and(|path| project_path_matches(path, project_root))
+                && entry.project.as_deref() == Some(durable_project)
         }) {
             quarantined.push(QuarantinedKnowledgeFile {
                 project: project.clone(),
@@ -634,14 +705,6 @@ fn inspect_repo_owned_files(
     }
     quarantined.sort_by(|left, right| left.path.cmp(&right.path));
     quarantined
-}
-
-fn project_path_matches(raw: &str, project_root: &Path) -> bool {
-    let raw = Path::new(raw);
-    raw == project_root
-        || raw
-            .canonicalize()
-            .is_ok_and(|canonical| canonical == project_root)
 }
 
 fn write_json_if_changed(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -665,7 +728,47 @@ fn row(entry: &KnowledgeEntry, reason: QuarantineReason) -> QuarantineRow {
 mod tests {
     use super::*;
     use crate::knowledge::{Approval, Category, Priority, Scope, Status};
-    use std::path::Path;
+    use crate::repo_io::test_support::TestKnowledgeRepoIo;
+    use std::path::{Path, PathBuf};
+
+    fn test_access(roots: &[PathBuf]) -> (TestKnowledgeRepoIo, Vec<KnowledgeRepoCarrier>) {
+        let pairs = roots
+            .iter()
+            .map(|root| {
+                let project = root.to_string_lossy().into_owned();
+                (
+                    KnowledgeRepoCarrier::new(project.clone(), project).unwrap(),
+                    root.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let io = TestKnowledgeRepoIo::default();
+        io.replace(&pairs);
+        let carriers = pairs.into_iter().map(|(carrier, _)| carrier).collect();
+        (io, carriers)
+    }
+
+    fn inventory_for_test(
+        entries: &[KnowledgeEntry],
+        resolve_inputs: impl Fn(&Path) -> RepoIdInputs,
+    ) -> KnowledgeInventory {
+        let roots = entries
+            .iter()
+            .filter_map(|entry| entry.project.as_ref().map(PathBuf::from))
+            .collect::<Vec<_>>();
+        let (io, carriers) = test_access(&roots);
+        inventory_project_entries(entries, &carriers, &io, resolve_inputs)
+    }
+
+    fn persist_for_test(
+        entries: &[KnowledgeEntry],
+        roots: &[PathBuf],
+        state_dir: &Path,
+        resolve_inputs: impl Fn(&Path) -> RepoIdInputs,
+    ) -> Result<PersistedInventoryReport> {
+        let (io, carriers) = test_access(roots);
+        persist_schema_epoch_inventory(entries, &carriers, state_dir, &io, &io, resolve_inputs)
+    }
 
     fn project_entry(id: &str, project: Option<&str>) -> KnowledgeEntry {
         KnowledgeEntry {
@@ -736,7 +839,7 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         git_repo(&root);
         let entries = vec![project_entry("e1", Some(root.to_str().unwrap()))];
-        let inv = inventory_project_entries(&entries, |_| recorded("repofam"));
+        let inv = inventory_for_test(&entries, |_| recorded("repofam"));
         assert!(inv.is_covered());
         assert_eq!(inv.schema_epoch, SCHEMA_EPOCH);
         let key = inv.resolved.get("e1").unwrap();
@@ -752,7 +855,7 @@ mod tests {
         let sub = root.join("services").join("api");
         std::fs::create_dir_all(&sub).unwrap();
         let entries = vec![project_entry("e1", Some(sub.to_str().unwrap()))];
-        let inv = inventory_project_entries(&entries, |_| recorded("repofam"));
+        let inv = inventory_for_test(&entries, |_| recorded("repofam"));
         let key = inv.resolved.get("e1").unwrap();
         assert_eq!(key.repo_id, "repofam");
         assert_eq!(key.bbox_root_relpath, "services/api");
@@ -765,7 +868,7 @@ mod tests {
         git_repo(&root);
         let entries = vec![project_entry("e1", Some(root.to_str().unwrap()))];
         // Empty inputs → no override/recorded/aka/computed → no repo_id.
-        let inv = inventory_project_entries(&entries, |_| RepoIdInputs::default());
+        let inv = inventory_for_test(&entries, |_| RepoIdInputs::default());
         assert!(!inv.is_covered());
         assert_eq!(inv.quarantined.len(), 1);
         assert_eq!(
@@ -781,7 +884,7 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         // No git init.
         let entries = vec![project_entry("e1", Some(root.to_str().unwrap()))];
-        let inv = inventory_project_entries(&entries, |_| recorded("repofam"));
+        let inv = inventory_for_test(&entries, |_| recorded("repofam"));
         assert_eq!(inv.quarantined.len(), 1);
         assert_eq!(inv.quarantined[0].reason, QuarantineReason::NotAGitRepo);
     }
@@ -789,7 +892,7 @@ mod tests {
     #[test]
     fn quarantines_missing_project_path() {
         let entries = vec![project_entry("e1", None)];
-        let inv = inventory_project_entries(&entries, |_| recorded("repofam"));
+        let inv = inventory_for_test(&entries, |_| recorded("repofam"));
         assert_eq!(inv.quarantined.len(), 1);
         assert_eq!(inv.quarantined[0].reason, QuarantineReason::NoProjectPath);
     }
@@ -803,7 +906,7 @@ mod tests {
             global_entry("g1"),
             project_entry("e1", Some(root.to_str().unwrap())),
         ];
-        let inv = inventory_project_entries(&entries, |_| recorded("repofam"));
+        let inv = inventory_for_test(&entries, |_| recorded("repofam"));
         assert_eq!(inv.skipped_global, 1);
         assert_eq!(inv.resolved.len(), 1);
         assert!(inv.is_covered());
@@ -815,7 +918,7 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         git_repo(&root);
         let entries = vec![project_entry("e1", Some(root.to_str().unwrap()))];
-        let inv = inventory_project_entries(&entries, |_| RepoIdInputs {
+        let inv = inventory_for_test(&entries, |_| RepoIdInputs {
             project_key_override: Some("ovr".into()),
             recorded: Some("rec".into()),
             ..Default::default()
@@ -835,11 +938,10 @@ mod tests {
             project_entry("project", Some(root.to_str().unwrap())),
         ];
 
-        let report =
-            persist_schema_epoch_inventory(&entries, std::slice::from_ref(&root), &state, |_| {
-                recorded("repofam")
-            })
-            .unwrap();
+        let report = persist_for_test(&entries, std::slice::from_ref(&root), &state, |_| {
+            recorded("repofam")
+        })
+        .unwrap();
         assert_eq!(report.marked_scopes.len(), 1);
         let marker: SchemaEpochMarker = serde_json::from_slice(
             &std::fs::read(root.join(".bbox/knowledge/.schema-epoch")).unwrap(),
@@ -860,7 +962,7 @@ mod tests {
         assert!(quarantine.files.is_empty());
 
         let before = std::fs::read(&report.inventory_path).unwrap();
-        persist_schema_epoch_inventory(&entries, std::slice::from_ref(&root), &state, |_| {
+        persist_for_test(&entries, std::slice::from_ref(&root), &state, |_| {
             recorded("repofam")
         })
         .unwrap();
@@ -876,11 +978,10 @@ mod tests {
         let state = root.join("state");
         let entries = vec![project_entry("orphan", Some(root.to_str().unwrap()))];
 
-        let report =
-            persist_schema_epoch_inventory(&entries, std::slice::from_ref(&root), &state, |_| {
-                RepoIdInputs::default()
-            })
-            .unwrap();
+        let report = persist_for_test(&entries, std::slice::from_ref(&root), &state, |_| {
+            RepoIdInputs::default()
+        })
+        .unwrap();
         assert!(report.marked_scopes.is_empty());
         assert!(!root.join(".bbox/knowledge/.schema-epoch").exists());
         let quarantine: QuarantineLedgerStore =
@@ -916,8 +1017,7 @@ mod tests {
         let state = root.join("state");
 
         let report =
-            persist_schema_epoch_inventory(&[], &[root.clone()], &state, |_| recorded("repofam"))
-                .unwrap();
+            persist_for_test(&[], &[root.clone()], &state, |_| recorded("repofam")).unwrap();
 
         assert!(!report.inventory.is_covered());
         assert!(report.marked_scopes.is_empty());
