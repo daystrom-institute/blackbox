@@ -398,11 +398,11 @@ generation stays active until verification completes.
 
 This cache accepts a bounded bit-rot detection window when bytes change without
 observable metadata changing. A low-priority scrub rehashes every blob
-referenced by an active generation at least once per 24 hours. A mismatch
-quarantines the blob, marks the source generation degraded, and requests the
-hash on the producer's next negotiation. Already materialized search documents
-remain readable while the prior verified source is repaired; no rebuild from
-the corrupt blob is allowed.
+referenced by an active or retained generation at least once per 24 hours. A
+mismatch quarantines the blob, marks every referencing generation degraded,
+and requests the hash on the producer's next negotiation. Already materialized
+search documents remain readable while the prior verified source is repaired;
+no rebuild or replay from the corrupt blob is allowed.
 
 ## 9. Corpus-side source abstraction and indexing
 
@@ -443,13 +443,14 @@ Legacy local behavior remains compatible during overlap.
 
 Every project-file document also carries an exact
 `code_source_entry_key = SHA-256(selector, relative_path)` term encoded as the
-full 64-character lowercase hexadecimal digest. It must not reuse the existing
-four-byte `short_hash`. Local indexing unconditionally deletes the exact entry
-key before every add, even when metadata has been lost, and local deletion uses
-the same term. It never uses the shared compatibility `file_path`. Collected
-staging deletes only the exact collected selector before re-adding it. The
-compatibility path remains a stored/searchable display value, not a lifecycle
-key.
+full 64-character lowercase hexadecimal digest. The hash input uses the same
+length-prefixed field encoding as the manifest digest in section 6.1 and must
+not reuse the existing four-byte `short_hash`. Local indexing unconditionally
+deletes the exact entry key before every add, even when metadata has been lost,
+and local deletion uses the same term. It never uses the shared compatibility
+`file_path`. Collected staging deletes only the exact collected selector before
+re-adding it. The compatibility path remains a stored/searchable display value,
+not a lifecycle key.
 
 ### 9.2 Active search selector
 
@@ -499,6 +500,9 @@ Finalization does not immediately change readers. The indexing actor performs:
    selector yet.
 3. Commit the staged Tantivy documents in one writer commit. Repeated staging
    is safe because it first deletes only the exact new selector term.
+   Activation metadata records the committed document count and a full
+   SHA-256 digest over the sorted stored entity ids for later preservation
+   checks.
 4. Build a prospective `EdgeIndex` from an in-memory manifest index selecting
    the new snapshot, and build the corresponding active-selector map.
 5. Under the project activation lock, confirm the generation is still newest,
@@ -572,6 +576,24 @@ A full rebuild deletes all documents, then reconstructs only:
 - the current local snapshot for local-owned projects;
 - existing non-project-file corpus lanes and provisional knowledge documents.
 
+There is one fail-safe preservation lane before `delete_all_documents`. For an
+active collected selector whose generation is degraded because a blob is
+missing or quarantined, the pass reads its already materialized Tantivy
+documents from the current committed index and verifies their complete count
+and entity inventory against activation metadata. It re-adds that immutable
+document set in the same full-rebuild commit and does not open the bad blob. If
+the inventory cannot be proven complete, the full pass fails before commit and
+the prior index remains active. It never commits a rebuild that silently drops
+a previously active collected scope. The summary and health state report every
+preserved degraded selector. This follows the existing provisional-knowledge
+read-back pattern but is keyed by the exact active source selector.
+
+The initial Phase 0 schema bump happens before collector activation is enabled,
+so no collected generation can require cross-schema preservation during that
+one-time reset. A future schema migration with collected scopes must provide an
+explicit compatible export/import path or stay unready; it may not bypass this
+preservation rule.
+
 If a ready generation was staged but not active, a full rebuild may discard its
 staged documents. The activation reconciler detects the missing selector and
 restages it. The active generation remains reconstructible from immutable
@@ -581,12 +603,15 @@ Git-history indexing stays a separately named local phase in this slice. It is
 not fed a synthetic checkout path, but it does receive
 `current_chunk_targets` derived from whichever source snapshot is active. For a
 collected scope, the map contains repo-relative paths and V2 refs from the
-collected generation. The local Git reader can therefore preserve and refresh
-`COMMIT_TOUCHED_FILE` edges, including during `force_full`, while its remaining
-`.git` checkout dependency stays explicit. Health reports the local history
-HEAD and collected HEAD separately and warns when the local clone does not
-contain the collected HEAD. Reindex summaries report local-history and
-collected-current-file work separately.
+collected generation. "Repo-relative" is exact: for a non-root published scope,
+the map key prefixes each scope-relative manifest path with the normalized
+`bbox_root_relpath`; `.` is the identity prefix. This matches the repository-root
+paths emitted by `git diff-tree --name-only`. The local Git reader can therefore
+preserve and refresh `COMMIT_TOUCHED_FILE` edges, including during `force_full`,
+while its remaining `.git` checkout dependency stays explicit. Health reports
+the local history HEAD and collected HEAD separately and warns when the local
+clone does not contain the collected HEAD. Reindex summaries report
+local-history and collected-current-file work separately.
 
 A lagging local clone does not fail collected-file activation. The Git phase
 indexes only commits reachable in that clone up to its local HEAD and joins
@@ -758,7 +783,11 @@ Unit and integration coverage must include:
   exact manifest document counts while removing local metadata rows; no
   recurring `needs_reindex` trigger remains;
 - `COMMIT_TOUCHED_FILE` edges targeting active collected V2 refs before and
-  after incremental and forced-full Git-history refresh;
+  after incremental and forced-full Git-history refresh, using a fixture whose
+  `bbox_root_relpath` is a non-root monorepo subproject;
+- a full rebuild with one quarantined active-generation blob preserving the
+  complete last-good selector documents, plus an incomplete preservation
+  inventory aborting without changing the committed index;
 - warming behavior, explicit cutback success, cutback failure preserving the
   collected generation, staleness reporting, and no implicit failover;
 - collector dependency ceiling and a binary smoke test against a temporary
