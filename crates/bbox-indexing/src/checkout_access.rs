@@ -807,7 +807,7 @@ fn health_from_snapshot(snapshot: &CheckoutAccessObservationSnapshot) -> Checkou
         .map(|kind| {
             let mut granted = 0_u64;
             let mut denied = 0_u64;
-            let mut last_success_unix_secs = None;
+            let mut last_success_unix_secs: Option<u64> = None;
             for counter in snapshot
                 .counters
                 .iter()
