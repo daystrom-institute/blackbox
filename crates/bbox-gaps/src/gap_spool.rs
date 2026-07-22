@@ -6,8 +6,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::gaps::{GapNote, GapStore};
+use crate::repo_io::{GapRepoCarrier, GapRepoWrite};
 
 const GAP_NOTE_TYPE: &str = "blackbox.gap_note.v1";
+const MAX_CARRIER_ID_BYTES: usize = 256;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GapSpoolImportReport {
@@ -36,10 +38,10 @@ impl GapSpoolImportReport {
             ));
         }
         for item in &self.skipped {
-            out.push_str(&format!("  skipped {} — {}\n", item.path, item.reason));
+            out.push_str(&format!("  skipped {} - {}\n", item.path, item.reason));
         }
         for item in &self.rejected {
-            out.push_str(&format!("  rejected {} — {}\n", item.path, item.error));
+            out.push_str(&format!("  rejected {} - {}\n", item.path, item.error));
         }
         out.push('\n');
         out
@@ -71,6 +73,42 @@ pub struct SkippedGapFile {
 struct SpoolSource {
     inbox_dir: PathBuf,
     project: Option<String>,
+    logical_prefix: Option<String>,
+    allowed_root: Option<PathBuf>,
+}
+
+impl SpoolSource {
+    fn repo(root: &Path, carrier: &GapRepoCarrier) -> Result<Self> {
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("resolving repository carrier {}", carrier.carrier_id))?;
+        Ok(Self {
+            inbox_dir: root.join(".bbox").join("gaps").join("inbox"),
+            project: Some(carrier.project.clone()),
+            logical_prefix: Some(format!("carrier:{}/.bbox/gaps/inbox", carrier.carrier_id)),
+            allowed_root: Some(root),
+        })
+    }
+
+    fn host(inbox_dir: PathBuf) -> Self {
+        Self {
+            inbox_dir,
+            project: None,
+            logical_prefix: None,
+            allowed_root: None,
+        }
+    }
+
+    fn report_path(&self, path: &Path) -> String {
+        let Some(prefix) = &self.logical_prefix else {
+            return path.display().to_string();
+        };
+        match path.strip_prefix(&self.inbox_dir) {
+            Ok(relative) if relative.as_os_str().is_empty() => prefix.clone(),
+            Ok(relative) => format!("{prefix}/{}", relative.display()),
+            Err(_) => prefix.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -87,20 +125,34 @@ struct ImportedFingerprint {
     imported_at: String,
 }
 
-/// `project_roots` are canonical project paths (the caller maps them from
-/// its project registry); each contributes a `.bbox/gaps/inbox` spool dir.
+/// Import repository-owned gap spools under operation-scoped mutation
+/// authority, then import the host-local spool directly.
+///
+/// A repository spool import reads files and moves them into `imported/` or
+/// `rejected/`, so read-only authority is intentionally insufficient. The
+/// authority callback remains active for the complete per-carrier operation.
 pub fn import_gap_spool(
     gaps: &mut GapStore,
-    project_roots: &[String],
+    project_carriers: &[GapRepoCarrier],
+    repo_write: &dyn GapRepoWrite,
     state_dir: &Path,
 ) -> Result<GapSpoolImportReport> {
     let host_inbox = host_gap_inbox_dir();
-    import_gap_spool_from_dirs(gaps, project_roots, state_dir, Some(host_inbox))
+    import_gap_spool_with_host_inbox(
+        gaps,
+        project_carriers,
+        repo_write,
+        state_dir,
+        Some(host_inbox),
+    )
 }
 
-pub fn import_gap_spool_from_dirs(
+/// Variant with an explicit host-local inbox. Repository carriers still pass
+/// exclusively through `repo_write`; only the host path is accepted directly.
+pub fn import_gap_spool_with_host_inbox(
     gaps: &mut GapStore,
-    project_roots: &[String],
+    project_carriers: &[GapRepoCarrier],
+    repo_write: &dyn GapRepoWrite,
     state_dir: &Path,
     host_inbox: Option<PathBuf>,
 ) -> Result<GapSpoolImportReport> {
@@ -108,31 +160,131 @@ pub fn import_gap_spool_from_dirs(
     let mut state = load_state(&state_path)?;
     let mut report = GapSpoolImportReport::default();
 
-    for source in spool_sources(project_roots, host_inbox) {
-        let entries = match fs::read_dir(&source.inbox_dir) {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                report.rejected.push(RejectedGapFile {
-                    path: source.inbox_dir.display().to_string(),
-                    moved_to: None,
-                    error: err.to_string(),
+    for carrier in project_carriers {
+        validate_spool_carrier(carrier)?;
+        let mut invoked = false;
+        let mut operation = |root: &Path| {
+            if invoked {
+                anyhow::bail!(
+                    "gap repository mutation authority invoked the operation more than once"
+                );
+            }
+            invoked = true;
+            let source = SpoolSource::repo(root, carrier)?;
+            import_source(gaps, &mut state, &mut report, &source)
+        };
+        let authority_result = repo_write.with_write(carrier, &mut operation);
+        drop(operation);
+        if let Err(err) = authority_result {
+            if invoked {
+                return Err(err).with_context(|| {
+                    format!(
+                        "importing gap spool for repository carrier {}",
+                        carrier.carrier_id
+                    )
+                });
+            } else {
+                tracing::debug!(
+                    carrier = %carrier.carrier_id,
+                    error = %err,
+                    "gap spool skipped repository carrier without mutation authority"
+                );
+                report.skipped.push(SkippedGapFile {
+                    path: format!("carrier:{}/.bbox/gaps/inbox", carrier.carrier_id),
+                    reason: "repository mutation authority unavailable".into(),
                 });
                 continue;
             }
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-            import_one(gaps, &mut state, &mut report, &source, &path)?;
         }
+        if !invoked {
+            report.skipped.push(SkippedGapFile {
+                path: format!("carrier:{}/.bbox/gaps/inbox", carrier.carrier_id),
+                reason: "repository mutation authority did not run the operation".into(),
+            });
+        }
+    }
+
+    if let Some(host_inbox) = host_inbox {
+        import_source(
+            gaps,
+            &mut state,
+            &mut report,
+            &SpoolSource::host(host_inbox),
+        )?;
     }
 
     save_state(&state_path, &state)?;
     Ok(report)
+}
+
+fn validate_spool_carrier(carrier: &GapRepoCarrier) -> Result<()> {
+    let carrier_id = carrier.carrier_id.as_str();
+    if carrier_id.trim().is_empty()
+        || carrier_id.len() > MAX_CARRIER_ID_BYTES
+        || carrier_id.contains('/')
+        || carrier_id.contains('\\')
+        || Path::new(carrier_id).is_absolute()
+    {
+        anyhow::bail!("gap spool carrier must use a bounded path-free logical identifier");
+    }
+    Ok(())
+}
+
+fn import_source(
+    gaps: &mut GapStore,
+    state: &mut ImportState,
+    report: &mut GapSpoolImportReport,
+    source: &SpoolSource,
+) -> Result<()> {
+    let inbox_dir = match source.inbox_dir.canonicalize() {
+        Ok(inbox_dir) => inbox_dir,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            report.rejected.push(RejectedGapFile {
+                path: source.report_path(&source.inbox_dir),
+                moved_to: None,
+                error: err.to_string(),
+            });
+            return Ok(());
+        }
+    };
+    if source
+        .allowed_root
+        .as_ref()
+        .is_some_and(|root| !inbox_dir.starts_with(root))
+    {
+        anyhow::bail!("gap spool inbox escapes its authorized repository root");
+    }
+    let source = SpoolSource {
+        inbox_dir,
+        project: source.project.clone(),
+        logical_prefix: source.logical_prefix.clone(),
+        allowed_root: source.allowed_root.clone(),
+    };
+    let entries = match fs::read_dir(&source.inbox_dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            report.rejected.push(RejectedGapFile {
+                path: source.report_path(&source.inbox_dir),
+                moved_to: None,
+                error: err.to_string(),
+            });
+            return Ok(());
+        }
+    };
+
+    for entry in entries.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if !file_type.is_file() || path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        import_one(gaps, state, report, &source, &path)?;
+    }
+    Ok(())
 }
 
 fn import_one(
@@ -144,7 +296,7 @@ fn import_one(
 ) -> Result<()> {
     let raw = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let hash = sha256_hex(&raw);
-    let path_s = path.display().to_string();
+    let path_s = source.report_path(path);
     if state
         .imported
         .iter()
@@ -204,23 +356,23 @@ fn import_one(
     gap.project = source.project.clone();
 
     let (gap_id, created) = gaps.ingest(gap)?;
-    let moved_to = move_file(path, &source.inbox_dir.join("imported"))?;
+    let moved_to = move_file(path, &source.inbox_dir.join("imported"), &source.inbox_dir)?;
     if created {
         state.imported.push(ImportedFingerprint {
-            path: path.display().to_string(),
+            path: source.report_path(path),
             sha256: hash,
             gap_id: gap_id.clone(),
             imported_at: bbox_util::util::now_iso(),
         });
         report.imported.push(ImportedGapFile {
-            path: path.display().to_string(),
-            moved_to: moved_to.display().to_string(),
+            path: source.report_path(path),
+            moved_to: source.report_path(&moved_to),
             gap_id,
             project: source.project.clone(),
         });
     } else {
         report.skipped.push(SkippedGapFile {
-            path: path.display().to_string(),
+            path: source.report_path(path),
             reason: "live gap with same dedupe_key already open".into(),
         });
     }
@@ -233,19 +385,25 @@ fn reject_file(
     path: &Path,
     error: String,
 ) -> Result<()> {
-    let moved_to = move_file(path, &source.inbox_dir.join("rejected"))?;
+    let moved_to = move_file(path, &source.inbox_dir.join("rejected"), &source.inbox_dir)?;
     let error_path = moved_to.with_extension("json.error.txt");
     fs::write(&error_path, &error).with_context(|| format!("writing {}", error_path.display()))?;
     report.rejected.push(RejectedGapFile {
-        path: path.display().to_string(),
-        moved_to: Some(moved_to.display().to_string()),
+        path: source.report_path(path),
+        moved_to: Some(source.report_path(&moved_to)),
         error,
     });
     Ok(())
 }
 
-fn move_file(path: &Path, target_dir: &Path) -> Result<PathBuf> {
+fn move_file(path: &Path, target_dir: &Path, inbox_dir: &Path) -> Result<PathBuf> {
     fs::create_dir_all(target_dir).with_context(|| format!("creating {}", target_dir.display()))?;
+    let target_dir = target_dir
+        .canonicalize()
+        .with_context(|| format!("resolving {}", target_dir.display()))?;
+    if !target_dir.starts_with(inbox_dir) {
+        anyhow::bail!("gap spool destination escapes its authorized inbox");
+    }
     let file_name = path
         .file_name()
         .with_context(|| format!("path has no file name: {}", path.display()))?;
@@ -259,24 +417,6 @@ fn move_file(path: &Path, target_dir: &Path) -> Result<PathBuf> {
     fs::rename(path, &target)
         .with_context(|| format!("moving {} to {}", path.display(), target.display()))?;
     Ok(target)
-}
-
-fn spool_sources(project_roots: &[String], host_inbox: Option<PathBuf>) -> Vec<SpoolSource> {
-    let mut out = Vec::new();
-    for canonical_path in project_roots {
-        let root = PathBuf::from(canonical_path);
-        out.push(SpoolSource {
-            inbox_dir: root.join(".bbox").join("gaps").join("inbox"),
-            project: Some(canonical_path.clone()),
-        });
-    }
-    if let Some(inbox_dir) = host_inbox {
-        out.push(SpoolSource {
-            inbox_dir,
-            project: None,
-        });
-    }
-    out
 }
 
 fn host_gap_inbox_dir() -> PathBuf {
@@ -316,7 +456,20 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repo_io::test_support::TestGapRepoIo;
+    use crate::repo_io::{GapRepoRead, GapRepoWrite};
+    use std::sync::Arc;
     use tempfile::tempdir;
+
+    fn repo_access(
+        project: &Path,
+        project_name: &str,
+    ) -> (Arc<TestGapRepoIo>, Vec<GapRepoCarrier>) {
+        let carrier = GapRepoCarrier::new(project_name, "checkout:test").unwrap();
+        let io = Arc::new(TestGapRepoIo::default());
+        io.replace(&[(carrier.clone(), project.to_path_buf())]);
+        (io, vec![carrier])
+    }
 
     fn gap_body(title: &str, dedupe_slug: &str) -> String {
         serde_json::json!({
@@ -343,21 +496,28 @@ mod tests {
         )
         .unwrap();
 
-        let canonical = project
-            .canonicalize()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-        let roots = vec![canonical.clone()];
+        let canonical = project.canonicalize().unwrap();
+        let project_name = "project:test";
+        let (io, carriers) = repo_access(&canonical, project_name);
         let mut gaps = GapStore::open(&dir.path().join("gaps.json")).unwrap();
 
-        let report =
-            import_gap_spool_from_dirs(&mut gaps, &roots, &dir.path().join("state"), None).unwrap();
+        let report = import_gap_spool_with_host_inbox(
+            &mut gaps,
+            &carriers,
+            io.as_ref(),
+            &dir.path().join("state"),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(report.imported.len(), 1);
         assert!(inbox.join("imported/gap.json").exists());
         assert_eq!(gaps.all().len(), 1);
-        assert_eq!(gaps.all()[0].project.as_deref(), Some(canonical.as_str()));
+        assert_eq!(gaps.all()[0].project.as_deref(), Some(project_name));
+        assert_eq!(
+            report.imported[0].path,
+            "carrier:checkout:test/.bbox/gaps/inbox/gap.json"
+        );
     }
 
     #[test]
@@ -372,9 +532,11 @@ mod tests {
         .unwrap();
         let mut gaps = GapStore::open(&dir.path().join("gaps.json")).unwrap();
 
-        let report = import_gap_spool_from_dirs(
+        let (io, carriers) = repo_access(dir.path(), "unused");
+        let report = import_gap_spool_with_host_inbox(
             &mut gaps,
-            &[],
+            &carriers[..0],
+            io.as_ref(),
             &dir.path().join("state"),
             Some(host.clone()),
         )
@@ -393,9 +555,11 @@ mod tests {
         fs::write(host.join("bad.json"), "{not json").unwrap();
         let mut gaps = GapStore::open(&dir.path().join("gaps.json")).unwrap();
 
-        let report = import_gap_spool_from_dirs(
+        let (io, carriers) = repo_access(dir.path(), "unused");
+        let report = import_gap_spool_with_host_inbox(
             &mut gaps,
-            &[],
+            &carriers[..0],
+            io.as_ref(),
             &dir.path().join("state"),
             Some(host.clone()),
         )
@@ -415,9 +579,11 @@ mod tests {
         fs::write(host.join("first.json"), gap_body("Need hook", "hook")).unwrap();
         let mut gaps = GapStore::open(&dir.path().join("gaps.json")).unwrap();
 
-        let first = import_gap_spool_from_dirs(
+        let (io, carriers) = repo_access(dir.path(), "unused");
+        let first = import_gap_spool_with_host_inbox(
             &mut gaps,
-            &[],
+            &carriers[..0],
+            io.as_ref(),
             &dir.path().join("state"),
             Some(host.clone()),
         )
@@ -429,9 +595,10 @@ mod tests {
             gap_body("Need hook again", "hook"),
         )
         .unwrap();
-        let second = import_gap_spool_from_dirs(
+        let second = import_gap_spool_with_host_inbox(
             &mut gaps,
-            &[],
+            &carriers[..0],
+            io.as_ref(),
             &dir.path().join("state"),
             Some(host.clone()),
         )
@@ -440,5 +607,76 @@ mod tests {
         assert_eq!(second.skipped.len(), 1);
         assert_eq!(gaps.all().len(), 1);
         assert!(host.join("imported/second.json").exists());
+    }
+
+    struct ReadOnlyRepoAuthority;
+
+    impl GapRepoRead for ReadOnlyRepoAuthority {
+        fn with_read(
+            &self,
+            _carrier: &GapRepoCarrier,
+            _operation: &mut dyn FnMut(&Path) -> Result<()>,
+        ) -> Result<()> {
+            anyhow::bail!("read authority is not used for spool mutation")
+        }
+    }
+
+    impl GapRepoWrite for ReadOnlyRepoAuthority {
+        fn with_write(
+            &self,
+            _carrier: &GapRepoCarrier,
+            _operation: &mut dyn FnMut(&Path) -> Result<()>,
+        ) -> Result<()> {
+            anyhow::bail!("repository mutation denied")
+        }
+    }
+
+    #[test]
+    fn read_only_authority_cannot_read_or_move_repository_spool() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().canonicalize().unwrap().join("project");
+        let inbox = project.join(".bbox/gaps/inbox");
+        fs::create_dir_all(&inbox).unwrap();
+        let gap_path = inbox.join("gap.json");
+        let original = gap_body("Need mutation authority", "write-gate");
+        fs::write(&gap_path, &original).unwrap();
+        let carrier = GapRepoCarrier::new("project:test", "checkout:denied").unwrap();
+        let mut gaps = GapStore::open(&dir.path().join("gaps.json")).unwrap();
+
+        let report = import_gap_spool_with_host_inbox(
+            &mut gaps,
+            &[carrier],
+            &ReadOnlyRepoAuthority,
+            &dir.path().join("state"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(fs::read_to_string(&gap_path).unwrap(), original);
+        assert!(!inbox.join("imported/gap.json").exists());
+        assert!(gaps.all().is_empty());
+    }
+
+    #[test]
+    fn repository_spool_rejects_path_shaped_carrier_identity() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let carrier = GapRepoCarrier::new("project:test", root.to_string_lossy()).unwrap();
+        let io = TestGapRepoIo::default();
+        io.replace(&[(carrier.clone(), root)]);
+        let mut gaps = GapStore::open(&dir.path().join("gaps.json")).unwrap();
+
+        let error = import_gap_spool_with_host_inbox(
+            &mut gaps,
+            &[carrier],
+            &io,
+            &dir.path().join("state"),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("path-free logical identifier"));
+        assert!(gaps.all().is_empty());
     }
 }

@@ -34,6 +34,8 @@ impl GapRepoCarrier {
 }
 
 pub trait GapRepoRead: Send + Sync {
+    /// Invoke `operation` exactly once while read authority for `carrier`
+    /// remains alive. A denial must not invoke the operation.
     fn with_read(
         &self,
         carrier: &GapRepoCarrier,
@@ -42,6 +44,8 @@ pub trait GapRepoRead: Send + Sync {
 }
 
 pub trait GapRepoWrite: Send + Sync {
+    /// Invoke `operation` exactly once while repository mutation authority for
+    /// `carrier` remains alive. A denial must not invoke the operation.
     fn with_write(
         &self,
         carrier: &GapRepoCarrier,
