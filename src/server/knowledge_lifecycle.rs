@@ -1042,7 +1042,7 @@ mod tests {
     use super::*;
     use crate::server::state::SharedState;
     use bbox_knowledge::knowledge::{Approval, Category, Priority, Status};
-    use bbox_knowledge::overlay::{OverlayStatus, OverlayValue};
+    use bbox_knowledge::overlay::{OverlayStatus, OverlayValue, provisional_entity_ref};
     use std::collections::HashMap;
 
     fn git(root: &Path, args: &[&str]) {
@@ -1094,6 +1094,21 @@ mod tests {
             serde_json::to_vec_pretty(&entry).unwrap(),
         )
         .unwrap();
+    }
+
+    fn indexed_entity_count(server: &BlackboxServer, entity_ref: &str) -> usize {
+        use tantivy::collector::Count;
+        use tantivy::query::TermQuery;
+        use tantivy::schema::{IndexRecordOption, Term};
+
+        let index = server.state.idx.read();
+        let reader = index.index_handle().reader().unwrap();
+        let searcher = reader.searcher();
+        let query = TermQuery::new(
+            Term::from_field_text(index.field_handles().entity_id, entity_ref),
+            IndexRecordOption::Basic,
+        );
+        searcher.search(&query, &Count).unwrap()
     }
 
     fn fixture() -> (
@@ -1423,6 +1438,83 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.contains("broken.json"))
+        );
+    }
+
+    #[test]
+    fn malformed_peer_overlay_preserves_published_knowledge_in_static_index() {
+        let (_temp, server, base, worktree, scope) = fixture();
+        server.reconcile_dark_knowledge_checkouts().unwrap();
+        let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&worktree).unwrap();
+        let row = server
+            .state
+            .checkout_registry
+            .read()
+            .get(&checkout_id, &scope)
+            .cloned()
+            .unwrap();
+        let checkout = server.resolve_registered_checkout(&row).unwrap();
+
+        write_test_knowledge(
+            &worktree,
+            "peer-removed-after-invalid",
+            "PEER REMOVED AFTER INVALID",
+        );
+        assert_eq!(
+            server.refresh_dark_knowledge_overlay(&checkout),
+            KnowledgeOverlayRefreshOutcome::Converged
+        );
+        server.state.index_writer.flush_blocking().unwrap();
+        let peer_ref = provisional_entity_ref(&scope, &checkout_id, "peer-removed-after-invalid");
+        assert_eq!(indexed_entity_count(&server, &peer_ref), 1);
+
+        write_test_knowledge(
+            &base,
+            "published-survives-peer-invalid",
+            "PUBLISHED SURVIVES PEER INVALID",
+        );
+        git(
+            &base,
+            &[
+                "add",
+                ".bbox/knowledge/published-survives-peer-invalid.json",
+            ],
+        );
+        git(&base, &["commit", "-q", "-m", "publish static fixture"]);
+        server.invalidate_published_knowledge_cache(&scope);
+        server
+            .sync_knowledge_scope_to_index(&scope, base.to_str().unwrap())
+            .unwrap();
+        server.state.index_writer.flush_blocking().unwrap();
+
+        std::fs::write(
+            worktree.join(".bbox/knowledge/peer-removed-after-invalid.json"),
+            b"{",
+        )
+        .unwrap();
+        assert_eq!(
+            server.refresh_dark_knowledge_overlay(&checkout),
+            KnowledgeOverlayRefreshOutcome::Invalid
+        );
+        server.state.index_writer.flush_blocking().unwrap();
+
+        let hits = server
+            .state
+            .idx
+            .read()
+            .hybrid_bm25_hits("PUBLISHED SURVIVES PEER INVALID", 10, Some("knowledge"))
+            .unwrap();
+        assert!(
+            hits.iter().any(|hit| {
+                hit.entity_id
+                    == crate::index::knowledge_entity_id("published-survives-peer-invalid")
+            }),
+            "malformed peer content must not clear published static knowledge: {hits:?}"
+        );
+        assert_eq!(
+            indexed_entity_count(&server, &peer_ref),
+            0,
+            "scope reconciliation must remove the stale provisional document"
         );
     }
 

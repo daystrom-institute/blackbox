@@ -358,24 +358,28 @@ impl BlackboxServer {
         {
             return KnowledgeOverlayRefreshOutcome::Superseded;
         }
-        if unchanged {
-            return if invalid {
-                KnowledgeOverlayRefreshOutcome::Invalid
-            } else {
-                KnowledgeOverlayRefreshOutcome::Converged
-            };
+        if unchanged && !invalid {
+            return KnowledgeOverlayRefreshOutcome::Converged;
         }
         self.invalidate_published_snapshot_caches(&checkout.published_scope);
-
-        if invalid {
-            self.clear_knowledge_scope_in_index(&checkout.published_scope);
-            return KnowledgeOverlayRefreshOutcome::Invalid;
-        }
 
         let Some(project) = publisher_project else {
             self.clear_knowledge_scope_in_index(&checkout.published_scope);
             return KnowledgeOverlayRefreshOutcome::Invalid;
         };
+        if invalid {
+            if let Err(err) =
+                self.sync_knowledge_scope_to_index(&checkout.published_scope, &project)
+            {
+                tracing::warn!(
+                    error = %err,
+                    scope = ?checkout.published_scope,
+                    "invalid knowledge overlay convergence failed closed"
+                );
+                self.clear_knowledge_scope_in_index(&checkout.published_scope);
+            }
+            return KnowledgeOverlayRefreshOutcome::Invalid;
+        }
         if publisher_moved {
             if let Err(err) =
                 self.sync_knowledge_scope_to_index(&checkout.published_scope, &project)
