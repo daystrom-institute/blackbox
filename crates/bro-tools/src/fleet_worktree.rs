@@ -2033,6 +2033,9 @@ fn push_recovery_retry_failed(mut result: PhaseResult, message: &str) -> PhaseRe
     result
 }
 
+// This synchronous closeout phase already owns the blocking git/worktree
+// lifecycle lane. Removing its generated claim belongs to the same lane.
+#[allow(clippy::disallowed_methods)]
 fn phase_remove(req: &CloseoutRequest) -> PhaseResult {
     let base_repo = &req.base_repo;
     let worktree = &req.worktree;
