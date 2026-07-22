@@ -179,11 +179,55 @@ pub(crate) fn run(server: &crate::server::BlackboxServer) -> anyhow::Result<Doct
         vectors_section(state),
         graph_section(server),
         projects_section(state),
+        checkout_access_section(state),
         memories_section(state),
         knowledge_section(state),
         attention_section(state),
     ];
     Ok(DoctorReport::from_sections(sections))
+}
+
+fn checkout_access_section(state: &crate::server::state::SharedState) -> SectionReport {
+    let health = state.checkout_access_observations.health();
+    let mut findings = Vec::new();
+    if health.sequence == 0 {
+        findings.push(Finding::info(
+            "checkout access broker has no observations yet",
+        ));
+    } else {
+        for operation in health
+            .operations
+            .iter()
+            .filter(|operation| operation.granted > 0 || operation.denied > 0)
+        {
+            let last_success = operation
+                .last_success_unix_secs
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "never".into());
+            findings.push(Finding::info(format!(
+                "{}: {} granted, {} denied, last success {}",
+                operation.kind.as_str(),
+                operation.granted,
+                operation.denied,
+                last_success,
+            )));
+        }
+        if !health.active_compatibility_lanes.is_empty() {
+            let lanes = health
+                .active_compatibility_lanes
+                .iter()
+                .map(|lane| lane.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            findings.push(Finding::info(format!(
+                "active checkout compatibility lanes: {lanes}"
+            )));
+        }
+    }
+    SectionReport {
+        section: "checkout_access",
+        findings,
+    }
 }
 
 fn code_sources_section(state: &crate::server::state::SharedState) -> SectionReport {
@@ -741,6 +785,7 @@ mod tests {
                 "vectors",
                 "graph",
                 "projects",
+                "checkout_access",
                 "memories",
                 "knowledge",
                 "attention"

@@ -328,6 +328,10 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         projects: projects_store,
         projects_persister,
         checkout_registry: RwLock::new(open_checkout_registry(&store_dir)),
+        checkout_access_observations:
+            bbox_indexing::checkout_access::CheckoutAccessObservations::open(
+                store_dir.join("checkout-access-observations.json"),
+            )?,
         // Publisher refs define authority and cannot be reconstructed from
         // checkout discovery without silently moving published truth. Keep
         // corrupt pins fail-closed even though the checkout census below is a
