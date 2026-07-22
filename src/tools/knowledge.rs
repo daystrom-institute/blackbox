@@ -247,6 +247,11 @@ impl BlackboxServer {
         };
 
         let _refresh = self.state.knowledge_overlay_refresh.lock();
+        // An explicit overlay refresh is an observer boundary, not a hot view
+        // read. Re-resolve authority now so publisher movement promotes away
+        // matching provisional values immediately. The following gap refresh
+        // reuses this freshly cached decision.
+        self.invalidate_publisher_authority_cache(&checkout.published_scope);
         let generation = self
             .state
             .knowledge_overlays

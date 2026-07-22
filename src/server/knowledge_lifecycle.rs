@@ -693,6 +693,10 @@ impl BlackboxServer {
             }
         }
         for scope in scopes {
+            // The migration cut is monotonic and security-sensitive. It must
+            // inspect the current committed marker, never a short-lived hot
+            // read authority decision from before the marker commit.
+            self.invalidate_publisher_authority_cache(&scope);
             let publisher = match self.authorize_publisher(&projects, &scope) {
                 Ok(publisher) => publisher,
                 Err(err) => {
