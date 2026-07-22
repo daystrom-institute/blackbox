@@ -646,7 +646,7 @@ pub(crate) fn impl_work_smart_read(
         out.push('\n');
     }
 
-    Ok(out)
+    Ok(knowledge_view.append_list_built_from(out))
 }
 
 fn impl_work_bash(

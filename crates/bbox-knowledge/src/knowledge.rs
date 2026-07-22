@@ -638,6 +638,12 @@ pub struct KnowledgeViewMetadata {
     pub checkout_id: Option<String>,
     pub content_hash: Option<String>,
     pub overlay_snapshot_id: Option<String>,
+    /// Response-local reference into the containing view's `built_from`
+    /// table. This is detached-view metadata and is never persisted.
+    pub built_from_ref: Option<String>,
+    /// Explicit label for rows that predate provable published/overlay
+    /// provenance. Never populated for newly assembled stamped rows.
+    pub compatibility_lane: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2546,6 +2552,19 @@ impl Knowledge {
                 };
                 let render_mark = if !e.render { " [indexed-only]" } else { "" };
                 let decay_mark = if !e.decay { " [invariant]" } else { "" };
+                let built_from = self
+                    .view_metadata(&e.id)
+                    .map(|metadata| {
+                        match (
+                            metadata.built_from_ref.as_deref(),
+                            metadata.compatibility_lane.as_deref(),
+                        ) {
+                            (Some(reference), _) => format!(" | built_from={reference}"),
+                            (None, Some(lane)) => format!(" | built_from={lane}"),
+                            (None, None) => String::new(),
+                        }
+                    })
+                    .unwrap_or_default();
                 let query_line = if query.is_some() && query_match.score > 0.0 {
                     format!(
                         "\n  score={:.1} | matched_by={}",
@@ -2557,7 +2576,7 @@ impl Knowledge {
                 };
                 let excerpt = knowledge_excerpt(&e.content, KNOWLEDGE_EXCERPT_BYTES);
                 format!(
-                    "[{}] {:?}/{} | {} | {}{}{}{}{}\n  content_bytes={}\n  {}",
+                    "[{}] {:?}/{} | {} | {}{}{}{}{}{}\n  content_bytes={}\n  {}",
                     e.id,
                     e.category,
                     e.scope,
@@ -2566,6 +2585,7 @@ impl Knowledge {
                     approval_mark,
                     render_mark,
                     decay_mark,
+                    built_from,
                     query_line,
                     e.content.len(),
                     excerpt
@@ -4018,16 +4038,19 @@ mod tests {
             entity_id.clone(),
             KnowledgeViewMetadata {
                 logical_ref: "knowledge:entry".into(),
+                built_from_ref: Some("built_from_0".into()),
                 ..Default::default()
             },
         )]);
-        let view = Knowledge::detached_view(vec![provisional], metadata);
+        let mut view = Knowledge::detached_view(vec![provisional], metadata);
 
         assert_eq!(
             view.entry_for_logical_ref("knowledge:entry")
                 .map(|entry| entry.id.as_str()),
             Some(entity_id.as_str())
         );
+        let listed = view.list(&KnowledgeListParams::default()).unwrap();
+        assert!(listed.contains("built_from=built_from_0"), "{listed}");
     }
 
     #[test]

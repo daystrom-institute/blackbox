@@ -13,7 +13,7 @@
 //! NO tantivy/search indexing, NO rendered provider memory. Gaps get durable
 //! persistence + live reload only.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -752,6 +752,15 @@ pub struct GapStoreData {
     pub gaps: Vec<GapNote>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct GapViewMetadata {
+    /// Response-local reference into the containing view's `built_from`
+    /// table. Detached read-view metadata only, never durable gap provenance.
+    pub built_from_ref: Option<String>,
+    /// Explicit label for an unstamped compatibility row.
+    pub compatibility_lane: Option<String>,
+}
+
 impl GapStoreData {
     fn new() -> Self {
         Self {
@@ -767,6 +776,7 @@ pub struct GapStore {
     project_roots: Vec<PathBuf>,
     /// Store-layer enforcement for the monotonic path-authority cut.
     path_fallback_cut: bool,
+    view_metadata: BTreeMap<String, GapViewMetadata>,
 }
 
 impl GapStore {
@@ -776,6 +786,7 @@ impl GapStore {
             data: GapStoreData::new(),
             project_roots: Vec::new(),
             path_fallback_cut: false,
+            view_metadata: BTreeMap::new(),
         };
         s.reload()?;
         Ok(s)
@@ -793,6 +804,7 @@ impl GapStore {
     }
 
     pub fn reload(&mut self) -> Result<()> {
+        self.view_metadata.clear();
         if self.store_path.exists() {
             let raw = fs::read_to_string(&self.store_path)
                 .with_context(|| format!("reading {}", self.store_path.display()))?;
@@ -939,13 +951,21 @@ impl GapStore {
 
     /// Read-only store assembled by the daemon from pinned published trees and
     /// selected checkout overlays.
-    pub fn detached_view(gaps: Vec<GapNote>) -> Self {
+    pub fn detached_view(
+        gaps: Vec<GapNote>,
+        view_metadata: BTreeMap<String, GapViewMetadata>,
+    ) -> Self {
         Self {
             store_path: PathBuf::new(),
             data: GapStoreData { version: 1, gaps },
             project_roots: Vec::new(),
             path_fallback_cut: true,
+            view_metadata,
         }
+    }
+
+    pub fn view_metadata(&self, id: &str) -> Option<&GapViewMetadata> {
+        self.view_metadata.get(id)
     }
 
     /// Project records still relying on the host-local central path key.
@@ -1564,7 +1584,18 @@ impl GapStore {
 
         let results = self.query(p);
         if p.json.unwrap_or(false) {
-            return Ok(serde_json::to_string_pretty(&results)?);
+            let rows = results
+                .into_iter()
+                .map(|gap| {
+                    let metadata = self.view_metadata(&gap.id);
+                    GapResponseRow {
+                        gap,
+                        built_from_ref: metadata.and_then(|row| row.built_from_ref.clone()),
+                        compatibility_lane: metadata.and_then(|row| row.compatibility_lane.clone()),
+                    }
+                })
+                .collect::<Vec<_>>();
+            return Ok(serde_json::to_string_pretty(&rows)?);
         }
         if results.is_empty() {
             return Ok("No gaps found.".to_string());
@@ -1579,8 +1610,21 @@ impl GapStore {
                 .as_deref()
                 .map(|checkout| format!("  checkout={checkout}"))
                 .unwrap_or_default();
+            let built_from = self
+                .view_metadata(&g.id)
+                .map(|metadata| {
+                    match (
+                        metadata.built_from_ref.as_deref(),
+                        metadata.compatibility_lane.as_deref(),
+                    ) {
+                        (Some(reference), _) => format!("  built_from={reference}"),
+                        (None, Some(lane)) => format!("  built_from={lane}"),
+                        (None, None) => String::new(),
+                    }
+                })
+                .unwrap_or_default();
             out.push_str(&format!(
-                "{id}  [{kind}/{impact}/{res}]  {ts}  scope={scope}{provisional}  dedupe={dedupe}\n  {title}\n  want: {want}\n",
+                "{id}  [{kind}/{impact}/{res}]  {ts}  scope={scope}{provisional}{built_from}  dedupe={dedupe}\n  {title}\n  want: {want}\n",
                 id = g.id,
                 kind = g.gap_kind.as_ref(),
                 impact = g.impact.as_ref(),
@@ -1600,6 +1644,16 @@ impl GapStore {
         }
         Ok(out)
     }
+}
+
+#[derive(Serialize)]
+struct GapResponseRow {
+    #[serde(flatten)]
+    gap: GapNote,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    built_from_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compatibility_lane: Option<String>,
 }
 
 /// Emit the companion gap note for a packet-authoring gap into the
@@ -1665,6 +1719,41 @@ mod tests {
             thread_id: None,
             allow_recurrence: None,
         }
+    }
+
+    #[test]
+    fn detached_gap_view_exposes_response_ref_in_text_and_json() {
+        let dir = tempdir().unwrap();
+        let mut durable = GapStore::open(&dir.path().join("gaps.json")).unwrap();
+        let (id, _) = durable
+            .file(&file_params(
+                "Stamped gap",
+                "tooling/test-domain/stamped-gap",
+            ))
+            .unwrap();
+        let gap = durable.all()[0].clone();
+        let view = GapStore::detached_view(
+            vec![gap],
+            BTreeMap::from([(
+                id,
+                GapViewMetadata {
+                    built_from_ref: Some("built_from_0".into()),
+                    compatibility_lane: None,
+                },
+            )]),
+        );
+
+        let text = view.list_rendered(&GapListParams::default()).unwrap();
+        assert!(text.contains("built_from=built_from_0"), "{text}");
+
+        let json = view
+            .list_rendered(&GapListParams {
+                json: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(rows[0]["built_from_ref"], "built_from_0");
     }
 
     #[test]

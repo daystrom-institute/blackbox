@@ -130,18 +130,74 @@ impl BlackboxServer {
                 )?,
                 &overlay_diagnostics,
             );
-            if let Some(report) = import_report {
+            let mut output = if let Some(report) = import_report {
                 let rendered = report.render();
                 if rendered.is_empty() {
-                    Ok(inbox)
+                    inbox
                 } else {
-                    Ok(format!("{rendered}{inbox}"))
+                    format!("{rendered}{inbox}")
                 }
             } else {
-                Ok(inbox)
+                inbox
+            };
+
+            let mut response_table = bbox_corpus_core::built_from::BuiltFromTable::default();
+            let mut knowledge_rows = Vec::<(String, String)>::new();
+            for item in &knowledge_view.items {
+                if !output.contains(&format!("\n  {} [", item.entry.id)) {
+                    continue;
+                }
+                let reference = if let Some(reference) = &item.metadata.built_from_ref {
+                    knowledge_view
+                        .built_from
+                        .get(reference)
+                        .map(|stamp| response_table.intern(stamp.clone()))
+                } else {
+                    item.metadata.compatibility_lane.clone()
+                };
+                if let Some(reference) = reference {
+                    knowledge_rows.push((item.entity_ref.clone(), reference));
+                }
             }
+            let mut gap_rows = Vec::<(String, String)>::new();
+            for gap in gap_view.gaps.all() {
+                if !output.contains(&format!("\n  {} ", gap.id)) {
+                    continue;
+                }
+                let reference = gap_view.gaps.view_metadata(&gap.id).and_then(|metadata| {
+                    if let Some(reference) = &metadata.built_from_ref {
+                        gap_view
+                            .built_from
+                            .get(reference)
+                            .map(|stamp| response_table.intern(stamp.clone()))
+                    } else {
+                        metadata.compatibility_lane.clone()
+                    }
+                });
+                if let Some(reference) = reference {
+                    gap_rows.push((gap.id.clone(), reference));
+                }
+            }
+            append_built_from_rows(&mut output, "Knowledge", &knowledge_rows);
+            append_built_from_rows(&mut output, "Gap", &gap_rows);
+            output = knowledge_view.append_built_from_table(output, &response_table);
+            Ok(output)
         })
         .await
+    }
+}
+
+fn append_built_from_rows(output: &mut String, label: &str, rows: &[(String, String)]) {
+    if rows.is_empty() {
+        return;
+    }
+    output.push_str(&format!("\n{label} row built_from refs:\n"));
+    for (entity_ref, reference) in rows {
+        output.push_str("- ");
+        output.push_str(entity_ref);
+        output.push_str(" => ");
+        output.push_str(reference);
+        output.push('\n');
     }
 }
 

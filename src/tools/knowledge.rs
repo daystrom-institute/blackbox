@@ -63,6 +63,18 @@ fn entry_ids(entries_block: &str) -> Vec<String> {
         .collect()
 }
 
+fn returned_entry_ids(entries_block: &str) -> Vec<String> {
+    entries_block
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix('[')?;
+            let end = rest.find(']')?;
+            let id = rest[..end].trim();
+            (!id.is_empty()).then(|| id.to_string())
+        })
+        .collect()
+}
+
 fn knowledge_entity_ref(id: &str) -> String {
     if id.starts_with("provisional_knowledge:") {
         id.to_string()
@@ -278,7 +290,7 @@ impl BlackboxServer {
                 publisher_project = Some(publisher.root.clone());
                 match stable_knowledge_overlay(
                     std::path::Path::new(&publisher.root),
-                    &publisher.commit,
+                    &publisher.branch_ref,
                     checkout,
                 ) {
                     Ok(snapshot) => snapshot,
@@ -694,9 +706,9 @@ impl BlackboxServer {
         Parameters(p): Parameters<KnowledgeListParams>,
     ) -> CallToolResult {
         let server = self.clone();
-        Self::run_blocking("bbox_knowledge", move || {
+        Self::run_blocking_with_structured("bbox_knowledge", move || {
             if let Some(out) = exact_system_memory_response(&p) {
-                return Ok(out);
+                return Ok((out.clone(), json!({ "text": out })));
             }
 
             let mut p = p;
@@ -710,6 +722,7 @@ impl BlackboxServer {
                 p.provisional.as_deref(),
             )?;
             let mut combined = view.knowledge.list(&p)?;
+            let returned_ids = returned_entry_ids(&combined);
             if let Some(diagnostics) = view.diagnostics_text() {
                 combined.push_str("\n\n");
                 combined.push_str(&diagnostics);
@@ -844,7 +857,9 @@ impl BlackboxServer {
                     "  → Package an answer: bbox_bundle_evidence(question=<q>, entity_refs=[\"{entity_ref}\"])\n"
                 ));
             }
-            Ok(combined)
+            let structured = view.structured_response(&returned_ids);
+            combined = view.append_built_from_for_ids(combined, &returned_ids);
+            Ok((combined, structured))
         })
         .await
     }

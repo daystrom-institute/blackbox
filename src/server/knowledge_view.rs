@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use bbox_corpus_core::built_from::{BuiltFromStamp, BuiltFromTable};
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_record::{ProjectRecord, ResolvedCheckoutScope};
@@ -33,10 +34,162 @@ pub(crate) struct KnowledgeViewItem {
 pub(crate) struct SessionKnowledgeView {
     pub(crate) knowledge: Knowledge,
     pub(crate) items: Vec<KnowledgeViewItem>,
+    pub(crate) built_from: BuiltFromTable,
     pub(crate) diagnostics: Vec<String>,
 }
 
 impl SessionKnowledgeView {
+    pub(crate) fn append_built_from_for_ids(
+        &self,
+        output: String,
+        returned_ids: &[String],
+    ) -> String {
+        let refs = returned_ids.iter().filter_map(|id| {
+            self.knowledge
+                .view_metadata(id)
+                .and_then(|metadata| metadata.built_from_ref.as_deref())
+        });
+        let table = self.built_from_for_refs(refs);
+        self.append_built_from_table(output, &table)
+    }
+
+    pub(crate) fn append_list_built_from(&self, output: String) -> String {
+        let returned_ids = output
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix('[')?;
+                let end = rest.find(']')?;
+                let id = rest[..end].trim();
+                (!id.is_empty()).then(|| id.to_string())
+            })
+            .collect::<Vec<_>>();
+        self.append_built_from_for_ids(output, &returned_ids)
+    }
+
+    pub(crate) fn metadata_for_entity_ref(
+        &self,
+        entity_ref: &str,
+    ) -> Option<&KnowledgeViewMetadata> {
+        let key = entity_ref.strip_prefix("knowledge:").unwrap_or(entity_ref);
+        self.knowledge.view_metadata(key)
+    }
+
+    pub(crate) fn built_from_for_refs<'a>(
+        &self,
+        refs: impl IntoIterator<Item = &'a str>,
+    ) -> BuiltFromTable {
+        let mut table = self.built_from.clone();
+        table.retain_ids(refs);
+        table
+    }
+
+    pub(crate) fn append_built_from_table(&self, output: String, table: &BuiltFromTable) -> String {
+        super::built_from::append_built_from_section(output, table)
+    }
+
+    pub(crate) fn enrich_json_response(
+        &self,
+        output: String,
+    ) -> Result<(String, serde_json::Value)> {
+        let mut structured: serde_json::Value = serde_json::from_str(&output)
+            .context("parsing knowledge-bearing response for built_from wiring")?;
+        let mut row_stamps = Vec::<(String, String)>::new();
+        let mut used_stamp_refs = Vec::<String>::new();
+        self.enrich_json_value(&mut structured, &mut row_stamps, &mut used_stamp_refs);
+        let built_from = self.built_from_for_refs(used_stamp_refs.iter().map(String::as_str));
+        if let Some(object) = structured.as_object_mut() {
+            if let Some(text) = object.get("text").and_then(serde_json::Value::as_str) {
+                let mut text = text.to_string();
+                append_row_stamp_refs(&mut text, &row_stamps);
+                text = self.append_built_from_table(text, &built_from);
+                object.insert("text".into(), serde_json::Value::String(text));
+            }
+            object.insert("built_from".into(), serde_json::to_value(&built_from)?);
+        }
+        let rendered = serde_json::to_string_pretty(&structured)?;
+        Ok((rendered, structured))
+    }
+
+    fn enrich_json_value(
+        &self,
+        value: &mut serde_json::Value,
+        row_stamps: &mut Vec<(String, String)>,
+        used_stamp_refs: &mut Vec<String>,
+    ) {
+        match value {
+            serde_json::Value::Object(object) => {
+                let entity_ref = object
+                    .get("entity_ref")
+                    .or_else(|| object.get("entity_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|entity_ref| {
+                        entity_ref.starts_with("knowledge:")
+                            || entity_ref.starts_with("provisional_knowledge:")
+                    })
+                    .map(str::to_owned);
+                if let Some(entity_ref) = entity_ref
+                    && let Some(metadata) = self.metadata_for_entity_ref(&entity_ref)
+                {
+                    if let Some(reference) = &metadata.built_from_ref {
+                        object.insert(
+                            "built_from_ref".into(),
+                            serde_json::Value::String(reference.clone()),
+                        );
+                        row_stamps.push((entity_ref, reference.clone()));
+                        used_stamp_refs.push(reference.clone());
+                    } else if let Some(lane) = &metadata.compatibility_lane {
+                        object.insert(
+                            "compatibility_lane".into(),
+                            serde_json::Value::String(lane.clone()),
+                        );
+                        row_stamps.push((entity_ref, lane.clone()));
+                    }
+                }
+                for child in object.values_mut() {
+                    self.enrich_json_value(child, row_stamps, used_stamp_refs);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for child in values {
+                    self.enrich_json_value(child, row_stamps, used_stamp_refs);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn structured_response(&self, returned_ids: &[String]) -> serde_json::Value {
+        let rows = returned_ids
+            .iter()
+            .filter_map(|id| {
+                let entry = self.knowledge.entry(id)?;
+                let metadata = self.knowledge.view_metadata(id);
+                let entity_ref = if id.starts_with("provisional_knowledge:") {
+                    id.clone()
+                } else {
+                    format!("knowledge:{id}")
+                };
+                Some(serde_json::json!({
+                    "entity_ref": entity_ref,
+                    "entry": entry,
+                    "built_from_ref": metadata.and_then(|row| row.built_from_ref.as_deref()),
+                    "compatibility_lane": metadata.and_then(|row| row.compatibility_lane.as_deref()),
+                }))
+            })
+            .collect::<Vec<_>>();
+        let refs = returned_ids.iter().filter_map(|id| {
+            self.knowledge
+                .view_metadata(id)
+                .and_then(|metadata| metadata.built_from_ref.as_deref())
+        });
+        let built_from = self.built_from_for_refs(refs);
+        serde_json::json!({
+            "rows": rows,
+            "built_from": built_from,
+            "diagnostics": &self.diagnostics,
+        })
+    }
+
     pub(crate) fn diagnostics_text(&self) -> Option<String> {
         (!self.diagnostics.is_empty()).then(|| {
             format!(
@@ -51,6 +204,20 @@ impl SessionKnowledgeView {
             Some(diagnostics) => format!("{output}\n{diagnostics}"),
             None => output,
         }
+    }
+}
+
+fn append_row_stamp_refs(output: &mut String, row_stamps: &[(String, String)]) {
+    if row_stamps.is_empty() {
+        return;
+    }
+    output.push_str("\nKnowledge row built_from refs:\n");
+    for (entity_ref, reference) in row_stamps {
+        output.push_str("- ");
+        output.push_str(entity_ref);
+        output.push_str(" => ");
+        output.push_str(reference);
+        output.push('\n');
     }
 }
 
@@ -132,6 +299,9 @@ impl BlackboxServer {
             .map(|project| project.canonical_path.as_str())
             .collect::<BTreeSet<_>>();
         let mut items = BTreeMap::<String, KnowledgeViewItem>::new();
+        let mut built_from = BuiltFromTable::default();
+        let mut diagnostics = Vec::new();
+        let mut has_legacy_compatibility_rows = false;
         for entry in self.state.kb.read().all_entries() {
             if self.path_fallback_is_cut() && entry.scope == Scope::Project {
                 continue;
@@ -143,7 +313,15 @@ impl BlackboxServer {
             if entry.scope == Scope::Project && is_managed_project {
                 continue;
             }
-            insert_published_item(&mut items, entry.clone(), None, None);
+            insert_published_item(
+                &mut items,
+                entry.clone(),
+                None,
+                None,
+                None,
+                Some("legacy_compatibility"),
+            );
+            has_legacy_compatibility_rows = true;
         }
 
         let selected_projects = requested_record
@@ -151,7 +329,6 @@ impl BlackboxServer {
             .map(|record| vec![record.clone()])
             .unwrap_or_else(|| projects.clone());
         let mut selected_scopes = BTreeMap::<PublishedScope, ProjectRecord>::new();
-        let mut diagnostics = Vec::new();
         for project in selected_projects {
             match project_published_scope(&project, crate::config::read_repo_id_inputs) {
                 Some(scope) => {
@@ -165,7 +342,15 @@ impl BlackboxServer {
                         entry.scope == Scope::Project
                             && entry.project.as_deref() == Some(&project.canonical_path)
                     }) {
-                        insert_published_item(&mut items, entry.clone(), None, None);
+                        insert_published_item(
+                            &mut items,
+                            entry.clone(),
+                            None,
+                            None,
+                            None,
+                            Some("legacy_compatibility"),
+                        );
+                        has_legacy_compatibility_rows = true;
                     }
                 }
                 None if explicit_managed_scope => {
@@ -192,6 +377,7 @@ impl BlackboxServer {
             };
             let published = self.cached_published_knowledge_snapshot(
                 Path::new(&publisher.root),
+                &publisher.branch_ref,
                 &publisher.commit,
                 &scope,
                 &project.canonical_path,
@@ -204,12 +390,19 @@ impl BlackboxServer {
                     continue;
                 }
             };
+            let published_ref = built_from.intern(BuiltFromStamp::Published {
+                published_scope: published.published_scope.clone(),
+                published_ref: published.published_ref.clone(),
+                publisher_commit: published.publisher_commit.clone(),
+            });
             for published_entry in published.entries.into_values() {
                 insert_published_item(
                     &mut items,
                     published_entry.entry,
                     Some(scope.clone()),
                     Some(published_entry.content_hash),
+                    Some(&published_ref),
+                    None,
                 );
             }
 
@@ -258,7 +451,14 @@ impl BlackboxServer {
                             snapshot.key.checkout_id
                         )
                     }));
-                    apply_own_overlay(&mut items, &snapshot, &project.canonical_path);
+                    let overlay_ref =
+                        intern_overlay_stamp(&mut built_from, &snapshot, &mut diagnostics);
+                    apply_own_overlay(
+                        &mut items,
+                        &snapshot,
+                        &project.canonical_path,
+                        overlay_ref.as_deref(),
+                    );
                 }
                 ProvisionalMode::All => {
                     let snapshots = self
@@ -292,13 +492,31 @@ impl BlackboxServer {
                                 ));
                             }
                         }
-                        add_overlay_upserts(&mut items, &snapshot, &project.canonical_path);
+                        let overlay_ref =
+                            intern_overlay_stamp(&mut built_from, &snapshot, &mut diagnostics);
+                        add_overlay_upserts(
+                            &mut items,
+                            &snapshot,
+                            &project.canonical_path,
+                            overlay_ref.as_deref(),
+                        );
                     }
                 }
             }
         }
 
+        if has_legacy_compatibility_rows {
+            diagnostics.push(
+                "legacy_compatibility knowledge rows have no provable built_from stamp".into(),
+            );
+        }
+
         let items = items.into_values().collect::<Vec<_>>();
+        built_from.retain_ids(
+            items
+                .iter()
+                .filter_map(|item| item.metadata.built_from_ref.as_deref()),
+        );
         let mut metadata = BTreeMap::new();
         let entries = items
             .iter()
@@ -314,6 +532,7 @@ impl BlackboxServer {
         Ok(SessionKnowledgeView {
             knowledge: Knowledge::detached_view(entries, metadata),
             items,
+            built_from,
             diagnostics,
         })
     }
@@ -321,6 +540,7 @@ impl BlackboxServer {
     fn cached_published_knowledge_snapshot(
         &self,
         publisher_root: &Path,
+        published_ref: &str,
         publisher_commit: &str,
         scope: &PublishedScope,
         durable_project: &str,
@@ -333,6 +553,7 @@ impl BlackboxServer {
             .get(scope)
             .filter(|entry| {
                 entry.publisher_root == publisher_root
+                    && entry.snapshot.published_ref == published_ref
                     && entry.publisher_commit == publisher_commit
                     && entry.durable_project == durable_project
             })
@@ -345,7 +566,7 @@ impl BlackboxServer {
 
         let snapshot = load_published_snapshot_at_commit_unhydrated(
             Path::new(&publisher_root),
-            publisher_commit,
+            published_ref,
             publisher_commit,
             scope,
             durable_project,
@@ -380,6 +601,8 @@ fn insert_published_item(
     entry: KnowledgeEntry,
     published_scope: Option<PublishedScope>,
     content_hash: Option<String>,
+    built_from_ref: Option<&str>,
+    compatibility_lane: Option<&str>,
 ) {
     let entity_ref = EntityRef::Knowledge {
         id: entry.id.clone(),
@@ -394,6 +617,8 @@ fn insert_published_item(
                 checkout_id: None,
                 content_hash,
                 overlay_snapshot_id: None,
+                built_from_ref: built_from_ref.map(str::to_owned),
+                compatibility_lane: compatibility_lane.map(str::to_owned),
             },
             entity_ref,
             entry,
@@ -405,6 +630,7 @@ fn apply_own_overlay(
     items: &mut BTreeMap<String, KnowledgeViewItem>,
     snapshot: &OverlaySnapshot,
     durable_project: &str,
+    built_from_ref: Option<&str>,
 ) {
     for (entry_id, value) in &snapshot.values {
         items.remove(
@@ -414,7 +640,14 @@ fn apply_own_overlay(
             .to_string(),
         );
         if matches!(value, OverlayValue::Upsert { .. }) {
-            insert_overlay_item(items, snapshot, entry_id, value, durable_project);
+            insert_overlay_item(
+                items,
+                snapshot,
+                entry_id,
+                value,
+                durable_project,
+                built_from_ref,
+            );
         }
     }
 }
@@ -423,10 +656,18 @@ fn add_overlay_upserts(
     items: &mut BTreeMap<String, KnowledgeViewItem>,
     snapshot: &OverlaySnapshot,
     durable_project: &str,
+    built_from_ref: Option<&str>,
 ) {
     for (entry_id, value) in &snapshot.values {
         if matches!(value, OverlayValue::Upsert { .. }) {
-            insert_overlay_item(items, snapshot, entry_id, value, durable_project);
+            insert_overlay_item(
+                items,
+                snapshot,
+                entry_id,
+                value,
+                durable_project,
+                built_from_ref,
+            );
         }
     }
 }
@@ -437,6 +678,7 @@ fn insert_overlay_item(
     entry_id: &str,
     value: &OverlayValue,
     durable_project: &str,
+    built_from_ref: Option<&str>,
 ) {
     let OverlayValue::Upsert {
         entry,
@@ -461,6 +703,10 @@ fn insert_overlay_item(
                 checkout_id: Some(snapshot.key.checkout_id.clone()),
                 content_hash: Some(content_hash.clone()),
                 overlay_snapshot_id: Some(snapshot.snapshot_id.clone()),
+                built_from_ref: built_from_ref.map(str::to_owned),
+                compatibility_lane: built_from_ref
+                    .is_none()
+                    .then(|| "legacy_compatibility".to_string()),
             },
             entity_ref,
             entry,
@@ -468,11 +714,33 @@ fn insert_overlay_item(
     );
 }
 
+fn intern_overlay_stamp(
+    table: &mut BuiltFromTable,
+    snapshot: &OverlaySnapshot,
+    diagnostics: &mut Vec<String>,
+) -> Option<String> {
+    let Some(stamp) = snapshot.stamp.as_ref() else {
+        diagnostics.push(format!(
+            "checkout {} overlay has no provable built_from stamp; rows remain in legacy_compatibility",
+            snapshot.key.checkout_id
+        ));
+        return None;
+    };
+    Some(table.intern(BuiltFromStamp::CheckoutOverlay {
+        published_scope: stamp.published_scope.clone(),
+        checkout_id: stamp.checkout_id.clone(),
+        publisher_commit: stamp.publisher_commit.clone(),
+        checkout_head: stamp.checkout_head.clone(),
+        merge_base: stamp.merge_base.clone(),
+        working_fingerprint: stamp.working_fingerprint.clone(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bbox_knowledge::knowledge::{Approval, Category, KnowledgeListParams, Priority, Status};
-    use bbox_knowledge::overlay::{OverlayKey, OverlaySnapshot};
+    use bbox_knowledge::overlay::{OverlayKey, OverlaySnapshot, OverlayStamp};
     use std::collections::HashMap;
     use std::process::Command;
 
@@ -541,7 +809,15 @@ mod tests {
                 published_scope: scope.clone(),
                 checkout_id: checkout_id.into(),
             },
-            stamp: None,
+            stamp: Some(OverlayStamp {
+                published_scope: scope.clone(),
+                checkout_id: checkout_id.into(),
+                published_ref: "refs/heads/main".into(),
+                publisher_commit: "published-for-test".into(),
+                checkout_head: format!("head-{checkout_id}"),
+                merge_base: "merge-base-for-test".into(),
+                working_fingerprint: format!("dirty-{checkout_id}"),
+            }),
             status: OverlayStatus::Valid,
             values,
             diagnostics: Vec::new(),
@@ -694,12 +970,88 @@ mod tests {
             .unwrap();
         assert!(listed.contains(&own_ref), "{listed}");
 
-        let all = server
+        let mut all = server
             .session_knowledge_view(Some(base.to_str().unwrap()), Some("all"))
             .unwrap();
         assert!(all.knowledge.entry("shared").is_some());
         assert!(all.knowledge.entry(&own_ref).is_some());
         assert!(all.knowledge.entry(&peer_ref).is_some());
+        assert_eq!(all.built_from.len(), 3);
+        let published_stamp_ref = all
+            .knowledge
+            .view_metadata("shared")
+            .and_then(|metadata| metadata.built_from_ref.clone())
+            .expect("published row stamp");
+        let own_stamp_ref = all
+            .knowledge
+            .view_metadata(&own_ref)
+            .and_then(|metadata| metadata.built_from_ref.clone())
+            .expect("own row stamp");
+        let peer_stamp_ref = all
+            .knowledge
+            .view_metadata(&peer_ref)
+            .and_then(|metadata| metadata.built_from_ref.clone())
+            .expect("peer row stamp");
+        assert_ne!(published_stamp_ref, own_stamp_ref);
+        assert_ne!(published_stamp_ref, peer_stamp_ref);
+        assert_ne!(own_stamp_ref, peer_stamp_ref);
+        assert!(matches!(
+            all.built_from.get(&peer_stamp_ref),
+            Some(BuiltFromStamp::CheckoutOverlay {
+                working_fingerprint,
+                ..
+            }) if working_fingerprint == "dirty-peer-checkout"
+        ));
+        let rendered = all.knowledge.list(&KnowledgeListParams::default()).unwrap();
+        let rendered = all.append_built_from_for_ids(
+            rendered,
+            &["shared".into(), own_ref.clone(), peer_ref.clone()],
+        );
+        assert!(rendered.contains("built_from=built_from_"), "{rendered}");
+        assert!(rendered.contains("working_fingerprint=dirty-peer-checkout"));
+        let structured =
+            all.structured_response(&["shared".into(), own_ref.clone(), peer_ref.clone()]);
+        assert_eq!(structured["rows"].as_array().unwrap().len(), 3);
+        for row in structured["rows"].as_array().unwrap() {
+            let reference = row["built_from_ref"].as_str().unwrap();
+            assert!(structured["built_from"].get(reference).is_some());
+        }
+        let (_, indexed) = all
+            .enrich_json_response(
+                serde_json::json!({
+                    "text": "hybrid rows",
+                    "results": [
+                        {"entity_id": "knowledge:shared"},
+                        {"entity_id": own_ref.clone()},
+                        {"entity_id": peer_ref.clone()},
+                        {"entity_id": "thread:unrelated"}
+                    ]
+                })
+                .to_string(),
+            )
+            .unwrap();
+        assert_eq!(indexed["built_from"].as_object().unwrap().len(), 3);
+        assert!(indexed["results"][0]["built_from_ref"].is_string());
+        assert!(indexed["results"][1]["built_from_ref"].is_string());
+        assert!(indexed["results"][2]["built_from_ref"].is_string());
+        assert!(indexed["results"][3].get("built_from_ref").is_none());
+        assert!(
+            indexed["text"]
+                .as_str()
+                .unwrap()
+                .contains("working_fingerprint=")
+        );
+        let pinned_publisher_commit = match all.built_from.get(&published_stamp_ref).unwrap() {
+            BuiltFromStamp::Published {
+                published_ref,
+                publisher_commit,
+                ..
+            } => {
+                assert_eq!(published_ref, "refs/heads/main");
+                publisher_commit.clone()
+            }
+            other => panic!("expected published stamp, got {other:?}"),
+        };
         let diagnostics = all.diagnostics_text().unwrap();
         assert!(diagnostics.contains("invalid-peer"), "{diagnostics}");
         assert!(
@@ -750,6 +1102,25 @@ mod tests {
             refreshed.knowledge.entry("shared").unwrap().content,
             "NEW_PUBLISHED_CONTENT"
         );
+        let refreshed_stamp_ref = refreshed
+            .knowledge
+            .view_metadata("shared")
+            .and_then(|metadata| metadata.built_from_ref.as_deref())
+            .unwrap();
+        let refreshed_publisher_commit = match refreshed.built_from.get(refreshed_stamp_ref) {
+            Some(BuiltFromStamp::Published {
+                publisher_commit, ..
+            }) => publisher_commit,
+            other => panic!("expected refreshed published stamp, got {other:?}"),
+        };
+        assert_ne!(refreshed_publisher_commit, &pinned_publisher_commit);
+        assert!(all.built_from.iter().any(|(_, stamp)| matches!(
+            stamp,
+            BuiltFromStamp::Published {
+                publisher_commit,
+                ..
+            } if publisher_commit == &pinned_publisher_commit
+        )));
         let all = server
             .session_knowledge_view(Some(base.to_str().unwrap()), Some("all"))
             .unwrap();
