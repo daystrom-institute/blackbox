@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use bbox_corpus_core::built_from::{BuiltFromStamp, BuiltFromTable};
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_record::{ProjectRecord, ResolvedCheckoutScope};
-use bbox_gaps::gaps::GapStore;
+use bbox_gaps::gaps::{GapStore, GapViewMetadata};
 use bbox_gaps::overlay::{
     GapOverlayKey, GapOverlayRecomputeError, GapOverlayRecomputeErrorKind, GapOverlaySnapshot,
     GapOverlayStatus, GapOverlayValue, PublishedGapSnapshot, load_published_snapshot_at_commit,
@@ -25,7 +26,23 @@ pub(crate) struct PublishedGapCacheEntry {
 
 pub(crate) struct SessionGapView {
     pub(crate) gaps: GapStore,
+    pub(crate) built_from: BuiltFromTable,
     pub(crate) diagnostics: Vec<String>,
+}
+
+impl SessionGapView {
+    pub(crate) fn built_from_for_refs<'a>(
+        &self,
+        refs: impl IntoIterator<Item = &'a str>,
+    ) -> BuiltFromTable {
+        let mut table = self.built_from.clone();
+        table.retain_ids(refs);
+        table
+    }
+
+    pub(crate) fn append_built_from_table(&self, output: String, table: &BuiltFromTable) -> String {
+        super::built_from::append_built_from_section(output, table)
+    }
 }
 
 impl BlackboxServer {
@@ -51,50 +68,53 @@ impl BlackboxServer {
         let prior_is_valid = prior
             .as_ref()
             .is_some_and(|snapshot| snapshot.status == GapOverlayStatus::Valid);
-        let snapshot = match self
-            .authorize_publisher_classified(&projects, &checkout.published_scope)
-        {
-            Ok(publisher) => {
-                match stable_gap_overlay(Path::new(&publisher.root), &publisher.commit, checkout) {
-                    Ok(snapshot) => snapshot,
-                    Err(err)
-                        if err.kind == GapOverlayRecomputeErrorKind::Transient
-                            && prior_is_valid =>
-                    {
-                        tracing::warn!(
-                                error = %err,
-                                checkout = %checkout.checkout_id,
-                                scope = ?checkout.published_scope,
-                            "gap overlay refresh degraded; preserving prior valid snapshot"
-                        );
-                        let mut preserved = prior.clone().expect("prior valid snapshot");
-                        preserved.diagnostics = vec![format!("refresh degraded: {err:#}")];
-                        self.state
-                            .gap_overlays
-                            .write()
-                            .publish_if_latest(generation, preserved);
-                        return;
+        let snapshot =
+            match self.authorize_publisher_classified(&projects, &checkout.published_scope) {
+                Ok(publisher) => {
+                    match stable_gap_overlay(
+                        Path::new(&publisher.root),
+                        &publisher.branch_ref,
+                        checkout,
+                    ) {
+                        Ok(snapshot) => snapshot,
+                        Err(err)
+                            if err.kind == GapOverlayRecomputeErrorKind::Transient
+                                && prior_is_valid =>
+                        {
+                            tracing::warn!(
+                                    error = %err,
+                                    checkout = %checkout.checkout_id,
+                                    scope = ?checkout.published_scope,
+                                "gap overlay refresh degraded; preserving prior valid snapshot"
+                            );
+                            let mut preserved = prior.clone().expect("prior valid snapshot");
+                            preserved.diagnostics = vec![format!("refresh degraded: {err:#}")];
+                            self.state
+                                .gap_overlays
+                                .write()
+                                .publish_if_latest(generation, preserved);
+                            return;
+                        }
+                        Err(err) => GapOverlaySnapshot::invalid(checkout, format!("{err:#}")),
                     }
-                    Err(err) => GapOverlaySnapshot::invalid(checkout, format!("{err:#}")),
                 }
-            }
-            Err(err) if err.is_transient() && prior_is_valid => {
-                tracing::warn!(
-                    error = %err,
-                    checkout = %checkout.checkout_id,
-                    scope = ?checkout.published_scope,
-                    "gap publisher refresh degraded; preserving prior valid snapshot"
-                );
-                let mut preserved = prior.clone().expect("prior valid snapshot");
-                preserved.diagnostics = vec![format!("publisher refresh degraded: {err:#}")];
-                self.state
-                    .gap_overlays
-                    .write()
-                    .publish_if_latest(generation, preserved);
-                return;
-            }
-            Err(err) => GapOverlaySnapshot::invalid(checkout, format!("{err:#}")),
-        };
+                Err(err) if err.is_transient() && prior_is_valid => {
+                    tracing::warn!(
+                        error = %err,
+                        checkout = %checkout.checkout_id,
+                        scope = ?checkout.published_scope,
+                        "gap publisher refresh degraded; preserving prior valid snapshot"
+                    );
+                    let mut preserved = prior.clone().expect("prior valid snapshot");
+                    preserved.diagnostics = vec![format!("publisher refresh degraded: {err:#}")];
+                    self.state
+                        .gap_overlays
+                        .write()
+                        .publish_if_latest(generation, preserved);
+                    return;
+                }
+                Err(err) => GapOverlaySnapshot::invalid(checkout, format!("{err:#}")),
+            };
         self.state
             .gap_overlays
             .write()
@@ -130,29 +150,30 @@ impl BlackboxServer {
             .iter()
             .map(|project| project.canonical_path.as_str())
             .collect::<BTreeSet<_>>();
-        let mut gaps = self
-            .state
-            .gaps
-            .read()
-            .all()
-            .iter()
-            .filter(|gap| {
-                if self.path_fallback_is_cut() && gap.project.is_some() {
-                    return false;
-                }
-                !gap.project
-                    .as_deref()
-                    .is_some_and(|project| managed_paths.contains(project))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut gaps = Vec::new();
+        let mut metadata = BTreeMap::<String, GapViewMetadata>::new();
+        let mut built_from = BuiltFromTable::default();
+        let mut diagnostics = Vec::new();
+        let mut has_legacy_compatibility_rows = false;
+        let durable_gaps = self.state.gaps.read().all().to_vec();
+        for gap in durable_gaps.iter().filter(|gap| {
+            if self.path_fallback_is_cut() && gap.project.is_some() {
+                return false;
+            }
+            !gap.project
+                .as_deref()
+                .is_some_and(|project| managed_paths.contains(project))
+        }) {
+            metadata.insert(gap.id.clone(), legacy_gap_metadata());
+            gaps.push(gap.clone());
+            has_legacy_compatibility_rows = true;
+        }
 
         let selected_projects = requested_record
             .as_ref()
             .map(|record| vec![record.clone()])
             .unwrap_or_else(|| projects.clone());
         let mut selected_scopes = BTreeMap::<PublishedScope, ProjectRecord>::new();
-        let mut diagnostics = Vec::new();
         for project in selected_projects {
             match project_published_scope(&project, crate::config::read_repo_id_inputs) {
                 Some(scope) => {
@@ -162,15 +183,14 @@ impl BlackboxServer {
                     // Inventory-bounded compatibility until the final path
                     // fallback cut: registered projects without a recorded
                     // scope keep their legacy loaded gap view.
-                    gaps.extend(
-                        self.state
-                            .gaps
-                            .read()
-                            .all()
-                            .iter()
-                            .filter(|gap| gap.project.as_deref() == Some(&project.canonical_path))
-                            .cloned(),
-                    );
+                    for gap in durable_gaps
+                        .iter()
+                        .filter(|gap| gap.project.as_deref() == Some(&project.canonical_path))
+                    {
+                        metadata.insert(gap.id.clone(), legacy_gap_metadata());
+                        gaps.push(gap.clone());
+                        has_legacy_compatibility_rows = true;
+                    }
                 }
                 None if explicit_managed_scope => anyhow::bail!(
                     "registered project {} has no authoritative published scope",
@@ -193,6 +213,7 @@ impl BlackboxServer {
             };
             let published = self.cached_published_gap_snapshot(
                 Path::new(&publisher.root),
+                &publisher.branch_ref,
                 &publisher.commit,
                 &scope,
                 &project.canonical_path,
@@ -205,10 +226,24 @@ impl BlackboxServer {
                     continue;
                 }
             };
+            let published_ref = built_from.intern(BuiltFromStamp::Published {
+                published_scope: published.published_scope.clone(),
+                published_ref: published.published_ref.clone(),
+                publisher_commit: published.publisher_commit.clone(),
+            });
             let mut scope_gaps = published
                 .gaps
                 .into_iter()
-                .map(|(id, entry)| (id, entry.gap))
+                .map(|(id, entry)| {
+                    metadata.insert(
+                        id.clone(),
+                        GapViewMetadata {
+                            built_from_ref: Some(published_ref.clone()),
+                            compatibility_lane: None,
+                        },
+                    );
+                    (id, entry.gap)
+                })
                 .collect::<BTreeMap<_, _>>();
 
             match mode {
@@ -257,15 +292,22 @@ impl BlackboxServer {
                             snapshot.key.checkout_id
                         )
                     }));
+                    let overlay_ref =
+                        intern_gap_overlay_stamp(&mut built_from, &snapshot, &mut diagnostics);
                     for (id, value) in snapshot.values {
                         match value {
                             GapOverlayValue::Upsert { mut gap, .. } => {
                                 gap.project = Some(project.canonical_path.clone());
                                 gap.provisional_checkout_id = Some(own.checkout_id.clone());
+                                metadata.insert(
+                                    id.clone(),
+                                    overlay_gap_metadata(overlay_ref.as_deref()),
+                                );
                                 scope_gaps.insert(id, *gap);
                             }
                             GapOverlayValue::Tombstone => {
                                 scope_gaps.remove(&id);
+                                metadata.remove(&id);
                             }
                         }
                     }
@@ -294,6 +336,8 @@ impl BlackboxServer {
                                 snapshot.key.checkout_id
                             )
                         }));
+                        let overlay_ref =
+                            intern_gap_overlay_stamp(&mut built_from, &snapshot, &mut diagnostics);
                         for (id, value) in snapshot.values {
                             match value {
                                 GapOverlayValue::Upsert { mut gap, .. } => {
@@ -302,6 +346,10 @@ impl BlackboxServer {
                                         Some(snapshot.key.checkout_id.clone());
                                     gap.id =
                                         provisional_gap_ref(&snapshot.key.checkout_id, &gap.id);
+                                    metadata.insert(
+                                        gap.id.clone(),
+                                        overlay_gap_metadata(overlay_ref.as_deref()),
+                                    );
                                     gaps.push(*gap);
                                 }
                                 GapOverlayValue::Tombstone => diagnostics.push(format!(
@@ -316,8 +364,19 @@ impl BlackboxServer {
             gaps.extend(scope_gaps.into_values());
         }
 
+        if has_legacy_compatibility_rows {
+            diagnostics
+                .push("legacy_compatibility gap rows have no provable built_from stamp".into());
+        }
+        built_from.retain_ids(
+            metadata
+                .values()
+                .filter_map(|row| row.built_from_ref.as_deref()),
+        );
+
         Ok(SessionGapView {
-            gaps: GapStore::detached_view(gaps),
+            gaps: GapStore::detached_view(gaps, metadata),
+            built_from,
             diagnostics,
         })
     }
@@ -325,6 +384,7 @@ impl BlackboxServer {
     fn cached_published_gap_snapshot(
         &self,
         publisher_root: &Path,
+        published_ref: &str,
         publisher_commit: &str,
         scope: &PublishedScope,
         durable_project: &str,
@@ -337,6 +397,7 @@ impl BlackboxServer {
             .get(scope)
             .filter(|entry| {
                 entry.publisher_root == publisher_root
+                    && entry.snapshot.published_ref == published_ref
                     && entry.publisher_commit == publisher_commit
                     && entry.durable_project == durable_project
             })
@@ -347,7 +408,7 @@ impl BlackboxServer {
 
         let snapshot = load_published_snapshot_at_commit(
             Path::new(&publisher_root),
-            publisher_commit,
+            published_ref,
             publisher_commit,
             scope,
             durable_project,
@@ -367,6 +428,44 @@ impl BlackboxServer {
 
 fn provisional_gap_ref(checkout_id: &str, gap_id: &str) -> String {
     format!("provisional_gap:{checkout_id}:{gap_id}")
+}
+
+fn legacy_gap_metadata() -> GapViewMetadata {
+    GapViewMetadata {
+        built_from_ref: None,
+        compatibility_lane: Some("legacy_compatibility".into()),
+    }
+}
+
+fn overlay_gap_metadata(built_from_ref: Option<&str>) -> GapViewMetadata {
+    GapViewMetadata {
+        built_from_ref: built_from_ref.map(str::to_owned),
+        compatibility_lane: built_from_ref
+            .is_none()
+            .then(|| "legacy_compatibility".into()),
+    }
+}
+
+fn intern_gap_overlay_stamp(
+    table: &mut BuiltFromTable,
+    snapshot: &GapOverlaySnapshot,
+    diagnostics: &mut Vec<String>,
+) -> Option<String> {
+    let Some(stamp) = snapshot.stamp.as_ref() else {
+        diagnostics.push(format!(
+            "checkout {} gap overlay has no provable built_from stamp; rows remain in legacy_compatibility",
+            snapshot.key.checkout_id
+        ));
+        return None;
+    };
+    Some(table.intern(BuiltFromStamp::CheckoutOverlay {
+        published_scope: stamp.published_scope.clone(),
+        checkout_id: stamp.checkout_id.clone(),
+        publisher_commit: stamp.publisher_commit.clone(),
+        checkout_head: stamp.checkout_head.clone(),
+        merge_base: stamp.merge_base.clone(),
+        working_fingerprint: stamp.working_fingerprint.clone(),
+    }))
 }
 
 fn stable_gap_overlay(
@@ -474,6 +573,20 @@ mod tests {
             .session_gap_view(Some(repo.to_str().expect("utf8 repo")), Some("published"))
             .expect("first gap view");
         assert_eq!(first.gaps.all().len(), 1);
+        assert_eq!(first.built_from.len(), 1);
+        let published_ref = first
+            .gaps
+            .view_metadata("gap-12345678")
+            .and_then(|metadata| metadata.built_from_ref.as_deref())
+            .expect("published gap stamp ref");
+        assert!(matches!(
+            first.built_from.get(published_ref),
+            Some(BuiltFromStamp::Published {
+                published_ref,
+                publisher_commit,
+                ..
+            }) if published_ref == "refs/heads/main" && !publisher_commit.is_empty()
+        ));
         assert_eq!(state.gap_published_cache.read().len(), 1);
         assert_eq!(state.publisher_authorization_cache.read().len(), 1);
 
@@ -524,6 +637,20 @@ mod tests {
             .session_gap_view(Some(repo.to_str().expect("utf8 repo")), Some("own"))
             .expect("bounded refresh should recover missing own gap overlay");
         assert_eq!(own.gaps.all()[0].title, "Dirty checkout gap");
+        assert_eq!(own.built_from.len(), 1);
+        let own_ref = own
+            .gaps
+            .view_metadata("gap-12345678")
+            .and_then(|metadata| metadata.built_from_ref.as_deref())
+            .expect("own gap stamp ref");
+        assert!(matches!(
+            own.built_from.get(own_ref),
+            Some(BuiltFromStamp::CheckoutOverlay {
+                checkout_id,
+                working_fingerprint,
+                ..
+            }) if checkout_id == "own-gap-checkout" && !working_fingerprint.is_empty()
+        ));
 
         server.invalidate_published_knowledge_cache(&scope);
         assert!(state.gap_published_cache.read().is_empty());

@@ -185,6 +185,29 @@ impl BlackboxServer {
         }
     }
 
+    /// Run a synchronous handler that preserves the established text content
+    /// while additively publishing a machine-readable response envelope.
+    pub(crate) fn run_with_structured<F>(tool: &'static str, op: F) -> CallToolResult
+    where
+        F: FnOnce() -> anyhow::Result<(String, Value)>,
+    {
+        let start = std::time::Instant::now();
+        match op() {
+            Ok((text, structured)) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::info!(target: "blackbox::tool", tool, elapsed_ms = ms, bytes = text.len(), "ok");
+                let mut response = Self::ok_text(&text);
+                response.structured_content = Some(structured);
+                response
+            }
+            Err(e) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::warn!(target: "blackbox::tool", tool, elapsed_ms = ms, error = %e, "err");
+                Self::err_text(&format!("Error: {e:#}"))
+            }
+        }
+    }
+
     /// Run a blocking sync tool handler on tokio's blocking pool while
     /// preserving the same timing, tracing, and response conversion as `run`.
     pub(crate) async fn run_blocking<F>(tool: &'static str, op: F) -> CallToolResult
@@ -202,6 +225,33 @@ impl BlackboxServer {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::info!(target: "blackbox::tool", tool, elapsed_ms = ms, bytes = text.len(), "ok");
                 Self::ok_text(&text)
+            }
+            Err(e) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::warn!(target: "blackbox::tool", tool, elapsed_ms = ms, error = %e, "err");
+                Self::err_text(&format!("Error: {e:#}"))
+            }
+        }
+    }
+
+    /// Blocking-pool twin of [`Self::run_with_structured`].
+    pub(crate) async fn run_blocking_with_structured<F>(tool: &'static str, op: F) -> CallToolResult
+    where
+        F: FnOnce() -> anyhow::Result<(String, Value)> + Send + 'static,
+    {
+        let start = std::time::Instant::now();
+        let result = tokio::task::spawn_blocking(op)
+            .await
+            .map_err(|e| anyhow::anyhow!("blocking task failed: {e}"))
+            .and_then(std::convert::identity);
+
+        match result {
+            Ok((text, structured)) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::info!(target: "blackbox::tool", tool, elapsed_ms = ms, bytes = text.len(), "ok");
+                let mut response = Self::ok_text(&text);
+                response.structured_content = Some(structured);
+                response
             }
             Err(e) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;

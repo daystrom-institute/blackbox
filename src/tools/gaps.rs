@@ -114,7 +114,7 @@ impl BlackboxServer {
         description = "List / filter substrate gap notes by typed fields (gap_kind, impact, blocking_level, dedupe_key, resolution, project)."
     )]
     pub(crate) fn bbox_gaps(&self, Parameters(p): Parameters<GapListParams>) -> CallToolResult {
-        Self::run("bbox_gaps", || {
+        Self::run_with_structured("bbox_gaps", || {
             let mut p = p;
             let requested_project = p.project.clone();
             let view =
@@ -125,12 +125,52 @@ impl BlackboxServer {
             {
                 p.project = Some(base);
             }
+            let mut used_stamp_refs = Vec::<String>::new();
+            let rows = view
+                .gaps
+                .query(&p)
+                .into_iter()
+                .map(|gap| {
+                    let metadata = view.gaps.view_metadata(&gap.id);
+                    let mut row = serde_json::to_value(gap)?;
+                    let object = row
+                        .as_object_mut()
+                        .expect("serialized gap response row must be an object");
+                    if let Some(reference) =
+                        metadata.and_then(|metadata| metadata.built_from_ref.as_ref())
+                    {
+                        object.insert(
+                            "built_from_ref".into(),
+                            serde_json::Value::String(reference.clone()),
+                        );
+                        used_stamp_refs.push(reference.clone());
+                    }
+                    if let Some(lane) =
+                        metadata.and_then(|metadata| metadata.compatibility_lane.as_ref())
+                    {
+                        object.insert(
+                            "compatibility_lane".into(),
+                            serde_json::Value::String(lane.clone()),
+                        );
+                    }
+                    Ok::<_, anyhow::Error>(row)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let built_from = view.built_from_for_refs(used_stamp_refs.iter().map(String::as_str));
+            let structured = serde_json::json!({
+                "rows": rows,
+                "built_from": &built_from,
+                "diagnostics": &view.diagnostics,
+            });
             let mut rendered = view.gaps.list_rendered(&p)?;
-            if !p.json.unwrap_or(false) && !view.diagnostics.is_empty() {
-                rendered.push_str("\n\nProvisional gap diagnostics:\n- ");
-                rendered.push_str(&view.diagnostics.join("\n- "));
+            if !p.json.unwrap_or(false) {
+                if !view.diagnostics.is_empty() {
+                    rendered.push_str("\n\nProvisional gap diagnostics:\n- ");
+                    rendered.push_str(&view.diagnostics.join("\n- "));
+                }
+                rendered = view.append_built_from_table(rendered, &built_from);
             }
-            Ok(rendered)
+            Ok((rendered, structured))
         })
     }
 
@@ -767,5 +807,14 @@ mod tests {
             body.contains("worktree gap"),
             "worktree-scoped list should find the base-keyed gap: {body}"
         );
+        assert!(body.contains("built_from=built_from_"), "{body}");
+        assert!(body.contains("working_fingerprint="), "{body}");
+        let structured = list
+            .structured_content
+            .expect("bbox_gaps structured response");
+        let reference = structured["rows"][0]["built_from_ref"]
+            .as_str()
+            .expect("row stamp reference");
+        assert!(structured["built_from"].get(reference).is_some());
     }
 }

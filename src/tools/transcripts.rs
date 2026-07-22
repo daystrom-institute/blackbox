@@ -116,7 +116,7 @@ impl BlackboxServer {
         Parameters(p): Parameters<HybridSearchParams>,
     ) -> CallToolResult {
         let server = self.clone();
-        Self::run_blocking("bbox_hybrid_search", move || {
+        Self::run_blocking_with_structured("bbox_hybrid_search", move || {
             // Fast path: read-lock the index to check emptiness. Only escalate
             // to a write lock if we actually need to build_index. The previous
             // unconditional write lock blocked every search behind the
@@ -136,14 +136,16 @@ impl BlackboxServer {
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
                     .with_knowledge_view(&knowledge_view.knowledge)
                     .with_searcher(&read_view.searcher);
-            mcp_tools::hybrid_search::hybrid_search_with_active_selectors_and_searcher(
-                &server.state.idx.read(),
-                &knowledge_view.knowledge,
-                &provider_ctx,
-                &p,
-                &read_view.active_selectors,
-                &read_view.searcher,
-            )
+            let response =
+                mcp_tools::hybrid_search::hybrid_search_typed_with_active_selectors_and_searcher(
+                    &server.state.idx.read(),
+                    &knowledge_view.knowledge,
+                    &provider_ctx,
+                    &p,
+                    &read_view.active_selectors,
+                    &read_view.searcher,
+                )?;
+            knowledge_view.enrich_json_response(serde_json::to_string(&response)?)
         })
         .await
     }
@@ -157,7 +159,7 @@ impl BlackboxServer {
         Parameters(p): Parameters<DiscoverSeedParams>,
     ) -> CallToolResult {
         let server = self.clone();
-        Self::run_blocking("bbox_discover_seed_entities", move || {
+        Self::run_blocking_with_structured("bbox_discover_seed_entities", move || {
             if server.state.idx.read().is_empty() {
                 server
                     .state
@@ -172,7 +174,7 @@ impl BlackboxServer {
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
                     .with_knowledge_view(&knowledge_view.knowledge)
                     .with_searcher(&read_view.searcher);
-            mcp_tools::discover_seed::discover_seed_entities(
+            let output = mcp_tools::discover_seed::discover_seed_entities(
                 &server.state.idx.read(),
                 &knowledge_view.knowledge,
                 &provider_ctx,
@@ -180,7 +182,8 @@ impl BlackboxServer {
                 &read_view.active_selectors,
                 &read_view.searcher,
                 &p,
-            )
+            )?;
+            knowledge_view.enrich_json_response(output)
         })
         .await
     }

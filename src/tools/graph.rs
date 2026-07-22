@@ -68,14 +68,13 @@ impl BlackboxServer {
         Parameters(p): Parameters<InspectEntityParams>,
     ) -> CallToolResult {
         let server = self.clone();
-        Self::run_blocking("bbox_inspect_entity", move || {
+        Self::run_blocking_with_structured("bbox_inspect_entity", move || {
             let entity_ref = match entity_ref::EntityRef::parse(&p.entity_ref) {
                 Ok(entity_ref) => entity_ref,
                 Err(err) => {
-                    return Ok(mcp_tools::inspect::bad_input(
-                        &p.entity_ref,
-                        err.to_string(),
-                    ));
+                    let output = mcp_tools::inspect::bad_input(&p.entity_ref, err.to_string());
+                    let structured = serde_json::from_str(&output)?;
+                    return Ok((output, structured));
                 }
             };
             let knowledge_view = server.session_knowledge_view(None, p.provisional.as_deref())?;
@@ -95,17 +94,20 @@ impl BlackboxServer {
                     &read_view.searcher,
                 )
             {
-                return Ok(mcp_tools::inspect::not_found(
+                let output = mcp_tools::inspect::not_found(
                     &entity_ref,
                     mcp_tools::inspect::similar_refs(edge_index, &entity_ref),
-                ));
+                );
+                return knowledge_view.enrich_json_response(output);
             }
             let provider_ctx =
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
                     .with_knowledge_view(&knowledge_view.knowledge)
                     .with_edge_index(edge_index)
                     .with_searcher(&read_view.searcher);
-            mcp_tools::inspect::inspect_entity(&p, &provider_ctx, &entity_ref, edge_index)
+            let output =
+                mcp_tools::inspect::inspect_entity(&p, &provider_ctx, &entity_ref, edge_index)?;
+            knowledge_view.enrich_json_response(output)
         })
         .await
     }
@@ -166,7 +168,7 @@ impl BlackboxServer {
         Parameters(p): Parameters<BundleEvidenceParams>,
     ) -> CallToolResult {
         let server = self.clone();
-        Self::run_blocking("bbox_bundle_evidence", move || {
+        Self::run_blocking_with_structured("bbox_bundle_evidence", move || {
             let knowledge_view = server.session_knowledge_view(None, p.provisional.as_deref())?;
             let read_view = server.state.code_read_view.read().clone();
             let edge_index = read_view.edge_index.as_ref();
@@ -175,12 +177,13 @@ impl BlackboxServer {
                     .with_knowledge_view(&knowledge_view.knowledge)
                     .with_edge_index(edge_index)
                     .with_searcher(&read_view.searcher);
-            mcp_tools::bundle_evidence::bundle_evidence(
+            let output = mcp_tools::bundle_evidence::bundle_evidence(
                 &p,
                 &provider_ctx,
                 edge_index,
                 &mut server.state.path_cache.write(),
-            )
+            )?;
+            knowledge_view.enrich_json_response(output)
         })
         .await
     }
