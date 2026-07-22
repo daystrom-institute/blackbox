@@ -588,6 +588,13 @@ a previously active collected scope. The summary and health state report every
 preserved degraded selector. This follows the existing provisional-knowledge
 read-back pattern but is keyed by the exact active source selector.
 
+A failed preservation check sets a persistent unhealthy state for the project
+and the full-rebuild subsystem, including expected and observed document counts
+and inventory digests without content or absolute paths. `doctor` reports the
+same condition and names the recovery choices: re-ship the generation or
+complete an explicit local cutback. Later full passes continue to fail closed
+until recovery; the condition cannot be reduced to a warning log.
+
 The initial Phase 0 schema bump happens before collector activation is enabled,
 so no collected generation can require cross-schema preservation during that
 one-time reset. A future schema migration with collected scopes must provide an
@@ -606,12 +613,15 @@ collected scope, the map contains repo-relative paths and V2 refs from the
 collected generation. "Repo-relative" is exact: for a non-root published scope,
 the map key prefixes each scope-relative manifest path with the normalized
 `bbox_root_relpath`; `.` is the identity prefix. This matches the repository-root
-paths emitted by `git diff-tree --name-only`. The local Git reader can therefore
-preserve and refresh `COMMIT_TOUCHED_FILE` edges, including during `force_full`,
-while its remaining `.git` checkout dependency stays explicit. Health reports
-the local history HEAD and collected HEAD separately and warns when the local
-clone does not contain the collected HEAD. Reindex summaries report
-local-history and collected-current-file work separately.
+paths emitted by `git diff-tree --name-only`. The local adapter uses the same
+Git-map key projection instead of changing the registered-root-relative path
+stored in chunks and entity refs. This also repairs the pre-existing local
+subproject join gap. The local Git reader can therefore preserve and refresh
+`COMMIT_TOUCHED_FILE` edges, including during `force_full`, while its remaining
+`.git` checkout dependency stays explicit. Health reports the local history
+HEAD and collected HEAD separately and warns when the local clone does not
+contain the collected HEAD. Reindex summaries report local-history and
+collected-current-file work separately.
 
 A lagging local clone does not fail collected-file activation. The Git phase
 indexes only commits reachable in that clone up to its local HEAD and joins
@@ -784,10 +794,12 @@ Unit and integration coverage must include:
   recurring `needs_reindex` trigger remains;
 - `COMMIT_TOUCHED_FILE` edges targeting active collected V2 refs before and
   after incremental and forced-full Git-history refresh, using a fixture whose
-  `bbox_root_relpath` is a non-root monorepo subproject;
+  `bbox_root_relpath` is a non-root monorepo subproject, with the same fixture
+  proving local-adapter joins while entity relative paths remain scope-local;
 - a full rebuild with one quarantined active-generation blob preserving the
   complete last-good selector documents, plus an incomplete preservation
-  inventory aborting without changing the committed index;
+  inventory aborting without changing the committed index and surfacing the
+  persistent health and doctor failure;
 - warming behavior, explicit cutback success, cutback failure preserving the
   collected generation, staleness reporting, and no implicit failover;
 - collector dependency ceiling and a binary smoke test against a temporary
