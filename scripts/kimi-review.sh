@@ -111,7 +111,7 @@ case "$verb" in
       --dangerously-skip-permissions \
       --append-system-prompt-file "$plan_prompt_file" \
       --session-id "$session_id" \
-      --name "kimi-checkout-provenance-plan-review" \
+      --name "kimi-distributed-code-source-plan-review" \
       --disallowedTools Edit Write NotebookEdit \
       -p "Perform the complete mandatory plan review now."; then
       if [[ -f "$plan_session_file" ]] && [[ "$(tr -d '[:space:]' <"$plan_session_file")" == "$session_id" ]]; then
