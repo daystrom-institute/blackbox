@@ -6,3 +6,4 @@ pub mod gap_closeout;
 pub mod gap_spool;
 pub mod gaps;
 pub mod overlay;
+pub mod repo_io;

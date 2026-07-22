@@ -13,15 +13,18 @@
 //! NO tantivy/search indexing, NO rendered provider memory. Gaps get durable
 //! persistence + live reload only.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::repo_io::{GapRepoCarrier, GapRepoRead, GapRepoWrite};
 
 pub const GAP_NOTE_TYPE: &str = "blackbox.gap_note.v1";
 
@@ -176,7 +179,7 @@ pub struct GapNote {
     //    scope, exactly like knowledge entries omit `project`). ──
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
-    /// Transient committed-file write target. A managed checkout carries the
+    /// Transient logical write-carrier id. A managed checkout carries the
     /// repo-owned gap file while `project` remains the durable base scope.
     /// Never retained in the central store or committed record; the checkout
     /// registry reconstructs its provisional overlay after restart.
@@ -415,9 +418,8 @@ pub struct GapFileParams {
     /// scope=project; ignored when scope=global.
     #[serde(default)]
     pub project: Option<String>,
-    /// Internal committed-file write target set by the MCP adapter for managed
-    /// fleet worktrees. Not accepted from clients and omitted from the tool
-    /// schema.
+    /// Internal logical write-carrier id set by the MCP adapter for managed
+    /// fleet worktrees. Not accepted from clients and omitted from the schema.
     #[serde(skip)]
     #[schemars(skip)]
     pub write_dir: Option<String>,
@@ -502,7 +504,7 @@ pub struct GapResolveParams {
     /// (the base checkout). Ignored for global-scope gaps.
     #[serde(default)]
     pub project: Option<String>,
-    /// Internal committed-file write target resolved by the MCP adapter from
+    /// Internal logical write-carrier id resolved by the MCP adapter from
     /// `project`. Not accepted from clients and omitted from the tool schema.
     #[serde(skip)]
     #[schemars(skip)]
@@ -542,7 +544,7 @@ pub struct GapUpdateParams {
     /// (the base checkout). Ignored for global-scope gaps.
     #[serde(default)]
     pub project: Option<String>,
-    /// Internal committed-file write target resolved by the MCP adapter from
+    /// Internal logical write-carrier id resolved by the MCP adapter from
     /// `project`. Not accepted from clients and omitted from the tool schema.
     #[serde(skip)]
     #[schemars(skip)]
@@ -565,21 +567,17 @@ fn repo_gaps_dir(project_dir: &Path) -> PathBuf {
     project_dir.join(".bbox").join("gaps")
 }
 
-fn is_checkout_redirect(project: Option<&str>, write_dir: Option<&str>) -> bool {
-    matches!((project, write_dir), (Some(project), Some(write_dir)) if project != write_dir)
-}
-
 /// A project is "repo-owned" for gaps once its `.bbox/gaps/` dir exists — via a
 /// clone that carries it, `bbox_project_init`, the spool dropping a file, or the
 /// first project-scoped `bbox_gap`.
-pub fn project_is_repo_owned(project_dir: &Path) -> bool {
+fn project_is_repo_owned(project_dir: &Path) -> bool {
     repo_gaps_dir(project_dir).is_dir()
 }
 
 /// Load every project-scoped gap committed under `<project>/.bbox/gaps/`,
 /// stamping each with `project = project_dir` (absent on disk). Top-level
 /// `*.json` only; tolerant skip-and-continue per file.
-fn load_repo_gap_entries(project_dir: &Path) -> Result<Vec<GapNote>> {
+fn load_repo_gap_entries(project_dir: &Path, durable_project: &str) -> Result<Vec<GapNote>> {
     let git_root = bbox_corpus_core::git::git_root_for_path(project_dir);
     let transaction_root = git_root.as_deref().unwrap_or(project_dir);
     if bbox_corpus_core::transaction::has_pending_transaction(transaction_root) {
@@ -593,7 +591,6 @@ fn load_repo_gap_entries(project_dir: &Path) -> Result<Vec<GapNote>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
-    let project = project_dir.to_string_lossy().to_string();
     let mut out = Vec::new();
     let mut skipped = 0usize;
     let read_dir = match fs::read_dir(&dir) {
@@ -633,7 +630,7 @@ fn load_repo_gap_entries(project_dir: &Path) -> Result<Vec<GapNote>> {
                 continue;
             }
         };
-        entry.project = Some(project.clone());
+        entry.project = Some(durable_project.to_string());
         // Committed records never carry a write redirect — the file's
         // location IS the carrier. Clearing here also makes loading a base
         // root's file the merge-observation signal that drops a retained
@@ -773,18 +770,90 @@ impl GapStoreData {
 pub struct GapStore {
     store_path: PathBuf,
     data: GapStoreData,
-    project_roots: Vec<PathBuf>,
+    project_carriers: Vec<GapRepoCarrier>,
+    repo_read: Option<Arc<dyn GapRepoRead>>,
+    repo_write: Option<Arc<dyn GapRepoWrite>>,
+    repo_owned_projects: BTreeSet<String>,
+    repo_owned_carriers: BTreeSet<String>,
     /// Store-layer enforcement for the monotonic path-authority cut.
     path_fallback_cut: bool,
     view_metadata: BTreeMap<String, GapViewMetadata>,
 }
 
 impl GapStore {
+    fn carrier_for_project(&self, project: &str) -> Option<&GapRepoCarrier> {
+        self.project_carriers
+            .iter()
+            .find(|carrier| carrier.project == project)
+    }
+
+    fn carrier_for_write(&self, project: &str, carrier_id: &str) -> Result<GapRepoCarrier> {
+        if let Some(base) = self
+            .carrier_for_project(project)
+            .filter(|base| base.carrier_id == carrier_id)
+        {
+            return Ok(base.clone());
+        }
+        GapRepoCarrier::new(project, carrier_id)
+    }
+
+    fn with_repo_read<T>(
+        &self,
+        carrier: &GapRepoCarrier,
+        mut operation: impl FnMut(&Path) -> Result<T>,
+    ) -> Result<T> {
+        let authority = self.repo_read.as_ref().with_context(|| {
+            format!(
+                "gap repository read authority is unavailable for carrier {}",
+                carrier.carrier_id
+            )
+        })?;
+        let mut result = None;
+        authority.with_read(carrier, &mut |root| {
+            result = Some(operation(root)?);
+            Ok(())
+        })?;
+        result.with_context(|| {
+            format!(
+                "gap repository read authority did not invoke operation for carrier {}",
+                carrier.carrier_id
+            )
+        })
+    }
+
+    fn with_repo_write<T>(
+        &self,
+        carrier: &GapRepoCarrier,
+        mut operation: impl FnMut(&Path) -> Result<T>,
+    ) -> Result<T> {
+        let authority = self.repo_write.as_ref().with_context(|| {
+            format!(
+                "gap repository write authority is unavailable for carrier {}",
+                carrier.carrier_id
+            )
+        })?;
+        let mut result = None;
+        authority.with_write(carrier, &mut |root| {
+            result = Some(operation(root)?);
+            Ok(())
+        })?;
+        result.with_context(|| {
+            format!(
+                "gap repository write authority did not invoke operation for carrier {}",
+                carrier.carrier_id
+            )
+        })
+    }
+
     pub fn open(store_path: &Path) -> Result<Self> {
         let mut s = Self {
             store_path: store_path.to_path_buf(),
             data: GapStoreData::new(),
-            project_roots: Vec::new(),
+            project_carriers: Vec::new(),
+            repo_read: None,
+            repo_write: None,
+            repo_owned_projects: BTreeSet::new(),
+            repo_owned_carriers: BTreeSet::new(),
             path_fallback_cut: false,
             view_metadata: BTreeMap::new(),
         };
@@ -792,10 +861,37 @@ impl GapStore {
         Ok(s)
     }
 
-    /// Register the repos whose committed `.bbox/gaps/` should load into the
-    /// query surface, then reload so their gaps are immediately visible.
+    /// Install repository I/O authorities and logical published carriers, then
+    /// reload so their committed gaps are immediately visible.
+    pub fn configure_repo_io(
+        &mut self,
+        read: Arc<dyn GapRepoRead>,
+        write: Arc<dyn GapRepoWrite>,
+        carriers: Vec<GapRepoCarrier>,
+    ) -> Result<()> {
+        self.repo_read = Some(read);
+        self.repo_write = Some(write);
+        self.project_carriers = carriers;
+        self.reload()
+    }
+
+    #[cfg(test)]
     pub fn set_project_roots(&mut self, roots: Vec<PathBuf>) -> Result<()> {
-        self.project_roots = roots;
+        use crate::repo_io::test_support::TestGapRepoIo;
+
+        let carriers = roots
+            .into_iter()
+            .map(|root| {
+                let project = root.to_string_lossy().into_owned();
+                let carrier = GapRepoCarrier::new(project.clone(), project)?;
+                Ok((carrier, root))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let io = Arc::new(TestGapRepoIo::default());
+        io.replace(&carriers);
+        self.repo_read = Some(io.clone());
+        self.repo_write = Some(io);
+        self.project_carriers = carriers.into_iter().map(|(carrier, _)| carrier).collect();
         self.reload()
     }
 
@@ -813,14 +909,26 @@ impl GapStore {
         } else {
             self.data = GapStoreData::new();
         }
+        self.repo_owned_projects.clear();
+        self.repo_owned_carriers.clear();
         self.load_project_entries()?;
         Ok(())
     }
 
     fn load_project_entries(&mut self) -> Result<()> {
-        let roots = self.project_roots.clone();
-        for root in &roots {
-            for entry in load_repo_gap_entries(root)? {
+        let carriers = self.project_carriers.clone();
+        for carrier in &carriers {
+            let (repo_owned, entries) = self.with_repo_read(carrier, |root| {
+                Ok((
+                    project_is_repo_owned(root),
+                    load_repo_gap_entries(root, &carrier.project)?,
+                ))
+            })?;
+            if repo_owned {
+                self.repo_owned_projects.insert(carrier.project.clone());
+                self.repo_owned_carriers.insert(carrier.carrier_id.clone());
+            }
+            for entry in entries {
                 if let Some(existing) = self.data.gaps.iter_mut().find(|g| g.id == entry.id) {
                     *existing = entry;
                 } else {
@@ -838,17 +946,31 @@ impl GapStore {
     fn seed_checkout_entries(
         &mut self,
         durable_project: Option<&str>,
-        write_dir: Option<&str>,
+        write_carrier_id: Option<&str>,
     ) -> Result<()> {
-        let (Some(durable_project), Some(write_dir)) = (durable_project, write_dir) else {
+        let (Some(durable_project), Some(write_carrier_id)) = (durable_project, write_carrier_id)
+        else {
             return Ok(());
         };
-        if durable_project == write_dir {
+        if self
+            .carrier_for_project(durable_project)
+            .is_some_and(|base| base.carrier_id == write_carrier_id)
+        {
             return Ok(());
         }
-        for mut gap in load_repo_gap_entries(Path::new(write_dir))? {
+        let carrier = self.carrier_for_write(durable_project, write_carrier_id)?;
+        let (repo_owned, entries) = self.with_repo_read(&carrier, |root| {
+            Ok((
+                project_is_repo_owned(root),
+                load_repo_gap_entries(root, durable_project)?,
+            ))
+        })?;
+        if repo_owned {
+            self.repo_owned_carriers.insert(carrier.carrier_id.clone());
+        }
+        for mut gap in entries {
             gap.project = Some(durable_project.to_string());
-            gap.write_dir = Some(write_dir.to_string());
+            gap.write_dir = Some(write_carrier_id.to_string());
             gap.provisional_checkout_id = None;
             if let Some(existing) = self.data.gaps.iter_mut().find(|item| item.id == gap.id) {
                 *existing = gap;
@@ -857,6 +979,41 @@ impl GapStore {
             }
         }
         Ok(())
+    }
+
+    /// Ensure the selected logical carrier has a repo-owned gap directory.
+    /// Returns `None` when a legacy project has no configured carrier and must
+    /// remain central-owned.
+    fn ensure_repo_owned_carrier(
+        &mut self,
+        project: &str,
+        write_carrier_id: Option<&str>,
+    ) -> Result<Option<GapRepoCarrier>> {
+        let carrier = match write_carrier_id {
+            Some(carrier_id) => self.carrier_for_write(project, carrier_id)?,
+            None => {
+                let Some(carrier) = self.carrier_for_project(project).cloned() else {
+                    return Ok(None);
+                };
+                carrier
+            }
+        };
+        self.with_repo_write(&carrier, |root| {
+            fs::create_dir_all(repo_gaps_dir(root)).with_context(|| {
+                format!(
+                    "creating repo-owned gaps for carrier {}",
+                    carrier.carrier_id
+                )
+            })
+        })?;
+        self.repo_owned_carriers.insert(carrier.carrier_id.clone());
+        if self
+            .carrier_for_project(project)
+            .is_some_and(|base| base.carrier_id == carrier.carrier_id)
+        {
+            self.repo_owned_projects.insert(project.to_string());
+        }
+        Ok(Some(carrier))
     }
 
     fn save(&self) -> Result<()> {
@@ -868,40 +1025,42 @@ impl GapStore {
             version: self.data.version,
             gaps: Vec::new(),
         };
-        let mut by_project: HashMap<PathBuf, Vec<&GapNote>> = HashMap::new();
+        let mut by_project: BTreeMap<GapRepoCarrier, Vec<&GapNote>> = BTreeMap::new();
         // Per durable-project dir: ids whose rewrite is targeted into a
         // checkout (`write_dir != project`). Their committed base files are
         // protected from generation purge while the checkout carries the
         // provisional variant.
-        let mut redirected: HashMap<PathBuf, BTreeSet<&str>> = HashMap::new();
+        let mut redirected: BTreeMap<GapRepoCarrier, BTreeSet<&str>> = BTreeMap::new();
         for g in &self.data.gaps {
             match g.project.as_deref() {
-                Some(dir) if !dir.is_empty() => {
-                    match g
-                        .write_dir
-                        .as_deref()
-                        .filter(|d| !d.is_empty() && *d != dir)
-                    {
+                Some(project) if !project.is_empty() => {
+                    let base = self.carrier_for_project(project).cloned();
+                    match g.write_dir.as_deref().filter(|id| !id.is_empty()) {
                         // The checkout file is the only provisional carrier.
                         // Registry discovery reconstructs its overlay after a
                         // restart, so the central store never retains a copy.
-                        Some(write_dir) if project_is_repo_owned(Path::new(write_dir)) => {
-                            by_project
-                                .entry(PathBuf::from(write_dir))
-                                .or_default()
-                                .push(g);
-                            redirected
-                                .entry(PathBuf::from(dir))
-                                .or_default()
-                                .insert(g.id.as_str());
+                        Some(write_carrier_id)
+                            if self.repo_owned_carriers.contains(write_carrier_id) =>
+                        {
+                            let carrier = self.carrier_for_write(project, write_carrier_id)?;
+                            by_project.entry(carrier).or_default().push(g);
+                            if let Some(base) = base
+                                && base.carrier_id != write_carrier_id
+                            {
+                                redirected.entry(base).or_default().insert(g.id.as_str());
+                            }
                         }
-                        Some(write_dir) => tracing::warn!(
+                        Some(write_carrier_id) => tracing::warn!(
                             gap = %g.id,
-                            target = write_dir,
+                            target = write_carrier_id,
                             "dropping legacy central gap redirect whose checkout is gone"
                         ),
-                        None if project_is_repo_owned(Path::new(dir)) => {
-                            by_project.entry(PathBuf::from(dir)).or_default().push(g);
+                        None if self.repo_owned_projects.contains(project) => {
+                            if let Some(base) = base {
+                                by_project.entry(base).or_default().push(g);
+                            } else {
+                                central.gaps.push(g.clone());
+                            }
                         }
                         None => central.gaps.push(g.clone()),
                     }
@@ -914,15 +1073,29 @@ impl GapStore {
             gap.provisional_checkout_id = None;
         }
         bbox_corpus_core::json_store::atomic_write_json_locked(&self.store_path, &central)?;
-        let loaded: HashSet<&Path> = self.project_roots.iter().map(|p| p.as_path()).collect();
+        let loaded = self
+            .project_carriers
+            .iter()
+            .map(|carrier| carrier.carrier_id.as_str())
+            .collect::<BTreeSet<_>>();
         let known_ids: BTreeSet<&str> = self.data.gaps.iter().map(|g| g.id.as_str()).collect();
         let no_redirects = BTreeSet::new();
-        for (dir, entries) in &by_project {
-            let purge = loaded.contains(dir.as_path());
-            let redirected_ids = redirected.get(dir.as_path()).unwrap_or(&no_redirects);
-            persist_repo_gap_entries(dir, entries, purge, &known_ids, redirected_ids)?;
+        for (carrier, entries) in &by_project {
+            let purge = loaded.contains(carrier.carrier_id.as_str());
+            let redirected_ids = redirected.get(carrier).unwrap_or(&no_redirects);
+            self.with_repo_write(carrier, |root| {
+                persist_repo_gap_entries(root, entries, purge, &known_ids, redirected_ids)
+            })?;
         }
         Ok(())
+    }
+
+    fn is_checkout_redirect(&self, project: Option<&str>, write_carrier_id: Option<&str>) -> bool {
+        let (Some(project), Some(write_carrier_id)) = (project, write_carrier_id) else {
+            return false;
+        };
+        self.carrier_for_project(project)
+            .is_none_or(|base| base.carrier_id != write_carrier_id)
     }
 
     fn now_iso() -> String {
@@ -958,7 +1131,11 @@ impl GapStore {
         Self {
             store_path: PathBuf::new(),
             data: GapStoreData { version: 1, gaps },
-            project_roots: Vec::new(),
+            project_carriers: Vec::new(),
+            repo_read: None,
+            repo_write: None,
+            repo_owned_projects: BTreeSet::new(),
+            repo_owned_carriers: BTreeSet::new(),
             path_fallback_cut: true,
             view_metadata,
         }
@@ -978,7 +1155,7 @@ impl GapStore {
             .filter(|gap| {
                 gap.project
                     .as_deref()
-                    .is_some_and(|project| !project_is_repo_owned(Path::new(project)))
+                    .is_some_and(|project| !self.repo_owned_projects.contains(project))
             })
             .map(|gap| gap.id.clone())
             .collect::<BTreeSet<_>>();
@@ -1013,7 +1190,8 @@ impl GapStore {
         bbox_corpus_core::json_store::with_store_lock(&path, || {
             self.reload()?;
             let result = self.file_locked(p);
-            let reloaded = is_checkout_redirect(p.project.as_deref(), p.write_dir.as_deref())
+            let reloaded = self
+                .is_checkout_redirect(p.project.as_deref(), p.write_dir.as_deref())
                 .then(|| self.reload());
             match result {
                 Ok(value) => {
@@ -1077,22 +1255,8 @@ impl GapStore {
             }
         }
 
-        // Project-scoped gaps live in-repo: ensure `.bbox/gaps/` exists so the
-        // gap is routed to the repo (opt the project into repo-ownership), but
-        // only when the project path itself exists on disk.
-        if let Some(dir) = project.as_deref() {
-            let p = Path::new(dir);
-            if p.is_dir() {
-                fs::create_dir_all(repo_gaps_dir(p))
-                    .with_context(|| format!("creating .bbox/gaps under {dir}"))?;
-            }
-        }
-        if let Some(dir) = write_dir.as_deref() {
-            let p = Path::new(dir);
-            if p.is_dir() {
-                fs::create_dir_all(repo_gaps_dir(p))
-                    .with_context(|| format!("creating .bbox/gaps under {dir}"))?;
-            }
+        if let Some(project) = project.as_deref() {
+            self.ensure_repo_owned_carrier(project, write_dir.as_deref())?;
         }
 
         let now = Self::now_iso();
@@ -1146,12 +1310,8 @@ impl GapStore {
             if let Some(existing) = self.open_duplicate(&gap.dedupe_key, gap.project.as_deref()) {
                 return Ok((existing.id.clone(), false));
             }
-            if let Some(dir) = gap.project.as_deref() {
-                let p = Path::new(dir);
-                if p.is_dir() {
-                    fs::create_dir_all(repo_gaps_dir(p))
-                        .with_context(|| format!("creating .bbox/gaps under {dir}"))?;
-                }
+            if let Some(project) = gap.project.clone() {
+                self.ensure_repo_owned_carrier(&project, None)?;
             }
             if gap.id.is_empty() {
                 gap.id = Self::gen_id();
@@ -1179,25 +1339,22 @@ impl GapStore {
     ///
     /// No-op for global gaps (`project=None`), gaps owned by a different
     /// project than the resolved base, or when no write target was resolved.
-    fn apply_write_target(
-        gap: &mut GapNote,
+    fn prepare_write_target(
+        &mut self,
+        owner: Option<&str>,
         resolved_base: Option<&str>,
-        write_dir: Option<&str>,
-    ) -> Result<()> {
-        let (Some(base), Some(dir)) = (resolved_base, write_dir) else {
-            return Ok(());
+        write_carrier_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        let (Some(owner), Some(base), Some(write_carrier_id)) =
+            (owner, resolved_base, write_carrier_id)
+        else {
+            return Ok(None);
         };
-        if gap.project.as_deref() != Some(base) {
-            return Ok(());
+        if owner != base {
+            return Ok(None);
         }
-        let path = Path::new(dir);
-        if !path.is_dir() {
-            anyhow::bail!("gap checkout write target is unavailable: {dir}");
-        }
-        fs::create_dir_all(repo_gaps_dir(path))
-            .with_context(|| format!("creating .bbox/gaps under {dir}"))?;
-        gap.write_dir = Some(dir.to_string());
-        Ok(())
+        self.ensure_repo_owned_carrier(owner, Some(write_carrier_id))?;
+        Ok(Some(write_carrier_id.to_string()))
     }
 
     fn validate_mutation_authority(
@@ -1226,16 +1383,7 @@ impl GapStore {
     }
 
     fn project_authority_matches_owner(project: &str, owner: &str) -> bool {
-        if project == owner {
-            return true;
-        }
-        match (
-            Path::new(project).canonicalize(),
-            Path::new(owner).canonicalize(),
-        ) {
-            (Ok(project), Ok(owner)) => project.starts_with(owner),
-            _ => false,
-        }
+        project == owner
     }
 
     pub fn resolve(&mut self, p: &GapResolveParams) -> Result<String> {
@@ -1244,7 +1392,8 @@ impl GapStore {
             self.reload()?;
             self.seed_checkout_entries(p.project.as_deref(), p.write_dir.as_deref())?;
             let result = self.resolve_locked(p);
-            let reloaded = is_checkout_redirect(p.project.as_deref(), p.write_dir.as_deref())
+            let reloaded = self
+                .is_checkout_redirect(p.project.as_deref(), p.write_dir.as_deref())
                 .then(|| self.reload());
             match result {
                 Ok(value) => {
@@ -1318,6 +1467,27 @@ impl GapStore {
         )?;
 
         let resolved_id = self.data.gaps[idx].id.clone();
+        let resolved_owner = self.data.gaps[idx].project.clone();
+        let resolved_target = self.prepare_write_target(
+            resolved_owner.as_deref(),
+            p.project.as_deref(),
+            p.write_dir.as_deref(),
+        )?;
+        let supersessor_target = if let Some(by) = superseded_by.as_deref() {
+            let owner = self
+                .data
+                .gaps
+                .iter()
+                .find(|gap| gap.matches_id(by))
+                .and_then(|gap| gap.project.clone());
+            self.prepare_write_target(
+                owner.as_deref(),
+                p.project.as_deref(),
+                p.write_dir.as_deref(),
+            )?
+        } else {
+            None
+        };
         {
             let gap = &mut self.data.gaps[idx];
             gap.resolution = resolution;
@@ -1333,7 +1503,9 @@ impl GapStore {
             if let Some(by) = &superseded_by {
                 gap.superseded_by = Some(by.clone());
             }
-            Self::apply_write_target(gap, p.project.as_deref(), p.write_dir.as_deref())?;
+            if resolved_target.is_some() {
+                gap.write_dir = resolved_target;
+            }
         }
         // Wire the reverse link on the supersessor. Its file is rewritten by
         // this mutation too, so it honors the same session write target.
@@ -1341,7 +1513,9 @@ impl GapStore {
             if let Some(other) = self.data.gaps.iter_mut().find(|g| g.matches_id(by)) {
                 other.supersedes = Some(resolved_id.clone());
                 other.updated_at = now;
-                Self::apply_write_target(other, p.project.as_deref(), p.write_dir.as_deref())?;
+                if supersessor_target.is_some() {
+                    other.write_dir = supersessor_target;
+                }
             }
         }
 
@@ -1357,7 +1531,8 @@ impl GapStore {
             self.reload()?;
             self.seed_checkout_entries(p.project.as_deref(), p.write_dir.as_deref())?;
             let result = self.update_locked(p);
-            let reloaded = is_checkout_redirect(p.project.as_deref(), p.write_dir.as_deref())
+            let reloaded = self
+                .is_checkout_redirect(p.project.as_deref(), p.write_dir.as_deref())
                 .then(|| self.reload());
             match result {
                 Ok(value) => {
@@ -1406,6 +1581,12 @@ impl GapStore {
             p.write_dir.as_deref(),
             self.path_fallback_cut,
         )?;
+        let owner = self.data.gaps[gap_index].project.clone();
+        let write_target = self.prepare_write_target(
+            owner.as_deref(),
+            p.project.as_deref(),
+            p.write_dir.as_deref(),
+        )?;
         let gap = self
             .data
             .gaps
@@ -1448,7 +1629,9 @@ impl GapStore {
             gap.notes = Some(v.clone()).filter(|s| !s.trim().is_empty());
         }
         gap.updated_at = Self::now_iso();
-        Self::apply_write_target(gap, p.project.as_deref(), p.write_dir.as_deref())?;
+        if write_target.is_some() {
+            gap.write_dir = write_target;
+        }
         let id = gap.id.clone();
         self.save()?;
         Ok(format!("Gap {id} updated"))
@@ -1693,7 +1876,41 @@ pub fn emit_companion_packet_gap_note(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
+
+    struct CountingGapRepoIo {
+        root: PathBuf,
+        reads: AtomicUsize,
+        writes: AtomicUsize,
+        deny_writes: bool,
+    }
+
+    impl GapRepoRead for CountingGapRepoIo {
+        fn with_read(
+            &self,
+            _carrier: &GapRepoCarrier,
+            operation: &mut dyn FnMut(&Path) -> Result<()>,
+        ) -> Result<()> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            operation(&self.root)
+        }
+    }
+
+    impl GapRepoWrite for CountingGapRepoIo {
+        fn with_write(
+            &self,
+            _carrier: &GapRepoCarrier,
+            operation: &mut dyn FnMut(&Path) -> Result<()>,
+        ) -> Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            if self.deny_writes {
+                anyhow::bail!("test gap write authority denied");
+            }
+            operation(&self.root)
+        }
+    }
 
     fn file_params(title: &str, dedupe: &str) -> GapFileParams {
         GapFileParams {
@@ -1806,6 +2023,34 @@ mod tests {
         params.project = Some(project.to_string_lossy().into_owned());
         let err = store.file(&params).unwrap_err();
         assert!(err.to_string().contains("checkout authority"));
+        assert!(store.all().is_empty());
+    }
+
+    #[test]
+    fn project_gap_creation_requires_repository_write_authority() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = "project:test".to_string();
+        let carrier = GapRepoCarrier::new(&project, "checkout:test").unwrap();
+        let io = Arc::new(CountingGapRepoIo {
+            root: root.clone(),
+            reads: AtomicUsize::new(0),
+            writes: AtomicUsize::new(0),
+            deny_writes: true,
+        });
+        let mut store = GapStore::open(&root.join("gaps.json")).unwrap();
+        store
+            .configure_repo_io(io.clone(), io.clone(), vec![carrier])
+            .unwrap();
+        let mut params = file_params("blocked", "tooling/test-domain/repo-write");
+        params.scope = Some("project".into());
+        params.project = Some(project);
+
+        let error = store.file(&params).unwrap_err();
+
+        assert!(error.to_string().contains("write authority denied"));
+        assert_eq!(io.writes.load(Ordering::SeqCst), 1);
+        assert!(io.reads.load(Ordering::SeqCst) >= 1);
         assert!(store.all().is_empty());
     }
 

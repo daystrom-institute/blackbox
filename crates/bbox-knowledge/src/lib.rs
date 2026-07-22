@@ -6,4 +6,5 @@ pub mod inventory;
 pub mod knowledge;
 pub mod overlay;
 pub mod render;
+pub mod repo_io;
 pub use bbox_corpus_core::transaction;
