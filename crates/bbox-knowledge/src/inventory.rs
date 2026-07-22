@@ -309,18 +309,44 @@ pub fn inventory_project_entries(
     inv
 }
 
-/// Run and persist the local schema-epoch migration products.
+/// Run and persist the local schema-epoch migration products, including the
+/// repo-owned marker for every clean scope.
 ///
 /// The quarantine ledger is written before any repo marker. A scope receives
 /// its committed marker only when it has recorded/overridden repo authority,
 /// owns a `.bbox/knowledge` directory, and every local-store entry associated
 /// with that exact project root resolved to the same durable key. Re-running is
-/// byte-idempotent and repairs a lost host ledger from source state.
+/// byte-idempotent and repairs a lost host ledger from source state. Callers
+/// must invoke this only from an explicit operator mutation such as project
+/// ejection. Background reconciliation must use
+/// [`persist_schema_epoch_inventory_read_only`] instead.
 pub fn persist_schema_epoch_inventory(
     entries: &[KnowledgeEntry],
     project_roots: &[PathBuf],
     state_dir: &Path,
     resolve_inputs: impl Fn(&Path) -> RepoIdInputs,
+) -> Result<PersistedInventoryReport> {
+    persist_schema_epoch_inventory_inner(entries, project_roots, state_dir, resolve_inputs, true)
+}
+
+/// Persist host-local inventory and quarantine ledgers without modifying any
+/// registered checkout. Existing matching repo markers are reported, but a
+/// missing marker remains an explicit operator migration task.
+pub fn persist_schema_epoch_inventory_read_only(
+    entries: &[KnowledgeEntry],
+    project_roots: &[PathBuf],
+    state_dir: &Path,
+    resolve_inputs: impl Fn(&Path) -> RepoIdInputs,
+) -> Result<PersistedInventoryReport> {
+    persist_schema_epoch_inventory_inner(entries, project_roots, state_dir, resolve_inputs, false)
+}
+
+fn persist_schema_epoch_inventory_inner(
+    entries: &[KnowledgeEntry],
+    project_roots: &[PathBuf],
+    state_dir: &Path,
+    resolve_inputs: impl Fn(&Path) -> RepoIdInputs,
+    write_repo_markers: bool,
 ) -> Result<PersistedInventoryReport> {
     let mut inventory = inventory_project_entries(entries, |path| resolve_inputs(path));
     let quarantine_entries = inventory
@@ -397,15 +423,24 @@ pub fn persist_schema_epoch_inventory(
         if !clean {
             continue;
         }
-        write_json_if_changed(
-            &knowledge_dir.join(SCHEMA_EPOCH_MARKER),
-            &SchemaEpochMarker {
-                schema_epoch: SCHEMA_EPOCH,
-                repo_id: scope.repo_id.clone(),
-                bbox_root_relpath: scope.bbox_root_relpath.clone(),
-            },
-        )?;
-        marked_scopes.push(scope);
+        let marker_path = knowledge_dir.join(SCHEMA_EPOCH_MARKER);
+        let marker = SchemaEpochMarker {
+            schema_epoch: SCHEMA_EPOCH,
+            repo_id: scope.repo_id.clone(),
+            bbox_root_relpath: scope.bbox_root_relpath.clone(),
+        };
+        let marker_present = if write_repo_markers {
+            write_json_if_changed(&marker_path, &marker)?;
+            true
+        } else {
+            std::fs::read(&marker_path)
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<SchemaEpochMarker>(&raw).ok())
+                .is_some_and(|existing| existing == marker)
+        };
+        if marker_present {
+            marked_scopes.push(scope);
+        }
     }
     marked_scopes.sort();
     marked_scopes.dedup();

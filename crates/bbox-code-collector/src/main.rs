@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -40,6 +42,8 @@ struct CollectorConfig {
     token_file: PathBuf,
     #[serde(default = "default_interval_secs")]
     interval_secs: u64,
+    #[serde(default = "default_status_timeout_secs")]
+    status_timeout_secs: u64,
     projects: Vec<ProjectConfig>,
 }
 
@@ -68,6 +72,10 @@ struct ScannedProject {
 
 fn default_interval_secs() -> u64 {
     120
+}
+
+fn default_status_timeout_secs() -> u64 {
+    6 * 60 * 60
 }
 
 #[tokio::main]
@@ -145,14 +153,26 @@ async fn publish_all(runtime: &Runtime, config: &CollectorConfig) -> Result<()> 
     if config.projects.is_empty() {
         bail!("collector config must contain at least one project");
     }
+    if config.status_timeout_secs == 0 {
+        bail!("collector status_timeout_secs must be greater than zero");
+    }
     for project in &config.projects {
         let scanned = scan_project(project)?;
-        publish_project(runtime, scanned).await?;
+        publish_project(
+            runtime,
+            scanned,
+            Duration::from_secs(config.status_timeout_secs),
+        )
+        .await?;
     }
     Ok(())
 }
 
-async fn publish_project(runtime: &Runtime, scanned: ScannedProject) -> Result<()> {
+async fn publish_project(
+    runtime: &Runtime,
+    scanned: ScannedProject,
+    status_timeout: Duration,
+) -> Result<()> {
     let begin: BeginUploadResponse = send_json(
         runtime
             .request(
@@ -188,12 +208,12 @@ async fn publish_project(runtime: &Runtime, scanned: ScannedProject) -> Result<(
     ))?;
     let mut missing: MissingBlobsPage =
         send_json(runtime.request(reqwest::Method::POST, complete_url)).await?;
+    let entries_by_hash = manifest_entries_by_hash(&scanned.entries);
     loop {
         for hash in &missing.hashes {
-            let entry = scanned
-                .entries
-                .iter()
-                .find(|entry| &entry.content_sha256 == hash)
+            let entry = entries_by_hash
+                .get(hash.as_str())
+                .copied()
                 .ok_or_else(|| anyhow!("server requested an unknown manifest hash"))?;
             let bytes = read_stable_file(&scanned.root, entry)?;
             let url = runtime.endpoint(&format!(
@@ -226,33 +246,55 @@ async fn publish_project(runtime: &Runtime, scanned: ScannedProject) -> Result<(
     let finalized: FinalizeResponse =
         send_json(runtime.request(reqwest::Method::POST, finalize_url)).await?;
     let status_url = runtime.endpoint(finalized.status_url.trim_start_matches('/'))?;
-    loop {
-        let status: GenerationStatus =
-            send_json(runtime.request(reqwest::Method::GET, status_url.clone())).await?;
-        match status.state {
-            GenerationState::Active | GenerationState::Superseded => {
-                tracing::info!(
-                    generation = %status.generation_id,
-                    files = status.file_count,
-                    bytes = status.logical_bytes,
-                    skipped_symlinks = scanned.skipped_symlinks,
-                    skipped_special = scanned.skipped_special,
-                    skipped_unsupported = scanned.skipped_unsupported,
-                    skipped_oversize = scanned.skipped_oversize,
-                    "code-source generation reached terminal success"
-                );
-                return Ok(());
+    with_status_timeout(status_timeout, async {
+        loop {
+            let status: GenerationStatus =
+                send_json(runtime.request(reqwest::Method::GET, status_url.clone())).await?;
+            match status.state {
+                GenerationState::Active | GenerationState::Superseded => {
+                    tracing::info!(
+                        generation = %status.generation_id,
+                        files = status.file_count,
+                        bytes = status.logical_bytes,
+                        skipped_symlinks = scanned.skipped_symlinks,
+                        skipped_special = scanned.skipped_special,
+                        skipped_unsupported = scanned.skipped_unsupported,
+                        skipped_oversize = scanned.skipped_oversize,
+                        "code-source generation reached terminal success"
+                    );
+                    return Ok(());
+                }
+                GenerationState::Failed | GenerationState::MissingBlobData => {
+                    bail!(
+                        "generation {} failed: {}",
+                        status.generation_id,
+                        status.diagnostic.as_deref().unwrap_or("no diagnostic")
+                    );
+                }
+                _ => tokio::time::sleep(Duration::from_secs(1)).await,
             }
-            GenerationState::Failed | GenerationState::MissingBlobData => {
-                bail!(
-                    "generation {} failed: {}",
-                    status.generation_id,
-                    status.diagnostic.as_deref().unwrap_or("no diagnostic")
-                );
-            }
-            _ => tokio::time::sleep(Duration::from_secs(1)).await,
         }
-    }
+    })
+    .await
+}
+
+fn manifest_entries_by_hash(entries: &[ManifestEntry]) -> HashMap<&str, &ManifestEntry> {
+    entries
+        .iter()
+        .map(|entry| (entry.content_sha256.as_str(), entry))
+        .collect()
+}
+
+async fn with_status_timeout<T>(
+    timeout: Duration,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(timeout, future).await.map_err(|_| {
+        anyhow!(
+            "generation status did not reach a terminal state within {} seconds",
+            timeout.as_secs()
+        )
+    })?
 }
 
 fn scan_project(config: &ProjectConfig) -> Result<ScannedProject> {
@@ -635,11 +677,53 @@ mod tests {
 
     #[test]
     fn collector_config_rejects_unknown_fields() {
+        let config = toml::from_str::<CollectorConfig>(
+            "server_url = \"https://example.test\"\ntoken_file = \"/tmp/token\"\nprojects = []\n",
+        )
+        .unwrap();
+        assert_eq!(config.status_timeout_secs, default_status_timeout_secs());
         assert!(
             toml::from_str::<CollectorConfig>(
                 "server_url = \"https://example.test\"\ntoken_file = \"/tmp/token\"\nprojects = []\nunknown = true\n"
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn manifest_hash_index_resolves_without_rescanning_entries() {
+        let entries = vec![
+            ManifestEntry {
+                relative_path: "src/a.rs".into(),
+                content_sha256: "a".repeat(64),
+                size: 1,
+            },
+            ManifestEntry {
+                relative_path: "src/b.rs".into(),
+                content_sha256: "b".repeat(64),
+                size: 2,
+            },
+        ];
+        let by_hash = manifest_entries_by_hash(&entries);
+        assert_eq!(
+            by_hash.get("b".repeat(64).as_str()).unwrap().relative_path,
+            "src/b.rs"
+        );
+        assert!(!by_hash.contains_key("c".repeat(64).as_str()));
+    }
+
+    #[tokio::test]
+    async fn generation_status_wait_is_bounded() {
+        let result = with_status_timeout(
+            Duration::from_millis(1),
+            std::future::pending::<Result<()>>(),
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("did not reach a terminal state")
         );
     }
 

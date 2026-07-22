@@ -560,7 +560,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_eject",
-        description = "Migrate a registered project's central-store knowledge entries into the repo's committed .bbox/knowledge/ (one file per entry), so the project's durable knowledge travels with the checkout. Accepts project (project_id, registered canonical_path, or absolute path) and optional dry_run. Entries are written without the absolute project path (location encodes scope) and dropped from the central store. dry_run=true reports the count without writing. Commit the resulting .bbox/ files to publish them."
+        description = "Migrate a registered project's central-store knowledge entries into the repo's committed .bbox/knowledge/ (one file per entry), so the project's durable knowledge travels with the checkout. Accepts project (project_id, registered canonical_path, or absolute path) and optional dry_run. Entries are written without the absolute project path (location encodes scope), dropped from the central store, and a clean schema-epoch marker is written by this explicit operator action. dry_run=true reports the count without writing. Commit the resulting .bbox/ files to publish them."
     )]
     pub(crate) async fn bbox_project_eject(
         &self,
@@ -588,20 +588,29 @@ impl BlackboxServer {
             // are accounted for and the post-eject reload loads from the repo.
             crate::server::routes::sync_kb_project_roots(&server.state);
 
-            let entries = if dry_run {
-                server.state.kb.read().count_project_entries(&dir)
+            let (entries, schema_epoch_marker_written) = if dry_run {
+                (server.state.kb.read().count_project_entries(&dir), false)
             } else {
-                server.state.kb.write().eject_project_to_repo(&dir)?
+                let entries = server.state.kb.write().eject_project_to_repo(&dir)?;
+                let report = server.write_knowledge_schema_epoch_marker(Path::new(&dir))?;
+                (entries, !report.marked_scopes.is_empty())
             };
 
-            Ok::<_, anyhow::Error>((record, dir, dry_run, entries, recorded_repo_id))
+            Ok::<_, anyhow::Error>((
+                record,
+                dir,
+                dry_run,
+                entries,
+                recorded_repo_id,
+                schema_epoch_marker_written,
+            ))
         })
         .await
         .map_err(|e| anyhow::anyhow!("blocking task failed: {e}"))
         .and_then(std::convert::identity);
 
         match fs_result {
-            Ok((record, dir, dry_run, entries, recorded_repo_id)) => {
+            Ok((record, dir, dry_run, entries, recorded_repo_id, schema_epoch_marker_written)) => {
                 // Phase 2: await the kb persister durable ack on the runtime.
                 if !dry_run && let Err(e) = self.state.kb_persister.request_durable().await {
                     let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -615,6 +624,7 @@ impl BlackboxServer {
                     "entries": entries,
                     "repo_id": recorded_repo_id.as_ref().map(|recorded| &recorded.repo_id),
                     "repo_id_recorded": recorded_repo_id.as_ref().is_some_and(|recorded| recorded.newly_recorded),
+                    "schema_epoch_marker_written": schema_epoch_marker_written,
                     "target": format!("{}/.bbox/knowledge", dir),
                     "detail": if dry_run {
                         "preview only; re-run without dry_run to write repo files and drop central copies"

@@ -238,6 +238,16 @@ impl TranscriptIndex {
         p: &SearchParams,
         active_selectors: &BTreeMap<String, String>,
     ) -> Result<String> {
+        let searcher = self.reader.searcher();
+        self.search_with_active_selectors_and_searcher(p, active_selectors, &searcher)
+    }
+
+    pub fn search_with_active_selectors_and_searcher(
+        &self,
+        p: &SearchParams,
+        active_selectors: &BTreeMap<String, String>,
+        searcher: &tantivy::Searcher,
+    ) -> Result<String> {
         let raw_query = p.query.as_str();
         let mode = TranscriptSearchMode::parse_optional(p.mode.as_deref())?;
         let query_str = match mode {
@@ -249,11 +259,9 @@ impl TranscriptIndex {
         let limit = p.limit.unwrap_or(20).min(100) as usize;
         let include_subagents = p.include_subagents.unwrap_or(true);
 
-        if self.is_empty() {
+        if searcher.num_docs() == 0 {
             return Ok("Index is empty. Run blackbox_reindex first.".to_string());
         }
-
-        let searcher = self.reader.searcher();
 
         // Parse the user's text query against content + project fields
         let mut qp = QueryParser::for_index(
@@ -450,12 +458,31 @@ impl TranscriptIndex {
         exclude_knowledge: bool,
         active_selectors: &BTreeMap<String, String>,
     ) -> Result<Vec<HybridBm25Hit>> {
-        if self.is_empty() || query.trim().is_empty() || limit == 0 {
+        let searcher = self.reader.searcher();
+        self.hybrid_bm25_hits_filtered_with_active_selectors_and_searcher(
+            query,
+            limit,
+            doc_type,
+            exclude_knowledge,
+            active_selectors,
+            &searcher,
+        )
+    }
+
+    pub fn hybrid_bm25_hits_filtered_with_active_selectors_and_searcher(
+        &self,
+        query: &str,
+        limit: usize,
+        doc_type: Option<&str>,
+        exclude_knowledge: bool,
+        active_selectors: &BTreeMap<String, String>,
+        searcher: &tantivy::Searcher,
+    ) -> Result<Vec<HybridBm25Hit>> {
+        if searcher.num_docs() == 0 || query.trim().is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
 
         let query_str = smart_query_to_tantivy(query).unwrap_or_else(|| query.to_string());
-        let searcher = self.reader.searcher();
         let mut qp = QueryParser::for_index(
             &self.index,
             vec![

@@ -404,6 +404,17 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_publisher_ref_store_fails_closed() {
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("publisher-refs.json");
+        std::fs::write(&path, b"{\"version\":").unwrap();
+
+        let error = PublisherRefStore::open(&path).err().unwrap();
+
+        assert!(error.to_string().contains("parsing"));
+    }
+
+    #[test]
     fn repin_requires_full_branch_ref() {
         let state = tempfile::tempdir().unwrap();
         let scope = PublishedScope {

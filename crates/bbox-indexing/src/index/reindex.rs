@@ -126,6 +126,14 @@ pub(super) fn execute_reindex_pass(
     writer: &mut IndexWriter,
     drain: &mut dyn FnMut(&mut IndexWriter),
 ) -> Result<String> {
+    let edges_dir =
+        bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&config.projects_path);
+    let recovery_reader = index.reader()?;
+    project_files::recover_pending_local_snapshot_activations(
+        &recovery_reader.searcher(),
+        fields,
+        &edges_dir,
+    )?;
     let provisional_documents = if full {
         collect_provisional_documents(index, fields)?
     } else {
@@ -313,7 +321,12 @@ pub(super) fn execute_reindex_pass(
     // still need a commit, but the actor commits its own batches; an op that
     // landed in this no-op pass commits with the actor's next cycle or the
     // pass's caller — never lost, reconciled by the next triggered pass.)
-    if !full && indexed_files == 0 && purged == 0 && !dirty {
+    if !full
+        && indexed_files == 0
+        && purged == 0
+        && !dirty
+        && project_stats.pending_local_snapshots.is_empty()
+    {
         let summary = "auto-reindex: no changes after re-check".to_string();
         tracing::debug!("{}", summary);
         // Commit anyway when ops were drained into this writer mid-pass;
@@ -323,9 +336,38 @@ pub(super) fn execute_reindex_pass(
         return Ok(summary);
     }
 
-    // 5. Commit + atomic meta save
+    // 5. Commit + atomic meta/edge-view publication. The durable journal is
+    // written before the Tantivy commit, and each project gets a marker in
+    // that same commit. Startup can therefore tell whether it must finish the
+    // manifest switch or discard an uncommitted journal.
     let commit_phase = Instant::now();
+    let pending_journal = if project_stats.pending_local_snapshots.is_empty() {
+        None
+    } else {
+        let journal = bbox_edge_sidecar::snapshot::write_pending_local_activation_journal(
+            &edges_dir,
+            &project_stats.pending_local_snapshots,
+        )?;
+        for activation in journal.activations() {
+            let marker = project_files::local_activation_marker(activation.project_id());
+            writer.delete_term(Term::from_field_text(fields.entity_id, &marker));
+            let mut document = TantivyDocument::new();
+            document.add_text(fields.doc_type, "code_source_activation");
+            document.add_text(fields.entity_id, &marker);
+            document.add_text(fields.project_id, activation.project_id());
+            document.add_text(fields.code_source_generation, journal.commit_token());
+            writer.add_document(document)?;
+        }
+        Some(journal)
+    };
     writer.commit()?;
+    if let Some(journal) = pending_journal {
+        bbox_edge_sidecar::snapshot::activate_pending_local_snapshots(
+            &edges_dir,
+            journal.activations(),
+        )?;
+        bbox_edge_sidecar::snapshot::clear_pending_local_activation_journal(&edges_dir)?;
+    }
     save_meta(&config.meta_path, &meta)?;
     tracing::info!(
         full,
@@ -574,6 +616,7 @@ mod tests {
             codex_root: None,
             meta_path: root.join("_meta.json"),
             projects_path: root.join("projects.json"),
+            code_source_store_path: root.join("code-sources"),
             knowledge_path: root.join("kb.json"),
             threads_path: root.join("threads.json"),
             roadmap_path: root.join("roadmap.json"),
@@ -667,6 +710,7 @@ mod tests {
             codex_root: None,
             meta_path: root.join("_meta.json"),
             projects_path: root.join("projects.json"),
+            code_source_store_path: root.join("code-sources"),
             knowledge_path: root.join("kb.json"),
             threads_path: root.join("threads.json"),
             roadmap_path: root.join("roadmap.json"),

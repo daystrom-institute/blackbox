@@ -32,6 +32,44 @@ pub(super) struct OpenedServer {
     pub(super) bind_is_loopback: bool,
 }
 
+fn sync_project_aliases_at_startup(
+    projects: &mut ProjectRegistry,
+    load_aliases: impl Fn(&Path) -> anyhow::Result<std::collections::BTreeSet<String>>,
+) -> bool {
+    let mut dirty = false;
+    for record in projects.list() {
+        let declared = match load_aliases(Path::new(&record.canonical_path)) {
+            Ok(declared) => declared,
+            Err(error) => {
+                // The committed config is authoritative only when it was read
+                // successfully. A transient read or parse failure must not be
+                // interpreted as an authoritative empty alias declaration.
+                tracing::warn!("project config for {}: {error:#}", record.project_id);
+                continue;
+            }
+        };
+        match projects.sync_declared_aliases(&record.project_id, &declared) {
+            Ok(changed) => dirty |= changed,
+            Err(error) => tracing::warn!("alias sync for {}: {error:#}", record.project_id),
+        }
+    }
+    dirty
+}
+
+fn open_checkout_registry(store_dir: &Path) -> bbox_indexing::checkout_registry::CheckoutRegistry {
+    let path = store_dir.join("checkout-registry.json");
+    let (registry, degraded) =
+        bbox_indexing::checkout_registry::CheckoutRegistry::open_recoverable(&path);
+    if let Some(error) = degraded {
+        tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "checkout registry unreadable; starting from an empty discovery index"
+        );
+    }
+    registry
+}
+
 pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     let cfg = config::load()?;
     // Push the config-resolved git-notes namespace into the corpus-core
@@ -61,11 +99,12 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     let kb_path = cfg.paths.knowledge_path.clone();
     let th_path = cfg.paths.threads_path.clone();
     let rm_path = cfg.paths.roadmap_path.clone();
-    let mut idx = TranscriptIndex::open_or_create(
+    let mut idx = TranscriptIndex::open_or_create_with_code_source_store_path(
         &index_path,
         roots,
         codex_root,
         projects_path.clone(),
+        cfg.paths.state_dir.join("code-sources"),
         kb_path.clone(),
         th_path.clone(),
         rm_path.clone(),
@@ -97,22 +136,10 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     // skipped with a warning — the alias simply never materializes, and
     // resolution fails closed by absence. Records are sorted by
     // canonical_path, so first-claim-wins is deterministic across boots.
-    for record in projects_store.list() {
-        let declared: std::collections::BTreeSet<String> = match crate::config::load_project_at_ref(
-            std::path::Path::new(&record.canonical_path),
-            "HEAD",
-        ) {
-            Ok(cfg) => cfg.project.aliases.into_iter().collect(),
-            Err(e) => {
-                tracing::warn!("project config for {}: {e:#}", record.project_id);
-                std::collections::BTreeSet::new()
-            }
-        };
-        match projects_store.sync_declared_aliases(&record.project_id, &declared) {
-            Ok(dirty) => projects_needs_persist |= dirty,
-            Err(e) => tracing::warn!("alias sync for {}: {e:#}", record.project_id),
-        }
-    }
+    projects_needs_persist |= sync_project_aliases_at_startup(&mut projects_store, |path| {
+        crate::config::load_project_at_ref(path, "HEAD")
+            .map(|config| config.project.aliases.into_iter().collect())
+    });
 
     let path_fallback_cut = bbox_knowledge::inventory::path_fallback_was_cut(&cfg.paths.bro_home)?;
     let mut kb = Knowledge::open(&kb_path)?;
@@ -280,6 +307,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     );
     let code_read_view = super::CodeReadView {
         active_selectors: idx.active_code_selectors(),
+        searcher: idx.searcher(),
         edge_index: Arc::new(edge_index),
     };
     let (edge_rebuild_nudge_tx, edge_rebuild_nudge_rx) = std::sync::mpsc::sync_channel(1);
@@ -299,9 +327,11 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         pins_persister,
         projects: projects_store,
         projects_persister,
-        checkout_registry: RwLock::new(bbox_indexing::checkout_registry::CheckoutRegistry::open(
-            &store_dir.join("checkout-registry.json"),
-        )?),
+        checkout_registry: RwLock::new(open_checkout_registry(&store_dir)),
+        // Publisher refs define authority and cannot be reconstructed from
+        // checkout discovery without silently moving published truth. Keep
+        // corrupt pins fail-closed even though the checkout census below is a
+        // recoverable discovery index.
         publisher_refs: RwLock::new(bbox_indexing::publisher::PublisherRefStore::open(
             store_dir.join("publisher-refs.json"),
         )?),
@@ -502,5 +532,40 @@ fn build_startup_edge_index(
             "startup EdgeIndex rebuild deferred (set BLACKBOX_EDGE_INDEX_BOOT_REBUILD=1 to restore eager rebuild)"
         );
         edge_index::EdgeIndex::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn unreadable_committed_config_preserves_materialized_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut registry = ProjectRegistry::open(&temp.path().join("projects.json")).unwrap();
+        let record = registry.register_path(&project).unwrap();
+        registry
+            .sync_declared_aliases(
+                &record.project_id,
+                &BTreeSet::from(["durable-alias".to_string()]),
+            )
+            .unwrap();
+
+        let changed = sync_project_aliases_at_startup(&mut registry, |_| {
+            anyhow::bail!("committed config temporarily unreadable")
+        });
+
+        assert!(!changed);
+        assert_eq!(
+            registry
+                .resolve("durable-alias")
+                .unwrap()
+                .unwrap()
+                .project_id,
+            record.project_id
+        );
     }
 }

@@ -142,6 +142,7 @@ struct ActorCtx {
 /// Cap on ops folded into one writer/commit cycle. Bounds worst-case batch
 /// latency; the queue itself is unbounded (ops are small).
 const MAX_BATCH_OPS: usize = 256;
+const STAGED_GENERATION_HOLD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
 
 const WRITER_HEAP_SMALL_OPS: usize = 50_000_000;
 const WRITER_HEAP_REINDEX: usize = 100_000_000;
@@ -337,7 +338,7 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
                 let should_hold = result.is_ok();
                 let _ = ack.send(result);
                 if should_hold {
-                    let _ = release.recv();
+                    await_stage_release(release, "collected generation");
                 }
             }
             IndexWriteOp::StageLocalGeneration {
@@ -350,7 +351,7 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
                 let should_hold = result.is_ok();
                 let _ = ack.send(result);
                 if should_hold {
-                    let _ = release.recv();
+                    await_stage_release(release, "local generation");
                 }
             }
             IndexWriteOp::RetireCodeSelector {
@@ -362,7 +363,7 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
                 let should_hold = result.is_ok();
                 let _ = ack.send(result);
                 if should_hold {
-                    let _ = release.recv();
+                    await_stage_release(release, "selector retirement");
                 }
             }
             first => {
@@ -394,6 +395,18 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
         }
     }
     tracing::info!("index writer actor stopped");
+}
+
+fn await_stage_release(release: mpsc::Receiver<()>, operation: &str) {
+    if let Err(mpsc::RecvTimeoutError::Timeout) =
+        release.recv_timeout(STAGED_GENERATION_HOLD_TIMEOUT)
+    {
+        tracing::error!(
+            operation,
+            timeout_secs = STAGED_GENERATION_HOLD_TIMEOUT.as_secs(),
+            "index writer stage hold timed out; releasing the writer lane"
+        );
+    }
 }
 
 fn run_collected_stage(
@@ -495,49 +508,48 @@ fn stage_git_current_edges(
         edges_dir,
         &project.project_id,
         &result.snapshot_id,
-        &[
-            ("project.jsonl", result.staged_edges.as_slice()),
-            ("git-current.jsonl", git_edges.as_slice()),
-        ],
+        &[("git-current.jsonl", git_edges.as_slice())],
     )
 }
 
 fn run_selector_retirement(ctx: &ActorCtx, selector: &str) -> Result<u64> {
     let edges_dir =
         bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&ctx.config.projects_path);
-    let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)?;
-    if manifest
-        .workspaces
-        .values()
-        .any(|entry| entry.code_source_selector.as_deref() == Some(selector))
-    {
-        anyhow::bail!("code-source selector became active before retirement");
-    }
-    ctx.reader.reload()?;
-    let searcher = ctx.reader.searcher();
-    let query = TermQuery::new(
-        Term::from_field_text(ctx.fields.code_source_selector, selector),
-        IndexRecordOption::Basic,
-    );
-    let count = searcher.search(&query, &Count)?;
-    let vectors = bbox_vectors::try_global()
-        .context("vector store is still warming up; retry selector retirement shortly")?;
-    for (_score, address) in searcher.search(&query, &TopDocs::with_limit(count))? {
-        let document = searcher.doc::<tantivy::TantivyDocument>(address)?;
-        if let Some(tantivy::schema::OwnedValue::Str(entity_id)) =
-            document.get_first(ctx.fields.entity_id)
+    bbox_edge_sidecar::snapshot::with_manifest_coordinator(|| {
+        let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)?;
+        if manifest
+            .workspaces
+            .values()
+            .any(|entry| entry.code_source_selector.as_deref() == Some(selector))
         {
-            vectors.delete_entity_all_routes(entity_id)?;
+            anyhow::bail!("code-source selector became active before retirement");
         }
-    }
-    let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
-    writer.delete_term(Term::from_field_text(
-        ctx.fields.code_source_selector,
-        selector,
-    ));
-    writer.commit()?;
-    post_commit(ctx);
-    Ok(count as u64)
+        ctx.reader.reload()?;
+        let searcher = ctx.reader.searcher();
+        let query = TermQuery::new(
+            Term::from_field_text(ctx.fields.code_source_selector, selector),
+            IndexRecordOption::Basic,
+        );
+        let count = searcher.search(&query, &Count)?;
+        let vectors = bbox_vectors::try_global()
+            .context("vector store is still warming up; retry selector retirement shortly")?;
+        for (_score, address) in searcher.search(&query, &TopDocs::with_limit(count))? {
+            let document = searcher.doc::<tantivy::TantivyDocument>(address)?;
+            if let Some(tantivy::schema::OwnedValue::Str(entity_id)) =
+                document.get_first(ctx.fields.entity_id)
+            {
+                vectors.delete_entity_all_routes(entity_id)?;
+            }
+        }
+        let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
+        writer.delete_term(Term::from_field_text(
+            ctx.fields.code_source_selector,
+            selector,
+        ));
+        writer.commit()?;
+        post_commit(ctx);
+        Ok(count as u64)
+    })
 }
 
 /// Apply a batch of small ops under one writer and one commit.

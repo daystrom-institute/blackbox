@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::edge_sidecar::Edge;
@@ -18,6 +19,7 @@ use bbox_corpus_core::entity_ref::EntityRef;
 const INDEXER_VERSION: &str = "project-index-v1";
 const CHUNKER_VERSION: &str = "chunker-v1";
 const DIRTY_OVERLAY_DIRNAME: &str = "dirty-current";
+const PENDING_LOCAL_ACTIVATIONS_FILENAME: &str = "pending-local-activations.json";
 static MANIFEST_COORDINATOR: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn lock_manifest_coordinator() -> Result<MutexGuard<'static, ()>> {
@@ -258,6 +260,203 @@ pub fn dirty_overlay_rel(project_id: &str) -> String {
     format!("workspace/{}/{}", project_id, DIRTY_OVERLAY_DIRNAME)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingLocalSnapshotActivation {
+    project_id: String,
+    repo_id: String,
+    branch: Option<String>,
+    head_sha: String,
+    dirty: bool,
+    dirty_fingerprint: Option<String>,
+    snapshot_id: String,
+}
+
+impl PendingLocalSnapshotActivation {
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    pub fn snapshot_id(&self) -> &str {
+        &self.snapshot_id
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingLocalActivationJournal {
+    version: u32,
+    commit_token: String,
+    activations: Vec<PendingLocalSnapshotActivation>,
+}
+
+impl PendingLocalActivationJournal {
+    pub fn commit_token(&self) -> &str {
+        &self.commit_token
+    }
+
+    pub fn activations(&self) -> &[PendingLocalSnapshotActivation] {
+        &self.activations
+    }
+}
+
+fn pending_local_activations_path(edges_dir: &Path) -> PathBuf {
+    crate::manifest::materialized_dir(edges_dir).join(PENDING_LOCAL_ACTIVATIONS_FILENAME)
+}
+
+pub fn write_pending_local_activation_journal(
+    edges_dir: &Path,
+    activations: &[PendingLocalSnapshotActivation],
+) -> Result<PendingLocalActivationJournal> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let mut token = Sha256::new();
+    token.update(b"bbox-local-activation-commit-v1");
+    token.update(std::process::id().to_be_bytes());
+    token.update(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_be_bytes(),
+    );
+    for activation in activations {
+        token.update(activation.project_id.as_bytes());
+        token.update(activation.snapshot_id.as_bytes());
+    }
+    let journal = PendingLocalActivationJournal {
+        version: 1,
+        commit_token: hex::encode(token.finalize()),
+        activations: activations.to_vec(),
+    };
+    let path = pending_local_activations_path(edges_dir);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("pending activation journal has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let temporary = path.with_extension("json.tmp");
+    let mut file = fs::File::create(&temporary)?;
+    serde_json::to_writer_pretty(&mut file, &journal)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temporary, &path)?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(journal)
+}
+
+pub fn load_pending_local_activation_journal(
+    edges_dir: &Path,
+) -> Result<Option<PendingLocalActivationJournal>> {
+    let path = pending_local_activations_path(edges_dir);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let journal: PendingLocalActivationJournal = serde_json::from_slice(&bytes)?;
+    if journal.version != 1 || journal.activations.is_empty() {
+        anyhow::bail!("pending local activation journal is invalid");
+    }
+    Ok(Some(journal))
+}
+
+pub fn clear_pending_local_activation_journal(edges_dir: &Path) -> Result<()> {
+    let path = pending_local_activations_path(edges_dir);
+    match fs::remove_file(&path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn activate_pending_local_snapshots(
+    edges_dir: &Path,
+    activations: &[PendingLocalSnapshotActivation],
+) -> Result<()> {
+    with_manifest_coordinator(|| {
+        for activation in activations {
+            if !snapshot_dir(edges_dir, &activation.project_id, &activation.snapshot_id).is_dir() {
+                anyhow::bail!("pending local edge snapshot is not staged");
+            }
+            let manifest = WorkspaceManifest {
+                version: 1,
+                project_id: activation.project_id.clone(),
+                repo_id: Some(activation.repo_id.clone()),
+                canonical_path: None,
+                git_common_dir: None,
+                git_worktree_dir: None,
+                branch: activation.branch.clone(),
+                head_sha: Some(activation.head_sha.clone()),
+                dirty: activation.dirty,
+                dirty_fingerprint: activation.dirty_fingerprint.clone(),
+                active_snapshot_id: Some(activation.snapshot_id.clone()),
+                active_dirty_overlay_id: None,
+                updated_at: None,
+            };
+            WorkspaceManifest::write_to(edges_dir, &manifest)?;
+        }
+
+        let mut index = ManifestIndex::load_or_new(edges_dir)?;
+        for activation in activations {
+            index.upsert_workspace(
+                &activation.project_id,
+                WorkspaceIndexEntry {
+                    manifest: format!("workspace/{}/manifest.json", activation.project_id),
+                    active_snapshot: Some(active_snapshot_rel(
+                        &activation.project_id,
+                        &activation.snapshot_id,
+                    )),
+                    dirty_overlay: None,
+                    repo_materialization: None,
+                    code_source_selector: Some(bbox_code_source::local_selector(
+                        &activation.project_id,
+                    )),
+                    code_source_generation: Some("local".to_string()),
+                },
+            );
+        }
+        index.write_atomic(edges_dir)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn stage_local_snapshot_activation(
+    edges_dir: &Path,
+    project_id: &str,
+    repo_id: &str,
+    branch: Option<&str>,
+    head_sha: &str,
+    dirty: bool,
+    dirty_fingerprint: Option<&str>,
+    snapshot_id: &str,
+    project_edges: &[Edge],
+    symbol_edges: &[Edge],
+    git_current_edges: &[Edge],
+) -> Result<PendingLocalSnapshotActivation> {
+    write_snapshot_files(
+        edges_dir,
+        project_id,
+        snapshot_id,
+        &[
+            ("project.jsonl", project_edges),
+            ("symbols.jsonl", symbol_edges),
+            ("git-current.jsonl", git_current_edges),
+        ],
+    )?;
+    Ok(PendingLocalSnapshotActivation {
+        project_id: project_id.to_string(),
+        repo_id: repo_id.to_string(),
+        branch: branch.map(str::to_string),
+        head_sha: head_sha.to_string(),
+        dirty,
+        dirty_fingerprint: dirty_fingerprint.map(str::to_string),
+        snapshot_id: snapshot_id.to_string(),
+    })
+}
+
 pub fn write_snapshot_files(
     edges_dir: &Path,
     project_id: &str,
@@ -290,6 +489,66 @@ pub fn write_snapshot_files(
     )?
     .sync_all()?;
     Ok(())
+}
+
+pub struct SnapshotEdgeWriter {
+    writer: Option<std::io::BufWriter<fs::File>>,
+    temporary: PathBuf,
+    destination: PathBuf,
+}
+
+impl SnapshotEdgeWriter {
+    pub fn append(&mut self, edges: &[Edge]) -> Result<()> {
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("snapshot edge writer is already finished"))?;
+        for edge in edges {
+            serde_json::to_writer(&mut *writer, edge)?;
+            writer.write_all(b"\n")?;
+        }
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<()> {
+        let writer = self
+            .writer
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("snapshot edge writer is already finished"))?;
+        let file = writer.into_inner().map_err(|error| error.into_error())?;
+        file.sync_all()?;
+        fs::rename(&self.temporary, &self.destination)?;
+        if let Some(parent) = self.destination.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SnapshotEdgeWriter {
+    fn drop(&mut self) {
+        if self.writer.is_some() {
+            let _ = fs::remove_file(&self.temporary);
+        }
+    }
+}
+
+pub fn create_snapshot_edge_writer(
+    edges_dir: &Path,
+    project_id: &str,
+    snapshot_id: &str,
+    filename: &str,
+) -> Result<SnapshotEdgeWriter> {
+    let directory = snapshot_dir(edges_dir, project_id, snapshot_id);
+    fs::create_dir_all(&directory)?;
+    let destination = directory.join(filename);
+    let temporary = destination.with_extension("jsonl.tmp");
+    let file = fs::File::create(&temporary)?;
+    Ok(SnapshotEdgeWriter {
+        writer: Some(std::io::BufWriter::new(file)),
+        temporary,
+        destination,
+    })
 }
 
 fn write_edges_file_atomic(directory: &Path, filename: &str, edges: &[Edge]) -> Result<()> {
@@ -1415,6 +1674,72 @@ mod tests {
         assert!(
             !has_a_in_b,
             "branch-b active graph must NOT have branch-a edges"
+        );
+    }
+
+    #[test]
+    fn pending_local_activations_publish_as_one_manifest_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+        let first_snapshot = clean_snapshot_id("repo-1", "project-1", "aaaa");
+        let second_snapshot = clean_snapshot_id("repo-2", "project-2", "bbbb");
+        let first = stage_local_snapshot_activation(
+            edges_dir,
+            "project-1",
+            "repo-1",
+            Some("main"),
+            "aaaa",
+            false,
+            None,
+            &first_snapshot,
+            &[derived_edge("first", "DESCRIBES", "target")],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let second = stage_local_snapshot_activation(
+            edges_dir,
+            "project-2",
+            "repo-2",
+            Some("main"),
+            "bbbb",
+            false,
+            None,
+            &second_snapshot,
+            &[derived_edge("second", "DESCRIBES", "target")],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let journal = write_pending_local_activation_journal(edges_dir, &[first, second]).unwrap();
+        assert_eq!(journal.activations().len(), 2);
+        assert!(
+            load_pending_local_activation_journal(edges_dir)
+                .unwrap()
+                .is_some()
+        );
+
+        activate_pending_local_snapshots(edges_dir, journal.activations()).unwrap();
+        let manifest = ManifestIndex::load(edges_dir).unwrap();
+        assert_eq!(manifest.workspaces.len(), 2);
+        assert_eq!(
+            manifest.workspaces["project-1"]
+                .code_source_selector
+                .as_deref(),
+            Some("local:project-1")
+        );
+        let expected_second = active_snapshot_rel("project-2", &second_snapshot);
+        assert_eq!(
+            manifest.workspaces["project-2"].active_snapshot.as_deref(),
+            Some(expected_second.as_str())
+        );
+
+        clear_pending_local_activation_journal(edges_dir).unwrap();
+        assert!(
+            load_pending_local_activation_journal(edges_dir)
+                .unwrap()
+                .is_none()
         );
     }
 }

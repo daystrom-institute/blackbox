@@ -221,18 +221,30 @@ impl BlackboxServer {
                         gaps.extend(scope_gaps.into_values());
                         continue;
                     };
-                    let snapshot = self
-                        .state
-                        .gap_overlays
-                        .read()
-                        .get(&scope, &own.checkout_id)
-                        .cloned()
-                        .with_context(|| {
-                            format!(
-                                "own checkout gap overlay is missing for scope {scope:?} and checkout {}",
-                                own.checkout_id
-                            )
-                        })?;
+                    let cached = {
+                        self.state
+                            .gap_overlays
+                            .read()
+                            .get(&scope, &own.checkout_id)
+                            .cloned()
+                    };
+                    let snapshot = match cached {
+                        Some(snapshot) => snapshot,
+                        None => {
+                            self.refresh_dark_gap_overlay(own);
+                            self.state
+                                .gap_overlays
+                                .read()
+                                .get(&scope, &own.checkout_id)
+                                .cloned()
+                                .with_context(|| {
+                                    format!(
+                                        "own checkout gap overlay is missing after one bounded refresh for scope {scope:?} and checkout {}",
+                                        own.checkout_id
+                                    )
+                                })?
+                        }
+                    };
                     if snapshot.status != GapOverlayStatus::Valid {
                         anyhow::bail!(
                             "own checkout gap overlay is invalid for scope {scope:?}: {}",
@@ -288,6 +300,8 @@ impl BlackboxServer {
                                     gap.project = Some(project.canonical_path.clone());
                                     gap.provisional_checkout_id =
                                         Some(snapshot.key.checkout_id.clone());
+                                    gap.id =
+                                        provisional_gap_ref(&snapshot.key.checkout_id, &gap.id);
                                     gaps.push(*gap);
                                 }
                                 GapOverlayValue::Tombstone => diagnostics.push(format!(
@@ -349,6 +363,10 @@ impl BlackboxServer {
         );
         Ok(snapshot)
     }
+}
+
+fn provisional_gap_ref(checkout_id: &str, gap_id: &str) -> String {
+    format!("provisional_gap:{checkout_id}:{gap_id}")
 }
 
 fn stable_gap_overlay(
@@ -473,8 +491,54 @@ mod tests {
             .next()
             .cloned()
             .expect("cached scope");
+
+        // Missing own overlays are lifecycle transients. One bounded inline
+        // refresh should recover the session view from the checkout bytes.
+        std::fs::write(
+            repo.join(".bbox/gaps/gap-12345678.json"),
+            serde_json::to_vec_pretty(&json!({
+                "id": "gap-12345678",
+                "title": "Dirty checkout gap",
+                "gap_kind": "tooling",
+                "domain": "tests",
+                "wanted_capability": "cached published snapshots",
+                "dedupe_key": "tooling/tests/cache-published-gap-reads",
+                "created_at": "2026-01-01T00:00:00Z"
+            }))
+            .expect("serialize dirty gap"),
+        )
+        .expect("write dirty gap");
+        let project_id = state.projects.read().list()[0].project_id.clone();
+        server
+            .session_checkout
+            .set(Some(Arc::new(ResolvedCheckoutScope {
+                project_id,
+                published_scope: scope.clone(),
+                checkout_id: "own-gap-checkout".into(),
+                checkout_dir: repo.to_string_lossy().into_owned(),
+                checkout_project_dir: repo.to_string_lossy().into_owned(),
+                branch_ref: Some("refs/heads/main".into()),
+            })))
+            .expect("pin checkout");
+        let own = server
+            .session_gap_view(Some(repo.to_str().expect("utf8 repo")), Some("own"))
+            .expect("bounded refresh should recover missing own gap overlay");
+        assert_eq!(own.gaps.all()[0].title, "Dirty checkout gap");
+
         server.invalidate_published_knowledge_cache(&scope);
         assert!(state.gap_published_cache.read().is_empty());
         assert!(state.publisher_authorization_cache.read().is_empty());
+    }
+
+    #[test]
+    fn provisional_gap_refs_include_checkout_identity() {
+        assert_eq!(
+            provisional_gap_ref("checkout-a", "gap-12345678"),
+            "provisional_gap:checkout-a:gap-12345678"
+        );
+        assert_ne!(
+            provisional_gap_ref("checkout-a", "gap-12345678"),
+            provisional_gap_ref("checkout-b", "gap-12345678")
+        );
     }
 }

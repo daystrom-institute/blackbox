@@ -101,9 +101,17 @@ impl ServerHandler for BlackboxServer {
     ) -> Result<InitializeResult, ErrorData> {
         let (surface_str, project_raw) =
             if let Some(parts) = context.extensions.get::<http::request::Parts>() {
+                let project =
+                    server::surface::extract_decoded_query_param(parts.uri.query(), "project")
+                        .map_err(|error| {
+                            ErrorData::internal_error(
+                                format!("invalid project query parameter: {error}"),
+                                None,
+                            )
+                        })?;
                 (
                     server::surface::extract_surface_from_uri(parts.uri.query()),
-                    server::surface::extract_decoded_query_param(parts.uri.query(), "project"),
+                    project,
                 )
             } else {
                 ("default", None)

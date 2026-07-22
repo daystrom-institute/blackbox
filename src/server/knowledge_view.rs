@@ -222,18 +222,30 @@ impl BlackboxServer {
                     else {
                         continue;
                     };
-                    let snapshot = self
-                        .state
-                        .knowledge_overlays
-                        .read()
-                        .get(&scope, &own.checkout_id)
-                        .cloned()
-                        .with_context(|| {
-                            format!(
-                                "own checkout overlay is missing for scope {scope:?} and checkout {}",
-                                own.checkout_id
-                            )
-                        })?;
+                    let cached = {
+                        self.state
+                            .knowledge_overlays
+                            .read()
+                            .get(&scope, &own.checkout_id)
+                            .cloned()
+                    };
+                    let snapshot = match cached {
+                        Some(snapshot) => snapshot,
+                        None => {
+                            let _ = self.refresh_dark_knowledge_overlay(own);
+                            self.state
+                                .knowledge_overlays
+                                .read()
+                                .get(&scope, &own.checkout_id)
+                                .cloned()
+                                .with_context(|| {
+                                    format!(
+                                        "own checkout overlay is missing after one bounded refresh for scope {scope:?} and checkout {}",
+                                        own.checkout_id
+                                    )
+                                })?
+                        }
+                    };
                     if snapshot.status != OverlayStatus::Valid {
                         anyhow::bail!(
                             "own checkout overlay is invalid for scope {scope:?}: {}",
@@ -641,16 +653,19 @@ mod tests {
             "commit-keyed blob caches must rehydrate mutable recall telemetry"
         );
 
-        let missing = server
+        let refreshed_own = server
             .session_knowledge_view(Some(base.to_str().unwrap()), Some("own"))
-            .err()
-            .expect("missing own overlay must fail closed");
-        assert!(
-            missing
-                .to_string()
-                .contains("own checkout overlay is missing"),
-            "{missing:#}"
+            .expect("missing own overlay should receive one bounded refresh");
+        let refreshed_own_ref = provisional_entity_ref(&scope, own_id, "shared");
+        assert_eq!(
+            refreshed_own
+                .knowledge
+                .entry(&refreshed_own_ref)
+                .unwrap()
+                .content,
+            "OWN_CONTENT"
         );
+        assert!(refreshed_own.knowledge.entry("deleted").is_none());
         server
             .register_dark_knowledge_checkout(&own_checkout)
             .unwrap();

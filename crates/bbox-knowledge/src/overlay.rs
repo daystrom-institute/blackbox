@@ -32,7 +32,9 @@ impl ProvisionalMode {
             None => Ok(Self::Published),
             Some("published") => Ok(Self::Published),
             Some("own") if has_session_checkout => Ok(Self::Own),
-            Some("own") => Ok(Self::Published),
+            Some("own") => {
+                anyhow::bail!("provisional mode own requires authoritative checkout context")
+            }
             Some("all") => Ok(Self::All),
             Some(other) => {
                 anyhow::bail!("invalid provisional mode {other:?}; expected published, own, or all")
@@ -647,6 +649,15 @@ mod tests {
     use super::*;
     use crate::knowledge::{Approval, Category, Priority, Scope, Status};
     use std::collections::HashMap;
+
+    #[test]
+    fn explicit_own_requires_checkout_authority() {
+        assert!(ProvisionalMode::parse(Some("own"), false).is_err());
+        assert_eq!(
+            ProvisionalMode::parse(None, false).unwrap(),
+            ProvisionalMode::Published
+        );
+    }
 
     fn run(root: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")

@@ -398,6 +398,44 @@ pub fn apply_export_page(
     })
 }
 
+pub fn append_note_documents_dedup(
+    root: &Path,
+    notes_ref: &str,
+    commit: &str,
+    documents: &[String],
+) -> Result<ApplyExportPageResult> {
+    let root = canonical_project_root(root)?;
+    validate_notes_ref(notes_ref)?;
+    if !commit_exists(&root, commit)? {
+        bail!("provenance target commit does not exist");
+    }
+    let _repository_lock = lock_repository(&root)?;
+    let existing = bbox_corpus_core::git::show_note(&root, notes_ref, commit)?;
+    let mut known_hashes = existing
+        .as_deref()
+        .map(split_note_documents)
+        .unwrap_or_default()
+        .into_iter()
+        .map(document_sha256)
+        .collect::<BTreeSet<_>>();
+    let mut written = 0_u64;
+    let mut unchanged = 0_u64;
+    bbox_corpus_core::git::ensure_notes_merge_strategy_union(&root)?;
+    for document in documents {
+        if !known_hashes.insert(document_sha256(document)) {
+            unchanged += 1;
+            continue;
+        }
+        bbox_corpus_core::git::write_note(&root, notes_ref, commit, &format!("{document}\n"))?;
+        written += 1;
+    }
+    Ok(ApplyExportPageResult {
+        written,
+        unchanged,
+        rejected: 0,
+    })
+}
+
 fn validate_page(root: &Path, page: &ProvenanceExportPage) -> Result<()> {
     if page.project_id.trim().is_empty() {
         bail!("provenance export page project_id must not be empty");

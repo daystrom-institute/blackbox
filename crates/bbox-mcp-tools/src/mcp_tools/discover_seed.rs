@@ -76,10 +76,11 @@ pub fn discover_seed_entities(
     ctx: &ProviderContext<'_>,
     edge_index: &EdgeIndex,
     active_selectors: &BTreeMap<String, String>,
+    searcher: &tantivy::Searcher,
     p: &DiscoverSeedParams,
 ) -> Result<String> {
     let limit = p.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-    let hybrid = hybrid_search::hybrid_search_typed_with_active_selectors(
+    let hybrid = hybrid_search::hybrid_search_typed_with_active_selectors_and_searcher(
         index,
         knowledge,
         ctx,
@@ -96,6 +97,7 @@ pub fn discover_seed_entities(
             rerank: None,
         },
         active_selectors,
+        searcher,
     )?;
     let seeds = hybrid
         .results

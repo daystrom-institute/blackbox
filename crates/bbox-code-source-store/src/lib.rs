@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -48,6 +50,8 @@ struct SharedStoreState {
     limits: RwLock<StoreLimits>,
     mutation: Mutex<()>,
     verified_blobs: Mutex<HashMap<String, BlobIdentity>>,
+    #[cfg(test)]
+    blob_verifications: AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,6 +185,8 @@ impl CodeSourceStore {
                     limits: RwLock::new(limits),
                     mutation: Mutex::new(()),
                     verified_blobs: Mutex::new(HashMap::new()),
+                    #[cfg(test)]
+                    blob_verifications: AtomicU64::new(0),
                 });
                 registry.insert(root.clone(), Arc::downgrade(&shared));
                 shared
@@ -445,7 +451,12 @@ impl CodeSourceStore {
         upload_id: &str,
         cursor: Option<&str>,
     ) -> Result<MissingBlobsPage> {
-        let record = self.load_upload(producer_id, upload_id)?;
+        let _guard = self
+            .shared
+            .mutation
+            .lock()
+            .map_err(|_| anyhow!("code-source store lock poisoned"))?;
+        let mut record = self.load_upload(producer_id, upload_id)?;
         if record.state != GenerationState::MissingBlobs {
             bail!("missing-blob cursor is stale for upload state");
         }
@@ -457,7 +468,10 @@ impl CodeSourceStore {
         let missing = read_json::<Vec<String>>(
             &self.upload_dir(producer_id, upload_id).join("missing.json"),
         )?;
-        self.missing_page(generation, &missing, offset)
+        let page = self.missing_page(generation, &missing, offset)?;
+        record.updated_unix_secs = now_unix_secs();
+        self.save_upload(&record)?;
+        Ok(page)
     }
 
     pub fn install_blob<R: Read>(
@@ -474,7 +488,7 @@ impl CodeSourceStore {
             .mutation
             .lock()
             .map_err(|_| anyhow!("code-source store lock poisoned"))?;
-        let record = self.load_upload(producer_id, upload_id)?;
+        let mut record = self.load_upload(producer_id, upload_id)?;
         let generation = record
             .generation_id
             .as_deref()
@@ -488,9 +502,15 @@ impl CodeSourceStore {
         }
         let destination = self.blob_path(expected_hash);
         if destination.is_file() {
-            if verify_blob(&destination, expected_hash, expected_size).is_ok() {
+            if self
+                .verified_blob_file(expected_hash, expected_size)
+                .is_ok()
+            {
+                record.updated_unix_secs = now_unix_secs();
+                self.save_upload(&record)?;
                 return Ok(expected_size);
             }
+            self.forget_verified_blob(expected_hash)?;
             quarantine_corrupt_blob(&destination)?;
         }
         create_private_dir(destination.parent().expect("blob path parent"))?;
@@ -533,10 +553,13 @@ impl CodeSourceStore {
             Ok(()) => {
                 fs::remove_file(&temporary)?;
                 sync_parent(&destination)?;
+                let file = open_blob_nofollow(&destination)?;
+                let identity = blob_identity(&file, expected_size)?;
+                self.remember_verified_blob(expected_hash, identity)?;
             }
             Err(error) if destination.is_file() => {
                 let _ = fs::remove_file(&temporary);
-                verify_blob(&destination, expected_hash, expected_size)?;
+                self.verified_blob_file(expected_hash, expected_size)?;
                 if error.kind() != std::io::ErrorKind::AlreadyExists {
                     tracing_rename_race(&error);
                 }
@@ -546,6 +569,8 @@ impl CodeSourceStore {
                 return Err(error.into());
             }
         }
+        record.updated_unix_secs = now_unix_secs();
+        self.save_upload(&record)?;
         Ok(written)
     }
 
@@ -909,18 +934,41 @@ impl CodeSourceStore {
             .get(hash)
             == Some(&identity);
         if !cache_hit {
+            #[cfg(test)]
+            self.shared
+                .blob_verifications
+                .fetch_add(1, Ordering::Relaxed);
             verify_open_blob(&mut file, hash)?;
-            let mut cache = self
-                .shared
-                .verified_blobs
-                .lock()
-                .map_err(|_| anyhow!("verified blob cache lock poisoned"))?;
-            if cache.len() >= 1_000_000 {
-                cache.clear();
-            }
-            cache.insert(hash.to_string(), identity);
+            self.remember_verified_blob(hash, identity)?;
         }
         Ok(file)
+    }
+
+    fn remember_verified_blob(&self, hash: &str, identity: BlobIdentity) -> Result<()> {
+        let mut cache = self
+            .shared
+            .verified_blobs
+            .lock()
+            .map_err(|_| anyhow!("verified blob cache lock poisoned"))?;
+        if cache.len() >= 1_000_000 {
+            cache.clear();
+        }
+        cache.insert(hash.to_string(), identity);
+        Ok(())
+    }
+
+    fn forget_verified_blob(&self, hash: &str) -> Result<()> {
+        self.shared
+            .verified_blobs
+            .lock()
+            .map_err(|_| anyhow!("verified blob cache lock poisoned"))?
+            .remove(hash);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn blob_verification_count(&self) -> u64 {
+        self.shared.blob_verifications.load(Ordering::Relaxed)
     }
 
     pub fn load_generation_entries(
@@ -1006,6 +1054,7 @@ impl CodeSourceStore {
                 let path = self.blob_path(&hash);
                 if verify_blob(&path, &hash, size).is_err() {
                     if path.exists() {
+                        self.forget_verified_blob(&hash)?;
                         quarantine_corrupt_blob(&path)?;
                     }
                     degraded = true;
@@ -1115,6 +1164,9 @@ impl CodeSourceStore {
                 let bytes = metadata.len();
                 let path = blob.path();
                 fs::remove_file(&path)?;
+                if is_blob {
+                    self.forget_verified_blob(&hash)?;
+                }
                 sync_parent(&path)?;
                 stats.reclaimed_blobs += 1;
                 stats.reclaimed_bytes = stats.reclaimed_bytes.saturating_add(bytes);
@@ -1165,7 +1217,8 @@ impl CodeSourceStore {
         for generation in generations {
             if matches!(
                 generation.state,
-                GenerationState::Ready
+                GenerationState::MissingBlobs
+                    | GenerationState::Ready
                     | GenerationState::StagingIndex
                     | GenerationState::Active
                     | GenerationState::MissingBlobData
@@ -1265,7 +1318,7 @@ impl CodeSourceStore {
                 .copied()
                 .ok_or_else(|| anyhow!("missing-set hash is absent from generation manifest"))?;
             let path = self.blob_path(hash);
-            if !path.is_file() || verify_blob(&path, hash, size).is_err() {
+            if !path.is_file() || self.verified_blob_file(hash, size).is_err() {
                 hashes.push(hash.clone());
             }
             position += 1;
@@ -1290,8 +1343,9 @@ impl CodeSourceStore {
         let mut missing = BTreeSet::new();
         for (hash, size) in sizes {
             let path = self.blob_path(&hash);
-            if !path.is_file() || verify_blob(&path, &hash, size).is_err() {
+            if !path.is_file() || self.verified_blob_file(&hash, size).is_err() {
                 if path.exists() {
+                    self.forget_verified_blob(&hash)?;
                     quarantine_corrupt_blob(&path)?;
                 }
                 missing.insert(hash);
@@ -1648,6 +1702,93 @@ mod tests {
         assert!(missing.hashes.is_empty());
         let ready = store.finalize_upload("host-a", &begin.upload_id).unwrap();
         assert_eq!(ready.state, GenerationState::Ready);
+        assert_eq!(store.blob_verification_count(), 0);
+    }
+
+    #[test]
+    fn unchanged_present_blob_is_hashed_once_across_publications() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = open_store(&root);
+        let bytes = b"already cached source";
+        let hash = sha256_hex(bytes);
+        let entries = vec![ManifestEntry {
+            relative_path: "src/lib.rs".into(),
+            content_sha256: hash.clone(),
+            size: bytes.len() as u64,
+        }];
+        let blob = store.blob_path(&hash);
+        fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        fs::write(&blob, bytes).unwrap();
+
+        for _ in 0..2 {
+            let upload = store.begin_upload("host-a", descriptor(&entries)).unwrap();
+            store
+                .put_manifest_page("host-a", &upload.upload_id, 0, &entries)
+                .unwrap();
+            let missing = store
+                .complete_manifest("host-a", &upload.upload_id)
+                .unwrap();
+            assert!(missing.hashes.is_empty());
+            store.finalize_upload("host-a", &upload.upload_id).unwrap();
+        }
+
+        assert_eq!(store.blob_verification_count(), 1);
+    }
+
+    #[test]
+    fn blob_and_missing_page_activity_refresh_upload_expiry() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = open_store(&root);
+        let bytes = b"upload activity";
+        let hash = sha256_hex(bytes);
+        let entries = vec![ManifestEntry {
+            relative_path: "src/lib.rs".into(),
+            content_sha256: hash.clone(),
+            size: bytes.len() as u64,
+        }];
+        let upload = store.begin_upload("host-a", descriptor(&entries)).unwrap();
+        store
+            .put_manifest_page("host-a", &upload.upload_id, 0, &entries)
+            .unwrap();
+        store
+            .complete_manifest("host-a", &upload.upload_id)
+            .unwrap();
+
+        let mut record = store.load_upload("host-a", &upload.upload_id).unwrap();
+        record.updated_unix_secs = 0;
+        store.save_upload(&record).unwrap();
+        store
+            .install_blob(
+                "host-a",
+                &upload.upload_id,
+                &hash,
+                bytes.len() as u64,
+                &bytes[..],
+            )
+            .unwrap();
+        assert!(
+            store
+                .load_upload("host-a", &upload.upload_id)
+                .unwrap()
+                .updated_unix_secs
+                > 0
+        );
+
+        let mut record = store.load_upload("host-a", &upload.upload_id).unwrap();
+        record.updated_unix_secs = 0;
+        store.save_upload(&record).unwrap();
+        store
+            .missing_blobs("host-a", &upload.upload_id, None)
+            .unwrap();
+        assert!(
+            store
+                .load_upload("host-a", &upload.upload_id)
+                .unwrap()
+                .updated_unix_secs
+                > 0
+        );
     }
 
     #[test]
@@ -1961,6 +2102,53 @@ mod tests {
         assert!(!orphan.exists());
         assert_eq!(stats.reclaimed_blobs, 1);
         assert_eq!(stats.reclaimed_bytes, orphan_bytes.len() as u64);
+    }
+
+    #[test]
+    fn gc_keeps_partial_generation_blobs_after_upload_expiry() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let mut limits = StoreLimits::default();
+        limits.unreferenced_blob_grace_hours = 0;
+        let store = CodeSourceStore::open(root.join("code-sources"), limits).unwrap();
+        let bytes = b"partial generation";
+        let hash = sha256_hex(bytes);
+        let entries = vec![ManifestEntry {
+            relative_path: "src/lib.rs".into(),
+            content_sha256: hash.clone(),
+            size: bytes.len() as u64,
+        }];
+        let upload = store.begin_upload("host-a", descriptor(&entries)).unwrap();
+        store
+            .put_manifest_page("host-a", &upload.upload_id, 0, &entries)
+            .unwrap();
+        store
+            .complete_manifest("host-a", &upload.upload_id)
+            .unwrap();
+        store
+            .install_blob(
+                "host-a",
+                &upload.upload_id,
+                &hash,
+                bytes.len() as u64,
+                &bytes[..],
+            )
+            .unwrap();
+        let mut record = store.load_upload("host-a", &upload.upload_id).unwrap();
+        record.updated_unix_secs = 0;
+        store.save_upload(&record).unwrap();
+        assert_eq!(store.expire_uploads(1).unwrap(), 1);
+
+        let orphan_bytes = b"orphan";
+        let orphan_hash = sha256_hex(orphan_bytes);
+        let orphan = store.blob_path(&orphan_hash);
+        fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+        fs::write(&orphan, orphan_bytes).unwrap();
+
+        let stats = store.gc_blobs().unwrap();
+        assert!(store.blob_path(&hash).is_file());
+        assert!(!orphan.exists());
+        assert_eq!(stats.reclaimed_blobs, 1);
     }
 
     #[test]

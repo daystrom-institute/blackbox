@@ -281,6 +281,25 @@ impl BlackboxServer {
         if id.is_empty() {
             anyhow::bail!("knowledge entry id is required");
         }
+        // Global entries live in the host store and do not depend on the
+        // session project's publisher or overlay health. Resolve them before
+        // preparing the project-scoped own view so an unrelated broken scope
+        // cannot block a global forget/review/link mutation.
+        if provisional_checkout.is_none()
+            && self
+                .state
+                .kb
+                .read()
+                .entry(&id)
+                .is_some_and(|entry| entry.scope == Scope::Global)
+        {
+            return Ok(ExistingKnowledgeMutation {
+                id,
+                carrier: None,
+                seed: None,
+                checkout: None,
+            });
+        }
         let Some(checkout) = self.authoritative_session_checkout() else {
             if provisional_checkout.is_some() {
                 anyhow::bail!("provisional knowledge mutation requires session checkout authority");
@@ -638,9 +657,25 @@ impl BlackboxServer {
             .into_iter()
             .map(|project| PathBuf::from(project.canonical_path))
             .collect::<Vec<_>>();
-        bbox_knowledge::inventory::persist_schema_epoch_inventory(
+        bbox_knowledge::inventory::persist_schema_epoch_inventory_read_only(
             &entries,
             &roots,
+            &self.state.store_dir,
+            crate::config::read_repo_id_inputs,
+        )
+    }
+
+    /// Write the repo-owned schema marker as part of an explicit operator
+    /// mutation. Periodic lifecycle work must never call this path because the
+    /// resulting file belongs in a user-reviewed commit.
+    pub(crate) fn write_knowledge_schema_epoch_marker(
+        &self,
+        project_root: &Path,
+    ) -> Result<bbox_knowledge::inventory::PersistedInventoryReport> {
+        let entries = self.state.kb.read().all_entries().to_vec();
+        bbox_knowledge::inventory::persist_schema_epoch_inventory(
+            &entries,
+            &[project_root.to_path_buf()],
             &self.state.store_dir,
             crate::config::read_repo_id_inputs,
         )
@@ -1191,7 +1226,7 @@ mod tests {
                 .is_some()
         );
 
-        let replacement_id = "replacement-checkout-identity";
+        let replacement_id = "0123456789abcdef0123456789abcdef";
         std::fs::write(worktree.join(".bbox/local/checkout-id"), replacement_id).unwrap();
         let second = server.reconcile_dark_knowledge_checkouts().unwrap();
         assert_eq!(second.dropped, 1, "marker mismatch drops the stale row");
@@ -1254,6 +1289,48 @@ mod tests {
                 .get(&scope, &checkout_id)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn global_mutation_is_not_gated_by_missing_project_overlay() {
+        let (_temp, server, _base, worktree, scope) = fixture();
+        let global = KnowledgeEntry {
+            id: "global-entry".into(),
+            title: "global entry".into(),
+            content: "global content".into(),
+            cluster: None,
+            variants: Default::default(),
+            category: Category::Memory,
+            scope: Scope::Global,
+            project: None,
+            providers: Vec::new(),
+            priority: Priority::Standard,
+            weight: 100,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            render: false,
+            decay: false,
+            review_at: None,
+            supersedes: None,
+            links: Vec::new(),
+            rationale: None,
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        };
+        server.state.kb.write().upsert_generated(global).unwrap();
+        server.set_session_checkout_for_test(scope, "missing-overlay".into(), worktree);
+
+        let mutation = server
+            .prepare_existing_knowledge_mutation("knowledge:global-entry")
+            .unwrap();
+
+        assert_eq!(mutation.id, "global-entry");
+        assert!(mutation.carrier.is_none());
+        assert!(mutation.checkout.is_none());
     }
 
     #[test]
@@ -1728,6 +1805,13 @@ mod tests {
     fn path_fallback_cut_waits_for_committed_marker_and_is_monotonic() {
         let (_temp, server, base, _worktree, _scope) = fixture();
         let inventory = server.run_knowledge_schema_epoch_inventory().unwrap();
+        assert!(
+            !base.join(".bbox/knowledge/.schema-epoch").exists(),
+            "background inventory must not dirty the operator checkout"
+        );
+
+        let explicit = server.write_knowledge_schema_epoch_marker(&base).unwrap();
+        assert_eq!(explicit.marked_scopes.len(), 1);
         assert!(base.join(".bbox/knowledge/.schema-epoch").is_file());
 
         let blocked = server.reconcile_path_fallback_cut(&inventory).unwrap();

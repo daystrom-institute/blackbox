@@ -5,7 +5,7 @@
 //! pointer is both the exclusive claim and the loader-visible pending marker;
 //! old and new bytes remain available until the apply reaches a terminal state.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,7 @@ const TRANSACTION_VERSION: u32 = 1;
 const TRANSACTION_KIND: &str = "knowledge_transaction_v1";
 const TRANSACTION_ROOT: &str = "knowledge-transactions";
 const PENDING_FILE: &str = "pending.json";
+const MAX_COMPLETED_MANIFESTS: usize = 64;
 static TRANSACTION_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -142,8 +143,7 @@ pub fn apply_transaction(
     if let Err(apply_err) = apply_manifest(&checkout_dir, &transaction_dir, &manifest) {
         match rollback_manifest(&checkout_dir, &transaction_dir, &manifest) {
             Ok(()) => {
-                clear_pointer(&pointer_path)?;
-                let _ = fs::remove_dir_all(&transaction_dir);
+                finish_terminal_rollback(&root, &transaction_dir, &pointer_path)?;
                 return Err(
                     apply_err.context("knowledge transaction applied partially and rolled back")
                 );
@@ -162,8 +162,9 @@ pub fn apply_transaction(
 
 /// Recover the one pending transaction for a checkout. Preparing transactions
 /// without a complete manifest touched no canonical files and are discarded.
-/// Any complete manifest rolls forward idempotently, then records the closeout
-/// proof and clears the pointer.
+/// A complete manifest rolls forward idempotently when its staged new bytes are
+/// intact. If roll-forward cannot verify those bytes, recovery restores the
+/// checksummed old direction and clears the pointer at that terminal state.
 pub fn recover_pending_transaction(checkout_dir: &Path) -> Result<Option<RepoTransactionManifest>> {
     recover_pending_transaction_with_lock(checkout_dir, true)
 }
@@ -216,6 +217,7 @@ fn recover_pending_transaction_with_lock(
                     pointer_path.display()
                 )
             })?;
+            cleanup_terminal_debris_best_effort(&root);
             return Ok(None);
         }
     };
@@ -228,6 +230,7 @@ fn recover_pending_transaction_with_lock(
     validate_transaction_id(&pointer.transaction_id)?;
     if matches!(pointer.state, TransactionState::Closeout) {
         clear_pointer(&pointer_path)?;
+        cleanup_terminal_debris_best_effort(&root);
         return Ok(None);
     }
     let transaction_dir = root.join(&pointer.transaction_id);
@@ -236,6 +239,7 @@ fn recover_pending_transaction_with_lock(
     if !manifest_path.exists() && matches!(pointer.state, TransactionState::Preparing) {
         let _ = fs::remove_dir_all(&transaction_dir);
         clear_pointer(&pointer_path)?;
+        cleanup_terminal_debris_best_effort(&root);
         return Ok(None);
     }
     let manifest: RepoTransactionManifest =
@@ -244,7 +248,24 @@ fn recover_pending_transaction_with_lock(
         })?)
         .with_context(|| format!("parsing transaction manifest {}", manifest_path.display()))?;
     validate_manifest(&manifest, &pointer.transaction_id)?;
-    apply_manifest(&checkout_dir, &transaction_dir, &manifest)?;
+    if let Err(apply_err) = apply_manifest(&checkout_dir, &transaction_dir, &manifest) {
+        match rollback_manifest(&checkout_dir, &transaction_dir, &manifest) {
+            Ok(()) => {
+                finish_terminal_rollback(&root, &transaction_dir, &pointer_path)?;
+                tracing::warn!(
+                    transaction_id = %manifest.transaction_id,
+                    error = %apply_err,
+                    "knowledge transaction recovery rolled back after roll-forward failed"
+                );
+                return Ok(Some(manifest));
+            }
+            Err(rollback_err) => {
+                return Err(apply_err.context(format!(
+                    "knowledge transaction recovery could neither roll forward nor roll back: {rollback_err:#}; pending recovery retained"
+                )));
+            }
+        }
+    }
     complete_transaction(&root, &transaction_dir, &pointer_path, &manifest)?;
     Ok(Some(manifest))
 }
@@ -408,7 +429,120 @@ fn complete_transaction(
     clear_pointer(pointer_path)?;
     let _ = fs::remove_dir_all(transaction_dir);
     sync_dir(root)?;
+    cleanup_terminal_debris_best_effort(root);
     Ok(())
+}
+
+fn finish_terminal_rollback(
+    root: &Path,
+    transaction_dir: &Path,
+    pointer_path: &Path,
+) -> Result<()> {
+    clear_pointer(pointer_path)?;
+    if let Err(err) = fs::remove_dir_all(transaction_dir)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            transaction_dir = %transaction_dir.display(),
+            error = %err,
+            "failed to remove rolled-back transaction staging"
+        );
+    }
+    sync_dir(root)?;
+    cleanup_terminal_debris_best_effort(root);
+    Ok(())
+}
+
+fn cleanup_terminal_debris_best_effort(root: &Path) {
+    if let Err(err) = cleanup_terminal_debris(root) {
+        tracing::warn!(
+            transaction_root = %root.display(),
+            error = %err,
+            "failed to clean terminal knowledge transaction debris"
+        );
+    }
+}
+
+/// Remove debris only after the pending pointer reached a terminal state while
+/// the caller still owns the transaction lane. Completed manifests are closeout
+/// proofs, so they are compacted rather than discarded.
+fn cleanup_terminal_debris(root: &Path) -> Result<()> {
+    if pending_path_for_root(root).exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root).with_context(|| format!("reading {}", root.display()))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == "completed" {
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(&path).with_context(|| {
+                format!("removing orphan transaction staging {}", path.display())
+            })?;
+        } else {
+            fs::remove_file(&path)
+                .with_context(|| format!("removing transaction debris {}", path.display()))?;
+        }
+    }
+    compact_completed_manifests(root)?;
+    sync_dir(root)
+}
+
+fn compact_completed_manifests(root: &Path) -> Result<()> {
+    let completed = root.join("completed");
+    if !completed.is_dir() {
+        return Ok(());
+    }
+    let mut paths = fs::read_dir(&completed)
+        .with_context(|| format!("reading completed transactions {}", completed.display()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    if paths.len() <= MAX_COMPLETED_MANIFESTS {
+        return Ok(());
+    }
+
+    let mut manifests = Vec::with_capacity(paths.len());
+    for path in &paths {
+        let manifest: RepoTransactionManifest = serde_json::from_slice(
+            &fs::read(path).with_context(|| format!("reading {}", path.display()))?,
+        )
+        .with_context(|| format!("parsing {}", path.display()))?;
+        validate_manifest(&manifest, &manifest.transaction_id)?;
+        manifests.push(manifest);
+    }
+    manifests.sort_by(|left, right| {
+        (&left.created_at, &left.transaction_id).cmp(&(&right.created_at, &right.transaction_id))
+    });
+    let mut latest = BTreeMap::new();
+    for manifest in manifests {
+        for file in manifest.files {
+            latest.insert(file.relative_path.clone(), file);
+        }
+    }
+    let transaction_id = format!("compacted-{}", transaction_id());
+    let compacted = RepoTransactionManifest {
+        version: TRANSACTION_VERSION,
+        kind: TRANSACTION_KIND.to_string(),
+        transaction_id: transaction_id.clone(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        files: latest.into_values().collect(),
+    };
+    let compacted_path = completed.join(format!("{transaction_id}.json"));
+    atomic_write_json_locked(&compacted_path, &compacted)?;
+    sync_dir(&completed)?;
+    paths.retain(|path| path != &compacted_path);
+    for path in paths {
+        fs::remove_file(&path)
+            .with_context(|| format!("removing superseded closeout proof {}", path.display()))?;
+    }
+    sync_dir(&completed)
+}
+
+fn pending_path_for_root(root: &Path) -> PathBuf {
+    root.join(PENDING_FILE)
 }
 
 fn validate_manifest(manifest: &RepoTransactionManifest, transaction_id: &str) -> Result<()> {
@@ -702,6 +836,153 @@ mod tests {
         assert_eq!(fs::read(&first).unwrap(), b"new-first");
         assert_eq!(fs::read(&second).unwrap(), b"new-second");
         assert!(!has_pending_transaction(&root));
+    }
+
+    #[test]
+    fn recovery_rolls_back_when_staged_new_bytes_are_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let first = root.join(".bbox/knowledge/first.json");
+        let created = root.join(".bbox/knowledge/created.json");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::write(&first, b"old-first").unwrap();
+
+        let tx_id = "rollback-recovery-fixture";
+        let root_dir = transaction_root(&root);
+        let tx_dir = root_dir.join(tx_id);
+        fs::create_dir_all(root_dir.join("completed")).unwrap();
+        let manifest = prepare_manifest(
+            &root,
+            &tx_dir,
+            tx_id,
+            vec![
+                TransactionWrite {
+                    target: created.clone(),
+                    new_bytes: Some(b"created-new".to_vec()),
+                },
+                TransactionWrite {
+                    target: first.clone(),
+                    new_bytes: Some(b"new-first".to_vec()),
+                },
+            ],
+        )
+        .unwrap();
+        atomic_write_json_locked(&tx_dir.join("manifest.json"), &manifest).unwrap();
+        atomic_write_json_locked(
+            &root_dir.join(PENDING_FILE),
+            &TransactionPointer {
+                version: TRANSACTION_VERSION,
+                transaction_id: tx_id.into(),
+                state: TransactionState::Applying,
+            },
+        )
+        .unwrap();
+
+        // Simulate a crash after the first canonical replacement, followed by
+        // corruption of a later staged new file.
+        fs::write(&created, b"created-new").unwrap();
+        fs::write(tx_dir.join("new/1"), b"corrupt").unwrap();
+
+        assert!(recover_pending_transaction(&root).unwrap().is_some());
+        assert!(
+            !created.exists(),
+            "rollback must remove newly created files"
+        );
+        assert_eq!(fs::read(&first).unwrap(), b"old-first");
+        assert!(!has_pending_transaction(&root));
+        assert!(!tx_dir.exists());
+        assert!(
+            fs::read_dir(root_dir.join("completed"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "a rolled-back transaction must not become a closeout proof"
+        );
+    }
+
+    #[test]
+    fn transaction_applies_deletion_and_records_it_in_closeout_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let target = root.join(".bbox/knowledge/deleted.json");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"old").unwrap();
+
+        let manifest = apply_transaction(
+            &root,
+            vec![TransactionWrite {
+                target: target.clone(),
+                new_bytes: None,
+            }],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(!target.exists());
+        assert_eq!(manifest.files.len(), 1);
+        assert!(manifest.files[0].old_ref.is_some());
+        assert!(manifest.files[0].new_ref.is_none());
+        assert!(manifest.files[0].new_sha256.is_none());
+    }
+
+    #[test]
+    fn terminal_cleanup_removes_orphan_staging_and_temp_debris() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let transaction_root = transaction_root(&root);
+        fs::create_dir_all(transaction_root.join("orphan/new")).unwrap();
+        fs::write(transaction_root.join("orphan/new/0"), b"orphan").unwrap();
+        fs::write(transaction_root.join(".pending-orphan.tmp"), b"temp").unwrap();
+
+        apply_transaction(
+            &root,
+            vec![TransactionWrite {
+                target: root.join(".bbox/knowledge/entry.json"),
+                new_bytes: Some(b"new".to_vec()),
+            }],
+        )
+        .unwrap();
+
+        assert!(!transaction_root.join("orphan").exists());
+        assert!(!transaction_root.join(".pending-orphan.tmp").exists());
+    }
+
+    #[test]
+    fn completed_closeout_proofs_compact_without_losing_terminal_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let transaction_root = transaction_root(&root);
+        let completed = transaction_root.join("completed");
+        fs::create_dir_all(&completed).unwrap();
+        for index in 0..=MAX_COMPLETED_MANIFESTS {
+            let transaction_id = format!("fixture-{index:03}");
+            let manifest = RepoTransactionManifest {
+                version: TRANSACTION_VERSION,
+                kind: TRANSACTION_KIND.to_string(),
+                transaction_id: transaction_id.clone(),
+                created_at: format!("2026-07-22T00:00:{index:02}Z"),
+                files: vec![RepoTransactionFile {
+                    relative_path: format!(".bbox/knowledge/{index}.json"),
+                    old_ref: None,
+                    new_ref: Some(format!("new/{index}")),
+                    old_sha256: None,
+                    new_sha256: Some(sha256(format!("value-{index}").as_bytes())),
+                }],
+            };
+            atomic_write_json_locked(&completed.join(format!("{transaction_id}.json")), &manifest)
+                .unwrap();
+        }
+
+        compact_completed_manifests(&transaction_root).unwrap();
+
+        let paths = fs::read_dir(&completed)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(paths.len(), 1);
+        let compacted: RepoTransactionManifest =
+            serde_json::from_slice(&fs::read(&paths[0]).unwrap()).unwrap();
+        assert_eq!(compacted.files.len(), MAX_COMPLETED_MANIFESTS + 1);
     }
 
     #[test]

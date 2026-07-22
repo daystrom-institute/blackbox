@@ -165,8 +165,9 @@ impl ProjectRegistry {
         let git_root = entity_ref::git_root_for_path(&canonical);
         let repo_id = git_root
             .as_deref()
-            .map(entity_ref::repo_id_for_root)
+            .map(computed_repo_id_for_registry)
             .transpose()?;
+        let repo_id = repo_id.flatten();
         let is_git_repo = git_root.is_some();
         let languages = detect_languages(&canonical);
         let record = ProjectRecord {
@@ -255,8 +256,9 @@ impl ProjectRegistry {
             (
                 git_root
                     .as_deref()
-                    .map(entity_ref::repo_id_for_root)
-                    .transpose()?,
+                    .map(computed_repo_id_for_registry)
+                    .transpose()?
+                    .flatten(),
                 git_root.is_some(),
             )
         };
@@ -382,6 +384,16 @@ impl ProjectRegistry {
         record.aliases = declared.clone();
         Ok(true)
     }
+}
+
+fn computed_repo_id_for_registry(git_root: &Path) -> Result<Option<String>> {
+    // The registry's legacy computed id is only a bootstrap hint. A shallow
+    // boundary is not the repository root, so recording its hash would change
+    // after unshallowing and could admit the wrong managed clone in between.
+    if bbox_corpus_core::git::is_shallow_repository(git_root) {
+        return Ok(None);
+    }
+    Ok(Some(entity_ref::repo_id_for_root(git_root)?))
 }
 
 /// An alias resolves only when exactly one registered project claims it —
@@ -878,6 +890,23 @@ mod tests {
         assert!(git_record.is_git_repo);
         assert_eq!(plain_record.repo_id, None);
         assert!(!plain_record.is_git_repo);
+    }
+
+    #[test]
+    fn registration_does_not_record_computed_repo_id_from_shallow_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("shallow-repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo);
+        let head = bbox_corpus_core::git::current_head(&repo).unwrap();
+        fs::write(repo.join(".git/shallow"), format!("{head}\n")).unwrap();
+        assert!(bbox_corpus_core::git::is_shallow_repository(&repo));
+
+        let mut registry = ProjectRegistry::open(dir.path().join("projects.json")).unwrap();
+        let record = registry.register_path(&repo).unwrap();
+
+        assert!(record.is_git_repo);
+        assert_eq!(record.repo_id, None);
     }
 
     #[tokio::test]

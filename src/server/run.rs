@@ -30,18 +30,21 @@ pub async fn run() -> anyhow::Result<()> {
         Some(shared.system_events.clone()),
     );
 
+    // Bind before starting any background work that probes registered project
+    // paths. A stalled mount must not prevent the daemon from claiming its
+    // listener; the initial lifecycle pass itself is spawned below.
+    let port = cfg.daemon.port;
+    let listener = tokio::net::TcpListener::bind(format!("{bind_host}:{port}")).await?;
+
     start_background_tasks(shared.clone()).await?;
 
     // MCP service
-    let port = cfg.daemon.port;
-
     let ct = CancellationToken::new();
     let app = build_http_app(shared.clone(), &cfg, &ct);
 
     // Bind address resolved above (hoisted so SharedState gets the
     // loopback flag). Default `127.0.0.1`; BBOX_BIND=0.0.0.0 opens
     // the listener to docker-bridged peers — closed-network only.
-    let listener = tokio::net::TcpListener::bind(format!("{bind_host}:{port}")).await?;
     tracing::info!(
         "blackboxd listening on http://{bind_host}:{port}/mcp (loopback={bind_is_loopback})"
     );

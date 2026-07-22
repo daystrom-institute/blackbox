@@ -65,14 +65,19 @@ pub fn reembed_start(p: &ReembedParams, state: Arc<SharedState>) -> Result<Strin
     // takes over across-wave persistence so residue past the queue cap is
     // driven to convergence instead of stranded (gap-7323e96c).
     sweep_notify().notify_one();
-    tokio::spawn(async move {
+    tokio::task::spawn_blocking(move || {
         match enqueue_reembed_routes(&state, &buckets, max_entities) {
-            Ok(enqueued) => {
-                tracing::info!(route = %route, ?max_entities, enqueued, "embedding rebuild queue refill completed");
-            }
-            Err(err) => {
-                tracing::warn!(route = %route, error = %err, "embedding rebuild queue refill failed");
-            }
+            Ok(enqueued) => tracing::info!(
+                route = %route,
+                ?max_entities,
+                enqueued,
+                "embedding rebuild queue refill completed"
+            ),
+            Err(err) => tracing::warn!(
+                route = %route,
+                error = %err,
+                "embedding rebuild queue refill failed"
+            ),
         }
     });
     Ok(serde_json::to_string_pretty(&json!({
@@ -723,7 +728,8 @@ fn enqueue_reembed_routes(
 ) -> Result<usize> {
     let mut enqueued = 0usize;
     if buckets.contains(&Bucket::Knowledge) {
-        for entry in state.kb.read().all_entries() {
+        let published = crate::server::routes::published_knowledge_for_embedding(state, None)?;
+        for entry in &published {
             // Don't re-embed retired entries — `all_entries()` includes Deleted,
             // which would revive a forgotten entry in vector search. Mirror the
             // tantivy reindex's indexable filter (Active|Superseded only).

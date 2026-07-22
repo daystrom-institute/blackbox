@@ -48,6 +48,7 @@ pub fn find_session_file(
         codex_root: codex_root.map(Path::to_path_buf),
         meta_path: PathBuf::new(),
         projects_path: PathBuf::new(),
+        code_source_store_path: PathBuf::new(),
         knowledge_path: PathBuf::new(),
         threads_path: PathBuf::new(),
         roadmap_path: PathBuf::new(),

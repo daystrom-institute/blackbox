@@ -64,6 +64,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
     let (tail_tx, _) = broadcast::channel::<TailEvent>(16);
     let (roster_tx, _) = broadcast::channel::<bro_protocol::RosterDelta>(16);
     let active_code_selectors = index.active_code_selectors();
+    let code_searcher = index.searcher();
     let state = Arc::new(SharedState {
         idx: RwLock::new(index),
         index_writer,
@@ -107,6 +108,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         reindex_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         code_read_view: RwLock::new(Arc::new(crate::server::CodeReadView {
             active_selectors: active_code_selectors,
+            searcher: code_searcher,
             edge_index: Arc::new(edge_index::EdgeIndex::default()),
         })),
         code_sources: Arc::new(crate::server::code_source::CodeSourceRuntime::for_test(

@@ -25,7 +25,10 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     spawn_runtime_metrics_sampler();
     spawn_task_completed_router(shared.clone());
     spawn_system_event_signal_bridge(shared.clone());
-    run_knowledge_lifecycle_pass(shared.clone()).await;
+    // Inventory and checkout reconciliation may probe registered paths on
+    // stalled mounts. Keep the initial pass off the listener startup path just
+    // like subsequent periodic passes.
+    tokio::spawn(run_knowledge_lifecycle_pass(shared.clone()));
     start_bbox_watcher(&shared);
     spawn_knowledge_lifecycle_reconciler(shared.clone());
     restore_runtime_state(&shared).await;

@@ -173,8 +173,34 @@ pub fn hybrid_search_with_active_selectors(
     p: &HybridSearchParams,
     active_selectors: &BTreeMap<String, String>,
 ) -> Result<String> {
+    let searcher = index.searcher();
+    hybrid_search_with_active_selectors_and_searcher(
+        index,
+        knowledge,
+        ctx,
+        p,
+        active_selectors,
+        &searcher,
+    )
+}
+
+pub fn hybrid_search_with_active_selectors_and_searcher(
+    index: &TranscriptIndex,
+    knowledge: &Knowledge,
+    ctx: &ProviderContext<'_>,
+    p: &HybridSearchParams,
+    active_selectors: &BTreeMap<String, String>,
+    searcher: &tantivy::Searcher,
+) -> Result<String> {
     Ok(serde_json::to_string_pretty(
-        &hybrid_search_typed_with_active_selectors(index, knowledge, ctx, p, active_selectors)?,
+        &hybrid_search_typed_with_active_selectors_and_searcher(
+            index,
+            knowledge,
+            ctx,
+            p,
+            active_selectors,
+            searcher,
+        )?,
     )?)
 }
 
@@ -194,6 +220,25 @@ pub fn hybrid_search_typed_with_active_selectors(
     ctx: &ProviderContext<'_>,
     p: &HybridSearchParams,
     active_selectors: &BTreeMap<String, String>,
+) -> Result<HybridSearchResponse> {
+    let searcher = index.searcher();
+    hybrid_search_typed_with_active_selectors_and_searcher(
+        index,
+        knowledge,
+        ctx,
+        p,
+        active_selectors,
+        &searcher,
+    )
+}
+
+pub fn hybrid_search_typed_with_active_selectors_and_searcher(
+    index: &TranscriptIndex,
+    knowledge: &Knowledge,
+    ctx: &ProviderContext<'_>,
+    p: &HybridSearchParams,
+    active_selectors: &BTreeMap<String, String>,
+    searcher: &tantivy::Searcher,
 ) -> Result<HybridSearchResponse> {
     let query = p.query.trim();
     if query.is_empty() {
@@ -216,12 +261,13 @@ pub fn hybrid_search_typed_with_active_selectors(
     // single chunk is competitive.
     let bm25_fetch = (limit * 32).max(fetch);
     let (bm25_weight, vector_weight) = fusion_weights(p.vector_weight);
-    let bm25_hits_full = index.hybrid_bm25_hits_filtered_with_active_selectors(
+    let bm25_hits_full = index.hybrid_bm25_hits_filtered_with_active_selectors_and_searcher(
         query,
         bm25_fetch,
         p.doc_type.as_deref(),
         true,
         active_selectors,
+        searcher,
     )?;
     // Truncate the chunk-level list to `fetch` so it doesn't dilute RRF with
     // tail chunks that rank too low to matter. The full set still feeds
@@ -325,7 +371,7 @@ pub fn hybrid_search_typed_with_active_selectors(
         )?;
         for list in &mut vector_lists {
             retain_authorized_knowledge_vectors(list, knowledge);
-            retain_active_code_vectors(list, index, active_selectors);
+            retain_active_code_vectors(list, index, active_selectors, searcher);
             list.hits.truncate(fetch);
         }
         vector_status.searched_partitions = vector_lists
@@ -346,6 +392,7 @@ pub fn hybrid_search_typed_with_active_selectors(
         fused.iter().map(|hit| hit.entity_id.as_str()),
         &mut features,
         &mut loaded_properties,
+        searcher,
     )?;
     let now = Utc::now();
     let rerank_cap = p
@@ -489,9 +536,11 @@ fn retain_active_code_vectors(
     list: &mut RankedList,
     index: &TranscriptIndex,
     active_selectors: &BTreeMap<String, String>,
+    searcher: &tantivy::Searcher,
 ) {
-    list.hits
-        .retain(|hit| index.is_active_code_entity_for(&hit.entity_id, active_selectors));
+    list.hits.retain(|hit| {
+        index.is_active_code_entity_for_with_searcher(&hit.entity_id, active_selectors, searcher)
+    });
 }
 
 /// Pre-fusion doc_type scoping: the BM25 lane is already filtered at the
@@ -1100,10 +1149,11 @@ fn enrich_fused_features<'a>(
     entity_ids: impl Iterator<Item = &'a str>,
     features: &mut BTreeMap<String, RerankFeatures>,
     loaded_properties: &mut BTreeMap<String, BTreeMap<String, String>>,
+    searcher: &tantivy::Searcher,
 ) -> Result<()> {
     for entity_id in entity_ids {
         if !features.contains_key(entity_id) {
-            let indexed_properties = index.entity_properties(entity_id)?;
+            let indexed_properties = index.entity_properties_with_searcher(entity_id, searcher)?;
             let mut feature = indexed_properties
                 .as_ref()
                 .map(features_from_properties)

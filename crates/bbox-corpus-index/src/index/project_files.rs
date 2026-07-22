@@ -30,6 +30,7 @@ pub struct ProjectIndexStats {
     pub skipped_special: u64,
     pub skipped_unsupported: u64,
     pub skipped_oversize: u64,
+    pub pending_local_snapshots: Vec<bbox_edge_sidecar::snapshot::PendingLocalSnapshotActivation>,
 }
 
 #[derive(Debug)]
@@ -39,7 +40,6 @@ pub struct CollectedIndexResult {
     pub document_count: u64,
     pub entity_inventory_sha256: String,
     pub current_chunk_targets: HashMap<String, EntityRef>,
-    pub staged_edges: Vec<bbox_edge_sidecar::edge_sidecar::Edge>,
     pub head_commit: String,
     pub dirty_fingerprint: String,
     pub worktree_dirty: bool,
@@ -54,6 +54,64 @@ pub fn collected_materialization_selector(project_id: &str, generation_id: &str)
         bbox_code_source::source_selector(project_id, generation_id),
         hex::encode(&hasher.finalize()[..8])
     )
+}
+
+pub fn local_activation_marker(project_id: &str) -> String {
+    format!("code-source-activation:{project_id}")
+}
+
+pub fn recover_pending_local_snapshot_activations(
+    searcher: &tantivy::Searcher,
+    fields: FieldHandles,
+    edges_dir: &Path,
+) -> Result<()> {
+    let Some(journal) =
+        bbox_edge_sidecar::snapshot::load_pending_local_activation_journal(edges_dir)?
+    else {
+        return Ok(());
+    };
+    let mut committed = 0_usize;
+    for activation in journal.activations() {
+        let query = TermQuery::new(
+            Term::from_field_text(
+                fields.entity_id,
+                &local_activation_marker(activation.project_id()),
+            ),
+            IndexRecordOption::Basic,
+        );
+        let count = searcher.search(&query, &Count)?;
+        if count > 1 {
+            anyhow::bail!("local activation marker is not unique");
+        }
+        let matches_commit = searcher
+            .search(&query, &TopDocs::with_limit(1))?
+            .into_iter()
+            .next()
+            .map(|(_score, address)| searcher.doc::<TantivyDocument>(address))
+            .transpose()?
+            .and_then(|document| {
+                document
+                    .get_first(fields.code_source_generation)
+                    .and_then(|value| match value {
+                        tantivy::schema::OwnedValue::Str(value) => Some(value.clone()),
+                        _ => None,
+                    })
+            })
+            .is_some_and(|token| token == journal.commit_token());
+        if matches_commit {
+            committed += 1;
+        }
+    }
+
+    if committed == journal.activations().len() {
+        bbox_edge_sidecar::snapshot::activate_pending_local_snapshots(
+            edges_dir,
+            journal.activations(),
+        )?;
+    } else if committed != 0 {
+        anyhow::bail!("local activation commit markers are only partially visible");
+    }
+    bbox_edge_sidecar::snapshot::clear_pending_local_activation_journal(edges_dir)
 }
 
 #[derive(Debug, Default)]
@@ -109,11 +167,7 @@ pub fn collect_preserved_collected_documents(
         return Ok(PreservedCollectedDocuments::default());
     }
     let store = bbox_code_source_store::CodeSourceStore::open(
-        config
-            .projects_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("code-sources"),
+        &config.code_source_store_path,
         bbox_code_source_store::StoreLimits::default(),
     )?;
     let searcher = index.reader()?.searcher();
@@ -294,11 +348,7 @@ pub fn index_registered_projects_standalone(
     let collected = active_collected_sources(config)?;
     let collected_store = (!collected.is_empty()).then(|| {
         bbox_code_source_store::CodeSourceStore::open(
-            config
-                .projects_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join("code-sources"),
+            &config.code_source_store_path,
             bbox_code_source_store::StoreLimits::default(),
         )
     });
@@ -482,10 +532,7 @@ fn index_active_collected_project(
             edges_dir,
             &project.project_id,
             &staged.snapshot_id,
-            &[
-                ("project.jsonl", staged.staged_edges.as_slice()),
-                ("git-current.jsonl", git_edges.as_slice()),
-            ],
+            &[("git-current.jsonl", git_edges.as_slice())],
         )?;
         stats.indexed_docs += staged.document_count;
         stats.indexed_files += stored.descriptor.file_count;
@@ -661,10 +708,12 @@ fn stage_project_file_generation<F>(
 where
     F: FnMut(&bbox_code_source::ManifestEntry) -> Result<Vec<u8>>,
 {
+    const MAX_STAGED_SYMBOLS: usize = 2_000_000;
+    const MAX_STAGED_CHUNK_TARGETS: usize = 2_000_000;
+    const MAX_STAGED_ENTITY_ID_BYTES: usize = 256 * 1024 * 1024;
+
     let registry = chunker::default_registry();
-    let mut pending = Vec::new();
-    let mut project_edges = Vec::new();
-    for entry in entries {
+    let mut chunk_entry = |entry: &bbox_code_source::ManifestEntry| {
         let relative_path = Path::new(&entry.relative_path);
         let display_path = Path::new(&project.canonical_path).join(relative_path);
         let bytes = open_bytes(entry)
@@ -673,14 +722,14 @@ where
             anyhow::bail!("collected source blob failed manifest verification");
         }
         if is_binary(relative_path, &bytes) {
-            continue;
+            return Ok(None);
         }
         let sniff_len = bytes.len().min(4096);
         let Some(format) = registry
             .iter()
             .find(|chunker| chunker.claims(relative_path, &bytes[..sniff_len]))
         else {
-            continue;
+            return Ok(None);
         };
         let (chunks, edges) = format.chunk(relative_path, &bytes).with_context(|| {
             format!(
@@ -690,42 +739,79 @@ where
             )
         })?;
         let chunks = bound_chunks(&finalize_chunks(project, relative_path, chunks));
-        project_edges.extend(derive_edges(&chunks, edges, Some(snapshot_id)));
-        pending.push(PendingProjectFile {
-            path_str: entry.relative_path.clone(),
-            absolute_path: display_path,
-            mtime: 0,
-            size: entry.size,
-            chunks,
-        });
+        Ok(Some((display_path, chunks, edges)))
+    };
+
+    // Pass one retains only symbol identities. Chunk bodies and file bytes are
+    // released after each immutable blob, so generation size no longer maps
+    // directly to peak staging memory.
+    let mut symbol_table = HashMap::new();
+    for entry in entries {
+        let Some((_display_path, chunks, _edges)) = chunk_entry(entry)? else {
+            continue;
+        };
+        extend_symbol_table(&mut symbol_table, &chunks, Some(snapshot_id));
+        if symbol_table.len() > MAX_STAGED_SYMBOLS {
+            anyhow::bail!("collected source symbol table exceeds the staging safety limit");
+        }
     }
 
     writer.delete_term(Term::from_field_text(f.code_source_selector, selector));
 
     let mut stats = ProjectIndexStats::default();
-    let symbol_table = build_symbol_table(&pending, Some(snapshot_id));
     let mut entity_ids = Vec::new();
+    let mut entity_id_bytes = 0_usize;
     let mut current_chunk_targets = HashMap::new();
-    for file in pending {
+    let mut edge_writer = bbox_edge_sidecar::snapshot::create_snapshot_edge_writer(
+        edges_dir,
+        &project.project_id,
+        snapshot_id,
+        "project.jsonl",
+    )?;
+    for entry in entries {
+        let Some((display_path, chunks, parser_edges)) = chunk_entry(entry)? else {
+            continue;
+        };
+        let mut project_edges = derive_edges(&chunks, parser_edges, Some(snapshot_id));
         project_edges.extend(derive_code_edges(
-            &file.chunks,
+            &chunks,
             &symbol_table,
             &mut stats,
             Some(snapshot_id),
         ));
         current_chunk_targets.extend(git_targets_for_scope(
             &descriptor.scope.bbox_root_relpath,
-            &file.chunks,
+            &chunks,
             Some(snapshot_id),
         ));
-        let entry_key = bbox_code_source::source_entry_key(&selector, &file.path_str);
-        for chunk in file.chunks {
+        if current_chunk_targets.len() > MAX_STAGED_CHUNK_TARGETS {
+            anyhow::bail!("collected source chunk targets exceed the staging safety limit");
+        }
+        let sidecar_edges = project_edges
+            .into_iter()
+            .map(|edge| bbox_edge_sidecar::edge_sidecar::Edge {
+                source: edge.source,
+                kind: edge.kind,
+                target: edge.target,
+                provenance: edge.provenance,
+                confidence: edge.confidence,
+                metadata: Default::default(),
+            })
+            .collect::<Vec<_>>();
+        edge_writer.append(&sidecar_edges)?;
+
+        let entry_key = bbox_code_source::source_entry_key(&selector, &entry.relative_path);
+        for chunk in chunks {
             let entity_id =
                 super::embed_hook::project_file_entity_id_for_snapshot(&chunk, Some(snapshot_id));
+            entity_id_bytes = entity_id_bytes.saturating_add(entity_id.len());
+            if entity_id_bytes > MAX_STAGED_ENTITY_ID_BYTES {
+                anyhow::bail!("collected source entity inventory exceeds the staging safety limit");
+            }
             let doc = build_project_file_doc_for_source(
                 &chunk,
                 project,
-                &file.absolute_path,
+                &display_path,
                 Some(&descriptor.head_commit),
                 Some(snapshot_id),
                 &selector,
@@ -738,24 +824,7 @@ where
             entity_ids.push(entity_id);
         }
     }
-
-    let sidecar_edges = project_edges
-        .into_iter()
-        .map(|edge| bbox_edge_sidecar::edge_sidecar::Edge {
-            source: edge.source,
-            kind: edge.kind,
-            target: edge.target,
-            provenance: edge.provenance,
-            confidence: edge.confidence,
-            metadata: Default::default(),
-        })
-        .collect::<Vec<_>>();
-    bbox_edge_sidecar::snapshot::write_snapshot_files(
-        edges_dir,
-        &project.project_id,
-        snapshot_id,
-        &[("project.jsonl", &sidecar_edges)],
-    )?;
+    edge_writer.finish()?;
 
     entity_ids.sort();
     let mut inventory = Sha256::new();
@@ -769,7 +838,6 @@ where
         document_count: entity_ids.len() as u64,
         entity_inventory_sha256: hex::encode(inventory.finalize()),
         current_chunk_targets,
-        staged_edges: sidecar_edges,
         head_commit: descriptor.head_commit.clone(),
         dirty_fingerprint: descriptor.dirty_fingerprint.clone(),
         worktree_dirty,
@@ -1143,7 +1211,11 @@ fn index_project(
 
     let materialization_changed =
         files_changed || git_stats.indexed_commits > 0 || deletions_purged > 0;
-    snapshot_after_reindex(project, root, ctx.edges_dir, materialization_changed)?;
+    if let Some(pending) =
+        snapshot_after_reindex(project, root, ctx.edges_dir, materialization_changed)?
+    {
+        ctx.stats.pending_local_snapshots.push(pending);
+    }
     Ok(())
 }
 
@@ -1412,7 +1484,18 @@ fn build_symbol_table(
     snapshot_id: Option<&str>,
 ) -> HashMap<String, EntityRef> {
     let mut symbols = HashMap::new();
-    for chunk in files.iter().flat_map(|file| file.chunks.iter()) {
+    for file in files {
+        extend_symbol_table(&mut symbols, &file.chunks, snapshot_id);
+    }
+    symbols
+}
+
+fn extend_symbol_table(
+    symbols: &mut HashMap<String, EntityRef>,
+    chunks: &[Chunk],
+    snapshot_id: Option<&str>,
+) {
+    for chunk in chunks {
         if chunk.chunk_kind != "code_block" {
             continue;
         }
@@ -1427,7 +1510,6 @@ fn build_symbol_table(
             symbols.entry(bare.clone()).or_insert(symbol);
         }
     }
-    symbols
 }
 
 fn derive_code_edges(
@@ -1806,12 +1888,12 @@ fn snapshot_after_reindex(
     root: &Path,
     edges_dir: &Path,
     materialization_changed: bool,
-) -> Result<()> {
+) -> Result<Option<bbox_edge_sidecar::snapshot::PendingLocalSnapshotActivation>> {
     let Some(repo_id) = project.repo_id.as_deref() else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(head_sha) = bbox_corpus_core::git::current_head(root) else {
-        return Ok(());
+        return Ok(None);
     };
     let branch = bbox_corpus_core::git::current_branch(root);
     let worktree_dirty = bbox_corpus_core::git::is_worktree_dirty(root);
@@ -1834,7 +1916,7 @@ fn snapshot_after_reindex(
             worktree_dirty,
         )
     {
-        return Ok(());
+        return Ok(None);
     }
 
     let project_edges = bbox_edge_sidecar::edge_sidecar::read_managed_derived_edges(
@@ -1871,32 +1953,41 @@ fn snapshot_after_reindex(
         })
         .collect();
 
-    if worktree_dirty {
-        let fp = bbox_corpus_core::git::dirty_fingerprint(root).unwrap_or_default();
-        bbox_edge_sidecar::snapshot::switch_to_dirty_overlay(
+    let pending = if worktree_dirty {
+        let fingerprint = bbox_corpus_core::git::dirty_fingerprint(root).unwrap_or_default();
+        let snapshot_id =
+            bbox_edge_sidecar::snapshot::nongit_snapshot_id(&project.project_id, &fingerprint);
+        bbox_edge_sidecar::snapshot::stage_local_snapshot_activation(
             edges_dir,
             &project.project_id,
             repo_id,
             branch.as_deref(),
             &head_sha,
-            &fp,
-            snapshot_edges,
-            vec![],
-            git_snapshot_edges,
-        )?;
+            true,
+            Some(&fingerprint),
+            &snapshot_id,
+            &snapshot_edges,
+            &[],
+            &git_snapshot_edges,
+        )?
     } else {
-        bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
+        let snapshot_id =
+            bbox_edge_sidecar::snapshot::clean_snapshot_id(repo_id, &project.project_id, &head_sha);
+        bbox_edge_sidecar::snapshot::stage_local_snapshot_activation(
             edges_dir,
             &project.project_id,
             repo_id,
             branch.as_deref(),
             &head_sha,
-            snapshot_edges,
-            vec![],
-            git_snapshot_edges,
-        )?;
-    }
-    Ok(())
+            false,
+            None,
+            &snapshot_id,
+            &snapshot_edges,
+            &[],
+            &git_snapshot_edges,
+        )?
+    };
+    Ok(Some(pending))
 }
 
 #[cfg(test)]

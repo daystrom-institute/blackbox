@@ -53,12 +53,13 @@ impl BlackboxServer {
                 .state
                 .idx
                 .read()
-                .hybrid_bm25_hits_filtered_with_active_selectors(
+                .hybrid_bm25_hits_filtered_with_active_selectors_and_searcher(
                     query,
                     p.limit.unwrap_or(10).clamp(1, 100),
                     None,
                     false,
                     &read_view.active_selectors,
+                    &read_view.searcher,
                 )?;
             Ok(serde_json::to_string(&json!({
                 "hits": hits
@@ -99,7 +100,11 @@ impl BlackboxServer {
                 .state
                 .idx
                 .read()
-                .search_with_active_selectors(&p, &read_view.active_selectors)
+                .search_with_active_selectors_and_searcher(
+                    &p,
+                    &read_view.active_selectors,
+                    &read_view.searcher,
+                )
         })
         .await
     }
@@ -129,16 +134,18 @@ impl BlackboxServer {
             }
             let knowledge_view =
                 server.session_knowledge_view(p.project.as_deref(), p.provisional.as_deref())?;
+            let read_view = server.state.code_read_view.read().clone();
             let provider_ctx =
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
-                    .with_knowledge_view(&knowledge_view.knowledge);
-            let read_view = server.state.code_read_view.read().clone();
-            mcp_tools::hybrid_search::hybrid_search_with_active_selectors(
+                    .with_knowledge_view(&knowledge_view.knowledge)
+                    .with_searcher(&read_view.searcher);
+            mcp_tools::hybrid_search::hybrid_search_with_active_selectors_and_searcher(
                 &server.state.idx.read(),
                 &knowledge_view.knowledge,
                 &provider_ctx,
                 &p,
                 &read_view.active_selectors,
+                &read_view.searcher,
             )
         })
         .await
@@ -164,16 +171,18 @@ impl BlackboxServer {
             }
             let knowledge_view =
                 server.session_knowledge_view(p.project.as_deref(), p.provisional.as_deref())?;
+            let read_view = server.state.code_read_view.read().clone();
             let provider_ctx =
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
-                    .with_knowledge_view(&knowledge_view.knowledge);
-            let read_view = server.state.code_read_view.read().clone();
+                    .with_knowledge_view(&knowledge_view.knowledge)
+                    .with_searcher(&read_view.searcher);
             mcp_tools::discover_seed::discover_seed_entities(
                 &server.state.idx.read(),
                 &knowledge_view.knowledge,
                 &provider_ctx,
                 read_view.edge_index.as_ref(),
                 &read_view.active_selectors,
+                &read_view.searcher,
                 &p,
             )
         })

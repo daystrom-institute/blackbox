@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tantivy::collector::{Count, DocSetCollector, TopDocs};
@@ -151,6 +151,7 @@ pub struct ReindexConfig {
     pub codex_root: Option<PathBuf>,
     pub meta_path: PathBuf,
     pub projects_path: PathBuf,
+    pub code_source_store_path: PathBuf,
     pub knowledge_path: PathBuf,
     pub threads_path: PathBuf,
     pub roadmap_path: PathBuf,
@@ -241,7 +242,35 @@ impl TranscriptIndex {
         threads_path: PathBuf,
         roadmap_path: PathBuf,
     ) -> Result<Self> {
-        let schema_was_reset = reset_index_on_schema_mismatch(index_path, &projects_path)?;
+        let code_source_store_path = projects_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("code-sources");
+        Self::open_or_create_with_code_source_store_path(
+            index_path,
+            roots,
+            codex_root,
+            projects_path,
+            code_source_store_path,
+            knowledge_path,
+            threads_path,
+            roadmap_path,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_or_create_with_code_source_store_path(
+        index_path: &Path,
+        roots: Vec<(String, PathBuf)>,
+        codex_root: Option<PathBuf>,
+        projects_path: PathBuf,
+        code_source_store_path: PathBuf,
+        knowledge_path: PathBuf,
+        threads_path: PathBuf,
+        roadmap_path: PathBuf,
+    ) -> Result<Self> {
+        let schema_was_reset =
+            reset_index_on_schema_mismatch(index_path, &projects_path, &code_source_store_path)?;
         let meta_path = index_path.join("_meta.json");
 
         let (schema, fields) = build_schema();
@@ -269,11 +298,20 @@ impl TranscriptIndex {
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()?;
 
+        let edges_dir =
+            bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&projects_path);
+        project_files::recover_pending_local_snapshot_activations(
+            &reader.searcher(),
+            fields,
+            &edges_dir,
+        )?;
+
         let config = ReindexConfig {
             roots,
             codex_root,
             meta_path,
             projects_path,
+            code_source_store_path,
             knowledge_path,
             threads_path,
             roadmap_path,
@@ -407,25 +445,45 @@ impl TranscriptIndex {
         entity_id: &str,
         selectors: &BTreeMap<String, String>,
     ) -> bool {
+        let searcher = self.reader.searcher();
+        self.is_active_code_entity_for_with_searcher(entity_id, selectors, &searcher)
+    }
+
+    pub fn is_active_code_entity_for_with_searcher(
+        &self,
+        entity_id: &str,
+        selectors: &BTreeMap<String, String>,
+        searcher: &tantivy::Searcher,
+    ) -> bool {
         use bbox_corpus_core::entity_ref::EntityRef;
 
         match EntityRef::parse(entity_id) {
             Ok(EntityRef::ProjectFile { project_id, .. })
-            | Ok(EntityRef::Symbol { project_id, .. }) => {
-                selectors.get(&project_id).is_some_and(|selector| {
-                    selector.as_str() == bbox_code_source::local_selector(&project_id)
-                })
-            }
-            Ok(EntityRef::ProjectFileV2 { project_id, .. })
+            | Ok(EntityRef::Symbol { project_id, .. })
+            | Ok(EntityRef::ProjectFileV2 { project_id, .. })
             | Ok(EntityRef::SymbolV2 { project_id, .. }) => {
                 let Some(active) = selectors.get(&project_id) else {
                     return false;
                 };
-                self.entity_properties(entity_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|properties| properties.get("code_source_selector").cloned())
-                    .is_some_and(|selector| selector == active.as_str())
+                let query = BooleanQuery::new(vec![
+                    (
+                        Occur::Must,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(self.fields.entity_id, entity_id),
+                            IndexRecordOption::Basic,
+                        )),
+                    ),
+                    (
+                        Occur::Must,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(self.fields.code_source_selector, active),
+                            IndexRecordOption::Basic,
+                        )),
+                    ),
+                ]);
+                searcher
+                    .search(&query, &tantivy::collector::Count)
+                    .is_ok_and(|count| count > 0)
             }
             _ => true,
         }
@@ -631,6 +689,14 @@ impl TranscriptIndex {
 
     pub fn entity_properties(&self, entity_id: &str) -> Result<Option<BTreeMap<String, String>>> {
         let searcher = self.reader.searcher();
+        self.entity_properties_with_searcher(entity_id, &searcher)
+    }
+
+    pub fn entity_properties_with_searcher(
+        &self,
+        entity_id: &str,
+        searcher: &tantivy::Searcher,
+    ) -> Result<Option<BTreeMap<String, String>>> {
         let query = TermQuery::new(
             Term::from_field_text(self.fields.entity_id, entity_id),
             IndexRecordOption::Basic,
@@ -873,7 +939,11 @@ pub fn register_code_tokenizer(index: &Index) {
 
 // one-time boot path before the runtime serves traffic.
 #[allow(clippy::disallowed_methods)]
-fn reset_index_on_schema_mismatch(index_path: &Path, projects_path: &Path) -> Result<bool> {
+fn reset_index_on_schema_mismatch(
+    index_path: &Path,
+    projects_path: &Path,
+    code_source_store_path: &Path,
+) -> Result<bool> {
     if !index_path.exists() {
         return Ok(false);
     }
@@ -889,16 +959,7 @@ fn reset_index_on_schema_mismatch(index_path: &Path, projects_path: &Path) -> Re
         let edges_dir =
             bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(projects_path);
         let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)?;
-        if manifest.workspaces.values().any(|entry| {
-            entry
-                .code_source_selector
-                .as_deref()
-                .is_some_and(|selector| selector.starts_with("collected:"))
-        }) {
-            anyhow::bail!(
-                "schema migration cannot discard an active collected code source without an explicit cross-schema migration"
-            );
-        }
+        verify_collected_schema_migration_sources(&manifest, code_source_store_path)?;
         tracing::info!(
             path = %index_path.display(),
             schema_version = INDEX_SCHEMA_VERSION,
@@ -907,6 +968,54 @@ fn reset_index_on_schema_mismatch(index_path: &Path, projects_path: &Path) -> Re
         fs::remove_dir_all(index_path)?;
     }
     Ok(should_reset)
+}
+
+fn verify_collected_schema_migration_sources(
+    manifest: &bbox_edge_sidecar::manifest::ManifestIndex,
+    code_source_store_path: &Path,
+) -> Result<()> {
+    let collected = manifest
+        .workspaces
+        .iter()
+        .filter_map(|(project_id, entry)| {
+            let selector = entry.code_source_selector.as_deref()?;
+            selector.starts_with("collected:").then_some((
+                project_id,
+                selector,
+                entry.code_source_generation.as_deref(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    if collected.is_empty() {
+        return Ok(());
+    }
+    let store = bbox_code_source_store::CodeSourceStore::open(
+        code_source_store_path,
+        bbox_code_source_store::StoreLimits::default(),
+    )?;
+    for (project_id, selector, generation) in collected {
+        let activation = store.load_activation(project_id)?.ok_or_else(|| {
+            anyhow::anyhow!("active collected source has no migration activation record")
+        })?;
+        if activation.selector != selector || generation != Some(activation.generation_id.as_str())
+        {
+            anyhow::bail!("active collected source migration metadata is inconsistent");
+        }
+        let stored = store.find_generation(&activation.generation_id)?;
+        let entries =
+            store.load_generation_entries(&stored.descriptor.scope, &activation.generation_id)?;
+        for entry in entries {
+            store
+                .verified_blob_file(&entry.content_sha256, entry.size)
+                .with_context(|| {
+                    format!(
+                        "active collected source {} cannot migrate schemas because a source blob is unavailable",
+                        activation.generation_id
+                    )
+                })?;
+        }
+    }
+    Ok(())
 }
 
 fn write_schema_version_marker(index_path: &Path) -> Result<()> {
@@ -939,6 +1048,78 @@ mod tests {
 
         let marker = fs::read_to_string(index_path.join(SCHEMA_VERSION_FILE)).unwrap();
         assert_eq!(marker.trim(), INDEX_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn explicit_code_source_store_path_is_independent_of_projects_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let projects_path = root.join("registry").join("projects.json");
+        let code_source_store_path = root.join("state").join("code-sources");
+        let index = TranscriptIndex::open_or_create_with_code_source_store_path(
+            &root.join("index"),
+            Vec::new(),
+            None,
+            projects_path.clone(),
+            code_source_store_path.clone(),
+            root.join("knowledge.json"),
+            root.join("threads.json"),
+            root.join("roadmap.json"),
+        )
+        .unwrap();
+
+        let config = index.reindex_config();
+        assert_eq!(config.projects_path, projects_path);
+        assert_eq!(config.code_source_store_path, code_source_store_path);
+    }
+
+    #[test]
+    fn pinned_searcher_keeps_entity_properties_on_one_index_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = TranscriptIndex::open_or_create(
+            &dir.path().join("index"),
+            Vec::new(),
+            None,
+            dir.path().join("projects.json"),
+            dir.path().join("knowledge.json"),
+            dir.path().join("threads.json"),
+            dir.path().join("roadmap.json"),
+        )
+        .unwrap();
+        let fields = index.field_handles();
+        let entity_id = "project_file:project-a:path-a:chunk-a:0";
+        let add_entity = |writer: &mut tantivy::IndexWriter, file_path: &str| {
+            let mut doc = TantivyDocument::new();
+            doc.add_text(fields.doc_type, "project_file");
+            doc.add_text(fields.entity_id, entity_id);
+            doc.add_text(fields.file_path, file_path);
+            writer.add_document(doc).unwrap();
+        };
+
+        let mut writer = index.index_handle().writer(50_000_000).unwrap();
+        add_entity(&mut writer, "src/old.rs");
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+        let pinned = index.searcher();
+
+        writer.delete_term(Term::from_field_text(fields.entity_id, entity_id));
+        add_entity(&mut writer, "src/new.rs");
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+
+        let pinned_properties = index
+            .entity_properties_with_searcher(entity_id, &pinned)
+            .unwrap()
+            .unwrap();
+        let current_properties = index.entity_properties(entity_id).unwrap().unwrap();
+        assert_eq!(
+            pinned_properties.get("file_path").map(String::as_str),
+            Some("src/old.rs")
+        );
+        assert_eq!(
+            current_properties.get("file_path").map(String::as_str),
+            Some("src/new.rs")
+        );
     }
 
     #[test]

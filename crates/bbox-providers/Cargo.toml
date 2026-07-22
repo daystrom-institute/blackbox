@@ -20,3 +20,4 @@ bbox-knowledge = { path = "../bbox-knowledge" }
 bbox-threads = { path = "../bbox-threads" }
 bbox-edge-index = { path = "../bbox-edge-index" }
 bbox-indexing = { path = "../bbox-indexing" }
+tantivy = "0.22"

@@ -136,27 +136,66 @@ pub fn resolve_base_project_for_scope<'a>(
     projects: &'a [ProjectRecord],
 ) -> Option<&'a ProjectRecord> {
     let canonical = std::fs::canonicalize(path).ok()?;
-    if let Some(record) = projects.iter().find(|project| {
+    if let Some(record) = unique_deepest_project(projects.iter().filter_map(|project| {
         let root = std::path::Path::new(&project.canonical_path);
-        canonical == root || canonical.starts_with(root)
-    }) {
+        (canonical == root || canonical.starts_with(root))
+            .then_some((root.components().count(), project))
+    })) {
         return Some(record);
     }
-    if let Some(common) = crate::git::git_common_dir(&canonical)
-        && let Some(record) = projects.iter().find(|project| {
-            crate::git::git_common_dir(std::path::Path::new(&project.canonical_path))
-                .is_some_and(|base_common| base_common == common)
-        })
-    {
+    if let (Some(common), Some(checkout_root)) = (
+        crate::git::git_common_dir(&canonical),
+        crate::git::git_root_for_path(&canonical),
+    ) && let Some(record) = unique_deepest_project(projects.iter().filter_map(|project| {
+        let project_root = std::path::Path::new(&project.canonical_path);
+        let project_git_root = crate::git::git_root_for_path(project_root)?;
+        (crate::git::git_common_dir(&project_git_root).as_ref() == Some(&common)).then_some(())?;
+        let rel = project_root.strip_prefix(&project_git_root).ok()?;
+        let projected_root = checkout_root.join(rel);
+        (canonical == projected_root || canonical.starts_with(&projected_root))
+            .then_some((rel.components().count(), project))
+    })) {
         return Some(record);
     }
     let checkout = crate::git::managed_checkout_root(&canonical)?;
     let repo_id = crate::entity_ref::repo_id_for_root(&checkout).ok()?;
-    let mut matches = projects
+    let repo_matches = projects
         .iter()
-        .filter(|project| project.repo_id.as_deref() == Some(repo_id.as_str()));
-    let matched = matches.next()?;
-    matches.next().is_none().then_some(matched)
+        .filter(|project| project.repo_id.as_deref() == Some(repo_id.as_str()))
+        .collect::<Vec<_>>();
+    if repo_matches.is_empty() {
+        return None;
+    }
+    let candidates = repo_matches
+        .into_iter()
+        .map(|project| {
+            let project_root = std::path::Path::new(&project.canonical_path);
+            let project_git_root = crate::git::git_root_for_path(project_root)?;
+            let rel = project_root.strip_prefix(&project_git_root).ok()?;
+            let projected_root = checkout.join(rel);
+            (canonical == projected_root || canonical.starts_with(&projected_root))
+                .then_some((rel.components().count(), project))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    unique_deepest_project(candidates.into_iter())
+}
+
+fn unique_deepest_project<'a>(
+    candidates: impl Iterator<Item = (usize, &'a ProjectRecord)>,
+) -> Option<&'a ProjectRecord> {
+    let mut selected = None;
+    let mut selected_depth = 0;
+    let mut ambiguous = false;
+    for (depth, project) in candidates {
+        if selected.is_none() || depth > selected_depth {
+            selected = Some(project);
+            selected_depth = depth;
+            ambiguous = false;
+        } else if depth == selected_depth {
+            ambiguous = true;
+        }
+    }
+    (!ambiguous).then_some(selected).flatten()
 }
 
 /// Minimal read-side view of the on-disk project registry file
@@ -185,4 +224,44 @@ pub fn load_project_records(
     let store: ProjectStoreView = serde_json::from_str(&raw)
         .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?;
     Ok(store.projects)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(path: &std::path::Path, id: &str) -> ProjectRecord {
+        ProjectRecord {
+            project_id: id.into(),
+            repo_id: None,
+            canonical_path: path.to_string_lossy().into_owned(),
+            registered_at: "2026-07-22T00:00:00Z".into(),
+            is_git_repo: false,
+            languages: BTreeSet::new(),
+            aliases: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn nested_scope_resolution_prefers_deepest_registered_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().canonicalize().unwrap();
+        let inner = outer.join("services/api");
+        let target = inner.join("src/deep");
+        std::fs::create_dir_all(&target).unwrap();
+        let projects = vec![record(&outer, "outer"), record(&inner, "inner")];
+
+        let resolved = resolve_base_project_for_scope(target.to_str().unwrap(), &projects)
+            .expect("nested path should resolve");
+        assert_eq!(resolved.project_id, "inner");
+    }
+
+    #[test]
+    fn equal_depth_scope_matches_fail_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let projects = vec![record(&root, "first"), record(&root, "second")];
+
+        assert!(resolve_base_project_for_scope(root.to_str().unwrap(), &projects).is_none());
+    }
 }

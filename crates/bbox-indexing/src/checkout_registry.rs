@@ -126,6 +126,25 @@ impl CheckoutRegistry {
         })
     }
 
+    /// Open this recoverable discovery index without making daemon startup
+    /// depend on its host-local JSON bytes. The returned diagnostic preserves
+    /// the failure for logging while reconciliation repopulates the empty
+    /// index from discoverable checkouts. The corrupt file is left in place
+    /// until a successful registry mutation atomically replaces it.
+    pub fn open_recoverable(store_path: &Path) -> (Self, Option<anyhow::Error>) {
+        match Self::open(store_path) {
+            Ok(registry) => (registry, None),
+            Err(error) => (
+                Self {
+                    store: CheckoutRegistryStore::new(),
+                    store_path: store_path.to_path_buf(),
+                    needs_persist: true,
+                },
+                Some(error),
+            ),
+        }
+    }
+
     pub fn rows(&self) -> &[CheckoutRow] {
         &self.store.checkouts
     }
@@ -252,7 +271,8 @@ impl CheckoutRow {
 ///
 /// - the cockpit-managed worktree roots (`$BRO_HOME/{fleet,agent}/worktrees`)
 ///   and their immediate children, and
-/// - every worktree of every registered repo, via `git worktree list`.
+/// - every worktree of every registered git repo, via `git worktree list`, and
+/// - each registered non-git root itself.
 ///
 /// Returns canonical, de-duplicated directories. This does NOT cover
 /// arbitrary-location marker clones — those are recoverable only through the
@@ -283,6 +303,12 @@ pub fn discover_checkout_dirs(projects: &[ProjectRecord]) -> Vec<PathBuf> {
 
     // Every worktree of every registered repo.
     for project in projects {
+        if !project.is_git_repo {
+            if let Ok(canonical) = std::fs::canonicalize(&project.canonical_path) {
+                push(canonical, &mut found);
+            }
+            continue;
+        }
         for wt in bbox_corpus_core::git::list_worktree_paths(Path::new(&project.canonical_path)) {
             push(wt, &mut found);
         }
@@ -537,6 +563,25 @@ mod tests {
     }
 
     #[test]
+    fn recoverable_open_degrades_corrupt_json_to_empty_and_replaces_on_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("checkouts.json");
+        std::fs::write(&path, b"{\"version\":").unwrap();
+
+        let (mut registry, diagnostic) = CheckoutRegistry::open_recoverable(&path);
+        assert!(diagnostic.is_some());
+        assert!(registry.rows().is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().canonicalize().unwrap();
+        registry.register(row("recovered", &checkout)).unwrap();
+
+        let reopened = CheckoutRegistry::open(&path).unwrap();
+        assert_eq!(reopened.rows().len(), 1);
+        assert_eq!(reopened.rows()[0].checkout_id, "recovered");
+    }
+
+    #[test]
     fn discover_lists_repo_worktrees() {
         // A real repo with a linked worktree is discoverable via git.
         let base = tempfile::tempdir().unwrap();
@@ -590,5 +635,26 @@ mod tests {
             &base_d,
             &["worktree", "remove", "--force", wt_d.to_str().unwrap()],
         );
+    }
+
+    #[test]
+    fn discover_includes_registered_non_git_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plain-project");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let project = ProjectRecord {
+            project_id: "plain".into(),
+            repo_id: None,
+            canonical_path: root.to_string_lossy().into_owned(),
+            registered_at: "2026-01-01T00:00:00Z".into(),
+            is_git_repo: false,
+            languages: Default::default(),
+            aliases: Default::default(),
+        };
+
+        let discovered = discover_checkout_dirs(&[project]);
+
+        assert!(discovered.contains(&root));
     }
 }

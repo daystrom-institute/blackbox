@@ -20,10 +20,11 @@
 //!   random, minted once, so a replacement checkout at the same path never
 //!   inherits a removed checkout's state (see [`ensure_checkout_id`]).
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -237,8 +238,9 @@ const CHECKOUT_ID_RELPATH: &str = "checkout-id";
 /// normalizes the base checkout to a concrete `checkout_id` exactly like any
 /// worktree.
 ///
-/// The write races safely: two concurrent minters both `create_new`; the loser
-/// gets `AlreadyExists` and reads back the winner's value, so both observe one
+/// The write races safely under an advisory lock on the host-local directory.
+/// Empty or truncated markers left by an older crashed writer are atomically
+/// replaced while the lock is held, so every concurrent minter observes one
 /// stable id.
 // Deliberate host-local marker I/O on a caller thread that is already doing
 // path/git work (write-side checkout resolution), not a tokio worker hot path —
@@ -257,29 +259,29 @@ pub fn ensure_checkout_id(checkout_dir: &Path) -> Result<String> {
         .with_context(|| format!("creating {}", local_dir.display()))?;
     ensure_local_gitignore(&local_dir);
 
-    let candidate = random_hex();
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&marker)
-    {
-        Ok(mut f) => {
-            f.write_all(candidate.as_bytes())
-                .with_context(|| format!("writing {}", marker.display()))?;
-            f.flush().ok();
-            Ok(candidate)
-        }
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            // Lost the create race; read the winner's value.
-            read_checkout_id(&marker)?.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "checkout-id marker {} vanished after create race",
-                    marker.display()
-                )
-            })
-        }
-        Err(e) => Err(e).with_context(|| format!("creating {}", marker.display())),
+    let local_lock = std::fs::File::open(&local_dir)
+        .with_context(|| format!("opening checkout identity lane {}", local_dir.display()))?;
+    local_lock
+        .lock_exclusive()
+        .with_context(|| format!("locking checkout identity lane {}", local_dir.display()))?;
+
+    // Recheck after taking the lock. Another process may have completed the
+    // marker between the unlocked fast path and lane acquisition.
+    if let Some(existing) = read_checkout_id(&marker)? {
+        return Ok(existing);
     }
+
+    let candidate = random_hex();
+    crate::json_store::atomic_write_bytes_from_dir_locked(
+        &marker,
+        &local_dir,
+        candidate.as_bytes(),
+    )
+    .with_context(|| format!("writing {}", marker.display()))?;
+    local_lock
+        .sync_all()
+        .with_context(|| format!("fsync checkout identity lane {}", local_dir.display()))?;
+    Ok(candidate)
 }
 
 /// Read an existing `checkout_id` marker if present and non-empty.
@@ -292,7 +294,7 @@ pub fn read_checkout_id(marker: &Path) -> Result<Option<String>> {
             f.read_to_string(&mut buf)
                 .with_context(|| format!("reading {}", marker.display()))?;
             let trimmed = buf.trim();
-            Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
+            Ok(is_checkout_id(trimmed).then(|| trimmed.to_string()))
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("reading {}", marker.display())),
@@ -314,6 +316,13 @@ fn ensure_local_gitignore(local_dir: &Path) {
 /// workspace-standard `uuid` v4 source.
 fn random_hex() -> String {
     uuid::Uuid::new_v4().simple().to_string()
+}
+
+fn is_checkout_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn non_empty(v: Option<&str>) -> Option<String> {
@@ -538,6 +547,21 @@ mod tests {
             first, second,
             "a new checkout at the same path must not inherit the old id"
         );
+    }
+
+    #[test]
+    fn checkout_id_remints_empty_or_partial_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let marker = root.join(".bbox").join("local").join("checkout-id");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+
+        for torn in ["", "0123456789abcdef"] {
+            std::fs::write(&marker, torn).unwrap();
+            let id = ensure_checkout_id(&root).unwrap();
+            assert!(is_checkout_id(&id));
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), id);
+        }
     }
 
     #[test]

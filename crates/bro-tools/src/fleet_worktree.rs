@@ -1697,7 +1697,7 @@ fn phase_merge_gate(
                 phase: CloseoutPhase::MergeGate,
                 repo_cwd: req.base_repo.clone(),
                 ok: false,
-                error_class: CloseoutErrorClass::MergeGateBlocked,
+                error_class: CloseoutErrorClass::Other,
                 content: json!({
                     "error": format!("starting git merge-tree failed: {err}"),
                 }),
@@ -1705,13 +1705,36 @@ fn phase_merge_gate(
         }
     };
     if !output.status.success() {
+        // `merge-tree` also returns 1 for invalid or missing refs. A real
+        // conflict still emits the candidate tree object id on stdout; ref and
+        // capability failures do not. Route only the former to conflict
+        // reconciliation.
+        let first_stdout_line = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let conflict = output.status.code() == Some(1)
+            && matches!(first_stdout_line.len(), 40 | 64)
+            && first_stdout_line
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit());
         return PhaseResult {
             phase: CloseoutPhase::MergeGate,
             repo_cwd: req.base_repo.clone(),
             ok: false,
-            error_class: CloseoutErrorClass::MergeGateBlocked,
+            error_class: if conflict {
+                CloseoutErrorClass::MergeGateBlocked
+            } else {
+                CloseoutErrorClass::Other
+            },
             content: json!({
-                "error": "candidate tree construction found an integration conflict",
+                "error": if conflict {
+                    "candidate tree construction found an integration conflict"
+                } else {
+                    "git merge-tree could not construct the candidate tree"
+                },
                 "stdout": String::from_utf8_lossy(&output.stdout).trim(),
                 "stderr": String::from_utf8_lossy(&output.stderr).trim(),
             }),
@@ -2014,11 +2037,27 @@ fn phase_remove(req: &CloseoutRequest) -> PhaseResult {
     let base_repo = &req.base_repo;
     let worktree = &req.worktree;
     let branch = &req.branch;
-    let force = if req.disposition == "discard" {
-        true
-    } else {
+    let force = req.disposition == "discard";
+    if !force {
         match closeout_claim_is_only_worktree_change(worktree) {
-            Ok(force) => force,
+            Ok(true) => {
+                let claim = worktree.join(".bbox/local/knowledge-transactions/pending.json");
+                if let Err(error) = std::fs::remove_file(&claim) {
+                    return PhaseResult {
+                        phase: CloseoutPhase::Remove,
+                        repo_cwd: base_repo.clone(),
+                        ok: false,
+                        error_class: CloseoutErrorClass::RemoveFailed,
+                        content: json!({
+                            "error": format!(
+                                "removing generated closeout claim {} failed: {error}",
+                                claim.display()
+                            )
+                        }),
+                    };
+                }
+            }
+            Ok(false) => {}
             Err(err) => {
                 return PhaseResult {
                     phase: CloseoutPhase::Remove,
@@ -2029,7 +2068,7 @@ fn phase_remove(req: &CloseoutRequest) -> PhaseResult {
                 };
             }
         }
-    };
+    }
     let mut remove_args: Vec<&str> = vec!["worktree", "remove"];
     if force {
         remove_args.push("--force");
@@ -2086,8 +2125,9 @@ fn phase_remove(req: &CloseoutRequest) -> PhaseResult {
 /// corpus writer cannot enter between candidate verification and removal. In
 /// repositories that do not yet carry `.bbox/local/.gitignore`, that claim is
 /// the one untracked path that makes ordinary `git worktree remove` refuse.
-/// Recheck immediately before removal and authorize `--force` only for that
-/// exact generated path. Any user or agent change remains a hard stop.
+/// Recheck immediately before removal and delete only that exact generated
+/// path. The subsequent ordinary worktree removal rechecks cleanliness, so
+/// any user or agent change remains a hard stop.
 fn closeout_claim_is_only_worktree_change(worktree: &Path) -> anyhow::Result<bool> {
     let status = git_capture(
         worktree,
@@ -3650,6 +3690,62 @@ mod tests {
             repo.path(),
             &["worktree", "remove", "--force", cwd.to_str().unwrap()],
         );
+    }
+
+    #[test]
+    fn merge_gate_classifies_missing_refs_as_tooling_failure() {
+        let repo = seed_repo();
+        let req = CloseoutRequest {
+            worktree: repo.path().to_path_buf(),
+            base_repo: repo.path().canonicalize().unwrap(),
+            branch: "refs/heads/does-not-exist".to_string(),
+            target: "main".to_string(),
+            disposition: "merge".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+            dry_run: false,
+            closeout_hooks: None,
+        };
+
+        let gate = phase_merge_gate(&req, None);
+
+        assert!(!gate.ok);
+        assert_eq!(gate.error_class, CloseoutErrorClass::Other);
+        assert_eq!(
+            gate.content["error"],
+            "git merge-tree could not construct the candidate tree"
+        );
+    }
+
+    #[test]
+    fn merge_gate_classifies_candidate_tree_conflicts_separately() {
+        let repo = seed_repo();
+        run_git(repo.path(), &["checkout", "-b", "conflicting"]);
+        std::fs::write(repo.path().join("README.md"), "branch\n").unwrap();
+        run_git(repo.path(), &["add", "README.md"]);
+        run_git(repo.path(), &["commit", "-m", "branch conflict"]);
+        run_git(repo.path(), &["checkout", "main"]);
+        std::fs::write(repo.path().join("README.md"), "main\n").unwrap();
+        run_git(repo.path(), &["add", "README.md"]);
+        run_git(repo.path(), &["commit", "-m", "main conflict"]);
+        let req = CloseoutRequest {
+            worktree: repo.path().to_path_buf(),
+            base_repo: repo.path().canonicalize().unwrap(),
+            branch: "conflicting".to_string(),
+            target: "main".to_string(),
+            disposition: "merge".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+            dry_run: false,
+            closeout_hooks: None,
+        };
+
+        let gate = phase_merge_gate(&req, None);
+
+        assert!(!gate.ok);
+        assert_eq!(gate.error_class, CloseoutErrorClass::MergeGateBlocked);
     }
 
     /// gap-a268b269: a failed `git branch -D` must not be reported as

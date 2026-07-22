@@ -28,11 +28,9 @@ impl InspectableEntityProvider for CommitProvider {
         let mut properties = BTreeMap::new();
         properties.insert("repo_id".into(), repo_id.clone());
         properties.insert("sha".into(), sha.clone());
-        if let Some(stores) = ctx.stores() {
-            let indexed = stores
-                .idx
-                .read()
-                .entity_properties(&r.to_string())?
+        if ctx.stores().is_some() {
+            let indexed = ctx
+                .indexed_entity_properties(&r.to_string())?
                 .ok_or_else(|| anyhow::anyhow!("commit entity {r} not found"))?;
             properties.extend(indexed);
         }
@@ -80,8 +78,8 @@ impl InspectableEntityProvider for CommitProvider {
             return None;
         };
         let short = sha.chars().take(7).collect::<String>();
-        if let Some(stores) = ctx.stores() {
-            if let Ok(Some(properties)) = stores.idx.read().entity_properties(&r.to_string()) {
+        if ctx.stores().is_some() {
+            if let Ok(Some(properties)) = ctx.indexed_entity_properties(&r.to_string()) {
                 if let Some(preview) = properties.get("content_preview") {
                     let subject = preview.lines().next().unwrap_or(preview);
                     return Some(truncate_label(format!("{short} {subject}")));

@@ -89,7 +89,11 @@ impl BlackboxServer {
                 .state
                 .idx
                 .read()
-                .is_active_code_entity_for(&p.entity_ref, &read_view.active_selectors)
+                .is_active_code_entity_for_with_searcher(
+                    &p.entity_ref,
+                    &read_view.active_selectors,
+                    &read_view.searcher,
+                )
             {
                 return Ok(mcp_tools::inspect::not_found(
                     &entity_ref,
@@ -99,7 +103,8 @@ impl BlackboxServer {
             let provider_ctx =
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
                     .with_knowledge_view(&knowledge_view.knowledge)
-                    .with_edge_index(edge_index);
+                    .with_edge_index(edge_index)
+                    .with_searcher(&read_view.searcher);
             mcp_tools::inspect::inspect_entity(&p, &provider_ctx, &entity_ref, edge_index)
         })
         .await
@@ -140,7 +145,8 @@ impl BlackboxServer {
             let edge_index = read_view.edge_index.as_ref();
             let provider_ctx =
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
-                    .with_edge_index(edge_index);
+                    .with_edge_index(edge_index)
+                    .with_searcher(&read_view.searcher);
             mcp_tools::find_paths::find_paths(
                 &p,
                 &provider_ctx,
@@ -167,7 +173,8 @@ impl BlackboxServer {
             let provider_ctx =
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
                     .with_knowledge_view(&knowledge_view.knowledge)
-                    .with_edge_index(edge_index);
+                    .with_edge_index(edge_index)
+                    .with_searcher(&read_view.searcher);
             mcp_tools::bundle_evidence::bundle_evidence(
                 &p,
                 &provider_ctx,
@@ -192,7 +199,8 @@ impl BlackboxServer {
             let edge_index = read_view.edge_index.as_ref();
             let provider_ctx =
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
-                    .with_edge_index(edge_index);
+                    .with_edge_index(edge_index)
+                    .with_searcher(&read_view.searcher);
             mcp_tools::ref_size::ref_size(&p, &provider_ctx)
         })
         .await
@@ -238,7 +246,8 @@ impl BlackboxServer {
             let edge_index = read_view.edge_index.as_ref();
             let provider_ctx =
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
-                    .with_edge_index(edge_index);
+                    .with_edge_index(edge_index)
+                    .with_searcher(&read_view.searcher);
             let projects = server.state.projects.read().list();
             mcp_tools::blame::blame(&p, &provider_ctx, edge_index, &projects)
         })
@@ -366,8 +375,10 @@ mod tests {
         let symbol = "symbol:d723917f:KnowledgeStore:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let file = "project_file:d723917f:31d088f0:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:163";
         let selectors = server.state.idx.read().active_code_selectors();
+        let searcher = server.state.idx.read().searcher();
         *server.state.code_read_view.write() = std::sync::Arc::new(crate::server::CodeReadView {
             active_selectors: selectors,
+            searcher,
             edge_index: std::sync::Arc::new(EdgeIndex::from_edges_for_tests(vec![Edge {
                 source: crate::entity_ref::EntityRef::parse(symbol).unwrap(),
                 kind: "DEFINED_IN".into(),

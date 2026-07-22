@@ -839,10 +839,9 @@ fn project_is_repo_owned(project_dir: &Path) -> bool {
 fn load_repo_kb_entries(
     project_dir: &Path,
 ) -> Result<(Vec<KnowledgeEntry>, BTreeMap<String, EntryProvenance>)> {
-    if bbox_corpus_core::git::git_root_for_path(project_dir)
-        .as_deref()
-        .is_some_and(crate::transaction::has_pending_transaction)
-    {
+    let git_root = bbox_corpus_core::git::git_root_for_path(project_dir);
+    let transaction_root = git_root.as_deref().unwrap_or(project_dir);
+    if crate::transaction::has_pending_transaction(transaction_root) {
         tracing::debug!(
             project = %project_dir.display(),
             "kb load skipped checkout with pending knowledge transaction"
@@ -1362,7 +1361,11 @@ impl Knowledge {
     /// Persist only the entries changed by one checkout-scoped mutation. This
     /// is deliberately additive: the checkout is not the daemon's published
     /// carrier, so it has no authority to purge or rewrite the base generation.
-    fn persist_repo_owned_mutation_at(&self, ids: &[&str], write_dir: Option<&str>) -> Result<()> {
+    fn persist_repo_owned_mutation_at(
+        &mut self,
+        ids: &[&str],
+        write_dir: Option<&str>,
+    ) -> Result<()> {
         let Some(write_dir) = write_dir.map(str::trim).filter(|dir| !dir.is_empty()) else {
             if self.path_fallback_cut
                 && ids.iter().any(|id| {
@@ -1376,7 +1379,16 @@ impl Knowledge {
                     "path-scoped project fallback is retired; project knowledge writes require checkout authority"
                 );
             }
-            return self.persist_repo_owned_entries();
+            let persisted = self.persist_repo_owned_entries();
+            if let Err(error) = persisted {
+                if let Err(reload_error) = self.reload() {
+                    return Err(error.context(format!(
+                        "knowledge persistence failed and in-memory rollback reload also failed: {reload_error:#}"
+                    )));
+                }
+                return Err(error);
+            }
+            return Ok(());
         };
         let entries = ids
             .iter()
@@ -1402,7 +1414,7 @@ impl Knowledge {
         };
         let mut writes = Vec::new();
         let mut stats = load_repo_kb_stats(project_dir);
-        for entry in entries {
+        for &entry in &entries {
             if entry.recall_count > 0 || entry.last_recalled.is_some() {
                 stats.insert(
                     entry.id.clone(),
@@ -1429,7 +1441,20 @@ impl Knowledge {
                 new_bytes: Some(new_bytes),
             });
         }
-        crate::transaction::apply_transaction(&checkout_dir, writes)?;
+        let persisted = crate::transaction::apply_transaction(&checkout_dir, writes);
+        drop(entries);
+        if let Err(error) = persisted {
+            // The caller has already changed the mutable store. Reload the
+            // authoritative carriers before returning the write failure so a
+            // later unrelated save cannot publish a mutation that was reported
+            // as failed or race an unresolved transaction claim.
+            if let Err(reload_error) = self.reload() {
+                return Err(error.context(format!(
+                    "repo-owned knowledge transaction failed and in-memory rollback reload also failed: {reload_error:#}"
+                )));
+            }
+            return Err(error);
+        }
         persist_repo_kb_stats(project_dir, &stats)
     }
 
@@ -2025,7 +2050,7 @@ impl Knowledge {
         self.store.entries.push(entry);
         let checkout_scoped = self.mutation_uses_checkout_carrier(&id, write_dir);
         let persisted = self.persist_repo_owned_mutation_at(&[&id], write_dir);
-        if checkout_scoped {
+        if checkout_scoped || persisted.is_err() {
             self.store.entries.retain(|entry| entry.id != id);
         }
         persisted?;
@@ -2134,7 +2159,7 @@ impl Knowledge {
 
         let checkout_scoped = self.mutation_uses_checkout_carrier(&id, write_dir);
         let persisted = self.persist_repo_owned_mutation_at(&[&id], write_dir);
-        if checkout_scoped {
+        if checkout_scoped || persisted.is_err() {
             self.store.entries.retain(|entry| entry.id != id);
         }
         persisted?;
@@ -2215,6 +2240,13 @@ impl Knowledge {
             }
             None => None,
         };
+        let superseded_before = p.supersedes.as_deref().and_then(|old_id| {
+            self.store
+                .entries
+                .iter()
+                .find(|entry| entry.id == old_id)
+                .cloned()
+        });
 
         // Validate the checkout-visible supersedes target before creating the
         // new decision. Restore the published generation on every exit path.
@@ -2279,10 +2311,25 @@ impl Knowledge {
         }
         let checkout_scoped = self.mutation_uses_checkout_carrier(&id, write_dir);
         let persisted = self.persist_repo_owned_mutation_at(&changed_ids, write_dir);
-        if checkout_scoped {
+        if checkout_scoped || persisted.is_err() {
             self.store.entries.retain(|entry| entry.id != id);
         }
         self.restore_checkout_mutation_seed(superseded_restore);
+        if persisted.is_err()
+            && !checkout_scoped
+            && let Some(prior) = superseded_before
+        {
+            if let Some(current) = self
+                .store
+                .entries
+                .iter_mut()
+                .find(|entry| entry.id == prior.id)
+            {
+                *current = prior;
+            } else {
+                self.store.entries.push(prior);
+            }
+        }
         persisted?;
         let message = if let Some(old_id) = p.supersedes.as_deref() {
             format!("Decided entry {id} (supersedes {old_id})")
@@ -4105,6 +4152,51 @@ mod tests {
             repo_kb_dir(&base_root)
                 .join(format!("{second}.json"))
                 .is_file()
+        );
+    }
+
+    #[test]
+    fn failed_base_carrier_create_is_removed_from_memory_and_later_save() {
+        let central = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let base_root = base.path().canonicalize().unwrap();
+        std::fs::create_dir_all(repo_kb_dir(&base_root)).unwrap();
+        let transaction_root = base_root.join(".bbox/local/knowledge-transactions");
+        std::fs::create_dir_all(transaction_root.join("completed")).unwrap();
+        std::fs::write(transaction_root.join("pending.json"), b"{}\n").unwrap();
+
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        kb.set_project_roots(vec![base_root.clone()]).unwrap();
+        let before = kb.store.entries.len();
+        let project = base_root.to_string_lossy().into_owned();
+        let error = kb
+            .learn_result_with_write_dir(
+                &LearnParams {
+                    content: "must not leak after a failed transaction".into(),
+                    category: "convention".into(),
+                    scope: Some("project".into()),
+                    project: Some(project.clone()),
+                    ..Default::default()
+                },
+                false,
+                Some(&project),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("claiming knowledge transaction"));
+        assert_eq!(kb.store.entries.len(), before);
+
+        std::fs::remove_file(transaction_root.join("pending.json")).unwrap();
+        kb.save().unwrap();
+        assert!(
+            std::fs::read_dir(repo_kb_dir(&base_root))
+                .unwrap()
+                .all(|entry| entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    != Some("json")),
+            "an unrelated save must not publish the failed create"
         );
     }
 
@@ -6300,6 +6392,26 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let repo = tempfile::tempdir().unwrap();
         let root = repo.path().canonicalize().unwrap();
         git_init_commit(&root);
+        std::fs::create_dir_all(repo_kb_dir(&root)).unwrap();
+        std::fs::write(
+            repo_kb_dir(&root).join("pending-entry.json"),
+            entry_json("pending-entry", "must not be partially observed"),
+        )
+        .unwrap();
+        let pending = root.join(".bbox/local/knowledge-transactions/pending.json");
+        std::fs::create_dir_all(pending.parent().unwrap()).unwrap();
+        std::fs::write(&pending, "{}\n").unwrap();
+
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        kb.set_project_roots(vec![root]).unwrap();
+        assert!(kb.entry("pending-entry").is_none());
+    }
+
+    #[test]
+    fn loader_skips_non_git_project_with_pending_knowledge_transaction() {
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
         std::fs::create_dir_all(repo_kb_dir(&root)).unwrap();
         std::fs::write(
             repo_kb_dir(&root).join("pending-entry.json"),

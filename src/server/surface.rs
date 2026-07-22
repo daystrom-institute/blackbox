@@ -426,27 +426,43 @@ pub fn extract_query_param<'a>(query: Option<&'a str>, key: &str) -> Option<&'a 
 }
 
 /// Decode a UTF-8 query parameter for consumers that treat the value as a
-/// filesystem selector. Invalid percent escapes fail closed.
-pub fn extract_decoded_query_param(query: Option<&str>, key: &str) -> Option<String> {
-    let raw = extract_query_param(query, key)?;
+/// filesystem selector. `+` remains a literal RFC 3986 query character;
+/// invalid percent escapes and invalid UTF-8 fail loudly so initialize cannot
+/// silently discard caller-supplied authority context.
+pub fn extract_decoded_query_param(
+    query: Option<&str>,
+    key: &str,
+) -> anyhow::Result<Option<String>> {
+    let Some(raw) = extract_query_param(query, key) else {
+        return Ok(None);
+    };
     let bytes = raw.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'%' {
-            let high = *bytes.get(index + 1)?;
-            let low = *bytes.get(index + 2)?;
-            decoded.push((hex_nibble(high)? << 4) | hex_nibble(low)?);
+            let high = bytes.get(index + 1).copied().ok_or_else(|| {
+                anyhow::anyhow!("invalid percent escape in `{key}` query parameter")
+            })?;
+            let low = bytes.get(index + 2).copied().ok_or_else(|| {
+                anyhow::anyhow!("invalid percent escape in `{key}` query parameter")
+            })?;
+            let high = hex_nibble(high).ok_or_else(|| {
+                anyhow::anyhow!("invalid percent escape in `{key}` query parameter")
+            })?;
+            let low = hex_nibble(low).ok_or_else(|| {
+                anyhow::anyhow!("invalid percent escape in `{key}` query parameter")
+            })?;
+            decoded.push((high << 4) | low);
             index += 3;
-        } else if bytes[index] == b'+' {
-            decoded.push(b' ');
-            index += 1;
         } else {
             decoded.push(bytes[index]);
             index += 1;
         }
     }
-    String::from_utf8(decoded).ok()
+    String::from_utf8(decoded)
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("invalid UTF-8 in `{key}` query parameter"))
 }
 
 fn hex_nibble(byte: u8) -> Option<u8> {
@@ -1132,25 +1148,22 @@ mod tests {
             extract_decoded_query_param(
                 Some("surface=default&project=%2Ftmp%2Frepo%20with%20spaces"),
                 "project"
-            ),
+            )
+            .unwrap(),
             Some("/tmp/repo with spaces".into())
         );
         assert_eq!(
-            extract_decoded_query_param(Some("project=%2Ftmp%2Frepo+with+spaces"), "project"),
-            Some("/tmp/repo with spaces".into())
+            extract_decoded_query_param(Some("project=%2Ftmp%2Frepo+with+spaces"), "project")
+                .unwrap(),
+            Some("/tmp/repo+with+spaces".into())
         );
         assert_eq!(
-            extract_decoded_query_param(Some("project=%2Ftmp%2Frepo%2Bplus"), "project"),
+            extract_decoded_query_param(Some("project=%2Ftmp%2Frepo%2Bplus"), "project").unwrap(),
             Some("/tmp/repo+plus".into())
         );
-        assert_eq!(
-            extract_decoded_query_param(Some("project=%2Ftmp%2Frepo%2"), "project"),
-            None
-        );
-        assert_eq!(
-            extract_decoded_query_param(Some("project=%FF"), "project"),
-            None
-        );
+        assert!(extract_decoded_query_param(Some("project=%2Ftmp%2Frepo%2"), "project").is_err());
+        assert!(extract_decoded_query_param(Some("project=%FF"), "project").is_err());
+        assert_eq!(extract_decoded_query_param(None, "project").unwrap(), None);
     }
 
     #[test]

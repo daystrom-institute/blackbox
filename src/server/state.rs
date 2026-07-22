@@ -234,6 +234,7 @@ pub(crate) struct SharedState {
 
 pub(crate) struct CodeReadView {
     pub(crate) active_selectors: BTreeMap<String, String>,
+    pub(crate) searcher: tantivy::Searcher,
     pub(crate) edge_index: Arc<edge_index::EdgeIndex>,
 }
 
@@ -483,6 +484,7 @@ impl SharedState {
 
         let (edge_rebuild_nudge_tx, edge_rebuild_nudge_rx) = std::sync::mpsc::sync_channel(1);
         let active_code_selectors = idx.active_code_selectors();
+        let code_searcher = idx.searcher();
         SharedState {
             idx: RwLock::new(idx),
             index_writer,
@@ -528,6 +530,7 @@ impl SharedState {
             reindex_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             code_read_view: RwLock::new(Arc::new(CodeReadView {
                 active_selectors: active_code_selectors,
+                searcher: code_searcher,
                 edge_index: Arc::new(edge_index::EdgeIndex::default()),
             })),
             code_sources: Arc::new(super::code_source::CodeSourceRuntime::for_test(store_dir)),

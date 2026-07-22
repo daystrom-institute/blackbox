@@ -2,6 +2,30 @@
 set -euo pipefail
 
 readonly BASE_REF="monolith-decomposition-pre-attempt-2"
+readonly -a REVIEW_TOOLS=(
+  Read
+  Glob
+  Grep
+  Task
+  Agent
+  'Bash(git status:*)'
+  'Bash(git diff:*)'
+  'Bash(git show:*)'
+  'Bash(git log:*)'
+  'Bash(git rev-parse:*)'
+  'Bash(git merge-base:*)'
+  'Bash(git tag:*)'
+  'Bash(rg:*)'
+  'Bash(grep:*)'
+  'Bash(sed:*)'
+  'Bash(awk:*)'
+  'Bash(find:*)'
+  'Bash(ls:*)'
+  'Bash(wc:*)'
+  'Bash(head:*)'
+  'Bash(tail:*)'
+  'Bash(cat:*)'
+)
 
 usage() {
   cat <<'EOF'
@@ -69,7 +93,8 @@ case "$verb" in
     printf 'kimi-review: session %s\n' "$session_id" >&2
     if ! CLAUDE_CONFIG_DIR="${HOME}/.claude-k" \
       "$claudew" \
-      --dangerously-skip-permissions \
+      --permission-mode dontAsk \
+      --allowedTools "${REVIEW_TOOLS[@]}" \
       --append-system-prompt-file "$prompt_file" \
       --session-id "$session_id" \
       --name "kimi-full-scope-review" \
@@ -94,7 +119,8 @@ case "$verb" in
     printf 'kimi-review: resuming session %s\n' "$session_id" >&2
     CLAUDE_CONFIG_DIR="${HOME}/.claude-k" \
       "$claudew" \
-      --dangerously-skip-permissions \
+      --permission-mode dontAsk \
+      --allowedTools "${REVIEW_TOOLS[@]}" \
       --append-system-prompt-file "$prompt_file" \
       --resume "$session_id" \
       --disallowedTools Edit Write NotebookEdit \
@@ -108,7 +134,8 @@ case "$verb" in
     printf 'kimi-review: plan session %s\n' "$session_id" >&2
     if ! CLAUDE_CONFIG_DIR="${HOME}/.claude-k" \
       "$claudew" \
-      --dangerously-skip-permissions \
+      --permission-mode dontAsk \
+      --allowedTools "${REVIEW_TOOLS[@]}" \
       --append-system-prompt-file "$plan_prompt_file" \
       --session-id "$session_id" \
       --name "kimi-distributed-code-source-plan-review" \
@@ -133,7 +160,8 @@ case "$verb" in
     printf 'kimi-review: resuming plan session %s\n' "$session_id" >&2
     CLAUDE_CONFIG_DIR="${HOME}/.claude-k" \
       "$claudew" \
-      --dangerously-skip-permissions \
+      --permission-mode dontAsk \
+      --allowedTools "${REVIEW_TOOLS[@]}" \
       --append-system-prompt-file "$plan_prompt_file" \
       --resume "$session_id" \
       --disallowedTools Edit Write NotebookEdit \

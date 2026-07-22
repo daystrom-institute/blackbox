@@ -106,6 +106,10 @@ pub struct ProviderContext<'a> {
     /// this is present. Absent → those providers keep the strict
     /// indexed-doc requirement.
     edges: Option<&'a bbox_edge_index::edge_index::EdgeIndex>,
+    /// Request-pinned Tantivy searcher. Code-source reads pair this with the
+    /// pinned selector map and edge sidecar so provider properties and labels
+    /// cannot reopen a newer reader mid-request.
+    searcher: Option<&'a tantivy::Searcher>,
 }
 
 impl<'a> ProviderContext<'a> {
@@ -115,6 +119,7 @@ impl<'a> ProviderContext<'a> {
             knowledge_view: None,
             ext: None,
             edges: None,
+            searcher: None,
         }
     }
 
@@ -127,6 +132,7 @@ impl<'a> ProviderContext<'a> {
             knowledge_view: None,
             ext: Some(ext),
             edges: None,
+            searcher: None,
         }
     }
 
@@ -140,12 +146,18 @@ impl<'a> ProviderContext<'a> {
         self
     }
 
+    pub fn with_searcher(mut self, searcher: &'a tantivy::Searcher) -> Self {
+        self.searcher = Some(searcher);
+        self
+    }
+
     pub fn empty_for_tests() -> Self {
         Self {
             stores: None,
             knowledge_view: None,
             ext: None,
             edges: None,
+            searcher: None,
         }
     }
 
@@ -163,6 +175,20 @@ impl<'a> ProviderContext<'a> {
 
     pub fn edge_index(&self) -> Option<&'a bbox_edge_index::edge_index::EdgeIndex> {
         self.edges
+    }
+
+    pub fn indexed_entity_properties(
+        &self,
+        entity_id: &str,
+    ) -> Result<Option<BTreeMap<String, String>>> {
+        let Some(stores) = self.stores() else {
+            return Ok(None);
+        };
+        let index = stores.idx.read();
+        match self.searcher {
+            Some(searcher) => index.entity_properties_with_searcher(entity_id, searcher),
+            None => index.entity_properties(entity_id),
+        }
     }
 }
 

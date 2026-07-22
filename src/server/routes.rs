@@ -1924,14 +1924,27 @@ pub(crate) fn rebuild_edge_index_from_shared(
     include_tantivy_projection: bool,
 ) {
     if let Err(error) = bbox_edge_sidecar::snapshot::with_manifest_coordinator(|| {
-        let rebuilt = build_edge_index_from_shared(state, include_tantivy_projection);
-        let selectors = state.idx.read().refresh_active_code_selectors()?;
+        let rebuilt = build_edge_index_from_shared(state, include_tantivy_projection)?;
+        let (selectors, searcher) = {
+            let index = state.idx.read();
+            (index.refresh_active_code_selectors()?, index.searcher())
+        };
         *state.code_read_view.write() = std::sync::Arc::new(super::CodeReadView {
             active_selectors: selectors,
+            searcher,
             edge_index: std::sync::Arc::new(rebuilt),
         });
+        state
+            .code_sources
+            .store()
+            .clear_health_failure("_edge_index", "rebuild_failed")?;
         Ok(())
     }) {
+        let _ = state.code_sources.store().record_health_failure(
+            "_edge_index",
+            "rebuild_failed",
+            &error.to_string(),
+        );
         tracing::error!(%error, "edge-index rebuild manifest coordination failed");
     }
 }
@@ -1939,7 +1952,7 @@ pub(crate) fn rebuild_edge_index_from_shared(
 pub(crate) fn build_edge_index_from_shared(
     state: &SharedState,
     include_tantivy_projection: bool,
-) -> edge_index::EdgeIndex {
+) -> anyhow::Result<edge_index::EdgeIndex> {
     let started = std::time::Instant::now();
     let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
     let registered_project_ids: std::collections::HashSet<String> = state
@@ -1949,6 +1962,10 @@ pub(crate) fn build_edge_index_from_shared(
         .into_iter()
         .map(|project| project.project_id)
         .collect();
+    match bbox_edge_sidecar::manifest::try_load_manifest_index(&edges_dir) {
+        Ok(_) | Err(bbox_edge_sidecar::manifest::ManifestFallbackReason::MissingNotMigrated) => {}
+        Err(reason) => anyhow::bail!("edge manifest is unavailable: {reason:?}"),
+    }
     // The store read-locks cover ONLY the in-memory store projections (fast).
     // The sidecar load below is a multi-GB disk parse and must run with NO
     // store guards held: parking_lot is fair, so a writer queued behind these
@@ -1990,7 +2007,7 @@ pub(crate) fn build_edge_index_from_shared(
     };
     rebuilt.load_sidecar_edges(&edges_dir, Some(&registered_project_ids), &mut seen, true);
     rebuilt.log_rebuilt(include_tantivy_projection, started);
-    rebuilt
+    Ok(rebuilt)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2272,16 +2289,42 @@ pub(crate) fn sync_kb_project_roots(state: &SharedState) {
     }
 }
 
-/// Enqueue embeddings for a project's loaded knowledge entries. The BM25
+/// Materialize knowledge bytes that are authorized for published vector ids.
+/// This must use the same committed publisher view as Tantivy. The central
+/// store also contains working-tree repo entries for overlay construction, so
+/// reading it directly would publish provisional bytes under `knowledge:*`.
+pub(crate) fn published_knowledge_for_embedding(
+    state: &std::sync::Arc<SharedState>,
+    project_dir: Option<&str>,
+) -> anyhow::Result<Vec<crate::knowledge::KnowledgeEntry>> {
+    let view = super::BlackboxServer::new(state.clone())
+        .session_knowledge_view(project_dir, Some("published"))?;
+    Ok(view.knowledge.all_entries().to_vec())
+}
+
+/// Enqueue embeddings for a project's committed knowledge entries. The BM25
 /// reindex picks up committed `.bbox/knowledge/` automatically, but vector
 /// coverage is driven by enqueue, so a project registered from a clone would
 /// otherwise be invisible to vector search until a manual reembed. The embed
 /// worker dedupes by (entity_id, chunk_hash), so re-enqueuing already-embedded
 /// entries is a cheap no-op. Returns the number of entries enqueued.
-pub(crate) fn enqueue_project_knowledge_embeds(state: &SharedState, project_dir: &str) -> usize {
-    let kb = state.kb.read();
+pub(crate) fn enqueue_project_knowledge_embeds(
+    state: &std::sync::Arc<SharedState>,
+    project_dir: &str,
+) -> usize {
+    let entries = match published_knowledge_for_embedding(state, Some(project_dir)) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(
+                project = project_dir,
+                error = %error,
+                "project knowledge embed source unavailable"
+            );
+            return 0;
+        }
+    };
     let mut enqueued = 0usize;
-    for entry in kb.all_entries().iter().filter(|e| {
+    for entry in entries.iter().filter(|e| {
         e.project.as_deref() == Some(project_dir)
             && matches!(
                 e.status,
@@ -3059,6 +3102,101 @@ mod tests {
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
+    }
+
+    fn git(root: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn embedding_test_entry(content: &str) -> crate::knowledge::KnowledgeEntry {
+        crate::knowledge::KnowledgeEntry {
+            id: "embed-source".into(),
+            title: "embed source".into(),
+            content: content.into(),
+            cluster: None,
+            variants: Default::default(),
+            category: crate::knowledge::Category::Memory,
+            scope: crate::knowledge::Scope::Project,
+            project: None,
+            providers: Vec::new(),
+            priority: crate::knowledge::Priority::Standard,
+            weight: 100,
+            status: crate::knowledge::Status::Active,
+            approval: crate::knowledge::Approval::UserConfirmed,
+            render: false,
+            decay: false,
+            review_at: None,
+            supersedes: None,
+            links: Vec::new(),
+            rationale: None,
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        }
+    }
+
+    #[test]
+    fn embedding_source_uses_committed_publisher_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(root.join(".bbox/knowledge")).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.email", "test@example.com"]);
+        git(&root, &["config", "user.name", "Test"]);
+        std::fs::write(
+            root.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"embedding-family\"\n",
+        )
+        .unwrap();
+        let entry_path = root.join(".bbox/knowledge/embed-source.json");
+        std::fs::write(
+            &entry_path,
+            serde_json::to_vec_pretty(&embedding_test_entry("published bytes")).unwrap(),
+        )
+        .unwrap();
+        git(&root, &["add", ".bbox"]);
+        git(&root, &["commit", "-q", "-m", "published knowledge"]);
+        let root = root.canonicalize().unwrap();
+
+        let server = test_server(&temp);
+        server.state.projects.write().register_path(&root).unwrap();
+        sync_kb_project_roots(&server.state);
+
+        std::fs::write(
+            &entry_path,
+            serde_json::to_vec_pretty(&embedding_test_entry("uncommitted bytes")).unwrap(),
+        )
+        .unwrap();
+        sync_kb_project_roots(&server.state);
+        assert_eq!(
+            server
+                .state
+                .kb
+                .read()
+                .entry("embed-source")
+                .unwrap()
+                .content,
+            "uncommitted bytes",
+            "fixture must expose working-tree bytes in the central overlay store"
+        );
+
+        let entries =
+            published_knowledge_for_embedding(&server.state, Some(root.to_str().unwrap())).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "published bytes");
     }
 
     #[test]

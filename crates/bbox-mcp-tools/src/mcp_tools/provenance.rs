@@ -69,11 +69,13 @@ pub fn export_provenance(
             }
         }
         let note = note_from_edges(&commit, &edges, edge_index);
-        for part in fragment_note(&note, MAX_NOTE_DOCUMENT_BYTES)? {
-            let body = serialize_note(&part)? + "\n";
-            bbox_corpus_core::git::write_note(root, &notes_ref, &commit, &body)?;
-        }
-        notes_written += 1;
+        let documents = fragment_note(&note, MAX_NOTE_DOCUMENT_BYTES)?
+            .into_iter()
+            .map(|part| serialize_note(&part))
+            .collect::<Result<Vec<_>>>()?;
+        let applied =
+            bbox_provenance::append_note_documents_dedup(root, &notes_ref, &commit, &documents)?;
+        notes_written += applied.written;
     }
 
     Ok(serde_json::to_string_pretty(&json!({

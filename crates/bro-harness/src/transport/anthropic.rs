@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 pub struct AnthropicTransport {
     http: reqwest::Client,
     base_url: String,
+    provider: Option<String>,
     auth: Auth,
     version: String,
     /// Native conversation: `[{"role":..,"content":[blocks]}]`.
@@ -54,6 +55,7 @@ impl AnthropicTransport {
         Ok(Self {
             http: reqwest::Client::new(),
             base_url,
+            provider: super::session_var("BRO_HARNESS_PROVIDER"),
             auth,
             version,
             messages: Vec::new(),
@@ -71,17 +73,17 @@ impl AnthropicTransport {
         self.base_url.to_ascii_lowercase().contains("minimax")
     }
 
-    /// True when this transport points at Kimi's Anthropic-compatible endpoint
-    /// (`https://api.kimi.com/coding`). Kimi's compat layer accepts the
+    /// True when daemon dispatch identified this transport as Kimi. Kimi's
+    /// compat layer accepts the
     /// server-side web_search tool but streams degenerate blocks for it: a
     /// `server_tool_use` with an empty `id` and a `web_search_tool_result`
     /// with no `tool_use_id`, then rejects any replay of its own turn
     /// with 400 "tool call id web_search:0 is not found", killing the session
     /// at the first search. The tool is therefore never advertised to Kimi
-    /// (see [`Self::build_body`]); keyed off the dispatch base URL like
-    /// [`Self::is_minimax`].
+    /// (see [`Self::build_body`]). Provider identity is explicit dispatch
+    /// metadata, not a substring guess over a mutable gateway URL.
     fn is_kimi(&self) -> bool {
-        self.base_url.to_ascii_lowercase().contains("kimi")
+        self.provider.as_deref() == Some("kimi")
     }
 
     /// Build the Messages request body (pure; no I/O), so the wire shape —
@@ -1096,6 +1098,7 @@ mod tests {
         AnthropicTransport {
             http: reqwest::Client::new(),
             base_url: "http://x".into(),
+            provider: None,
             auth: Auth::Bearer("t".into()),
             version: "2023-06-01".into(),
             messages: vec![json!({"role": "user", "content": "hi"})],
@@ -1147,7 +1150,7 @@ mod tests {
         // not found"), killing the session at the first search. Fail closed:
         // never advertise it there, even with web_search enabled.
         let mut tx = transport();
-        tx.base_url = "https://api.kimi.com/coding".into();
+        tx.provider = Some("kimi".into());
         let mut o = opts(SystemPrompt::default());
         o.web_search = true;
         let body = tx.build_body(&[], &o);
@@ -1160,6 +1163,17 @@ mod tests {
             !has_ws,
             "kimi endpoint must not receive the server-side web_search tool"
         );
+
+        // Gateway hostnames are not provider authority. A non-Kimi dispatch
+        // must retain web search even if its URL happens to contain "kimi".
+        tx.provider = None;
+        tx.base_url = "https://gateway.invalid/kimi-compatible".into();
+        let body = tx.build_body(&[], &o);
+        assert!(body["tools"].as_array().is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool["type"] == "web_search_20250305")
+        }));
     }
 
     #[test]
@@ -1780,6 +1794,7 @@ mod tests {
         let mut tx = AnthropicTransport {
             http: reqwest::Client::new(),
             base_url: format!("http://{addr}"),
+            provider: None,
             auth: Auth::Bearer("token".into()),
             version: "2023-06-01".into(),
             messages: Vec::new(),
@@ -1852,6 +1867,7 @@ mod tests {
         let mut tx = AnthropicTransport {
             http: reqwest::Client::new(),
             base_url: format!("http://{addr}"),
+            provider: None,
             auth: Auth::Bearer("token".into()),
             version: "2023-06-01".into(),
             messages: Vec::new(),
@@ -1937,6 +1953,7 @@ mod tests {
         let mut tx = AnthropicTransport {
             http: reqwest::Client::new(),
             base_url: format!("http://{addr}"),
+            provider: None,
             auth: Auth::Bearer("token".into()),
             version: "2023-06-01".into(),
             messages: Vec::new(),
@@ -2003,6 +2020,7 @@ mod tests {
         let mut tx = AnthropicTransport {
             http: reqwest::Client::new(),
             base_url: format!("http://{addr}"),
+            provider: None,
             auth: Auth::Bearer("token".into()),
             version: "2023-06-01".into(),
             messages: Vec::new(),

@@ -821,6 +821,7 @@ fn cutback_to_local(
         .into_iter()
         .find(|project| project.project_id == project_id)
         .ok_or_else(|| anyhow!("registered project disappeared during local cutback"))?;
+    let cutback_deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
     let staged = loop {
         match state
             .index_writer
@@ -828,6 +829,18 @@ fn cutback_to_local(
         {
             Ok(staged) => break staged,
             Err(error) if writer_pass_in_progress(&error) => {
+                if std::time::Instant::now() >= cutback_deadline {
+                    bail!("local cutback timed out waiting for the index writer");
+                }
+                if !state
+                    .projects
+                    .read()
+                    .list()
+                    .iter()
+                    .any(|project| project.project_id == project_id)
+                {
+                    bail!("registered project disappeared while local cutback was waiting");
+                }
                 if state.code_sources.assignment_matches(scope, project_id) {
                     bail!("collector assignment returned while local cutback was waiting");
                 }
@@ -837,6 +850,7 @@ fn cutback_to_local(
         }
     };
     if state.code_sources.assignment_matches(scope, project_id) {
+        schedule_unactivated_retirement(state, project_id, &staged, None)?;
         bail!("collector assignment returned while local cutback was staging");
     }
     let previous_entry = manifest.workspaces.get(project_id).cloned();
@@ -859,13 +873,14 @@ fn cutback_to_local(
             .worktree_dirty
             .then_some(staged.dirty_fingerprint.as_str()),
         || {
-            let rebuilt = super::routes::build_edge_index_from_shared(state, false);
+            let rebuilt = super::routes::build_edge_index_from_shared(state, false)?;
             let index = state.idx.write();
             let mut selectors = index.active_code_selectors();
             selectors.insert(project_id.to_string(), staged.selector.clone());
             index.replace_active_code_selectors(selectors.clone());
             *state.code_read_view.write() = Arc::new(super::CodeReadView {
                 active_selectors: selectors,
+                searcher: index.searcher(),
                 edge_index: Arc::new(rebuilt),
             });
             Ok(())
@@ -1065,6 +1080,12 @@ fn activate_desired_loop(
             .code_sources
             .assignment_authorizes(scope, project_id, &desired.producer_id)
         {
+            schedule_unactivated_retirement(
+                state,
+                project_id,
+                &staged,
+                Some(desired.generation_id.clone()),
+            )?;
             store.mark_generation_state(
                 scope,
                 &desired.generation_id,
@@ -1077,6 +1098,12 @@ fn activate_desired_loop(
             .desired_generation(scope)?
             .ok_or_else(|| anyhow!("desired generation disappeared during activation"))?;
         if newest.generation_id != desired.generation_id {
+            schedule_unactivated_retirement(
+                state,
+                project_id,
+                &staged,
+                Some(desired.generation_id.clone()),
+            )?;
             store.mark_generation_state(
                 scope,
                 &desired.generation_id,
@@ -1112,6 +1139,13 @@ fn activate_desired_loop(
             .code_sources
             .assignment_authorizes(scope, project_id, &desired.producer_id)
         {
+            schedule_unactivated_retirement(
+                state,
+                project_id,
+                &staged,
+                Some(desired.generation_id.clone()),
+            )?;
+            store.clear_activation(project_id)?;
             store.mark_generation_state(
                 scope,
                 &desired.generation_id,
@@ -1141,13 +1175,14 @@ fn activate_desired_loop(
             &staged.selector,
             &staged.snapshot_id,
             || {
-                let rebuilt = super::routes::build_edge_index_from_shared(state, false);
+                let rebuilt = super::routes::build_edge_index_from_shared(state, false)?;
                 let index = state.idx.write();
                 let mut selectors = index.active_code_selectors();
                 selectors.insert(project_id.to_string(), staged.selector.clone());
                 index.replace_active_code_selectors(selectors.clone());
                 *state.code_read_view.write() = Arc::new(super::CodeReadView {
                     active_selectors: selectors,
+                    searcher: index.searcher(),
                     edge_index: Arc::new(rebuilt),
                 });
                 Ok(())
@@ -1203,6 +1238,24 @@ fn schedule_previous_retirement(
     };
     state.code_sources.store().enqueue_retirement(&record)?;
     spawn_retirement(state, record, Some(previous_view));
+    Ok(())
+}
+
+fn schedule_unactivated_retirement(
+    state: &Arc<SharedState>,
+    project_id: &str,
+    staged: &crate::index::project_files::CollectedIndexResult,
+    generation_id: Option<String>,
+) -> Result<()> {
+    let record = RetirementRecord {
+        version: 1,
+        project_id: project_id.to_string(),
+        selector: staged.selector.clone(),
+        snapshot_id: staged.snapshot_id.clone(),
+        generation_id,
+    };
+    state.code_sources.store().enqueue_retirement(&record)?;
+    spawn_retirement(state.clone(), record, None);
     Ok(())
 }
 

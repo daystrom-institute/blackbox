@@ -417,6 +417,10 @@ host claims coverage for an offline host's private central store. An empty
 project registry cannot prove the cut vacuously. The host cut marker is parsed
 and version-checked at startup, and every later registered scope is re-audited
 so post-cut debris remains quarantined and visible as an operational blocker.
+Periodic lifecycle inventory writes only host-local ledgers and never modifies
+a registered checkout. `bbox_project_eject` is the explicit operator mutation
+that writes a clean scope's repo marker; the operator then reviews and commits
+the resulting `.bbox/` files before that marker can satisfy the cut.
 
 ### 3.6 First consumers
 

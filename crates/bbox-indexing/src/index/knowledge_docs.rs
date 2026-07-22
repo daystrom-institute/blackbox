@@ -189,8 +189,20 @@ pub fn reindex_knowledge_store_standalone(
     let knowledge = Knowledge::open(knowledge_path)?;
     let projects =
         crate::projects::ProjectRegistry::load_records(projects_path).unwrap_or_default();
+    // Before the migration cut, a registered project without recorded durable
+    // identity still publishes through its legacy central entry lane. Exclude
+    // only scopes whose committed publisher lane can replace those bytes. The
+    // cut gate separately guarantees that no legacy central entries remain, so
+    // this compatibility rule becomes inert after migration.
     let managed_paths = projects
         .iter()
+        .filter(|project| {
+            crate::publisher::project_published_scope(
+                project,
+                bbox_config::config::read_repo_id_inputs,
+            )
+            .is_some()
+        })
         .map(|project| project.canonical_path.as_str())
         .collect::<BTreeSet<_>>();
     let mut documents = knowledge
@@ -549,6 +561,81 @@ mod tests {
             docs, 1,
             "the committed project .bbox/knowledge entry must be indexed even though central is empty"
         );
+    }
+
+    #[test]
+    fn reindex_keeps_legacy_registered_scope_before_identity_migration() {
+        use bbox_knowledge::knowledge::KnowledgeStore;
+        use tantivy::Index;
+
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("legacy-project");
+        std::fs::create_dir_all(&project).unwrap();
+        let project = project.canonicalize().unwrap();
+        let entry = KnowledgeEntry {
+            id: "legacy01".into(),
+            title: "legacy project knowledge".into(),
+            content: "LEGACY_SCOPE_STAYS_SEARCHABLE".into(),
+            cluster: None,
+            variants: Default::default(),
+            category: Category::Convention,
+            scope: Scope::Project,
+            project: Some(project.to_string_lossy().into_owned()),
+            providers: Vec::new(),
+            priority: Priority::Standard,
+            weight: 100,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            render: true,
+            decay: true,
+            review_at: None,
+            supersedes: None,
+            links: Vec::new(),
+            rationale: None,
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        };
+        let knowledge_path = temp.path().join("knowledge.json");
+        std::fs::write(
+            &knowledge_path,
+            serde_json::to_vec_pretty(&KnowledgeStore {
+                version: 1,
+                built_from: Default::default(),
+                provenance: Default::default(),
+                entries: vec![entry],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let projects_path = temp.path().join("projects.json");
+        let mut registry = crate::projects::ProjectRegistry::open(&projects_path).unwrap();
+        registry.register_path(&project).unwrap();
+        bbox_corpus_core::json_store::atomic_write_json_locked(
+            &projects_path,
+            &<crate::projects::ProjectRegistry as bbox_stores::store_persister::StoreSnapshot>::snapshot(
+                &registry,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (schema, fields) = crate::index::build_schema();
+        let index = Index::create_in_ram(schema);
+        let mut writer: IndexWriter = index.writer(15_000_000).unwrap();
+        let docs = reindex_knowledge_store_standalone(
+            &knowledge_path,
+            &projects_path,
+            fields,
+            &mut writer,
+            &mut HashMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(docs, 1);
     }
 
     fn first_text(doc: &TantivyDocument, field: tantivy::schema::Field) -> String {

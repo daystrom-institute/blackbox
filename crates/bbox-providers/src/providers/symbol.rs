@@ -137,8 +137,8 @@ fn symbol_entity(ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView>
     }
     properties.insert("qualified_name".into(), qualified_name.to_string());
     properties.insert("defn_hash".into(), defn_hash.to_string());
-    if let Some(stores) = ctx.stores() {
-        match stores.idx.read().entity_properties(&r.to_string())? {
+    if ctx.stores().is_some() {
+        match ctx.indexed_entity_properties(&r.to_string())? {
             Some(indexed) => {
                 properties.extend(indexed);
             }

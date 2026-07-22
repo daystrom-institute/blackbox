@@ -17,6 +17,7 @@ bbox-corpus-core = { path = "../bbox-corpus-core" }
 bbox-chunker = { path = "../bbox-chunker" }
 bbox-system-memory = { path = "../bbox-system-memory" }
 tracing = "0.1"
+tantivy = "0.22"
 chrono = "0.4"
 tokio = { version = "1", features = ["full"] }
 rmcp = { version = "1.4", features = [

@@ -11,9 +11,13 @@ pub(crate) fn evaluate(candidate: &CandidateTree) -> Result<CandidateGateReport>
     bro_tools::fleet_worktree::materialize_candidate_tree(candidate, tree.path())?;
     let roots = discover_project_roots(tree.path())?;
     if roots.is_empty() {
+        let removed_existing_bbox = target_contains_bbox(candidate)?;
         return Ok(CandidateGateReport {
-            ok: true,
+            ok: !removed_existing_bbox,
             content: serde_json::json!({
+                "error": removed_existing_bbox.then_some(
+                    "candidate deletes the complete .bbox knowledge tree; explicit operator review is required"
+                ),
                 "projects_checked": 0,
                 "render_mismatches": 0,
                 "contradictions": 0,
@@ -65,6 +69,29 @@ pub(crate) fn evaluate(candidate: &CandidateTree) -> Result<CandidateGateReport>
             "projects": projects,
         }),
     })
+}
+
+fn target_contains_bbox(candidate: &CandidateTree) -> Result<bool> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&candidate.repo)
+        .args([
+            "ls-tree",
+            "-r",
+            "--name-only",
+            &candidate.target,
+            "--",
+            ".bbox",
+        ])
+        .output()
+        .context("checking target tree for existing .bbox content")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "checking target tree for existing .bbox content failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(!output.stdout.is_empty())
 }
 
 #[allow(clippy::disallowed_methods)]
