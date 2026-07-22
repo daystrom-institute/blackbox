@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use rmcp::schemars;
@@ -12,6 +13,8 @@ pub use bbox_corpus_core::project_record::{CheckoutContext, ProjectContext, Proj
 use bbox_corpus_core::entity_ref;
 use bbox_stores::store_persister::StoreSnapshot;
 use bbox_util::util;
+
+use crate::project_catalog_migration_lock::ProjectCatalogMigrationLock;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ProjectRegisterParams {
@@ -99,6 +102,9 @@ impl Default for ProjectStore {
 #[derive(Debug, Clone)]
 pub struct ProjectRegistry {
     store: ProjectStore,
+    // StorePersister and every fallback writer retain the registry in an Arc,
+    // so this shared guard outlives every version-1 project-store write.
+    _migration_lock: Arc<ProjectCatalogMigrationLock>,
 }
 
 impl StoreSnapshot for ProjectRegistry {
@@ -117,6 +123,7 @@ impl ProjectRegistry {
 
     pub fn open_with_backfill_status(path: impl Into<PathBuf>) -> Result<(Self, bool)> {
         let path = path.into();
+        let migration_lock = Arc::new(ProjectCatalogMigrationLock::acquire_shared(&path)?);
         let mut store = load_store(&path)?;
         let mut dirty = false;
         for record in store.projects.iter_mut() {
@@ -133,7 +140,13 @@ impl ProjectRegistry {
                 dirty = true;
             }
         }
-        Ok((Self { store }, dirty))
+        Ok((
+            Self {
+                store,
+                _migration_lock: migration_lock,
+            },
+            dirty,
+        ))
     }
 
     pub fn register_path(&mut self, path: impl AsRef<Path>) -> Result<ProjectRecord> {
