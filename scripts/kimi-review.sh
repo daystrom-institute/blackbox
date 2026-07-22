@@ -8,11 +8,14 @@ usage() {
 usage:
   scripts/kimi-review.sh review
   scripts/kimi-review.sh resume [session-id]
+  scripts/kimi-review.sh plan-review
+  scripts/kimi-review.sh plan-resume [session-id]
 
-The review scope and rubric are fixed by prompts/agents/kimi-review.md.
-The most recent session ID is recorded per Git worktree, so `resume` normally
-needs no argument. Pass an explicit session ID only when resuming an older
-review from the same worktree.
+The code-review scope is fixed by prompts/agents/kimi-review.md. The plan-review
+scope is fixed by prompts/agents/kimi-plan-review.md. The most recent session
+ID for each mode is recorded per Git worktree, so resume normally needs no
+argument. Pass an explicit session ID only when resuming an older review from
+the same worktree.
 EOF
 }
 
@@ -41,10 +44,13 @@ validate_session_id() {
 repo_root="$(resolve_repo_root)"
 prompt_file="$repo_root/prompts/agents/kimi-review.md"
 session_file="$(git -C "$repo_root" rev-parse --git-path kimi-review-session)"
+plan_prompt_file="$repo_root/prompts/agents/kimi-plan-review.md"
+plan_session_file="$(git -C "$repo_root" rev-parse --git-path kimi-plan-review-session)"
 claudew="$(command -v claudew || true)"
 
 [[ -n "$claudew" ]] || die "claudew is not on PATH"
 [[ -f "$prompt_file" ]] || die "review prompt is missing: $prompt_file"
+[[ -f "$plan_prompt_file" ]] || die "plan review prompt is missing: $plan_prompt_file"
 [[ -d "${HOME}/.claude-k" ]] || die "Kimi config directory is missing: ${HOME}/.claude-k"
 git -C "$repo_root" rev-parse --verify "${BASE_REF}^{commit}" >/dev/null 2>&1 ||
   die "fixed baseline tag is missing: $BASE_REF"
@@ -93,6 +99,45 @@ case "$verb" in
       --resume "$session_id" \
       --disallowedTools Edit Write NotebookEdit \
       -p "Reinspect the complete mandatory scope. Reproduce and recheck every prior finding against the actual current code, verify each claimed fix, and search the entire scope for regressions and newly exposed defects. Do not rely on a fix summary and do not narrow the review to files changed since the previous turn."
+    ;;
+  plan-review)
+    [[ $# -eq 1 ]] || die "plan-review accepts no arguments"
+    session_id="$(new_session_id)"
+    mkdir -p "$(dirname "$plan_session_file")"
+    printf '%s\n' "$session_id" >"$plan_session_file"
+    printf 'kimi-review: plan session %s\n' "$session_id" >&2
+    if ! CLAUDE_CONFIG_DIR="${HOME}/.claude-k" \
+      "$claudew" \
+      --dangerously-skip-permissions \
+      --append-system-prompt-file "$plan_prompt_file" \
+      --session-id "$session_id" \
+      --name "kimi-checkout-provenance-plan-review" \
+      --disallowedTools Edit Write NotebookEdit \
+      -p "Perform the complete mandatory plan review now."; then
+      if [[ -f "$plan_session_file" ]] && [[ "$(tr -d '[:space:]' <"$plan_session_file")" == "$session_id" ]]; then
+        rm -f "$plan_session_file"
+      fi
+      exit 1
+    fi
+    ;;
+  plan-resume)
+    [[ $# -le 2 ]] || die "plan-resume accepts only an optional session ID"
+    if [[ $# -eq 2 ]]; then
+      session_id="$2"
+    else
+      [[ -f "$plan_session_file" ]] ||
+        die "no recorded plan review session; pass an explicit session ID"
+      session_id="$(tr -d '[:space:]' <"$plan_session_file")"
+    fi
+    validate_session_id "$session_id"
+    printf 'kimi-review: resuming plan session %s\n' "$session_id" >&2
+    CLAUDE_CONFIG_DIR="${HOME}/.claude-k" \
+      "$claudew" \
+      --dangerously-skip-permissions \
+      --append-system-prompt-file "$plan_prompt_file" \
+      --resume "$session_id" \
+      --disallowedTools Edit Write NotebookEdit \
+      -p "Reinspect the complete mandatory plan scope. Reproduce every prior plan finding against the current document and actual code, verify each correction, and search the entire plan for new gaps. Do not rely on a fix summary and do not narrow review to paragraphs changed since the previous turn."
     ;;
   -h|--help|help)
     usage
