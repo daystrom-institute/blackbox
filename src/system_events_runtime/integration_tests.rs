@@ -81,12 +81,12 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         pins_persister,
         projects,
         projects_persister,
-        checkout_registry: RwLock::new(
+        checkout_registry: Arc::new(RwLock::new(
             bbox_indexing::checkout_registry::CheckoutRegistry::open(
                 &tmp.path().join("checkout-registry.json"),
             )
             .unwrap(),
-        ),
+        )),
         checkout_access_observations:
             bbox_indexing::checkout_access::CheckoutAccessObservations::open(
                 tmp.path().join("checkout-access-observations.json"),

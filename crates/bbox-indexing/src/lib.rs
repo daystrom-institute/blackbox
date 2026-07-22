@@ -3,6 +3,7 @@
 //! `crate::<module>` paths.
 
 pub mod checkout_access;
+pub mod checkout_access_v1;
 pub mod checkout_registry;
 pub mod index;
 pub mod project_catalog_migration_lock;

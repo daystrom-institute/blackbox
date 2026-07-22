@@ -70,7 +70,7 @@ impl CheckoutAccessKind {
 
     const fn permits(self, intent: CheckoutAccessIntent) -> bool {
         match self {
-            Self::ProvenanceNoteIo => true,
+            Self::RenderFileProvider | Self::ProvenanceNoteIo => true,
             Self::RepositoryMutation => matches!(intent, CheckoutAccessIntent::Write),
             _ => matches!(intent, CheckoutAccessIntent::Read),
         }
@@ -180,8 +180,7 @@ pub trait CheckoutAccessAuthority: Send + Sync + 'static {
     fn revalidate_conservative_path_gate(
         &self,
         request: &CheckoutAccessRequest,
-        checkout_root: &Path,
-        project_root: &Path,
+        candidate: &CheckoutAccessCandidate,
     ) -> std::result::Result<(), CheckoutAccessError>;
 }
 
@@ -203,8 +202,7 @@ impl CheckoutAccessAuthority for DenyCheckoutAccess {
     fn revalidate_conservative_path_gate(
         &self,
         _request: &CheckoutAccessRequest,
-        _checkout_root: &Path,
-        _project_root: &Path,
+        _candidate: &CheckoutAccessCandidate,
     ) -> std::result::Result<(), CheckoutAccessError> {
         Err(CheckoutAccessError::new(
             CheckoutAccessErrorCode::DeniedByTestProbe,
@@ -569,10 +567,10 @@ impl CheckoutAccessBroker {
                 "the project root is outside the checkout root",
             ));
         }
-        self.authority
-            .revalidate_conservative_path_gate(request, &checkout_root, &project_root)?;
         candidate.checkout_root = checkout_root;
         candidate.project_root = project_root;
+        self.authority
+            .revalidate_conservative_path_gate(request, &candidate)?;
         Ok(candidate)
     }
 }
@@ -883,8 +881,7 @@ mod tests {
         fn revalidate_conservative_path_gate(
             &self,
             _request: &CheckoutAccessRequest,
-            _checkout_root: &Path,
-            _project_root: &Path,
+            _candidate: &CheckoutAccessCandidate,
         ) -> std::result::Result<(), CheckoutAccessError> {
             self.allow_gate.then_some(()).ok_or_else(|| {
                 CheckoutAccessError::new(
@@ -963,6 +960,28 @@ mod tests {
         assert_eq!(operation.granted, 1);
         assert_eq!(operation.denied, 0);
         assert!(operation.last_success_unix_secs.is_some());
+    }
+
+    #[test]
+    fn access_kind_intent_matrix_keeps_render_as_its_own_write_capability() {
+        for kind in CheckoutAccessKind::ALL {
+            let permits_read = kind.permits(CheckoutAccessIntent::Read);
+            let permits_write = kind.permits(CheckoutAccessIntent::Write);
+            match kind {
+                CheckoutAccessKind::RenderFileProvider | CheckoutAccessKind::ProvenanceNoteIo => {
+                    assert!(permits_read, "{} must permit reads", kind.as_str());
+                    assert!(permits_write, "{} must permit writes", kind.as_str());
+                }
+                CheckoutAccessKind::RepositoryMutation => {
+                    assert!(!permits_read, "repository mutation is write-only");
+                    assert!(permits_write, "repository mutation must permit writes");
+                }
+                _ => {
+                    assert!(permits_read, "{} must permit reads", kind.as_str());
+                    assert!(!permits_write, "{} must reject writes", kind.as_str());
+                }
+            }
+        }
     }
 
     #[test]
