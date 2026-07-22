@@ -124,29 +124,33 @@ impl ProjectRegistry {
     pub fn open_with_backfill_status(path: impl Into<PathBuf>) -> Result<(Self, bool)> {
         let path = path.into();
         let migration_lock = Arc::new(ProjectCatalogMigrationLock::acquire_shared(&path)?);
-        let mut store = load_store(&path)?;
-        let mut dirty = false;
-        for record in store.projects.iter_mut() {
-            if !record.languages.is_empty() {
-                continue;
-            }
-            let canonical = PathBuf::from(&record.canonical_path);
-            if !canonical.is_dir() {
-                continue;
-            }
-            let detected = detect_languages(&canonical);
-            if !detected.is_empty() {
-                record.languages = detected;
-                dirty = true;
-            }
-        }
+        let store = load_store(&path)?;
         Ok((
             Self {
                 store,
                 _migration_lock: migration_lock,
             },
-            dirty,
+            false,
         ))
+    }
+
+    /// Fill an established record's language set from a caller-authorized
+    /// checkout walk. Opening the durable registry is intentionally path-free;
+    /// daemon startup invokes this only while holding a LocalProjectWalk lease.
+    pub fn backfill_languages(&mut self, project_id: &str, languages: BTreeSet<Language>) -> bool {
+        let Some(record) = self
+            .store
+            .projects
+            .iter_mut()
+            .find(|record| record.project_id == project_id)
+        else {
+            return false;
+        };
+        if !record.languages.is_empty() || languages.is_empty() {
+            return false;
+        }
+        record.languages = languages;
+        true
     }
 
     pub fn register_path(&mut self, path: impl AsRef<Path>) -> Result<ProjectRecord> {
@@ -1131,7 +1135,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_redetects_languages_for_legacy_records() {
+    async fn open_is_path_free_and_backfill_requires_explicit_languages() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("legacy");
         fs::create_dir_all(&project).unwrap();
@@ -1152,12 +1156,13 @@ mod tests {
         });
         fs::write(&store_path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
 
-        let (registry, backfilled) =
+        let (mut registry, backfilled) =
             ProjectRegistry::open_with_backfill_status(&store_path).unwrap();
-        assert!(backfilled);
+        assert!(!backfilled);
         let recs = registry.list();
         assert_eq!(recs.len(), 1);
-        assert!(recs[0].languages.contains(&Language::Rust));
+        assert!(recs[0].languages.is_empty());
+        assert!(registry.backfill_languages("test-id", BTreeSet::from([Language::Rust]),));
 
         // Persisted on disk so subsequent loads skip the walk.
         let registry = Arc::new(RwLock::new(registry));

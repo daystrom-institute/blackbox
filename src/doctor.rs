@@ -321,9 +321,47 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
                     .into_iter()
                     .find(|project| project.project_id == activation.project_id)
                 {
-                    let local_head = bbox_corpus_core::git::current_head(std::path::Path::new(
-                        &project.canonical_path,
-                    ));
+                    use bbox_indexing::checkout_access::{
+                        CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest,
+                        CheckoutAccessSourceLane, CheckoutAttachmentSelector,
+                    };
+                    let request = |kind, expected_scope| CheckoutAccessRequest {
+                        project_id: project.project_id.clone(),
+                        attachment: CheckoutAttachmentSelector::Selected,
+                        expected_scope,
+                        kind,
+                        intent: CheckoutAccessIntent::Read,
+                        source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+                    };
+                    let scope = state
+                        .checkout_access
+                        .acquire(request(CheckoutAccessKind::PublisherConfigTreeRead, None));
+                    let git = scope.and_then(|scope| {
+                        state.checkout_access.acquire(request(
+                            CheckoutAccessKind::GitHistory,
+                            scope.published_scope().cloned(),
+                        ))
+                    });
+                    let git = match git {
+                        Ok(git) => git,
+                        Err(error) => {
+                            findings.push(Finding::warn(format!(
+                                "project `{}` Git-history freshness unavailable ({})",
+                                activation.project_id,
+                                error.code.as_str()
+                            )));
+                            continue;
+                        }
+                    };
+                    let local_head = bbox_corpus_core::git::current_head(git.checkout_root());
+                    if let Err(error) = state.checkout_access.revalidate(&git) {
+                        findings.push(Finding::warn(format!(
+                            "project `{}` Git-history freshness unavailable ({})",
+                            activation.project_id,
+                            error.code.as_str()
+                        )));
+                        continue;
+                    }
                     if local_head.as_deref() != Some(generation.descriptor.head_commit.as_str()) {
                         findings.push(Finding::warn(format!(
                             "project `{}` local Git-history HEAD differs from collected current files",

@@ -15,7 +15,8 @@ use super::project_files;
 use super::tool_edges::ToolEdgeContext;
 use super::writer_actor::IndexWriterActor;
 use super::{FieldHandles, FileMetaSource, ReindexConfig};
-use crate::projects::ProjectRecord;
+use crate::checkout_access::CheckoutAccessBroker;
+use crate::projects::{ProjectRecord, ProjectRegistry};
 use bbox_corpus_index::transcripts::adapters::{TranscriptAdapterRegistry, TranscriptScanTarget};
 
 // At the default 120s interval this is one full refresh per day. Full
@@ -33,25 +34,38 @@ fn background_startup_delay(interval: Duration) -> Duration {
 
 /// Check if any source files have changed since last index.
 /// Returns true if reindexing is needed (cheap — stat only, no I/O on file contents).
-pub(super) fn needs_reindex(config: &ReindexConfig) -> bool {
+pub(super) fn needs_reindex(
+    config: &ReindexConfig,
+    projects: &Arc<parking_lot::RwLock<ProjectRegistry>>,
+    checkout_access: &Arc<CheckoutAccessBroker>,
+) -> Result<bool> {
     let meta = load_meta(&config.meta_path).unwrap_or_default();
-    let files = scan_all_source_files(config);
+    let leased = super::writer_actor::acquire_project_leases(config, projects, checkout_access)?;
+    let lower = leased
+        .iter()
+        .map(|project| project.lower())
+        .collect::<Vec<_>>();
+    let mut files = scan_non_project_source_files(config);
+    files.extend(project_files::scan_project_files_with_access(
+        config, &lower,
+    )?);
+    super::writer_actor::revalidate_project_leases(checkout_access, &leased)?;
     let current_paths: std::collections::HashSet<&str> =
         files.iter().map(|(p, _, _)| p.as_str()).collect();
     // Check for new or changed files
     for (path, mtime, size) in &files {
         match meta.get(path.as_str()) {
             Some(prev) if prev.mtime == *mtime && prev.size == *size => continue,
-            _ => return true,
+            _ => return Ok(true),
         }
     }
     // Check for deleted files (in meta but not on disk)
     for path in meta.keys() {
         if !current_paths.contains(path.as_str()) {
-            return true;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 /// Restores the reindex-dirty flag when a *triggered* pass exits before
@@ -90,21 +104,21 @@ impl Drop for DirtyRestore<'_> {
 /// in the meta-tracked source set, so they can only be picked up this way.
 fn scheduled_reindex_tick(
     actor: &IndexWriterActor,
-    config: &ReindexConfig,
     full: bool,
     reindex_dirty: &AtomicBool,
 ) -> Result<()> {
     // Speculative scan — cheap, no writer allocation. `dirty` forces a pass
     // (and is consumed here); a failed pass restores it via the guard.
     let dirty = reindex_dirty.swap(false, Ordering::Relaxed);
-    if !full && !needs_reindex(config) && !dirty {
-        tracing::debug!("auto-reindex: no changes detected");
-        return Ok(());
-    }
     let mut dirty_guard = DirtyRestore {
         flag: reindex_dirty,
         armed: dirty,
     };
+    if !full && !actor.needs_reindex()? && !dirty {
+        dirty_guard.disarm();
+        tracing::debug!("auto-reindex: no changes detected");
+        return Ok(());
+    }
     actor.run_reindex_pass(full, dirty)?;
     // Committed (or a genuine no-op) — the trigger is satisfied; don't replay it.
     dirty_guard.disarm();
@@ -125,6 +139,8 @@ pub(super) fn execute_reindex_pass(
     dirty: bool,
     writer: &mut IndexWriter,
     drain: &mut dyn FnMut(&mut IndexWriter),
+    projects: &Arc<parking_lot::RwLock<ProjectRegistry>>,
+    checkout_access: &Arc<CheckoutAccessBroker>,
 ) -> Result<String> {
     let edges_dir =
         bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&config.projects_path);
@@ -139,10 +155,41 @@ pub(super) fn execute_reindex_pass(
     } else {
         Vec::new()
     };
+    let leased = super::writer_actor::acquire_project_leases(config, projects, checkout_access)?;
+    for access in &leased {
+        if let Some(error) = &access.local_denial {
+            tracing::warn!(
+                project_id = %access.project.project_id,
+                error_code = %error.split(':').next().unwrap_or("checkout_access_denied"),
+                "LocalProjectWalk unavailable; retaining last-good project generation"
+            );
+        }
+        if let Some(error) = &access.git_denial {
+            tracing::warn!(
+                project_id = %access.project.project_id,
+                error_code = %error.split(':').next().unwrap_or("checkout_access_denied"),
+                "GitHistory unavailable during project reindex"
+            );
+        }
+    }
+    let project_access = leased
+        .iter()
+        .map(|project| project.lower())
+        .collect::<Vec<_>>();
+    let unavailable_local = leased
+        .iter()
+        .filter(|access| access.local.is_none() && access.local_denial.is_some())
+        .map(|access| access.project.project_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
     let preserved_collected = if full {
         project_files::collect_preserved_collected_documents(index, config, fields)?
     } else {
         project_files::PreservedCollectedDocuments::default()
+    };
+    let preserved_unavailable = if full {
+        project_files::collect_project_documents(index, fields, &unavailable_local)?
+    } else {
+        Vec::new()
     };
     // Reload meta at pass start (a prior pass may have committed since the
     // scheduler's speculative scan).
@@ -155,11 +202,24 @@ pub(super) fn execute_reindex_pass(
         for document in &preserved_collected.documents {
             writer.add_document(document.clone())?;
         }
+        for document in preserved_unavailable {
+            writer.add_document(document)?;
+        }
         // Don't commit yet — let the rebuild work and the trailing
         // writer.commit() atomically commit delete+adds together.
         // If we commit delete now and a later step fails, the index
         // is empty while _meta.json still says sources are current.
-        HashMap::new()
+        load_meta(&config.meta_path)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_path, row)| {
+                matches!(
+                    &row.source,
+                    FileMetaSource::LocalProjectFile { project_id, .. }
+                        if unavailable_local.contains(project_id)
+                )
+            })
+            .collect()
     } else {
         load_meta(&config.meta_path).unwrap_or_default()
     };
@@ -194,8 +254,9 @@ pub(super) fn execute_reindex_pass(
     drain(writer);
 
     let project_phase = Instant::now();
-    let project_stats = project_files::index_registered_projects_standalone(
+    let project_stats = project_files::index_projects_with_access(
         config,
+        &project_access,
         fields,
         &mut *writer,
         &mut meta,
@@ -277,7 +338,11 @@ pub(super) fn execute_reindex_pass(
 
     // 4b. Purge documents for deleted source files
     let purge_phase = Instant::now();
-    let current_files = scan_all_source_files(config);
+    let mut current_files = scan_non_project_source_files(config);
+    current_files.extend(project_files::scan_project_files_with_access(
+        config,
+        &project_access,
+    )?);
     let current_paths: std::collections::HashSet<String> =
         current_files.iter().map(|(p, _, _)| p.clone()).collect();
     let mut purged = 0u64;
@@ -290,7 +355,8 @@ pub(super) fn execute_reindex_pass(
     for path in &stale_paths {
         match meta.get(path).map(|row| row.source.clone()) {
             Some(FileMetaSource::LocalProjectFile { project_id, .. })
-                if active_collected.contains_key(&project_id) => {}
+                if active_collected.contains_key(&project_id)
+                    || unavailable_local.contains(&project_id) => {}
             Some(FileMetaSource::LocalProjectFile { entry_key, .. }) => {
                 writer.delete_term(Term::from_field_text(
                     fields.code_source_entry_key,
@@ -341,6 +407,7 @@ pub(super) fn execute_reindex_pass(
     // that same commit. Startup can therefore tell whether it must finish the
     // manifest switch or discard an uncommitted journal.
     let commit_phase = Instant::now();
+    super::writer_actor::revalidate_project_leases(checkout_access, &leased)?;
     let pending_journal = if project_stats.pending_local_snapshots.is_empty() {
         None
     } else {
@@ -411,7 +478,7 @@ fn collect_provisional_documents(
 /// `needs_reindex` cannot see still drive one incremental pass.
 pub fn spawn_reindex_thread(
     actor: super::writer_actor::IndexWriterActor,
-    config: ReindexConfig,
+    _config: ReindexConfig,
     interval: Duration,
     reindex_dirty: Arc<AtomicBool>,
 ) {
@@ -445,7 +512,7 @@ pub fn spawn_reindex_thread(
                 tick = tick.wrapping_add(1);
                 let full =
                     full_reindex_every_ticks != 0 && tick.is_multiple_of(full_reindex_every_ticks);
-                if let Err(e) = scheduled_reindex_tick(&actor, &config, full, &reindex_dirty) {
+                if let Err(e) = scheduled_reindex_tick(&actor, full, &reindex_dirty) {
                     tracing::error!("background reindex failed: {:#}", e);
                 }
                 std::thread::sleep(interval);
@@ -727,8 +794,15 @@ mod tests {
 
         // The same scan drives change detection: an adapter session unknown to
         // meta must mark the index dirty.
+        let projects = Arc::new(parking_lot::RwLock::new(
+            ProjectRegistry::open(&config.projects_path).unwrap(),
+        ));
+        let broker = Arc::new(CheckoutAccessBroker::new(
+            Arc::new(crate::checkout_access::DenyCheckoutAccess),
+            crate::checkout_access::CheckoutAccessObservations::in_memory(),
+        ));
         assert!(
-            needs_reindex(&config),
+            needs_reindex(&config, &projects, &broker).unwrap(),
             "new harness session log must trigger needs_reindex"
         );
     }

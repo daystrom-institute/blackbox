@@ -35,7 +35,6 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         tmp.path().join("roadmap.json"),
     )
     .unwrap();
-    let index_writer = crate::index::IndexWriterActor::spawn_for(&index);
     let kb_path = tmp.path().join("knowledge.json");
     let kb = Arc::new(RwLock::new(Knowledge::open(&kb_path).unwrap()));
     let kb_persister = StorePersister::spawn("knowledge-test", kb.clone(), kb_path);
@@ -59,6 +58,31 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
     ));
     let projects_persister =
         StorePersister::spawn("projects-test", projects.clone(), projects_path);
+    let checkout_registry = Arc::new(RwLock::new(
+        bbox_indexing::checkout_registry::CheckoutRegistry::open(
+            &tmp.path().join("checkout-registry.json"),
+        )
+        .unwrap(),
+    ));
+    let checkout_access_observations =
+        bbox_indexing::checkout_access::CheckoutAccessObservations::open(
+            tmp.path().join("checkout-access-observations.json"),
+        )
+        .unwrap();
+    let checkout_access = Arc::new(bbox_indexing::checkout_access::CheckoutAccessBroker::new(
+        Arc::new(
+            bbox_indexing::checkout_access_v1::V1CheckoutAccessAuthority::new(
+                projects.clone(),
+                checkout_registry.clone(),
+            ),
+        ),
+        checkout_access_observations.clone(),
+    ));
+    let index_writer = crate::index::IndexWriterActor::spawn_for_with_checkout_access(
+        &index,
+        projects.clone(),
+        checkout_access.clone(),
+    );
     let packets = Packets::open(tmp.path()).unwrap();
     let artifacts = artifacts::ArtifactCatalog::open(tmp.path().join("artifacts")).unwrap();
     let (tail_tx, _) = broadcast::channel::<TailEvent>(16);
@@ -81,17 +105,9 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         pins_persister,
         projects,
         projects_persister,
-        checkout_registry: Arc::new(RwLock::new(
-            bbox_indexing::checkout_registry::CheckoutRegistry::open(
-                &tmp.path().join("checkout-registry.json"),
-            )
-            .unwrap(),
-        )),
-        checkout_access_observations:
-            bbox_indexing::checkout_access::CheckoutAccessObservations::open(
-                tmp.path().join("checkout-access-observations.json"),
-            )
-            .unwrap(),
+        checkout_registry,
+        checkout_access_observations,
+        checkout_access,
         publisher_refs: RwLock::new(
             bbox_indexing::publisher::PublisherRefStore::open(
                 tmp.path().join("publisher-refs.json"),
