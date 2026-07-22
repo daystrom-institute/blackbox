@@ -407,6 +407,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
             store_dir.join("identities"),
         )),
     });
+    shared.install_code_read_view_commit_hook();
 
     // Start the single-writer task-store persist actor (control-plane starvation
     // fix). Hot paths now signal `request_persist` instead of doing a blocking

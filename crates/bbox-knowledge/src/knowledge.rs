@@ -821,7 +821,16 @@ fn persist_repo_kb_stats(
     if fs::read(&path).map(|cur| cur == new_bytes).unwrap_or(false) {
         return Ok(());
     }
-    bbox_corpus_core::json_store::atomic_write_json_locked(&path, stats)
+    bbox_corpus_core::json_store::atomic_write_json_locked(&path, stats)?;
+    sync_parent_directory(&path)
+}
+
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::File::open(parent)
+        .with_context(|| format!("opening {} for fsync", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("fsync directory {}", parent.display()))
 }
 
 /// A project is "repo-owned" once its `.bbox/knowledge/` directory exists —
@@ -1900,6 +1909,7 @@ impl Knowledge {
         // wrong entry. Unchanged fields are omitted from the summary.
         if let Some(id) = p.id.as_deref() {
             if let Some(entry) = self.store.entries.iter_mut().find(|e| e.id == id) {
+                let prior_entry = entry.clone();
                 let old_title = entry.title.clone();
                 let old_content = entry.content.clone();
                 let old_content_len = entry.content.len();
@@ -1993,8 +2003,17 @@ impl Knowledge {
                 }
 
                 let persisted = self.persist_repo_owned_mutation_at(&[id], write_dir);
+                if let Err(error) = persisted {
+                    if let Some(entry) = self.store.entries.iter_mut().find(|entry| entry.id == id)
+                    {
+                        *entry = prior_entry;
+                    } else {
+                        self.store.entries.push(prior_entry);
+                    }
+                    self.restore_checkout_mutation_seed(update_restore);
+                    return Err(error);
+                }
                 self.restore_checkout_mutation_seed(update_restore);
-                persisted?;
                 let summary = if changes.is_empty() {
                     "no-op (all fields unchanged)".to_string()
                 } else {
@@ -4198,6 +4217,68 @@ mod tests {
                     != Some("json")),
             "an unrelated save must not publish the failed create"
         );
+    }
+
+    #[test]
+    fn failed_base_carrier_update_restores_memory_before_later_save() {
+        let central = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let base_root = base.path().canonicalize().unwrap();
+        std::fs::create_dir_all(repo_kb_dir(&base_root)).unwrap();
+        let project = base_root.to_string_lossy().into_owned();
+        let kb_path = central.path().join("kb.json");
+        let mut kb = Knowledge::open(&kb_path).unwrap();
+        kb.set_project_roots(vec![base_root.clone()]).unwrap();
+        let id = kb
+            .learn_result_with_write_dir(
+                &LearnParams {
+                    content: "published content".into(),
+                    category: "convention".into(),
+                    scope: Some("project".into()),
+                    project: Some(project.clone()),
+                    ..Default::default()
+                },
+                false,
+                Some(&project),
+            )
+            .unwrap()
+            .id;
+        kb.save().unwrap();
+        let valid_central = std::fs::read(&kb_path).unwrap();
+
+        let transaction_root = base_root.join(".bbox/local/knowledge-transactions");
+        std::fs::create_dir_all(transaction_root.join("completed")).unwrap();
+        std::fs::write(transaction_root.join("pending.json"), b"{}\n").unwrap();
+        // Make the persistence helper's reload fallback fail too. The update
+        // path must still restore its direct in-memory snapshot.
+        std::fs::write(&kb_path, b"{not json").unwrap();
+
+        let error = kb
+            .learn_result_with_write_dir(
+                &LearnParams {
+                    id: Some(id.clone()),
+                    content: "failed edit must never leak".into(),
+                    category: "convention".into(),
+                    scope: Some("project".into()),
+                    project: Some(project.clone()),
+                    ..Default::default()
+                },
+                false,
+                Some(&project),
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("claiming knowledge transaction"));
+        assert_eq!(kb.entry(&id).unwrap().content, "published content");
+
+        std::fs::write(&kb_path, valid_central).unwrap();
+        std::fs::remove_file(transaction_root.join("pending.json")).unwrap();
+        kb.save().unwrap();
+
+        let on_disk: KnowledgeEntry = serde_json::from_slice(
+            &std::fs::read(repo_kb_dir(&base_root).join(format!("{id}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(on_disk.content, "published content");
     }
 
     #[test]

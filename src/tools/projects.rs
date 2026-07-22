@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::artifacts;
 use crate::config;
 use crate::edge_index;
-use crate::index::{self, ReindexParams};
+use crate::index;
 use crate::mcp_tools;
 use crate::mcp_tools::provenance::ProvenanceParams;
 use crate::orchestration;
@@ -426,11 +426,7 @@ impl BlackboxServer {
             let reindex = if response.dry_run {
                 None
             } else {
-                let result = server
-                    .state
-                    .idx
-                    .write()
-                    .reindex(&ReindexParams { full: Some(false) })?;
+                let result = server.state.index_writer.run_reindex_pass(false, true)?;
                 server.rebuild_edge_index_from_stores();
                 Some(result)
             };

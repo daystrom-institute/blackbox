@@ -286,6 +286,33 @@ pub(crate) struct WebhookDelivery {
 }
 
 impl SharedState {
+    /// Attach the daemon read-view publisher to the index writer's commit
+    /// boundary. The actor invokes the hook once immediately, then after each
+    /// successful commit, so no startup or small-op batch can leave the pinned
+    /// searcher behind the shared Tantivy reader.
+    pub(crate) fn install_code_read_view_commit_hook(self: &Arc<Self>) {
+        let state = Arc::downgrade(self);
+        self.index_writer
+            .set_post_commit_searcher_hook(move |searcher| {
+                if let Some(state) = state.upgrade() {
+                    state.publish_code_read_searcher(searcher);
+                }
+            });
+    }
+
+    /// Replace only the searcher component of the immutable read view. Holding
+    /// the view write lock while cloning selectors and edges prevents a commit
+    /// refresh from reverting a concurrent code-source activation swap.
+    pub(crate) fn publish_code_read_searcher(&self, searcher: tantivy::Searcher) {
+        let mut published = self.code_read_view.write();
+        let current = published.as_ref();
+        *published = Arc::new(CodeReadView {
+            active_selectors: current.active_selectors.clone(),
+            searcher,
+            edge_index: current.edge_index.clone(),
+        });
+    }
+
     pub(crate) async fn persist_notes_durable(&self) -> anyhow::Result<()> {
         self.notes_persister.request_durable().await
     }
@@ -600,6 +627,95 @@ impl SharedState {
                 store_dir.join("identities"),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod code_read_view_tests {
+    use super::*;
+
+    fn knowledge_entry(content: &str) -> bbox_knowledge::knowledge::KnowledgeEntry {
+        bbox_knowledge::knowledge::KnowledgeEntry {
+            id: "feed1234".into(),
+            title: "pinned view commit test".into(),
+            content: content.into(),
+            cluster: None,
+            variants: Default::default(),
+            category: bbox_knowledge::knowledge::Category::Memory,
+            scope: bbox_knowledge::knowledge::Scope::Global,
+            project: None,
+            providers: Vec::new(),
+            priority: bbox_knowledge::knowledge::Priority::Standard,
+            weight: 100,
+            status: bbox_knowledge::knowledge::Status::Active,
+            approval: bbox_knowledge::knowledge::Approval::UserConfirmed,
+            render: true,
+            decay: true,
+            review_at: None,
+            supersedes: None,
+            links: Vec::new(),
+            rationale: None,
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-07-22T00:00:00Z".into(),
+            updated_at: "2026-07-22T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        }
+    }
+
+    fn pinned_search(state: &SharedState, view: &CodeReadView, query: &str) -> String {
+        state
+            .idx
+            .read()
+            .search_with_active_selectors_and_searcher(
+                &crate::index::SearchParams {
+                    query: query.into(),
+                    mode: None,
+                    account: None,
+                    project: None,
+                    role: None,
+                    include_subagents: None,
+                    limit: Some(5),
+                    exclude_self: None,
+                },
+                &view.active_selectors,
+                &view.searcher,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn ordinary_commit_refreshes_pinned_searcher_without_sidecar_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let state = Arc::new(SharedState::for_test(&root));
+        state.install_code_read_view_commit_hook();
+        let before = state.code_read_view.read().clone();
+        assert!(
+            !pinned_search(&state, &before, "pinnedrefreshsentinel")
+                .contains("pinnedrefreshsentinel")
+        );
+
+        state
+            .index_writer
+            .enqueue(crate::index::IndexWriteOp::UpsertKnowledge(Box::new(
+                knowledge_entry("pinnedrefreshsentinel"),
+            )));
+        state.index_writer.flush_blocking().unwrap();
+
+        let after = state.code_read_view.read().clone();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(before.active_selectors, after.active_selectors);
+        assert!(Arc::ptr_eq(&before.edge_index, &after.edge_index));
+        assert!(
+            pinned_search(&state, &after, "pinnedrefreshsentinel")
+                .contains("pinnedrefreshsentinel")
+        );
+        assert!(
+            !pinned_search(&state, &before, "pinnedrefreshsentinel")
+                .contains("pinnedrefreshsentinel")
+        );
     }
 }
 

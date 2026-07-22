@@ -165,6 +165,7 @@ impl CheckoutRegistry {
 
     fn replace_store(&mut self, next: CheckoutRegistryStore) -> Result<()> {
         atomic_write_json_locked(&self.store_path, &next)?;
+        sync_parent_directory(&self.store_path)?;
         self.store = next;
         self.needs_persist = false;
         Ok(())
@@ -250,6 +251,14 @@ impl CheckoutRegistry {
         }
         Ok(dropped)
     }
+}
+
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(parent)
+        .with_context(|| format!("opening {} for fsync", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("fsync directory {}", parent.display()))
 }
 
 impl CheckoutRow {

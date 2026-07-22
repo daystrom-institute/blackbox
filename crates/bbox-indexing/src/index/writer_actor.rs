@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -94,7 +94,11 @@ pub enum IndexWriteOp {
 #[derive(Clone)]
 pub struct IndexWriterActor {
     tx: mpsc::Sender<IndexWriteOp>,
+    reader: IndexReader,
+    post_commit_hook: Arc<parking_lot::RwLock<Option<PostCommitHook>>>,
 }
+
+type PostCommitHook = Arc<dyn Fn(tantivy::Searcher) + Send + Sync>;
 
 pub struct StagedIndexGeneration {
     result: super::project_files::CollectedIndexResult,
@@ -137,6 +141,7 @@ struct ActorCtx {
     config: ReindexConfig,
     reader: IndexReader,
     stats_cache: StatsCache,
+    post_commit_hook: Arc<parking_lot::RwLock<Option<PostCommitHook>>>,
 }
 
 /// Cap on ops folded into one writer/commit cycle. Bounds worst-case batch
@@ -175,12 +180,14 @@ impl IndexWriterActor {
         stats_cache: StatsCache,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<IndexWriteOp>();
+        let post_commit_hook = Arc::new(parking_lot::RwLock::new(None));
         let ctx = ActorCtx {
             index,
             fields,
             config,
-            reader,
+            reader: reader.clone(),
             stats_cache,
+            post_commit_hook: post_commit_hook.clone(),
         };
         if let Err(err) = std::thread::Builder::new()
             .name("blackbox-index-writer".into())
@@ -191,7 +198,25 @@ impl IndexWriterActor {
         {
             tracing::error!(error = %err, "failed to spawn index writer actor thread");
         }
-        Self { tx }
+        Self {
+            tx,
+            reader,
+            post_commit_hook,
+        }
+    }
+
+    /// Publish a fresh searcher after every successful commit. Installing the
+    /// hook also publishes the reader's current searcher while holding the
+    /// hook write lock, closing the startup race between actor spawn and hook
+    /// registration.
+    pub fn set_post_commit_searcher_hook(
+        &self,
+        hook: impl Fn(tantivy::Searcher) + Send + Sync + 'static,
+    ) {
+        let hook: PostCommitHook = Arc::new(hook);
+        let mut installed = self.post_commit_hook.write();
+        *installed = Some(hook.clone());
+        hook(self.reader.searcher());
     }
 
     /// Queue a mutation, fire-and-forget. A send failure (actor thread dead)
@@ -806,8 +831,15 @@ fn manual_knowledge_store_pass(
 /// stats TTL cache — the same post-write publication the old inline
 /// facade methods performed under the `state.idx` write guard.
 fn post_commit(ctx: &ActorCtx) {
-    if let Err(err) = ctx.reader.reload() {
-        tracing::warn!(error = %err, "index writer actor: reader reload failed");
+    match ctx.reader.reload() {
+        Ok(()) => {
+            if let Some(hook) = ctx.post_commit_hook.read().clone() {
+                hook(ctx.reader.searcher());
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "index writer actor: reader reload failed");
+        }
     }
     *ctx.stats_cache.lock() = None;
 }

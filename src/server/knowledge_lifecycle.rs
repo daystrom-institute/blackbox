@@ -284,19 +284,22 @@ impl BlackboxServer {
         // Global entries live in the host store and do not depend on the
         // session project's publisher or overlay health. Resolve them before
         // preparing the project-scoped own view so an unrelated broken scope
-        // cannot block a global forget/review/link mutation.
-        if provisional_checkout.is_none()
-            && self
-                .state
+        // cannot block a global forget/review/link/update mutation.
+        let authoritative_global = if provisional_checkout.is_none() {
+            self.state
                 .kb
                 .read()
                 .entry(&id)
-                .is_some_and(|entry| entry.scope == Scope::Global)
-        {
+                .filter(|entry| entry.scope == Scope::Global)
+                .cloned()
+        } else {
+            None
+        };
+        if let Some(entry) = authoritative_global {
             return Ok(ExistingKnowledgeMutation {
                 id,
                 carrier: None,
-                seed: None,
+                seed: Some(entry),
                 checkout: None,
             });
         }
@@ -1292,10 +1295,10 @@ mod tests {
     }
 
     #[test]
-    fn global_mutation_is_not_gated_by_missing_project_overlay() {
-        let (_temp, server, _base, worktree, scope) = fixture();
+    fn global_mutations_bypass_broken_project_publisher_and_overlay() {
+        let (_temp, server, base, worktree, scope) = fixture();
         let global = KnowledgeEntry {
-            id: "global-entry".into(),
+            id: "global-update".into(),
             title: "global entry".into(),
             content: "global content".into(),
             cluster: None,
@@ -1321,16 +1324,127 @@ mod tests {
             recall_count: 0,
             last_recalled: None,
         };
-        server.state.kb.write().upsert_generated(global).unwrap();
-        server.set_session_checkout_for_test(scope, "missing-overlay".into(), worktree);
+        for id in [
+            "global-update",
+            "global-link",
+            "global-review",
+            "global-forget",
+        ] {
+            let mut entry = global.clone();
+            entry.id = id.into();
+            if id == "global-review" {
+                entry.approval = Approval::AgentInferred;
+            }
+            server.state.kb.write().upsert_generated(entry).unwrap();
+        }
+        server
+            .state
+            .publisher_refs
+            .write()
+            .repin(&scope, "refs/heads/missing-publisher")
+            .unwrap();
+        server.set_session_checkout_for_test(scope, "broken-overlay".into(), worktree);
+        let checkout = server.authoritative_session_checkout().unwrap();
+        server.state.knowledge_overlays.write().publish(
+            bbox_knowledge::overlay::OverlaySnapshot::invalid(
+                &checkout,
+                "deliberately broken overlay",
+            ),
+        );
+        assert!(
+            server
+                .session_knowledge_view(Some(base.to_str().unwrap()), Some("own"))
+                .is_err(),
+            "fixture must have broken project publisher authority"
+        );
 
-        let mutation = server
-            .prepare_existing_knowledge_mutation("knowledge:global-entry")
+        let update = server
+            .prepare_existing_knowledge_mutation("knowledge:global-update")
+            .unwrap();
+        server
+            .state
+            .kb
+            .write()
+            .learn_result_with_checkout(
+                &bbox_knowledge::knowledge::LearnParams {
+                    id: Some(update.id),
+                    content: "updated global content".into(),
+                    category: "memory".into(),
+                    scope: Some("global".into()),
+                    ..Default::default()
+                },
+                false,
+                None,
+                update.seed.as_ref(),
+            )
             .unwrap();
 
-        assert_eq!(mutation.id, "global-entry");
-        assert!(mutation.carrier.is_none());
-        assert!(mutation.checkout.is_none());
+        let link = server
+            .prepare_existing_knowledge_mutation("knowledge:global-link")
+            .unwrap();
+        server
+            .state
+            .kb
+            .write()
+            .append_link_with_write_dir(
+                &bbox_knowledge::knowledge::KnowledgeLinkParams {
+                    source: format!("knowledge:{}", link.id),
+                    target: "knowledge:global-update".into(),
+                    kind: "RelatesTo".into(),
+                    note: None,
+                    source_arc: None,
+                    confidence: None,
+                },
+                None,
+                link.seed.as_ref(),
+            )
+            .unwrap();
+
+        let review = server
+            .prepare_existing_knowledge_mutation("knowledge:global-review")
+            .unwrap();
+        server
+            .state
+            .kb
+            .write()
+            .review_with_write_dir(
+                &bbox_knowledge::knowledge::ReviewParams {
+                    action: Some("approve".into()),
+                    id: Some(review.id),
+                },
+                None,
+                review.seed.as_ref(),
+            )
+            .unwrap();
+
+        let forget = server
+            .prepare_existing_knowledge_mutation("knowledge:global-forget")
+            .unwrap();
+        server
+            .state
+            .kb
+            .write()
+            .forget_with_write_dir(
+                &bbox_knowledge::knowledge::ForgetParams {
+                    id: forget.id,
+                    superseded_by: None,
+                },
+                None,
+                forget.seed.as_ref(),
+            )
+            .unwrap();
+
+        let kb = server.state.kb.read();
+        assert_eq!(
+            kb.entry("global-update").unwrap().content,
+            "updated global content"
+        );
+        assert_eq!(kb.entry("global-link").unwrap().links.len(), 1);
+        assert_eq!(
+            kb.entry("global-review").unwrap().approval,
+            Approval::UserConfirmed
+        );
+        assert_eq!(kb.entry("global-forget").unwrap().status, Status::Deleted);
     }
 
     #[test]

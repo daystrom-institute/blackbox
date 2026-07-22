@@ -2129,18 +2129,18 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
                         "edge-index watcher: sidecars changed or store nudge, EdgeIndex rebuilt"
                     );
                     last_signature = signature;
-                } else if current > last_seen {
+                } else if current != last_seen {
+                    let searcher = { state.idx.read().searcher() };
+                    state.publish_code_read_searcher(searcher);
                     tracing::debug!(
                         prev_docs = last_seen,
                         new_docs = current,
                         sidecar_files = signature.files,
                         sidecar_bytes = signature.bytes,
-                        "edge-index watcher: corpus grew without sidecar changes; rebuild skipped"
+                        "edge-index watcher: corpus changed without sidecar changes; pinned searcher refreshed"
                     );
                 }
-                if current > last_seen {
-                    last_seen = current;
-                }
+                last_seen = current;
             }
         })
         .expect("failed to spawn edge index rebuild watcher");

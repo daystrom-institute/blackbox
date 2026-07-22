@@ -988,9 +988,8 @@ impl BlackboxServer {
             if server.state.idx.read().is_empty() {
                 server
                     .state
-                    .idx
-                    .write()
-                    .build_index(false)
+                    .index_writer
+                    .run_reindex_pass(false, true)
                     .map_err(|e| anyhow::anyhow!("auto-index failed: {e}"))?;
             }
             impl_work_tool_calls(&server.state.idx.read(), &p)

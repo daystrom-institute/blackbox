@@ -43,9 +43,8 @@ impl BlackboxServer {
             if server.state.idx.read().is_empty() {
                 server
                     .state
-                    .idx
-                    .write()
-                    .build_index(false)
+                    .index_writer
+                    .run_reindex_pass(false, true)
                     .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
             let read_view = server.state.code_read_view.read().clone();
@@ -90,9 +89,8 @@ impl BlackboxServer {
             if server.state.idx.read().is_empty() {
                 server
                     .state
-                    .idx
-                    .write()
-                    .build_index(false)
+                    .index_writer
+                    .run_reindex_pass(false, true)
                     .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
             let read_view = server.state.code_read_view.read().clone();
@@ -127,9 +125,8 @@ impl BlackboxServer {
             if server.state.idx.read().is_empty() {
                 server
                     .state
-                    .idx
-                    .write()
-                    .build_index(false)
+                    .index_writer
+                    .run_reindex_pass(false, true)
                     .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
             let knowledge_view =
@@ -164,9 +161,8 @@ impl BlackboxServer {
             if server.state.idx.read().is_empty() {
                 server
                     .state
-                    .idx
-                    .write()
-                    .build_index(false)
+                    .index_writer
+                    .run_reindex_pass(false, true)
                     .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
             let knowledge_view =
