@@ -33,12 +33,15 @@ pub(super) struct OpenedServer {
 }
 
 fn sync_project_aliases_at_startup(
-    projects: &mut ProjectRegistry,
-    load_aliases: impl Fn(&Path) -> anyhow::Result<std::collections::BTreeSet<String>>,
+    projects: &Arc<RwLock<ProjectRegistry>>,
+    load_aliases: impl Fn(
+        &bbox_corpus_core::project_record::ProjectRecord,
+    ) -> anyhow::Result<std::collections::BTreeSet<String>>,
 ) -> bool {
     let mut dirty = false;
-    for record in projects.list() {
-        let declared = match load_aliases(Path::new(&record.canonical_path)) {
+    let records = projects.read().list();
+    for record in records {
+        let declared = match load_aliases(&record) {
             Ok(declared) => declared,
             Err(error) => {
                 // The committed config is authoritative only when it was read
@@ -48,7 +51,10 @@ fn sync_project_aliases_at_startup(
                 continue;
             }
         };
-        match projects.sync_declared_aliases(&record.project_id, &declared) {
+        match projects
+            .write()
+            .sync_declared_aliases(&record.project_id, &declared)
+        {
             Ok(changed) => dirty |= changed,
             Err(error) => tracing::warn!("alias sync for {}: {error:#}", record.project_id),
         }
@@ -68,6 +74,73 @@ fn open_checkout_registry(store_dir: &Path) -> bbox_indexing::checkout_registry:
         );
     }
     registry
+}
+
+fn backfill_project_languages(
+    projects: &Arc<RwLock<ProjectRegistry>>,
+    checkout_access: &bbox_indexing::checkout_access::CheckoutAccessBroker,
+) -> bool {
+    use bbox_indexing::checkout_access::{
+        CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest, CheckoutAccessSourceLane,
+        CheckoutAttachmentSelector,
+    };
+
+    let records = projects.read().list();
+    let mut changed = false;
+    for project in records {
+        if !project.languages.is_empty() {
+            continue;
+        }
+        let scope_lease = match checkout_access.acquire(CheckoutAccessRequest {
+            project_id: project.project_id.clone(),
+            attachment: CheckoutAttachmentSelector::Selected,
+            expected_scope: None,
+            kind: CheckoutAccessKind::PublisherConfigTreeRead,
+            intent: CheckoutAccessIntent::Read,
+            source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+        }) {
+            Ok(lease) => lease,
+            Err(error) => {
+                tracing::warn!(
+                    project_id = %project.project_id,
+                    error_code = %error.code.as_str(),
+                    "language backfill skipped because scope discovery is unavailable"
+                );
+                continue;
+            }
+        };
+        let lease = match checkout_access.acquire(CheckoutAccessRequest {
+            project_id: project.project_id.clone(),
+            attachment: CheckoutAttachmentSelector::Selected,
+            expected_scope: scope_lease.published_scope().cloned(),
+            kind: CheckoutAccessKind::LocalProjectWalk,
+            intent: CheckoutAccessIntent::Read,
+            source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+        }) {
+            Ok(lease) => lease,
+            Err(error) => {
+                tracing::warn!(
+                    project_id = %project.project_id,
+                    error_code = %error.code.as_str(),
+                    "language backfill skipped because LocalProjectWalk is unavailable"
+                );
+                continue;
+            }
+        };
+        let languages = bbox_indexing::projects::detect_languages(lease.project_root());
+        if let Err(error) = checkout_access.revalidate(&lease) {
+            tracing::warn!(
+                project_id = %project.project_id,
+                error_code = %error.code.as_str(),
+                "language backfill discarded because checkout authority changed"
+            );
+            continue;
+        }
+        changed |= projects
+            .write()
+            .backfill_languages(&project.project_id, languages);
+    }
+    changed
 }
 
 pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
@@ -99,6 +172,26 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     let kb_path = cfg.paths.knowledge_path.clone();
     let th_path = cfg.paths.threads_path.clone();
     let rm_path = cfg.paths.roadmap_path.clone();
+    let store_dir = cfg.paths.bro_home.clone();
+    let (projects_registry, mut projects_needs_persist) =
+        ProjectRegistry::open_with_backfill_status(&projects_path)?;
+    let projects_store = Arc::new(RwLock::new(projects_registry));
+    let checkout_registry = Arc::new(RwLock::new(open_checkout_registry(&store_dir)));
+    let checkout_access_observations =
+        bbox_indexing::checkout_access::CheckoutAccessObservations::open(
+            store_dir.join("checkout-access-observations.json"),
+        )?;
+    let checkout_access = Arc::new(bbox_indexing::checkout_access::CheckoutAccessBroker::new(
+        Arc::new(
+            bbox_indexing::checkout_access_v1::V1CheckoutAccessAuthority::new(
+                projects_store.clone(),
+                checkout_registry.clone(),
+            ),
+        ),
+        checkout_access_observations.clone(),
+    ));
+    projects_needs_persist |= backfill_project_languages(&projects_store, &checkout_access);
+
     let mut idx = TranscriptIndex::open_or_create_with_code_source_store_path(
         &index_path,
         roots,
@@ -126,9 +219,11 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     // The daemon's single tantivy writer: every index mutation and reindex
     // pass flows through this actor (concurrency-model §4.3). Spawned AFTER
     // all ReindexConfig mutation — the actor clones the config at spawn.
-    let index_writer = crate::index::IndexWriterActor::spawn_for(&idx);
-    let (mut projects_store, mut projects_needs_persist) =
-        ProjectRegistry::open_with_backfill_status(&projects_path)?;
+    let index_writer = crate::index::IndexWriterActor::spawn_for_with_checkout_access(
+        &idx,
+        projects_store.clone(),
+        checkout_access.clone(),
+    );
     tracing::info!("Project registry: {}", projects_path.display());
     // Materialize repo-declared aliases (`[project] aliases` in each repo's
     // committed `.bbox/config.toml`) into the registry. Boot cannot fail
@@ -136,9 +231,26 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     // skipped with a warning — the alias simply never materializes, and
     // resolution fails closed by absence. Records are sorted by
     // canonical_path, so first-claim-wins is deterministic across boots.
-    projects_needs_persist |= sync_project_aliases_at_startup(&mut projects_store, |path| {
-        crate::config::load_project_at_ref(path, "HEAD")
-            .map(|config| config.project.aliases.into_iter().collect())
+    projects_needs_persist |= sync_project_aliases_at_startup(&projects_store, |project| {
+        use bbox_indexing::checkout_access::{
+            CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest,
+            CheckoutAccessSourceLane, CheckoutAttachmentSelector,
+        };
+        let lease = checkout_access.acquire(CheckoutAccessRequest {
+            project_id: project.project_id.clone(),
+            attachment: CheckoutAttachmentSelector::Selected,
+            expected_scope: None,
+            kind: CheckoutAccessKind::PublisherConfigTreeRead,
+            intent: CheckoutAccessIntent::Read,
+            source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+        })?;
+        let aliases = crate::config::load_project_at_ref(lease.project_root(), "HEAD")?
+            .project
+            .aliases
+            .into_iter()
+            .collect();
+        checkout_access.revalidate(&lease)?;
+        Ok(aliases)
     });
 
     let path_fallback_cut = bbox_knowledge::inventory::path_fallback_was_cut(&cfg.paths.bro_home)?;
@@ -152,6 +264,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     // purge the committed .bbox/knowledge files for a repo-owned project.
     {
         let kb_roots: Vec<std::path::PathBuf> = projects_store
+            .read()
             .list()
             .into_iter()
             .map(|r| std::path::PathBuf::from(r.canonical_path))
@@ -173,6 +286,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     tracing::info!("Gap store: {}", gaps_path.display());
     {
         let gap_roots: Vec<std::path::PathBuf> = projects_store
+            .read()
             .list()
             .into_iter()
             .map(|r| std::path::PathBuf::from(r.canonical_path))
@@ -227,7 +341,6 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     let pins_persister = StorePersister::spawn("pins", pins_store.clone(), pins_path.clone());
     tracing::info!("Pins store: {}", pins_path.display());
 
-    let projects_store = Arc::new(RwLock::new(projects_store));
     let projects_persister =
         StorePersister::spawn("projects", projects_store.clone(), projects_path.clone());
     if projects_needs_persist {
@@ -247,7 +360,6 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     tracing::info!("Artifact catalog: {}", artifacts_store.root().display());
     backfill_artifact_hashes(&artifacts_store);
 
-    let store_dir = cfg.paths.bro_home.clone();
     // Keep daemon-side transcript discovery on the configured harness-session
     // root. Each standalone harness child also receives this path explicitly
     // in its own environment at spawn.
@@ -327,11 +439,9 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         pins_persister,
         projects: projects_store,
         projects_persister,
-        checkout_registry: Arc::new(RwLock::new(open_checkout_registry(&store_dir))),
-        checkout_access_observations:
-            bbox_indexing::checkout_access::CheckoutAccessObservations::open(
-                store_dir.join("checkout-access-observations.json"),
-            )?,
+        checkout_registry,
+        checkout_access_observations,
+        checkout_access,
         // Publisher refs define authority and cannot be reconstructed from
         // checkout discovery without silently moving published truth. Keep
         // corrupt pins fail-closed even though the checkout census below is a
@@ -550,27 +660,50 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let mut registry = ProjectRegistry::open(&temp.path().join("projects.json")).unwrap();
-        let record = registry.register_path(&project).unwrap();
+        let registry = Arc::new(RwLock::new(
+            ProjectRegistry::open(&temp.path().join("projects.json")).unwrap(),
+        ));
+        let record = registry.write().register_path(&project).unwrap();
         registry
+            .write()
             .sync_declared_aliases(
                 &record.project_id,
                 &BTreeSet::from(["durable-alias".to_string()]),
             )
             .unwrap();
 
-        let changed = sync_project_aliases_at_startup(&mut registry, |_| {
+        let changed = sync_project_aliases_at_startup(&registry, |_| {
             anyhow::bail!("committed config temporarily unreadable")
         });
 
         assert!(!changed);
         assert_eq!(
             registry
+                .read()
                 .resolve("durable-alias")
                 .unwrap()
                 .unwrap()
                 .project_id,
             record.project_id
         );
+    }
+
+    #[test]
+    fn language_backfill_does_not_walk_without_checkout_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let projects = Arc::new(RwLock::new(
+            ProjectRegistry::open(temp.path().join("projects.json")).unwrap(),
+        ));
+        projects.write().register_path(&project).unwrap();
+        std::fs::write(project.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let broker = bbox_indexing::checkout_access::CheckoutAccessBroker::new(
+            Arc::new(bbox_indexing::checkout_access::DenyCheckoutAccess),
+            bbox_indexing::checkout_access::CheckoutAccessObservations::in_memory(),
+        );
+
+        assert!(!backfill_project_languages(&projects, &broker));
+        assert!(projects.read().list()[0].languages.is_empty());
     }
 }

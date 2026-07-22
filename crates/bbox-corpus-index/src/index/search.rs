@@ -1593,6 +1593,21 @@ impl TranscriptIndex {
     }
 
     pub fn build_index(&mut self, full: bool) -> Result<String> {
+        let projects =
+            bbox_corpus_core::project_record::load_project_records(&self.config.projects_path)?;
+        if !projects.is_empty() {
+            anyhow::bail!(
+                "registered-project reindex requires caller-supplied validated checkout roots"
+            );
+        }
+        self.build_index_with_project_access(full, &[])
+    }
+
+    pub fn build_index_with_project_access(
+        &mut self,
+        full: bool,
+        project_access: &[project_files::ProjectIndexAccess<'_>],
+    ) -> Result<String> {
         let mut writer: IndexWriter = self.index.writer(100_000_000)?;
         // Incremental rebuilds use the same conservative policy as the
         // background reindexer: bounded segment fanout without the default
@@ -1646,8 +1661,9 @@ impl TranscriptIndex {
             !full,
         )?;
 
-        let project_stats = project_files::index_registered_projects_standalone(
+        let project_stats = project_files::index_projects_with_access(
             &self.config,
+            project_access,
             f,
             &mut writer,
             &mut meta,
@@ -1678,7 +1694,11 @@ impl TranscriptIndex {
         }
 
         // Purge documents for deleted source files
-        let current_files = scan_all_source_files(&self.config);
+        let mut current_files = scan_non_project_source_files(&self.config);
+        current_files.extend(project_files::scan_project_files_with_access(
+            &self.config,
+            project_access,
+        )?);
         let current_paths: std::collections::HashSet<String> =
             current_files.iter().map(|(p, _, _)| p.clone()).collect();
         let mut purged = 0u64;
@@ -1794,7 +1814,10 @@ mod agentic_project_file_tests {
     /// Write a minimal projects.json registering `root`, using the same
     /// id/path derivations as the daemon-side registry. Direct JSON write:
     /// the engine reads the registry file, it never mutates it.
-    fn register_test_project(projects_path: &std::path::Path, root: &std::path::Path) {
+    fn register_test_project(
+        projects_path: &std::path::Path,
+        root: &std::path::Path,
+    ) -> ProjectRecord {
         let canonical = bbox_corpus_core::entity_ref::canonical_input_path(root).unwrap();
         let record = ProjectRecord {
             project_id: bbox_corpus_core::entity_ref::project_id_for_path(&canonical).unwrap(),
@@ -1807,9 +1830,10 @@ mod agentic_project_file_tests {
         };
         std::fs::write(
             projects_path,
-            serde_json::json!({"version": 1, "projects": [record]}).to_string(),
+            serde_json::json!({"version": 1, "projects": [record.clone()]}).to_string(),
         )
         .unwrap();
+        record
     }
 
     #[test]
@@ -1822,7 +1846,7 @@ mod agentic_project_file_tests {
             .ancestors()
             .nth(2)
             .unwrap();
-        register_test_project(&projects_path, repo_root);
+        let project = register_test_project(&projects_path, repo_root);
 
         let mut index = TranscriptIndex::open_or_create(
             &dir.path().join("index"),
@@ -1834,7 +1858,14 @@ mod agentic_project_file_tests {
             dir.path().join("roadmap.json"),
         )
         .unwrap();
-        let msg = index.build_index(false).unwrap();
+        let access = project_files::ProjectIndexAccess {
+            project: &project,
+            local_root: Some(repo_root),
+            git_root: project.repo_id.as_ref().map(|_| repo_root),
+        };
+        let msg = index
+            .build_index_with_project_access(false, &[access])
+            .unwrap();
         assert!(msg.contains("Indexed"));
 
         let design_hits = index
@@ -1883,7 +1914,9 @@ mod agentic_project_file_tests {
             .unwrap();
         assert!(display_hits.contains("src/entity_ref.rs"));
 
-        let rerun = index.build_index(false).unwrap();
+        let rerun = index
+            .build_index_with_project_access(false, &[access])
+            .unwrap();
         assert!(rerun.contains("skipped"));
     }
 
@@ -1910,7 +1943,7 @@ mod agentic_project_file_tests {
         );
 
         let projects_path = dir.path().join("projects.json");
-        register_test_project(&projects_path, &repo);
+        let project = register_test_project(&projects_path, &repo);
         let mut index = TranscriptIndex::open_or_create(
             &dir.path().join("index"),
             Vec::new(),
@@ -1921,7 +1954,16 @@ mod agentic_project_file_tests {
             dir.path().join("roadmap.json"),
         )
         .unwrap();
-        index.build_index(false).unwrap();
+        index
+            .build_index_with_project_access(
+                false,
+                &[project_files::ProjectIndexAccess {
+                    project: &project,
+                    local_root: Some(&repo),
+                    git_root: Some(&repo),
+                }],
+            )
+            .unwrap();
 
         let hits = index
             .search(&SearchParams {

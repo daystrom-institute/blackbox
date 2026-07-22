@@ -15,7 +15,6 @@ use tantivy::schema::*;
 use tantivy::{Index, IndexWriter};
 use walkdir::WalkDir;
 
-use super::project_files;
 use super::tool_edges::ToolEdgeContext;
 use super::{FieldHandles, FileMeta, ReindexConfig};
 use crate::transcripts::adapters::{
@@ -178,6 +177,12 @@ pub fn scan_adapter_source_files(config: &ReindexConfig, files: &mut Vec<(String
 }
 
 pub fn scan_all_source_files(config: &ReindexConfig) -> Vec<(String, u64, u64)> {
+    scan_non_project_source_files(config)
+}
+
+/// Scan every non-project source. Daemon reindex appends project files from
+/// lease-backed roots before applying purge or change detection.
+pub fn scan_non_project_source_files(config: &ReindexConfig) -> Vec<(String, u64, u64)> {
     let mut files = scan_source_files(config);
     if config.knowledge_path.exists() {
         scan_single_file(&config.knowledge_path, &mut files);
@@ -187,10 +192,6 @@ pub fn scan_all_source_files(config: &ReindexConfig) -> Vec<(String, u64, u64)> 
     }
     if config.roadmap_path.exists() {
         scan_single_file(&config.roadmap_path, &mut files);
-    }
-    match project_files::scan_registered_project_files(config) {
-        Ok(mut project_files) => files.append(&mut project_files),
-        Err(err) => tracing::warn!(error = %err, "failed to scan registered project files"),
     }
     scan_adapter_source_files(config, &mut files);
     // Adapter-owned files can overlap the roots walk (interactive claude/codex

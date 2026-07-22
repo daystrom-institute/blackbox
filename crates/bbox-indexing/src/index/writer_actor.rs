@@ -40,6 +40,11 @@ use bbox_threads::threads::Thread;
 use super::knowledge_docs::KnowledgeIndexDocument;
 use super::reindex::{conservative_log_merge_policy, execute_reindex_pass};
 use super::{FieldHandles, ReindexConfig, StatsCache, TranscriptIndex};
+use crate::checkout_access::{
+    CheckoutAccessBroker, CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest,
+    CheckoutAccessSourceLane, CheckoutAttachmentSelector, ValidatedCheckoutLease,
+};
+use crate::projects::ProjectRegistry;
 
 /// One queued index mutation.
 pub enum IndexWriteOp {
@@ -96,6 +101,9 @@ pub struct IndexWriterActor {
     tx: mpsc::Sender<IndexWriteOp>,
     reader: IndexReader,
     post_commit_hook: Arc<parking_lot::RwLock<Option<PostCommitHook>>>,
+    checkout_access: Arc<CheckoutAccessBroker>,
+    projects: Arc<parking_lot::RwLock<ProjectRegistry>>,
+    config: ReindexConfig,
 }
 
 type PostCommitHook = Arc<dyn Fn(tantivy::Searcher) + Send + Sync>;
@@ -142,6 +150,123 @@ struct ActorCtx {
     reader: IndexReader,
     stats_cache: StatsCache,
     post_commit_hook: Arc<parking_lot::RwLock<Option<PostCommitHook>>>,
+    checkout_access: Arc<CheckoutAccessBroker>,
+    projects: Arc<parking_lot::RwLock<ProjectRegistry>>,
+}
+
+pub(super) struct LeasedProjectAccess {
+    pub(super) project: ProjectRecord,
+    pub(super) local: Option<ValidatedCheckoutLease>,
+    pub(super) local_denial: Option<String>,
+    pub(super) git: Option<ValidatedCheckoutLease>,
+    pub(super) git_denial: Option<String>,
+}
+
+impl LeasedProjectAccess {
+    pub(super) fn lower(&self) -> super::project_files::ProjectIndexAccess<'_> {
+        super::project_files::ProjectIndexAccess {
+            project: &self.project,
+            local_root: self
+                .local
+                .as_ref()
+                .map(ValidatedCheckoutLease::project_root),
+            git_root: self.git.as_ref().map(ValidatedCheckoutLease::checkout_root),
+        }
+    }
+}
+
+pub(super) fn acquire_project_leases(
+    config: &ReindexConfig,
+    projects: &Arc<parking_lot::RwLock<ProjectRegistry>>,
+    broker: &Arc<CheckoutAccessBroker>,
+) -> Result<Vec<LeasedProjectAccess>> {
+    let collected = super::project_files::active_collected_sources(config)?;
+    let records = projects.read().list();
+    records
+        .into_iter()
+        .map(|project| {
+            let scope = broker.acquire(access_request(
+                &project,
+                None,
+                CheckoutAccessKind::PublisherConfigTreeRead,
+            ));
+            let expected_scope = scope
+                .as_ref()
+                .ok()
+                .and_then(|lease| lease.published_scope().cloned());
+            let (local, local_denial) = if collected.contains_key(&project.project_id) {
+                (None, None)
+            } else {
+                match broker.acquire(access_request(
+                    &project,
+                    expected_scope.clone(),
+                    CheckoutAccessKind::LocalProjectWalk,
+                )) {
+                    Ok(lease) => (Some(lease), None),
+                    Err(error) => (None, Some(error.to_string())),
+                }
+            };
+            let (git, git_denial) = if project.repo_id.is_some() {
+                match broker.acquire(access_request(
+                    &project,
+                    expected_scope,
+                    CheckoutAccessKind::GitHistory,
+                )) {
+                    Ok(lease) => (Some(lease), None),
+                    Err(error) => (None, Some(error.to_string())),
+                }
+            } else {
+                (None, None)
+            };
+            Ok(LeasedProjectAccess {
+                project,
+                local,
+                local_denial,
+                git,
+                git_denial,
+            })
+        })
+        .collect()
+}
+
+pub(super) fn revalidate_project_leases(
+    broker: &CheckoutAccessBroker,
+    projects: &[LeasedProjectAccess],
+) -> Result<()> {
+    for access in projects {
+        if let Some(local) = &access.local {
+            broker.revalidate(local).with_context(|| {
+                format!(
+                    "LocalProjectWalk authority changed for project {}",
+                    access.project.project_id
+                )
+            })?;
+        }
+        if let Some(git) = &access.git {
+            broker.revalidate(git).with_context(|| {
+                format!(
+                    "GitHistory authority changed for project {}",
+                    access.project.project_id
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn access_request(
+    project: &ProjectRecord,
+    expected_scope: Option<bbox_corpus_core::identity::PublishedScope>,
+    kind: CheckoutAccessKind,
+) -> CheckoutAccessRequest {
+    CheckoutAccessRequest {
+        project_id: project.project_id.clone(),
+        attachment: CheckoutAttachmentSelector::Selected,
+        expected_scope,
+        kind,
+        intent: CheckoutAccessIntent::Read,
+        source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+    }
 }
 
 /// Cap on ops folded into one writer/commit cycle. Bounds worst-case batch
@@ -161,7 +286,37 @@ impl IndexWriterActor {
     /// manual-rebuild store-document pass): every spawn point is a daemon
     /// boot path, so this is the single place store-side wiring attaches
     /// to the engine.
+    #[cfg(test)]
     pub fn spawn_for(idx: &TranscriptIndex) -> Self {
+        let projects = Arc::new(parking_lot::RwLock::new(
+            ProjectRegistry::open(&idx.reindex_config().projects_path)
+                .expect("opening standalone project registry for index writer"),
+        ));
+        let checkout_path = idx
+            .reindex_config()
+            .projects_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("checkout-registry.json");
+        let checkouts = Arc::new(parking_lot::RwLock::new(
+            crate::checkout_registry::CheckoutRegistry::open(&checkout_path)
+                .expect("opening standalone checkout registry for index writer"),
+        ));
+        let authority =
+            crate::checkout_access_v1::V1CheckoutAccessAuthority::new(projects.clone(), checkouts);
+        let broker = Arc::new(CheckoutAccessBroker::new(
+            Arc::new(authority),
+            crate::checkout_access::CheckoutAccessObservations::in_memory(),
+        ));
+        Self::spawn_for_with_checkout_access(idx, projects, broker)
+    }
+
+    /// Spawn against the daemon's single shared registry and access broker.
+    pub fn spawn_for_with_checkout_access(
+        idx: &TranscriptIndex,
+        projects: Arc<parking_lot::RwLock<ProjectRegistry>>,
+        checkout_access: Arc<CheckoutAccessBroker>,
+    ) -> Self {
         register_index_store_hooks();
         Self::spawn(
             idx.index_handle(),
@@ -169,6 +324,8 @@ impl IndexWriterActor {
             idx.reindex_config(),
             idx.reader_handle(),
             idx.stats_cache_handle(),
+            projects,
+            checkout_access,
         )
     }
 
@@ -178,16 +335,20 @@ impl IndexWriterActor {
         config: ReindexConfig,
         reader: IndexReader,
         stats_cache: StatsCache,
+        projects: Arc<parking_lot::RwLock<ProjectRegistry>>,
+        checkout_access: Arc<CheckoutAccessBroker>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<IndexWriteOp>();
         let post_commit_hook = Arc::new(parking_lot::RwLock::new(None));
         let ctx = ActorCtx {
             index,
             fields,
-            config,
+            config: config.clone(),
             reader: reader.clone(),
             stats_cache,
             post_commit_hook: post_commit_hook.clone(),
+            checkout_access: checkout_access.clone(),
+            projects: projects.clone(),
         };
         if let Err(err) = std::thread::Builder::new()
             .name("blackbox-index-writer".into())
@@ -202,6 +363,9 @@ impl IndexWriterActor {
             tx,
             reader,
             post_commit_hook,
+            checkout_access,
+            projects,
+            config,
         }
     }
 
@@ -238,6 +402,10 @@ impl IndexWriterActor {
         ack_rx
             .recv()
             .map_err(|_| anyhow!("index writer actor dropped the reindex ack"))?
+    }
+
+    pub fn needs_reindex(&self) -> Result<bool> {
+        super::reindex::needs_reindex(&self.config, &self.projects, &self.checkout_access)
     }
 
     pub fn stage_collected_generation(
@@ -442,26 +610,99 @@ fn run_collected_stage(
     entries: &[bbox_code_source::ManifestEntry],
     store: &bbox_code_source_store::CodeSourceStore,
 ) -> Result<super::project_files::CollectedIndexResult> {
-    let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
-    writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
+    let git_lease = if project.repo_id.is_some() {
+        match ctx.checkout_access.acquire(access_request(
+            project,
+            Some(descriptor.scope.clone()),
+            CheckoutAccessKind::GitHistory,
+        )) {
+            Ok(lease) => {
+                if let Err(error) =
+                    store.clear_health_failure(&project.project_id, "git_history_unavailable")
+                {
+                    tracing::warn!(
+                        project_id = %project.project_id,
+                        error = %error,
+                        "failed to clear GitHistory degradation record"
+                    );
+                }
+                Some(lease)
+            }
+            Err(error) => {
+                if let Err(record_error) = store.record_health_failure(
+                    &project.project_id,
+                    "git_history_unavailable",
+                    &format!("GitHistory access unavailable: {}", error.code.as_str()),
+                ) {
+                    tracing::warn!(
+                        project_id = %project.project_id,
+                        error = %record_error,
+                        "failed to persist GitHistory degradation record"
+                    );
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
     let edges_dir =
         bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&ctx.config.projects_path);
-    let result = super::project_files::stage_collected_project_generation(
+    let stage_code = |writer: &mut IndexWriter| {
+        super::project_files::stage_collected_project_generation(
+            project,
+            descriptor,
+            generation_id,
+            entries,
+            ctx.fields,
+            writer,
+            &edges_dir,
+            |entry| {
+                let mut file = store.verified_blob_file(&entry.content_sha256, entry.size)?;
+                let mut bytes = Vec::with_capacity(entry.size as usize);
+                std::io::Read::read_to_end(&mut file, &mut bytes)?;
+                Ok(bytes)
+            },
+        )
+    };
+    let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
+    writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
+    let mut result = stage_code(&mut writer)?;
+    stage_git_current_edges(
+        ctx,
         project,
-        descriptor,
-        generation_id,
-        entries,
-        ctx.fields,
+        git_lease
+            .as_ref()
+            .map(ValidatedCheckoutLease::checkout_root),
+        &result,
         &mut writer,
         &edges_dir,
-        |entry| {
-            let mut file = store.verified_blob_file(&entry.content_sha256, entry.size)?;
-            let mut bytes = Vec::with_capacity(entry.size as usize);
-            std::io::Read::read_to_end(&mut file, &mut bytes)?;
-            Ok(bytes)
-        },
     )?;
-    stage_git_current_edges(ctx, project, &result, &mut writer, &edges_dir)?;
+    if let Some(git_lease) = &git_lease
+        && let Err(error) = ctx.checkout_access.revalidate(git_lease)
+    {
+        tracing::warn!(
+            project_id = %project.project_id,
+            error_code = %error.code.as_str(),
+            "GitHistory authority changed during collected staging; retrying path-free"
+        );
+        if let Err(record_error) = store.record_health_failure(
+            &project.project_id,
+            "git_history_unavailable",
+            &format!("GitHistory authority changed: {}", error.code.as_str()),
+        ) {
+            tracing::warn!(
+                project_id = %project.project_id,
+                error = %record_error,
+                "failed to persist GitHistory degradation record"
+            );
+        }
+        drop(writer);
+        writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
+        writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
+        result = stage_code(&mut writer)?;
+        stage_git_current_edges(ctx, project, None, &result, &mut writer, &edges_dir)?;
+    }
     writer.commit()?;
     post_commit(ctx);
     Ok(result)
@@ -472,6 +713,16 @@ fn run_local_stage(
     project: &ProjectRecord,
     scope: &bbox_corpus_core::identity::PublishedScope,
 ) -> Result<super::project_files::CollectedIndexResult> {
+    let local_lease = ctx.checkout_access.acquire(access_request(
+        project,
+        Some(scope.clone()),
+        CheckoutAccessKind::LocalProjectWalk,
+    ))?;
+    let git_lease = ctx.checkout_access.acquire(access_request(
+        project,
+        Some(scope.clone()),
+        CheckoutAccessKind::GitHistory,
+    ))?;
     let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
     writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
     let edges_dir =
@@ -479,11 +730,22 @@ fn run_local_stage(
     let result = super::project_files::stage_local_project_generation(
         project,
         scope,
+        local_lease.project_root(),
+        git_lease.checkout_root(),
         ctx.fields,
         &mut writer,
         &edges_dir,
     )?;
-    stage_git_current_edges(ctx, project, &result, &mut writer, &edges_dir)?;
+    stage_git_current_edges(
+        ctx,
+        project,
+        Some(git_lease.checkout_root()),
+        &result,
+        &mut writer,
+        &edges_dir,
+    )?;
+    ctx.checkout_access.revalidate(&local_lease)?;
+    ctx.checkout_access.revalidate(&git_lease)?;
     writer.commit()?;
     post_commit(ctx);
     Ok(result)
@@ -492,11 +754,20 @@ fn run_local_stage(
 fn stage_git_current_edges(
     ctx: &ActorCtx,
     project: &ProjectRecord,
+    git_root: Option<&Path>,
     result: &super::project_files::CollectedIndexResult,
     writer: &mut IndexWriter,
     edges_dir: &Path,
 ) -> Result<()> {
-    let root = Path::new(&project.canonical_path);
+    let Some(root) = git_root else {
+        let no_edges: &[bbox_edge_sidecar::edge_sidecar::Edge] = &[];
+        return bbox_edge_sidecar::snapshot::write_snapshot_files(
+            edges_dir,
+            &project.project_id,
+            &result.snapshot_id,
+            &[("git-current.jsonl", no_edges)],
+        );
+    };
     let git_meta_dir =
         super::git_history::git_meta_dir_from_projects_path(&ctx.config.projects_path);
     let mut meta = HashMap::new();
@@ -668,6 +939,8 @@ fn run_pass(
             dirty,
             &mut writer,
             &mut drain,
+            &ctx.projects,
+            &ctx.checkout_access,
         )
     };
     if outcome.is_ok() {
@@ -874,6 +1147,7 @@ fn create_writer(index: &Index, heap: usize) -> Result<IndexWriter> {
 mod tests {
     use super::*;
     use crate::index::{SearchParams, TranscriptIndex};
+    use std::process::Command;
 
     fn test_entry(id: &str, content: &str) -> KnowledgeEntry {
         KnowledgeEntry {
@@ -916,6 +1190,229 @@ mod tests {
             dir.join("roadmap.json"),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn reindex_access_plan_counts_each_local_and_git_lease_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project_root = root.join("project");
+        std::fs::create_dir_all(project_root.join(".bbox")).unwrap();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@example.test"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&project_root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        }
+        std::fs::write(
+            project_root.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"repo-family\"\n",
+        )
+        .unwrap();
+        std::fs::write(project_root.join("README.md"), "fixture\n").unwrap();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["add", "."])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["commit", "-m", "fixture"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+
+        let projects = Arc::new(parking_lot::RwLock::new(
+            ProjectRegistry::open(root.join("projects.json")).unwrap(),
+        ));
+        projects.write().register_path(&project_root).unwrap();
+        let checkouts = Arc::new(parking_lot::RwLock::new(
+            crate::checkout_registry::CheckoutRegistry::open(&root.join("checkout-registry.json"))
+                .unwrap(),
+        ));
+        let observations = crate::checkout_access::CheckoutAccessObservations::in_memory();
+        let broker = Arc::new(CheckoutAccessBroker::new(
+            Arc::new(crate::checkout_access_v1::V1CheckoutAccessAuthority::new(
+                projects.clone(),
+                checkouts,
+            )),
+            observations,
+        ));
+        let index = test_index(&root);
+        let leased = acquire_project_leases(&index.reindex_config(), &projects, &broker).unwrap();
+        assert_eq!(leased.len(), 1);
+        assert!(leased[0].local.is_some());
+        assert!(leased[0].git.is_some());
+
+        let health = broker.health();
+        for kind in [
+            CheckoutAccessKind::PublisherConfigTreeRead,
+            CheckoutAccessKind::LocalProjectWalk,
+            CheckoutAccessKind::GitHistory,
+        ] {
+            let operation = health
+                .operations
+                .iter()
+                .find(|operation| operation.kind == kind)
+                .unwrap();
+            assert_eq!(operation.granted, 1, "{} grants", kind.as_str());
+            assert_eq!(operation.denied, 0, "{} denials", kind.as_str());
+        }
+    }
+
+    #[test]
+    fn full_reindex_with_denied_local_access_never_reads_the_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project_root = root.join("remote-shaped-project");
+        std::fs::create_dir(&project_root).unwrap();
+        let projects = Arc::new(parking_lot::RwLock::new(
+            ProjectRegistry::open(root.join("projects.json")).unwrap(),
+        ));
+        projects.write().register_path(&project_root).unwrap();
+        std::fs::remove_dir(&project_root).unwrap();
+        let observations = crate::checkout_access::CheckoutAccessObservations::in_memory();
+        let broker = Arc::new(CheckoutAccessBroker::new(
+            Arc::new(crate::checkout_access::DenyCheckoutAccess),
+            observations,
+        ));
+        let index = test_index(&root);
+        let actor =
+            IndexWriterActor::spawn_for_with_checkout_access(&index, projects, broker.clone());
+
+        actor.run_reindex_pass(true, true).unwrap();
+        let local = broker
+            .health()
+            .operations
+            .into_iter()
+            .find(|operation| operation.kind == CheckoutAccessKind::LocalProjectWalk)
+            .unwrap();
+        assert_eq!(local.granted, 0);
+        assert_eq!(local.denied, 1);
+    }
+
+    #[test]
+    fn collected_stage_degrades_git_without_requesting_local_access() {
+        use sha2::{Digest, Sha256};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let projects = Arc::new(parking_lot::RwLock::new(
+            ProjectRegistry::open(root.join("projects.json")).unwrap(),
+        ));
+        let observations = crate::checkout_access::CheckoutAccessObservations::in_memory();
+        let broker = Arc::new(CheckoutAccessBroker::new(
+            Arc::new(crate::checkout_access::DenyCheckoutAccess),
+            observations,
+        ));
+        let index = test_index(&root);
+        let actor =
+            IndexWriterActor::spawn_for_with_checkout_access(&index, projects, broker.clone());
+        let store = Arc::new(
+            bbox_code_source_store::CodeSourceStore::open(
+                root.join("code-sources"),
+                bbox_code_source_store::StoreLimits::default(),
+            )
+            .unwrap(),
+        );
+        let bytes = b"pub fn collected() {}\n";
+        let hash = hex::encode(Sha256::digest(bytes));
+        let entries = vec![bbox_code_source::ManifestEntry {
+            relative_path: "src/lib.rs".into(),
+            content_sha256: hash.clone(),
+            size: bytes.len() as u64,
+        }];
+        let head_commit = "b".repeat(40);
+        let descriptor = bbox_code_source::GenerationDescriptor {
+            schema_version: bbox_code_source::SCHEMA_VERSION,
+            walker_policy_version: bbox_code_source::WALKER_POLICY_VERSION.into(),
+            scope: bbox_corpus_core::identity::PublishedScope {
+                repo_id: "repo-family".into(),
+                bbox_root_relpath: ".".into(),
+            },
+            head_commit: head_commit.clone(),
+            dirty_fingerprint: bbox_code_source::dirty_fingerprint(&head_commit, &entries),
+            manifest_sha256: bbox_code_source::manifest_sha256(&entries),
+            file_count: entries.len() as u64,
+            logical_bytes: bytes.len() as u64,
+        };
+        let upload = store.begin_upload("host-a", descriptor.clone()).unwrap();
+        store
+            .put_manifest_page("host-a", &upload.upload_id, 0, &entries)
+            .unwrap();
+        store
+            .complete_manifest("host-a", &upload.upload_id)
+            .unwrap();
+        store
+            .install_blob(
+                "host-a",
+                &upload.upload_id,
+                &hash,
+                bytes.len() as u64,
+                &bytes[..],
+            )
+            .unwrap();
+        let generation = store.finalize_upload("host-a", &upload.upload_id).unwrap();
+        let project = ProjectRecord {
+            project_id: "collected-project".into(),
+            repo_id: Some("repo-family".into()),
+            canonical_path: "/unavailable/remote/project".into(),
+            registered_at: "2026-07-22T00:00:00Z".into(),
+            is_git_repo: true,
+            languages: Default::default(),
+            aliases: Default::default(),
+        };
+
+        let staged = actor
+            .stage_collected_generation(
+                project.clone(),
+                descriptor,
+                generation.generation_id,
+                entries,
+                store.clone(),
+            )
+            .unwrap();
+        let snapshot_id = staged.snapshot_id.clone();
+        drop(staged);
+
+        let health = broker.health();
+        let local_attempts = health
+            .operations
+            .iter()
+            .find(|operation| operation.kind == CheckoutAccessKind::LocalProjectWalk)
+            .map(|operation| operation.granted + operation.denied)
+            .unwrap_or(0);
+        assert_eq!(local_attempts, 0);
+        let git = health
+            .operations
+            .iter()
+            .find(|operation| operation.kind == CheckoutAccessKind::GitHistory)
+            .unwrap();
+        assert_eq!(git.granted, 0);
+        assert_eq!(git.denied, 1);
+        assert!(store.health_records().unwrap().iter().any(|record| {
+            record.project_id == project.project_id && record.code == "git_history_unavailable"
+        }));
+        let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
+            &root.join("projects.json"),
+        );
+        let git_overlay = bbox_edge_sidecar::snapshot::snapshot_dir(
+            &edges_dir,
+            &project.project_id,
+            &snapshot_id,
+        )
+        .join("git-current.jsonl");
+        assert_eq!(std::fs::read_to_string(git_overlay).unwrap(), "");
     }
 
     /// Write entries into the on-disk central kb store. Reindex passes

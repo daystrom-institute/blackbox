@@ -63,6 +63,9 @@ pub(crate) struct SharedState {
     /// remain owned by the consumer being migrated.
     pub(crate) checkout_access_observations:
         bbox_indexing::checkout_access::CheckoutAccessObservations,
+    /// Single daemon-owned checkout authority. Every checkout consumer reuses
+    /// this broker so counters and authority state cannot diverge per call.
+    pub(crate) checkout_access: Arc<bbox_indexing::checkout_access::CheckoutAccessBroker>,
     /// Host-local symbolic branch pins defining published truth per scope.
     pub(crate) publisher_refs: RwLock<bbox_indexing::publisher::PublisherRefStore>,
     /// Session-authorized provisional snapshots keyed by scope and checkout.
@@ -447,17 +450,45 @@ impl SharedState {
         use std::collections::VecDeque;
         let (tail_tx, _) = broadcast::channel(128);
         let (roster_tx, _) = broadcast::channel(ROSTER_BROADCAST_BUFFER);
+        let projects_path = store_dir.join("projects.json");
+        let (projects, projects_needs_persist) =
+            ProjectRegistry::open_with_backfill_status(&projects_path).unwrap();
+        let projects_store = Arc::new(RwLock::new(projects));
+        let checkout_registry = Arc::new(RwLock::new(
+            bbox_indexing::checkout_registry::CheckoutRegistry::open(
+                &store_dir.join("checkout-registry.json"),
+            )
+            .unwrap(),
+        ));
+        let checkout_access_observations =
+            bbox_indexing::checkout_access::CheckoutAccessObservations::open(
+                store_dir.join("checkout-access-observations.json"),
+            )
+            .unwrap();
+        let checkout_access = Arc::new(bbox_indexing::checkout_access::CheckoutAccessBroker::new(
+            Arc::new(
+                bbox_indexing::checkout_access_v1::V1CheckoutAccessAuthority::new(
+                    projects_store.clone(),
+                    checkout_registry.clone(),
+                ),
+            ),
+            checkout_access_observations.clone(),
+        ));
         let idx = TranscriptIndex::open_or_create(
             &store_dir.join("idx"),
             Vec::new(),
             None,
-            store_dir.join("projects"),
+            projects_path.clone(),
             store_dir.join("kb.json"),
             store_dir.join("threads.json"),
             store_dir.join("roadmap.json"),
         )
         .unwrap();
-        let index_writer = crate::index::IndexWriterActor::spawn_for(&idx);
+        let index_writer = crate::index::IndexWriterActor::spawn_for_with_checkout_access(
+            &idx,
+            projects_store.clone(),
+            checkout_access.clone(),
+        );
         // Load committed `.bbox/knowledge/` for every registered project into
         // the knowledge query surface at startup (project durable knowledge is
         // repo-owned; the central store holds only global entries).
@@ -504,10 +535,6 @@ impl SharedState {
         let pins_path = store_dir.join("pins.json");
         let pins_store = Arc::new(RwLock::new(Pins::open(&pins_path).unwrap()));
         let pins_persister = StorePersister::spawn("pins-test", pins_store.clone(), pins_path);
-        let projects_path = store_dir.join("projects.json");
-        let (projects, projects_needs_persist) =
-            ProjectRegistry::open_with_backfill_status(&projects_path).unwrap();
-        let projects_store = Arc::new(RwLock::new(projects));
         let projects_persister =
             StorePersister::spawn("projects-test", projects_store.clone(), projects_path);
         if projects_needs_persist {
@@ -533,17 +560,9 @@ impl SharedState {
             pins_persister,
             projects: projects_store,
             projects_persister,
-            checkout_registry: Arc::new(RwLock::new(
-                bbox_indexing::checkout_registry::CheckoutRegistry::open(
-                    &store_dir.join("checkout-registry.json"),
-                )
-                .unwrap(),
-            )),
-            checkout_access_observations:
-                bbox_indexing::checkout_access::CheckoutAccessObservations::open(
-                    store_dir.join("checkout-access-observations.json"),
-                )
-                .unwrap(),
+            checkout_registry,
+            checkout_access_observations,
+            checkout_access,
             publisher_refs: RwLock::new(
                 bbox_indexing::publisher::PublisherRefStore::open(
                     store_dir.join("publisher-refs.json"),

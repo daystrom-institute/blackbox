@@ -15,7 +15,19 @@ use tantivy::{Index, IndexWriter, TantivyDocument, Term};
 use super::{FieldHandles, FileMeta, FileMetaSource, ReindexConfig};
 use bbox_chunker::{self as chunker, Chunk, Edge, EdgeConfidence, EdgeProvenance};
 use bbox_corpus_core::entity_ref::{self, EntityRef};
-use bbox_corpus_core::project_record::{ProjectRecord, load_project_records};
+use bbox_corpus_core::project_record::ProjectRecord;
+
+/// Caller-supplied checkout roots for one project indexing operation.
+///
+/// The daemon indexing layer obtains these roots from validated leases and
+/// retains the leases for the entire lower-layer call. This crate deliberately
+/// knows nothing about the authority or lease types.
+#[derive(Clone, Copy)]
+pub struct ProjectIndexAccess<'a> {
+    pub project: &'a ProjectRecord,
+    pub local_root: Option<&'a Path>,
+    pub git_root: Option<&'a Path>,
+}
 
 #[derive(Debug, Default)]
 pub struct ProjectIndexStats {
@@ -132,6 +144,30 @@ pub struct ActiveCollectedSource {
 pub struct PreservedCollectedDocuments {
     pub project_ids: BTreeSet<String>,
     pub documents: Vec<TantivyDocument>,
+}
+
+pub fn collect_project_documents(
+    index: &Index,
+    f: FieldHandles,
+    project_ids: &BTreeSet<String>,
+) -> Result<Vec<TantivyDocument>> {
+    if project_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let searcher = index.reader()?.searcher();
+    let mut documents = Vec::new();
+    for project_id in project_ids {
+        let selector = bbox_code_source::local_selector(project_id);
+        let query = TermQuery::new(
+            Term::from_field_text(f.code_source_selector, &selector),
+            IndexRecordOption::Basic,
+        );
+        let count = searcher.search(&query, &Count)?;
+        for (_score, address) in searcher.search(&query, &TopDocs::with_limit(count))? {
+            documents.push(searcher.doc::<TantivyDocument>(address)?);
+        }
+    }
+    Ok(documents)
 }
 
 pub fn active_collected_sources(
@@ -312,16 +348,23 @@ fn ref_snapshot_id(
     ))
 }
 
-pub fn scan_registered_project_files(config: &ReindexConfig) -> Result<Vec<(String, u64, u64)>> {
+pub fn scan_project_files_with_access(
+    config: &ReindexConfig,
+    projects: &[ProjectIndexAccess<'_>],
+) -> Result<Vec<(String, u64, u64)>> {
     let mut files = Vec::new();
     let collected = active_collected_sources(config)?;
-    for project in load_project_records(&config.projects_path)? {
-        let root = PathBuf::from(&project.canonical_path);
-        if !collected.contains_key(&project.project_id) {
+    for access in projects {
+        let project = access.project;
+        if !collected.contains_key(&project.project_id)
+            && let Some(root) = access.local_root
+        {
             let _ = scan_project_files(&root, &mut files)?;
         }
-        if project.repo_id.is_some() {
-            if let Some(head) = bbox_corpus_core::git::head_fingerprint(&root) {
+        if project.repo_id.is_some()
+            && let Some(git_root) = access.git_root
+        {
+            if let Some(head) = bbox_corpus_core::git::head_fingerprint(git_root) {
                 files.push((
                     super::git_history::git_source_key(&project.project_id),
                     0,
@@ -333,8 +376,9 @@ pub fn scan_registered_project_files(config: &ReindexConfig) -> Result<Vec<(Stri
     Ok(files)
 }
 
-pub fn index_registered_projects_standalone(
+pub fn index_projects_with_access(
     config: &ReindexConfig,
+    projects: &[ProjectIndexAccess<'_>],
     f: FieldHandles,
     writer: &mut IndexWriter,
     meta: &mut HashMap<String, FileMeta>,
@@ -352,8 +396,8 @@ pub fn index_registered_projects_standalone(
             bbox_code_source_store::StoreLimits::default(),
         )
     });
-    for project in load_project_records(&config.projects_path)? {
-        let root = PathBuf::from(&project.canonical_path);
+    for access in projects {
+        let project = access.project;
         if let Some(active) = collected.get(&project.project_id) {
             let store = collected_store
                 .as_ref()
@@ -361,8 +405,8 @@ pub fn index_registered_projects_standalone(
                 .as_ref()
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             index_active_collected_project(
-                &project,
-                &root,
+                project,
+                access.git_root,
                 active,
                 store,
                 f,
@@ -376,9 +420,13 @@ pub fn index_registered_projects_standalone(
             )?;
             continue;
         }
-        if !root.exists() {
+        let Some(root) = access.local_root else {
+            tracing::warn!(
+                project_id = %project.project_id,
+                "local project unavailable; retaining its last-good indexed generation"
+            );
             continue;
-        }
+        };
         let mut ctx = ProjectIndexContext {
             f,
             writer,
@@ -388,7 +436,7 @@ pub fn index_registered_projects_standalone(
             git_meta_dir: &git_meta_dir,
             force_git_full,
         };
-        index_project(&project, &root, &mut ctx)?;
+        index_project(project, root, access.git_root, &mut ctx)?;
     }
     Ok(stats)
 }
@@ -396,7 +444,7 @@ pub fn index_registered_projects_standalone(
 #[allow(clippy::too_many_arguments)]
 fn index_active_collected_project(
     project: &ProjectRecord,
-    root: &Path,
+    git_root: Option<&Path>,
     active: &ActiveCollectedSource,
     store: &bbox_code_source_store::CodeSourceStore,
     f: FieldHandles,
@@ -495,38 +543,67 @@ fn index_active_collected_project(
                 .into_iter()
                 .collect()
         });
-    let mut git_ctx = super::git_history::GitIndexContext {
-        f,
-        writer,
-        meta,
-        edges_dir,
-        git_meta_dir,
-        force_full,
+    let git_stats = if let Some(git_root) = git_root {
+        let mut git_ctx = super::git_history::GitIndexContext {
+            f,
+            writer,
+            meta,
+            edges_dir,
+            git_meta_dir,
+            force_full,
+        };
+        let stats = super::git_history::index_git_history_for_project(
+            project,
+            git_root,
+            &current_chunk_targets,
+            &mut git_ctx,
+        )?;
+        if let Err(error) =
+            store.clear_health_failure(&project.project_id, "git_history_unavailable")
+        {
+            tracing::warn!(
+                project_id = %project.project_id,
+                error = %error,
+                "failed to clear GitHistory degradation record"
+            );
+        }
+        stats
+    } else {
+        if let Err(error) = store.record_health_failure(
+            &project.project_id,
+            "git_history_unavailable",
+            "active code generation has no validated GitHistory attachment",
+        ) {
+            tracing::warn!(
+                project_id = %project.project_id,
+                error = %error,
+                "failed to persist GitHistory degradation record"
+            );
+        }
+        super::git_history::GitIndexStats::default()
     };
-    let git_stats = super::git_history::index_git_history_for_project(
-        project,
-        root,
-        &current_chunk_targets,
-        &mut git_ctx,
-    )?;
     stats.indexed_commits += git_stats.indexed_commits;
     stats.indexed_docs += git_stats.indexed_commits;
     stats.emitted_edges += git_stats.emitted_edges;
-    let git_edges = bbox_edge_sidecar::edge_sidecar::read_managed_derived_edges(
-        edges_dir,
-        "git",
-        &project.project_id,
-    )?
-    .into_iter()
-    .map(|edge| bbox_edge_sidecar::edge_sidecar::Edge {
-        source: edge.source,
-        kind: edge.kind,
-        target: edge.target,
-        provenance: edge.provenance,
-        confidence: edge.confidence,
-        metadata: Default::default(),
-    })
-    .collect::<Vec<_>>();
+    let git_edges = if git_root.is_some() {
+        bbox_edge_sidecar::edge_sidecar::read_managed_derived_edges(
+            edges_dir,
+            "git",
+            &project.project_id,
+        )?
+        .into_iter()
+        .map(|edge| bbox_edge_sidecar::edge_sidecar::Edge {
+            source: edge.source,
+            kind: edge.kind,
+            target: edge.target,
+            provenance: edge.provenance,
+            confidence: edge.confidence,
+            metadata: Default::default(),
+        })
+        .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     if let Some(staged) = staged {
         bbox_edge_sidecar::snapshot::write_snapshot_files(
             edges_dir,
@@ -562,6 +639,7 @@ pub fn build_project_file_doc(
         chunk,
         project,
         absolute_path,
+        &project.canonical_path,
         commit_sha,
         snapshot_id,
         &selector,
@@ -599,6 +677,7 @@ where
         f,
         writer,
         edges_dir,
+        None,
         open_bytes,
     )
 }
@@ -606,17 +685,19 @@ where
 pub fn stage_local_project_generation(
     project: &ProjectRecord,
     scope: &bbox_corpus_core::identity::PublishedScope,
+    project_root: &Path,
+    git_root: &Path,
     f: FieldHandles,
     writer: &mut IndexWriter,
     edges_dir: &Path,
 ) -> Result<CollectedIndexResult> {
-    let root = PathBuf::from(&project.canonical_path)
+    let root = project_root
         .canonicalize()
         .with_context(|| format!("canonicalizing local project {}", project.project_id))?;
     if !root.is_dir() {
         anyhow::bail!("registered local project root is not a directory");
     }
-    let head_commit = bbox_corpus_core::git::current_head(&root)
+    let head_commit = bbox_corpus_core::git::current_head(git_root)
         .ok_or_else(|| anyhow::anyhow!("registered local project has no readable Git HEAD"))?;
     let mut scanned = Vec::new();
     let _scan_stats = scan_project_files(&root, &mut scanned)?;
@@ -663,7 +744,7 @@ pub fn stage_local_project_generation(
     };
     descriptor.validate_manifest(&entries, u64::MAX, u64::MAX)?;
     let selector = bbox_code_source::local_selector(&project.project_id);
-    let worktree_dirty = bbox_corpus_core::git::is_worktree_dirty(&root);
+    let worktree_dirty = bbox_corpus_core::git::is_worktree_dirty(git_root);
     let snapshot_id = if worktree_dirty {
         bbox_edge_sidecar::snapshot::nongit_snapshot_id(&project.project_id, &dirty_fingerprint)
     } else {
@@ -684,6 +765,7 @@ pub fn stage_local_project_generation(
         f,
         writer,
         edges_dir,
+        Some(&root),
         |entry| {
             read_regular_file_confined(&root, Path::new(&entry.relative_path))
                 .with_context(|| format!("re-reading local source {}", entry.relative_path))
@@ -703,6 +785,7 @@ fn stage_project_file_generation<F>(
     f: FieldHandles,
     writer: &mut IndexWriter,
     edges_dir: &Path,
+    display_root: Option<&Path>,
     mut open_bytes: F,
 ) -> Result<CollectedIndexResult>
 where
@@ -715,7 +798,9 @@ where
     let registry = chunker::default_registry();
     let mut chunk_entry = |entry: &bbox_code_source::ManifestEntry| {
         let relative_path = Path::new(&entry.relative_path);
-        let display_path = Path::new(&project.canonical_path).join(relative_path);
+        let display_path = display_root
+            .map(|root| root.join(relative_path))
+            .unwrap_or_else(|| relative_path.to_path_buf());
         let bytes = open_bytes(entry)
             .with_context(|| format!("opening collected source {}", entry.relative_path))?;
         if bytes.len() as u64 != entry.size || full_hash(&bytes) != entry.content_sha256 {
@@ -812,6 +897,9 @@ where
                 &chunk,
                 project,
                 &display_path,
+                display_root
+                    .map(|_| project.canonical_path.as_str())
+                    .unwrap_or(project.project_id.as_str()),
                 Some(&descriptor.head_commit),
                 Some(snapshot_id),
                 &selector,
@@ -849,6 +937,7 @@ pub fn build_project_file_doc_for_source(
     chunk: &Chunk,
     project: &ProjectRecord,
     display_path: &Path,
+    project_display: &str,
     commit_sha: Option<&str>,
     snapshot_id: Option<&str>,
     selector: &str,
@@ -866,7 +955,7 @@ pub fn build_project_file_doc_for_source(
     }
     doc.add_text(f.session_id, "");
     doc.add_text(f.account, "project_file");
-    doc.add_text(f.project, &project.canonical_path);
+    doc.add_text(f.project, project_display);
     doc.add_text(f.role, "file");
     let path_str = display_path.to_string_lossy();
     doc.add_text(f.file_path, &*path_str);
@@ -994,10 +1083,11 @@ fn classify_project_file(
 fn index_project(
     project: &ProjectRecord,
     root: &Path,
+    git_root: Option<&Path>,
     ctx: &mut ProjectIndexContext<'_>,
 ) -> Result<()> {
     let registry = chunker::default_registry();
-    let commit_sha = bbox_corpus_core::git::current_head(root);
+    let commit_sha = git_root.and_then(bbox_corpus_core::git::current_head);
     let mut files = Vec::new();
     let mut pending = Vec::new();
     let mut project_edges = Vec::new();
@@ -1082,8 +1172,8 @@ fn index_project(
     let files_changed = !pending.is_empty();
     let symbol_table = build_symbol_table(&pending, snapshot_id.as_deref());
     let mut current_chunk_targets = HashMap::new();
-    let scope_relpath = bbox_corpus_core::git::git_root_for_path(root)
-        .and_then(|git_root| bbox_corpus_core::identity::bbox_root_relpath(&git_root, root))
+    let scope_relpath = git_root
+        .and_then(|git_root| bbox_corpus_core::identity::bbox_root_relpath(git_root, root))
         .unwrap_or_else(|| ".".to_string());
     for file in pending {
         let code_edges = derive_code_edges(
@@ -1135,20 +1225,24 @@ fn index_project(
         &project.project_id,
         &project_edges,
     )?;
-    let mut git_ctx = super::git_history::GitIndexContext {
-        f: ctx.f,
-        writer: ctx.writer,
-        meta: ctx.meta,
-        edges_dir: ctx.edges_dir,
-        git_meta_dir: ctx.git_meta_dir,
-        force_full: ctx.force_git_full,
+    let git_stats = if let Some(git_root) = git_root {
+        let mut git_ctx = super::git_history::GitIndexContext {
+            f: ctx.f,
+            writer: ctx.writer,
+            meta: ctx.meta,
+            edges_dir: ctx.edges_dir,
+            git_meta_dir: ctx.git_meta_dir,
+            force_full: ctx.force_git_full,
+        };
+        super::git_history::index_git_history_for_project(
+            project,
+            git_root,
+            &current_chunk_targets,
+            &mut git_ctx,
+        )?
+    } else {
+        super::git_history::GitIndexStats::default()
     };
-    let git_stats = super::git_history::index_git_history_for_project(
-        project,
-        root,
-        &current_chunk_targets,
-        &mut git_ctx,
-    )?;
     ctx.stats.indexed_commits += git_stats.indexed_commits;
     ctx.stats.indexed_docs += git_stats.indexed_commits;
     if git_stats.indexed_commits > 0 {
@@ -1211,10 +1305,12 @@ fn index_project(
 
     let materialization_changed =
         files_changed || git_stats.indexed_commits > 0 || deletions_purged > 0;
-    if let Some(pending) =
-        snapshot_after_reindex(project, root, ctx.edges_dir, materialization_changed)?
-    {
-        ctx.stats.pending_local_snapshots.push(pending);
+    if let Some(git_root) = git_root {
+        if let Some(pending) =
+            snapshot_after_reindex(project, git_root, ctx.edges_dir, materialization_changed)?
+        {
+            ctx.stats.pending_local_snapshots.push(pending);
+        }
     }
     Ok(())
 }
