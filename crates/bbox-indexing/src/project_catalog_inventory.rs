@@ -1576,11 +1576,19 @@ pub struct InventoryRefusalV1 {
     pub diagnostic_code: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationRefusalOriginV1 {
+    Inventory,
+    Semantic,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MigrationRefusalReportV1 {
-    pub record_id: String,
+    pub origin: MigrationRefusalOriginV1,
     pub diagnostic_code: String,
+    pub affected_record_ids: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1898,13 +1906,32 @@ impl ProjectCatalogMigrationReportV1 {
                 .map(|row| row.resolution_id.as_str()),
             "required resolution",
         )?;
-        validate_unique_by(
-            self.refusals.iter().map(|row| row.record_id.as_str()),
-            "migration refusal",
-        )?;
         for refusal in &self.refusals {
-            validate_stable_id(&refusal.record_id, "migration refusal record id")?;
             validate_diagnostic_code(&refusal.diagnostic_code)?;
+            if refusal.affected_record_ids.is_empty() {
+                return Err(invalid("migration refusal has no affected records"));
+            }
+            if refusal.affected_record_ids.len() > MAX_PROJECT_CATALOG_ENTRIES {
+                return Err(limit("migration refusal affected records"));
+            }
+            for record_id in &refusal.affected_record_ids {
+                validate_stable_id(record_id, "migration refusal affected record id")?;
+            }
+        }
+        if self.refusals.windows(2).any(|pair| {
+            (
+                pair[0].origin,
+                pair[0].diagnostic_code.as_str(),
+                &pair[0].affected_record_ids,
+            ) >= (
+                pair[1].origin,
+                pair[1].diagnostic_code.as_str(),
+                &pair[1].affected_record_ids,
+            )
+        }) {
+            return Err(invalid(
+                "migration refusal rows are duplicated or non-canonical",
+            ));
         }
         validate_unique_by(
             self.namespace_conflicts
@@ -2013,6 +2040,29 @@ impl ProjectCatalogMigrationReportV1 {
             return Err(ProjectCatalogInventoryError::new(
                 "error.project_catalog_inventory_stale_report",
                 "report does not match the captured inventory",
+            ));
+        }
+        let expected_inventory_refusals = inventory
+            .hard_refusals()
+            .into_iter()
+            .map(|row| (row.diagnostic_code, BTreeSet::from([row.record_id])))
+            .collect::<BTreeSet<_>>();
+        let reported_inventory_refusals = self
+            .refusals
+            .iter()
+            .filter(|row| row.origin == MigrationRefusalOriginV1::Inventory)
+            .map(|row| (row.diagnostic_code.clone(), row.affected_record_ids.clone()))
+            .collect::<BTreeSet<_>>();
+        if reported_inventory_refusals != expected_inventory_refusals
+            || reported_inventory_refusals.len()
+                != self
+                    .refusals
+                    .iter()
+                    .filter(|row| row.origin == MigrationRefusalOriginV1::Inventory)
+                    .count()
+        {
+            return Err(invalid(
+                "report inventory-owned refusals are not the exact inventory projection",
             ));
         }
         let project_rows = self
