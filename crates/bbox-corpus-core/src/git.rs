@@ -86,8 +86,8 @@ struct VerifiedObjectSessions {
 #[cfg(unix)]
 struct CatFileSession {
     child: std::process::Child,
-    stdin: std::process::ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
+    stdin: Option<std::process::ChildStdin>,
+    stdout: Option<BufReader<std::process::ChildStdout>>,
     stderr_drain: Option<std::thread::JoinHandle<(Vec<u8>, bool)>>,
     request_timeout: Duration,
     invalid: bool,
@@ -96,11 +96,7 @@ struct CatFileSession {
 #[cfg(unix)]
 impl Drop for CatFileSession {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if let Some(stderr_drain) = self.stderr_drain.take() {
-            let _ = stderr_drain.join();
-        }
+        self.terminate_bounded();
     }
 }
 
@@ -415,7 +411,12 @@ pub fn read_verified_committed_file_bytes_bounded(
             .lock()
             .map_err(|_| anyhow::anyhow!("verified Git object session lock was poisoned"))?;
         let object = sessions
-            .resolve_path(&commit.root_tree_oid, repo_rel, max_bytes)?
+            .resolve_path(
+                &commit.root_tree_oid,
+                repo_rel,
+                max_bytes,
+                std::time::Instant::now() + GIT_OUTPUT_TIMEOUT,
+            )?
             .context("committed file is missing from the verified object database")?;
         if object.object_type != "blob" {
             anyhow::bail!("committed file does not resolve to a blob");
@@ -746,12 +747,43 @@ fn parse_commit_tree_oid(commit: &[u8], object_id_hex_len: usize) -> Result<Stri
 #[cfg(unix)]
 impl VerifiedObjectSessions {
     fn read_object(&mut self, object_id: &str, max_bytes: usize) -> Result<Option<CatObject>> {
-        if let Some(object) = self.primary.read_object(object_id, max_bytes)? {
+        self.read_object_before(
+            object_id,
+            max_bytes,
+            std::time::Instant::now() + GIT_OUTPUT_TIMEOUT,
+        )
+    }
+
+    fn read_object_before(
+        &mut self,
+        object_id: &str,
+        max_bytes: usize,
+        deadline: std::time::Instant,
+    ) -> Result<Option<CatObject>> {
+        if let Some(object) = self
+            .primary
+            .read_object_before(object_id, max_bytes, deadline)?
+        {
             return Ok(Some(object));
         }
         self.alternate
             .as_mut()
-            .map(|session| session.read_object(object_id, max_bytes))
+            .map(|session| session.read_object_before(object_id, max_bytes, deadline))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    fn read_info_before(
+        &mut self,
+        object_id: &str,
+        deadline: std::time::Instant,
+    ) -> Result<Option<(String, usize)>> {
+        if let Some(info) = self.primary.read_info_before(object_id, deadline)? {
+            return Ok(Some(info));
+        }
+        self.alternate
+            .as_mut()
+            .map(|session| session.read_info_before(object_id, deadline))
             .transpose()
             .map(Option::flatten)
     }
@@ -761,6 +793,7 @@ impl VerifiedObjectSessions {
         root_tree_oid: &str,
         repo_rel: &str,
         max_object_bytes: usize,
+        deadline: std::time::Instant,
     ) -> Result<Option<CatObject>> {
         let mut tree_oid = root_tree_oid.to_string();
         let mut traversal_bytes = 0_usize;
@@ -770,7 +803,7 @@ impl VerifiedObjectSessions {
                 .checked_sub(traversal_bytes)
                 .context("committed path traversal exceeds its byte limit")?;
             let tree = self
-                .read_object(&tree_oid, remaining)?
+                .read_object_before(&tree_oid, remaining, deadline)?
                 .context("committed path references a missing tree")?;
             if tree.object_type != "tree" {
                 anyhow::bail!("committed path traversal encountered a non-tree object");
@@ -791,7 +824,7 @@ impl VerifiedObjectSessions {
                 tree_oid = entry.object_id;
                 continue;
             }
-            return self.read_object(&entry.object_id, max_object_bytes);
+            return self.read_object_before(&entry.object_id, max_object_bytes, deadline);
         }
         anyhow::bail!("committed path has no components")
     }
@@ -840,8 +873,8 @@ impl CatFileSession {
         });
         Ok(Self {
             child,
-            stdin,
-            stdout: BufReader::new(stdout),
+            stdin: Some(stdin),
+            stdout: Some(BufReader::new(stdout)),
             stderr_drain: Some(stderr_drain),
             request_timeout,
             invalid: false,
@@ -849,8 +882,20 @@ impl CatFileSession {
     }
 
     fn read_info(&mut self, spec: &str) -> Result<Option<(String, usize)>> {
+        self.read_info_before(spec, std::time::Instant::now() + self.request_timeout)
+    }
+
+    fn read_info_before(
+        &mut self,
+        spec: &str,
+        deadline: std::time::Instant,
+    ) -> Result<Option<(String, usize)>> {
         self.ensure_valid()?;
-        let deadline = std::time::Instant::now() + self.request_timeout;
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            anyhow::bail!("stable Git object request timed out");
+        }
+        let deadline = deadline.min(now + self.request_timeout);
         let result = (|| {
             self.send_command("info", spec)?;
             self.read_header(deadline)
@@ -876,8 +921,25 @@ impl CatFileSession {
     }
 
     fn read_object(&mut self, spec: &str, max_bytes: usize) -> Result<Option<CatObject>> {
+        self.read_object_before(
+            spec,
+            max_bytes,
+            std::time::Instant::now() + self.request_timeout,
+        )
+    }
+
+    fn read_object_before(
+        &mut self,
+        spec: &str,
+        max_bytes: usize,
+        deadline: std::time::Instant,
+    ) -> Result<Option<CatObject>> {
         self.ensure_valid()?;
-        let deadline = std::time::Instant::now() + self.request_timeout;
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            anyhow::bail!("stable Git object request timed out");
+        }
+        let deadline = deadline.min(now + self.request_timeout);
         let result = self.read_object_until(spec, max_bytes, deadline);
         if result.is_err() {
             self.invalidate();
@@ -896,15 +958,23 @@ impl CatFileSession {
             return Ok(None);
         };
         if size > max_bytes {
-            discard_exact_until(&mut self.stdout, size, deadline)
+            let stdout = self
+                .stdout
+                .as_mut()
+                .context("stable Git object session has no stdout")?;
+            discard_exact_until(stdout, size, deadline)
                 .context("draining oversized stable Git object")?;
-            read_git_object_terminator(&mut self.stdout, deadline, "oversized")?;
+            read_git_object_terminator(stdout, deadline, "oversized")?;
             anyhow::bail!("committed object exceeds its byte limit");
         }
         let mut bytes = vec![0_u8; size];
-        read_exact_until(&mut self.stdout, &mut bytes, deadline)
+        let stdout = self
+            .stdout
+            .as_mut()
+            .context("stable Git object session has no stdout")?;
+        read_exact_until(stdout, &mut bytes, deadline)
             .context("reading stable Git object bytes")?;
-        read_git_object_terminator(&mut self.stdout, deadline, "")?;
+        read_git_object_terminator(stdout, deadline, "")?;
         Ok(Some(CatObject { object_type, bytes }))
     }
 
@@ -912,14 +982,20 @@ impl CatFileSession {
         if spec.bytes().any(|byte| matches!(byte, b'\n' | b'\r' | 0)) {
             anyhow::bail!("stable Git object request contains a control delimiter");
         }
-        writeln!(self.stdin, "{command} {spec}").context("writing stable Git object request")?;
-        self.stdin
-            .flush()
-            .context("flushing stable Git object request")
+        let stdin = self
+            .stdin
+            .as_mut()
+            .context("stable Git object session has no stdin")?;
+        writeln!(stdin, "{command} {spec}").context("writing stable Git object request")?;
+        stdin.flush().context("flushing stable Git object request")
     }
 
     fn read_header(&mut self, deadline: std::time::Instant) -> Result<Option<(String, usize)>> {
-        let line = read_bounded_line_until(&mut self.stdout, 4096, deadline)
+        let stdout = self
+            .stdout
+            .as_mut()
+            .context("stable Git object session has no stdout")?;
+        let line = read_bounded_line_until(stdout, 4096, deadline)
             .context("reading stable Git object response header")?;
         if line.ends_with(b" missing\n") {
             return Ok(None);
@@ -958,8 +1034,47 @@ impl CatFileSession {
     }
 
     fn invalidate(&mut self) {
+        self.terminate_bounded();
+    }
+
+    fn terminate_bounded(&mut self) {
         self.invalid = true;
+        if self.stdin.is_none() && self.stdout.is_none() && self.stderr_drain.is_none() {
+            return;
+        }
+        self.stdin.take();
+        self.stdout.take();
         let _ = self.child.kill();
+        poll_child_exit_bounded(GIT_SESSION_SHUTDOWN_TIMEOUT, || {
+            matches!(self.child.try_wait(), Ok(Some(_)) | Err(_))
+        });
+        if self
+            .stderr_drain
+            .as_ref()
+            .is_some_and(|drain| drain.is_finished())
+            && let Some(stderr_drain) = self.stderr_drain.take()
+        {
+            let _ = stderr_drain.join();
+        } else {
+            self.stderr_drain.take();
+        }
+    }
+}
+
+#[cfg(unix)]
+const GIT_SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[cfg(unix)]
+fn poll_child_exit_bounded(timeout: Duration, mut exited: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if exited() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -1180,6 +1295,52 @@ struct RawTreeEntry {
 }
 
 #[cfg(unix)]
+struct VerifiedListingBudget {
+    max_bytes: usize,
+    retained_bytes: usize,
+    max_trees: usize,
+    tree_count: usize,
+}
+
+#[cfg(unix)]
+impl VerifiedListingBudget {
+    fn new(max_bytes: usize, max_entries: usize) -> Self {
+        Self {
+            max_bytes,
+            retained_bytes: 0,
+            max_trees: max_entries.saturating_add(1).min(200_000),
+            tree_count: 0,
+        }
+    }
+
+    fn charge_bytes(&mut self, bytes: usize) -> Result<()> {
+        let retained_bytes = self
+            .retained_bytes
+            .checked_add(bytes)
+            .context("committed directory listing byte count overflowed")?;
+        if retained_bytes > self.max_bytes {
+            anyhow::bail!("committed directory listing exceeds its byte limit");
+        }
+        self.retained_bytes = retained_bytes;
+        Ok(())
+    }
+
+    fn remaining_bytes(&self) -> Result<usize> {
+        self.max_bytes
+            .checked_sub(self.retained_bytes)
+            .context("committed directory listing exceeds its byte limit")
+    }
+
+    fn charge_tree(&mut self) -> Result<()> {
+        if self.tree_count >= self.max_trees {
+            anyhow::bail!("committed directory listing exceeds its tree count limit");
+        }
+        self.tree_count += 1;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
 fn list_verified_committed_dir_bounded_unix(
     commit: &VerifiedCommit,
     dir_rel: &str,
@@ -1191,8 +1352,13 @@ fn list_verified_committed_dir_bounded_unix(
         .sessions
         .lock()
         .map_err(|_| anyhow::anyhow!("verified Git object session lock was poisoned"))?;
-    let Some(root_tree) =
-        sessions.resolve_path(&commit.root_tree_oid, dir_rel, max_listing_bytes)?
+    let listing_deadline = std::time::Instant::now() + GIT_OUTPUT_TIMEOUT;
+    let Some(root_tree) = sessions.resolve_path(
+        &commit.root_tree_oid,
+        dir_rel,
+        max_listing_bytes,
+        listing_deadline,
+    )?
     else {
         return Ok(Vec::new());
     };
@@ -1200,54 +1366,66 @@ fn list_verified_committed_dir_bounded_unix(
         anyhow::bail!("committed directory does not resolve to a tree");
     }
 
-    let mut retained_tree_bytes = root_tree.bytes.len();
-    let mut retained_path_bytes = 0_usize;
+    let mut budget = VerifiedListingBudget::new(max_listing_bytes, max_entries);
+    budget.charge_tree()?;
+    budget.charge_bytes(root_tree.bytes.len())?;
+    budget.charge_bytes(
+        dir_rel
+            .len()
+            .checked_add(1)
+            .context("committed directory path byte count overflowed")?,
+    )?;
+    let mut root_path = String::with_capacity(dir_rel.len());
+    root_path.push_str(dir_rel);
     let mut files = std::collections::BTreeSet::new();
-    let mut trees = vec![(dir_rel.to_string(), root_tree.bytes)];
+    let mut trees = vec![(root_path, root_tree.bytes)];
     while let Some((tree_path, tree_bytes)) = trees.pop() {
         let entries = parse_raw_tree_entries(&tree_bytes, commit.object_id_hex_len)?;
         for entry in entries {
             let name = std::str::from_utf8(&entry.name)
                 .context("committed tree contains a non-UTF-8 path component")?;
-            let full_path = format!("{tree_path}/{name}");
+            let full_path_len = tree_path
+                .len()
+                .checked_add(1)
+                .and_then(|length| length.checked_add(name.len()))
+                .context("committed directory path byte count overflowed")?;
+            budget.charge_bytes(
+                full_path_len
+                    .checked_add(1)
+                    .context("committed directory path byte count overflowed")?,
+            )?;
+            let mut full_path = String::with_capacity(full_path_len);
+            full_path.push_str(&tree_path);
+            full_path.push('/');
+            full_path.push_str(name);
             validate_repository_relative_git_path(&full_path, "committed tree path")?;
             match entry.mode.as_slice() {
                 b"40000" | b"040000" => {
-                    let remaining = max_listing_bytes
-                        .checked_sub(retained_tree_bytes)
-                        .and_then(|remaining| remaining.checked_sub(retained_path_bytes))
-                        .context("committed directory listing exceeds its byte limit")?;
+                    budget.charge_tree()?;
                     let subtree = sessions
-                        .read_object(&entry.object_id, remaining)?
+                        .read_object_before(
+                            &entry.object_id,
+                            budget.remaining_bytes()?,
+                            listing_deadline,
+                        )?
                         .context("committed tree references a missing subtree")?;
                     if subtree.object_type != "tree" {
                         anyhow::bail!("committed tree mode does not reference a tree object");
                     }
-                    retained_tree_bytes = retained_tree_bytes
-                        .checked_add(subtree.bytes.len())
-                        .context("committed directory listing byte count overflowed")?;
-                    if retained_tree_bytes
-                        .checked_add(retained_path_bytes)
-                        .context("committed directory listing byte count overflowed")?
-                        > max_listing_bytes
-                    {
-                        anyhow::bail!("committed directory listing exceeds its byte limit");
-                    }
+                    budget.charge_bytes(subtree.bytes.len())?;
                     trees.push((full_path, subtree.bytes));
                 }
                 b"100644" | b"100755" => {
                     if files.len() >= max_entries {
                         anyhow::bail!("committed directory listing exceeds its entry limit");
                     }
-                    retained_path_bytes = retained_path_bytes
-                        .checked_add(full_path.len() + 1)
-                        .context("committed directory path byte count overflowed")?;
-                    if retained_tree_bytes
-                        .checked_add(retained_path_bytes)
-                        .context("committed directory listing byte count overflowed")?
-                        > max_listing_bytes
-                    {
-                        anyhow::bail!("committed directory listing exceeds its byte limit");
+                    let (object_type, _) = sessions
+                        .read_info_before(&entry.object_id, listing_deadline)?
+                        .context("committed regular-file entry references a missing object")?;
+                    if object_type != "blob" {
+                        anyhow::bail!(
+                            "committed regular-file mode does not reference a blob object"
+                        );
                     }
                     if !files.insert(full_path) {
                         anyhow::bail!("committed directory listing contains a duplicate path");
@@ -1267,6 +1445,7 @@ fn list_verified_committed_dir_bounded_unix(
 fn parse_raw_tree_entries(tree: &[u8], object_id_hex_len: usize) -> Result<Vec<RawTreeEntry>> {
     let object_id_bytes = object_id_hex_len / 2;
     let mut entries = Vec::new();
+    let mut names = std::collections::BTreeSet::new();
     let mut cursor = 0_usize;
     while cursor < tree.len() {
         let mode_end = tree[cursor..]
@@ -1288,13 +1467,16 @@ fn parse_raw_tree_entries(tree: &[u8], object_id_hex_len: usize) -> Result<Vec<R
         if object_end > tree.len() {
             anyhow::bail!("committed tree entry has a truncated object id");
         }
-        let name = tree[name_start..name_end].to_vec();
+        let name = &tree[name_start..name_end];
         if name.is_empty() || name.contains(&b'/') {
             anyhow::bail!("committed tree entry name is malformed");
         }
+        if !names.insert(name) {
+            anyhow::bail!("committed tree contains a duplicate entry name");
+        }
         entries.push(RawTreeEntry {
             mode,
-            name,
+            name: name.to_vec(),
             object_id: hex::encode(&tree[object_start..object_end]),
         });
         cursor = object_end;
@@ -2194,6 +2376,36 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn stable_git_session_drop_does_not_join_an_unclosed_stderr_pipe() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 2 >&2 &"]);
+        let session = CatFileSession::spawn_command(
+            command,
+            Duration::from_secs(1),
+            "spawning unclosed-stderr test session",
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let started = std::time::Instant::now();
+        drop(session);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "session destruction must detach a drain held open by another process"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_child_reap_abandons_injected_unreapable_child() {
+        let started = std::time::Instant::now();
+        let exited = poll_child_exit_bounded(Duration::from_millis(25), || false);
+        assert!(!exited);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
     #[test]
     fn run_bounded_returns_full_output_for_fast_child() {
         let mut cmd = Command::new("echo");
@@ -2368,6 +2580,61 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn write_raw_object(root: &Path, object_type: &str, bytes: &[u8]) -> String {
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args([
+                "hash-object",
+                "--literally",
+                "-w",
+                "-t",
+                object_type,
+                "--stdin",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(bytes).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "writing raw {object_type} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn raw_tree_entry(mode: &str, name: &str, object_id: &str) -> Vec<u8> {
+        let mut entry = format!("{mode} {name}").into_bytes();
+        entry.push(0);
+        entry.extend(hex::decode(object_id).unwrap());
+        entry
+    }
+
+    fn commit_root_tree(root: &Path, root_tree: &str) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["commit-tree", root_tree, "-m", "synthetic tree"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "committing raw tree failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn commit_scope_tree(root: &Path, scope_tree: &str) -> String {
+        let root_tree =
+            write_raw_object(root, "tree", &raw_tree_entry("40000", "scope", scope_tree));
+        commit_root_tree(root, &root_tree)
     }
 
     #[test]
@@ -2572,6 +2839,59 @@ mod tests {
                 .to_string()
                 .contains("byte limit")
         );
+    }
+
+    #[test]
+    fn bounded_committed_listing_rejects_regular_mode_pointing_to_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        init_repo(&root);
+        let empty_tree = write_raw_object(&root, "tree", b"");
+        let bad_scope = write_raw_object(
+            &root,
+            "tree",
+            &raw_tree_entry("100644", "bad.json", &empty_tree),
+        );
+        let commit_oid = commit_scope_tree(&root, &bad_scope);
+        let verified = verify_commit_oid_with_alternate(&root, &commit_oid, None).unwrap();
+
+        let error = list_verified_committed_dir_bounded(&verified, "scope", 10, 4096).unwrap_err();
+        assert!(error.to_string().contains("does not reference a blob"));
+    }
+
+    #[test]
+    fn bounded_committed_listing_rejects_duplicate_raw_tree_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        init_repo(&root);
+        let blob = write_raw_object(&root, "blob", b"value");
+        let mut duplicate_scope = raw_tree_entry("100644", "same.json", &blob);
+        duplicate_scope.extend(raw_tree_entry("100644", "same.json", &blob));
+        let duplicate_scope = write_raw_object(&root, "tree", &duplicate_scope);
+        let commit_oid = commit_scope_tree(&root, &duplicate_scope);
+        let verified = verify_commit_oid_with_alternate(&root, &commit_oid, None).unwrap();
+
+        let error = list_verified_committed_dir_bounded(&verified, "scope", 10, 4096).unwrap_err();
+        assert!(error.to_string().contains("duplicate entry name"));
+    }
+
+    #[test]
+    fn bounded_committed_listing_limits_two_directory_deep_graphs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        init_repo(&root);
+        let mut child = write_raw_object(&root, "tree", b"");
+        for _ in 0..16 {
+            let mut tree = raw_tree_entry("40000", "a", &child);
+            tree.extend(raw_tree_entry("40000", "b", &child));
+            child = write_raw_object(&root, "tree", &tree);
+        }
+        let commit_oid = commit_scope_tree(&root, &child);
+        let verified = verify_commit_oid_with_alternate(&root, &commit_oid, None).unwrap();
+
+        let error =
+            list_verified_committed_dir_bounded(&verified, "scope", 8, 1024 * 1024).unwrap_err();
+        assert!(error.to_string().contains("tree count limit"));
     }
 
     fn ls_tree_record(mode: &str, object_type: &str, path: &[u8]) -> Vec<u8> {
