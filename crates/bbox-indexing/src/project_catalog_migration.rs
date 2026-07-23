@@ -77,7 +77,8 @@ use crate::project_catalog_store::{
     MigrationParticipantDraftV1, MigrationParticipantRegistry, MigrationPlanDraftV1,
     MigrationPublisherSourceDraftV1, ParticipantRoleV1, ProjectCatalogStore,
     PublisherDispositionEvidenceV1, PublisherPinEvidenceV1, Sha256Hex, ValidatedMigrationPlanV1,
-    bootstrap_migration_checkout_registry, transact_migration_classified, validate_migration_plan,
+    begin_migration_checkout_registry_bootstrap, transact_migration_classified,
+    validate_migration_plan,
 };
 use crate::publisher::PublisherRefStore;
 
@@ -4599,37 +4600,30 @@ fn verify_installed(
 fn verify_installed_optional(
     layout: &ProjectCatalogMigrationResolvedLayoutV1,
 ) -> Result<Option<ProjectCatalogMigrationVerifyResultV1>, ProjectCatalogMigrationError> {
-    let checkout_roots = discover_checkout_roots(layout)?;
+    let bootstrap_registry = build_registry(layout, &BTreeMap::new())?;
+    let bootstrap =
+        begin_migration_checkout_registry_bootstrap(&layout.projects_path, bootstrap_registry)
+            .map_err(|failure| {
+                ProjectCatalogMigrationError::new(
+                    failure.error.code(),
+                    "migration checkout registry bootstrap failed",
+                    facade_mutation_disposition(failure.disposition),
+                )
+            })?;
+    let session = match bootstrap {
+        MigrationCheckoutRegistryBootstrapV1::FreshLegacyNotInstalled => return Ok(None),
+        MigrationCheckoutRegistryBootstrapV1::RequiresCheckoutDiscovery(session) => session,
+    };
+    let bootstrap_disposition = facade_mutation_disposition(session.disposition());
+    let checkout_roots = discover_checkout_roots(layout)
+        .map_err(|error| error.with_mutation_disposition(bootstrap_disposition))?;
     let checkout_bindings =
         ProjectCatalogMigrationInventoryFacadeV1::discover_checkout_observation_bindings(
             checkout_roots,
         )
-        .map_err(adapter_error)?;
-    let bootstrap_registry = build_registry(layout, &BTreeMap::new())?;
-    let bootstrap = bootstrap_migration_checkout_registry(
-        &layout.projects_path,
-        bootstrap_registry,
-        &checkout_bindings,
-    )
-    .map_err(|failure| {
-        ProjectCatalogMigrationError::new(
-            failure.error.code(),
-            "migration checkout registry bootstrap failed",
-            facade_mutation_disposition(failure.disposition),
-        )
-    })?;
-    let retained_checkout_roots = match bootstrap {
-        MigrationCheckoutRegistryBootstrapV1::FreshLegacyNotInstalled => return Ok(None),
-        MigrationCheckoutRegistryBootstrapV1::Ready {
-            retained_checkout_roots,
-        } => retained_checkout_roots,
-    };
-    let registry = build_registry(layout, &retained_checkout_roots)?;
-    let opened = ProjectCatalogStore::open_existing_after_migration_classified(
-        layout.projects_path.clone(),
-        registry,
-    )
-    .map_err(|failure| {
+        .map_err(adapter_error)
+        .map_err(|error| error.with_mutation_disposition(bootstrap_disposition))?;
+    let opened = session.finish_open(&checkout_bindings).map_err(|failure| {
         ProjectCatalogMigrationError::new(
             failure.error.code(),
             "migration store recovery or open failed",
