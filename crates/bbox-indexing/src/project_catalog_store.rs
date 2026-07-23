@@ -846,14 +846,10 @@ pub(crate) fn bootstrap_migration_checkout_registry(
     let Some(journal) = owner.read_journal_locked()? else {
         let catalog_bytes = owner
             .io
-            .read_regular_nofollow(&owner.paths.catalog, MAX_PROJECT_CATALOG_BYTES)?
-            .ok_or_else(|| {
-                ProjectCatalogStoreError::new(
-                    "error.project_catalog_migration_incomplete",
-                    "journal-free migration bootstrap lacks its legacy catalog",
-                )
-            })?;
-        if decode_legacy_project_store(&catalog_bytes).is_err()
+            .read_regular_nofollow(&owner.paths.catalog, MAX_PROJECT_CATALOG_BYTES)?;
+        if catalog_bytes
+            .as_deref()
+            .is_some_and(|bytes| decode_legacy_project_store(bytes).is_err())
             || owner
                 .io
                 .read_regular_nofollow(&owner.paths.attachments, MAX_PROJECT_CATALOG_BYTES)?

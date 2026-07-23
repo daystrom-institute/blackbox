@@ -84,12 +84,16 @@ fn config(root: &Path) -> Config {
 
 struct RehearsalFixture {
     winner_checkout: PathBuf,
+    collision_winner_checkout: PathBuf,
     loser_checkout: PathBuf,
     winner_project: ProjectId,
+    collision_winner_project: ProjectId,
     loser_project: ProjectId,
     winner_generation: String,
+    collision_winner_generation: String,
     loser_generation: String,
     scope: PublishedScope,
+    collision_scope: PublishedScope,
 }
 
 fn write_generation(
@@ -194,13 +198,27 @@ fn prepare_rehearsal(root: &Path, config: &Config) -> RehearsalFixture {
         &winner_checkout,
         &["commit", "-qm", "seed migration fixture"],
     );
-    let head_commit = git(&winner_checkout, &["rev-parse", "HEAD"]);
+    let winner_head_commit = git(&winner_checkout, &["rev-parse", "HEAD"]);
+    let collision_winner_checkout = root.join("checkouts").join("collision-winner-checkout");
+    fs::create_dir_all(&collision_winner_checkout).unwrap();
+    git(&collision_winner_checkout, &["init", "-q"]);
+    git(&collision_winner_checkout, &["checkout", "-qb", "main"]);
+    write(
+        &collision_winner_checkout.join(".bbox/config.toml"),
+        b"[project]\nrepo_id = \"neutral-collision\"\n",
+    );
+    git(&collision_winner_checkout, &["add", ".bbox"]);
+    git(
+        &collision_winner_checkout,
+        &["commit", "-qm", "seed collision fixture"],
+    );
+    let collision_head_commit = git(&collision_winner_checkout, &["rev-parse", "HEAD"]);
     let loser_checkout = root.join("checkouts").join("loser-checkout");
     let clone = Command::new("git")
         .args([
             "clone",
             "-q",
-            winner_checkout.to_str().unwrap(),
+            collision_winner_checkout.to_str().unwrap(),
             loser_checkout.to_str().unwrap(),
         ])
         .output()
@@ -214,6 +232,7 @@ fn prepare_rehearsal(root: &Path, config: &Config) -> RehearsalFixture {
     let state = root.join("state");
     fs::create_dir_all(state.join("bro")).unwrap();
     let winner_project = ProjectId::parse("neutral-winner").unwrap();
+    let collision_winner_project = ProjectId::parse("neutral-collision-winner").unwrap();
     let loser_project = ProjectId::parse("neutral-loser").unwrap();
     write(
         &state.join("projects.json"),
@@ -230,10 +249,19 @@ fn prepare_rehearsal(root: &Path, config: &Config) -> RehearsalFixture {
                     "aliases": []
                 },
                 {
-                    "project_id": loser_project,
-                    "repo_id": "neutral-repository",
-                    "canonical_path": loser_checkout,
+                    "project_id": collision_winner_project,
+                    "repo_id": "neutral-collision",
+                    "canonical_path": collision_winner_checkout,
                     "registered_at": "2026-01-02T03:04:06Z",
+                    "is_git_repo": true,
+                    "languages": [],
+                    "aliases": []
+                },
+                {
+                    "project_id": loser_project,
+                    "repo_id": "neutral-collision",
+                    "canonical_path": loser_checkout,
+                    "registered_at": "2026-01-02T03:04:07Z",
                     "is_git_repo": true,
                     "languages": [],
                     "aliases": []
@@ -249,12 +277,37 @@ fn prepare_rehearsal(root: &Path, config: &Config) -> RehearsalFixture {
     )
     .unwrap();
     let scope = PublishedScope::try_new("neutral-repository", ".").unwrap();
+    let collision_scope = PublishedScope::try_new("neutral-collision", ".").unwrap();
     let paths = CodeSourceStorePaths::new(code_sources.root()).unwrap();
-    let (winner_generation, winner_selection) =
-        write_generation(&paths, &winner_project, &scope, "winner", &head_commit, 1);
-    let (loser_generation, loser_selection) =
-        write_generation(&paths, &loser_project, &scope, "loser", &head_commit, 2);
-    let mut selections = vec![winner_selection, loser_selection];
+    let (winner_generation, winner_selection) = write_generation(
+        &paths,
+        &winner_project,
+        &scope,
+        "winner",
+        &winner_head_commit,
+        1,
+    );
+    let (collision_winner_generation, collision_winner_selection) = write_generation(
+        &paths,
+        &collision_winner_project,
+        &collision_scope,
+        "collision_winner",
+        &collision_head_commit,
+        2,
+    );
+    let (loser_generation, loser_selection) = write_generation(
+        &paths,
+        &loser_project,
+        &collision_scope,
+        "loser",
+        &collision_head_commit,
+        3,
+    );
+    let mut selections = vec![
+        winner_selection,
+        collision_winner_selection,
+        loser_selection,
+    ];
     selections.sort_by(|left, right| left.project_id.cmp(&right.project_id));
     write(
         &paths.anchor(),
@@ -270,12 +323,16 @@ fn prepare_rehearsal(root: &Path, config: &Config) -> RehearsalFixture {
     publisher.persist_pin_candidate(&pin).unwrap();
     RehearsalFixture {
         winner_checkout,
+        collision_winner_checkout,
         loser_checkout,
         winner_project,
+        collision_winner_project,
         loser_project,
         winner_generation,
+        collision_winner_generation,
         loser_generation,
         scope,
+        collision_scope,
     }
 }
 
@@ -292,6 +349,10 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
             .winner_checkout
             .join(".bbox/local/checkout-id")
             .exists()
+            && !fixture
+                .collision_winner_checkout
+                .join(".bbox/local/checkout-id")
+                .exists()
             && !fixture
                 .loser_checkout
                 .join(".bbox/local/checkout-id")
@@ -342,8 +403,8 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
     let scope_conflict = assessment_report.scope_conflicts.first().unwrap();
     resolution.selected_scope_owners.push(SelectedScopeOwnerV1 {
         resolution_id: scope_conflict.conflict_id.clone(),
-        scope: fixture.scope.clone(),
-        owner_project_id: fixture.winner_project.clone(),
+        scope: fixture.collision_scope.clone(),
+        owner_project_id: fixture.collision_winner_project.clone(),
         losing_project_ids: [fixture.loser_project.clone()].into_iter().collect(),
         owned_aliases: Default::default(),
     });
@@ -390,10 +451,10 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
         ProjectCatalogMigrationStatusV1::Clean
     );
     assert_public_value_is_path_redacted(&preflight.receipt, &rehearsal_root);
-    assert_eq!(preflight.receipt.checkout_action_count, 1);
+    assert_eq!(preflight.receipt.checkout_action_count, 2);
     assert_eq!(preflight.receipt.publisher_pin_count, 1);
     assert_eq!(preflight.receipt.quarantine_root_count, 1);
-    assert_eq!(preflight.receipt.attached_project_count, 1);
+    assert_eq!(preflight.receipt.attached_project_count, 2);
     assert_eq!(preflight.receipt.omitted_catalog_count, 1);
 
     let reviewed_report_bytes = fs::read(&report_path).unwrap();
@@ -468,17 +529,35 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
         .unwrap();
     assert_public_value_is_path_redacted(verified.receipt(), &rehearsal_root);
     assert_eq!(verified.receipt(), &applied.receipt.verification);
-    assert_eq!(verified.compatibility().records().len(), 1);
+    assert_eq!(verified.compatibility().records().len(), 2);
     assert_eq!(verified.compatibility().omitted_catalog_count(), 1);
 
     let code_source_paths =
         CodeSourceStorePaths::new(rehearsal_root.join("state/code-sources")).unwrap();
     let executable_report = decode_migration_report_v1(&fs::read(&report_path).unwrap()).unwrap();
-    let checkout_action = executable_report.checkout_identity_actions.first().unwrap();
-    assert_eq!(
-        fs::read_to_string(fixture.winner_checkout.join(".bbox/local/checkout-id")).unwrap(),
-        format!("{}\n", checkout_action.planned_checkout_id)
-    );
+    for (project_id, checkout) in [
+        (&fixture.winner_project, &fixture.winner_checkout),
+        (
+            &fixture.collision_winner_project,
+            &fixture.collision_winner_checkout,
+        ),
+    ] {
+        let observation_id = &executable_report
+            .attachments
+            .iter()
+            .find(|attachment| &attachment.project_id == project_id)
+            .unwrap()
+            .checkout_observation_id;
+        let action = executable_report
+            .checkout_identity_actions
+            .iter()
+            .find(|action| &action.observation_id == observation_id)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(checkout.join(".bbox/local/checkout-id")).unwrap(),
+            format!("{}\n", action.planned_checkout_id)
+        );
+    }
     assert!(
         !fixture
             .loser_checkout
@@ -489,12 +568,15 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
         &fs::read(code_source_paths.anchor()).unwrap(),
     )
     .unwrap();
-    assert_eq!(effective.selections.len(), 1);
-    assert_eq!(effective.selections[0].project_id, fixture.winner_project);
-    assert_eq!(
-        effective.selections[0].generation_id,
-        fixture.winner_generation
-    );
+    assert_eq!(effective.selections.len(), 2);
+    assert!(effective.selections.iter().any(|selection| {
+        selection.project_id == fixture.winner_project
+            && selection.generation_id == fixture.winner_generation
+    }));
+    assert!(effective.selections.iter().any(|selection| {
+        selection.project_id == fixture.collision_winner_project
+            && selection.generation_id == fixture.collision_winner_generation
+    }));
     let winner_activation = decode_activation_v2_for_migration(
         &fs::read(code_source_paths.activation(&fixture.winner_project)).unwrap(),
     )
@@ -502,6 +584,18 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
     assert_eq!(winner_activation.project_id, fixture.winner_project);
     assert_eq!(winner_activation.published_scope, fixture.scope);
     assert_eq!(winner_activation.generation_id, fixture.winner_generation);
+    let collision_winner_activation = decode_activation_v2_for_migration(
+        &fs::read(code_source_paths.activation(&fixture.collision_winner_project)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        collision_winner_activation.published_scope,
+        fixture.collision_scope
+    );
+    assert_eq!(
+        collision_winner_activation.generation_id,
+        fixture.collision_winner_generation
+    );
     assert!(
         !code_source_paths
             .activation(&fixture.loser_project)
@@ -517,16 +611,32 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
     )
     .unwrap();
     assert_eq!(winner_metadata.published_scope, fixture.scope);
-    let loser_metadata = decode_stored_generation_v2_for_migration(
+    let collision_winner_metadata = decode_stored_generation_v2_for_migration(
         &fs::read(
             code_source_paths
-                .generation_metadata(&fixture.scope, &fixture.loser_generation)
+                .generation_metadata(
+                    &fixture.collision_scope,
+                    &fixture.collision_winner_generation,
+                )
                 .unwrap(),
         )
         .unwrap(),
     )
     .unwrap();
-    assert_eq!(loser_metadata.published_scope, fixture.scope);
+    assert_eq!(
+        collision_winner_metadata.published_scope,
+        fixture.collision_scope
+    );
+    let loser_metadata = decode_stored_generation_v2_for_migration(
+        &fs::read(
+            code_source_paths
+                .generation_metadata(&fixture.collision_scope, &fixture.loser_generation)
+                .unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(loser_metadata.published_scope, fixture.collision_scope);
     let retirement = decode_collision_retirement_pending_for_migration(
         &fs::read(code_source_paths.collision_retirement_pending(&fixture.loser_project)).unwrap(),
     )
@@ -626,4 +736,70 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
         ProjectCatalogMigrationApplyOutcomeV1::AlreadyApplied
     );
     assert_eq!(reapplied.receipt.verification, applied.receipt.verification);
+}
+
+#[test]
+fn absent_legacy_catalog_is_fresh_for_first_apply_but_public_verify_fails_closed() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let config = config(&root);
+    let rehearsal_root = root.join("empty-rehearsal");
+    fs::create_dir_all(&rehearsal_root).unwrap();
+    let rehearsal =
+        ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(&rehearsal_root, &config)
+            .unwrap();
+    let protected_root = root.join("protected-empty");
+    fs::create_dir_all(&protected_root).unwrap();
+    let protected = ProjectCatalogMigrationResolvedLayoutV1::from_config(
+        &config,
+        ProjectCatalogMigrationLayoutOverridesV1 {
+            projects_path: Some(protected_root.join("projects.json")),
+            state_dir: Some(protected_root),
+        },
+    )
+    .unwrap();
+    let verify_error =
+        ProjectCatalogMigrationFacadeV1::verify(ProjectCatalogMigrationVerifyRequestV1 {
+            rehearsal_layout: rehearsal.clone(),
+        })
+        .unwrap_err();
+    assert_eq!(verify_error.code, "error.project_catalog_invalid_snapshot");
+    assert_eq!(
+        verify_error.mutation_disposition,
+        ProjectCatalogMigrationMutationDispositionV1::NoDurableMutation
+    );
+
+    let review = rehearsal_root.join("review");
+    let report_path = review.join("report.json");
+    let resolution_path = review.join("resolution.json");
+    let preflight =
+        ProjectCatalogMigrationFacadeV1::preflight(ProjectCatalogMigrationPreflightRequestV1 {
+            layout: rehearsal.clone(),
+            report_path: report_path.clone(),
+            resolution_path: resolution_path.clone(),
+            sensitive_report_path: None,
+        })
+        .unwrap();
+    assert_eq!(
+        preflight.receipt.status,
+        ProjectCatalogMigrationStatusV1::Clean
+    );
+    let applied =
+        ProjectCatalogMigrationFacadeV1::apply_rehearsal(ProjectCatalogMigrationApplyRequestV1 {
+            rehearsal_layout: rehearsal.clone(),
+            protected_layout: protected,
+            report_path,
+            resolution_path,
+        })
+        .unwrap();
+    assert_eq!(
+        applied.receipt.outcome,
+        ProjectCatalogMigrationApplyOutcomeV1::Applied
+    );
+    let verified =
+        ProjectCatalogMigrationFacadeV1::verify(ProjectCatalogMigrationVerifyRequestV1 {
+            rehearsal_layout: rehearsal,
+        })
+        .unwrap();
+    assert_eq!(verified.receipt(), &applied.receipt.verification);
 }
