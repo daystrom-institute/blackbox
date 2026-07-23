@@ -345,3 +345,69 @@ until a later entry explicitly supersedes it.
   must bind the exact evidence while every allocation remains bounded.
 - Revisit only if: a replacement publication substrate provides equivalent
   byte-exact provenance, deterministic identity, and stricter resource bounds.
+
+## D-015: Preflight persists the migration transaction identity
+
+- Date: 2026-07-22
+- Phase: durable project catalog, migration reproducibility
+- Status: accepted after independent plan re-review
+- Decision: Preflight mints one strong-random migration transaction id and
+  persists it in the migration report and deterministic post-image input. The
+  catalog origin, transaction draft, journal, and marker must all use that
+  exact id. Apply never remints or substitutes it.
+- Evidence:
+  - A migrated catalog embeds the transaction id in its canonical post-image.
+  - The report promises an exact predicted catalog hash that a later,
+    separately invoked apply must reproduce.
+  - Persisting only the predicted hash cannot recover a randomly minted id and
+    would make the advertised post-image non-reconstructible.
+- Rationale: Planning the id before hashing removes the reproducibility gap
+  without deriving an authority-bearing transaction identity from mutable
+  source data or introducing a hash cycle.
+- Revisit only if: the migration report is replaced by another durable,
+  operator-reviewed artifact that binds the same exact transaction identity.
+
+## D-016: Preflight persists every random post-image identity
+
+- Date: 2026-07-22
+- Phase: durable project catalog, migration reproducibility
+- Status: accepted after independent plan re-review
+- Decision: Preflight plans and persists every strong-random value embedded in
+  a predicted migration post-image. This includes repository-history ids,
+  legacy-path binding ids, local commit namespaces required by inventoried
+  local history, checkout ids, and the migration transaction id. Apply reuses
+  the exact planned values and never remints them. A `LegacyLocal` project
+  without inventoried history evidence receives no repository-history record.
+- Evidence:
+  - Repository-history and legacy-path maps use opaque random ids as canonical
+    keys, and a local-authority history may require a random namespace.
+  - A later apply cannot reconstruct a predicted hash if it remints any value
+    contained in the hashed snapshot.
+  - Deriving authority-bearing ids from paths, aliases, or weak namespaces
+    would reintroduce the identity assumptions the catalog removes.
+- Rationale: Persisting all planned random values makes separate preflight and
+  apply invocations byte-reproducible while keeping logical identity opaque and
+  independent of private or mutable source labels.
+- Revisit only if: a replacement planning artifact durably binds every random
+  post-image value or a reviewed opaque deterministic id scheme provides the
+  same authority and privacy properties.
+
+## D-017: Predicted migration timestamps come from inventoried state
+
+- Date: 2026-07-22
+- Phase: durable project catalog, migration reproducibility
+- Status: accepted after independent plan re-review
+- Decision: A migrated project's `created_at` and each corresponding
+  attachment's `attached_at` preserve the legacy project's exact
+  `registered_at` value. No wall-clock value enters a predicted migration
+  post-image. Any later timestamp-bearing participant must use a persisted
+  planned value or exact inventoried source value.
+- Evidence:
+  - Both timestamps are canonical snapshot bytes covered by predicted hashes.
+  - Separately invoked preflight and apply cannot reproduce a wall-clock value.
+  - The validated legacy registration timestamp already expresses the closest
+    durable event available for both imported records.
+- Rationale: Preserving existing time evidence gives byte-reproducible
+  post-images without inventing precision or another planned timestamp.
+- Revisit only if: a stronger exact source timestamp is inventoried and bound
+  into the same plan before its predicted post-image is hashed.

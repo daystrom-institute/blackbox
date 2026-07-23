@@ -674,12 +674,36 @@ An active or retained generation with a missing or corrupt immutable descriptor
 is refused with the exact bridge-v1 repair/retire instruction. Resolution
 cannot invent its scope.
 
-For each eligible missing-or-empty checkout marker, the persisted preflight
-report adds one planned strong-random checkout id shared by all monorepo
-attachments on that canonical root. The inventory, planned identity actions,
-resolution, and all predicted post-images form one canonical `plan_hash`.
-Generating a new report may generate a different plan, but apply consumes one
-exact persisted report and never substitutes a new id.
+Preflight plans and persists every strong-random value that will enter a
+predicted post-image:
+
+- one migration transaction id;
+- one repository-history id for each surviving history group;
+- one legacy-path binding id for each retained ledger row;
+- one local commit namespace for each history group that requires local
+  authority and has no inventoried materialized namespace; and
+- one checkout id per eligible missing-or-empty marker, shared by all monorepo
+  attachments on that canonical root.
+
+The catalog post-image uses the exact transaction id in
+`CatalogOriginV2::MigratedV1`. Reported repository-history groups carry their
+planned history id, primary namespace, and compatibility namespaces. Reported
+legacy-path binding rows carry their planned binding id. Apply never remints or
+substitutes any of these values. A `LegacyLocal` project with no inventoried
+history evidence receives no repository-history record; when such evidence
+requires a local-authority history and supplies no materialized namespace,
+preflight uses the persisted planned local namespace.
+
+Migrated `CorpusProject.created_at` and every corresponding
+`CheckoutAttachment.attached_at` preserve that legacy project's exact
+`registered_at` value. No wall-clock value may enter a predicted post-image;
+any future timestamp-bearing migration participant must use a persisted planned
+value or exact inventoried source value.
+
+The planned identities, inventory, resolution, and all predicted post-images
+form one canonical `plan_hash`. Generating a new report may generate a different
+plan, but apply consumes one exact persisted report and never substitutes a new
+id.
 
 ### 6.3 Evidence and grouping
 
@@ -704,6 +728,7 @@ retain distinct published scopes.
 
 ```text
 version
+transaction_id
 inventory_hash
 plan_hash
 source_store_hash
@@ -879,7 +904,12 @@ plan inventories and backs up those SHA values, creates the repo-history record
 without a cursor, and requires the later Git-overlay phase to publish one full
 reachable-history generation before recording a new cursor.
 
-The builder emits one transaction plan containing:
+The deterministic post-image input carries the report's exact migration
+transaction id, planned repository-history assignments, planned legacy-path
+binding ids, planned local namespaces, and checkout identity actions. The
+builder rejects any catalog origin, transaction draft, history record, ledger
+row, or local namespace whose id differs from that persisted value. It emits
+one transaction plan containing:
 
 - catalog and attachment post-images;
 - the complete mapped, unscoped, and quarantined legacy path ledger inside the
@@ -916,8 +946,8 @@ The engine:
    locks, and reruns inventory from the exact bytes;
 3. prepares Git/content-derived G1 assets through explicit read leases without
    holding a store lock;
-4. requires the exact persisted report, resolution, inventory hash, and
-   `plan_hash`;
+4. requires the exact persisted report, migration transaction id, resolution,
+   inventory hash, and `plan_hash`;
 5. requires a clean report and one disposition for every publisher pin and
    collision;
 6. builds and validates every post-image in memory;
@@ -952,6 +982,10 @@ it changes destination, not transaction semantics.
 Fixture and property tests cover:
 
 - empty v1 store;
+- separately invoked preflight and apply reproducing identical post-image
+  hashes for repository-history records, legacy-path binding rows, and a
+  `LegacyLocal` project whose inventoried history requires a planned local
+  namespace;
 - Git, non-Git, monorepo, shallow, missing, and moved projects;
 - duplicate ids, scopes, aliases, and weak namespaces;
 - same-repo and false-same-repo evidence;
