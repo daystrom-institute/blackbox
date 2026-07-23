@@ -13978,14 +13978,21 @@ mod tests {
     fn directory_only_pre_journal_state_requires_exact_plan_retry() {
         let (_directory, path, plan, _, _) = migration_fault_fixture();
         let paths = ProjectCatalogPaths::derive(&path).unwrap();
-        fs::create_dir_all(&paths.stage_dir).unwrap();
 
-        let disposition = classify_migration_failure(&path, &plan, Arc::new(RealCatalogStoreIo));
+        let failure = transact_migration_classified_with_io(
+            &path,
+            plan,
+            Arc::new(TracingIo::failing_points([FaultPoint::StageWrite])),
+        )
+        .unwrap_err();
 
         assert_eq!(
-            disposition,
+            failure.disposition,
             MigrationMutationDispositionV1::RetryExactPlanRequired
         );
+        assert!(paths.stage_dir.is_dir());
+        assert!(paths.backup_dir.is_dir());
+        assert!(!paths.journal.exists());
     }
 
     #[test]
