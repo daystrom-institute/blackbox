@@ -5586,11 +5586,11 @@ mod tests {
             legacy_project_paths: BTreeMap::from([
                 (
                     "legacy_alpha".to_string(),
-                    PathBuf::from("/workspace/acme/services/alpha"),
+                    PathBuf::from("/workspace/acme/alpha"),
                 ),
                 (
                     "legacy_beta".to_string(),
-                    PathBuf::from("/workspace/acme/services/beta"),
+                    PathBuf::from("/workspace/acme/beta"),
                 ),
             ]),
             checkout_paths: BTreeMap::from([(
@@ -5600,7 +5600,7 @@ mod tests {
             git_common_directories: BTreeMap::new(),
             legacy_selectors: BTreeMap::from([(
                 "legacy_path_alpha".to_string(),
-                "/workspace/acme/services/alpha/src/Example.java".to_string(),
+                "/workspace/acme/alpha/src/Example.java".to_string(),
             )]),
         };
 
@@ -5639,10 +5639,13 @@ mod tests {
 
         runtime.legacy_selectors.insert(
             "legacy_path_alpha".to_string(),
-            "/workspace/acme/services/alpha".to_string(),
+            "/workspace/acme/alpha".to_string(),
         );
+        let mut exact_inventory = inventory.clone();
+        exact_inventory.legacy_path_observations[0].selector_digest =
+            digest_path("/workspace/acme/alpha");
         assert_eq!(
-            classify_legacy_paths(&inventory, &runtime, &identities)
+            classify_legacy_paths(&exact_inventory, &runtime, &identities)
                 .unwrap()
                 .report_rows[0]
                 .relationship,
@@ -5652,7 +5655,10 @@ mod tests {
             "legacy_path_alpha".to_string(),
             "/outside/unscoped".to_string(),
         );
-        let unscoped = classify_legacy_paths(&inventory, &runtime, &identities).unwrap();
+        let mut unscoped_inventory = inventory.clone();
+        unscoped_inventory.legacy_path_observations[0].selector_digest =
+            digest_path("/outside/unscoped");
+        let unscoped = classify_legacy_paths(&unscoped_inventory, &runtime, &identities).unwrap();
         assert_eq!(
             unscoped.report_rows[0].relationship,
             LegacyPathRelationshipV1::Unscoped
@@ -5666,7 +5672,7 @@ mod tests {
 
         runtime.legacy_selectors.insert(
             "legacy_path_alpha".to_string(),
-            "/workspace/acme/services/alpha/src/Example.java".to_string(),
+            "/workspace/acme/alpha/src/Example.java".to_string(),
         );
         let mut missing_inventory = inventory.clone();
         missing_inventory.legacy_projects[0].path_status =
@@ -5680,7 +5686,7 @@ mod tests {
 
         runtime.legacy_project_paths.insert(
             "legacy_beta".to_string(),
-            PathBuf::from("/workspace/acme/services/alpha"),
+            PathBuf::from("/workspace/acme/alpha"),
         );
         let ambiguous = classify_legacy_paths(&inventory, &runtime, &identities).unwrap();
         assert_eq!(
@@ -5691,9 +5697,13 @@ mod tests {
 
         runtime.legacy_selectors.insert(
             "legacy_path_alpha".to_string(),
-            "/workspace/acme/services/alpha/../beta".to_string(),
+            "/workspace/acme/alpha/../beta".to_string(),
         );
-        let unsafe_selector = classify_legacy_paths(&inventory, &runtime, &identities).unwrap();
+        let mut unsafe_inventory = inventory.clone();
+        unsafe_inventory.legacy_path_observations[0].selector_digest =
+            digest_path("/workspace/acme/alpha/../beta");
+        let unsafe_selector =
+            classify_legacy_paths(&unsafe_inventory, &runtime, &identities).unwrap();
         assert_eq!(
             unsafe_selector.report_rows[0].relationship,
             LegacyPathRelationshipV1::UnsafeSelector
