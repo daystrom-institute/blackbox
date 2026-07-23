@@ -15,33 +15,49 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bbox_code_source_store::CodeSourceStorePaths;
+use bbox_code_source_store::{
+    CodeSourceStorePaths, decode_activation_v2_for_migration,
+    decode_collision_retirement_pending_for_migration, decode_stored_generation_v2_for_migration,
+};
 use bbox_corpus_core::identity::CHECKOUT_LOCAL_GITIGNORE_BYTES;
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::json_store::{
     NofollowDirectory, StoreLockGuard, acquire_store_lock_nofollow, canonical_store_lock_path,
 };
 use bbox_corpus_core::project_catalog::{
-    AttachmentSnapshotV1, CatalogOriginV2, CatalogSnapshotV2, MAX_PROJECT_CATALOG_BYTES,
-    MAX_PROJECT_CATALOG_ENTRIES, ProjectCatalogTransactionId, ProjectId,
-    decode_attachment_snapshot, decode_catalog_snapshot, decode_legacy_project_store,
+    AttachmentId, AttachmentSnapshotV1, AttachmentStatus, CatalogOriginV2, CatalogSnapshotV2,
+    MAX_PROJECT_CATALOG_BYTES, MAX_PROJECT_CATALOG_ENTRIES, ProjectCatalogTransactionId, ProjectId,
+    ProjectScope, decode_attachment_snapshot, decode_catalog_snapshot, decode_legacy_project_store,
     encode_attachment_snapshot, encode_catalog_snapshot, validate_catalog_attachments,
 };
 use parking_lot::RwLock;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::{Digest, Sha256};
 
+use crate::accepted_publication_store::{
+    AcceptedPublicationGenerationId, AcceptedPublicationLimits, AcceptedPublicationStorePaths,
+    FullPublisherRef, GitObjectId, MAX_ACCEPTED_PUBLICATION_GENERATION_BYTES,
+    MAX_ACCEPTED_PUBLICATION_POINTER_BYTES, decode_generation_v1, decode_pointer_v1,
+    verify_pointer_generation_v1,
+};
 use crate::project_catalog_migration_lock::{
     ProjectCatalogMigrationLock, project_catalog_migration_lock_path,
 };
 
 const JOURNAL_VERSION: u32 = 1;
 const MIGRATION_MARKER_VERSION: u32 = 1;
-const MAX_MIGRATION_PARTICIPANTS: usize = MAX_PROJECT_CATALOG_ENTRIES * 4 + 4;
+const MAX_MIGRATION_PARTICIPANTS: usize = MAX_PROJECT_CATALOG_ENTRIES * 5 + 4;
 const MAX_MIGRATION_IMMUTABLE_ASSETS: usize = MAX_PROJECT_CATALOG_ENTRIES * 2 + 2;
 const MAX_MIGRATION_CHECKOUT_ACTIONS: usize = MAX_PROJECT_CATALOG_ENTRIES;
+const MAX_MIGRATION_PUBLISHER_PINS: usize = 4 * 1024;
 const MAX_JOURNAL_BYTES: usize = 512 * 1024 * 1024;
 const MAX_MARKER_BYTES: usize = 512 * 1024 * 1024;
+const MAX_CODE_SOURCE_EFFECTIVE_MANIFEST_BYTES: usize = 512 * 1024 * 1024;
+const MAX_CODE_SOURCE_ACTIVATION_BYTES: usize = 512 * 1024 * 1024;
+const MAX_CODE_SOURCE_GENERATION_METADATA_BYTES: usize = 64 * 1024;
+const MAX_CODE_SOURCE_COLLISION_RETIREMENT_BYTES: usize = 64 * 1024;
+const MAX_CODE_SOURCE_COLLECTED_MANIFEST_BYTES: usize = 512 * 1024 * 1024;
+const MAX_LEGACY_PUBLISHER_REF_SOURCE_BYTES: usize = MAX_PROJECT_CATALOG_BYTES;
 
 pub type ProjectCatalogStoreResult<T> = Result<T, ProjectCatalogStoreError>;
 
@@ -500,6 +516,8 @@ enum ParticipantRegistry {
 pub(crate) struct MigrationParticipantRegistry {
     catalog_path: PathBuf,
     code_source_paths: CodeSourceStorePaths,
+    accepted_publication_paths: AcceptedPublicationStorePaths,
+    legacy_publisher_ref_source: PathBuf,
     catalog_immutable_root: PathBuf,
     checkout_identity_markers: std::collections::BTreeMap<String, PathBuf>,
 }
@@ -509,6 +527,7 @@ impl MigrationParticipantRegistry {
     pub(crate) fn new(
         projects_path: &Path,
         code_source_root: PathBuf,
+        legacy_publisher_ref_source: PathBuf,
     ) -> ProjectCatalogStoreResult<Self> {
         let paths = ProjectCatalogPaths::derive(projects_path)?;
         let code_source_paths = CodeSourceStorePaths::new(code_source_root).map_err(|error| {
@@ -517,9 +536,18 @@ impl MigrationParticipantRegistry {
                 error.to_string(),
             )
         })?;
+        let accepted_publication_paths = AcceptedPublicationStorePaths::derive(projects_path)
+            .map_err(|error| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_invalid_migration_registry",
+                    error.to_string(),
+                )
+            })?;
         Self {
             catalog_path: paths.catalog,
             code_source_paths,
+            accepted_publication_paths,
+            legacy_publisher_ref_source,
             catalog_immutable_root: paths.backup_dir.join("immutable"),
             checkout_identity_markers: std::collections::BTreeMap::new(),
         }
@@ -584,15 +612,25 @@ impl MigrationParticipantRegistry {
         all_fixed_paths.extend(lock_paths);
         let distinct_fixed_paths = all_fixed_paths.iter().collect::<BTreeSet<_>>();
         let code_source_root = self.code_source_paths.root();
-        let root_collides = control_paths
-            .iter()
-            .any(|path| paths_overlap(path, code_source_root));
+        let accepted_publication_root = self.accepted_publication_paths.root();
+        let root_collides = control_paths.iter().any(|path| {
+            paths_overlap(path, code_source_root)
+                || paths_overlap(path, accepted_publication_root)
+                || paths_overlap(path, &self.legacy_publisher_ref_source)
+        }) || paths_overlap(code_source_root, accepted_publication_root)
+            || paths_overlap(code_source_root, &self.legacy_publisher_ref_source)
+            || paths_overlap(accepted_publication_root, &self.legacy_publisher_ref_source);
         let checkout_collides = self.checkout_identity_markers.values().any(|target| {
             control_paths.iter().any(|path| paths_overlap(path, target))
                 || paths_overlap(code_source_root, target)
+                || paths_overlap(accepted_publication_root, target)
+                || paths_overlap(&self.legacy_publisher_ref_source, target)
         });
         if !safe_absolute_path(&self.catalog_path)
             || !safe_absolute_path(self.code_source_paths.root())
+            || !safe_absolute_path(self.accepted_publication_paths.anchor())
+            || !safe_absolute_path(self.accepted_publication_paths.root())
+            || !safe_absolute_path(&self.legacy_publisher_ref_source)
             || !safe_absolute_path(&self.catalog_immutable_root)
             || self
                 .checkout_identity_markers
@@ -629,6 +667,9 @@ impl MigrationParticipantRegistry {
                 self.code_source_paths
                     .collision_retirement_pending(project_id),
             ),
+            ParticipantRoleV1::AcceptedPublicationPointer { project_id } => {
+                Some(self.accepted_publication_paths.pointer(project_id))
+            }
             ParticipantRoleV1::Catalog
             | ParticipantRoleV1::Attachments
             | ParticipantRoleV1::MigrationMarker => None,
@@ -645,6 +686,19 @@ impl MigrationParticipantRegistry {
             | ImmutableAssetRoleV1::LegacyPublisherRefBackup => {
                 self.catalog_immutable_root.join(validated_name.as_str())
             }
+            ImmutableAssetRoleV1::AcceptedPublicationGeneration {
+                project_id,
+                generation_id,
+            } => self
+                .accepted_publication_paths
+                .generation(project_id, generation_id),
+            ImmutableAssetRoleV1::CollectedGenerationManifest {
+                published_scope,
+                generation_id,
+            } => self
+                .code_source_paths
+                .generation_manifest(published_scope, generation_id.as_str())
+                .expect("validated immutable collected manifest role"),
         }
     }
 
@@ -653,7 +707,11 @@ impl MigrationParticipantRegistry {
     }
 
     fn auxiliary_store_paths(&self) -> Vec<PathBuf> {
-        let mut paths = vec![self.code_source_paths.anchor()];
+        let mut paths = vec![
+            self.code_source_paths.anchor(),
+            self.accepted_publication_paths.anchor().to_path_buf(),
+            self.legacy_publisher_ref_source.clone(),
+        ];
         paths.sort();
         paths.dedup();
         paths
@@ -704,13 +762,29 @@ impl MigrationParticipantDraftV1 {
 #[allow(dead_code)] // P1-B transaction input consumed by P1-C.
 pub(crate) struct MigrationImmutableAssetDraftV1 {
     role: ImmutableAssetRoleV1,
-    bytes: Vec<u8>,
+    source: MigrationImmutableAssetSourceV1,
+}
+
+#[derive(Debug, Clone)]
+enum MigrationImmutableAssetSourceV1 {
+    InstallableBytes(Vec<u8>),
+    PinnedExisting { expected_sha256: Sha256Hex },
 }
 
 #[allow(dead_code)] // P1-B transaction input consumed by P1-C.
 impl MigrationImmutableAssetDraftV1 {
     pub(crate) fn new(role: ImmutableAssetRoleV1, bytes: Vec<u8>) -> Self {
-        Self { role, bytes }
+        Self {
+            role,
+            source: MigrationImmutableAssetSourceV1::InstallableBytes(bytes),
+        }
+    }
+
+    pub(crate) fn pinned_existing(role: ImmutableAssetRoleV1, expected_sha256: Sha256Hex) -> Self {
+        Self {
+            role,
+            source: MigrationImmutableAssetSourceV1::PinnedExisting { expected_sha256 },
+        }
     }
 }
 
@@ -731,18 +805,492 @@ impl MigrationCheckoutIdentityActionDraftV1 {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PublisherPinEvidenceV1 {
+    pub(crate) observation_id: String,
+    pub(crate) project_id: ProjectId,
+    pub(crate) expected_scope: PublishedScope,
+    pub(crate) full_ref: FullPublisherRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "disposition", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum PublisherDispositionEvidenceV1 {
+    SeedG1 {
+        observation_id: String,
+        project_id: ProjectId,
+        attachment_id: AttachmentId,
+        expected_scope: PublishedScope,
+        full_ref: FullPublisherRef,
+        accepted_commit: GitObjectId,
+        generation_id: AcceptedPublicationGenerationId,
+        generation_sha256: Sha256Hex,
+        pointer_sha256: Sha256Hex,
+    },
+    NoPublishedContentAcknowledged {
+        observation_id: String,
+        project_id: ProjectId,
+        expected_scope: PublishedScope,
+        full_ref: FullPublisherRef,
+        bounded_reason: String,
+    },
+}
+
+impl PublisherDispositionEvidenceV1 {
+    fn observation_id(&self) -> &str {
+        match self {
+            Self::SeedG1 { observation_id, .. }
+            | Self::NoPublishedContentAcknowledged { observation_id, .. } => observation_id,
+        }
+    }
+
+    fn project_id(&self) -> &ProjectId {
+        match self {
+            Self::SeedG1 { project_id, .. }
+            | Self::NoPublishedContentAcknowledged { project_id, .. } => project_id,
+        }
+    }
+
+    fn expected_scope(&self) -> &PublishedScope {
+        match self {
+            Self::SeedG1 { expected_scope, .. }
+            | Self::NoPublishedContentAcknowledged { expected_scope, .. } => expected_scope,
+        }
+    }
+
+    fn full_ref(&self) -> &FullPublisherRef {
+        match self {
+            Self::SeedG1 { full_ref, .. }
+            | Self::NoPublishedContentAcknowledged { full_ref, .. } => full_ref,
+        }
+    }
+}
+
+fn validate_publisher_evidence(
+    pins: &[PublisherPinEvidenceV1],
+    dispositions: &[PublisherDispositionEvidenceV1],
+    owner: &str,
+) -> ProjectCatalogStoreResult<()> {
+    if pins.len() > MAX_MIGRATION_PUBLISHER_PINS
+        || dispositions.len() > MAX_MIGRATION_PUBLISHER_PINS
+    {
+        return Err(ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_publisher_evidence",
+            format!("{owner} publisher evidence exceeds its cardinality limit"),
+        ));
+    }
+    let mut pins_by_observation = std::collections::BTreeMap::new();
+    let mut scopes = BTreeSet::new();
+    for pin in pins {
+        validate_evidence_id(&pin.observation_id, "publisher pin observation")?;
+        pin.expected_scope.validate().map_err(contract_error)?;
+        if pins_by_observation
+            .insert(pin.observation_id.as_str(), pin)
+            .is_some()
+            || !scopes.insert(pin.expected_scope.clone())
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_publisher_evidence",
+                format!("{owner} publisher pin evidence is duplicated"),
+            ));
+        }
+    }
+    let mut disposition_ids = BTreeSet::new();
+    for disposition in dispositions {
+        validate_evidence_id(
+            disposition.observation_id(),
+            "publisher disposition observation",
+        )?;
+        disposition
+            .expected_scope()
+            .validate()
+            .map_err(contract_error)?;
+        let pin = pins_by_observation
+            .get(disposition.observation_id())
+            .ok_or_else(|| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_invalid_publisher_evidence",
+                    format!("{owner} publisher disposition has no matching pin"),
+                )
+            })?;
+        if !disposition_ids.insert(disposition.observation_id())
+            || disposition.project_id() != &pin.project_id
+            || disposition.expected_scope() != &pin.expected_scope
+            || disposition.full_ref() != &pin.full_ref
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_publisher_evidence",
+                format!("{owner} publisher disposition rewrites or duplicates pin evidence"),
+            ));
+        }
+        if let PublisherDispositionEvidenceV1::NoPublishedContentAcknowledged {
+            bounded_reason, ..
+        } = disposition
+            && (bounded_reason.is_empty()
+                || bounded_reason.len() > 4096
+                || bounded_reason.trim() != bounded_reason
+                || bounded_reason.chars().any(char::is_control))
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_publisher_evidence",
+                format!("{owner} no-content acknowledgement reason is invalid"),
+            ));
+        }
+    }
+    if disposition_ids != pins_by_observation.keys().copied().collect() {
+        return Err(ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_publisher_evidence",
+            format!("{owner} does not contain exactly one disposition per publisher pin"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_evidence_id(value: &str, kind: &str) -> ProjectCatalogStoreResult<()> {
+    if value.is_empty()
+        || value.len() > 256
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_publisher_evidence",
+            format!("{kind} id is invalid"),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_new_side_cross_roles(
+    catalog: &CatalogSnapshotV2,
+    attachments: &AttachmentSnapshotV1,
+    post_images: &std::collections::BTreeMap<ParticipantRoleV1, Option<Vec<u8>>>,
+    immutable_assets: &[MigrationImmutableAssetEvidenceV1],
+    immutable_asset_bytes: &std::collections::BTreeMap<ImmutableAssetRoleV1, Vec<u8>>,
+    publisher_pins: &[PublisherPinEvidenceV1],
+    publisher_dispositions: &[PublisherDispositionEvidenceV1],
+    inventory_sha256: &Sha256Hex,
+    plan_hash: &Sha256Hex,
+    error_code: &'static str,
+) -> ProjectCatalogStoreResult<()> {
+    validate_publisher_evidence(
+        publisher_pins,
+        publisher_dispositions,
+        "migration cross-role state",
+    )?;
+    let fail = |detail| {
+        ProjectCatalogStoreError::new(
+            error_code,
+            format!("migration cross-role validation failed: {detail}"),
+        )
+    };
+    let image_for = |role: &ParticipantRoleV1| {
+        post_images
+            .get(role)
+            .ok_or_else(|| fail("required participant role is missing"))
+    };
+    let immutable_for = |role: &ImmutableAssetRoleV1| {
+        immutable_assets
+            .iter()
+            .find(|asset| &asset.role == role)
+            .ok_or_else(|| fail("required immutable asset role is missing"))
+    };
+
+    let mut stored_generations = std::collections::BTreeMap::new();
+    for (role, post_image) in post_images {
+        let ParticipantRoleV1::StoredGenerationMetadata {
+            project_id,
+            published_scope,
+            generation_id,
+        } = role
+        else {
+            continue;
+        };
+        let bytes = post_image
+            .as_ref()
+            .ok_or_else(|| fail("stored generation metadata post-image is absent"))?;
+        let record = decode_stored_generation_v2_for_migration(bytes)
+            .map_err(|error| fail(error.to_string()))?;
+        let project = catalog
+            .projects
+            .get(project_id)
+            .ok_or_else(|| fail("stored generation project is absent from the catalog"))?;
+        if record.generation_id != generation_id.as_str()
+            || &record.published_scope != published_scope
+            || project.scope != ProjectScope::Published(published_scope.clone())
+        {
+            return Err(fail(
+                "stored generation role, record, and catalog scope disagree",
+            ));
+        }
+        let key = (
+            project_id.clone(),
+            published_scope.clone(),
+            generation_id.clone(),
+        );
+        if stored_generations.insert(key, record).is_some() {
+            return Err(fail("stored generation identity is duplicated"));
+        }
+    }
+    let mut activation_projects = BTreeSet::new();
+    let mut collision_projects = BTreeSet::new();
+    for (role, post_image) in post_images {
+        match role {
+            ParticipantRoleV1::StoredGenerationMetadata { .. } => {}
+            ParticipantRoleV1::Activation { project_id } => {
+                if !activation_projects.insert(project_id.clone()) {
+                    return Err(fail("activation project is duplicated"));
+                }
+                let Some(bytes) = post_image else {
+                    continue;
+                };
+                let activation = decode_activation_v2_for_migration(bytes)
+                    .map_err(|error| fail(error.to_string()))?;
+                let project = catalog
+                    .projects
+                    .get(project_id)
+                    .ok_or_else(|| fail("activation project is absent from the catalog"))?;
+                let generation_id = Sha256Hex::parse(activation.generation_id.clone())
+                    .map_err(|_| fail("activation generation id is invalid"))?;
+                if &activation.project_id != project_id
+                    || project.scope != ProjectScope::Published(activation.published_scope.clone())
+                {
+                    return Err(fail("activation role, record, and catalog scope disagree"));
+                }
+                let generation = stored_generations
+                    .get(&(
+                        project_id.clone(),
+                        activation.published_scope.clone(),
+                        generation_id,
+                    ))
+                    .ok_or_else(|| {
+                        fail("activation lacks its exact scope-bearing stored generation")
+                    })?;
+                activation
+                    .validate_against_generation(generation)
+                    .map_err(|error| fail(error.to_string()))?;
+            }
+            ParticipantRoleV1::CollisionRetirement { project_id } => {
+                if !collision_projects.insert(project_id.clone()) {
+                    return Err(fail("collision retirement project is duplicated"));
+                }
+                let bytes = post_image.as_ref().ok_or_else(|| {
+                    fail("collision retirement participant must install a record")
+                })?;
+                let retirement = decode_collision_retirement_pending_for_migration(bytes)
+                    .map_err(|error| fail(error.to_string()))?;
+                let project = catalog
+                    .projects
+                    .get(project_id)
+                    .ok_or_else(|| fail("collision retirement project is absent from catalog"))?;
+                let generation_id = Sha256Hex::parse(retirement.generation_id.clone())
+                    .map_err(|_| fail("collision retirement generation id is invalid"))?;
+                let manifest_hash = Sha256Hex::parse(retirement.manifest_sha256.clone())
+                    .map_err(|_| fail("collision retirement manifest hash is invalid"))?;
+                if &retirement.project_id != project_id
+                    || project.scope != ProjectScope::LegacyLocal
+                    || retirement.inventory_hash != inventory_sha256.as_str()
+                    || retirement.plan_hash != plan_hash.as_str()
+                    || image_for(&ParticipantRoleV1::Activation {
+                        project_id: project_id.clone(),
+                    })?
+                    .is_some()
+                {
+                    return Err(fail(
+                        "collision retirement role, catalog, hashes, or activation removal disagree",
+                    ));
+                }
+                let manifest_role = ImmutableAssetRoleV1::CollectedGenerationManifest {
+                    published_scope: retirement.former_scope.clone(),
+                    generation_id,
+                };
+                let manifest = immutable_for(&manifest_role)?;
+                if manifest.mode != ImmutableAssetModeV1::PinnedExisting
+                    || manifest.sha256 != manifest_hash
+                {
+                    return Err(fail(
+                        "collision retirement lacks its exact pinned collected manifest",
+                    ));
+                }
+            }
+            ParticipantRoleV1::Catalog
+            | ParticipantRoleV1::Attachments
+            | ParticipantRoleV1::EffectiveSourceManifest
+            | ParticipantRoleV1::AcceptedPublicationPointer { .. }
+            | ParticipantRoleV1::MigrationMarker => {}
+        }
+    }
+    for (role, post_image) in post_images {
+        if let ParticipantRoleV1::Activation { project_id } = role
+            && post_image.is_none()
+            && !collision_projects.contains(project_id)
+        {
+            return Err(fail(
+                "activation removal lacks exact collision retirement evidence",
+            ));
+        }
+    }
+    for asset in immutable_assets {
+        if let ImmutableAssetRoleV1::CollectedGenerationManifest {
+            published_scope,
+            generation_id,
+        } = &asset.role
+        {
+            let accounted = post_images.iter().any(|(role, image)| {
+                let ParticipantRoleV1::CollisionRetirement { project_id } = role else {
+                    return false;
+                };
+                let Some(bytes) = image else {
+                    return false;
+                };
+                let Ok(retirement) = decode_collision_retirement_pending_for_migration(bytes)
+                else {
+                    return false;
+                };
+                &retirement.project_id == project_id
+                    && &retirement.former_scope == published_scope
+                    && retirement.generation_id == generation_id.as_str()
+                    && retirement.manifest_sha256 == asset.sha256.as_str()
+            });
+            if !accounted {
+                return Err(fail(
+                    "pinned collected manifest has no exact collision retirement evidence",
+                ));
+            }
+        }
+    }
+
+    let limits = AcceptedPublicationLimits::default();
+    for pin in publisher_pins {
+        let project = catalog
+            .projects
+            .get(&pin.project_id)
+            .ok_or_else(|| fail("publisher pin project is absent from catalog"))?;
+        if project.scope != ProjectScope::Published(pin.expected_scope.clone()) {
+            return Err(fail("publisher pin scope disagrees with catalog"));
+        }
+    }
+    let mut seed_projects = BTreeSet::new();
+    let mut seed_generation_roles = BTreeSet::new();
+    let mut seed_pointer_roles = BTreeSet::new();
+    for disposition in publisher_dispositions {
+        let PublisherDispositionEvidenceV1::SeedG1 {
+            project_id,
+            attachment_id,
+            expected_scope,
+            full_ref,
+            accepted_commit,
+            generation_id,
+            generation_sha256,
+            pointer_sha256,
+            ..
+        } = disposition
+        else {
+            continue;
+        };
+        if !seed_projects.insert(project_id.clone()) {
+            return Err(fail("publisher seed project is duplicated"));
+        }
+        let project = catalog
+            .projects
+            .get(project_id)
+            .ok_or_else(|| fail("publisher seed project is absent from catalog"))?;
+        let attachment = attachments
+            .attachments
+            .get(attachment_id)
+            .ok_or_else(|| fail("publisher seed attachment is absent"))?;
+        if project.scope != ProjectScope::Published(expected_scope.clone())
+            || &attachment.project_id != project_id
+            || attachment.validated_scope.as_ref() != Some(expected_scope)
+            || attachment.status != AttachmentStatus::Attached
+        {
+            return Err(fail(
+                "publisher seed catalog project and attachment do not prove its scope",
+            ));
+        }
+        let pointer_role = ParticipantRoleV1::AcceptedPublicationPointer {
+            project_id: project_id.clone(),
+        };
+        let pointer_bytes = image_for(&pointer_role)?
+            .as_deref()
+            .ok_or_else(|| fail("publisher seed pointer post-image is absent"))?;
+        let pointer =
+            decode_pointer_v1(pointer_bytes, &limits).map_err(|error| fail(error.to_string()))?;
+        let generation_role = ImmutableAssetRoleV1::AcceptedPublicationGeneration {
+            project_id: project_id.clone(),
+            generation_id: generation_id.clone(),
+        };
+        let generation_asset = immutable_for(&generation_role)?;
+        let generation_bytes = immutable_asset_bytes
+            .get(&generation_role)
+            .ok_or_else(|| fail("publisher seed generation bytes are absent"))?;
+        let generation = decode_generation_v1(generation_bytes, &limits)
+            .map_err(|error| fail(error.to_string()))?;
+        verify_pointer_generation_v1(&pointer, generation_bytes, &limits)
+            .map_err(|error| fail(error.to_string()))?;
+        if &pointer.project_id != project_id
+            || &pointer.attachment_id != attachment_id
+            || &pointer.full_ref != full_ref
+            || &pointer.accepted_commit != accepted_commit
+            || &pointer.accepted_scope != expected_scope
+            || &pointer.accepted_generation != generation_id
+            || pointer.generation_hash.as_str() != generation_sha256.as_str()
+            || sha256(pointer_bytes) != *pointer_sha256
+            || generation_asset.mode != ImmutableAssetModeV1::Installable
+            || generation_asset.sha256 != *generation_sha256
+            || sha256(generation_bytes) != *generation_sha256
+            || &generation.project_id != project_id
+            || &generation.scope != expected_scope
+            || &generation.full_ref != full_ref
+            || &generation.accepted_commit != accepted_commit
+        {
+            return Err(fail(
+                "publisher seed evidence, pointer, generation, and hashes disagree",
+            ));
+        }
+        seed_pointer_roles.insert(pointer_role);
+        seed_generation_roles.insert(generation_role);
+    }
+    for (role, post_image) in post_images {
+        if let ParticipantRoleV1::AcceptedPublicationPointer { .. } = role
+            && (post_image.is_none() || !seed_pointer_roles.contains(role))
+        {
+            return Err(fail(
+                "accepted publication pointer is not accounted by one publisher seed",
+            ));
+        }
+    }
+    for asset in immutable_assets {
+        if matches!(
+            &asset.role,
+            ImmutableAssetRoleV1::AcceptedPublicationGeneration { .. }
+        ) && !seed_generation_roles.contains(&asset.role)
+        {
+            return Err(fail(
+                "accepted publication generation is not accounted by one publisher seed",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // P1-B transaction input consumed by P1-C.
 pub(crate) struct MigrationPlanDraftV1 {
     pub(crate) transaction_id: ProjectCatalogTransactionId,
     pub(crate) plan_hash: Sha256Hex,
     pub(crate) source_store_sha256: Sha256Hex,
+    pub(crate) publisher_ref_source_sha256: Sha256Hex,
     pub(crate) inventory_sha256: Sha256Hex,
     pub(crate) expected_legacy_catalog_sha256: Sha256Hex,
     pub(crate) catalog: CatalogSnapshotV2,
     pub(crate) attachments: AttachmentSnapshotV1,
     pub(crate) participants: Vec<MigrationParticipantDraftV1>,
     pub(crate) immutable_assets: Vec<MigrationImmutableAssetDraftV1>,
+    pub(crate) publisher_pins: Vec<PublisherPinEvidenceV1>,
+    pub(crate) publisher_dispositions: Vec<PublisherDispositionEvidenceV1>,
     pub(crate) checkout_identity_actions: Vec<MigrationCheckoutIdentityActionDraftV1>,
 }
 
@@ -762,22 +1310,29 @@ pub(crate) fn validate_migration_plan(
     draft: MigrationPlanDraftV1,
 ) -> ProjectCatalogStoreResult<ValidatedMigrationPlanV1> {
     let registry = registry.validate()?;
-    let _store_paths = ProjectCatalogPaths::derive(paths)?;
+    let store_paths = ProjectCatalogPaths::derive(paths)?;
     if draft.participants.len().saturating_add(3) > MAX_MIGRATION_PARTICIPANTS
         || draft.immutable_assets.len() > MAX_MIGRATION_IMMUTABLE_ASSETS
         || draft.checkout_identity_actions.len() > MAX_MIGRATION_CHECKOUT_ACTIONS
+        || draft.publisher_pins.len() > MAX_MIGRATION_PUBLISHER_PINS
+        || draft.publisher_dispositions.len() > MAX_MIGRATION_PUBLISHER_PINS
     {
         return Err(ProjectCatalogStoreError::new(
             "error.project_catalog_invalid_migration_plan",
             "migration plan exceeds its cardinality limit",
         ));
     }
-    if registry.catalog_path != _store_paths.catalog {
+    if registry.catalog_path != store_paths.catalog {
         return Err(ProjectCatalogStoreError::new(
             "error.project_catalog_invalid_migration_registry",
             "migration registry is bound to a different project catalog path",
         ));
     }
+    validate_publisher_evidence(
+        &draft.publisher_pins,
+        &draft.publisher_dispositions,
+        "migration plan",
+    )?;
     validate_catalog_attachments(&draft.catalog, &draft.attachments).map_err(contract_error)?;
     if draft.catalog.epoch != 1
         || draft.attachments.epoch != 1
@@ -860,29 +1415,70 @@ pub(crate) fn validate_migration_plan(
         }
     }
 
+    let mut immutable_assets_by_role = std::collections::BTreeMap::new();
     let mut immutable_asset_bytes = std::collections::BTreeMap::new();
     for asset in draft.immutable_assets {
-        if asset.bytes.len() > MAX_PROJECT_CATALOG_BYTES
-            || immutable_asset_bytes
-                .insert(asset.role, asset.bytes)
-                .is_some()
+        let role = asset.role;
+        let (mode, hash, bytes) = match asset.source {
+            MigrationImmutableAssetSourceV1::InstallableBytes(bytes) => {
+                if role.required_mode() != ImmutableAssetModeV1::Installable
+                    || bytes.len() > role.max_bytes()
+                {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_invalid_migration_plan",
+                        "migration installable immutable asset has an invalid role or byte size",
+                    ));
+                }
+                let hash = sha256(&bytes);
+                (ImmutableAssetModeV1::Installable, hash, Some(bytes))
+            }
+            MigrationImmutableAssetSourceV1::PinnedExisting { expected_sha256 } => {
+                if role.required_mode() != ImmutableAssetModeV1::PinnedExisting {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_invalid_migration_plan",
+                        "migration pinned immutable asset has an invalid role",
+                    ));
+                }
+                (ImmutableAssetModeV1::PinnedExisting, expected_sha256, None)
+            }
+        };
+        if immutable_assets_by_role
+            .insert(role.clone(), (mode, hash.clone()))
+            .is_some()
         {
             return Err(ProjectCatalogStoreError::new(
                 "error.project_catalog_invalid_migration_plan",
-                "migration immutable assets are oversized, duplicated, or unregistered",
+                "migration immutable asset role is duplicated",
             ));
+        }
+        if let Some(bytes) = bytes {
+            immutable_asset_bytes.insert(role, bytes);
         }
     }
     for mandatory in [
         ImmutableAssetRoleV1::LegacyProjectStoreBackup,
         ImmutableAssetRoleV1::LegacyPublisherRefBackup,
     ] {
-        if !immutable_asset_bytes.contains_key(&mandatory) {
+        if !immutable_assets_by_role.contains_key(&mandatory) {
             return Err(ProjectCatalogStoreError::new(
                 "error.project_catalog_invalid_migration_plan",
                 "migration plan lacks a mandatory immutable source backup",
             ));
         }
+    }
+    if immutable_assets_by_role
+        .get(&ImmutableAssetRoleV1::LegacyProjectStoreBackup)
+        .map(|(_, hash)| hash)
+        != Some(&draft.source_store_sha256)
+        || immutable_assets_by_role
+            .get(&ImmutableAssetRoleV1::LegacyPublisherRefBackup)
+            .map(|(_, hash)| hash)
+            != Some(&draft.publisher_ref_source_sha256)
+    {
+        return Err(ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_migration_plan",
+            "migration source backups do not match their inventoried source hashes",
+        ));
     }
 
     let actions = draft
@@ -929,24 +1525,39 @@ pub(crate) fn validate_migration_plan(
             new: participant.new.clone(),
         })
         .collect::<Vec<_>>();
-    let immutable_evidence = immutable_asset_bytes
+    let immutable_evidence = immutable_assets_by_role
         .iter()
-        .map(|(role, bytes)| {
-            let hash = sha256(bytes);
+        .map(|(role, (mode, hash))| {
             let validated_name = immutable_target_name(&draft.transaction_id, role, &hash)?;
             Ok(MigrationImmutableAssetEvidenceV1 {
                 role: role.clone(),
-                sha256: hash,
+                mode: *mode,
+                sha256: hash.clone(),
                 validated_name,
             })
         })
         .collect::<ProjectCatalogStoreResult<Vec<_>>>()?;
+    validate_new_side_cross_roles(
+        &draft.catalog,
+        &draft.attachments,
+        &post_images,
+        &immutable_evidence,
+        &immutable_asset_bytes,
+        &draft.publisher_pins,
+        &draft.publisher_dispositions,
+        &draft.inventory_sha256,
+        &draft.plan_hash,
+        "error.project_catalog_invalid_migration_plan",
+    )?;
     let marker = ProjectCatalogMigrationMarkerV1 {
         version: MIGRATION_MARKER_VERSION,
         transaction_id: draft.transaction_id.clone(),
         plan_hash: draft.plan_hash.clone(),
-        source_store_sha256: draft.source_store_sha256,
-        inventory_sha256: draft.inventory_sha256,
+        source_store_sha256: draft.source_store_sha256.clone(),
+        publisher_ref_source_sha256: draft.publisher_ref_source_sha256.clone(),
+        inventory_sha256: draft.inventory_sha256.clone(),
+        publisher_pins: draft.publisher_pins.clone(),
+        publisher_dispositions: draft.publisher_dispositions.clone(),
         participants: participant_evidence,
         immutable_assets: immutable_evidence,
         migration_epoch: 1,
@@ -968,16 +1579,21 @@ pub(crate) fn validate_migration_plan(
             )
         })
         .collect::<ProjectCatalogStoreResult<Vec<_>>>()?;
-    let immutable_assets = immutable_asset_bytes
+    let immutable_assets = immutable_assets_by_role
         .iter()
-        .map(|(role, bytes)| {
-            let hash = sha256(bytes);
+        .map(|(role, (mode, hash))| {
             let validated_name = immutable_target_name(&draft.transaction_id, role, &hash)?;
             Ok(ImmutableAssetV1 {
                 role: role.clone(),
+                mode: *mode,
                 sha256: hash.clone(),
                 validated_name,
-                stage_name: immutable_stage_name(&draft.transaction_id, role, &hash)?,
+                stage_name: match mode {
+                    ImmutableAssetModeV1::Installable => {
+                        Some(immutable_stage_name(&draft.transaction_id, role, &hash)?)
+                    }
+                    ImmutableAssetModeV1::PinnedExisting => None,
+                },
             })
         })
         .collect::<ProjectCatalogStoreResult<Vec<_>>>()?;
@@ -988,6 +1604,9 @@ pub(crate) fn validate_migration_plan(
         state: TransactionStateV1::Prepared,
         outcome: None,
         plan_hash: Some(draft.plan_hash),
+        publisher_ref_source_sha256: Some(draft.publisher_ref_source_sha256),
+        publisher_pins: draft.publisher_pins,
+        publisher_dispositions: draft.publisher_dispositions,
         old_epoch: 0,
         new_epoch: 1,
         participants,
@@ -1000,22 +1619,23 @@ pub(crate) fn validate_migration_plan(
     let _ = encode_bounded_json(&journal, MAX_JOURNAL_BYTES, "transaction journal")?;
 
     let mut derived_targets = BTreeSet::from([
-        _store_paths.catalog.clone(),
-        _store_paths.attachments.clone(),
-        _store_paths.migration_marker.clone(),
-        _store_paths.stage_dir.clone(),
-        _store_paths.backup_dir.clone(),
-        _store_paths.mutation_lock.clone(),
-        _store_paths.lifetime_lock.clone(),
+        store_paths.catalog.clone(),
+        store_paths.attachments.clone(),
+        store_paths.migration_marker.clone(),
+        store_paths.stage_dir.clone(),
+        store_paths.backup_dir.clone(),
+        store_paths.mutation_lock.clone(),
+        store_paths.lifetime_lock.clone(),
+        registry.legacy_publisher_ref_source.clone(),
     ]);
     for auxiliary in registry.auxiliary_store_paths() {
         derived_targets.insert(canonical_store_lock_path(&auxiliary));
     }
     for role in post_images.keys() {
         let target = match role {
-            ParticipantRoleV1::Catalog => _store_paths.catalog.clone(),
-            ParticipantRoleV1::Attachments => _store_paths.attachments.clone(),
-            ParticipantRoleV1::MigrationMarker => _store_paths.migration_marker.clone(),
+            ParticipantRoleV1::Catalog => store_paths.catalog.clone(),
+            ParticipantRoleV1::Attachments => store_paths.attachments.clone(),
+            ParticipantRoleV1::MigrationMarker => store_paths.migration_marker.clone(),
             role => registry.participant_target(role).ok_or_else(|| {
                 ProjectCatalogStoreError::new(
                     "error.project_catalog_invalid_migration_registry",
@@ -1370,6 +1990,7 @@ impl ProjectCatalogTransactionOwner {
                             .iter()
                             .map(|asset| MigrationImmutableAssetEvidenceV1 {
                                 role: asset.role.clone(),
+                                mode: asset.mode,
                                 sha256: asset.sha256.clone(),
                                 validated_name: asset.validated_name.clone(),
                             })
@@ -1384,6 +2005,10 @@ impl ProjectCatalogTransactionOwner {
                                     )
                             )
                             || journal.plan_hash.as_ref() != Some(&marker.plan_hash)
+                            || journal.publisher_ref_source_sha256.as_ref()
+                                != Some(&marker.publisher_ref_source_sha256)
+                            || journal.publisher_pins != marker.publisher_pins
+                            || journal.publisher_dispositions != marker.publisher_dispositions
                             || journal.new_epoch != marker.migration_epoch
                             || marker_hash != Some(&sha256(&bytes))
                             || journal_participants != marker.participants
@@ -1481,6 +2106,9 @@ impl ProjectCatalogTransactionOwner {
             state: TransactionStateV1::Prepared,
             outcome: None,
             plan_hash: None,
+            publisher_ref_source_sha256: None,
+            publisher_pins: Vec::new(),
+            publisher_dispositions: Vec::new(),
             old_epoch: old.map_or(0, |state| state.epoch),
             new_epoch: new.catalog.epoch,
             participants,
@@ -1588,6 +2216,34 @@ impl ProjectCatalogTransactionOwner {
         // The complete live inventory is revalidated before this transaction
         // creates even a staging directory. A stale plan therefore has no
         // filesystem side effects and cannot poison a corrected attempt.
+        let expected_publisher_source = plan
+            .journal
+            .publisher_ref_source_sha256
+            .as_ref()
+            .ok_or_else(|| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_invalid_migration_plan",
+                    "validated migration plan lacks its publisher source hash",
+                )
+            })?;
+        let publisher_source = self
+            .io
+            .read_regular_nofollow(
+                &registry.legacy_publisher_ref_source,
+                MAX_LEGACY_PUBLISHER_REF_SOURCE_BYTES,
+            )?
+            .ok_or_else(|| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_migration_inventory_stale",
+                    "legacy publisher source disappeared after inventory",
+                )
+            })?;
+        if sha256(&publisher_source) != *expected_publisher_source {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_inventory_stale",
+                "legacy publisher source changed after inventory",
+            ));
+        }
         let mut old_images = std::collections::BTreeMap::new();
         for participant in &plan.journal.participants {
             let target = self.target_for_role(&participant.role)?;
@@ -1620,33 +2276,105 @@ impl ProjectCatalogTransactionOwner {
             old_images.insert(participant.role.clone(), actual);
         }
         for asset in &plan.journal.immutable_assets {
-            let bytes = plan.immutable_asset_bytes.get(&asset.role).ok_or_else(|| {
-                ProjectCatalogStoreError::new(
-                    "error.project_catalog_invalid_migration_plan",
-                    "validated migration plan lacks journaled immutable bytes",
-                )
-            })?;
             let target = registry.immutable_target(&asset.role, &asset.validated_name);
-            if sha256(bytes) != asset.sha256
-                || target.file_name().and_then(|name| name.to_str())
-                    != Some(asset.validated_name.as_str())
+            let planned_bytes = plan.immutable_asset_bytes.get(&asset.role);
+            if target.file_name().and_then(|name| name.to_str())
+                != Some(asset.validated_name.as_str())
+                || match asset.mode {
+                    ImmutableAssetModeV1::Installable => {
+                        !planned_bytes.is_some_and(|bytes| sha256(bytes) == asset.sha256)
+                    }
+                    ImmutableAssetModeV1::PinnedExisting => planned_bytes.is_some(),
+                }
             {
                 return Err(ProjectCatalogStoreError::new(
                     "error.project_catalog_invalid_migration_plan",
                     "validated migration immutable bytes or target disagree with the journal",
                 ));
             }
-            if let Some(existing) = self
+            let existing = self
                 .io
-                .read_regular_nofollow(&target, MAX_PROJECT_CATALOG_BYTES)?
-                && sha256(&existing) != asset.sha256
-            {
-                return Err(ProjectCatalogStoreError::new(
-                    "error.project_catalog_artifact_collision",
-                    "immutable migration target has unexpected bytes",
-                ));
+                .read_regular_nofollow(&target, asset.role.max_bytes())?;
+            match (asset.mode, existing) {
+                (_, Some(bytes)) if sha256(&bytes) != asset.sha256 => {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_artifact_collision",
+                        "immutable migration target has unexpected bytes",
+                    ));
+                }
+                (ImmutableAssetModeV1::PinnedExisting, None) => {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_migration_inventory_stale",
+                        "pinned immutable migration asset disappeared after inventory",
+                    ));
+                }
+                _ => {}
             }
         }
+        let immutable_evidence = plan
+            .journal
+            .immutable_assets
+            .iter()
+            .map(|asset| MigrationImmutableAssetEvidenceV1 {
+                role: asset.role.clone(),
+                mode: asset.mode,
+                sha256: asset.sha256.clone(),
+                validated_name: asset.validated_name.clone(),
+            })
+            .collect::<Vec<_>>();
+        let planned_catalog = decode_catalog_snapshot(
+            plan.post_images
+                .get(&ParticipantRoleV1::Catalog)
+                .and_then(Option::as_deref)
+                .ok_or_else(|| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_invalid_migration_plan",
+                        "validated migration plan lacks its catalog post-image",
+                    )
+                })?,
+        )
+        .map_err(contract_error)?;
+        let planned_attachments = decode_attachment_snapshot(
+            plan.post_images
+                .get(&ParticipantRoleV1::Attachments)
+                .and_then(Option::as_deref)
+                .ok_or_else(|| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_invalid_migration_plan",
+                        "validated migration plan lacks its attachment post-image",
+                    )
+                })?,
+        )
+        .map_err(contract_error)?;
+        let planned_marker: ProjectCatalogMigrationMarkerV1 = decode_bounded_json(
+            plan.post_images
+                .get(&ParticipantRoleV1::MigrationMarker)
+                .and_then(Option::as_deref)
+                .ok_or_else(|| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_invalid_migration_plan",
+                        "validated migration plan lacks its marker evidence",
+                    )
+                })?,
+            MAX_MARKER_BYTES,
+            "migration marker",
+        )?;
+        planned_marker.validate()?;
+        validate_new_side_cross_roles(
+            &planned_catalog,
+            &planned_attachments,
+            &plan.post_images,
+            &immutable_evidence,
+            &plan.immutable_asset_bytes,
+            &plan.journal.publisher_pins,
+            &plan.journal.publisher_dispositions,
+            &planned_marker.inventory_sha256,
+            plan.journal
+                .plan_hash
+                .as_ref()
+                .expect("migration plan hash"),
+            "error.project_catalog_invalid_migration_plan",
+        )?;
         self.prevalidate_monotonic_checkout_actions(&plan.journal)?;
 
         let checkout_locks = self.acquire_checkout_action_locks(&plan.journal)?;
@@ -1656,12 +2384,19 @@ impl ProjectCatalogTransactionOwner {
             .create_private_dir_nofollow(&self.paths.backup_dir)?;
 
         for asset in &plan.journal.immutable_assets {
+            if asset.mode != ImmutableAssetModeV1::Installable {
+                continue;
+            }
             let bytes = plan
                 .immutable_asset_bytes
                 .get(&asset.role)
                 .expect("immutable plan bytes were revalidated");
+            let stage_name = asset
+                .stage_name
+                .as_ref()
+                .expect("installable immutable asset has a stage name");
             self.write_artifact(
-                &self.paths.stage_dir.join(asset.stage_name.as_str()),
+                &self.paths.stage_dir.join(stage_name.as_str()),
                 bytes,
                 asset.sha256.clone(),
                 FaultPoint::ImmutableAssetWrite,
@@ -1727,6 +2462,7 @@ impl ProjectCatalogTransactionOwner {
         self.io.checkpoint(FaultPoint::CompletePlanVerify)?;
         self.verify_immutable_assets(&journal)?;
         self.verify_expected_pair(&journal, ExpectedSide::New)?;
+        self.verify_migration_new_side_cross_roles(&journal)?;
         self.verify_journal_pair_invariants(&journal, ExpectedSide::New)?;
         self.io.checkpoint(FaultPoint::CompletePlanVerify)?;
 
@@ -1825,6 +2561,7 @@ impl ProjectCatalogTransactionOwner {
         match (journal.state, journal.outcome) {
             (TransactionStateV1::Committed, Some(TransactionOutcomeV1::Committed)) => {
                 self.verify_expected_pair(&journal, ExpectedSide::New)?;
+                self.verify_migration_new_side_cross_roles(&journal)?;
                 self.verify_journal_pair_invariants(&journal, ExpectedSide::New)
             }
             (TransactionStateV1::Committed, Some(TransactionOutcomeV1::RolledBack)) => {
@@ -1850,6 +2587,7 @@ impl ProjectCatalogTransactionOwner {
                             self.io.checkpoint(FaultPoint::RecoveryParticipantInstall)?;
                         }
                         self.verify_expected_pair(&journal, ExpectedSide::New)?;
+                        self.verify_migration_new_side_cross_roles(&journal)?;
                         self.verify_journal_pair_invariants(&journal, ExpectedSide::New)?;
                         journal.state = TransactionStateV1::Committed;
                         journal.outcome = Some(TransactionOutcomeV1::Committed);
@@ -2087,6 +2825,120 @@ impl ProjectCatalogTransactionOwner {
         Ok(())
     }
 
+    fn verify_migration_new_side_cross_roles(
+        &self,
+        journal: &ProjectCatalogTransactionJournalV1,
+    ) -> ProjectCatalogStoreResult<()> {
+        if journal.kind != TransactionKindV1::V1Migration {
+            return Ok(());
+        }
+        let ParticipantRegistry::Migration(registry) = &self.registry else {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_registry_required",
+                "migration cross-role verification requires the complete registry",
+            ));
+        };
+        let mut post_images = std::collections::BTreeMap::new();
+        for participant in &journal.participants {
+            let target = self.target_for_role(&participant.role)?;
+            let bytes = self
+                .io
+                .read_regular_nofollow(&target, participant.role.max_bytes())?;
+            if bytes.as_ref().map(|value| sha256(value)).as_ref() != participant.new.sha256() {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_recovery_incomplete",
+                    "migration participant changed before cross-role verification",
+                ));
+            }
+            post_images.insert(participant.role.clone(), bytes);
+        }
+        let catalog = decode_catalog_snapshot(
+            post_images
+                .get(&ParticipantRoleV1::Catalog)
+                .and_then(Option::as_deref)
+                .ok_or_else(|| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_recovery_incomplete",
+                        "migration catalog is missing during cross-role verification",
+                    )
+                })?,
+        )
+        .map_err(contract_error)?;
+        let attachments = decode_attachment_snapshot(
+            post_images
+                .get(&ParticipantRoleV1::Attachments)
+                .and_then(Option::as_deref)
+                .ok_or_else(|| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_recovery_incomplete",
+                        "migration attachments are missing during cross-role verification",
+                    )
+                })?,
+        )
+        .map_err(contract_error)?;
+        let marker: ProjectCatalogMigrationMarkerV1 = decode_bounded_json(
+            post_images
+                .get(&ParticipantRoleV1::MigrationMarker)
+                .and_then(Option::as_deref)
+                .ok_or_else(|| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_recovery_incomplete",
+                        "migration marker is missing during cross-role verification",
+                    )
+                })?,
+            MAX_MARKER_BYTES,
+            "migration marker",
+        )?;
+        marker.validate()?;
+        let immutable_assets = journal
+            .immutable_assets
+            .iter()
+            .map(|asset| MigrationImmutableAssetEvidenceV1 {
+                role: asset.role.clone(),
+                mode: asset.mode,
+                sha256: asset.sha256.clone(),
+                validated_name: asset.validated_name.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut immutable_asset_bytes = std::collections::BTreeMap::new();
+        for asset in &journal.immutable_assets {
+            if !matches!(
+                &asset.role,
+                ImmutableAssetRoleV1::AcceptedPublicationGeneration { .. }
+            ) {
+                continue;
+            }
+            let target = registry.immutable_target(&asset.role, &asset.validated_name);
+            let bytes = self
+                .io
+                .read_regular_nofollow(&target, asset.role.max_bytes())?
+                .ok_or_else(|| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_recovery_incomplete",
+                        "accepted publication generation is missing during verification",
+                    )
+                })?;
+            immutable_asset_bytes.insert(asset.role.clone(), bytes);
+        }
+        validate_new_side_cross_roles(
+            &catalog,
+            &attachments,
+            &post_images,
+            &immutable_assets,
+            &immutable_asset_bytes,
+            &journal.publisher_pins,
+            &journal.publisher_dispositions,
+            &marker.inventory_sha256,
+            journal.plan_hash.as_ref().ok_or_else(|| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_invalid_journal",
+                    "migration journal lacks its plan hash",
+                )
+            })?,
+            "error.project_catalog_recovery_incomplete",
+        )
+    }
+
     fn verify_journal_pair_invariants(
         &self,
         journal: &ProjectCatalogTransactionJournalV1,
@@ -2178,7 +3030,7 @@ impl ProjectCatalogTransactionOwner {
             }
             let bytes = self
                 .io
-                .read_regular_nofollow(&target, MAX_PROJECT_CATALOG_BYTES)?
+                .read_regular_nofollow(&target, asset.role.max_bytes())?
                 .ok_or_else(|| {
                     ProjectCatalogStoreError::new(
                         "error.project_catalog_recovery_incomplete",
@@ -2225,11 +3077,26 @@ impl ProjectCatalogTransactionOwner {
                     "immutable migration target has no parent",
                 )
             })?;
-            self.io.create_private_dir_nofollow(parent)?;
-            if let Some(existing) = self
+            let existing = self
                 .io
-                .read_regular_nofollow(&target, MAX_PROJECT_CATALOG_BYTES)?
-            {
+                .read_regular_nofollow(&target, asset.role.max_bytes())?;
+            if asset.mode == ImmutableAssetModeV1::PinnedExisting {
+                let bytes = existing.ok_or_else(|| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_recovery_incomplete",
+                        "pinned immutable migration asset is missing",
+                    )
+                })?;
+                if sha256(&bytes) != asset.sha256 {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_recovery_incomplete",
+                        "pinned immutable migration asset has unexpected bytes",
+                    ));
+                }
+                continue;
+            }
+            self.io.create_private_dir_nofollow(parent)?;
+            if let Some(existing) = existing {
                 if sha256(&existing) != asset.sha256 {
                     return Err(ProjectCatalogStoreError::new(
                         "error.project_catalog_artifact_collision",
@@ -2241,10 +3108,16 @@ impl ProjectCatalogTransactionOwner {
                 continue;
             }
 
-            let stage = self.paths.stage_dir.join(asset.stage_name.as_str());
+            let stage_name = asset.stage_name.as_ref().ok_or_else(|| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_invalid_journal",
+                    "installable immutable migration asset lacks its stage name",
+                )
+            })?;
+            let stage = self.paths.stage_dir.join(stage_name.as_str());
             let bytes = self
                 .io
-                .read_regular_nofollow(&stage, MAX_PROJECT_CATALOG_BYTES)?
+                .read_regular_nofollow(&stage, asset.role.max_bytes())?
                 .ok_or_else(|| {
                     ProjectCatalogStoreError::new(
                         "error.project_catalog_recovery_incomplete",
@@ -2263,7 +3136,7 @@ impl ProjectCatalogTransactionOwner {
                 Err(error) if error.code() == "error.project_catalog_already_exists" => {
                     let installed = self
                         .io
-                        .read_regular_nofollow(&target, MAX_PROJECT_CATALOG_BYTES)?
+                        .read_regular_nofollow(&target, asset.role.max_bytes())?
                         .ok_or_else(|| {
                             ProjectCatalogStoreError::new(
                                 "error.project_catalog_recovery_incomplete",
@@ -2713,6 +3586,9 @@ pub(crate) enum ParticipantRoleV1 {
     CollisionRetirement {
         project_id: ProjectId,
     },
+    AcceptedPublicationPointer {
+        project_id: ProjectId,
+    },
     MigrationMarker,
 }
 
@@ -2731,8 +3607,13 @@ impl ParticipantRoleV1 {
 
     fn max_bytes(&self) -> usize {
         match self {
+            Self::Catalog | Self::Attachments => MAX_PROJECT_CATALOG_BYTES,
+            Self::EffectiveSourceManifest => MAX_CODE_SOURCE_EFFECTIVE_MANIFEST_BYTES,
+            Self::Activation { .. } => MAX_CODE_SOURCE_ACTIVATION_BYTES,
+            Self::StoredGenerationMetadata { .. } => MAX_CODE_SOURCE_GENERATION_METADATA_BYTES,
+            Self::CollisionRetirement { .. } => MAX_CODE_SOURCE_COLLISION_RETIREMENT_BYTES,
+            Self::AcceptedPublicationPointer { .. } => MAX_ACCEPTED_PUBLICATION_POINTER_BYTES,
             Self::MigrationMarker => MAX_MARKER_BYTES,
-            _ => MAX_PROJECT_CATALOG_BYTES,
         }
     }
 }
@@ -2864,12 +3745,38 @@ enum TransactionOutcomeV1 {
 pub(crate) enum ImmutableAssetRoleV1 {
     LegacyProjectStoreBackup,
     LegacyPublisherRefBackup,
+    AcceptedPublicationGeneration {
+        project_id: ProjectId,
+        generation_id: AcceptedPublicationGenerationId,
+    },
+    CollectedGenerationManifest {
+        published_scope: PublishedScope,
+        generation_id: Sha256Hex,
+    },
 }
 
 impl ImmutableAssetRoleV1 {
     fn artifact_token(&self) -> String {
         let encoded = serde_json::to_vec(self).expect("closed immutable role must serialize");
         format!("immutable-role-{}", &sha256(&encoded).as_str()[..24])
+    }
+
+    fn max_bytes(&self) -> usize {
+        match self {
+            Self::LegacyProjectStoreBackup => MAX_PROJECT_CATALOG_BYTES,
+            Self::LegacyPublisherRefBackup => MAX_LEGACY_PUBLISHER_REF_SOURCE_BYTES,
+            Self::AcceptedPublicationGeneration { .. } => MAX_ACCEPTED_PUBLICATION_GENERATION_BYTES,
+            Self::CollectedGenerationManifest { .. } => MAX_CODE_SOURCE_COLLECTED_MANIFEST_BYTES,
+        }
+    }
+
+    fn required_mode(&self) -> ImmutableAssetModeV1 {
+        match self {
+            Self::LegacyProjectStoreBackup
+            | Self::LegacyPublisherRefBackup
+            | Self::AcceptedPublicationGeneration { .. } => ImmutableAssetModeV1::Installable,
+            Self::CollectedGenerationManifest { .. } => ImmutableAssetModeV1::PinnedExisting,
+        }
     }
 }
 
@@ -2878,12 +3785,21 @@ fn immutable_target_name(
     role: &ImmutableAssetRoleV1,
     hash: &Sha256Hex,
 ) -> ProjectCatalogStoreResult<ValidatedBasename> {
-    ValidatedBasename::parse(format!(
-        "{}.{}.{}.immutable",
-        transaction_id,
-        role.artifact_token(),
-        hash
-    ))
+    match role {
+        ImmutableAssetRoleV1::LegacyProjectStoreBackup
+        | ImmutableAssetRoleV1::LegacyPublisherRefBackup => ValidatedBasename::parse(format!(
+            "{}.{}.{}.immutable",
+            transaction_id,
+            role.artifact_token(),
+            hash
+        )),
+        ImmutableAssetRoleV1::AcceptedPublicationGeneration { generation_id, .. } => {
+            ValidatedBasename::parse(format!("{generation_id}.json"))
+        }
+        ImmutableAssetRoleV1::CollectedGenerationManifest { .. } => {
+            ValidatedBasename::parse("manifest.jsonl".to_string())
+        }
+    }
 }
 
 fn immutable_stage_name(
@@ -2899,13 +3815,22 @@ fn immutable_stage_name(
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ImmutableAssetModeV1 {
+    Installable,
+    PinnedExisting,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ImmutableAssetV1 {
     role: ImmutableAssetRoleV1,
+    mode: ImmutableAssetModeV1,
     sha256: Sha256Hex,
     validated_name: ValidatedBasename,
-    stage_name: ValidatedBasename,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stage_name: Option<ValidatedBasename>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2926,6 +3851,12 @@ struct ProjectCatalogTransactionJournalV1 {
     outcome: Option<TransactionOutcomeV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     plan_hash: Option<Sha256Hex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    publisher_ref_source_sha256: Option<Sha256Hex>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    publisher_pins: Vec<PublisherPinEvidenceV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    publisher_dispositions: Vec<PublisherDispositionEvidenceV1>,
     old_epoch: u64,
     new_epoch: u64,
     participants: Vec<TransactionParticipantV1>,
@@ -2943,6 +3874,8 @@ impl ProjectCatalogTransactionJournalV1 {
             || self.created_at == 0
             || self.participants.len() > MAX_MIGRATION_PARTICIPANTS
             || self.immutable_assets.len() > MAX_MIGRATION_IMMUTABLE_ASSETS
+            || self.publisher_pins.len() > MAX_MIGRATION_PUBLISHER_PINS
+            || self.publisher_dispositions.len() > MAX_MIGRATION_PUBLISHER_PINS
             || self.monotonic_checkout_identity_actions.len() > MAX_MIGRATION_CHECKOUT_ACTIONS
         {
             return Err(ProjectCatalogStoreError::new(
@@ -2988,9 +3921,18 @@ impl ProjectCatalogTransactionJournalV1 {
         for asset in &self.immutable_assets {
             let expected_target =
                 immutable_target_name(&self.transaction_id, &asset.role, &asset.sha256)?;
-            let expected_stage =
-                immutable_stage_name(&self.transaction_id, &asset.role, &asset.sha256)?;
-            if asset.validated_name != expected_target || asset.stage_name != expected_stage {
+            let expected_stage = match asset.mode {
+                ImmutableAssetModeV1::Installable => Some(immutable_stage_name(
+                    &self.transaction_id,
+                    &asset.role,
+                    &asset.sha256,
+                )?),
+                ImmutableAssetModeV1::PinnedExisting => None,
+            };
+            if asset.validated_name != expected_target
+                || asset.stage_name != expected_stage
+                || asset.mode != asset.role.required_mode()
+            {
                 return Err(ProjectCatalogStoreError::new(
                     "error.project_catalog_invalid_journal",
                     "journal immutable asset names are not code-derived",
@@ -3010,6 +3952,9 @@ impl ProjectCatalogTransactionJournalV1 {
                 });
                 if roles != required
                     || self.plan_hash.is_some()
+                    || self.publisher_ref_source_sha256.is_some()
+                    || !self.publisher_pins.is_empty()
+                    || !self.publisher_dispositions.is_empty()
                     || !self.immutable_assets.is_empty()
                     || !self.monotonic_checkout_identity_actions.is_empty()
                     || !old_images_match_epoch
@@ -3044,12 +3989,73 @@ impl ProjectCatalogTransactionJournalV1 {
                 let catalog = participant_for(&ParticipantRoleV1::Catalog);
                 let attachments = participant_for(&ParticipantRoleV1::Attachments);
                 let marker = participant_for(&ParticipantRoleV1::MigrationMarker);
+                let source_backup = self
+                    .immutable_assets
+                    .iter()
+                    .find(|asset| asset.role == ImmutableAssetRoleV1::LegacyProjectStoreBackup);
+                let publisher_backup = self
+                    .immutable_assets
+                    .iter()
+                    .find(|asset| asset.role == ImmutableAssetRoleV1::LegacyPublisherRefBackup);
+                let collision_projects = self
+                    .participants
+                    .iter()
+                    .filter_map(|participant| {
+                        if let ParticipantRoleV1::CollisionRetirement { project_id } =
+                            &participant.role
+                        {
+                            Some(project_id.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<BTreeSet<_>>();
+                let role_shapes_are_valid =
+                    self.participants
+                        .iter()
+                        .all(|participant| match &participant.role {
+                            ParticipantRoleV1::StoredGenerationMetadata { .. } => {
+                                matches!(&participant.new, ExpectedImageV1::Present { .. })
+                            }
+                            ParticipantRoleV1::Activation { project_id } => {
+                                matches!(&participant.new, ExpectedImageV1::Present { .. })
+                                    || (matches!(&participant.old, ExpectedImageV1::Present { .. })
+                                        && collision_projects.contains(project_id))
+                            }
+                            ParticipantRoleV1::CollisionRetirement { project_id } => {
+                                matches!(&participant.old, ExpectedImageV1::Absent {})
+                                    && matches!(&participant.new, ExpectedImageV1::Present { .. })
+                                    && participant_for(&ParticipantRoleV1::Activation {
+                                        project_id: project_id.clone(),
+                                    })
+                                    .is_some_and(
+                                        |activation| {
+                                            matches!(
+                                                &activation.old,
+                                                ExpectedImageV1::Present { .. }
+                                            ) && matches!(
+                                                &activation.new,
+                                                ExpectedImageV1::Absent {}
+                                            )
+                                        },
+                                    )
+                            }
+                            ParticipantRoleV1::AcceptedPublicationPointer { .. } => {
+                                matches!(&participant.old, ExpectedImageV1::Absent {})
+                                    && matches!(&participant.new, ExpectedImageV1::Present { .. })
+                            }
+                            ParticipantRoleV1::Catalog
+                            | ParticipantRoleV1::Attachments
+                            | ParticipantRoleV1::EffectiveSourceManifest
+                            | ParticipantRoleV1::MigrationMarker => true,
+                        });
                 let action_ids = self
                     .monotonic_checkout_identity_actions
                     .iter()
                     .map(|action| action.observation_id.as_str())
                     .collect::<BTreeSet<_>>();
                 if self.plan_hash.is_none()
+                    || self.publisher_ref_source_sha256.is_none()
                     || self.old_epoch != 0
                     || self.new_epoch != 1
                     || mandatory.iter().any(|role| !roles.contains(role))
@@ -3059,6 +4065,11 @@ impl ProjectCatalogTransactionJournalV1 {
                     || asset_roles.len() != self.immutable_assets.len()
                     || !asset_roles.contains(&ImmutableAssetRoleV1::LegacyProjectStoreBackup)
                     || !asset_roles.contains(&ImmutableAssetRoleV1::LegacyPublisherRefBackup)
+                    || source_backup.map(|asset| &asset.sha256)
+                        != catalog.and_then(|participant| participant.old.sha256())
+                    || publisher_backup.map(|asset| &asset.sha256)
+                        != self.publisher_ref_source_sha256.as_ref()
+                    || !role_shapes_are_valid
                     || !catalog.is_some_and(|participant| {
                         matches!(&participant.old, ExpectedImageV1::Present { .. })
                             && matches!(&participant.new, ExpectedImageV1::Present { .. })
@@ -3090,6 +4101,11 @@ impl ProjectCatalogTransactionJournalV1 {
                         "migration journal lacks its closed participant or evidence set",
                     ));
                 }
+                validate_publisher_evidence(
+                    &self.publisher_pins,
+                    &self.publisher_dispositions,
+                    "journal",
+                )?;
             }
         }
         Ok(())
@@ -3103,7 +4119,10 @@ struct ProjectCatalogMigrationMarkerV1 {
     transaction_id: ProjectCatalogTransactionId,
     plan_hash: Sha256Hex,
     source_store_sha256: Sha256Hex,
+    publisher_ref_source_sha256: Sha256Hex,
     inventory_sha256: Sha256Hex,
+    publisher_pins: Vec<PublisherPinEvidenceV1>,
+    publisher_dispositions: Vec<PublisherDispositionEvidenceV1>,
     participants: Vec<MigrationParticipantEvidenceV1>,
     immutable_assets: Vec<MigrationImmutableAssetEvidenceV1>,
     migration_epoch: u64,
@@ -3117,6 +4136,8 @@ impl ProjectCatalogMigrationMarkerV1 {
             || self.committed_at == 0
             || self.participants.len() > MAX_MIGRATION_PARTICIPANTS
             || self.immutable_assets.len() > MAX_MIGRATION_IMMUTABLE_ASSETS
+            || self.publisher_pins.len() > MAX_MIGRATION_PUBLISHER_PINS
+            || self.publisher_dispositions.len() > MAX_MIGRATION_PUBLISHER_PINS
         {
             return Err(ProjectCatalogStoreError::new(
                 "error.project_catalog_migration_incomplete",
@@ -3128,11 +4149,60 @@ impl ProjectCatalogMigrationMarkerV1 {
             .iter()
             .map(|evidence| evidence.role.clone())
             .collect::<BTreeSet<_>>();
+        let participant_for = |role: &ParticipantRoleV1| {
+            self.participants
+                .iter()
+                .find(|participant| &participant.role == role)
+        };
+        let collision_projects = self
+            .participants
+            .iter()
+            .filter_map(|participant| {
+                if let ParticipantRoleV1::CollisionRetirement { project_id } = &participant.role {
+                    Some(project_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<BTreeSet<_>>();
+        let role_shapes_are_valid = self
+            .participants
+            .iter()
+            .all(|participant| match &participant.role {
+                ParticipantRoleV1::StoredGenerationMetadata { .. } => {
+                    matches!(&participant.new, ExpectedImageV1::Present { .. })
+                }
+                ParticipantRoleV1::Activation { project_id } => {
+                    matches!(&participant.new, ExpectedImageV1::Present { .. })
+                        || (matches!(&participant.old, ExpectedImageV1::Present { .. })
+                            && collision_projects.contains(project_id))
+                }
+                ParticipantRoleV1::CollisionRetirement { project_id } => {
+                    matches!(&participant.old, ExpectedImageV1::Absent {})
+                        && matches!(&participant.new, ExpectedImageV1::Present { .. })
+                        && participant_for(&ParticipantRoleV1::Activation {
+                            project_id: project_id.clone(),
+                        })
+                        .is_some_and(|activation| {
+                            matches!(&activation.old, ExpectedImageV1::Present { .. })
+                                && matches!(&activation.new, ExpectedImageV1::Absent {})
+                        })
+                }
+                ParticipantRoleV1::AcceptedPublicationPointer { .. } => {
+                    matches!(&participant.old, ExpectedImageV1::Absent {})
+                        && matches!(&participant.new, ExpectedImageV1::Present { .. })
+                }
+                ParticipantRoleV1::Catalog
+                | ParticipantRoleV1::Attachments
+                | ParticipantRoleV1::EffectiveSourceManifest => true,
+                ParticipantRoleV1::MigrationMarker => false,
+            });
         if participant_roles.len() != self.participants.len()
             || !participant_roles.contains(&ParticipantRoleV1::Catalog)
             || !participant_roles.contains(&ParticipantRoleV1::Attachments)
             || !participant_roles.contains(&ParticipantRoleV1::EffectiveSourceManifest)
             || participant_roles.contains(&ParticipantRoleV1::MigrationMarker)
+            || !role_shapes_are_valid
             || self.participants.iter().any(|evidence| {
                 validate_expected_artifact_name(
                     &self.transaction_id,
@@ -3151,7 +4221,7 @@ impl ProjectCatalogMigrationMarkerV1 {
             })
             || self.participants.iter().any(|evidence| {
                 matches!(
-                    evidence.role,
+                    &evidence.role,
                     ParticipantRoleV1::Catalog
                         | ParticipantRoleV1::Attachments
                         | ParticipantRoleV1::EffectiveSourceManifest
@@ -3174,7 +4244,10 @@ impl ProjectCatalogMigrationMarkerV1 {
             || self.immutable_assets.iter().any(|evidence| {
                 match immutable_target_name(&self.transaction_id, &evidence.role, &evidence.sha256)
                 {
-                    Ok(expected) => expected != evidence.validated_name,
+                    Ok(expected) => {
+                        expected != evidence.validated_name
+                            || evidence.mode != evidence.role.required_mode()
+                    }
                     Err(_) => true,
                 }
             })
@@ -3195,6 +4268,17 @@ impl ProjectCatalogMigrationMarkerV1 {
                 "migration marker source hash disagrees with its retained backup",
             ));
         }
+        let publisher_backup = self
+            .immutable_assets
+            .iter()
+            .find(|asset| asset.role == ImmutableAssetRoleV1::LegacyPublisherRefBackup)
+            .expect("mandatory publisher source backup role was checked");
+        if publisher_backup.sha256 != self.publisher_ref_source_sha256 {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_incomplete",
+                "migration marker publisher source hash disagrees with its retained backup",
+            ));
+        }
         let catalog_backup = self
             .participants
             .iter()
@@ -3206,6 +4290,7 @@ impl ProjectCatalogMigrationMarkerV1 {
                 "migration marker source hash disagrees with its mutable catalog backup",
             ));
         }
+        validate_publisher_evidence(&self.publisher_pins, &self.publisher_dispositions, "marker")?;
         Ok(())
     }
 }
@@ -3222,6 +4307,7 @@ struct MigrationParticipantEvidenceV1 {
 #[serde(deny_unknown_fields)]
 struct MigrationImmutableAssetEvidenceV1 {
     role: ImmutableAssetRoleV1,
+    mode: ImmutableAssetModeV1,
     sha256: Sha256Hex,
     validated_name: ValidatedBasename,
 }
@@ -4141,6 +5227,7 @@ mod tests {
         fail_points: BTreeSet<FaultPoint>,
         seen: AtomicUsize,
         points: Mutex<Vec<FaultPoint>>,
+        mutation_lock_paths: Mutex<Vec<PathBuf>>,
     }
 
     impl TracingIo {
@@ -4151,6 +5238,7 @@ mod tests {
                 fail_points: BTreeSet::new(),
                 seen: AtomicUsize::new(0),
                 points: Mutex::new(Vec::new()),
+                mutation_lock_paths: Mutex::new(Vec::new()),
             }
         }
 
@@ -4161,6 +5249,7 @@ mod tests {
                 fail_points: BTreeSet::new(),
                 seen: AtomicUsize::new(0),
                 points: Mutex::new(Vec::new()),
+                mutation_lock_paths: Mutex::new(Vec::new()),
             }
         }
 
@@ -4171,6 +5260,7 @@ mod tests {
                 fail_points: points.into_iter().collect(),
                 seen: AtomicUsize::new(0),
                 points: Mutex::new(Vec::new()),
+                mutation_lock_paths: Mutex::new(Vec::new()),
             }
         }
 
@@ -4184,11 +5274,16 @@ mod tests {
                 fail_points: points.into_iter().collect(),
                 seen: AtomicUsize::new(0),
                 points: Mutex::new(Vec::new()),
+                mutation_lock_paths: Mutex::new(Vec::new()),
             }
         }
 
         fn trace(&self) -> Vec<FaultPoint> {
             self.points.lock().unwrap().clone()
+        }
+
+        fn mutation_lock_paths(&self) -> Vec<PathBuf> {
+            self.mutation_lock_paths.lock().unwrap().clone()
         }
     }
 
@@ -4197,6 +5292,10 @@ mod tests {
             &self,
             catalog_path: &Path,
         ) -> ProjectCatalogStoreResult<StoreLockGuard> {
+            self.mutation_lock_paths
+                .lock()
+                .unwrap()
+                .push(catalog_path.to_path_buf());
             self.real.acquire_mutation_lock(catalog_path)
         }
 
@@ -4476,8 +5575,12 @@ mod tests {
     ) {
         let root = path.parent().unwrap();
         let transaction_id = ProjectCatalogTransactionId::mint();
+        let publisher_source = root.join("publisher-refs.json");
+        let publisher_bytes = b"legacy publisher refs";
+        fs::write(&publisher_source, publisher_bytes).unwrap();
         let mut registry =
-            MigrationParticipantRegistry::new(path, root.join("code-source")).unwrap();
+            MigrationParticipantRegistry::new(path, root.join("code-source"), publisher_source)
+                .unwrap();
         registry
             .register_checkout_identity("checkout-observation-1".into(), root.join("checkout"))
             .unwrap();
@@ -4495,6 +5598,7 @@ mod tests {
             transaction_id,
             plan_hash: Sha256Hex::digest(b"migration fault plan"),
             source_store_sha256: Sha256Hex::digest(legacy_bytes),
+            publisher_ref_source_sha256: Sha256Hex::digest(publisher_bytes),
             inventory_sha256: Sha256Hex::digest(b"migration fault inventory"),
             expected_legacy_catalog_sha256: Sha256Hex::digest(legacy_bytes),
             catalog,
@@ -4514,6 +5618,8 @@ mod tests {
                     b"legacy publisher refs".to_vec(),
                 ),
             ],
+            publisher_pins: Vec::new(),
+            publisher_dispositions: Vec::new(),
             checkout_identity_actions: vec![MigrationCheckoutIdentityActionDraftV1::new(
                 "checkout-observation-1".into(),
                 "66666666666666666666666666666666".into(),
@@ -4535,6 +5641,302 @@ mod tests {
         let (registry, draft, expected) = basic_migration_draft(&path, &legacy_bytes);
         let plan = validate_migration_plan(&path, registry, draft).unwrap();
         (directory, path, plan, expected, legacy_bytes)
+    }
+
+    fn publisher_seed_migration_draft(
+        path: &Path,
+        legacy_bytes: &[u8],
+    ) -> (
+        MigrationParticipantRegistry,
+        MigrationPlanDraftV1,
+        ParticipantRoleV1,
+        ImmutableAssetRoleV1,
+    ) {
+        use crate::accepted_publication_store::{
+            AcceptedPublicationBuildInputV1, prepare_accepted_publication_v1,
+        };
+
+        let (registry, mut draft, _) = basic_migration_draft(path, legacy_bytes);
+        let project_id = ProjectId::parse("published-project").unwrap();
+        let attachment_id = AttachmentId::parse("att_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let scope = PublishedScope::try_new("published-repo", ".").unwrap();
+        let full_ref = FullPublisherRef::parse("refs/heads/main").unwrap();
+        let accepted_commit = GitObjectId::parse("a".repeat(40)).unwrap();
+        draft.catalog.projects.insert(
+            project_id.clone(),
+            CorpusProject {
+                project_id: project_id.clone(),
+                scope: ProjectScope::Published(scope.clone()),
+                operator_aliases: BTreeSet::new(),
+                nominated_aliases: BTreeSet::new(),
+                display_name: "Published project".into(),
+                created_at: "2026-07-23T00:00:00Z".into(),
+                registered_at_compat: None,
+                repo_history: None,
+                languages: BTreeSet::new(),
+            },
+        );
+        draft.attachments.attachments.insert(
+            attachment_id.clone(),
+            CheckoutAttachment {
+                attachment_id: attachment_id.clone(),
+                project_id: project_id.clone(),
+                checkout_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                checkout_dir: "/tmp/published-project".into(),
+                checkout_project_dir: "/tmp/published-project".into(),
+                project_root_relpath: ".".into(),
+                kind: AttachmentKind::Base,
+                validated_scope: Some(scope.clone()),
+                computed_repo_hint: None,
+                branch_ref: None,
+                capabilities: AttachmentCapabilities {
+                    local_code_source: true,
+                    ..AttachmentCapabilities::default()
+                },
+                status: AttachmentStatus::Attached,
+                attached_at: "2026-07-23T00:00:00Z".into(),
+                detached_at: None,
+            },
+        );
+        let prepared = prepare_accepted_publication_v1(
+            AcceptedPublicationBuildInputV1 {
+                project_id: project_id.clone(),
+                attachment_id: attachment_id.clone(),
+                scope: scope.clone(),
+                full_ref: full_ref.clone(),
+                accepted_commit: accepted_commit.clone(),
+                knowledge: Vec::new(),
+                gaps: Vec::new(),
+                prior_pointer: None,
+            },
+            &AcceptedPublicationLimits::default(),
+        )
+        .unwrap();
+        let pointer_role = ParticipantRoleV1::AcceptedPublicationPointer {
+            project_id: project_id.clone(),
+        };
+        draft.participants.push(MigrationParticipantDraftV1::new(
+            pointer_role.clone(),
+            None,
+            Some(prepared.pointer_bytes.clone()),
+        ));
+        let generation_role = ImmutableAssetRoleV1::AcceptedPublicationGeneration {
+            project_id: project_id.clone(),
+            generation_id: prepared.generation_id.clone(),
+        };
+        draft
+            .immutable_assets
+            .push(MigrationImmutableAssetDraftV1::new(
+                generation_role.clone(),
+                prepared.generation_bytes.clone(),
+            ));
+        let generation_sha256 =
+            Sha256Hex::parse(prepared.generation_hash.as_str().to_string()).unwrap();
+        let pointer_sha256 = Sha256Hex::parse(prepared.pointer_hash.as_str().to_string()).unwrap();
+        draft.publisher_pins.push(PublisherPinEvidenceV1 {
+            observation_id: "publisher-observation-1".into(),
+            project_id: project_id.clone(),
+            expected_scope: scope.clone(),
+            full_ref: full_ref.clone(),
+        });
+        draft
+            .publisher_dispositions
+            .push(PublisherDispositionEvidenceV1::SeedG1 {
+                observation_id: "publisher-observation-1".into(),
+                project_id,
+                attachment_id,
+                expected_scope: scope,
+                full_ref,
+                accepted_commit,
+                generation_id: prepared.generation_id,
+                generation_sha256,
+                pointer_sha256,
+            });
+        (registry, draft, pointer_role, generation_role)
+    }
+
+    fn add_collision_retirement_to_draft(
+        registry: &MigrationParticipantRegistry,
+        draft: &mut MigrationPlanDraftV1,
+    ) -> (ImmutableAssetRoleV1, PathBuf, Vec<u8>) {
+        let project_id = ProjectId::parse("collision-project").unwrap();
+        let former_scope = PublishedScope::try_new("collision-repo", ".").unwrap();
+        let generation_id = Sha256Hex::digest(b"collected-generation");
+        let manifest_bytes = b"{\"path\":\"synthetic.rs\"}\n".to_vec();
+        let manifest_sha256 = Sha256Hex::digest(&manifest_bytes);
+        draft.catalog.projects.insert(
+            project_id.clone(),
+            CorpusProject {
+                project_id: project_id.clone(),
+                scope: ProjectScope::LegacyLocal,
+                operator_aliases: BTreeSet::new(),
+                nominated_aliases: BTreeSet::new(),
+                display_name: "Collision project".into(),
+                created_at: "2026-07-23T00:00:00Z".into(),
+                registered_at_compat: None,
+                repo_history: None,
+                languages: BTreeSet::new(),
+            },
+        );
+        let activation_bytes = b"legacy activation".to_vec();
+        let activation_target = registry.code_source_paths.activation(&project_id);
+        fs::create_dir_all(activation_target.parent().unwrap()).unwrap();
+        fs::write(&activation_target, &activation_bytes).unwrap();
+        draft.participants.push(MigrationParticipantDraftV1::new(
+            ParticipantRoleV1::Activation {
+                project_id: project_id.clone(),
+            },
+            Some(Sha256Hex::digest(&activation_bytes)),
+            None,
+        ));
+        let retirement = bbox_code_source_store::CollisionRetirementPendingV1 {
+            version: 1,
+            project_id: project_id.clone(),
+            former_scope: former_scope.clone(),
+            generation_id: generation_id.to_string(),
+            selector: bbox_code_source::source_selector(
+                project_id.as_str(),
+                generation_id.as_str(),
+            ),
+            snapshot_id: format!("collected-{}", "e".repeat(32)),
+            manifest_sha256: manifest_sha256.to_string(),
+            inventory_hash: draft.inventory_sha256.to_string(),
+            plan_hash: draft.plan_hash.to_string(),
+        };
+        let retirement_bytes =
+            bbox_code_source_store::encode_collision_retirement_pending_for_migration(&retirement)
+                .unwrap();
+        draft.participants.push(MigrationParticipantDraftV1::new(
+            ParticipantRoleV1::CollisionRetirement {
+                project_id: project_id.clone(),
+            },
+            None,
+            Some(retirement_bytes),
+        ));
+        let manifest_role = ImmutableAssetRoleV1::CollectedGenerationManifest {
+            published_scope: former_scope,
+            generation_id,
+        };
+        let manifest_name =
+            immutable_target_name(&draft.transaction_id, &manifest_role, &manifest_sha256).unwrap();
+        let manifest_target = registry.immutable_target(&manifest_role, &manifest_name);
+        fs::create_dir_all(manifest_target.parent().unwrap()).unwrap();
+        fs::write(&manifest_target, &manifest_bytes).unwrap();
+        draft
+            .immutable_assets
+            .push(MigrationImmutableAssetDraftV1::pinned_existing(
+                manifest_role.clone(),
+                manifest_sha256,
+            ));
+        (manifest_role, manifest_target, manifest_bytes)
+    }
+
+    fn extended_migration_fault_fixture() -> (
+        tempfile::TempDir,
+        PathBuf,
+        ValidatedMigrationPlanV1,
+        PathBuf,
+        Vec<u8>,
+    ) {
+        let (directory, path) = projects_path();
+        let legacy_bytes = b"{\"version\":1,\"projects\":[]}\n".to_vec();
+        fs::write(&path, &legacy_bytes).unwrap();
+        let (registry, mut draft, _, _) = publisher_seed_migration_draft(&path, &legacy_bytes);
+        let (_, manifest_target, manifest_bytes) =
+            add_collision_retirement_to_draft(&registry, &mut draft);
+        let plan = validate_migration_plan(&path, registry, draft).unwrap();
+        (directory, path, plan, manifest_target, manifest_bytes)
+    }
+
+    fn activation_migration_draft(
+        path: &Path,
+        legacy_bytes: &[u8],
+    ) -> (
+        MigrationParticipantRegistry,
+        MigrationPlanDraftV1,
+        ParticipantRoleV1,
+        ParticipantRoleV1,
+    ) {
+        let (registry, mut draft, _) = basic_migration_draft(path, legacy_bytes);
+        let project_id = ProjectId::parse("active-project").unwrap();
+        let scope = PublishedScope::try_new("active-repo", ".").unwrap();
+        draft.catalog.projects.insert(
+            project_id.clone(),
+            CorpusProject {
+                project_id: project_id.clone(),
+                scope: ProjectScope::Published(scope.clone()),
+                operator_aliases: BTreeSet::new(),
+                nominated_aliases: BTreeSet::new(),
+                display_name: "Active project".into(),
+                created_at: "2026-07-23T00:00:00Z".into(),
+                registered_at_compat: None,
+                repo_history: None,
+                languages: BTreeSet::new(),
+            },
+        );
+        let entries = Vec::<bbox_code_source::ManifestEntry>::new();
+        let head_commit = "b".repeat(40);
+        let descriptor = bbox_code_source::GenerationDescriptor {
+            schema_version: bbox_code_source::SCHEMA_VERSION,
+            walker_policy_version: bbox_code_source::WALKER_POLICY_VERSION.into(),
+            scope: scope.clone(),
+            head_commit: head_commit.clone(),
+            dirty_fingerprint: bbox_code_source::dirty_fingerprint(&head_commit, &entries),
+            manifest_sha256: bbox_code_source::manifest_sha256(&entries),
+            file_count: 0,
+            logical_bytes: 0,
+        };
+        let producer_id = "migration-producer";
+        let generation_id = bbox_code_source::generation_id(producer_id, &descriptor);
+        let generation = bbox_code_source_store::StoredGenerationV2 {
+            version: 2,
+            generation_id: generation_id.clone(),
+            producer_id: producer_id.into(),
+            ordinal: 1,
+            descriptor,
+            published_scope: scope.clone(),
+            state: bbox_code_source::GenerationState::Active,
+            diagnostic: None,
+            created_unix_secs: 1,
+            materialized_doc_count: Some(0),
+            entity_inventory_sha256: Some("c".repeat(64)),
+        };
+        let activation = bbox_code_source_store::ActivationRecordV2 {
+            version: 2,
+            project_id: project_id.clone(),
+            published_scope: scope.clone(),
+            generation_id: generation_id.clone(),
+            selector: bbox_code_source::source_selector(project_id.as_str(), &generation_id),
+            snapshot_id: format!("collected-{}", "e".repeat(32)),
+            document_count: 0,
+            entity_inventory_sha256: "c".repeat(64),
+            current_chunk_targets: BTreeMap::new(),
+            activated_unix_secs: 1,
+            cutback_pending: false,
+            diagnostic: None,
+        };
+        let activation_role = ParticipantRoleV1::Activation {
+            project_id: project_id.clone(),
+        };
+        let stored_role = ParticipantRoleV1::StoredGenerationMetadata {
+            project_id,
+            published_scope: scope,
+            generation_id: Sha256Hex::parse(generation_id).unwrap(),
+        };
+        draft.participants.push(MigrationParticipantDraftV1::new(
+            activation_role.clone(),
+            None,
+            Some(bbox_code_source_store::encode_activation_v2_for_migration(&activation).unwrap()),
+        ));
+        draft.participants.push(MigrationParticipantDraftV1::new(
+            stored_role.clone(),
+            None,
+            Some(
+                bbox_code_source_store::encode_stored_generation_v2_for_migration(&generation)
+                    .unwrap(),
+            ),
+        ));
+        (registry, draft, activation_role, stored_role)
     }
 
     #[test]
@@ -4741,15 +6143,64 @@ mod tests {
     }
 
     #[test]
+    fn migration_apply_contends_on_accepted_publication_and_publisher_source_locks() {
+        for lane in ["accepted", "publisher"] {
+            let (_directory, path, plan, _, _) = migration_fault_fixture();
+            let root = path.parent().unwrap();
+            let auxiliary_path = match lane {
+                "accepted" => root.join("accepted-publications.json"),
+                "publisher" => root.join("publisher-refs.json"),
+                _ => unreachable!(),
+            };
+            let auxiliary_guard = acquire_store_lock_nofollow(&auxiliary_path).unwrap();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                sender.send(transact_migration(&path, plan)).unwrap();
+            });
+            assert!(
+                receiver.recv_timeout(Duration::from_millis(100)).is_err(),
+                "{lane} auxiliary lock did not exclude migration apply"
+            );
+            drop(auxiliary_guard);
+            receiver
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap();
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn migration_auxiliary_lock_order_is_lexically_deterministic() {
+        let (_directory, path, plan, _, _) = migration_fault_fixture();
+        let mut expected = plan.registry.auxiliary_store_paths();
+        expected.sort();
+        let recording = Arc::new(TracingIo::recording());
+        transact_migration_with_io(&path, plan, recording.clone()).unwrap();
+        let acquired = recording.mutation_lock_paths();
+        assert_eq!(acquired.first(), Some(&path));
+        assert_eq!(&acquired[1..], expected.as_slice());
+    }
+
+    #[test]
     fn migration_registry_rejects_unsafe_roots_and_duplicate_checkout_targets() {
         let (_directory, path) = projects_path();
         let root = path.parent().unwrap();
         assert!(
-            MigrationParticipantRegistry::new(&path, root.join("code-source/../escape"),).is_err()
+            MigrationParticipantRegistry::new(
+                &path,
+                root.join("code-source/../escape"),
+                root.join("publisher-refs.json"),
+            )
+            .is_err()
         );
 
-        let mut registry =
-            MigrationParticipantRegistry::new(&path, root.join("code-source")).unwrap();
+        let mut registry = MigrationParticipantRegistry::new(
+            &path,
+            root.join("code-source"),
+            root.join("publisher-refs.json"),
+        )
+        .unwrap();
         registry
             .register_checkout_identity("first".into(), root.join("checkout"))
             .unwrap();
@@ -4768,6 +6219,7 @@ mod tests {
             MigrationParticipantRegistry::new(
                 &root.join("effective-source-manifest.toml"),
                 root.clone(),
+                root.join("publisher-refs.json"),
             )
             .is_err()
         );
@@ -4775,6 +6227,7 @@ mod tests {
             MigrationParticipantRegistry::new(
                 &root.join("projects.json"),
                 root.join("project-catalog-stage/code-source"),
+                root.join("publisher-refs.json"),
             )
             .is_err()
         );
@@ -4782,6 +6235,7 @@ mod tests {
         let mut registry = MigrationParticipantRegistry::new(
             &root.join("projects.json"),
             root.join("code-source"),
+            root.join("publisher-refs.json"),
         )
         .unwrap();
         registry
@@ -4804,7 +6258,10 @@ mod tests {
         assert_no_migration_outputs(&path);
 
         let (registry, mut draft, _) = basic_migration_draft(&path, legacy_bytes);
-        draft.immutable_assets[0].bytes = vec![b'x'; MAX_PROJECT_CATALOG_BYTES + 1];
+        draft.immutable_assets[0].source = MigrationImmutableAssetSourceV1::InstallableBytes(vec![
+                b'x';
+                MAX_PROJECT_CATALOG_BYTES + 1
+            ]);
         assert!(validate_migration_plan(&path, registry, draft).is_err());
         assert_no_migration_outputs(&path);
 
@@ -4814,11 +6271,194 @@ mod tests {
         assert_no_migration_outputs(&path);
 
         let (registry, mut draft, _) = basic_migration_draft(&path, legacy_bytes);
-        draft.immutable_assets[0].bytes = b"different retained source".to_vec();
+        draft.immutable_assets[0].source = MigrationImmutableAssetSourceV1::InstallableBytes(
+            b"different retained source".to_vec(),
+        );
+        assert!(validate_migration_plan(&path, registry, draft).is_err());
+        assert_no_migration_outputs(&path);
+
+        let (registry, mut draft, _) = basic_migration_draft(&path, legacy_bytes);
+        draft.publisher_ref_source_sha256 = Sha256Hex::digest(b"different publisher source");
         assert!(validate_migration_plan(&path, registry, draft).is_err());
         assert_no_migration_outputs(&path);
 
         drop(directory);
+    }
+
+    #[test]
+    fn publisher_evidence_requires_exactly_one_matching_disposition_per_pin() {
+        let (_directory, path) = projects_path();
+        let legacy = b"{\"version\":1,\"projects\":[]}\n";
+
+        let (registry, mut draft, _, _) = publisher_seed_migration_draft(&path, legacy);
+        draft.publisher_dispositions.clear();
+        let error = validate_migration_plan(&path, registry, draft).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_invalid_publisher_evidence"
+        );
+
+        let (registry, mut draft, _, _) = publisher_seed_migration_draft(&path, legacy);
+        draft
+            .publisher_dispositions
+            .push(draft.publisher_dispositions[0].clone());
+        let error = validate_migration_plan(&path, registry, draft).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_invalid_publisher_evidence"
+        );
+
+        let (registry, mut draft, _, _) = publisher_seed_migration_draft(&path, legacy);
+        if let PublisherDispositionEvidenceV1::SeedG1 { observation_id, .. } =
+            &mut draft.publisher_dispositions[0]
+        {
+            *observation_id = "different-observation".into();
+        }
+        let error = validate_migration_plan(&path, registry, draft).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_invalid_publisher_evidence"
+        );
+    }
+
+    #[test]
+    fn accepted_pointer_and_generation_require_exact_seed_binding() {
+        let (_directory, path) = projects_path();
+        let legacy = b"{\"version\":1,\"projects\":[]}\n";
+        let (registry, draft, _, _) = publisher_seed_migration_draft(&path, legacy);
+        validate_migration_plan(&path, registry, draft).unwrap();
+
+        let (registry, mut draft, pointer_role, _) = publisher_seed_migration_draft(&path, legacy);
+        draft
+            .participants
+            .iter_mut()
+            .find(|participant| participant.role == pointer_role)
+            .unwrap()
+            .post_image = Some(b"{}".to_vec());
+        let error = validate_migration_plan(&path, registry, draft).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_invalid_migration_plan");
+
+        let (registry, mut draft, _, generation_role) =
+            publisher_seed_migration_draft(&path, legacy);
+        let source = &mut draft
+            .immutable_assets
+            .iter_mut()
+            .find(|asset| asset.role == generation_role)
+            .unwrap()
+            .source;
+        *source = MigrationImmutableAssetSourceV1::InstallableBytes(b"{}".to_vec());
+        let error = validate_migration_plan(&path, registry, draft).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_invalid_migration_plan");
+    }
+
+    #[test]
+    fn activation_requires_its_exact_scope_bearing_stored_generation() {
+        let (_directory, path) = projects_path();
+        let legacy = b"{\"version\":1,\"projects\":[]}\n";
+        let (registry, draft, _, _) = activation_migration_draft(&path, legacy);
+        validate_migration_plan(&path, registry, draft).unwrap();
+
+        let (registry, mut draft, _, stored_role) = activation_migration_draft(&path, legacy);
+        draft
+            .participants
+            .retain(|participant| participant.role != stored_role);
+        let error = validate_migration_plan(&path, registry, draft).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_invalid_migration_plan");
+
+        let (registry, mut draft, activation_role, _) = activation_migration_draft(&path, legacy);
+        let participant = draft
+            .participants
+            .iter_mut()
+            .find(|participant| participant.role == activation_role)
+            .unwrap();
+        let mut activation =
+            decode_activation_v2_for_migration(participant.post_image.as_deref().unwrap()).unwrap();
+        activation.document_count = 1;
+        participant.post_image =
+            Some(bbox_code_source_store::encode_activation_v2_for_migration(&activation).unwrap());
+        let error = validate_migration_plan(&path, registry, draft).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_invalid_migration_plan");
+    }
+
+    #[test]
+    fn pinned_collected_manifest_is_verified_without_an_installable_stage() {
+        let (_directory, path, plan, manifest_target, manifest_bytes) =
+            extended_migration_fault_fixture();
+        let pinned = plan
+            .journal
+            .immutable_assets
+            .iter()
+            .find(|asset| {
+                matches!(
+                    &asset.role,
+                    ImmutableAssetRoleV1::CollectedGenerationManifest { .. }
+                )
+            })
+            .unwrap();
+        assert_eq!(pinned.mode, ImmutableAssetModeV1::PinnedExisting);
+        assert!(pinned.stage_name.is_none());
+        assert!(!plan.immutable_asset_bytes.contains_key(&pinned.role));
+
+        transact_migration(&path, plan).unwrap();
+        assert_eq!(fs::read(manifest_target).unwrap(), manifest_bytes);
+    }
+
+    #[test]
+    fn missing_or_corrupt_pinned_manifest_refuses_apply_and_recovery() {
+        let (_directory, path, plan, manifest_target, _) = extended_migration_fault_fixture();
+        fs::remove_file(&manifest_target).unwrap();
+        let error = transact_migration(&path, plan).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_migration_inventory_stale"
+        );
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        assert!(!paths.stage_dir.exists());
+        assert!(!paths.backup_dir.exists());
+        assert!(!paths.journal.exists());
+
+        let (_directory, path, plan, manifest_target, _) = extended_migration_fault_fixture();
+        fs::write(&manifest_target, b"corrupt manifest").unwrap();
+        let error = transact_migration(&path, plan).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_artifact_collision");
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        assert!(!paths.stage_dir.exists());
+        assert!(!paths.backup_dir.exists());
+        assert!(!paths.journal.exists());
+
+        let (_directory, path, plan, manifest_target, _) = extended_migration_fault_fixture();
+        let registry = plan.registry.clone();
+        let failing = Arc::new(TracingIo::failing_points([FaultPoint::ParticipantInstall]));
+        let error = transact_migration_with_io(&path, plan, failing).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_injected_fault");
+        fs::write(&manifest_target, b"corrupt manifest").unwrap();
+        let error =
+            recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_recovery_incomplete");
+    }
+
+    #[test]
+    fn migration_role_caps_are_specific_to_each_participant_class() {
+        let project_id = ProjectId::parse("cap-project").unwrap();
+        let scope = PublishedScope::try_new("cap-repo", ".").unwrap();
+        assert_eq!(
+            ParticipantRoleV1::AcceptedPublicationPointer {
+                project_id: project_id.clone(),
+            }
+            .max_bytes(),
+            MAX_ACCEPTED_PUBLICATION_POINTER_BYTES
+        );
+        assert_eq!(
+            ParticipantRoleV1::StoredGenerationMetadata {
+                project_id,
+                published_scope: scope,
+                generation_id: Sha256Hex::digest(b"cap-generation"),
+            }
+            .max_bytes(),
+            MAX_CODE_SOURCE_GENERATION_METADATA_BYTES
+        );
+        assert!(ParticipantRoleV1::MigrationMarker.max_bytes() > MAX_PROJECT_CATALOG_BYTES);
+        assert!(ParticipantRoleV1::EffectiveSourceManifest.max_bytes() > MAX_PROJECT_CATALOG_BYTES);
     }
 
     #[test]
@@ -4835,10 +6475,16 @@ mod tests {
         assert_eq!(error.code(), "error.project_catalog_invalid_migration_plan");
         assert_no_migration_outputs(&path);
 
+        let (registry, mut draft, _, _) = publisher_seed_migration_draft(&path, legacy_bytes);
+        draft.publisher_pins =
+            vec![draft.publisher_pins[0].clone(); MAX_MIGRATION_PUBLISHER_PINS + 1];
+        let error = validate_migration_plan(&path, registry, draft).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_invalid_migration_plan");
+
         let transaction_id = ProjectCatalogTransactionId::mint();
         let project_id = ProjectId::parse("x".repeat(96)).unwrap();
         let role = ParticipantRoleV1::StoredGenerationMetadata {
-            project_id,
+            project_id: project_id.clone(),
             published_scope: PublishedScope::try_new("r".repeat(128), ".").unwrap(),
             generation_id: Sha256Hex::digest(b"generation"),
         };
@@ -4851,8 +6497,11 @@ mod tests {
         let encoded_asset = serde_json::to_vec(&ImmutableAssetV1 {
             validated_name: immutable_target_name(&transaction_id, &asset_role, &asset_hash)
                 .unwrap(),
-            stage_name: immutable_stage_name(&transaction_id, &asset_role, &asset_hash).unwrap(),
+            stage_name: Some(
+                immutable_stage_name(&transaction_id, &asset_role, &asset_hash).unwrap(),
+            ),
             role: asset_role,
+            mode: ImmutableAssetModeV1::Installable,
             sha256: asset_hash,
         })
         .unwrap()
@@ -4863,10 +6512,43 @@ mod tests {
         })
         .unwrap()
         .len();
+        let long_scope = PublishedScope::try_new(
+            "r".repeat(256),
+            std::iter::repeat_n("p".repeat(255), 15)
+                .collect::<Vec<_>>()
+                .join("/"),
+        )
+        .unwrap();
+        let full_ref =
+            FullPublisherRef::parse(format!("refs/heads/{}", "b".repeat(1_000))).unwrap();
+        let encoded_pin = serde_json::to_vec(&PublisherPinEvidenceV1 {
+            observation_id: "o".repeat(256),
+            project_id: project_id.clone(),
+            expected_scope: long_scope.clone(),
+            full_ref: full_ref.clone(),
+        })
+        .unwrap()
+        .len();
+        let encoded_disposition = serde_json::to_vec(
+            &PublisherDispositionEvidenceV1::NoPublishedContentAcknowledged {
+                observation_id: "o".repeat(256),
+                project_id,
+                expected_scope: long_scope,
+                full_ref,
+                bounded_reason: "r".repeat(4_096),
+            },
+        )
+        .unwrap()
+        .len();
         let conservative_max = encoded_participant
             .saturating_mul(MAX_MIGRATION_PARTICIPANTS)
             .saturating_add(encoded_asset.saturating_mul(MAX_MIGRATION_IMMUTABLE_ASSETS))
             .saturating_add(encoded_action.saturating_mul(MAX_MIGRATION_CHECKOUT_ACTIONS))
+            .saturating_add(
+                encoded_pin
+                    .saturating_add(encoded_disposition)
+                    .saturating_mul(MAX_MIGRATION_PUBLISHER_PINS),
+            )
             .saturating_add(1024 * 1024);
         assert!(conservative_max <= MAX_JOURNAL_BYTES);
     }
@@ -5271,6 +6953,8 @@ mod tests {
             decode_bounded_json(&bytes, MAX_JOURNAL_BYTES, "transaction journal").unwrap();
         journal.kind = TransactionKindV1::V1Migration;
         journal.plan_hash = Some(sha256(b"synthetic migration plan"));
+        let publisher_hash = sha256(b"legacy publisher refs");
+        journal.publisher_ref_source_sha256 = Some(publisher_hash.clone());
         let catalog = journal
             .participants
             .iter_mut()
@@ -5308,20 +6992,18 @@ mod tests {
             });
         }
         journal.immutable_assets = [
-            (
-                ImmutableAssetRoleV1::LegacyProjectStoreBackup,
-                sha256(b"legacy project store"),
-            ),
+            (ImmutableAssetRoleV1::LegacyProjectStoreBackup, legacy_hash),
             (
                 ImmutableAssetRoleV1::LegacyPublisherRefBackup,
-                sha256(b"legacy publisher refs"),
+                publisher_hash,
             ),
         ]
         .into_iter()
         .map(|(role, hash)| ImmutableAssetV1 {
             validated_name: immutable_target_name(&journal.transaction_id, &role, &hash).unwrap(),
-            stage_name: immutable_stage_name(&journal.transaction_id, &role, &hash).unwrap(),
+            stage_name: Some(immutable_stage_name(&journal.transaction_id, &role, &hash).unwrap()),
             role,
+            mode: ImmutableAssetModeV1::Installable,
             sha256: hash,
         })
         .collect();
@@ -5340,86 +7022,7 @@ mod tests {
 
     #[test]
     fn validated_migration_plan_uses_closed_roles_and_commits_every_participant() {
-        let (_directory, path) = projects_path();
-        let root = path.parent().unwrap();
-        let transaction_id = ProjectCatalogTransactionId::mint();
-        let project_id = ProjectId::parse("migration-example").unwrap();
-        let published_scope = PublishedScope::try_new("repo-migration", ".").unwrap();
-        let generation_id = Sha256Hex::digest(b"generation");
-        let legacy_bytes = b"{\"version\":1,\"projects\":[]}\n".to_vec();
-        fs::write(&path, &legacy_bytes).unwrap();
-
-        let mut registry =
-            MigrationParticipantRegistry::new(&path, root.join("code-source")).unwrap();
-        let retirement_target = root
-            .join("code-source/collision-retirements")
-            .join("migration-example.json");
-        registry
-            .register_checkout_identity("checkout-observation-1".into(), root.join("checkout"))
-            .unwrap();
-        fs::create_dir_all(retirement_target.parent().unwrap()).unwrap();
-        fs::write(&retirement_target, b"legacy activation").unwrap();
-
-        let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
-        catalog.origin = CatalogOriginV2::MigratedV1 {
-            transaction_id: transaction_id.clone(),
-        };
-        let attachments = AttachmentSnapshotV1::empty(1).unwrap();
-        let participants = vec![
-            MigrationParticipantDraftV1::new(
-                ParticipantRoleV1::EffectiveSourceManifest,
-                None,
-                Some(b"effective manifest".to_vec()),
-            ),
-            MigrationParticipantDraftV1::new(
-                ParticipantRoleV1::Activation {
-                    project_id: project_id.clone(),
-                },
-                None,
-                Some(b"activation v2".to_vec()),
-            ),
-            MigrationParticipantDraftV1::new(
-                ParticipantRoleV1::StoredGenerationMetadata {
-                    project_id: project_id.clone(),
-                    published_scope,
-                    generation_id: generation_id.clone(),
-                },
-                None,
-                Some(b"stored generation v2".to_vec()),
-            ),
-            MigrationParticipantDraftV1::new(
-                ParticipantRoleV1::CollisionRetirement {
-                    project_id: project_id.clone(),
-                },
-                Some(Sha256Hex::digest(b"legacy activation")),
-                None,
-            ),
-        ];
-        let draft = MigrationPlanDraftV1 {
-            transaction_id,
-            plan_hash: Sha256Hex::digest(b"migration plan"),
-            source_store_sha256: Sha256Hex::digest(&legacy_bytes),
-            inventory_sha256: Sha256Hex::digest(b"migration inventory"),
-            expected_legacy_catalog_sha256: Sha256Hex::digest(&legacy_bytes),
-            catalog,
-            attachments,
-            participants,
-            immutable_assets: vec![
-                MigrationImmutableAssetDraftV1::new(
-                    ImmutableAssetRoleV1::LegacyProjectStoreBackup,
-                    legacy_bytes,
-                ),
-                MigrationImmutableAssetDraftV1::new(
-                    ImmutableAssetRoleV1::LegacyPublisherRefBackup,
-                    b"legacy publisher refs".to_vec(),
-                ),
-            ],
-            checkout_identity_actions: vec![MigrationCheckoutIdentityActionDraftV1::new(
-                "checkout-observation-1".into(),
-                "55555555555555555555555555555555".into(),
-            )],
-        };
-        let plan = validate_migration_plan(&path, registry, draft).unwrap();
+        let (_directory, path, plan, _, _) = migration_fault_fixture();
         let retry_plan = plan.clone();
         let retry_after_regular_commit = plan.clone();
         let reopen_registry = plan.registry.clone();
@@ -5461,23 +7064,23 @@ mod tests {
         )
         .unwrap();
         marker.validate().unwrap();
-        let retirement_evidence = marker
-            .participants
-            .iter()
-            .find(|evidence| matches!(evidence.role, ParticipantRoleV1::CollisionRetirement { .. }))
-            .unwrap();
-        assert!(matches!(
-            retirement_evidence.old,
-            ExpectedImageV1::Present { .. }
-        ));
-        assert!(matches!(
-            retirement_evidence.new,
-            ExpectedImageV1::Absent {}
-        ));
-        assert!(!retirement_target.exists());
+        assert!(marker.participants.iter().any(|evidence| {
+            evidence.role == ParticipantRoleV1::EffectiveSourceManifest
+                && matches!(evidence.new, ExpectedImageV1::Present { .. })
+        }));
+        assert_eq!(marker.immutable_assets.len(), 2);
+        assert_eq!(
+            marker.publisher_ref_source_sha256,
+            Sha256Hex::digest(b"legacy publisher refs")
+        );
+        assert!(marker.immutable_assets.iter().any(|asset| {
+            asset.role == ImmutableAssetRoleV1::LegacyPublisherRefBackup
+                && asset.sha256 == marker.publisher_ref_source_sha256
+        }));
+        let root = path.parent().unwrap();
         assert_eq!(
             fs::read_to_string(root.join("checkout/.bbox/local/checkout-id")).unwrap(),
-            "55555555555555555555555555555555\n"
+            "66666666666666666666666666666666\n"
         );
         assert_eq!(
             fs::read(root.join("checkout/.bbox/local/.gitignore")).unwrap(),
@@ -5485,7 +7088,7 @@ mod tests {
         );
         assert_eq!(
             bbox_corpus_core::identity::ensure_checkout_id(&root.join("checkout")).unwrap(),
-            "55555555555555555555555555555555"
+            "66666666666666666666666666666666"
         );
     }
 
@@ -5493,9 +7096,12 @@ mod tests {
     fn migration_marker_uses_its_role_cap_during_install_verify_and_rollback() {
         let (_directory, path) = projects_path();
         let paths = ProjectCatalogPaths::derive(&path).unwrap();
-        let registry =
-            MigrationParticipantRegistry::new(&path, path.parent().unwrap().join("code-source"))
-                .unwrap();
+        let registry = MigrationParticipantRegistry::new(
+            &path,
+            path.parent().unwrap().join("code-source"),
+            path.parent().unwrap().join("publisher-refs.json"),
+        )
+        .unwrap();
         let owner = ProjectCatalogTransactionOwner {
             paths: paths.clone(),
             registry: ParticipantRegistry::Migration(Arc::new(registry)),
@@ -5552,7 +7158,7 @@ mod tests {
                     generation_id: Sha256Hex::digest(&ordinal.to_le_bytes()),
                 },
                 None,
-                &None,
+                &Some(vec![b'x']),
             )
             .unwrap();
             evidence.push(MigrationParticipantEvidenceV1 {
@@ -5575,6 +7181,7 @@ mod tests {
             MigrationImmutableAssetEvidenceV1 {
                 validated_name: immutable_target_name(&transaction_id, &role, &hash).unwrap(),
                 role,
+                mode: ImmutableAssetModeV1::Installable,
                 sha256: hash,
             }
         })
@@ -5584,7 +7191,10 @@ mod tests {
             transaction_id: transaction_id.clone(),
             plan_hash: Sha256Hex::digest(b"plan"),
             source_store_sha256: source_hash,
+            publisher_ref_source_sha256: Sha256Hex::digest(b"publisher refs"),
             inventory_sha256: Sha256Hex::digest(b"inventory"),
+            publisher_pins: Vec::new(),
+            publisher_dispositions: Vec::new(),
             participants: evidence,
             immutable_assets,
             migration_epoch: 1,
@@ -5620,6 +7230,9 @@ mod tests {
             state: TransactionStateV1::Prepared,
             outcome: None,
             plan_hash: Some(Sha256Hex::digest(b"plan")),
+            publisher_ref_source_sha256: Some(Sha256Hex::digest(b"publisher refs")),
+            publisher_pins: Vec::new(),
+            publisher_dispositions: Vec::new(),
             old_epoch: 0,
             new_epoch: 1,
             participants: vec![participant.clone()],
@@ -5668,6 +7281,29 @@ mod tests {
         let (registry, draft, _) = basic_migration_draft(&path, changed);
         let corrected = validate_migration_plan(&path, registry, draft).unwrap();
         assert_eq!(transact_migration(&path, corrected).unwrap().epoch, 1);
+    }
+
+    #[test]
+    fn changed_publisher_source_refuses_before_transaction_side_effects() {
+        let (_directory, path) = projects_path();
+        let legacy = b"{\"version\":1,\"projects\":[]}\n";
+        fs::write(&path, legacy).unwrap();
+        let (registry, draft, _) = basic_migration_draft(&path, legacy);
+        let publisher_source = registry.legacy_publisher_ref_source.clone();
+        let plan = validate_migration_plan(&path, registry, draft).unwrap();
+        fs::write(&publisher_source, b"changed publisher refs").unwrap();
+
+        let error = transact_migration(&path, plan).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_migration_inventory_stale"
+        );
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        assert!(!paths.stage_dir.exists());
+        assert!(!paths.backup_dir.exists());
+        assert!(!paths.journal.exists());
+        assert!(!paths.attachments.exists());
+        assert_eq!(fs::read(path).unwrap(), legacy);
     }
 
     #[test]
@@ -5876,6 +7512,61 @@ mod tests {
                     sha256(&attachment_bytes).to_string(),
                 );
                 assert_eq!(actual, expected_new);
+            }
+        }
+    }
+
+    #[test]
+    fn migration_extended_fault_matrix_covers_pointer_and_both_asset_modes() {
+        let (_trace_directory, trace_path, trace_plan, _, _) = extended_migration_fault_fixture();
+        assert!(trace_plan.journal.participants.iter().any(|participant| {
+            matches!(
+                &participant.role,
+                ParticipantRoleV1::AcceptedPublicationPointer { .. }
+            )
+        }));
+        assert!(
+            trace_plan
+                .journal
+                .immutable_assets
+                .iter()
+                .any(|asset| { asset.mode == ImmutableAssetModeV1::PinnedExisting })
+        );
+        assert!(
+            trace_plan
+                .journal
+                .immutable_assets
+                .iter()
+                .any(|asset| { asset.mode == ImmutableAssetModeV1::Installable })
+        );
+        let recording = Arc::new(TracingIo::recording());
+        transact_migration_with_io(&trace_path, trace_plan, recording.clone()).unwrap();
+        let trace = recording.trace();
+        assert!(trace.contains(&FaultPoint::ImmutableAssetWrite));
+        assert!(trace.contains(&FaultPoint::ImmutableAssetVerify));
+
+        for index in 0..trace.len() {
+            let (_directory, path, plan, manifest_target, manifest_bytes) =
+                extended_migration_fault_fixture();
+            let registry = plan.registry.clone();
+            let accepted_paths = registry.accepted_publication_paths.clone();
+            let failing = Arc::new(TracingIo::failing_at(index));
+            let _ = transact_migration_with_io(&path, plan, failing);
+            recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+            assert_eq!(fs::read(&manifest_target).unwrap(), manifest_bytes);
+            let catalog_bytes = fs::read(&path).unwrap();
+            if decode_legacy_project_store(&catalog_bytes).is_ok() {
+                assert!(
+                    fs::read_dir(accepted_paths.pointers())
+                        .map(|mut entries| entries.next().is_none())
+                        .unwrap_or(true)
+                );
+            } else {
+                assert!(
+                    accepted_paths
+                        .pointer(&ProjectId::parse("published-project").unwrap())
+                        .exists()
+                );
             }
         }
     }
