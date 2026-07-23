@@ -1808,6 +1808,7 @@ impl Default for ProjectCatalogOwnerInventoryLimitsV1 {
 }
 
 pub(crate) struct ProjectCatalogMigrationInventoryRequestV1<'a> {
+    pub(crate) rehearsal_root: Option<PathBuf>,
     pub(crate) legacy_project_store_path: PathBuf,
     pub(crate) publisher_ref_store: &'a PublisherRefStore,
     pub(crate) code_source_store_root: PathBuf,
@@ -1819,6 +1820,7 @@ pub(crate) struct ProjectCatalogMigrationInventoryRequestV1<'a> {
 }
 
 pub(crate) struct ProjectCatalogAttachmentCandidateDiscoveryRequestV1 {
+    pub(crate) rehearsal_root: Option<PathBuf>,
     pub(crate) legacy_project_store_path: PathBuf,
     pub(crate) checkout_roots: Vec<PathBuf>,
 }
@@ -2026,6 +2028,7 @@ impl ProjectCatalogMigrationInventoryFacadeV1 {
     pub(crate) fn discover_provenance_owner_sources(
         legacy_project_store_path: PathBuf,
         notes_ref: String,
+        rehearsal_root: Option<PathBuf>,
     ) -> Result<Vec<ProjectCatalogProvenanceOwnerSourceV1>, InventoryAdapterError> {
         let legacy_project_store_path = AuthorizedInventoryPath::new(&legacy_project_store_path)?;
         let projects_path = legacy_project_store_path.as_path().to_path_buf();
@@ -2036,7 +2039,9 @@ impl ProjectCatalogMigrationInventoryFacadeV1 {
                 let legacy_source = accept_missing_legacy_projects_source(
                     capture_legacy_projects_source(&legacy_project_store_path)?,
                 )?;
-                derive_legacy_project_probes(&legacy_source)?
+                let probes = derive_legacy_project_probes(&legacy_source)?;
+                validate_probe_containment(&probes, rehearsal_root.as_deref())?;
+                probes
                     .into_iter()
                     .filter_map(|probe| {
                         probe.repository_root.map(|repository_root| {
@@ -2082,6 +2087,11 @@ impl ProjectCatalogMigrationInventoryFacadeV1 {
                     capture_legacy_projects_source(&legacy_project_store_path)?,
                 )?;
                 let probes = derive_legacy_project_probes(&legacy_source)?;
+                validate_probe_containment(&probes, request.rehearsal_root.as_deref())?;
+                validate_authorized_containment(
+                    &checkout_roots,
+                    request.rehearsal_root.as_deref(),
+                )?;
                 let legacy = observe_legacy_projects(&legacy_source, probes)?;
                 let checkout_captures = capture_checkout_roots(&checkout_roots)?;
                 discover_attachment_candidate_keys_locked(&legacy, &checkout_captures)
@@ -2095,7 +2105,16 @@ impl ProjectCatalogMigrationInventoryFacadeV1 {
         let legacy_project_store_path =
             AuthorizedInventoryPath::new(&request.legacy_project_store_path)?;
         let checkout_roots = authorize_checkout_roots(&request.checkout_roots)?;
+        validate_authorized_containment(&checkout_roots, request.rehearsal_root.as_deref())?;
         let owner_paths = authorize_owner_paths(request.owner_paths)?;
+        validate_authorized_containment(
+            &owner_paths
+                .provenance_sources
+                .iter()
+                .map(|source| source.repository_root.clone())
+                .collect::<Vec<_>>(),
+            request.rehearsal_root.as_deref(),
+        )?;
         let code_source_store = CodeSourceStore::open_existing_for_migration(
             &request.code_source_store_root,
             request.code_source_store_limits,
@@ -2111,6 +2130,7 @@ impl ProjectCatalogMigrationInventoryFacadeV1 {
             owner_paths,
             owner_limits: request.owner_limits,
             attachment_identity_plan: request.attachment_identity_plan,
+            rehearsal_root: request.rehearsal_root,
         };
         crate::project_catalog_store::capture_migration_preflight_with(
             &projects_path,
@@ -2128,6 +2148,45 @@ struct AuthorizedProjectCatalogMigrationInventoryRequestV1<'a> {
     owner_paths: AuthorizedProjectCatalogOwnerInventoryPathsV1,
     owner_limits: ProjectCatalogOwnerInventoryLimitsV1,
     attachment_identity_plan: &'a AttachmentCandidateIdentityPlanV1,
+    rehearsal_root: Option<PathBuf>,
+}
+
+fn validate_authorized_containment(
+    paths: &[AuthorizedInventoryPath],
+    rehearsal_root: Option<&Path>,
+) -> AdapterResult<()> {
+    let Some(rehearsal_root) = rehearsal_root else {
+        return Ok(());
+    };
+    let canonical_root = rehearsal_root
+        .canonicalize()
+        .map_err(|_| invalid_input("rehearsal root is not canonicalizable"))?;
+    for path in paths {
+        path.ensure_authority()?;
+        let canonical = path
+            .as_path()
+            .canonicalize()
+            .map_err(|_| invalid_input("runtime authority is not canonicalizable"))?;
+        if canonical != path.as_path() || !canonical.starts_with(&canonical_root) {
+            return Err(invalid_input("runtime authority escapes rehearsal root"));
+        }
+        path.ensure_authority()?;
+    }
+    Ok(())
+}
+
+fn validate_probe_containment(
+    probes: &[LegacyProjectProbeInputV1],
+    rehearsal_root: Option<&Path>,
+) -> AdapterResult<()> {
+    let paths = probes
+        .iter()
+        .flat_map(|probe| {
+            std::iter::once(probe.authorized_canonical_path.clone())
+                .chain(probe.repository_root.iter().cloned())
+        })
+        .collect::<Vec<_>>();
+    validate_authorized_containment(&paths, rehearsal_root)
 }
 
 #[derive(Clone)]
@@ -2238,6 +2297,7 @@ fn capture_inventory_locked(
         &request.legacy_project_store_path,
     )?)?;
     let probes = derive_legacy_project_probes(&legacy_source)?;
+    validate_probe_containment(&probes, request.rehearsal_root.as_deref())?;
     let mut legacy = observe_legacy_projects(&legacy_source, probes)?;
     let catalog_scopes = legacy
         .published_scopes
