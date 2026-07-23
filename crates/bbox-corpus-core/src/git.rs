@@ -399,6 +399,20 @@ pub fn read_verified_committed_file_bytes_bounded(
     repo_rel: &str,
     max_bytes: usize,
 ) -> Result<Vec<u8>> {
+    read_verified_committed_file_bytes_optional_bounded(commit, repo_rel, max_bytes)?
+        .context("committed file is missing from the verified object database")
+}
+
+/// Optional counterpart to [`read_verified_committed_file_bytes_bounded`].
+///
+/// The same verified object authority and byte limits apply, but an absent
+/// path is returned distinctly so migration inventory can preserve exact
+/// committed-source absence without consulting the working tree.
+pub fn read_verified_committed_file_bytes_optional_bounded(
+    commit: &VerifiedCommit,
+    repo_rel: &str,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>> {
     validate_repository_relative_git_path(repo_rel, "committed file")?;
     #[cfg(not(unix))]
     {
@@ -413,19 +427,20 @@ pub fn read_verified_committed_file_bytes_bounded(
             .lock()
             .map_err(|_| anyhow::anyhow!("verified Git object session lock was poisoned"))?;
         let mut raw_entry_count = 0_usize;
-        let object = sessions
-            .resolve_path(
-                &commit.root_tree_oid,
-                repo_rel,
-                max_bytes,
-                std::time::Instant::now() + GIT_OUTPUT_TIMEOUT,
-                &mut raw_entry_count,
-            )?
-            .context("committed file is missing from the verified object database")?;
+        let object = sessions.resolve_path(
+            &commit.root_tree_oid,
+            repo_rel,
+            max_bytes,
+            std::time::Instant::now() + GIT_OUTPUT_TIMEOUT,
+            &mut raw_entry_count,
+        )?;
+        let Some(object) = object else {
+            return Ok(None);
+        };
         if object.object_type != "blob" {
             anyhow::bail!("committed file does not resolve to a blob");
         }
-        Ok(object.bytes)
+        Ok(Some(object.bytes))
     }
 }
 

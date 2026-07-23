@@ -231,7 +231,10 @@ pub struct QuarantinedGenerationObservationV1 {
     pub observation_id: String,
     pub project_id: ProjectId,
     pub generation_id: String,
+    pub descriptor: ImmutableCollectedDescriptorV1,
+    pub manifest: ImmutableArtifactObservationV1,
     pub manifest_hash: Sha256ValueV1,
+    pub planned_metadata_v2_hash: Sha256ValueV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,11 +281,47 @@ pub enum MutableInventorySourceKindV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MutableInventorySourceLocatorV1 {
+    LegacyProjectStore,
+    PublisherRefStore,
+    CodeSourceAnchor,
+    CodeSourceActivation {
+        project_id: ProjectId,
+    },
+    CodeSourceGenerationMetadata {
+        scope_hash: Sha256ValueV1,
+        generation_id: String,
+    },
+    CodeSourceGenerationManifest {
+        scope_hash: Sha256ValueV1,
+        generation_id: String,
+    },
+    CommittedProjectConfig {
+        project_id: ProjectId,
+        commit_oid: String,
+        repo_relative_path: String,
+    },
+    CommittedProjectConfigUnavailable {
+        project_id: ProjectId,
+    },
+    CheckoutRoot {
+        canonical_root_digest: Sha256ValueV1,
+    },
+    CheckoutMarker {
+        canonical_root_digest: Sha256ValueV1,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MutableInventorySourceEvidenceV1 {
     pub source_id: String,
     pub source_kind: MutableInventorySourceKindV1,
+    pub source_locator: MutableInventorySourceLocatorV1,
     pub state: InventorySourceStateV1,
+    pub row_observation_ids: BTreeSet<String>,
+    pub row_set_sha256: Sha256ValueV1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -590,6 +629,9 @@ pub struct V1ProjectCatalogInventory {
     pub source_store_bytes: Vec<u8>,
     pub publisher_ref_source_hash: Sha256ValueV1,
     pub publisher_ref_source_bytes: Vec<u8>,
+    pub code_source_inventory_hash: Sha256ValueV1,
+    pub code_source_generation_count: u64,
+    pub code_source_generation_set_sha256: Sha256ValueV1,
     pub mutable_source_evidence: Vec<MutableInventorySourceEvidenceV1>,
     pub immutable_lane_evidence: Vec<ImmutableInventoryLaneEvidenceV1>,
     pub legacy_projects: Vec<LegacyProjectObservationV1>,
@@ -626,6 +668,16 @@ impl V1ProjectCatalogInventory {
                 "captured source bytes do not match their recorded hash",
             ));
         }
+        let materialized_generation_count = self
+            .code_sources
+            .iter()
+            .map(|source| source.generations.len() + source.quarantine.len())
+            .sum::<usize>() as u64;
+        if self.code_source_generation_count < materialized_generation_count {
+            return Err(invalid(
+                "code-source complete-set count omits a materialized generation",
+            ));
+        }
         if self.mutable_source_evidence.len() > MAX_PROJECT_CATALOG_ENTRIES
             || self.immutable_lane_evidence.len() > ImmutableInventoryLaneKindV1::all().len()
         {
@@ -637,7 +689,15 @@ impl V1ProjectCatalogInventory {
             if !source_ids.insert(evidence.source_id.as_str()) {
                 return Err(duplicate("mutable source id"));
             }
+            validate_mutable_source_locator(evidence.source_kind, &evidence.source_locator)?;
             validate_inventory_source_state(&evidence.state)?;
+            for observation_id in &evidence.row_observation_ids {
+                validate_stable_id(observation_id, "mutable source row observation id")?;
+            }
+            if evidence.row_set_sha256 != mutable_source_row_set_hash(&evidence.row_observation_ids)
+            {
+                return Err(invalid("mutable source row-set hash mismatch"));
+            }
         }
         let source_kind_counts = self.mutable_source_evidence.iter().fold(
             BTreeMap::<MutableInventorySourceKindV1, usize>::new(),
@@ -649,7 +709,7 @@ impl V1ProjectCatalogInventory {
         let generation_count = self
             .code_sources
             .iter()
-            .map(|source| source.generations.len())
+            .map(|source| source.generations.len() + source.quarantine.len())
             .sum::<usize>();
         for (kind, expected) in [
             (MutableInventorySourceKindV1::LegacyProjectStore, 1),
@@ -897,6 +957,8 @@ impl V1ProjectCatalogInventory {
                 if per_source_generations.contains(generation.generation_id.as_str()) {
                     return Err(invalid("quarantined generation is also active or retained"));
                 }
+                validate_descriptor(&generation.descriptor)?;
+                validate_artifact(&generation.manifest)?;
             }
         }
 
@@ -1058,6 +1120,7 @@ impl V1ProjectCatalogInventory {
                 &generations,
             )?;
         }
+        validate_mutable_source_row_coverage(self, &observations)?;
         Ok(())
     }
 
@@ -3651,6 +3714,300 @@ fn domain_hash(domain: &[u8], bytes: &[u8]) -> Sha256ValueV1 {
     Sha256ValueV1(hex::encode(hasher.finalize()))
 }
 
+pub fn mutable_source_row_set_hash(observation_ids: &BTreeSet<String>) -> Sha256ValueV1 {
+    let mut bytes = Vec::new();
+    for observation_id in observation_ids {
+        bytes.extend_from_slice(&(observation_id.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(observation_id.as_bytes());
+    }
+    domain_hash(
+        b"blackbox.project-catalog.mutable-source-row-set.v1\0",
+        &bytes,
+    )
+}
+
+fn validate_mutable_source_locator(
+    source_kind: MutableInventorySourceKindV1,
+    locator: &MutableInventorySourceLocatorV1,
+) -> InventoryResult<()> {
+    let matches_kind = matches!(
+        (source_kind, locator),
+        (
+            MutableInventorySourceKindV1::LegacyProjectStore,
+            MutableInventorySourceLocatorV1::LegacyProjectStore
+        ) | (
+            MutableInventorySourceKindV1::PublisherRefStore,
+            MutableInventorySourceLocatorV1::PublisherRefStore
+        ) | (
+            MutableInventorySourceKindV1::EffectiveSourceManifest,
+            MutableInventorySourceLocatorV1::CodeSourceAnchor
+        ) | (
+            MutableInventorySourceKindV1::CodeSourceActivation,
+            MutableInventorySourceLocatorV1::CodeSourceActivation { .. }
+        ) | (
+            MutableInventorySourceKindV1::CodeSourceGenerationMetadata,
+            MutableInventorySourceLocatorV1::CodeSourceGenerationMetadata { .. }
+        ) | (
+            MutableInventorySourceKindV1::CodeSourceGenerationManifest,
+            MutableInventorySourceLocatorV1::CodeSourceGenerationManifest { .. }
+        ) | (
+            MutableInventorySourceKindV1::CommittedAuthorityProbe,
+            MutableInventorySourceLocatorV1::CommittedProjectConfig { .. }
+                | MutableInventorySourceLocatorV1::CommittedProjectConfigUnavailable { .. }
+        ) | (
+            MutableInventorySourceKindV1::CheckoutRoot,
+            MutableInventorySourceLocatorV1::CheckoutRoot { .. }
+        ) | (
+            MutableInventorySourceKindV1::CheckoutMarker,
+            MutableInventorySourceLocatorV1::CheckoutMarker { .. }
+        )
+    );
+    if !matches_kind {
+        return Err(invalid("mutable source kind and locator disagree"));
+    }
+    match locator {
+        MutableInventorySourceLocatorV1::CodeSourceGenerationMetadata { generation_id, .. }
+        | MutableInventorySourceLocatorV1::CodeSourceGenerationManifest { generation_id, .. } => {
+            Sha256ValueV1::parse(generation_id.clone())
+                .map_err(|_| invalid("generation source locator id is invalid"))?;
+        }
+        MutableInventorySourceLocatorV1::CommittedProjectConfig {
+            commit_oid,
+            repo_relative_path,
+            ..
+        } => {
+            validate_full_commit(commit_oid)?;
+            validate_relative_path(repo_relative_path)?;
+        }
+        MutableInventorySourceLocatorV1::LegacyProjectStore
+        | MutableInventorySourceLocatorV1::PublisherRefStore
+        | MutableInventorySourceLocatorV1::CodeSourceAnchor
+        | MutableInventorySourceLocatorV1::CodeSourceActivation { .. }
+        | MutableInventorySourceLocatorV1::CommittedProjectConfigUnavailable { .. }
+        | MutableInventorySourceLocatorV1::CheckoutRoot { .. }
+        | MutableInventorySourceLocatorV1::CheckoutMarker { .. } => {}
+    }
+    Ok(())
+}
+
+fn validate_mutable_source_row_coverage(
+    inventory: &V1ProjectCatalogInventory,
+    observations: &BTreeSet<&str>,
+) -> InventoryResult<()> {
+    let code_source_row_by_project = inventory
+        .code_sources
+        .iter()
+        .map(|row| (row.project_id.clone(), row.observation_id.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let generation_row_by_identity = inventory
+        .code_sources
+        .iter()
+        .flat_map(|source| {
+            source
+                .generations
+                .iter()
+                .map(|row| {
+                    let scope = match &row.descriptor {
+                        ImmutableCollectedDescriptorV1::Valid {
+                            published_scope, ..
+                        } => Some(published_scope),
+                        ImmutableCollectedDescriptorV1::Missing
+                        | ImmutableCollectedDescriptorV1::Corrupt { .. } => None,
+                    };
+                    (row.observation_id.as_str(), (&row.generation_id, scope))
+                })
+                .chain(source.quarantine.iter().map(|row| {
+                    let scope = match &row.descriptor {
+                        ImmutableCollectedDescriptorV1::Valid {
+                            published_scope, ..
+                        } => Some(published_scope),
+                        ImmutableCollectedDescriptorV1::Missing
+                        | ImmutableCollectedDescriptorV1::Corrupt { .. } => None,
+                    };
+                    (row.observation_id.as_str(), (&row.generation_id, scope))
+                }))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let authority_row_by_project = inventory
+        .legacy_projects
+        .iter()
+        .map(|row| {
+            (
+                ProjectId::parse(row.record.project_id.clone())
+                    .expect("validated legacy project id remains valid"),
+                row.committed_authority
+                    .as_ref()
+                    .map_or(row.observation_id.as_str(), |authority| {
+                        authority.observation_id.as_str()
+                    }),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let checkout_row_by_digest = inventory
+        .checkouts
+        .iter()
+        .map(|row| {
+            (
+                row.canonical_root_digest.clone(),
+                row.observation_id.as_str(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut actual = BTreeMap::<MutableInventorySourceKindV1, BTreeSet<&str>>::new();
+    for source in &inventory.mutable_source_evidence {
+        for observation_id in &source.row_observation_ids {
+            if !observations.contains(observation_id.as_str()) {
+                return Err(unknown("mutable source row observation"));
+            }
+            actual
+                .entry(source.source_kind)
+                .or_default()
+                .insert(observation_id);
+        }
+        let expected_single_row = match &source.source_locator {
+            MutableInventorySourceLocatorV1::CodeSourceActivation { project_id } => {
+                code_source_row_by_project.get(project_id).copied()
+            }
+            MutableInventorySourceLocatorV1::CodeSourceGenerationMetadata {
+                scope_hash,
+                generation_id,
+            }
+            | MutableInventorySourceLocatorV1::CodeSourceGenerationManifest {
+                scope_hash,
+                generation_id,
+            } => generation_row_by_identity.iter().find_map(
+                |(observation_id, (observed_generation_id, scope))| {
+                    (*observed_generation_id == generation_id
+                        && scope.is_some_and(|scope| {
+                            Sha256ValueV1::parse(bbox_code_source::scope_hash(scope))
+                                .ok()
+                                .as_ref()
+                                == Some(scope_hash)
+                        }))
+                    .then_some(*observation_id)
+                },
+            ),
+            MutableInventorySourceLocatorV1::CommittedProjectConfig { project_id, .. }
+            | MutableInventorySourceLocatorV1::CommittedProjectConfigUnavailable { project_id } => {
+                authority_row_by_project.get(project_id).copied()
+            }
+            MutableInventorySourceLocatorV1::CheckoutRoot {
+                canonical_root_digest,
+            }
+            | MutableInventorySourceLocatorV1::CheckoutMarker {
+                canonical_root_digest,
+            } => checkout_row_by_digest.get(canonical_root_digest).copied(),
+            MutableInventorySourceLocatorV1::LegacyProjectStore
+            | MutableInventorySourceLocatorV1::PublisherRefStore
+            | MutableInventorySourceLocatorV1::CodeSourceAnchor => None,
+        };
+        if !matches!(
+            &source.source_locator,
+            MutableInventorySourceLocatorV1::LegacyProjectStore
+                | MutableInventorySourceLocatorV1::PublisherRefStore
+                | MutableInventorySourceLocatorV1::CodeSourceAnchor
+        ) && expected_single_row
+            .is_none_or(|row| source.row_observation_ids != BTreeSet::from([row.to_string()]))
+        {
+            return Err(invalid(
+                "mutable source locator and bound observation disagree",
+            ));
+        }
+    }
+    let legacy_rows = inventory
+        .legacy_projects
+        .iter()
+        .map(|row| row.observation_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let authority_rows = inventory
+        .legacy_projects
+        .iter()
+        .map(|row| {
+            row.committed_authority
+                .as_ref()
+                .map_or(row.observation_id.as_str(), |authority| {
+                    authority.observation_id.as_str()
+                })
+        })
+        .collect::<BTreeSet<_>>();
+    let code_source_rows = inventory
+        .code_sources
+        .iter()
+        .map(|row| row.observation_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let generation_rows = inventory
+        .code_sources
+        .iter()
+        .flat_map(|source| {
+            source
+                .generations
+                .iter()
+                .map(|row| row.observation_id.as_str())
+                .chain(
+                    source
+                        .quarantine
+                        .iter()
+                        .map(|row| row.observation_id.as_str()),
+                )
+        })
+        .collect::<BTreeSet<_>>();
+    let effective_rows = code_source_rows
+        .iter()
+        .copied()
+        .chain(generation_rows.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let publisher_rows = inventory
+        .publisher_pins
+        .iter()
+        .map(|row| row.observation_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let checkout_rows = inventory
+        .checkouts
+        .iter()
+        .map(|row| row.observation_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for (kind, expected) in [
+        (
+            MutableInventorySourceKindV1::LegacyProjectStore,
+            legacy_rows,
+        ),
+        (
+            MutableInventorySourceKindV1::PublisherRefStore,
+            publisher_rows,
+        ),
+        (
+            MutableInventorySourceKindV1::EffectiveSourceManifest,
+            effective_rows,
+        ),
+        (
+            MutableInventorySourceKindV1::CodeSourceActivation,
+            code_source_rows,
+        ),
+        (
+            MutableInventorySourceKindV1::CodeSourceGenerationMetadata,
+            generation_rows.clone(),
+        ),
+        (
+            MutableInventorySourceKindV1::CodeSourceGenerationManifest,
+            generation_rows,
+        ),
+        (
+            MutableInventorySourceKindV1::CommittedAuthorityProbe,
+            authority_rows,
+        ),
+        (
+            MutableInventorySourceKindV1::CheckoutRoot,
+            checkout_rows.clone(),
+        ),
+        (MutableInventorySourceKindV1::CheckoutMarker, checkout_rows),
+    ] {
+        if actual.remove(&kind).unwrap_or_default() != expected {
+            return Err(invalid("mutable source row coverage is incomplete"));
+        }
+    }
+    Ok(())
+}
+
 fn digest_json(value: &impl Serialize) -> InventoryResult<Sha256ValueV1> {
     let bytes = serde_json::to_vec(value).map_err(|error| {
         ProjectCatalogInventoryError::new(
@@ -3761,7 +4118,7 @@ fn validate_checkout_id(value: &str) -> InventoryResult<()> {
 }
 
 fn validate_full_commit(value: &str) -> InventoryResult<()> {
-    if value.len() != 40
+    if !matches!(value.len(), 40 | 64)
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
@@ -3947,14 +4304,87 @@ mod tests {
         source_kind: MutableInventorySourceKindV1,
         content_hash: Sha256ValueV1,
     ) -> MutableInventorySourceEvidenceV1 {
+        let (source_locator, row_observation_ids) = match source_id {
+            "source_legacy_store" => (
+                MutableInventorySourceLocatorV1::LegacyProjectStore,
+                BTreeSet::from(["legacy_alpha".to_string(), "legacy_beta".to_string()]),
+            ),
+            "source_publisher_store" => (
+                MutableInventorySourceLocatorV1::PublisherRefStore,
+                BTreeSet::from(["pin_alpha".to_string()]),
+            ),
+            "source_effective_manifest" => (
+                MutableInventorySourceLocatorV1::CodeSourceAnchor,
+                BTreeSet::from(["source_alpha".to_string(), "generation_alpha".to_string()]),
+            ),
+            "source_activation" => (
+                MutableInventorySourceLocatorV1::CodeSourceActivation {
+                    project_id: project_id("alpha"),
+                },
+                BTreeSet::from(["source_alpha".to_string()]),
+            ),
+            "source_metadata" => (
+                MutableInventorySourceLocatorV1::CodeSourceGenerationMetadata {
+                    scope_hash: Sha256ValueV1::parse(bbox_code_source::scope_hash(&scope(
+                        "services/alpha",
+                    )))
+                    .unwrap(),
+                    generation_id: "e".repeat(64),
+                },
+                BTreeSet::from(["generation_alpha".to_string()]),
+            ),
+            "source_manifest" => (
+                MutableInventorySourceLocatorV1::CodeSourceGenerationManifest {
+                    scope_hash: Sha256ValueV1::parse(bbox_code_source::scope_hash(&scope(
+                        "services/alpha",
+                    )))
+                    .unwrap(),
+                    generation_id: "e".repeat(64),
+                },
+                BTreeSet::from(["generation_alpha".to_string()]),
+            ),
+            "source_authority_alpha" => (
+                MutableInventorySourceLocatorV1::CommittedProjectConfig {
+                    project_id: project_id("alpha"),
+                    commit_oid: "a".repeat(40),
+                    repo_relative_path: "alpha/.bbox/config.toml".to_string(),
+                },
+                BTreeSet::from(["authority_alpha".to_string()]),
+            ),
+            "source_authority_beta" => (
+                MutableInventorySourceLocatorV1::CommittedProjectConfig {
+                    project_id: project_id("beta"),
+                    commit_oid: "b".repeat(40),
+                    repo_relative_path: "beta/.bbox/config.toml".to_string(),
+                },
+                BTreeSet::from(["authority_beta".to_string()]),
+            ),
+            "source_checkout_root" => (
+                MutableInventorySourceLocatorV1::CheckoutRoot {
+                    canonical_root_digest: digest_path("/workspace/acme"),
+                },
+                BTreeSet::from(["checkout_acme".to_string()]),
+            ),
+            "source_checkout_marker" => (
+                MutableInventorySourceLocatorV1::CheckoutMarker {
+                    canonical_root_digest: digest_path("/workspace/acme"),
+                },
+                BTreeSet::from(["checkout_acme".to_string()]),
+            ),
+            _ => unreachable!("fixture source id is closed"),
+        };
+        let row_set_sha256 = mutable_source_row_set_hash(&row_observation_ids);
         MutableInventorySourceEvidenceV1 {
             source_id: source_id.to_string(),
             source_kind,
+            source_locator,
             state: InventorySourceStateV1::Present {
                 fingerprint: hash(&format!("{source_id}_fingerprint")),
                 content_hash,
                 byte_len: 1,
             },
+            row_observation_ids,
+            row_set_sha256,
         }
     }
 
@@ -3998,6 +4428,9 @@ mod tests {
             source_store_bytes,
             publisher_ref_source_hash: publisher_ref_source_hash.clone(),
             publisher_ref_source_bytes,
+            code_source_inventory_hash: hash("code_source_inventory"),
+            code_source_generation_count: 1,
+            code_source_generation_set_sha256: hash("code_source_generation_set"),
             mutable_source_evidence: vec![
                 mutable_evidence(
                     "source_legacy_store",
@@ -4119,7 +4552,7 @@ mod tests {
                     observation_id: "generation_alpha".to_string(),
                     project_id: alpha.clone(),
                     role: CollectedGenerationRoleV1::Active,
-                    generation_id: "generation_alpha_1".to_string(),
+                    generation_id: "e".repeat(64),
                     activation_scope: Some(scope("services/alpha")),
                     descriptor: ImmutableCollectedDescriptorV1::Valid {
                         descriptor_hash: hash("descriptor"),
