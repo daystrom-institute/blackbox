@@ -18,10 +18,10 @@ use bbox_code_source::{GenerationState, validate_collected_materialization_selec
 use bbox_code_source_store::{
     ActivationRecord, ActivationRecordV2, CodeSourceStore, CollisionRetirementLifecycleStateV1,
     CollisionRetirementSelectorEvidenceV1, MigrationLegacyAnchorEvidenceV1,
-    MigrationLegacyGenerationEvidenceV1, MigrationOwnedLegacyInventoryV1, StoreLimits,
-    StoredGenerationV2, decode_migration_effective_source_manifest_v1,
-    encode_activation_v2_for_migration, encode_stored_generation_v2_for_migration,
-    verify_generation_manifest_for_migration,
+    MigrationLegacyGenerationEvidenceV1, MigrationLegacyInventoryV1,
+    MigrationOwnedLegacyInventoryV1, StoreLimits, StoredGenerationV2,
+    decode_migration_effective_source_manifest_v1, encode_activation_v2_for_migration,
+    encode_stored_generation_v2_for_migration, verify_generation_manifest_for_migration,
 };
 use bbox_corpus_core::git::{
     read_verified_committed_file_bytes_optional_bounded, verify_commit_oid_with_alternate,
@@ -29,25 +29,47 @@ use bbox_corpus_core::git::{
 use bbox_corpus_core::identity::{PublishedScope, resolve_recorded_repo_id};
 use bbox_corpus_core::json_store::NofollowDirectory;
 use bbox_corpus_core::project_catalog::{
-    LegacyProjectStoreV1, MAX_PROJECT_CATALOG_BYTES, ProjectId, RecordedRepoAuthority,
-    decode_legacy_project_store,
+    AttachmentId, CommitNamespace, LegacyProjectStoreV1, MAX_PROJECT_CATALOG_BYTES, ProjectId,
+    RecordedRepoAuthority, decode_legacy_project_store,
+};
+use bbox_corpus_core::project_catalog_snapshot::{
+    LegacyProjectSelectorKindV1, OwnerSnapshotLimitsV1, OwnerSnapshotRowValueV1,
+    OwnerSnapshotStateV1, OwnerSnapshotV1, capture_legacy_proposal_owner_snapshot,
+    capture_legacy_task_owner_snapshot,
+};
+use bbox_corpus_index::index::migration_inventory::{
+    CorpusMigrationSnapshotLimitsV1, CorpusMigrationSourceStateV1, CorpusOwnerMigrationSnapshotV1,
+    capture_owner_migration_snapshot_no_create,
+};
+use bbox_edge_sidecar::migration_inventory::{
+    EdgeMigrationSnapshotLimitsV1, EdgeMigrationSnapshotV1, EdgeMigrationSourceStateV1,
+    capture_migration_snapshot_no_create as capture_edge_migration_snapshot_no_create,
+};
+use bbox_vectors::migration_inventory::{
+    VectorMigrationSnapshotLimitsV1, VectorMigrationSnapshotV1, VectorMigrationSourceStateV1,
+    capture_migration_snapshot_no_create as capture_vector_migration_snapshot_no_create,
 };
 use sha2::{Digest, Sha256};
 
 use crate::project_catalog_inventory::{
     AttachmentCandidateObservationV1, CheckoutMarkerStateV1, CheckoutObservationV1,
-    CodeSourceObservationV1, CollectedGenerationObservationV1, CollectedGenerationRoleV1,
-    CollisionLifecycleObservationV1, CollisionLifecycleStateObservationV1,
-    DurableSelectorEvidenceV1, EdgeWorkspaceObservationV1, GitMetadataObservationV1,
-    ImmutableArtifactObservationV1, ImmutableCollectedDescriptorV1,
-    ImmutableInventoryLaneEvidenceV1, ImmutableInventoryLaneKindV1, InventorySourceStateV1,
-    InventoryTargetObservationV1, LegacyNamespaceClusterObservationV1, LegacyPathObservationV1,
-    LegacyProjectObservationV1, LegacyProjectPathStatusV1, LegacyProjectRecordInventoryV1,
-    MaterializedAliasObservationV1, MutableInventorySourceEvidenceV1, MutableInventorySourceKindV1,
-    MutableInventorySourceLocatorV1, PROJECT_CATALOG_INVENTORY_VERSION_V1,
-    ProjectScopedRefObservationV1, PublisherPinObservationV1, QuarantinedGenerationObservationV1,
-    RepoGroupingProofV1, RetainedGenerationOwnerResolutionObservationV1, Sha256ValueV1,
-    V1ProjectCatalogInventory, digest_path, mutable_source_row_set_hash,
+    CodeSourceObservationV1, CollectedEvidenceMemberV1, CollectedGenerationObservationV1,
+    CollectedGenerationRoleV1, CollisionLifecycleObservationV1,
+    CollisionLifecycleStateObservationV1, DurableSelectorEvidenceV1, EdgeWorkspaceObservationV1,
+    GitEvidenceMemberV1, GitMetadataObservationV1, ImmutableArtifactObservationV1,
+    ImmutableCollectedDescriptorV1, ImmutableInventoryLaneEvidenceV1, ImmutableInventoryLaneKindV1,
+    ImmutableInventoryOwnerKindV1, InventorySourceStateV1, InventoryTargetKindV1,
+    InventoryTargetObservationV1, LegacyCommitNamespaceAttributionV1,
+    LegacyCommitNamespaceInventoryV1, LegacyNamespaceClusterObservationV1, LegacyPathObservationV1,
+    LegacyPathStoreKindV1, LegacyProjectObservationV1, LegacyProjectPathStatusV1,
+    LegacyProjectRecordInventoryV1, LegacySelectorKindV1, MaterializedAliasObservationV1,
+    MutableInventorySourceEvidenceV1, MutableInventorySourceKindV1,
+    MutableInventorySourceLocatorV1, OwnerSubsourceEvidenceV1,
+    PROJECT_CATALOG_INVENTORY_VERSION_V1, ProjectScopedRefObservationV1,
+    ProjectScopedRefStoreKindV1, PublisherPinObservationV1, QuarantinedGenerationObservationV1,
+    RecordedAuthorityEvidenceMemberV1, RepoGroupingProofV1,
+    RetainedGenerationOwnerResolutionObservationV1, Sha256ValueV1, V1ProjectCatalogInventory,
+    digest_path, mutable_source_row_set_hash,
 };
 use crate::publisher::{MigrationPublisherRefSnapshotV1, PublisherRefRow, PublisherRefStore};
 
@@ -636,6 +658,7 @@ struct LegacyProjectProbeInputV1 {
 struct LegacyProjectsCaptureV1 {
     observations: Vec<LegacyProjectObservationV1>,
     source_evidence: Vec<MutableInventorySourceEvidenceV1>,
+    owner_state: InventorySourceStateV1,
     published_scopes: BTreeMap<ProjectId, PublishedScope>,
     project_roots: BTreeMap<ProjectId, AuthorizedInventoryPath>,
     runtime_project_paths: BTreeMap<String, AuthorizedInventoryPath>,
@@ -761,6 +784,13 @@ fn observe_legacy_projects(
     Ok(LegacyProjectsCaptureV1 {
         observations,
         source_evidence,
+        owner_state: if source.was_missing {
+            InventorySourceStateV1::Missing {
+                fingerprint: missing_source_fingerprint("legacy-project-store"),
+            }
+        } else {
+            present_source_state(&source.source)
+        },
         published_scopes,
         project_roots,
         runtime_project_paths,
@@ -1497,6 +1527,70 @@ struct CheckoutCaptureV1 {
     marker_source_evidence: MutableInventorySourceEvidenceV1,
 }
 
+fn capture_checkout_roots(
+    roots: &[AuthorizedInventoryPath],
+) -> AdapterResult<Vec<CheckoutCaptureV1>> {
+    let mut captures = roots
+        .iter()
+        .map(observe_checkout)
+        .collect::<AdapterResult<Vec<_>>>()?;
+    captures.sort_by(|left, right| {
+        left.observation
+            .observation_id
+            .cmp(&right.observation.observation_id)
+    });
+    Ok(captures)
+}
+
+fn discover_attachment_candidate_keys_locked(
+    legacy: &LegacyProjectsCaptureV1,
+    checkout_captures: &[CheckoutCaptureV1],
+) -> AdapterResult<Vec<AttachmentCandidateKeyV1>> {
+    let mut keys = Vec::new();
+    for project in &legacy.observations {
+        if project.path_status != LegacyProjectPathStatusV1::Present {
+            continue;
+        }
+        let project_id = ProjectId::parse(project.record.project_id.clone())
+            .map_err(|_| invalid_source("legacy_project_id_invalid"))?;
+        let project_root = legacy
+            .project_roots
+            .get(&project_id)
+            .ok_or_else(|| invalid_source("legacy_project_root_missing"))?
+            .as_path();
+        for checkout in checkout_captures {
+            let checkout_root = checkout.runtime_root.as_path();
+            let Ok(relative) = project_root.strip_prefix(checkout_root) else {
+                continue;
+            };
+            if relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+            {
+                return Err(invalid_source("attachment_relative_path_invalid"));
+            }
+            let base_relpath = if relative.as_os_str().is_empty() {
+                ".".to_string()
+            } else {
+                relative
+                    .to_str()
+                    .ok_or_else(|| invalid_source("attachment_relative_path_not_utf8"))?
+                    .replace(std::path::MAIN_SEPARATOR, "/")
+            };
+            keys.push(AttachmentCandidateKeyV1 {
+                project_id: project_id.clone(),
+                checkout_observation_id: checkout.observation.observation_id.clone(),
+                base_relpath,
+            });
+        }
+    }
+    keys.sort();
+    if keys.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(invalid_source("attachment_candidate_key_duplicate"));
+    }
+    Ok(keys)
+}
+
 fn observe_checkout(root: &AuthorizedInventoryPath) -> AdapterResult<CheckoutCaptureV1> {
     if !matches!(inspect_path(root.as_path()), InspectedPath::Directory) {
         return Err(invalid_source("checkout_root_invalid"));
@@ -1618,7 +1712,7 @@ fn marker_state(source: &AuthorizedFileObservationV1) -> CheckoutMarkerStateV1 {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ImmutableLaneCaptureV1<T> {
     evidence: ImmutableInventoryLaneEvidenceV1,
     rows: Vec<T>,
@@ -1638,16 +1732,93 @@ struct ImmutableInventoryLanesV1 {
     legacy_namespace_clusters: ImmutableLaneCaptureV1<LegacyNamespaceClusterObservationV1>,
 }
 
+#[derive(Clone)]
+struct RequiredOwnerLaneCaptureV1 {
+    lanes: ImmutableInventoryLanesV1,
+    legacy_commit_namespaces: Vec<LegacyCommitNamespaceInventoryV1>,
+    git_common_directories: BTreeMap<String, AuthorizedInventoryPath>,
+    legacy_selectors: BTreeMap<String, RuntimeLiteralBindingV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct AttachmentCandidateKeyV1 {
+    pub(crate) project_id: ProjectId,
+    pub(crate) checkout_observation_id: String,
+    pub(crate) base_relpath: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AttachmentCandidateIdentityPlanV1 {
+    pub(crate) identities: BTreeMap<AttachmentCandidateKeyV1, AttachmentId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectCatalogProvenanceOwnerSourceV1 {
+    pub(crate) project_id: ProjectId,
+    pub(crate) repository_root: PathBuf,
+    pub(crate) notes_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectCatalogOwnerInventoryPathsV1 {
+    pub(crate) corpus_index_root: PathBuf,
+    pub(crate) git_cursor_root: PathBuf,
+    pub(crate) vector_root: PathBuf,
+    pub(crate) edge_root: PathBuf,
+    pub(crate) knowledge_store_path: PathBuf,
+    pub(crate) gap_store_path: PathBuf,
+    pub(crate) thread_store_path: PathBuf,
+    pub(crate) note_store_path: PathBuf,
+    pub(crate) pin_store_path: PathBuf,
+    pub(crate) roadmap_store_path: PathBuf,
+    pub(crate) packet_root: PathBuf,
+    pub(crate) task_store_path: PathBuf,
+    pub(crate) proposal_root: PathBuf,
+    pub(crate) slack_store_root: PathBuf,
+    pub(crate) whiteboard_root: PathBuf,
+    pub(crate) artifact_root: PathBuf,
+    pub(crate) provenance_sources: Vec<ProjectCatalogProvenanceOwnerSourceV1>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProjectCatalogOwnerInventoryLimitsV1 {
+    pub(crate) corpus: CorpusMigrationSnapshotLimitsV1,
+    pub(crate) vectors: VectorMigrationSnapshotLimitsV1,
+    pub(crate) edges: EdgeMigrationSnapshotLimitsV1,
+    pub(crate) durable_owners: OwnerSnapshotLimitsV1,
+}
+
+impl Default for ProjectCatalogOwnerInventoryLimitsV1 {
+    fn default() -> Self {
+        Self {
+            corpus: CorpusMigrationSnapshotLimitsV1::default(),
+            vectors: VectorMigrationSnapshotLimitsV1::default(),
+            edges: EdgeMigrationSnapshotLimitsV1::default(),
+            durable_owners: OwnerSnapshotLimitsV1::default(),
+        }
+    }
+}
+
 pub(crate) struct ProjectCatalogMigrationInventoryRequestV1<'a> {
     pub(crate) legacy_project_store_path: PathBuf,
     pub(crate) publisher_ref_store: &'a PublisherRefStore,
-    pub(crate) code_source_store: &'a CodeSourceStore,
+    pub(crate) code_source_store_root: PathBuf,
+    pub(crate) code_source_store_limits: StoreLimits,
+    pub(crate) checkout_roots: Vec<PathBuf>,
+    pub(crate) owner_paths: ProjectCatalogOwnerInventoryPathsV1,
+    pub(crate) owner_limits: ProjectCatalogOwnerInventoryLimitsV1,
+    pub(crate) attachment_identity_plan: &'a AttachmentCandidateIdentityPlanV1,
+}
+
+pub(crate) struct ProjectCatalogAttachmentCandidateDiscoveryRequestV1 {
+    pub(crate) legacy_project_store_path: PathBuf,
     pub(crate) checkout_roots: Vec<PathBuf>,
 }
 
 #[derive(Clone)]
-struct InventoryRuntimeBindingsV1 {
+pub(crate) struct InventoryRuntimeBindingsV1 {
     legacy_project_store_source: ExactSourceBytesV1,
+    legacy_project_store_was_missing: bool,
     legacy_project_paths: BTreeMap<String, AuthorizedInventoryPath>,
     checkout_paths: BTreeMap<String, AuthorizedInventoryPath>,
     git_common_directories: BTreeMap<String, AuthorizedInventoryPath>,
@@ -1683,6 +1854,62 @@ impl fmt::Debug for InventoryRuntimeBindingsV1 {
 }
 
 impl InventoryRuntimeBindingsV1 {
+    pub(crate) fn legacy_project_store_bytes(&self) -> &[u8] {
+        &self.legacy_project_store_source.bytes
+    }
+
+    pub(crate) fn legacy_project_store_was_missing(&self) -> bool {
+        self.legacy_project_store_was_missing
+    }
+
+    pub(crate) fn legacy_project_path(&self, observation_id: &str) -> Option<&Path> {
+        self.legacy_project_paths
+            .get(observation_id)
+            .map(AuthorizedInventoryPath::as_path)
+    }
+
+    pub(crate) fn legacy_project_paths(&self) -> impl Iterator<Item = (&str, &Path)> {
+        self.legacy_project_paths
+            .iter()
+            .map(|(id, path)| (id.as_str(), path.as_path()))
+    }
+
+    pub(crate) fn checkout_path(&self, observation_id: &str) -> Option<&Path> {
+        self.checkout_paths
+            .get(observation_id)
+            .map(AuthorizedInventoryPath::as_path)
+    }
+
+    pub(crate) fn checkout_paths(&self) -> impl Iterator<Item = (&str, &Path)> {
+        self.checkout_paths
+            .iter()
+            .map(|(id, path)| (id.as_str(), path.as_path()))
+    }
+
+    pub(crate) fn git_common_directory(&self, observation_id: &str) -> Option<&Path> {
+        self.git_common_directories
+            .get(observation_id)
+            .map(AuthorizedInventoryPath::as_path)
+    }
+
+    pub(crate) fn git_common_directories(&self) -> impl Iterator<Item = (&str, &Path)> {
+        self.git_common_directories
+            .iter()
+            .map(|(id, path)| (id.as_str(), path.as_path()))
+    }
+
+    pub(crate) fn legacy_selector(&self, observation_id: &str) -> Option<&str> {
+        self.legacy_selectors
+            .get(observation_id)
+            .map(|binding| binding.literal.as_str())
+    }
+
+    pub(crate) fn legacy_selectors(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.legacy_selectors
+            .iter()
+            .map(|(id, binding)| (id.as_str(), binding.literal.as_str()))
+    }
+
     fn validate_pairing(&self, inventory: &V1ProjectCatalogInventory) -> AdapterResult<()> {
         if self.legacy_project_store_source.content_hash != inventory.source_store_hash {
             return Err(invalid_source(
@@ -1771,31 +1998,67 @@ fn validate_authorized_path_bindings(
 pub(crate) struct ProjectCatalogMigrationInventoryResultV1 {
     pub(crate) inventory: V1ProjectCatalogInventory,
     /// Host-local authorities are retained outside canonical inventory JSON.
-    _runtime_bindings: InventoryRuntimeBindingsV1,
+    runtime_bindings: InventoryRuntimeBindingsV1,
+    pub(crate) code_source_owner_inventory: MigrationLegacyInventoryV1,
+    pub(crate) publisher_ref_source_was_missing: bool,
     pub(crate) code_source_canonical_sha256: Sha256ValueV1,
     pub(crate) code_source_generation_count: u64,
     pub(crate) code_source_generation_set_sha256: Sha256ValueV1,
 }
 
+impl ProjectCatalogMigrationInventoryResultV1 {
+    pub(crate) fn runtime_bindings(&self) -> &InventoryRuntimeBindingsV1 {
+        &self.runtime_bindings
+    }
+}
+
 pub(crate) struct ProjectCatalogMigrationInventoryFacadeV1;
 
 impl ProjectCatalogMigrationInventoryFacadeV1 {
+    pub(crate) fn discover_attachment_candidate_keys(
+        request: ProjectCatalogAttachmentCandidateDiscoveryRequestV1,
+    ) -> Result<Vec<AttachmentCandidateKeyV1>, InventoryAdapterError> {
+        let legacy_project_store_path =
+            AuthorizedInventoryPath::new(&request.legacy_project_store_path)?;
+        let checkout_roots = authorize_checkout_roots(&request.checkout_roots)?;
+        let projects_path = legacy_project_store_path.as_path().to_path_buf();
+        crate::project_catalog_store::capture_migration_preflight_with(
+            &projects_path,
+            |error| invalid_source(error.to_string()),
+            || {
+                let legacy_source = accept_missing_legacy_projects_source(
+                    capture_legacy_projects_source(&legacy_project_store_path)?,
+                )?;
+                let probes = derive_legacy_project_probes(&legacy_source)?;
+                let legacy = observe_legacy_projects(&legacy_source, probes)?;
+                let checkout_captures = capture_checkout_roots(&checkout_roots)?;
+                discover_attachment_candidate_keys_locked(&legacy, &checkout_captures)
+            },
+        )
+    }
+
     pub(crate) fn capture(
         request: ProjectCatalogMigrationInventoryRequestV1<'_>,
     ) -> Result<ProjectCatalogMigrationInventoryResultV1, InventoryAdapterError> {
         let legacy_project_store_path =
             AuthorizedInventoryPath::new(&request.legacy_project_store_path)?;
-        let checkout_roots = request
-            .checkout_roots
-            .iter()
-            .map(AuthorizedInventoryPath::new)
-            .collect::<AdapterResult<Vec<_>>>()?;
+        let checkout_roots = authorize_checkout_roots(&request.checkout_roots)?;
+        let owner_paths = authorize_owner_paths(request.owner_paths)?;
+        let code_source_store = CodeSourceStore::open_existing_for_migration(
+            &request.code_source_store_root,
+            request.code_source_store_limits,
+        )
+        .map_err(|_| invalid_source("code_source_store_existing_open_failed"))?
+        .ok_or_else(|| invalid_source("code_source_store_missing"))?;
         let projects_path = legacy_project_store_path.as_path().to_path_buf();
         let authorized = AuthorizedProjectCatalogMigrationInventoryRequestV1 {
             legacy_project_store_path,
             publisher_ref_store: request.publisher_ref_store,
-            code_source_store: request.code_source_store,
+            code_source_store,
             checkout_roots,
+            owner_paths,
+            owner_limits: request.owner_limits,
+            attachment_identity_plan: request.attachment_identity_plan,
         };
         crate::project_catalog_store::capture_migration_preflight_with(
             &projects_path,
@@ -1808,8 +2071,112 @@ impl ProjectCatalogMigrationInventoryFacadeV1 {
 struct AuthorizedProjectCatalogMigrationInventoryRequestV1<'a> {
     legacy_project_store_path: AuthorizedInventoryPath,
     publisher_ref_store: &'a PublisherRefStore,
-    code_source_store: &'a CodeSourceStore,
+    code_source_store: CodeSourceStore,
     checkout_roots: Vec<AuthorizedInventoryPath>,
+    owner_paths: AuthorizedProjectCatalogOwnerInventoryPathsV1,
+    owner_limits: ProjectCatalogOwnerInventoryLimitsV1,
+    attachment_identity_plan: &'a AttachmentCandidateIdentityPlanV1,
+}
+
+#[derive(Clone)]
+struct AuthorizedProjectCatalogProvenanceOwnerSourceV1 {
+    project_id: ProjectId,
+    repository_root: AuthorizedInventoryPath,
+    notes_ref: String,
+}
+
+#[derive(Clone)]
+struct AuthorizedProjectCatalogOwnerInventoryPathsV1 {
+    corpus_index_root: AuthorizedInventoryPath,
+    git_cursor_root: AuthorizedInventoryPath,
+    vector_root: AuthorizedInventoryPath,
+    edge_root: AuthorizedInventoryPath,
+    knowledge_store_path: AuthorizedInventoryPath,
+    gap_store_path: AuthorizedInventoryPath,
+    thread_store_path: AuthorizedInventoryPath,
+    note_store_path: AuthorizedInventoryPath,
+    pin_store_path: AuthorizedInventoryPath,
+    roadmap_store_path: AuthorizedInventoryPath,
+    packet_root: AuthorizedInventoryPath,
+    task_store_path: AuthorizedInventoryPath,
+    proposal_root: AuthorizedInventoryPath,
+    slack_store_root: AuthorizedInventoryPath,
+    whiteboard_root: AuthorizedInventoryPath,
+    artifact_root: AuthorizedInventoryPath,
+    provenance_sources: Vec<AuthorizedProjectCatalogProvenanceOwnerSourceV1>,
+}
+
+fn authorize_checkout_roots(paths: &[PathBuf]) -> AdapterResult<Vec<AuthorizedInventoryPath>> {
+    let roots = paths
+        .iter()
+        .map(AuthorizedInventoryPath::new)
+        .collect::<AdapterResult<Vec<_>>>()?;
+    let mut canonical_paths = BTreeSet::new();
+    let mut identities = BTreeSet::new();
+    for root in &roots {
+        let (canonical_path, identity) = root.checkout_identity_key()?;
+        if !canonical_paths.insert(canonical_path) || !identities.insert(identity) {
+            return Err(invalid_input("checkout roots contain a canonical alias"));
+        }
+    }
+    Ok(roots)
+}
+
+fn authorize_owner_paths(
+    paths: ProjectCatalogOwnerInventoryPathsV1,
+) -> AdapterResult<AuthorizedProjectCatalogOwnerInventoryPathsV1> {
+    let mut provenance_sources = paths
+        .provenance_sources
+        .into_iter()
+        .map(|source| {
+            if source.notes_ref.is_empty()
+                || source.notes_ref.len() > MAX_AUTHORIZED_PATH_BYTES
+                || source
+                    .notes_ref
+                    .bytes()
+                    .any(|byte| byte == 0 || byte.is_ascii_control())
+            {
+                return Err(invalid_input("provenance notes ref is invalid"));
+            }
+            Ok(AuthorizedProjectCatalogProvenanceOwnerSourceV1 {
+                project_id: source.project_id,
+                repository_root: AuthorizedInventoryPath::new(source.repository_root)?,
+                notes_ref: source.notes_ref,
+            })
+        })
+        .collect::<AdapterResult<Vec<_>>>()?;
+    provenance_sources.sort_by(|left, right| {
+        left.project_id
+            .cmp(&right.project_id)
+            .then_with(|| left.notes_ref.cmp(&right.notes_ref))
+    });
+    if provenance_sources
+        .windows(2)
+        .any(|pair| pair[0].project_id == pair[1].project_id)
+    {
+        return Err(invalid_input(
+            "provenance sources contain a duplicate project",
+        ));
+    }
+    Ok(AuthorizedProjectCatalogOwnerInventoryPathsV1 {
+        corpus_index_root: AuthorizedInventoryPath::new(paths.corpus_index_root)?,
+        git_cursor_root: AuthorizedInventoryPath::new(paths.git_cursor_root)?,
+        vector_root: AuthorizedInventoryPath::new(paths.vector_root)?,
+        edge_root: AuthorizedInventoryPath::new(paths.edge_root)?,
+        knowledge_store_path: AuthorizedInventoryPath::new(paths.knowledge_store_path)?,
+        gap_store_path: AuthorizedInventoryPath::new(paths.gap_store_path)?,
+        thread_store_path: AuthorizedInventoryPath::new(paths.thread_store_path)?,
+        note_store_path: AuthorizedInventoryPath::new(paths.note_store_path)?,
+        pin_store_path: AuthorizedInventoryPath::new(paths.pin_store_path)?,
+        roadmap_store_path: AuthorizedInventoryPath::new(paths.roadmap_store_path)?,
+        packet_root: AuthorizedInventoryPath::new(paths.packet_root)?,
+        task_store_path: AuthorizedInventoryPath::new(paths.task_store_path)?,
+        proposal_root: AuthorizedInventoryPath::new(paths.proposal_root)?,
+        slack_store_root: AuthorizedInventoryPath::new(paths.slack_store_root)?,
+        whiteboard_root: AuthorizedInventoryPath::new(paths.whiteboard_root)?,
+        artifact_root: AuthorizedInventoryPath::new(paths.artifact_root)?,
+        provenance_sources,
+    })
 }
 
 fn capture_inventory_locked(
@@ -1826,7 +2193,7 @@ fn capture_inventory_locked(
         .cloned()
         .collect::<BTreeSet<_>>();
     let publisher_locked = capture_publisher_ref_source(request.publisher_ref_store)?;
-    let code_snapshot = capture_code_source_inventory(request.code_source_store, &catalog_scopes)?;
+    let code_snapshot = capture_code_source_inventory(&request.code_source_store, &catalog_scopes)?;
     let missing_checkout_projects = legacy
         .observations
         .iter()
@@ -1843,24 +2210,7 @@ fn capture_inventory_locked(
     )?;
     let mut code_sources = code_capture.sources;
     let publisher_source = &publisher_locked.source;
-    let mut checkout_paths = BTreeSet::new();
-    let mut checkout_identities = BTreeSet::new();
-    for root in &request.checkout_roots {
-        let (canonical_path, identity) = root.checkout_identity_key()?;
-        if !checkout_paths.insert(canonical_path) || !checkout_identities.insert(identity) {
-            return Err(invalid_input("checkout roots contain a canonical alias"));
-        }
-    }
-    let mut checkout_captures = request
-        .checkout_roots
-        .iter()
-        .map(observe_checkout)
-        .collect::<AdapterResult<Vec<_>>>()?;
-    checkout_captures.sort_by(|left, right| {
-        left.observation
-            .observation_id
-            .cmp(&right.observation.observation_id)
-    });
+    let checkout_captures = capture_checkout_roots(&request.checkout_roots)?;
     let legacy_row_ids = legacy
         .observations
         .iter()
@@ -1917,20 +2267,25 @@ fn capture_inventory_locked(
         mutable_source_evidence.append(&mut capture.source_evidence);
     }
     mutable_source_evidence.append(&mut code_capture.retained_owner_source_evidence);
-    let checkout_observations = checkout_captures
-        .iter()
-        .map(|capture| capture.observation.clone())
-        .collect::<Vec<_>>();
     let mut checkout_path_bindings = BTreeMap::new();
-    for capture in checkout_captures {
+    for capture in &checkout_captures {
         checkout_path_bindings.insert(
             capture.observation.observation_id.clone(),
-            capture.runtime_root,
+            capture.runtime_root.clone(),
         );
-        mutable_source_evidence.push(capture.root_source_evidence);
-        mutable_source_evidence.push(capture.marker_source_evidence);
+        mutable_source_evidence.push(capture.root_source_evidence.clone());
+        mutable_source_evidence.push(capture.marker_source_evidence.clone());
     }
-    let mut lanes = capture_required_owner_lanes(&checkout_observations)?;
+    let owner_capture = capture_required_owner_lanes(
+        &request.owner_paths,
+        request.owner_limits,
+        &legacy,
+        &code_sources,
+        publisher_source,
+        &checkout_captures,
+        request.attachment_identity_plan,
+    )?;
+    let mut lanes = owner_capture.lanes;
     sort_lane_rows(&mut lanes);
     validate_lane_kinds(&lanes)?;
     let publisher_pins = derive_publisher_pins(
@@ -1953,11 +2308,13 @@ fn capture_inventory_locked(
     mutable_source_evidence.sort_by(|left, right| left.source_id.cmp(&right.source_id));
     let runtime_bindings = InventoryRuntimeBindingsV1 {
         legacy_project_store_source: legacy_source.source.clone(),
+        legacy_project_store_was_missing: legacy_source.was_missing,
         legacy_project_paths: legacy.runtime_project_paths,
         checkout_paths: checkout_path_bindings,
-        git_common_directories: BTreeMap::new(),
-        legacy_selectors: BTreeMap::new(),
+        git_common_directories: owner_capture.git_common_directories,
+        legacy_selectors: owner_capture.legacy_selectors,
     };
+    let code_source_owner_inventory = code_snapshot.owner.inventory.clone();
     let code_source_canonical_sha256 =
         Sha256ValueV1::parse(code_snapshot.owner.inventory.canonical_sha256.clone())
             .map_err(|_| invalid_source("code_source_canonical_hash_invalid"))?;
@@ -1991,7 +2348,7 @@ fn capture_inventory_locked(
         legacy_path_observations: lanes.legacy_path_observations.rows,
         repo_grouping_proofs: lanes.repo_grouping_proofs.rows,
         legacy_namespace_clusters: lanes.legacy_namespace_clusters.rows,
-        legacy_commit_namespaces: Vec::new(),
+        legacy_commit_namespaces: owner_capture.legacy_commit_namespaces,
     };
     inventory
         .validate()
@@ -2001,18 +2358,1560 @@ fn capture_inventory_locked(
         code_source_canonical_sha256,
         code_source_generation_count: code_snapshot.owner.inventory.generation_count,
         code_source_generation_set_sha256,
+        code_source_owner_inventory,
+        publisher_ref_source_was_missing: publisher_source.was_missing,
         inventory,
-        _runtime_bindings: runtime_bindings,
+        runtime_bindings,
     })
 }
 
+#[derive(Clone)]
+struct DurableOwnerSnapshotsV1 {
+    knowledge: Vec<OwnerSnapshotV1>,
+    gap: Vec<OwnerSnapshotV1>,
+    thread: Vec<OwnerSnapshotV1>,
+    note: Vec<OwnerSnapshotV1>,
+    pin: Vec<OwnerSnapshotV1>,
+    roadmap: Vec<OwnerSnapshotV1>,
+    packet: Vec<OwnerSnapshotV1>,
+    task: Vec<OwnerSnapshotV1>,
+    proposal: Vec<OwnerSnapshotV1>,
+    slack_binding: Vec<OwnerSnapshotV1>,
+    whiteboard: Vec<OwnerSnapshotV1>,
+    artifact: Vec<OwnerSnapshotV1>,
+    provenance: Vec<OwnerSnapshotV1>,
+    transcript_edge: Vec<OwnerSnapshotV1>,
+}
+
 fn capture_required_owner_lanes(
-    _checkout_observations: &[CheckoutObservationV1],
-) -> AdapterResult<ImmutableInventoryLanesV1> {
-    Err(InventoryAdapterError::new(
-        "error.project_catalog_inventory_owner_lane_unsupported",
-        "required auxiliary inventory owners are not yet connected",
-    ))
+    paths: &AuthorizedProjectCatalogOwnerInventoryPathsV1,
+    limits: ProjectCatalogOwnerInventoryLimitsV1,
+    legacy: &LegacyProjectsCaptureV1,
+    code_sources: &[CodeSourceCaptureV1],
+    publisher_source: &ExactDecodedSourceV1<PublisherRefInventoryV1>,
+    checkout_captures: &[CheckoutCaptureV1],
+    attachment_identity_plan: &AttachmentCandidateIdentityPlanV1,
+) -> AdapterResult<RequiredOwnerLaneCaptureV1> {
+    let expected_provenance_projects = legacy
+        .observations
+        .iter()
+        .filter(|project| {
+            project.record.is_git_repo && project.path_status == LegacyProjectPathStatusV1::Present
+        })
+        .map(|project| {
+            ProjectId::parse(project.record.project_id.clone())
+                .map_err(|_| invalid_source("legacy_project_id_invalid"))
+        })
+        .collect::<AdapterResult<BTreeSet<_>>>()?;
+    let supplied_provenance_projects = paths
+        .provenance_sources
+        .iter()
+        .map(|source| source.project_id.clone())
+        .collect::<BTreeSet<_>>();
+    if expected_provenance_projects != supplied_provenance_projects {
+        return Err(invalid_input(
+            "provenance owner sources do not exactly cover present Git projects",
+        ));
+    }
+    let corpus = capture_owner_path(&paths.corpus_index_root, |path| {
+        capture_owner_migration_snapshot_no_create(
+            path,
+            paths.git_cursor_root.as_path(),
+            limits.corpus,
+        )
+    })?;
+    let vectors = capture_owner_path(&paths.vector_root, |path| {
+        capture_vector_migration_snapshot_no_create(path, limits.vectors)
+    })?;
+    let edges = capture_owner_path(&paths.edge_root, |path| {
+        capture_edge_migration_snapshot_no_create(path, limits.edges)
+    })?;
+    paths.git_cursor_root.ensure_authority()?;
+
+    let durable = capture_durable_owner_snapshots(paths, limits.durable_owners)?;
+    let project_scoped_refs = capture_project_scoped_refs_lane(&corpus, &vectors)?;
+    let edge_workspaces = capture_edge_workspaces_lane(&edges)?;
+    let checkouts = capture_checkouts_lane(checkout_captures)?;
+    let attachment_candidates =
+        capture_attachment_candidates_lane(legacy, checkout_captures, attachment_identity_plan)?;
+    let materialized_aliases = capture_materialized_aliases_lane(legacy)?;
+    let inventory_targets = capture_inventory_targets_lane(&durable.artifact, &durable.provenance)?;
+    let (legacy_path_observations, legacy_selectors) =
+        capture_legacy_path_observations_lane(&durable)?;
+    let (git_metadata, legacy_commit_namespaces, git_common_directories) =
+        capture_git_metadata_lane(
+            &corpus,
+            &vectors,
+            legacy,
+            publisher_source,
+            checkout_captures,
+            &attachment_candidates.rows,
+        )?;
+    let repo_grouping_proofs =
+        capture_repo_grouping_proofs_lane(legacy, code_sources, &git_metadata)?;
+    let legacy_namespace_clusters = capture_legacy_namespace_clusters_lane(legacy, &git_metadata)?;
+
+    Ok(RequiredOwnerLaneCaptureV1 {
+        lanes: ImmutableInventoryLanesV1 {
+            project_scoped_refs,
+            edge_workspaces,
+            git_metadata,
+            checkouts,
+            attachment_candidates,
+            inventory_targets,
+            materialized_aliases,
+            legacy_path_observations,
+            repo_grouping_proofs,
+            legacy_namespace_clusters,
+        },
+        legacy_commit_namespaces,
+        git_common_directories,
+        legacy_selectors,
+    })
+}
+
+fn capture_owner_path<T>(
+    path: &AuthorizedInventoryPath,
+    capture: impl FnOnce(&Path) -> T,
+) -> AdapterResult<T> {
+    path.ensure_authority()?;
+    let value = capture(path.as_path());
+    path.ensure_authority()?;
+    Ok(value)
+}
+
+fn capture_owner_snapshot_path(
+    path: &AuthorizedInventoryPath,
+    capture: impl FnOnce(
+        &Path,
+    ) -> Result<
+        OwnerSnapshotV1,
+        bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotError,
+    >,
+) -> AdapterResult<OwnerSnapshotV1> {
+    capture_owner_path(path, capture)?.map_err(|error| {
+        invalid_input(format!("owner snapshot limits are invalid: {}", error.code))
+    })
+}
+
+fn capture_durable_owner_snapshots(
+    paths: &AuthorizedProjectCatalogOwnerInventoryPathsV1,
+    limits: OwnerSnapshotLimitsV1,
+) -> AdapterResult<DurableOwnerSnapshotsV1> {
+    let knowledge = capture_owner_snapshot_path(&paths.knowledge_store_path, |path| {
+        bbox_knowledge::knowledge::capture_project_catalog_owner_snapshot(path, limits)
+    })?;
+    let gap = capture_owner_snapshot_path(&paths.gap_store_path, |path| {
+        bbox_gaps::gaps::capture_project_catalog_owner_snapshot(path, limits)
+    })?;
+    let thread = capture_owner_snapshot_path(&paths.thread_store_path, |path| {
+        bbox_threads::threads::capture_project_catalog_owner_snapshot(path, limits)
+    })?;
+    let note = capture_owner_snapshot_path(&paths.note_store_path, |path| {
+        bbox_threads::notes::capture_project_catalog_owner_snapshot(path, limits)
+    })?;
+    let pin = capture_owner_snapshot_path(&paths.pin_store_path, |path| {
+        bbox_stores::pins::capture_project_catalog_owner_snapshot(path, limits)
+    })?;
+    let roadmap = capture_owner_snapshot_path(&paths.roadmap_store_path, |path| {
+        bbox_stores::roadmap::capture_project_catalog_owner_snapshot(path, limits)
+    })?;
+    let packet = capture_owner_snapshot_path(&paths.packet_root, |path| {
+        bbox_packets::capture_project_catalog_owner_snapshot(path, limits)
+    })?;
+    let task = capture_owner_snapshot_path(&paths.task_store_path, |path| {
+        capture_legacy_task_owner_snapshot(path, limits)
+    })?;
+    let proposal = capture_owner_snapshot_path(&paths.proposal_root, |path| {
+        capture_legacy_proposal_owner_snapshot(path, limits)
+    })?;
+    let slack_channels = capture_owner_snapshot_path(&paths.slack_store_root, |path| {
+        bbox_slack::slack_channel_bindings::capture_project_catalog_owner_snapshot(path, limits)
+    })?;
+    let slack_proposals = capture_owner_snapshot_path(&paths.slack_store_root, |path| {
+        bbox_slack::slack_proposal_links::capture_project_catalog_owner_snapshot(path, limits)
+    })?;
+    let whiteboard = capture_owner_snapshot_path(&paths.whiteboard_root, |path| {
+        bbox_whiteboards::whiteboards::capture_project_catalog_owner_snapshot(path, limits)
+    })?;
+    let artifact = capture_owner_snapshot_path(&paths.artifact_root, |path| {
+        bbox_artifacts::artifacts::capture_project_catalog_owner_snapshot(path, limits)
+    })?;
+    let transcript_edge = capture_owner_snapshot_path(&paths.edge_root, |path| {
+        bbox_edge_sidecar::edge_sidecar::capture_project_catalog_owner_snapshot(path, limits)
+    })?;
+    let mut provenance = Vec::new();
+    for source in &paths.provenance_sources {
+        provenance.push(capture_owner_snapshot_path(
+            &source.repository_root,
+            |path| {
+                bbox_provenance::capture_project_catalog_owner_snapshot(
+                    path,
+                    &source.notes_ref,
+                    source.project_id.as_str(),
+                    limits,
+                )
+            },
+        )?);
+    }
+    Ok(DurableOwnerSnapshotsV1 {
+        knowledge: vec![knowledge],
+        gap: vec![gap],
+        thread: vec![thread],
+        note: vec![note],
+        pin: vec![pin],
+        roadmap: vec![roadmap],
+        packet: vec![packet],
+        task: vec![task],
+        proposal: vec![proposal],
+        slack_binding: vec![slack_channels, slack_proposals],
+        whiteboard: vec![whiteboard],
+        artifact: vec![artifact],
+        provenance,
+        transcript_edge: vec![transcript_edge],
+    })
+}
+
+fn snapshot_owner_state(
+    source_id: &str,
+    snapshots: &[OwnerSnapshotV1],
+) -> AdapterResult<InventorySourceStateV1> {
+    let mut digest = Sha256::new();
+    digest.update(b"blackbox.project-catalog.owner-snapshot-set.v1\0");
+    digest.update((source_id.len() as u64).to_be_bytes());
+    digest.update(source_id.as_bytes());
+    let mut byte_len = 0u64;
+    let mut first_corrupt = None;
+    let mut missing = false;
+    for snapshot in snapshots {
+        digest.update((snapshot.source_id.len() as u64).to_be_bytes());
+        digest.update(snapshot.source_id.as_bytes());
+        digest.update(snapshot.canonical_sha256.as_bytes());
+        match &snapshot.state {
+            OwnerSnapshotStateV1::Present {
+                content_sha256,
+                byte_len: source_len,
+            } => {
+                digest.update(b"present");
+                digest.update(content_sha256.as_bytes());
+                byte_len = byte_len
+                    .checked_add(*source_len)
+                    .ok_or_else(|| invalid_source("owner_snapshot_byte_count_overflow"))?;
+            }
+            OwnerSnapshotStateV1::Missing { fingerprint } => {
+                missing = true;
+                digest.update(b"missing");
+                digest.update(fingerprint.as_bytes());
+            }
+            OwnerSnapshotStateV1::Corrupt {
+                diagnostic_code,
+                fingerprint,
+            } => {
+                first_corrupt.get_or_insert_with(|| diagnostic_code.clone());
+                digest.update(b"corrupt");
+                digest.update(diagnostic_code.as_bytes());
+                digest.update(fingerprint.as_bytes());
+            }
+        }
+    }
+    let fingerprint = Sha256ValueV1::parse(hex::encode(digest.finalize()))
+        .expect("SHA-256 encoding is always a valid hash");
+    Ok(if let Some(diagnostic_code) = first_corrupt {
+        InventorySourceStateV1::Corrupt {
+            fingerprint: fingerprint.clone(),
+            content_hash: Some(fingerprint),
+            diagnostic_code,
+        }
+    } else if missing {
+        InventorySourceStateV1::Missing { fingerprint }
+    } else {
+        InventorySourceStateV1::Present {
+            fingerprint: fingerprint.clone(),
+            content_hash: fingerprint,
+            byte_len,
+        }
+    })
+}
+
+fn direct_owner_state(
+    source_id: &str,
+    state: &str,
+    content_fingerprint: Option<&str>,
+    diagnostic_code: Option<&str>,
+) -> InventorySourceStateV1 {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(source_id.as_bytes());
+    bytes.extend_from_slice(state.as_bytes());
+    if let Some(value) = content_fingerprint {
+        bytes.extend_from_slice(value.as_bytes());
+    }
+    let fingerprint = Sha256ValueV1::digest(&bytes);
+    match state {
+        "present" => InventorySourceStateV1::Present {
+            fingerprint: fingerprint.clone(),
+            content_hash: content_fingerprint
+                .and_then(|value| Sha256ValueV1::parse(value.to_string()).ok())
+                .unwrap_or(fingerprint),
+            byte_len: 0,
+        },
+        "missing" => InventorySourceStateV1::Missing { fingerprint },
+        _ => InventorySourceStateV1::Corrupt {
+            fingerprint,
+            content_hash: None,
+            diagnostic_code: diagnostic_code
+                .unwrap_or("owner_source_corrupt")
+                .to_string(),
+        },
+    }
+}
+
+fn lane_capture<T>(
+    lane_kind: ImmutableInventoryLaneKindV1,
+    source_id: &str,
+    mut owners: Vec<(
+        ImmutableInventoryOwnerKindV1,
+        String,
+        InventorySourceStateV1,
+        BTreeSet<String>,
+    )>,
+    mut rows: Vec<T>,
+) -> AdapterResult<ImmutableLaneCaptureV1<T>> {
+    let complete = owners
+        .iter()
+        .all(|(_, _, state, _)| matches!(state, InventorySourceStateV1::Present { .. }));
+    if !complete {
+        rows.clear();
+        for (_, _, _, row_ids) in &mut owners {
+            row_ids.clear();
+        }
+    }
+    let owner_subsources = owners
+        .into_iter()
+        .map(
+            |(owner_kind, owner_source_id, source_state, row_observation_ids)| {
+                OwnerSubsourceEvidenceV1::new(
+                    owner_kind,
+                    owner_source_id,
+                    source_state,
+                    row_observation_ids,
+                )
+            },
+        )
+        .collect();
+    let evidence = ImmutableInventoryLaneEvidenceV1::from_owner_subsources(
+        lane_kind,
+        source_id,
+        rows.len() as u64,
+        owner_subsources,
+    )
+    .map_err(|error| invalid_source(error.to_string()))?;
+    Ok(ImmutableLaneCaptureV1 { evidence, rows })
+}
+
+fn corpus_source_state(
+    source_id: &str,
+    state: &CorpusMigrationSourceStateV1,
+    fingerprint: Option<&str>,
+) -> InventorySourceStateV1 {
+    match state {
+        CorpusMigrationSourceStateV1::Present => {
+            direct_owner_state(source_id, "present", fingerprint, None)
+        }
+        CorpusMigrationSourceStateV1::Missing => {
+            direct_owner_state(source_id, "missing", None, None)
+        }
+        CorpusMigrationSourceStateV1::Corrupt { diagnostic_code } => {
+            direct_owner_state(source_id, "corrupt", fingerprint, Some(diagnostic_code))
+        }
+    }
+}
+
+fn vector_source_state(snapshot: &VectorMigrationSnapshotV1) -> InventorySourceStateV1 {
+    match &snapshot.state {
+        VectorMigrationSourceStateV1::Present => direct_owner_state(
+            "vector-metadata",
+            "present",
+            snapshot.source_fingerprint_sha256.as_deref(),
+            None,
+        ),
+        VectorMigrationSourceStateV1::Missing => {
+            direct_owner_state("vector-metadata", "missing", None, None)
+        }
+        VectorMigrationSourceStateV1::Corrupt { diagnostic_code } => direct_owner_state(
+            "vector-metadata",
+            "corrupt",
+            snapshot.source_fingerprint_sha256.as_deref(),
+            Some(diagnostic_code),
+        ),
+    }
+}
+
+fn edge_source_state(snapshot: &EdgeMigrationSnapshotV1) -> InventorySourceStateV1 {
+    match &snapshot.state {
+        EdgeMigrationSourceStateV1::Present => direct_owner_state(
+            "edge-manifest",
+            "present",
+            snapshot.source_fingerprint_sha256.as_deref(),
+            None,
+        ),
+        EdgeMigrationSourceStateV1::Missing => {
+            direct_owner_state("edge-manifest", "missing", None, None)
+        }
+        EdgeMigrationSourceStateV1::Corrupt { diagnostic_code } => direct_owner_state(
+            "edge-manifest",
+            "corrupt",
+            snapshot.source_fingerprint_sha256.as_deref(),
+            Some(diagnostic_code),
+        ),
+    }
+}
+
+fn capture_project_scoped_refs_lane(
+    corpus: &CorpusOwnerMigrationSnapshotV1,
+    vectors: &VectorMigrationSnapshotV1,
+) -> AdapterResult<ImmutableLaneCaptureV1<ProjectScopedRefObservationV1>> {
+    let corpus_state = corpus_source_state(
+        "tantivy",
+        &corpus.index.state,
+        corpus.index.source_fingerprint_sha256.as_deref(),
+    );
+    let vector_state = vector_source_state(vectors);
+    let mut rows = Vec::new();
+    let mut tantivy_row_ids = BTreeSet::new();
+    let mut vector_row_ids = BTreeSet::new();
+    if matches!(corpus_state, InventorySourceStateV1::Present { .. }) {
+        for row in &corpus.index.project_scoped_refs {
+            let project_id = ProjectId::parse(row.project_id.clone())
+                .map_err(|_| invalid_source("tantivy_project_id_invalid"))?;
+            for occurrence in 0..row.document_count {
+                let stable_row_id = stable_observation_id_v1(
+                    "tantivy-row",
+                    &[
+                        row.project_id.as_bytes(),
+                        row.entity_ref.as_bytes(),
+                        &occurrence.to_be_bytes(),
+                    ],
+                )?;
+                let observation_id = stable_observation_id_v1(
+                    "project-ref",
+                    &[b"tantivy", stable_row_id.as_bytes()],
+                )?;
+                tantivy_row_ids.insert(observation_id.clone());
+                rows.push(ProjectScopedRefObservationV1 {
+                    observation_id,
+                    store_kind: ProjectScopedRefStoreKindV1::Tantivy,
+                    project_id: project_id.clone(),
+                    stable_row_id,
+                    entity_ref_hash: Sha256ValueV1::digest(row.entity_ref.as_bytes()),
+                });
+            }
+        }
+    }
+    if matches!(vector_state, InventorySourceStateV1::Present { .. }) {
+        for row in &vectors.project_scoped_refs {
+            let project_id = ProjectId::parse(row.project_id.clone())
+                .map_err(|_| invalid_source("vector_project_id_invalid"))?;
+            let stable_row_id = stable_observation_id_v1(
+                "vector-row",
+                &[
+                    row.route.as_bytes(),
+                    row.project_id.as_bytes(),
+                    row.entity_ref.as_bytes(),
+                    row.content_hash.as_bytes(),
+                ],
+            )?;
+            let observation_id =
+                stable_observation_id_v1("project-ref", &[b"vector", stable_row_id.as_bytes()])?;
+            vector_row_ids.insert(observation_id.clone());
+            rows.push(ProjectScopedRefObservationV1 {
+                observation_id,
+                store_kind: ProjectScopedRefStoreKindV1::VectorMetadata,
+                project_id,
+                stable_row_id,
+                entity_ref_hash: Sha256ValueV1::digest(row.entity_ref.as_bytes()),
+            });
+        }
+    }
+    lane_capture(
+        ImmutableInventoryLaneKindV1::ProjectScopedRefs,
+        "project-scoped-refs",
+        vec![
+            (
+                ImmutableInventoryOwnerKindV1::Tantivy,
+                "tantivy".to_string(),
+                corpus_state,
+                tantivy_row_ids,
+            ),
+            (
+                ImmutableInventoryOwnerKindV1::VectorMetadata,
+                "vector-metadata".to_string(),
+                vector_state,
+                vector_row_ids,
+            ),
+        ],
+        rows,
+    )
+}
+
+fn capture_edge_workspaces_lane(
+    edges: &EdgeMigrationSnapshotV1,
+) -> AdapterResult<ImmutableLaneCaptureV1<EdgeWorkspaceObservationV1>> {
+    let state = edge_source_state(edges);
+    let mut rows = Vec::new();
+    let mut row_ids = BTreeSet::new();
+    if matches!(state, InventorySourceStateV1::Present { .. }) {
+        for workspace in &edges.workspaces {
+            let project_id = ProjectId::parse(workspace.project_id.clone())
+                .map_err(|_| invalid_source("edge_workspace_project_id_invalid"))?;
+            let observation_id = stable_observation_id_v1(
+                "edge-workspace",
+                &[
+                    workspace.workspace_id.as_bytes(),
+                    workspace.project_id.as_bytes(),
+                ],
+            )?;
+            let selector_bytes = serde_json::to_vec(&(
+                &workspace.active_snapshot_id,
+                &workspace.active_dirty_overlay_id,
+                &workspace.active_snapshot_path,
+                &workspace.dirty_overlay_path,
+                &workspace.repo_materialization,
+                &workspace.code_source_selector,
+                &workspace.code_source_generation,
+            ))
+            .map_err(|_| invalid_source("edge_workspace_selector_encode_failed"))?;
+            row_ids.insert(observation_id.clone());
+            rows.push(EdgeWorkspaceObservationV1 {
+                observation_id,
+                workspace_id: workspace.workspace_id.clone(),
+                project_ids: BTreeSet::from([project_id]),
+                manifest_hash: Sha256ValueV1::parse(
+                    workspace.manifest_source_fingerprint_sha256.clone(),
+                )
+                .map_err(|_| invalid_source("edge_workspace_manifest_hash_invalid"))?,
+                active_selector_hash: Sha256ValueV1::digest(&selector_bytes),
+            });
+        }
+    }
+    lane_capture(
+        ImmutableInventoryLaneKindV1::EdgeWorkspaces,
+        "edge-workspaces",
+        vec![(
+            ImmutableInventoryOwnerKindV1::EdgeManifest,
+            "edge-manifest".to_string(),
+            state,
+            row_ids,
+        )],
+        rows,
+    )
+}
+
+fn checkout_owner_state(
+    checkout_captures: &[CheckoutCaptureV1],
+) -> AdapterResult<InventorySourceStateV1> {
+    let rows = checkout_captures
+        .iter()
+        .map(|capture| &capture.observation)
+        .collect::<Vec<_>>();
+    let bytes =
+        serde_json::to_vec(&rows).map_err(|_| invalid_source("checkout_evidence_encode_failed"))?;
+    Ok(InventorySourceStateV1::Present {
+        fingerprint: Sha256ValueV1::digest(&bytes),
+        content_hash: Sha256ValueV1::digest(&bytes),
+        byte_len: bytes.len() as u64,
+    })
+}
+
+fn capture_checkouts_lane(
+    checkout_captures: &[CheckoutCaptureV1],
+) -> AdapterResult<ImmutableLaneCaptureV1<CheckoutObservationV1>> {
+    let rows = checkout_captures
+        .iter()
+        .map(|capture| capture.observation.clone())
+        .collect::<Vec<_>>();
+    let row_ids = rows
+        .iter()
+        .map(|row| row.observation_id.clone())
+        .collect::<BTreeSet<_>>();
+    lane_capture(
+        ImmutableInventoryLaneKindV1::Checkouts,
+        "checkouts",
+        vec![(
+            ImmutableInventoryOwnerKindV1::Checkout,
+            "checkout".to_string(),
+            checkout_owner_state(checkout_captures)?,
+            row_ids,
+        )],
+        rows,
+    )
+}
+
+fn attachment_observation_id(key: &AttachmentCandidateKeyV1) -> AdapterResult<String> {
+    stable_observation_id_v1(
+        "attachment",
+        &[
+            key.project_id.as_str().as_bytes(),
+            key.checkout_observation_id.as_bytes(),
+            key.base_relpath.as_bytes(),
+        ],
+    )
+}
+
+fn capture_attachment_candidates_lane(
+    legacy: &LegacyProjectsCaptureV1,
+    checkout_captures: &[CheckoutCaptureV1],
+    plan: &AttachmentCandidateIdentityPlanV1,
+) -> AdapterResult<ImmutableLaneCaptureV1<AttachmentCandidateObservationV1>> {
+    let keys = discover_attachment_candidate_keys_locked(legacy, checkout_captures)?;
+    let expected = keys.iter().cloned().collect::<BTreeSet<_>>();
+    let supplied = plan.identities.keys().cloned().collect::<BTreeSet<_>>();
+    if expected != supplied {
+        return Err(invalid_input(
+            "attachment identity plan does not exactly cover discovered candidates",
+        ));
+    }
+    if plan.identities.values().collect::<BTreeSet<_>>().len() != plan.identities.len() {
+        return Err(invalid_input(
+            "attachment identity plan reuses an attachment id",
+        ));
+    }
+    let mut rows = Vec::new();
+    for key in keys {
+        let attachment_id = plan
+            .identities
+            .get(&key)
+            .ok_or_else(|| invalid_input("attachment identity plan entry is missing"))?
+            .clone();
+        let observed_scope = legacy.published_scopes.get(&key.project_id).cloned();
+        rows.push(AttachmentCandidateObservationV1 {
+            observation_id: attachment_observation_id(&key)?,
+            attachment_id,
+            project_id: key.project_id,
+            checkout_observation_id: key.checkout_observation_id,
+            base_relpath: key.base_relpath,
+            observed_scope,
+        });
+    }
+    let row_ids = rows
+        .iter()
+        .map(|row| row.observation_id.clone())
+        .collect::<BTreeSet<_>>();
+    lane_capture(
+        ImmutableInventoryLaneKindV1::AttachmentCandidates,
+        "attachment-candidates",
+        vec![
+            (
+                ImmutableInventoryOwnerKindV1::LegacyProjectStore,
+                "legacy-project-store".to_string(),
+                legacy.owner_state.clone(),
+                row_ids.clone(),
+            ),
+            (
+                ImmutableInventoryOwnerKindV1::Checkout,
+                "checkout".to_string(),
+                checkout_owner_state(checkout_captures)?,
+                row_ids,
+            ),
+        ],
+        rows,
+    )
+}
+
+fn capture_materialized_aliases_lane(
+    legacy: &LegacyProjectsCaptureV1,
+) -> AdapterResult<ImmutableLaneCaptureV1<MaterializedAliasObservationV1>> {
+    let mut rows = Vec::new();
+    for project in &legacy.observations {
+        let project_id = ProjectId::parse(project.record.project_id.clone())
+            .map_err(|_| invalid_source("legacy_project_id_invalid"))?;
+        for alias in &project.record.aliases {
+            rows.push(MaterializedAliasObservationV1 {
+                observation_id: stable_observation_id_v1(
+                    "materialized-alias",
+                    &[project_id.as_str().as_bytes(), alias.as_bytes()],
+                )?,
+                alias: alias.clone(),
+                project_id: project_id.clone(),
+                registered_at: Some(project.record.registered_at.clone()),
+            });
+        }
+    }
+    let row_ids = rows
+        .iter()
+        .map(|row| row.observation_id.clone())
+        .collect::<BTreeSet<_>>();
+    lane_capture(
+        ImmutableInventoryLaneKindV1::MaterializedAliases,
+        "materialized-aliases",
+        vec![(
+            ImmutableInventoryOwnerKindV1::LegacyProjectStore,
+            "legacy-project-store".to_string(),
+            legacy.owner_state.clone(),
+            row_ids,
+        )],
+        rows,
+    )
+}
+
+fn capture_inventory_targets_lane(
+    artifacts: &[OwnerSnapshotV1],
+    provenance: &[OwnerSnapshotV1],
+) -> AdapterResult<ImmutableLaneCaptureV1<InventoryTargetObservationV1>> {
+    let artifact_state = snapshot_owner_state("artifact", artifacts)?;
+    let provenance_state = snapshot_owner_state("provenance", provenance)?;
+    let mut rows = Vec::new();
+    let mut owner_rows = BTreeMap::<ImmutableInventoryOwnerKindV1, BTreeSet<String>>::new();
+    for (owner_kind, target_kind, snapshots) in [
+        (
+            ImmutableInventoryOwnerKindV1::Artifact,
+            InventoryTargetKindV1::ProjectArtifact,
+            artifacts,
+        ),
+        (
+            ImmutableInventoryOwnerKindV1::Provenance,
+            InventoryTargetKindV1::ProvenanceNote,
+            provenance,
+        ),
+    ] {
+        for snapshot in snapshots {
+            for raw in &snapshot.rows {
+                let OwnerSnapshotRowValueV1::InventoryTarget {
+                    project_id,
+                    target_sha256,
+                } = &raw.value
+                else {
+                    continue;
+                };
+                let project_id = ProjectId::parse(project_id.clone())
+                    .map_err(|_| invalid_source("inventory_target_project_id_invalid"))?;
+                let stable_target_id = stable_observation_id_v1(
+                    "target-row",
+                    &[
+                        owner_kind_token(owner_kind).as_bytes(),
+                        raw.stable_row_id.as_bytes(),
+                    ],
+                )?;
+                let observation_id = stable_observation_id_v1(
+                    "inventory-target",
+                    &[
+                        owner_kind_token(owner_kind).as_bytes(),
+                        stable_target_id.as_bytes(),
+                    ],
+                )?;
+                owner_rows
+                    .entry(owner_kind)
+                    .or_default()
+                    .insert(observation_id.clone());
+                rows.push(InventoryTargetObservationV1 {
+                    observation_id,
+                    target_kind,
+                    project_id,
+                    stable_target_id,
+                    target_hash: Sha256ValueV1::parse(target_sha256.clone())
+                        .map_err(|_| invalid_source("inventory_target_hash_invalid"))?,
+                });
+            }
+        }
+    }
+    lane_capture(
+        ImmutableInventoryLaneKindV1::InventoryTargets,
+        "inventory-targets",
+        vec![
+            (
+                ImmutableInventoryOwnerKindV1::Artifact,
+                "artifact".to_string(),
+                artifact_state,
+                owner_rows
+                    .get(&ImmutableInventoryOwnerKindV1::Artifact)
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            (
+                ImmutableInventoryOwnerKindV1::Provenance,
+                "provenance".to_string(),
+                provenance_state,
+                owner_rows
+                    .get(&ImmutableInventoryOwnerKindV1::Provenance)
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        ],
+        rows,
+    )
+}
+
+fn owner_kind_token(kind: ImmutableInventoryOwnerKindV1) -> &'static str {
+    match kind {
+        ImmutableInventoryOwnerKindV1::Tantivy => "tantivy",
+        ImmutableInventoryOwnerKindV1::VectorMetadata => "vector",
+        ImmutableInventoryOwnerKindV1::EdgeManifest => "edge",
+        ImmutableInventoryOwnerKindV1::GitMetadata => "git",
+        ImmutableInventoryOwnerKindV1::Checkout => "checkout",
+        ImmutableInventoryOwnerKindV1::LegacyProjectStore => "legacy-project",
+        ImmutableInventoryOwnerKindV1::Knowledge => "knowledge",
+        ImmutableInventoryOwnerKindV1::Gap => "gap",
+        ImmutableInventoryOwnerKindV1::Thread => "thread",
+        ImmutableInventoryOwnerKindV1::Note => "note",
+        ImmutableInventoryOwnerKindV1::Pin => "pin",
+        ImmutableInventoryOwnerKindV1::Roadmap => "roadmap",
+        ImmutableInventoryOwnerKindV1::Packet => "packet",
+        ImmutableInventoryOwnerKindV1::Task => "task",
+        ImmutableInventoryOwnerKindV1::Proposal => "proposal",
+        ImmutableInventoryOwnerKindV1::SlackBinding => "slack",
+        ImmutableInventoryOwnerKindV1::Whiteboard => "whiteboard",
+        ImmutableInventoryOwnerKindV1::Artifact => "artifact",
+        ImmutableInventoryOwnerKindV1::Provenance => "provenance",
+        ImmutableInventoryOwnerKindV1::TranscriptEdge => "transcript-edge",
+        ImmutableInventoryOwnerKindV1::DerivedRepoGrouping => "derived-repo",
+        ImmutableInventoryOwnerKindV1::DerivedLegacyNamespaceClusters => "derived-namespace",
+    }
+}
+
+fn legacy_store_token(kind: LegacyPathStoreKindV1) -> &'static str {
+    match kind {
+        LegacyPathStoreKindV1::Knowledge => "knowledge",
+        LegacyPathStoreKindV1::Gap => "gap",
+        LegacyPathStoreKindV1::Thread => "thread",
+        LegacyPathStoreKindV1::Note => "note",
+        LegacyPathStoreKindV1::Pin => "pin",
+        LegacyPathStoreKindV1::Roadmap => "roadmap",
+        LegacyPathStoreKindV1::Packet => "packet",
+        LegacyPathStoreKindV1::Task => "task",
+        LegacyPathStoreKindV1::Proposal => "proposal",
+        LegacyPathStoreKindV1::SlackBinding => "slack",
+        LegacyPathStoreKindV1::Whiteboard => "whiteboard",
+        LegacyPathStoreKindV1::Artifact => "artifact",
+        LegacyPathStoreKindV1::Provenance => "provenance",
+        LegacyPathStoreKindV1::TranscriptEdge => "transcript-edge",
+    }
+}
+
+fn legacy_owner_kind(kind: LegacyPathStoreKindV1) -> ImmutableInventoryOwnerKindV1 {
+    match kind {
+        LegacyPathStoreKindV1::Knowledge => ImmutableInventoryOwnerKindV1::Knowledge,
+        LegacyPathStoreKindV1::Gap => ImmutableInventoryOwnerKindV1::Gap,
+        LegacyPathStoreKindV1::Thread => ImmutableInventoryOwnerKindV1::Thread,
+        LegacyPathStoreKindV1::Note => ImmutableInventoryOwnerKindV1::Note,
+        LegacyPathStoreKindV1::Pin => ImmutableInventoryOwnerKindV1::Pin,
+        LegacyPathStoreKindV1::Roadmap => ImmutableInventoryOwnerKindV1::Roadmap,
+        LegacyPathStoreKindV1::Packet => ImmutableInventoryOwnerKindV1::Packet,
+        LegacyPathStoreKindV1::Task => ImmutableInventoryOwnerKindV1::Task,
+        LegacyPathStoreKindV1::Proposal => ImmutableInventoryOwnerKindV1::Proposal,
+        LegacyPathStoreKindV1::SlackBinding => ImmutableInventoryOwnerKindV1::SlackBinding,
+        LegacyPathStoreKindV1::Whiteboard => ImmutableInventoryOwnerKindV1::Whiteboard,
+        LegacyPathStoreKindV1::Artifact => ImmutableInventoryOwnerKindV1::Artifact,
+        LegacyPathStoreKindV1::Provenance => ImmutableInventoryOwnerKindV1::Provenance,
+        LegacyPathStoreKindV1::TranscriptEdge => ImmutableInventoryOwnerKindV1::TranscriptEdge,
+    }
+}
+
+fn legacy_owner_snapshots(
+    durable: &DurableOwnerSnapshotsV1,
+    kind: LegacyPathStoreKindV1,
+) -> &[OwnerSnapshotV1] {
+    match kind {
+        LegacyPathStoreKindV1::Knowledge => &durable.knowledge,
+        LegacyPathStoreKindV1::Gap => &durable.gap,
+        LegacyPathStoreKindV1::Thread => &durable.thread,
+        LegacyPathStoreKindV1::Note => &durable.note,
+        LegacyPathStoreKindV1::Pin => &durable.pin,
+        LegacyPathStoreKindV1::Roadmap => &durable.roadmap,
+        LegacyPathStoreKindV1::Packet => &durable.packet,
+        LegacyPathStoreKindV1::Task => &durable.task,
+        LegacyPathStoreKindV1::Proposal => &durable.proposal,
+        LegacyPathStoreKindV1::SlackBinding => &durable.slack_binding,
+        LegacyPathStoreKindV1::Whiteboard => &durable.whiteboard,
+        LegacyPathStoreKindV1::Artifact => &durable.artifact,
+        LegacyPathStoreKindV1::Provenance => &durable.provenance,
+        LegacyPathStoreKindV1::TranscriptEdge => &durable.transcript_edge,
+    }
+}
+
+fn selector_kind(kind: LegacyProjectSelectorKindV1) -> LegacySelectorKindV1 {
+    match kind {
+        LegacyProjectSelectorKindV1::Project => LegacySelectorKindV1::Project,
+        LegacyProjectSelectorKindV1::ProjectAndRelativePath => {
+            LegacySelectorKindV1::ProjectAndRelativePath
+        }
+        LegacyProjectSelectorKindV1::AbsolutePath => LegacySelectorKindV1::AbsolutePath,
+    }
+}
+
+fn capture_legacy_path_observations_lane(
+    durable: &DurableOwnerSnapshotsV1,
+) -> AdapterResult<(
+    ImmutableLaneCaptureV1<LegacyPathObservationV1>,
+    BTreeMap<String, RuntimeLiteralBindingV1>,
+)> {
+    let kinds = [
+        LegacyPathStoreKindV1::Knowledge,
+        LegacyPathStoreKindV1::Gap,
+        LegacyPathStoreKindV1::Thread,
+        LegacyPathStoreKindV1::Note,
+        LegacyPathStoreKindV1::Pin,
+        LegacyPathStoreKindV1::Roadmap,
+        LegacyPathStoreKindV1::Packet,
+        LegacyPathStoreKindV1::Task,
+        LegacyPathStoreKindV1::Proposal,
+        LegacyPathStoreKindV1::SlackBinding,
+        LegacyPathStoreKindV1::Whiteboard,
+        LegacyPathStoreKindV1::Artifact,
+        LegacyPathStoreKindV1::Provenance,
+        LegacyPathStoreKindV1::TranscriptEdge,
+    ];
+    let mut rows = Vec::new();
+    let mut bindings = BTreeMap::new();
+    let mut owners = Vec::new();
+    for kind in kinds {
+        let snapshots = legacy_owner_snapshots(durable, kind);
+        let state = snapshot_owner_state(legacy_store_token(kind), snapshots)?;
+        let mut row_ids = BTreeSet::new();
+        if matches!(state, InventorySourceStateV1::Present { .. }) {
+            for snapshot in snapshots {
+                for raw in &snapshot.rows {
+                    let OwnerSnapshotRowValueV1::LegacyProjectSelector {
+                        selector_kind: raw_kind,
+                        literal_selector,
+                    } = &raw.value
+                    else {
+                        continue;
+                    };
+                    let stable_row_id = stable_observation_id_v1(
+                        "legacy-row",
+                        &[
+                            legacy_store_token(kind).as_bytes(),
+                            raw.stable_row_id.as_bytes(),
+                        ],
+                    )?;
+                    let observation_id = stable_observation_id_v1(
+                        "legacy-path",
+                        &[
+                            legacy_store_token(kind).as_bytes(),
+                            stable_row_id.as_bytes(),
+                        ],
+                    )?;
+                    let digest = digest_path(literal_selector);
+                    if bindings
+                        .insert(
+                            observation_id.clone(),
+                            RuntimeLiteralBindingV1 {
+                                digest: digest.clone(),
+                                literal: literal_selector.clone(),
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(invalid_source("legacy_path_observation_duplicate"));
+                    }
+                    row_ids.insert(observation_id.clone());
+                    rows.push(LegacyPathObservationV1 {
+                        observation_id,
+                        store_kind: kind,
+                        stable_row_id,
+                        selector_kind: selector_kind(*raw_kind),
+                        selector_digest: digest,
+                    });
+                }
+            }
+        }
+        owners.push((
+            legacy_owner_kind(kind),
+            legacy_store_token(kind).to_string(),
+            state,
+            row_ids,
+        ));
+    }
+    let lane = lane_capture(
+        ImmutableInventoryLaneKindV1::LegacyPathObservations,
+        "legacy-path-observations",
+        owners,
+        rows,
+    )?;
+    if lane.rows.is_empty() {
+        bindings.clear();
+    }
+    Ok((lane, bindings))
+}
+
+fn aggregate_inventory_states(
+    source_id: &str,
+    states: &[InventorySourceStateV1],
+) -> InventorySourceStateV1 {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(source_id.as_bytes());
+    let mut byte_len = 0u64;
+    let mut first_corrupt = None;
+    let mut missing = false;
+    for state in states {
+        match state {
+            InventorySourceStateV1::Present {
+                fingerprint,
+                content_hash,
+                byte_len: source_len,
+            } => {
+                bytes.extend_from_slice(b"present");
+                bytes.extend_from_slice(fingerprint.as_str().as_bytes());
+                bytes.extend_from_slice(content_hash.as_str().as_bytes());
+                byte_len = byte_len.saturating_add(*source_len);
+            }
+            InventorySourceStateV1::Missing { fingerprint } => {
+                missing = true;
+                bytes.extend_from_slice(b"missing");
+                bytes.extend_from_slice(fingerprint.as_str().as_bytes());
+            }
+            InventorySourceStateV1::Corrupt {
+                fingerprint,
+                diagnostic_code,
+                ..
+            } => {
+                first_corrupt.get_or_insert_with(|| diagnostic_code.clone());
+                bytes.extend_from_slice(b"corrupt");
+                bytes.extend_from_slice(fingerprint.as_str().as_bytes());
+                bytes.extend_from_slice(diagnostic_code.as_bytes());
+            }
+        }
+    }
+    let fingerprint = Sha256ValueV1::digest(&bytes);
+    if let Some(diagnostic_code) = first_corrupt {
+        InventorySourceStateV1::Corrupt {
+            fingerprint: fingerprint.clone(),
+            content_hash: Some(fingerprint),
+            diagnostic_code,
+        }
+    } else if missing {
+        InventorySourceStateV1::Missing { fingerprint }
+    } else {
+        InventorySourceStateV1::Present {
+            fingerprint: fingerprint.clone(),
+            content_hash: fingerprint,
+            byte_len,
+        }
+    }
+}
+
+fn empty_set_commitment(domain: &[u8]) -> Sha256ValueV1 {
+    Sha256ValueV1::digest(domain)
+}
+
+fn namespace_attribution(
+    namespace: &str,
+    legacy: &LegacyProjectsCaptureV1,
+) -> LegacyCommitNamespaceAttributionV1 {
+    let proved = legacy
+        .observations
+        .iter()
+        .filter_map(|project| {
+            let authority = project.committed_authority.as_ref()?;
+            (authority.authority.as_str() == namespace)
+                .then(|| ProjectId::parse(project.record.project_id.clone()).ok())
+                .flatten()
+        })
+        .collect::<BTreeSet<_>>();
+    if !proved.is_empty() {
+        return LegacyCommitNamespaceAttributionV1::Proved {
+            project_ids: proved,
+        };
+    }
+    let candidates = legacy
+        .observations
+        .iter()
+        .filter(|project| project.record.repo_id.as_deref() == Some(namespace))
+        .filter_map(|project| ProjectId::parse(project.record.project_id.clone()).ok())
+        .collect::<BTreeSet<_>>();
+    if candidates.len() >= 2 {
+        LegacyCommitNamespaceAttributionV1::Ambiguous {
+            candidate_project_ids: candidates,
+        }
+    } else {
+        LegacyCommitNamespaceAttributionV1::Unclaimed
+    }
+}
+
+fn attributed_projects(attribution: &LegacyCommitNamespaceAttributionV1) -> BTreeSet<ProjectId> {
+    match attribution {
+        LegacyCommitNamespaceAttributionV1::Proved { project_ids } => project_ids.clone(),
+        LegacyCommitNamespaceAttributionV1::Ambiguous {
+            candidate_project_ids,
+        } => candidate_project_ids.clone(),
+        LegacyCommitNamespaceAttributionV1::Unclaimed => BTreeSet::new(),
+    }
+}
+
+fn capture_commit_namespaces(
+    corpus: &CorpusOwnerMigrationSnapshotV1,
+    vectors: &VectorMigrationSnapshotV1,
+    legacy: &LegacyProjectsCaptureV1,
+) -> AdapterResult<Vec<LegacyCommitNamespaceInventoryV1>> {
+    let corpus_rows = corpus
+        .index
+        .commit_namespaces
+        .iter()
+        .map(|row| (row.namespace.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
+    let vector_rows = vectors
+        .commit_namespaces
+        .iter()
+        .map(|row| (row.namespace.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
+    let namespaces = corpus_rows
+        .keys()
+        .chain(vector_rows.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut rows = Vec::new();
+    for namespace in namespaces {
+        let corpus_row = corpus_rows.get(namespace).copied();
+        let vector_row = vector_rows.get(namespace).copied();
+        let observation_id = stable_observation_id_v1("commit-namespace", &[namespace.as_bytes()])?;
+        rows.push(LegacyCommitNamespaceInventoryV1 {
+            observation_id,
+            namespace: CommitNamespace::parse(namespace.to_string())
+                .map_err(|_| invalid_source("legacy_commit_namespace_invalid"))?,
+            commit_document_count: corpus_row
+                .map(|row| row.commit_document_count)
+                .unwrap_or_default(),
+            commit_document_set_sha256: corpus_row
+                .map(|row| Sha256ValueV1::parse(row.commit_document_commitment_sha256.clone()))
+                .transpose()
+                .map_err(|_| invalid_source("commit_document_commitment_invalid"))?
+                .unwrap_or_else(|| {
+                    empty_set_commitment(b"blackbox.corpus-index.commit-namespace.v1\0")
+                }),
+            vector_key_count: vector_row
+                .map(|row| row.vector_key_count)
+                .unwrap_or_default(),
+            vector_key_set_sha256: vector_row
+                .map(|row| Sha256ValueV1::parse(row.vector_key_commitment_sha256.clone()))
+                .transpose()
+                .map_err(|_| invalid_source("vector_key_commitment_invalid"))?
+                .unwrap_or_else(|| empty_set_commitment(b"blackbox.vectors.commit-namespace.v1\0")),
+            attribution: namespace_attribution(namespace, legacy),
+        });
+    }
+    rows.sort_by(|left, right| left.namespace.cmp(&right.namespace));
+    Ok(rows)
+}
+
+fn capture_git_metadata_lane(
+    corpus: &CorpusOwnerMigrationSnapshotV1,
+    vectors: &VectorMigrationSnapshotV1,
+    legacy: &LegacyProjectsCaptureV1,
+    publisher_source: &ExactDecodedSourceV1<PublisherRefInventoryV1>,
+    checkout_captures: &[CheckoutCaptureV1],
+    attachment_candidates: &[AttachmentCandidateObservationV1],
+) -> AdapterResult<(
+    ImmutableLaneCaptureV1<GitMetadataObservationV1>,
+    Vec<LegacyCommitNamespaceInventoryV1>,
+    BTreeMap<String, AuthorizedInventoryPath>,
+)> {
+    let index_state = corpus_source_state(
+        "tantivy",
+        &corpus.index.state,
+        corpus.index.source_fingerprint_sha256.as_deref(),
+    );
+    let code_metadata_state = corpus_source_state(
+        "tantivy-code-metadata",
+        &corpus.code_metadata.state,
+        corpus.code_metadata.source_fingerprint_sha256.as_deref(),
+    );
+    let tantivy_state = aggregate_inventory_states("tantivy", &[index_state, code_metadata_state]);
+    let vector_state = vector_source_state(vectors);
+    let cursor_state = corpus_source_state(
+        "git-cursors",
+        &corpus.git_cursors.state,
+        corpus.git_cursors.source_fingerprint_sha256.as_deref(),
+    );
+    let legacy_commit_namespaces = if matches!(
+        (&tantivy_state, &vector_state),
+        (
+            InventorySourceStateV1::Present { .. },
+            InventorySourceStateV1::Present { .. }
+        )
+    ) {
+        capture_commit_namespaces(corpus, vectors, legacy)?
+    } else {
+        Vec::new()
+    };
+    let namespace_projects = legacy_commit_namespaces
+        .iter()
+        .map(|row| {
+            (
+                row.namespace.as_str().to_string(),
+                attributed_projects(&row.attribution),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let cursor_by_project = corpus
+        .git_cursors
+        .rows
+        .iter()
+        .map(|row| (row.project_id.as_str(), row.last_ingested_sha.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let checkout_by_id = checkout_captures
+        .iter()
+        .map(|capture| (capture.observation.observation_id.as_str(), capture))
+        .collect::<BTreeMap<_, _>>();
+    let legacy_by_project = legacy
+        .observations
+        .iter()
+        .map(|project| (project.record.project_id.as_str(), project))
+        .collect::<BTreeMap<_, _>>();
+    let mut rows = Vec::new();
+    let mut runtime_common_dirs = BTreeMap::new();
+    let mut git_probe_corrupt = None;
+    for attachment in attachment_candidates {
+        let project = legacy_by_project
+            .get(attachment.project_id.as_str())
+            .copied()
+            .ok_or_else(|| invalid_source("attachment_legacy_project_missing"))?;
+        let checkout = checkout_by_id
+            .get(attachment.checkout_observation_id.as_str())
+            .copied()
+            .ok_or_else(|| invalid_source("attachment_checkout_missing"))?;
+        let project_root = legacy
+            .project_roots
+            .get(&attachment.project_id)
+            .ok_or_else(|| invalid_source("attachment_project_root_missing"))?;
+        let common_directory =
+            bbox_corpus_core::git::git_common_dir(checkout.runtime_root.as_path());
+        let first_commit =
+            bbox_corpus_core::git::git_first_commit_for_path(checkout.runtime_root.as_path());
+        if project.record.is_git_repo && (common_directory.is_none() || first_commit.is_none()) {
+            git_probe_corrupt.get_or_insert("git_repository_evidence_unavailable");
+            continue;
+        }
+        let materialized_commit_namespaces = namespace_projects
+            .iter()
+            .filter(|(_, projects)| projects.contains(&attachment.project_id))
+            .map(|(namespace, _)| namespace.clone())
+            .collect::<BTreeSet<_>>();
+        let mut resolved_refs = BTreeMap::new();
+        for publisher in &publisher_source.value.rows {
+            let belongs = legacy
+                .published_scopes
+                .get(&attachment.project_id)
+                .is_some_and(|scope| scope == &publisher.scope);
+            if !belongs {
+                continue;
+            }
+            if let Some(commit) =
+                bbox_corpus_core::git::resolve_commit(project_root.as_path(), &publisher.branch_ref)
+            {
+                resolved_refs.insert(publisher.branch_ref.clone(), commit);
+            }
+        }
+        let observation_id = stable_observation_id_v1(
+            "git-metadata",
+            &[
+                attachment.project_id.as_str().as_bytes(),
+                attachment.checkout_observation_id.as_bytes(),
+            ],
+        )?;
+        let common_directory_digest = common_directory
+            .as_ref()
+            .and_then(|path| path.to_str())
+            .map(digest_path);
+        if let Some(common_directory) = common_directory {
+            let authorized = AuthorizedInventoryPath::new(common_directory)?;
+            runtime_common_dirs.insert(observation_id.clone(), authorized);
+        }
+        rows.push(GitMetadataObservationV1 {
+            observation_id,
+            project_id: attachment.project_id.clone(),
+            checkout_observation_id: attachment.checkout_observation_id.clone(),
+            common_directory_digest,
+            full_first_commit: first_commit,
+            materialized_commit_namespaces,
+            last_ingested_sha: cursor_by_project
+                .get(attachment.project_id.as_str())
+                .cloned()
+                .flatten(),
+            resolved_refs,
+        });
+    }
+    let represented_cursor_projects = rows
+        .iter()
+        .map(|row| row.project_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if corpus
+        .git_cursors
+        .rows
+        .iter()
+        .any(|cursor| !represented_cursor_projects.contains(cursor.project_id.as_str()))
+    {
+        git_probe_corrupt.get_or_insert("git_cursor_checkout_evidence_missing");
+    }
+    let direct_git_state = if let Some(code) = git_probe_corrupt {
+        direct_owner_state("git-metadata", "corrupt", None, Some(code))
+    } else {
+        let rows_bytes =
+            serde_json::to_vec(&rows).map_err(|_| invalid_source("git_metadata_encode_failed"))?;
+        aggregate_inventory_states(
+            "git-metadata",
+            &[
+                cursor_state,
+                InventorySourceStateV1::Present {
+                    fingerprint: Sha256ValueV1::digest(&rows_bytes),
+                    content_hash: Sha256ValueV1::digest(&rows_bytes),
+                    byte_len: rows_bytes.len() as u64,
+                },
+            ],
+        )
+    };
+    let git_row_ids = rows
+        .iter()
+        .map(|row| row.observation_id.clone())
+        .collect::<BTreeSet<_>>();
+    let namespace_row_ids = legacy_commit_namespaces
+        .iter()
+        .map(|row| row.observation_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut lane = lane_capture(
+        ImmutableInventoryLaneKindV1::GitMetadata,
+        "git-metadata",
+        vec![
+            (
+                ImmutableInventoryOwnerKindV1::GitMetadata,
+                "git-metadata".to_string(),
+                direct_git_state,
+                git_row_ids,
+            ),
+            (
+                ImmutableInventoryOwnerKindV1::Tantivy,
+                "tantivy".to_string(),
+                tantivy_state,
+                namespace_row_ids.clone(),
+            ),
+            (
+                ImmutableInventoryOwnerKindV1::VectorMetadata,
+                "vector-metadata".to_string(),
+                vector_state,
+                namespace_row_ids,
+            ),
+        ],
+        rows,
+    )?;
+    if matches!(
+        lane.evidence.completeness,
+        crate::project_catalog_inventory::ImmutableInventoryLaneCompletenessV1::Complete
+    ) {
+        lane.evidence = ImmutableInventoryLaneEvidenceV1::from_owner_subsources(
+            ImmutableInventoryLaneKindV1::GitMetadata,
+            "git-metadata",
+            lane.rows.len() as u64 + legacy_commit_namespaces.len() as u64,
+            lane.evidence.owner_subsources.clone(),
+        )
+        .map_err(|error| invalid_source(error.to_string()))?;
+    }
+    if lane.rows.is_empty() {
+        runtime_common_dirs.clear();
+    }
+    let legacy_commit_namespaces = if lane.evidence.completeness
+        == crate::project_catalog_inventory::ImmutableInventoryLaneCompletenessV1::Complete
+    {
+        legacy_commit_namespaces
+    } else {
+        Vec::new()
+    };
+    Ok((lane, legacy_commit_namespaces, runtime_common_dirs))
+}
+
+fn capture_repo_grouping_proofs_lane(
+    legacy: &LegacyProjectsCaptureV1,
+    code_sources: &[CodeSourceCaptureV1],
+    git_metadata: &ImmutableLaneCaptureV1<GitMetadataObservationV1>,
+) -> AdapterResult<ImmutableLaneCaptureV1<RepoGroupingProofV1>> {
+    let derived_state = aggregate_inventory_states(
+        "derived-repo-grouping",
+        &[
+            legacy.owner_state.clone(),
+            git_metadata.evidence.source_state.clone(),
+        ],
+    );
+    let mut rows = Vec::new();
+    if matches!(derived_state, InventorySourceStateV1::Present { .. }) {
+        let mut authority_groups =
+            BTreeMap::<RecordedRepoAuthority, Vec<RecordedAuthorityEvidenceMemberV1>>::new();
+        for project in &legacy.observations {
+            let Some(authority) = &project.committed_authority else {
+                continue;
+            };
+            let project_id = ProjectId::parse(project.record.project_id.clone())
+                .map_err(|_| invalid_source("legacy_project_id_invalid"))?;
+            authority_groups
+                .entry(authority.authority.clone())
+                .or_default()
+                .push(RecordedAuthorityEvidenceMemberV1 {
+                    project_id,
+                    authority: authority.authority.clone(),
+                    authority_observation_id: authority.observation_id.clone(),
+                });
+        }
+        for (authority, mut members) in authority_groups {
+            if members.len() < 2 {
+                continue;
+            }
+            members.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+            rows.push(RepoGroupingProofV1::IdenticalCommittedRecordedAuthority {
+                proof_id: stable_observation_id_v1(
+                    "repo-proof",
+                    &[b"recorded-authority", authority.as_str().as_bytes()],
+                )?,
+                members,
+            });
+        }
+
+        let mut git_groups = BTreeMap::<(Sha256ValueV1, String), Vec<GitEvidenceMemberV1>>::new();
+        for git in &git_metadata.rows {
+            let (Some(common), Some(first_commit)) =
+                (&git.common_directory_digest, &git.full_first_commit)
+            else {
+                continue;
+            };
+            git_groups
+                .entry((common.clone(), first_commit.clone()))
+                .or_default()
+                .push(GitEvidenceMemberV1 {
+                    project_id: git.project_id.clone(),
+                    git_observation_id: git.observation_id.clone(),
+                });
+        }
+        for ((common, first_commit), mut members) in git_groups {
+            members.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+            members.dedup_by(|left, right| left.project_id == right.project_id);
+            if members.len() < 2 {
+                continue;
+            }
+            rows.push(
+                RepoGroupingProofV1::SharedGitCommonDirectoryAndFirstCommit {
+                    proof_id: stable_observation_id_v1(
+                        "repo-proof",
+                        &[
+                            b"git-common-first",
+                            common.as_str().as_bytes(),
+                            first_commit.as_bytes(),
+                        ],
+                    )?,
+                    members,
+                },
+            );
+        }
+
+        let mut collected_groups = BTreeMap::<String, Vec<CollectedEvidenceMemberV1>>::new();
+        for source in code_sources {
+            for generation in &source.observation.generations {
+                if !generation.checkout_missing {
+                    continue;
+                }
+                let Some(scope) = &generation.activation_scope else {
+                    continue;
+                };
+                if !matches!(
+                    &generation.descriptor,
+                    crate::project_catalog_inventory::ImmutableCollectedDescriptorV1::Valid {
+                        published_scope,
+                        ..
+                    } if published_scope == scope
+                ) {
+                    continue;
+                }
+                collected_groups
+                    .entry(scope.repo_id().to_string())
+                    .or_default()
+                    .push(CollectedEvidenceMemberV1 {
+                        project_id: generation.project_id.clone(),
+                        generation_observation_id: generation.observation_id.clone(),
+                    });
+            }
+        }
+        for (repo_id, mut members) in collected_groups {
+            members.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+            members.dedup_by(|left, right| left.project_id == right.project_id);
+            if members.len() < 2 {
+                continue;
+            }
+            rows.push(
+                RepoGroupingProofV1::CollectedDescriptorActivationAgreement {
+                    proof_id: stable_observation_id_v1(
+                        "repo-proof",
+                        &[b"collected-agreement", repo_id.as_bytes()],
+                    )?,
+                    members,
+                },
+            );
+        }
+    }
+    let row_ids = rows
+        .iter()
+        .map(|proof| proof.proof_id().to_string())
+        .collect::<BTreeSet<_>>();
+    lane_capture(
+        ImmutableInventoryLaneKindV1::RepoGroupingProofs,
+        "repo-grouping-proofs",
+        vec![(
+            ImmutableInventoryOwnerKindV1::DerivedRepoGrouping,
+            "derived-repo-grouping".to_string(),
+            derived_state,
+            row_ids,
+        )],
+        rows,
+    )
+}
+
+fn capture_legacy_namespace_clusters_lane(
+    legacy: &LegacyProjectsCaptureV1,
+    git_metadata: &ImmutableLaneCaptureV1<GitMetadataObservationV1>,
+) -> AdapterResult<ImmutableLaneCaptureV1<LegacyNamespaceClusterObservationV1>> {
+    let derived_state = aggregate_inventory_states(
+        "derived-legacy-namespaces",
+        &[
+            legacy.owner_state.clone(),
+            git_metadata.evidence.source_state.clone(),
+        ],
+    );
+    let mut rows = Vec::new();
+    if matches!(derived_state, InventorySourceStateV1::Present { .. }) {
+        let mut projects_by_namespace = BTreeMap::<String, BTreeSet<ProjectId>>::new();
+        for git in &git_metadata.rows {
+            for namespace in &git.materialized_commit_namespaces {
+                projects_by_namespace
+                    .entry(namespace.clone())
+                    .or_default()
+                    .insert(git.project_id.clone());
+            }
+        }
+        for (namespace, project_ids) in projects_by_namespace {
+            if project_ids.len() < 2 {
+                continue;
+            }
+            let cluster_id =
+                stable_observation_id_v1("namespace-cluster", &[namespace.as_bytes()])?;
+            rows.push(LegacyNamespaceClusterObservationV1 {
+                observation_id: stable_observation_id_v1(
+                    "legacy-namespace",
+                    &[cluster_id.as_bytes()],
+                )?,
+                cluster_id,
+                materialized_namespace: namespace,
+                project_ids,
+            });
+        }
+    }
+    let row_ids = rows
+        .iter()
+        .map(|row| row.observation_id.clone())
+        .collect::<BTreeSet<_>>();
+    lane_capture(
+        ImmutableInventoryLaneKindV1::LegacyNamespaceClusters,
+        "legacy-namespace-clusters",
+        vec![(
+            ImmutableInventoryOwnerKindV1::DerivedLegacyNamespaceClusters,
+            "derived-legacy-namespaces".to_string(),
+            derived_state,
+            row_ids,
+        )],
+        rows,
+    )
 }
 
 fn source_evidence(
@@ -2813,8 +4712,294 @@ mod tests {
         );
     }
 
+    fn present_owner_state(seed: &str) -> InventorySourceStateV1 {
+        InventorySourceStateV1::Present {
+            fingerprint: Sha256ValueV1::digest(seed.as_bytes()),
+            content_hash: Sha256ValueV1::digest(seed.as_bytes()),
+            byte_len: seed.len() as u64,
+        }
+    }
+
     #[test]
-    fn facade_refuses_until_required_owner_lanes_are_connected() {
+    fn owner_lane_completeness_is_exact_and_cannot_omit_a_subsource() {
+        let complete = lane_capture::<ProjectScopedRefObservationV1>(
+            ImmutableInventoryLaneKindV1::ProjectScopedRefs,
+            "project-scoped-refs",
+            vec![
+                (
+                    ImmutableInventoryOwnerKindV1::Tantivy,
+                    "tantivy".to_string(),
+                    present_owner_state("tantivy"),
+                    BTreeSet::new(),
+                ),
+                (
+                    ImmutableInventoryOwnerKindV1::VectorMetadata,
+                    "vector-metadata".to_string(),
+                    present_owner_state("vectors"),
+                    BTreeSet::new(),
+                ),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            complete.evidence.completeness,
+            crate::project_catalog_inventory::ImmutableInventoryLaneCompletenessV1::Complete
+        );
+
+        let missing = lane_capture::<ProjectScopedRefObservationV1>(
+            ImmutableInventoryLaneKindV1::ProjectScopedRefs,
+            "project-scoped-refs",
+            vec![
+                (
+                    ImmutableInventoryOwnerKindV1::Tantivy,
+                    "tantivy".to_string(),
+                    InventorySourceStateV1::Missing {
+                        fingerprint: Sha256ValueV1::digest(b"missing"),
+                    },
+                    BTreeSet::new(),
+                ),
+                (
+                    ImmutableInventoryOwnerKindV1::VectorMetadata,
+                    "vector-metadata".to_string(),
+                    present_owner_state("vectors"),
+                    BTreeSet::new(),
+                ),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            missing.evidence.completeness,
+            crate::project_catalog_inventory::ImmutableInventoryLaneCompletenessV1::Missing
+        );
+
+        let corrupt = lane_capture::<ProjectScopedRefObservationV1>(
+            ImmutableInventoryLaneKindV1::ProjectScopedRefs,
+            "project-scoped-refs",
+            vec![
+                (
+                    ImmutableInventoryOwnerKindV1::Tantivy,
+                    "tantivy".to_string(),
+                    InventorySourceStateV1::Corrupt {
+                        fingerprint: Sha256ValueV1::digest(b"corrupt"),
+                        content_hash: None,
+                        diagnostic_code: "owner_decode_failed".to_string(),
+                    },
+                    BTreeSet::new(),
+                ),
+                (
+                    ImmutableInventoryOwnerKindV1::VectorMetadata,
+                    "vector-metadata".to_string(),
+                    present_owner_state("vectors"),
+                    BTreeSet::new(),
+                ),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            corrupt.evidence.completeness,
+            crate::project_catalog_inventory::ImmutableInventoryLaneCompletenessV1::Corrupt
+        );
+
+        let omitted = lane_capture::<ProjectScopedRefObservationV1>(
+            ImmutableInventoryLaneKindV1::ProjectScopedRefs,
+            "project-scoped-refs",
+            vec![(
+                ImmutableInventoryOwnerKindV1::Tantivy,
+                "tantivy".to_string(),
+                present_owner_state("tantivy"),
+                BTreeSet::new(),
+            )],
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            omitted.code(),
+            "error.project_catalog_inventory_adapter_source"
+        );
+    }
+
+    fn namespace_legacy_capture() -> LegacyProjectsCaptureV1 {
+        let project_id = ProjectId::parse("project-a").unwrap();
+        LegacyProjectsCaptureV1 {
+            observations: vec![LegacyProjectObservationV1 {
+                observation_id: "legacy-project-a".to_string(),
+                record: LegacyProjectRecordInventoryV1 {
+                    project_id: project_id.to_string(),
+                    repo_id: Some("repo-one".to_string()),
+                    canonical_path_digest: digest_path("/tmp/project-a"),
+                    registered_at: "2026-01-01T00:00:00Z".to_string(),
+                    is_git_repo: true,
+                    languages: BTreeSet::new(),
+                    aliases: BTreeSet::new(),
+                },
+                path_status: LegacyProjectPathStatusV1::Missing,
+                committed_authority: Some(
+                    crate::project_catalog_inventory::CommittedAuthorityObservationV1 {
+                        observation_id: "authority-project-a".to_string(),
+                        authority: RecordedRepoAuthority::parse("repo-one").unwrap(),
+                    },
+                ),
+                committed_scope: None,
+            }],
+            source_evidence: Vec::new(),
+            owner_state: present_owner_state("legacy"),
+            published_scopes: BTreeMap::new(),
+            project_roots: BTreeMap::new(),
+            runtime_project_paths: BTreeMap::new(),
+        }
+    }
+
+    fn namespace_corpus_snapshot() -> CorpusOwnerMigrationSnapshotV1 {
+        use bbox_corpus_index::index::migration_inventory::{
+            CodeIndexMetadataMigrationSnapshotV1, CorpusCommitNamespaceV1,
+            CorpusIndexMigrationSnapshotV1, GitCursorMigrationSnapshotV1,
+        };
+
+        CorpusOwnerMigrationSnapshotV1 {
+            index: CorpusIndexMigrationSnapshotV1 {
+                version: 1,
+                state: CorpusMigrationSourceStateV1::Present,
+                schema_version: Some("schema".to_string()),
+                schema_fingerprint_sha256: Some("1".repeat(64)),
+                source_fingerprint_sha256: Some("2".repeat(64)),
+                document_count: 2,
+                project_scoped_ref_count: 0,
+                project_scoped_ref_commitment_sha256: "3".repeat(64),
+                project_scoped_refs: Vec::new(),
+                commit_namespaces: vec![CorpusCommitNamespaceV1 {
+                    namespace: "repo-one".to_string(),
+                    commit_document_count: 2,
+                    commit_document_commitment_sha256: "4".repeat(64),
+                }],
+            },
+            code_metadata: CodeIndexMetadataMigrationSnapshotV1 {
+                version: 1,
+                state: CorpusMigrationSourceStateV1::Present,
+                schema_fingerprint_sha256: "5".repeat(64),
+                source_fingerprint_sha256: Some("6".repeat(64)),
+                row_count: 0,
+                project_scoped_row_count: 0,
+                row_commitment_sha256: "7".repeat(64),
+                rows: Vec::new(),
+            },
+            git_cursors: GitCursorMigrationSnapshotV1 {
+                version: 1,
+                state: CorpusMigrationSourceStateV1::Present,
+                schema_fingerprint_sha256: "8".repeat(64),
+                source_fingerprint_sha256: Some("9".repeat(64)),
+                row_count: 0,
+                row_commitment_sha256: "a".repeat(64),
+                rows: Vec::new(),
+            },
+        }
+    }
+
+    fn namespace_vector_snapshot() -> VectorMigrationSnapshotV1 {
+        use bbox_vectors::migration_inventory::VectorCommitNamespaceV1;
+
+        VectorMigrationSnapshotV1 {
+            version: 1,
+            state: VectorMigrationSourceStateV1::Present,
+            schema_version: "schema".to_string(),
+            schema_fingerprint_sha256: "b".repeat(64),
+            source_fingerprint_sha256: Some("c".repeat(64)),
+            partition_count: 0,
+            active_key_count: 2,
+            project_scoped_ref_count: 0,
+            project_scoped_ref_commitment_sha256: "d".repeat(64),
+            partitions: Vec::new(),
+            project_scoped_refs: Vec::new(),
+            commit_namespaces: vec![VectorCommitNamespaceV1 {
+                namespace: "repo-one".to_string(),
+                vector_key_count: 2,
+                vector_key_commitment_sha256: "e".repeat(64),
+            }],
+        }
+    }
+
+    #[test]
+    fn namespace_join_detects_changed_and_omitted_owner_rows() {
+        let legacy = namespace_legacy_capture();
+        let corpus = namespace_corpus_snapshot();
+        let vectors = namespace_vector_snapshot();
+        let joined = capture_commit_namespaces(&corpus, &vectors, &legacy).unwrap();
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].commit_document_count, 2);
+        assert_eq!(joined[0].vector_key_count, 2);
+        assert!(matches!(
+            joined[0].attribution,
+            LegacyCommitNamespaceAttributionV1::Proved { .. }
+        ));
+
+        let mut changed_corpus = corpus.clone();
+        changed_corpus.index.commit_namespaces[0].commit_document_count = 3;
+        changed_corpus.index.commit_namespaces[0].commit_document_commitment_sha256 =
+            "f".repeat(64);
+        let changed = capture_commit_namespaces(&changed_corpus, &vectors, &legacy).unwrap();
+        assert_ne!(changed, joined);
+
+        let mut omitted_vector = vectors.clone();
+        omitted_vector.commit_namespaces.clear();
+        let omitted = capture_commit_namespaces(&corpus, &omitted_vector, &legacy).unwrap();
+        assert_eq!(omitted.len(), 1);
+        assert_eq!(omitted[0].vector_key_count, 0);
+        assert_ne!(
+            omitted[0].vector_key_set_sha256,
+            joined[0].vector_key_set_sha256
+        );
+
+        let mut omitted_corpus = corpus;
+        omitted_corpus.index.commit_namespaces.clear();
+        omitted_vector.commit_namespaces.clear();
+        assert!(
+            capture_commit_namespaces(&omitted_corpus, &omitted_vector, &legacy)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unrepresented_git_cursor_fails_the_git_lane_closed() {
+        use bbox_corpus_index::index::migration_inventory::GitCursorMigrationRowV1;
+
+        let legacy = namespace_legacy_capture();
+        let mut corpus = namespace_corpus_snapshot();
+        corpus.git_cursors.row_count = 1;
+        corpus.git_cursors.rows = vec![GitCursorMigrationRowV1 {
+            project_id: "project-a".to_string(),
+            last_ingested_sha: Some("1".repeat(40)),
+        }];
+        let vectors = namespace_vector_snapshot();
+        let publisher = ExactDecodedSourceV1 {
+            source: ExactSourceBytesV1::new(Vec::new()),
+            value: PublisherRefInventoryV1 { rows: Vec::new() },
+            was_missing: true,
+        };
+        let (lane, namespaces, runtime_common_dirs) =
+            capture_git_metadata_lane(&corpus, &vectors, &legacy, &publisher, &[], &[]).unwrap();
+        assert_eq!(
+            lane.evidence.completeness,
+            crate::project_catalog_inventory::ImmutableInventoryLaneCompletenessV1::Corrupt
+        );
+        assert!(lane.rows.is_empty());
+        assert!(namespaces.is_empty());
+        assert!(runtime_common_dirs.is_empty());
+        assert!(lane.evidence.owner_subsources.iter().any(|owner| {
+            matches!(
+                &owner.source_state,
+                InventorySourceStateV1::Corrupt {
+                    diagnostic_code,
+                    ..
+                } if diagnostic_code == "git_cursor_checkout_evidence_missing"
+            )
+        }));
+    }
+
+    #[test]
+    fn attachment_discovery_is_stable_and_duplicate_roots_refuse() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let projects = root.join("projects.json");
@@ -2831,28 +5016,28 @@ mod tests {
             }))
             .unwrap(),
         );
-        let publisher = PublisherRefStore::open(root.join("publisher-refs.json")).unwrap();
-        let code_source =
-            CodeSourceStore::open(root.join("code-sources"), StoreLimits::default()).unwrap();
-        let error = ProjectCatalogMigrationInventoryFacadeV1::capture(
-            ProjectCatalogMigrationInventoryRequestV1 {
+        let discovered =
+            ProjectCatalogMigrationInventoryFacadeV1::discover_attachment_candidate_keys(
+                ProjectCatalogAttachmentCandidateDiscoveryRequestV1 {
+                    legacy_project_store_path: projects.clone(),
+                    checkout_roots: vec![root.clone()],
+                },
+            )
+            .unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].base_relpath, ".");
+        let second = ProjectCatalogMigrationInventoryFacadeV1::discover_attachment_candidate_keys(
+            ProjectCatalogAttachmentCandidateDiscoveryRequestV1 {
                 legacy_project_store_path: projects.clone(),
-                publisher_ref_store: &publisher,
-                code_source_store: &code_source,
-                checkout_roots: Vec::new(),
+                checkout_roots: vec![root.clone()],
             },
         )
-        .unwrap_err();
-        assert_eq!(
-            error.code(),
-            "error.project_catalog_inventory_owner_lane_unsupported"
-        );
+        .unwrap();
+        assert_eq!(discovered, second);
 
-        let error = ProjectCatalogMigrationInventoryFacadeV1::capture(
-            ProjectCatalogMigrationInventoryRequestV1 {
+        let error = ProjectCatalogMigrationInventoryFacadeV1::discover_attachment_candidate_keys(
+            ProjectCatalogAttachmentCandidateDiscoveryRequestV1 {
                 legacy_project_store_path: projects,
-                publisher_ref_store: &publisher,
-                code_source_store: &code_source,
                 checkout_roots: vec![root.clone(), root],
             },
         )

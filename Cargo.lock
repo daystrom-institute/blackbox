@@ -571,6 +571,7 @@ name = "bbox-indexing"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bbox-artifacts",
  "bbox-chunker",
  "bbox-code-source",
  "bbox-code-source-store",
@@ -581,10 +582,14 @@ dependencies = [
  "bbox-edge-sidecar",
  "bbox-gaps",
  "bbox-knowledge",
+ "bbox-packets",
+ "bbox-provenance",
+ "bbox-slack",
  "bbox-stores",
  "bbox-threads",
  "bbox-util",
  "bbox-vectors",
+ "bbox-whiteboards",
  "bro-core",
  "bro-transcript",
  "fs2",
