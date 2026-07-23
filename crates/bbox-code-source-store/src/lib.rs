@@ -2200,7 +2200,9 @@ pub fn enumerate_current_migration_inventory_for_scopes_locked(
         |project_id, bytes, record| {
             collision_lifecycle_commitment.add(&project_id, &bytes)?;
             let relevant = record.state != CollisionRetirementLifecycleStateV1::Completed
-                || expected_retirement_selectors.contains(&record.selector);
+                || record
+                    .exact_selector()
+                    .is_some_and(|selector| expected_retirement_selectors.contains(selector));
             if relevant {
                 if collision_pending.len() >= limits.max_migration_survivor_rows {
                     bail!("relevant collision lifecycle inventory exceeds its row limit");
