@@ -997,12 +997,13 @@ fn observe_code_sources(
                 ));
             }
             Some(_) => {}
-            None => {
+            None if missing_checkout_projects.contains(&activation.project_id) => {
                 project_authority_scopes.insert(
                     activation.project_id.clone(),
                     selection.published_scope.clone(),
                 );
             }
+            None => {}
         }
         insert_generation_owner(
             &mut owner_by_generation,
@@ -1097,6 +1098,26 @@ fn observe_code_sources(
             return Err(invalid_source("retained_generation_owner_missing"));
         }
         owner_by_generation.insert(generation.generation_id.clone(), candidates[0].clone());
+    }
+    for collision in &snapshot.owner.inventory.collision_pending {
+        let expected_generation_ids = owner_by_generation
+            .iter()
+            .filter_map(|(generation_id, project_id)| {
+                (project_id == &collision.project_id).then_some(generation_id.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        if collision
+            .record
+            .entries
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            != expected_generation_ids
+        {
+            return Err(invalid_source(
+                "collision_lifecycle_owner_generation_set_mismatch",
+            ));
+        }
     }
     let mut collision_by_generation = BTreeMap::new();
     for row in &snapshot.owner.inventory.collision_pending {
@@ -2445,20 +2466,34 @@ mod tests {
         let mut collision = CollisionRetirementLifecycleV1 {
             version: 1,
             project_id: project_id.clone(),
-            entries: BTreeMap::from([(
-                active_generation_id.clone(),
-                CollisionRetirementEntryV1 {
-                    state: CollisionRetirementLifecycleStateV1::Pending,
-                    former_scope: scope.clone(),
-                    selector_evidence: CollisionRetirementSelectorEvidenceV1::ExactMaterialized(
-                        selector,
-                    ),
-                    snapshot_id: format!("collected-{}", "e".repeat(32)),
-                    manifest_sha256: descriptor_manifest_sha256,
-                    inventory_hash: "d".repeat(64),
-                    plan_hash: "f".repeat(64),
-                },
-            )]),
+            entries: BTreeMap::from([
+                (
+                    active_generation_id.clone(),
+                    CollisionRetirementEntryV1 {
+                        state: CollisionRetirementLifecycleStateV1::Pending,
+                        former_scope: scope.clone(),
+                        selector_evidence: CollisionRetirementSelectorEvidenceV1::ExactMaterialized(
+                            selector,
+                        ),
+                        snapshot_id: format!("collected-{}", "e".repeat(32)),
+                        manifest_sha256: descriptor_manifest_sha256.clone(),
+                        inventory_hash: "d".repeat(64),
+                        plan_hash: "f".repeat(64),
+                    },
+                ),
+                (
+                    retained_generation_id.clone(),
+                    CollisionRetirementEntryV1 {
+                        state: CollisionRetirementLifecycleStateV1::Pending,
+                        former_scope: scope.clone(),
+                        selector_evidence: CollisionRetirementSelectorEvidenceV1::NoDurableSelector,
+                        snapshot_id: format!("collected-{}", "f".repeat(32)),
+                        manifest_sha256: descriptor_manifest_sha256,
+                        inventory_hash: "d".repeat(64),
+                        plan_hash: "f".repeat(64),
+                    },
+                ),
+            ]),
         };
         write(
             &paths.collision_retirement_pending(&project_id),
@@ -2477,29 +2512,11 @@ mod tests {
             .to_string(),
             "error.project_catalog_inventory_adapter_source: active_descriptor_committed_scope_mismatch"
         );
-        let present_checkout_capture =
-            observe_code_sources(&snapshot, &BTreeMap::new(), &BTreeSet::new()).unwrap();
         assert_eq!(
-            present_checkout_capture
-                .project_authority_scopes
-                .get(&project_id),
-            Some(&scope)
-        );
-        let retained_with_present_checkout = present_checkout_capture
-            .sources
-            .iter()
-            .find(|source| source.observation.project_id == project_id)
-            .and_then(|source| {
-                source
-                    .observation
-                    .generations
-                    .iter()
-                    .find(|generation| generation.generation_id == retained_generation_id)
-            })
-            .unwrap();
-        assert_eq!(
-            retained_with_present_checkout.role,
-            CollectedGenerationRoleV1::Retained
+            observe_code_sources(&snapshot, &BTreeMap::new(), &BTreeSet::new())
+                .unwrap_err()
+                .to_string(),
+            "error.project_catalog_inventory_adapter_source: collision_lifecycle_owner_generation_set_mismatch"
         );
         let capture = observe_code_sources(
             &snapshot,
@@ -2552,17 +2569,43 @@ mod tests {
                     .contains(&quarantined.observation_id)
             });
         assert!(bound);
-        let retained = &capture.sources[0].observation.generations[0];
+        let retained = capture.sources[0]
+            .observation
+            .quarantine
+            .iter()
+            .find(|generation| generation.generation_id == retained_generation_id)
+            .unwrap();
         assert_eq!(retained.generation_id, retained_generation_id);
-        assert_eq!(retained.role, CollectedGenerationRoleV1::Retained);
-        assert_eq!(retained.activation_scope, None);
         assert_eq!(
-            retained.selector_evidence,
+            retained.collision_lifecycle.selector_evidence,
             DurableSelectorEvidenceV1::NoDurableSelector
         );
 
         drop(capture);
         drop(snapshot);
+        let mut incomplete_collision = collision.clone();
+        incomplete_collision.entries.remove(&retained_generation_id);
+        write(
+            &paths.collision_retirement_pending(&project_id),
+            &encode_collision_retirement_pending_for_migration(&incomplete_collision).unwrap(),
+        );
+        let snapshot =
+            capture_code_source_inventory(&store, &BTreeSet::from([scope.clone()])).unwrap();
+        assert_eq!(
+            observe_code_sources(
+                &snapshot,
+                &BTreeMap::new(),
+                &BTreeSet::from([project_id.clone()]),
+            )
+            .unwrap_err()
+            .to_string(),
+            "error.project_catalog_inventory_adapter_source: collision_lifecycle_owner_generation_set_mismatch"
+        );
+        drop(snapshot);
+        write(
+            &paths.collision_retirement_pending(&project_id),
+            &encode_collision_retirement_pending_for_migration(&collision).unwrap(),
+        );
         fs::remove_file(paths.activation(&project_id)).unwrap();
         fs::write(
             paths.anchor(),

@@ -653,7 +653,7 @@ impl CollisionRetirementLifecycleV1 {
             .ok_or_else(|| anyhow!("collision retirement generation is absent"))
     }
 
-    fn validate_transition_from(&self, previous: &Self) -> Result<()> {
+    pub fn validate_transition_from(&self, previous: &Self) -> Result<()> {
         self.validate()?;
         previous.validate()?;
         if self.project_id != previous.project_id
@@ -667,6 +667,35 @@ impl CollisionRetirementLifecycleV1 {
             entry.validate_transition_from(previous_entry)?;
         }
         Ok(())
+    }
+
+    pub fn validate_descendant_from(&self, previous: &Self) -> Result<()> {
+        self.validate()?;
+        previous.validate()?;
+        if self.project_id != previous.project_id
+            || self.entries.keys().collect::<Vec<_>>()
+                != previous.entries.keys().collect::<Vec<_>>()
+        {
+            bail!("collision retirement lifecycle membership changed");
+        }
+        for (generation_id, entry) in &self.entries {
+            let previous_entry = &previous.entries[generation_id];
+            if !entry.immutable_evidence_eq(previous_entry)
+                || collision_retirement_state_rank(entry.state)
+                    < collision_retirement_state_rank(previous_entry.state)
+            {
+                bail!("collision retirement lifecycle evidence changed or state regressed");
+            }
+        }
+        Ok(())
+    }
+}
+
+fn collision_retirement_state_rank(state: CollisionRetirementLifecycleStateV1) -> u8 {
+    match state {
+        CollisionRetirementLifecycleStateV1::Pending => 0,
+        CollisionRetirementLifecycleStateV1::Queued => 1,
+        CollisionRetirementLifecycleStateV1::Completed => 2,
     }
 }
 
@@ -3821,7 +3850,7 @@ impl CodeSourceStore {
                         }
                         CollisionRetirementLifecycleStateV1::Queued => {
                             if existing.is_none() {
-                                atomic_write_json(&work_path, &work)?;
+                                bail!("queued collision retirement lacks its work row");
                             }
                         }
                         CollisionRetirementLifecycleStateV1::Completed => {
@@ -3844,11 +3873,37 @@ impl CodeSourceStore {
     }
 
     pub fn collision_retirement_work_records(&self) -> Result<Vec<CollisionRetirementWorkV1>> {
+        let _guard = self.lock_mutation()?;
+        let mut lifecycle_entries = BTreeMap::new();
+        walk_collision_lifecycle_records(
+            &self.paths,
+            "collision retirement lifecycle",
+            |_, _, lifecycle| {
+                for (generation_id, entry) in lifecycle.entries {
+                    let identity = (lifecycle.project_id.clone(), generation_id);
+                    if lifecycle_entries.insert(identity, entry).is_some() {
+                        bail!("collision retirement lifecycle identity is duplicated");
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        let mut missing_queued_work = lifecycle_entries
+            .iter()
+            .filter_map(|(identity, entry)| {
+                (entry.state == CollisionRetirementLifecycleStateV1::Queued)
+                    .then_some(identity.clone())
+            })
+            .collect::<BTreeSet<_>>();
         let path = self.root().join("collision-retirement-work");
         let Some(directory) = NofollowDirectory::open_existing(&path)? else {
-            return Ok(Vec::new());
+            if missing_queued_work.is_empty() {
+                return Ok(Vec::new());
+            }
+            bail!("queued collision retirement lacks its work row");
         };
         let mut records = Vec::new();
+        let mut completed_lag_paths = Vec::new();
         for name in sorted_regular_entry_names(
             &path,
             MAX_MIGRATION_INVENTORY_GENERATIONS,
@@ -3869,10 +3924,98 @@ impl CodeSourceStore {
             if collision_retirement_work_id(&record.project_id, &record.generation_id) != work_id {
                 bail!("collision retirement work path and identity disagree");
             }
-            records.push(record);
+            let identity = (record.project_id.clone(), record.generation_id.clone());
+            let entry = lifecycle_entries
+                .get(&identity)
+                .ok_or_else(|| anyhow!("collision retirement work row is orphaned"))?;
+            if !record.matches_entry(entry) {
+                bail!("collision retirement work row rewrites lifecycle evidence");
+            }
+            match entry.state {
+                CollisionRetirementLifecycleStateV1::Pending => {
+                    bail!("collision retirement work precedes its queued lifecycle state");
+                }
+                CollisionRetirementLifecycleStateV1::Queued => {
+                    if !missing_queued_work.remove(&identity) {
+                        bail!("collision retirement work identity is duplicated");
+                    }
+                    records.push(record);
+                }
+                CollisionRetirementLifecycleStateV1::Completed => {
+                    completed_lag_paths.push(path.join(&name));
+                }
+            }
         }
         directory.ensure_still_current()?;
+        if !missing_queued_work.is_empty() {
+            bail!("queued collision retirement lacks its work row");
+        }
+        for completed_lag_path in completed_lag_paths {
+            remove_file_if_exists(&completed_lag_path)?;
+        }
+        records.sort_by(|left, right| {
+            left.project_id
+                .cmp(&right.project_id)
+                .then_with(|| left.generation_id.cmp(&right.generation_id))
+        });
         Ok(records)
+    }
+
+    pub fn repair_collision_generation_state(
+        &self,
+        project_id: &ProjectId,
+        generation_id: &str,
+    ) -> Result<()> {
+        validate_sha256(generation_id)?;
+        let _guard = self.lock_mutation()?;
+        let lifecycle = self
+            .collision_lifecycle_for_project_locked(project_id)?
+            .ok_or_else(|| anyhow!("collision retirement lifecycle is missing"))?;
+        let entry = lifecycle.entry(generation_id)?;
+        if entry.state != CollisionRetirementLifecycleStateV1::Queued {
+            bail!("collision retirement generation repair requires queued lifecycle state");
+        }
+        let work_path = self
+            .paths
+            .collision_retirement_work(project_id, generation_id)?;
+        let work = read_collision_retirement_work_nofollow(&work_path)?
+            .ok_or_else(|| anyhow!("queued collision retirement work row is missing"))?;
+        if !work.matches_entry(entry) {
+            bail!("collision retirement work row rewrites lifecycle evidence");
+        }
+
+        let activation_path = self.paths.activation(project_id);
+        if activation_path.is_file() {
+            let activation = read_mixed_activation(&activation_path)?;
+            if activation.project_id() != project_id.as_str() {
+                bail!("collision retirement activation identity disagrees");
+            }
+            if activation.generation_id() == generation_id {
+                bail!("collision retirement generation remains active");
+            }
+        }
+
+        let metadata_path = self
+            .paths
+            .generation_metadata(&entry.former_scope, generation_id)?;
+        let mut stored = read_mixed_stored_generation(&metadata_path)?;
+        if stored.generation_id() != generation_id
+            || stored.descriptor().scope != entry.former_scope
+        {
+            bail!("collision retirement generation metadata disagrees with lifecycle evidence");
+        }
+        match &mut stored {
+            MixedStoredGeneration::LegacyV1(record) => {
+                record.state = GenerationState::Superseded;
+                record.diagnostic = None;
+            }
+            MixedStoredGeneration::CurrentV2(record) => {
+                record.state = GenerationState::Superseded;
+                record.diagnostic = None;
+            }
+        }
+        self.save_mixed_generation_locked(&stored)?;
+        self.update_desired_if_same_mixed(&stored)
     }
 
     pub fn complete_collision_retirement(
@@ -6661,7 +6804,7 @@ mod tests {
     }
 
     #[test]
-    fn collision_lifecycle_reconciliation_repairs_queued_absence_and_completed_lag() {
+    fn collision_lifecycle_reconciliation_refuses_queued_absence_and_repairs_completed_lag() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let store = open_store(&root);
@@ -6671,8 +6814,15 @@ mod tests {
         }
         write_collision_lifecycle(&store, &lifecycle);
 
-        store.reconcile_collision_retirements().unwrap();
+        assert!(store.reconcile_collision_retirements().is_err());
+        assert!(store.collision_retirement_work_records().is_err());
 
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = open_store(&root);
+        let mut lifecycle = collision_lifecycle_fixture();
+        write_collision_lifecycle(&store, &lifecycle);
+        store.reconcile_collision_retirements().unwrap();
         let work_path = store
             .paths
             .collision_retirement_work(&lifecycle.project_id, &"a".repeat(64))
@@ -6727,6 +6877,32 @@ mod tests {
                 .inventory_hash,
             "2".repeat(64)
         );
+    }
+
+    #[test]
+    fn collision_lifecycle_descendant_validation_is_transitive_and_immutable() {
+        let pending = collision_lifecycle_fixture();
+        let mut completed = pending.clone();
+        for entry in completed.entries.values_mut() {
+            entry.state = CollisionRetirementLifecycleStateV1::Completed;
+        }
+
+        completed.validate_descendant_from(&pending).unwrap();
+        assert!(completed.validate_transition_from(&pending).is_err());
+
+        let mut rewritten = completed.clone();
+        rewritten
+            .entries
+            .get_mut(&"b".repeat(64))
+            .unwrap()
+            .inventory_hash = "9".repeat(64);
+        assert!(rewritten.validate_descendant_from(&pending).is_err());
+
+        let mut regressed = completed;
+        regressed.entries.get_mut(&"a".repeat(64)).unwrap().state =
+            CollisionRetirementLifecycleStateV1::Pending;
+        assert!(regressed.validate_descendant_from(&pending).is_ok());
+        assert!(pending.validate_descendant_from(&regressed).is_err());
     }
 
     #[test]

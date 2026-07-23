@@ -2397,6 +2397,47 @@ pub struct QuarantinePostImageInputV1 {
     pub generation_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedQuarantineBindingsV1 {
+    plan_hash: Sha256ValueV1,
+    transaction_id: ProjectCatalogTransactionId,
+    generation_owners: BTreeMap<Sha256ValueV1, ProjectId>,
+    bindings: BTreeSet<(ProjectId, Sha256ValueV1)>,
+}
+
+impl ValidatedQuarantineBindingsV1 {
+    pub fn plan_hash(&self) -> &Sha256ValueV1 {
+        &self.plan_hash
+    }
+
+    pub fn bindings(&self) -> &BTreeSet<(ProjectId, Sha256ValueV1)> {
+        &self.bindings
+    }
+
+    pub fn transaction_id(&self) -> &ProjectCatalogTransactionId {
+        &self.transaction_id
+    }
+
+    pub fn generation_owners(&self) -> &BTreeMap<Sha256ValueV1, ProjectId> {
+        &self.generation_owners
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(
+        plan_hash: Sha256ValueV1,
+        transaction_id: ProjectCatalogTransactionId,
+        generation_owners: BTreeMap<Sha256ValueV1, ProjectId>,
+        bindings: BTreeSet<(ProjectId, Sha256ValueV1)>,
+    ) -> Self {
+        Self {
+            plan_hash,
+            transaction_id,
+            generation_owners,
+            bindings,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PredictedPostImageHashesV1 {
@@ -3045,6 +3086,83 @@ pub fn validate_supported_resolution(
         ));
     }
     Ok(())
+}
+
+pub fn validated_quarantine_bindings(
+    inventory: &V1ProjectCatalogInventory,
+    report: &ProjectCatalogMigrationReportV1,
+    resolution: &ProjectCatalogMigrationResolutionV1,
+    post_image: &DeterministicPostImageInputV1,
+) -> InventoryResult<ValidatedQuarantineBindingsV1> {
+    validate_supported_resolution(inventory, report, resolution, post_image)?;
+    let mut generation_owners = BTreeMap::new();
+    for source in &inventory.code_sources {
+        for generation in &source.generations {
+            let generation_id = Sha256ValueV1::parse(generation.generation_id.clone())?;
+            if generation_owners
+                .insert(generation_id, generation.project_id.clone())
+                .is_some()
+            {
+                return Err(duplicate("canonical generation owner"));
+            }
+        }
+        for generation in &source.quarantine {
+            let generation_id = Sha256ValueV1::parse(generation.generation_id.clone())?;
+            if generation_owners
+                .insert(generation_id, generation.project_id.clone())
+                .is_some()
+            {
+                return Err(duplicate("canonical generation owner"));
+            }
+        }
+    }
+    for generation in &inventory.retained_owner_resolutions {
+        let quarantined_owner = post_image
+            .quarantined_collected
+            .iter()
+            .find(|row| row.generation_id == generation.generation_id)
+            .map(|row| row.project_id.clone());
+        let owner = match quarantined_owner {
+            Some(owner) => owner,
+            None => {
+                let candidates = post_image
+                    .resolved_project_scopes
+                    .iter()
+                    .filter(|row| {
+                        generation.candidate_project_ids.contains(&row.project_id)
+                            && row.published_scope.as_ref() == Some(&generation.published_scope)
+                    })
+                    .map(|row| row.project_id.clone())
+                    .collect::<BTreeSet<_>>();
+                if candidates.len() != 1 {
+                    return Err(invalid(
+                        "validated retained generation lacks one canonical owner",
+                    ));
+                }
+                candidates.into_iter().next().expect("one canonical owner")
+            }
+        };
+        let generation_id = Sha256ValueV1::parse(generation.generation_id.clone())?;
+        if generation_owners.insert(generation_id, owner).is_some() {
+            return Err(duplicate("canonical generation owner"));
+        }
+    }
+    let bindings = post_image
+        .quarantined_collected
+        .iter()
+        .map(|row| {
+            Ok((
+                row.project_id.clone(),
+                Sha256ValueV1::parse(row.generation_id.clone())?,
+            ))
+        })
+        .collect::<InventoryResult<BTreeSet<_>>>()?;
+    Ok(ValidatedQuarantineBindingsV1 {
+        plan_hash: report.plan_hash.clone(),
+        transaction_id: post_image.transaction_id.clone(),
+        generation_owners,
+        bindings,
+    })
 }
 
 fn validate_publisher_disposition_set<'a>(
@@ -3950,18 +4068,19 @@ fn project_authority_scope<'a>(
             ImmutableCollectedDescriptorV1::Valid {
                 published_scope, ..
             } if generation.activation_scope.as_ref() == Some(published_scope) => {
-                Some(published_scope)
+                Some((published_scope, generation.checkout_missing))
             }
             ImmutableCollectedDescriptorV1::Valid { .. }
             | ImmutableCollectedDescriptorV1::Missing
             | ImmutableCollectedDescriptorV1::Corrupt { .. } => None,
         });
     match (committed, active) {
-        (Some(committed), Some(active)) if committed != active => Err(invalid(
+        (Some(committed), Some((active, _))) if committed != active => Err(invalid(
             "publisher committed and active scope authorities disagree",
         )),
         (Some(committed), _) => Ok(Some(committed)),
-        (None, active) => Ok(active),
+        (None, Some((active, true))) => Ok(Some(active)),
+        (None, Some((_, false)) | None) => Ok(None),
     }
 }
 
@@ -5203,6 +5322,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn collected_scope_authority_is_only_a_missing_checkout_fallback() {
+        let mut inventory = fixture_inventory();
+        let project_id = project_id("alpha");
+        inventory
+            .legacy_projects
+            .iter_mut()
+            .find(|project| project.record.project_id == project_id.as_str())
+            .unwrap()
+            .committed_scope = None;
+        let generation = inventory
+            .code_sources
+            .iter_mut()
+            .find(|source| source.project_id == project_id)
+            .unwrap()
+            .generations
+            .first_mut()
+            .unwrap();
+
+        generation.checkout_missing = false;
+        assert_eq!(
+            project_authority_scope(&inventory, &project_id).unwrap(),
+            None
+        );
+
+        generation.checkout_missing = true;
+        assert_eq!(
+            project_authority_scope(&inventory, &project_id).unwrap(),
+            Some(&scope("services/alpha"))
+        );
+
+        inventory
+            .legacy_projects
+            .iter_mut()
+            .find(|project| project.record.project_id == project_id.as_str())
+            .unwrap()
+            .committed_scope = Some(scope("services/different"));
+        assert!(project_authority_scope(&inventory, &project_id).is_err());
+    }
+
     fn fixture_post_image(inventory: &V1ProjectCatalogInventory) -> DeterministicPostImageInputV1 {
         let inventory_hash = inventory.inventory_hash().unwrap();
         let checkout_id = "e".repeat(32);
@@ -5767,6 +5926,36 @@ mod tests {
         assert_ne!(
             canonical_plan_hash(&inventory, &resolution, &changed).unwrap(),
             report.plan_hash
+        );
+    }
+
+    #[test]
+    fn quarantine_bindings_cannot_be_laundered_with_coordinated_post_image_and_hash_changes() {
+        let inventory = fixture_inventory();
+        let resolution =
+            ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
+        let post_image = fixture_post_image(&inventory);
+        let report = fixture_report(&inventory, &resolution, &post_image);
+        let authority =
+            validated_quarantine_bindings(&inventory, &report, &resolution, &post_image).unwrap();
+        assert!(authority.bindings().is_empty());
+
+        let mut laundered_post_image = post_image;
+        laundered_post_image
+            .quarantined_collected
+            .push(QuarantinePostImageInputV1 {
+                project_id: project_id("alpha"),
+                generation_id: "e".repeat(64),
+            });
+        let laundered_report = fixture_report(&inventory, &resolution, &laundered_post_image);
+        assert!(
+            validated_quarantine_bindings(
+                &inventory,
+                &laundered_report,
+                &resolution,
+                &laundered_post_image,
+            )
+            .is_err()
         );
     }
 
