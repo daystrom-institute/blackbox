@@ -444,10 +444,11 @@ until a later entry explicitly supersedes it.
 - Status: accepted after independent plan re-review
 - Decision: One project-scoped lifecycle record advances through typed
   `Pending`, `Queued`, and `Completed` states while preserving the original
-  losing project, former scope, generation, selector, and migration evidence.
-  The completed record is retained as the terminal receipt. The physical queue
-  is subordinate execution state; a matching lagging row is tolerated and
-  removed idempotently.
+  losing project, former scope, generation, typed selector evidence, and
+  migration evidence. Active losers carry their exact materialized selector;
+  retained-only losers carry `NoDurableSelector`. The completed record is
+  retained as the terminal receipt. The physical queue is subordinate execution
+  state; a matching lagging row is tolerated and removed idempotently.
 - Evidence:
   - Deleting the only collision record after retirement erases the durable
     explanation for unavailable migrated state.
@@ -504,3 +505,54 @@ until a later entry explicitly supersedes it.
   CLI adapter from inventing authority or bypassing the migration facade.
 - Revisit only if: the facade adopts one typed location object that makes
   conflicting overrides unrepresentable while preserving these semantics.
+
+## D-022: Ordinary retained generations carry no fabricated selector
+
+- Date: 2026-07-23
+- Phase: durable project catalog, migration inventory
+- Status: accepted after independent plan re-review
+- Decision: Active generations and active collision losers must carry their
+  exact durable materialized selectors. An ordinary retained generation or
+  retained-only collision loser without an activation has no selector
+  authority and carries typed `NoDurableSelector`; migration joins it through
+  the owner-locked retention set, immutable descriptor and manifest, generation
+  id, project, and scope. Retained-only collision retirement is keyed by exact
+  project/generation identity. Ambiguous retained scope ownership produces a
+  bounded resolution-required candidate set instead of an invented owner or
+  pre-report abort.
+- Evidence:
+  - Stored-generation evidence does not durably retain the `:m<16hex>`
+    materialization suffix after activation/effective selection is gone.
+  - The project-plus-generation selector is only a prefix and cannot authorize
+    retirement, quarantine, or an exact selector join.
+  - Descriptor, manifest, owner retention, project, and scope remain exact
+    evidence for rewriting ordinary retained metadata.
+- Rationale: Typed absence preserves every authority distinction while still
+  migrating retained bytes whose ownership is provable.
+- Revisit only if: the owner store begins durably binding the exact
+  materialized selector to every retained generation.
+
+## D-023: Canonical inventory is path-redacted
+
+- Date: 2026-07-23
+- Phase: durable project catalog, migration inventory privacy
+- Status: accepted after independent plan re-review
+- Decision: Canonical inventory JSON contains domain-separated path digests,
+  typed relationships, and stable row ids, never absolute paths or literal
+  legacy selectors. Bounded literals live only in a non-serializable
+  host-local runtime binding set paired one-to-one with those digests. Apply
+  recaptures inventory and bindings under the same owner locks and verifies the
+  pairing. The explicit owner-only local-path review artifact and strict
+  attachment post-image remain separate sensitive host-local surfaces.
+- Evidence:
+  - Canonical inventory bytes are hashed and may otherwise leak through debug,
+    serialization, or report plumbing.
+  - Deepest-root classification still requires literals during capture and
+    apply, but the durable binding needs only their domain-separated digest.
+  - D-013 already requires default reports and public fixtures to remain
+    path-redacted.
+- Rationale: Separating deterministic evidence from ephemeral path authority
+  preserves reproducibility without making canonical inventory a disclosure
+  surface.
+- Revisit only if: a different non-serializable capability model provides the
+  same digest-bound classification and apply-time recapture guarantees.

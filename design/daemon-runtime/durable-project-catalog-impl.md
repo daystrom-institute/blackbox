@@ -511,14 +511,17 @@ Before import, take a read-only inventory of:
   required for inventory-time deepest-root classification; and
 - materialized aliases and registration timestamps.
 
-Literal legacy selectors remain inside the immutable inventory and strict
-host-local attachment post-image. Default reports expose only observation id,
-store kind, relationship/status, and a domain-separated path digest. The local
-CLI may display a selected ambiguous row or write an explicit
-`--include-local-paths` review artifact with owner-only permissions and a
-sensitive marker. That artifact is never a public fixture or commit candidate.
-Apply reruns the typed inventory and never performs a second untracked live
-store read to build the ledger.
+Literal legacy selectors remain only in a bounded, non-serializable,
+host-local runtime binding set paired one-to-one with their domain-separated
+digests. The immutable canonical inventory and its default report contain the
+digest and typed relationship, never the literal. The strict host-local
+attachment post-image may contain the selected current path. The local CLI may
+display a selected ambiguous row or write an explicit `--include-local-paths`
+review artifact with owner-only permissions and a sensitive marker. That
+artifact is never canonical inventory, a public fixture, or a commit candidate.
+Apply recaptures the typed inventory and runtime bindings under the same owner
+locks, verifies every digest, and never performs a second untracked live-store
+read to build the ledger.
 
 Preflight also inventories `.bbox/local/checkout-id` once per canonical
 checkout root as valid, missing-or-empty, malformed, unreadable, or symlinked.
@@ -587,14 +590,18 @@ The operator reruns preflight with the mapping and must obtain a clean report
 before apply.
 
 A losing duplicate-scope id with active or retained collected state requires an
-explicit `quarantine_collected` disposition in the resolution file. Apply moves
-its activation and selector to
-`CollisionRetirementLifecycle::Pending { former_scope, generation }`, preserves
-immutable bytes for rollback, and removes it from effective/read-view selection
-before v2 can bind. It does not relabel the generation as LegacyLocal and does
-not serve the former scope. Startup scope-agreement validation accepts this one
-typed quarantine state, then resumes the normal journaled
-selector/vector/edge retirement. The losing project remains
+explicit `quarantine_collected` disposition in the resolution file. For an
+active loser, apply moves its activation and exact materialized selector to
+`CollisionRetirementLifecycle::Pending`; for a retained-only loser, the
+lifecycle records typed `NoDurableSelector` and exact project/generation
+identity. Both forms preserve immutable bytes for rollback and remove any
+effective/read-view selection before v2 can bind. They do not relabel the
+generation as LegacyLocal or serve the former scope. Startup scope-agreement
+validation accepts only this typed quarantine evidence, then resumes normal
+journaled retirement. Physical cleanup is keyed by exact project and generation
+identity; any historical selector discovered in index/vector/edge data is
+validated as data to delete, never promoted into selector authority. The losing
+project remains
 `Unavailable::ScopeCollision` until an attachment-backed local generation
 succeeds or the project is explicitly retired. Without the disposition, apply
 refuses. The migration report lists the exact search, graph, vector, and source
@@ -602,7 +609,8 @@ generations made unavailable.
 
 Collision quarantine has one project-scoped durable lifecycle record. Its
 typed states are `Pending`, `Queued`, and `Completed`, and every state preserves
-the losing project, former scope, generation, selector, and migration evidence.
+the losing project, former scope, generation, typed selector evidence, and
+migration evidence.
 The ordinary retirement queue is subordinate execution state, not the terminal
 proof. A completed lifecycle record remains as the durable receipt after
 physical retirement; a matching lagging queue row is tolerated and removed
@@ -617,16 +625,28 @@ edge snapshots may remain pinned for idempotent retirement, but deferring
 physical deletion never defers the selection cut.
 
 For every surviving active or retained collected generation, migration writes
-strict version-2 metadata with an explicit `PublishedScope`. Legacy
-`StoredGeneration.descriptor.scope` and the immutable manifest are the only
-backfill evidence: descriptor, manifest, legacy activation, effective
-selector, and the migrated catalog project must agree exactly. Any missing or
-ambiguous join refuses. `ActivationRecordV2.published_scope` and
+strict version-2 metadata with an explicit `PublishedScope`. An active
+generation requires exact agreement among its immutable descriptor and
+manifest, activation, durable effective materialized selector, and migrated
+catalog project. An ordinary retained generation with no activation has no
+durable materialized selector authority: it is joined by the owner-locked
+retention set, immutable descriptor and manifest, generation id, project, and
+scope, and carries a typed `NoDurableSelector` observation. Migration never
+constructs a selector from the project/generation prefix. A collision
+lifecycle uses the same evidence distinction: active losers require the exact
+materialized selector, while retained-only losers require typed
+`NoDurableSelector` plus exact project/generation identity. All other quarantine
+evidence remains mandatory. Missing evidence refuses. Multiple candidate
+projects for one retained scope produce a bounded
+`resolution_required` conflict; they do not force a project assignment or
+abort before the report can represent the conflict.
+
+`ActivationRecordV2.published_scope` and
 `StoredGenerationV2.published_scope` have no serde default and must equal the
 immutable descriptor scope. Losing collision records preserve their former
 scope under the typed quarantine instead of producing an active v2 record.
 Thus first v2 startup validates already-rewritten scope-bearing metadata; it
-never guesses scope from project id.
+never guesses scope from project id or fabricates retained selector authority.
 An active or retained legacy generation whose descriptor is missing or corrupt
 keeps preflight refused. No resolution may invent its scope; the operator must
 repair or retire it with the bridge-compatible v1 tooling and rerun preflight.
@@ -1652,8 +1672,10 @@ the explicit adapter table.
   unreadable, or symlinked marker refuses without overwrite.
 - Every surviving legacy collected activation and retained-generation metadata
   gains explicit scope only from exact descriptor/manifest/catalog agreement.
-  First v2 startup selects it without a compatibility guess; any ambiguous join
-  refuses preflight.
+  First v2 startup selects it without a compatibility guess. An ambiguous
+  active or selector join refuses preflight; ambiguous retained ownership emits
+  a bounded `resolution_required` candidate set, and only ambiguity that cannot
+  be represented or resolved refuses.
 - Typed legacy-path observations classify every durable row from the captured
   literal selector. Default reports contain only path digests; an explicit
   owner-only local review artifact is marked sensitive.

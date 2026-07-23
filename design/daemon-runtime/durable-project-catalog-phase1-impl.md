@@ -641,8 +641,9 @@ their role locks. It then builds one canonical
 - every `LegacyProjectRecordV1`, including missing paths;
 - committed recorded authority when available through an explicit
   read-authorized probe;
-- code-source activation, retained generation, descriptor, manifest, selector,
-  and quarantine summaries;
+- code-source activation, retained generation, descriptor, manifest, exact
+  active/collision selectors, typed selector absence for ordinary retained
+  rows, and quarantine summaries;
 - exact `PublisherRefStore` source bytes and one row per pin with scope, full
   ref, candidate attachment ids, resolved commit, resolved scope, and
   observation ids;
@@ -664,16 +665,21 @@ refresh indexes, infer authority from origin URLs, or dump private content into
 the report. Reports use generic record ids, hashes, counts, and bounded
 diagnostics. Public fixtures use only neutral synthetic names.
 
-Literal legacy selectors are migration inputs, not default report fields.
+Literal legacy selectors are migration inputs, not canonical inventory or
+default report fields.
 `legacy_path_bindings` report rows contain observation id, store kind,
 relationship/status, and a domain-separated path digest. The complete bounded
-literal appears only in the in-memory inventory and the strict host-local
-attachment post-image. When an operator must resolve an ambiguous row, the
-local CLI may display it interactively or write an explicitly requested
-`--include-local-paths` review report using no-follow creation, owner-only
-permissions, a `local_paths_included: true` warning, and no stdout echo. Such a
-report is host-local sensitive state and must never be committed. The default
-report and every public fixture remain path-redacted.
+literal appears only in a non-serializable host-local runtime binding set and
+the strict host-local attachment post-image. Each runtime binding is paired
+one-to-one with the digest in canonical inventory. Apply recaptures both under
+the same owner locks and verifies the pairing before constructing post-images.
+When an operator must resolve an ambiguous row, the local CLI may display it
+interactively or write an explicitly requested `--include-local-paths` review
+report using no-follow creation, owner-only permissions, a
+`local_paths_included: true` warning, and no stdout echo. Such a report is
+host-local sensitive state, not canonical inventory, and must never be
+committed. The default report, canonical inventory JSON, and every public
+fixture remain path-redacted.
 
 The inventory hash is SHA-256 over a versioned domain separator plus canonical
 inventory JSON. File mtimes and directory enumeration order are excluded.
@@ -894,26 +900,37 @@ write APIs only; publisher advance and query integration remain Phase 5.
 
 `bbox-code-source-store` adds a strict
 `CollisionRetirementLifecycleV1` containing project id, former scope,
-generation, selector, snapshot and manifest hashes, inventory hash, plan hash,
-and a typed `Pending`, `Queued`, or `Completed` state. Its target path is
+generation, `selector_evidence`, snapshot and manifest hashes, inventory hash,
+plan hash, and a typed `Pending`, `Queued`, or `Completed` state.
+`selector_evidence` is exactly `ExactMaterialized(selector)` for an active
+loser or `NoDurableSelector` for a retained-only loser. Its target path is
 code-derived from the validated project id. The migration transaction installs
-`Pending` while its complete manifest participant removes the losing active
+`Pending` while its complete manifest participant removes any losing active
 row. Ordinary retirement advances `Pending` to `Queued` atomically under the
 store lock and treats the queue row as subordinate execution state. Physical
-completion atomically installs the durable `Completed` receipt before removing
-the matching queue row. A matching lagging queue row beside `Completed` is
-tolerated and cleaned idempotently; contradictory or regressed state fails
-closed. The immutable collected generation remains a journal/marker/lifecycle
-GC root until the completed receipt proves retirement.
+retirement is keyed by exact project/generation identity; a retained-only row
+never acquires selector authority during cleanup. Completion atomically
+installs the durable `Completed` receipt before removing the matching queue
+row. A matching lagging queue row beside `Completed` is tolerated and cleaned
+idempotently; contradictory or regressed state fails closed. The immutable
+collected generation remains a journal/marker/lifecycle GC root until the
+completed receipt proves retirement.
 
 The same crate adds strict `ActivationRecordV2` and `StoredGenerationV2`
 metadata with explicit `published_scope` and no serde default. Migration
-backfills scope only when the legacy immutable generation descriptor, manifest,
-activation, effective selector, and migrated published catalog project agree
-exactly. Each rewritten metadata file is a code-owned migration participant.
-A losing collision writes no active v2 record; its former scope lives only in
-`CollisionRetirementLifecycleV1`. First v2 startup rejects scopeless metadata
-instead of inferring scope from project id.
+backfills active scope only when the legacy immutable generation descriptor,
+manifest, activation, exact effective materialized selector, and migrated
+published catalog project agree. An ordinary retained generation without an
+activation is instead bound through the exact owner-locked retention set,
+descriptor, manifest, generation id, project, and scope, and records typed
+`NoDurableSelector`; the adapter never invents a `:m<16hex>` suffix. Ambiguous
+retained scope ownership yields a bounded resolution conflict carrying its
+candidate set. Each rewritten metadata file is a code-owned migration
+participant. A losing collision writes no active v2 record; its former scope
+and typed selector evidence live only in `CollisionRetirementLifecycleV1`.
+Active losers require an exact materialized selector; retained-only losers
+require `NoDurableSelector` and exact project/generation identity. First v2
+startup rejects scopeless metadata instead of inferring scope from project id.
 
 ### 6.6 Deterministic post-image construction
 
@@ -952,7 +969,7 @@ one transaction plan containing:
 - the complete effective source-manifest post-image;
 - strict scope-bearing activation and retained-generation metadata post-images
   for every surviving collected generation;
-- typed `CollisionRetirementLifecycleV1::Pending` records and removal of the
+- typed `CollisionRetirementLifecycleV1::Pending` records and removal of any
   corresponding legacy activation;
 - every accepted-publication pointer post-image;
 - the migration marker;
@@ -1030,6 +1047,11 @@ Fixture and property tests cover:
   or orphan rows do not survive;
 - refusal when a protected generation is omitted or lacks exact owner/scope
   evidence;
+- ordinary retained generations and retained-only collision losers with typed
+  selector absence, active and active-collision rows with exact materialized
+  selectors, and refusal of any fabricated retained selector;
+- duplicate-scope retained rows represented as resolution-required candidate
+  sets rather than prematurely assigned or dropped;
 - descriptor/activation/manifest disagreement;
 - legacy scopeless active/retained metadata rewritten from exact descriptor
   agreement, plus every missing or ambiguous scope join refusal;
@@ -1042,6 +1064,8 @@ Fixture and property tests cover:
 - collision lifecycle crash/retry at `Pending` to `Queued` and `Queued` to
   `Completed`, durable terminal-receipt validation, and idempotent cleanup of a
   matching lagging queue row;
+- retained-only collision retirement keyed by exact project/generation
+  identity without manufacturing selector authority;
 - mixed v1/v2 maintenance and GC, proving unprotected leftovers remain
   non-selectable and protected scopeless legacy state refuses;
 - lock overlap with a live bridge registry;
@@ -1061,7 +1085,10 @@ Fixture and property tests cover:
   attachment diagnostic is requested;
 - default legacy-binding rows exposing only path digests, plus an explicit
   `--include-local-paths` report with owner-only permissions and the sensitive
-  marker; and
+  marker;
+- canonical inventory JSON containing no absolute path or literal legacy
+  selector, with non-serializable runtime bindings recaptured and digest-joined
+  under the same owner locks; and
 - complete mapped/unscoped classification from typed literal observations
   without a second live-store read.
 
