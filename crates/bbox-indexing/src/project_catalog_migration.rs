@@ -973,6 +973,25 @@ struct MigrationBasePostImagesV1 {
     refusal_count: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LateMigrationDomainRefusalV1 {
+    ConflictingPublishedAuthorities,
+    MultipleBaseAttachments,
+    MissingBaseAttachment,
+}
+
+#[derive(Debug)]
+enum MigrationBasePostImagesFailureV1 {
+    Refused(LateMigrationDomainRefusalV1),
+    Error(ProjectCatalogMigrationError),
+}
+
+impl From<ProjectCatalogMigrationError> for MigrationBasePostImagesFailureV1 {
+    fn from(error: ProjectCatalogMigrationError) -> Self {
+        Self::Error(error)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PreparedPublisherPlanV1 {
     dispositions: Vec<PublisherBindingDispositionV1>,
@@ -1751,7 +1770,7 @@ fn build_base_post_images(
     assessment: &MigrationSemanticAssessmentV1,
     identities: &MigrationPersistedIdentityPlanV1,
     resolution: &ProjectCatalogMigrationResolutionV1,
-) -> Result<MigrationBasePostImagesV1, ProjectCatalogMigrationError> {
+) -> Result<MigrationBasePostImagesV1, MigrationBasePostImagesFailureV1> {
     let resolved_scopes = assessment
         .resolved_project_scopes
         .iter()
@@ -1806,8 +1825,8 @@ fn build_base_post_images(
             }
             0 => RepoHistoryAuthority::LegacyNamespace(group.planned_primary_namespace.clone()),
             _ => {
-                return Err(planner_error(
-                    "one repository-history group contains conflicting published authorities",
+                return Err(MigrationBasePostImagesFailureV1::Refused(
+                    LateMigrationDomainRefusalV1::ConflictingPublishedAuthorities,
                 ));
             }
         };
@@ -1930,7 +1949,8 @@ fn build_base_post_images(
         if candidates.len() < 2 {
             return Err(planner_error(
                 "legacy namespace ambiguity lacks two planned history candidates",
-            ));
+            )
+            .into());
         }
         ambiguous_namespaces.insert(
             namespace.clone(),
@@ -1982,9 +2002,9 @@ fn build_base_post_images(
                 crate::project_catalog_inventory::CheckoutMarkerStateV1::Malformed { .. }
                 | crate::project_catalog_inventory::CheckoutMarkerStateV1::Unreadable { .. }
                 | crate::project_catalog_inventory::CheckoutMarkerStateV1::Symlinked => {
-                    return Err(planner_error(
-                        "unsafe checkout marker cannot form a post-image",
-                    ));
+                    return Err(
+                        planner_error("unsafe checkout marker cannot form a post-image").into(),
+                    );
                 }
             };
             Ok((checkout.observation_id.as_str(), checkout_id))
@@ -2045,8 +2065,8 @@ fn build_base_post_images(
             .ok_or_else(|| planner_error("legacy project runtime binding is missing"))?;
         let kind = if &project_dir == legacy_project_path {
             if !base_attachment_projects.insert(observed.project_id.clone()) {
-                return Err(planner_error(
-                    "project has more than one exact base attachment candidate",
+                return Err(MigrationBasePostImagesFailureV1::Refused(
+                    LateMigrationDomainRefusalV1::MultipleBaseAttachments,
                 ));
             }
             AttachmentKind::Base
@@ -2097,8 +2117,8 @@ fn build_base_post_images(
     }
     for (project_id, attachment_ids) in &attachments_by_project {
         if !attachment_ids.is_empty() && !base_attachment_projects.contains(project_id) {
-            return Err(planner_error(
-                "attached migrated project lacks an exact legacy base attachment",
+            return Err(MigrationBasePostImagesFailureV1::Refused(
+                LateMigrationDomainRefusalV1::MissingBaseAttachment,
             ));
         }
     }
@@ -3541,7 +3561,7 @@ fn prepare_closed_migration(
     let base =
         match build_base_post_images(inventory, &runtime, &assessment, &identities, &resolution) {
             Ok(base) => base,
-            Err(_) => {
+            Err(MigrationBasePostImagesFailureV1::Refused(_)) => {
                 assessment.refusal_count = assessment.refusal_count.saturating_add(1);
                 return prepare_assessment_only(
                     inventory,
@@ -3552,6 +3572,7 @@ fn prepare_closed_migration(
                     include_sensitive_paths,
                 );
             }
+            Err(MigrationBasePostImagesFailureV1::Error(error)) => return Err(error),
         };
     if base.refusal_count != 0 {
         assessment.refusal_count = assessment.refusal_count.saturating_add(base.refusal_count);
@@ -5059,5 +5080,89 @@ mod tests {
             ProjectCatalogMigrationStatusV1::Refused
         );
         assert_eq!(assessment.refusal_count, 1);
+    }
+
+    #[test]
+    fn late_domain_refusal_is_assessment_state_but_internal_binding_failure_is_error() {
+        let inventory = crate::project_catalog_inventory::tests::fixture_inventory();
+        let resolution =
+            ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
+        let mut assessment = assess_migration_semantics(&inventory, &resolution).unwrap();
+        assert_eq!(assessment.status(), ProjectCatalogMigrationStatusV1::Clean);
+        let identities = build_persisted_identity_plan(
+            &inventory,
+            &assessment.resolved_project_scopes,
+            &assessment.retained_attachment_ids,
+            None,
+        )
+        .unwrap();
+        let runtime = MigrationRuntimeBindingsViewV1 {
+            legacy_project_store_bytes: Vec::new(),
+            legacy_project_store_was_missing: false,
+            legacy_project_paths: BTreeMap::from([
+                (
+                    "legacy_alpha".to_string(),
+                    PathBuf::from("/workspace/acme/alpha"),
+                ),
+                (
+                    "legacy_beta".to_string(),
+                    PathBuf::from("/workspace/acme/beta"),
+                ),
+            ]),
+            checkout_paths: BTreeMap::from([(
+                "checkout_acme".to_string(),
+                PathBuf::from("/workspace/acme"),
+            )]),
+            git_common_directories: BTreeMap::new(),
+            legacy_selectors: BTreeMap::from([(
+                "legacy_path_alpha".to_string(),
+                "/workspace/acme/alpha/src/Example.java".to_string(),
+            )]),
+        };
+
+        let refusal =
+            build_base_post_images(&inventory, &runtime, &assessment, &identities, &resolution)
+                .unwrap_err();
+        assert!(matches!(
+            refusal,
+            MigrationBasePostImagesFailureV1::Refused(
+                LateMigrationDomainRefusalV1::MissingBaseAttachment
+            )
+        ));
+        assessment.refusal_count = assessment.refusal_count.saturating_add(1);
+        let prepared = prepare_assessment_only(
+            &inventory,
+            &runtime,
+            &encode_migration_resolution_v1(&resolution).unwrap(),
+            &assessment,
+            &identities,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.preflight.receipt.status,
+            ProjectCatalogMigrationStatusV1::Refused
+        );
+        assert!(prepared.plan.is_none());
+
+        let mut incomplete_runtime = runtime;
+        incomplete_runtime.checkout_paths.clear();
+        let failure = build_base_post_images(
+            &inventory,
+            &incomplete_runtime,
+            &assessment,
+            &identities,
+            &resolution,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            failure,
+            MigrationBasePostImagesFailureV1::Error(error)
+                if error.code == "error.project_catalog_migration_planner"
+        ));
+
+        let wrong_resolution =
+            ProjectCatalogMigrationResolutionV1::empty(Sha256ValueV1::digest(b"wrong inventory"));
+        assert!(assess_migration_semantics(&inventory, &wrong_resolution).is_err());
     }
 }

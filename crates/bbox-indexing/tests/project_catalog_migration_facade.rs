@@ -254,11 +254,13 @@ fn prepare_rehearsal(root: &Path, config: &Config) -> RehearsalFixture {
         write_generation(&paths, &winner_project, &scope, "winner", &head_commit, 1);
     let (loser_generation, loser_selection) =
         write_generation(&paths, &loser_project, &scope, "loser", &head_commit, 2);
+    let mut selections = vec![winner_selection, loser_selection];
+    selections.sort_by(|left, right| left.project_id.cmp(&right.project_id));
     write(
         &paths.anchor(),
         &encode_migration_effective_source_manifest_v1(&MigrationEffectiveSourceManifestV1 {
             version: 1,
-            selections: vec![winner_selection, loser_selection],
+            selections,
         })
         .unwrap(),
     );
