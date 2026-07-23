@@ -11,8 +11,9 @@ use std::fmt;
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::language::Language;
 use bbox_corpus_core::project_catalog::{
-    AttachmentId, LegacyProjectRecordV1, MAX_PROJECT_CATALOG_ENTRIES, ProjectId,
-    RecordedRepoAuthority,
+    AttachmentId, CommitNamespace, LegacyPathBindingId, LegacyProjectRecordV1,
+    MAX_PROJECT_CATALOG_ENTRIES, ProjectCatalogTransactionId, ProjectId, RecordedRepoAuthority,
+    RepoHistoryId,
 };
 use serde::de::{self, DeserializeOwned};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -221,6 +222,7 @@ pub struct CollectedGenerationObservationV1 {
     pub manifest: ImmutableArtifactObservationV1,
     pub selector_hash: Sha256ValueV1,
     pub checkout_missing: bool,
+    pub planned_metadata_v2_hash: Sha256ValueV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,6 +241,98 @@ pub struct CodeSourceObservationV1 {
     pub project_id: ProjectId,
     pub generations: Vec<CollectedGenerationObservationV1>,
     pub quarantine: Vec<QuarantinedGenerationObservationV1>,
+    pub effective_manifest_hash: Sha256ValueV1,
+    pub planned_activation_v2_hash: Option<Sha256ValueV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InventorySourceStateV1 {
+    Present {
+        fingerprint: Sha256ValueV1,
+        content_hash: Sha256ValueV1,
+        byte_len: u64,
+    },
+    Missing {
+        fingerprint: Sha256ValueV1,
+    },
+    Corrupt {
+        fingerprint: Sha256ValueV1,
+        content_hash: Option<Sha256ValueV1>,
+        diagnostic_code: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutableInventorySourceKindV1 {
+    LegacyProjectStore,
+    PublisherRefStore,
+    EffectiveSourceManifest,
+    CodeSourceActivation,
+    CodeSourceGenerationMetadata,
+    CodeSourceGenerationManifest,
+    CommittedAuthorityProbe,
+    CheckoutRoot,
+    CheckoutMarker,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MutableInventorySourceEvidenceV1 {
+    pub source_id: String,
+    pub source_kind: MutableInventorySourceKindV1,
+    pub state: InventorySourceStateV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImmutableInventoryLaneKindV1 {
+    ProjectScopedRefs,
+    EdgeWorkspaces,
+    GitMetadata,
+    Checkouts,
+    AttachmentCandidates,
+    InventoryTargets,
+    MaterializedAliases,
+    LegacyPathObservations,
+    RepoGroupingProofs,
+    LegacyNamespaceClusters,
+}
+
+impl ImmutableInventoryLaneKindV1 {
+    fn all() -> BTreeSet<Self> {
+        BTreeSet::from([
+            Self::ProjectScopedRefs,
+            Self::EdgeWorkspaces,
+            Self::GitMetadata,
+            Self::Checkouts,
+            Self::AttachmentCandidates,
+            Self::InventoryTargets,
+            Self::MaterializedAliases,
+            Self::LegacyPathObservations,
+            Self::RepoGroupingProofs,
+            Self::LegacyNamespaceClusters,
+        ])
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImmutableInventoryLaneCompletenessV1 {
+    Complete,
+    Missing,
+    Corrupt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImmutableInventoryLaneEvidenceV1 {
+    pub lane_kind: ImmutableInventoryLaneKindV1,
+    pub source_id: String,
+    pub source_state: InventorySourceStateV1,
+    pub completeness: ImmutableInventoryLaneCompletenessV1,
+    pub row_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -496,6 +590,8 @@ pub struct V1ProjectCatalogInventory {
     pub source_store_bytes: Vec<u8>,
     pub publisher_ref_source_hash: Sha256ValueV1,
     pub publisher_ref_source_bytes: Vec<u8>,
+    pub mutable_source_evidence: Vec<MutableInventorySourceEvidenceV1>,
+    pub immutable_lane_evidence: Vec<ImmutableInventoryLaneEvidenceV1>,
     pub legacy_projects: Vec<LegacyProjectObservationV1>,
     pub code_sources: Vec<CodeSourceObservationV1>,
     pub publisher_pins: Vec<PublisherPinObservationV1>,
@@ -529,6 +625,179 @@ impl V1ProjectCatalogInventory {
                 "error.project_catalog_inventory_source_hash_mismatch",
                 "captured source bytes do not match their recorded hash",
             ));
+        }
+        if self.mutable_source_evidence.len() > MAX_PROJECT_CATALOG_ENTRIES
+            || self.immutable_lane_evidence.len() > ImmutableInventoryLaneKindV1::all().len()
+        {
+            return Err(limit("inventory source evidence"));
+        }
+        let mut source_ids = BTreeSet::new();
+        for evidence in &self.mutable_source_evidence {
+            validate_stable_id(&evidence.source_id, "mutable source id")?;
+            if !source_ids.insert(evidence.source_id.as_str()) {
+                return Err(duplicate("mutable source id"));
+            }
+            validate_inventory_source_state(&evidence.state)?;
+        }
+        let source_kind_counts = self.mutable_source_evidence.iter().fold(
+            BTreeMap::<MutableInventorySourceKindV1, usize>::new(),
+            |mut counts, evidence| {
+                *counts.entry(evidence.source_kind).or_default() += 1;
+                counts
+            },
+        );
+        let generation_count = self
+            .code_sources
+            .iter()
+            .map(|source| source.generations.len())
+            .sum::<usize>();
+        for (kind, expected) in [
+            (MutableInventorySourceKindV1::LegacyProjectStore, 1),
+            (MutableInventorySourceKindV1::PublisherRefStore, 1),
+            (MutableInventorySourceKindV1::EffectiveSourceManifest, 1),
+            (
+                MutableInventorySourceKindV1::CodeSourceActivation,
+                self.code_sources.len(),
+            ),
+            (
+                MutableInventorySourceKindV1::CodeSourceGenerationMetadata,
+                generation_count,
+            ),
+            (
+                MutableInventorySourceKindV1::CodeSourceGenerationManifest,
+                generation_count,
+            ),
+            (
+                MutableInventorySourceKindV1::CommittedAuthorityProbe,
+                self.legacy_projects.len(),
+            ),
+            (
+                MutableInventorySourceKindV1::CheckoutRoot,
+                self.checkouts.len(),
+            ),
+            (
+                MutableInventorySourceKindV1::CheckoutMarker,
+                self.checkouts.len(),
+            ),
+        ] {
+            if source_kind_counts.get(&kind).copied().unwrap_or_default() != expected {
+                return Err(invalid("mutable inventory source coverage is incomplete"));
+            }
+        }
+        for (kind, expected_hash) in [
+            (
+                MutableInventorySourceKindV1::LegacyProjectStore,
+                &self.source_store_hash,
+            ),
+            (
+                MutableInventorySourceKindV1::PublisherRefStore,
+                &self.publisher_ref_source_hash,
+            ),
+        ] {
+            let evidence = self
+                .mutable_source_evidence
+                .iter()
+                .find(|evidence| evidence.source_kind == kind)
+                .ok_or_else(|| invalid("required mutable source evidence is missing"))?;
+            if let InventorySourceStateV1::Present { content_hash, .. } = &evidence.state
+                && content_hash != expected_hash
+            {
+                return Err(invalid("mutable source evidence hash mismatch"));
+            }
+        }
+        let mut lane_kinds = BTreeSet::new();
+        for evidence in &self.immutable_lane_evidence {
+            validate_stable_id(&evidence.source_id, "immutable lane source id")?;
+            validate_inventory_source_state(&evidence.source_state)?;
+            if !lane_kinds.insert(evidence.lane_kind) {
+                return Err(duplicate("immutable inventory lane"));
+            }
+            match evidence.completeness {
+                ImmutableInventoryLaneCompletenessV1::Complete => {
+                    if !matches!(
+                        &evidence.source_state,
+                        InventorySourceStateV1::Present { .. }
+                    ) {
+                        return Err(invalid(
+                            "complete immutable lane does not have present source evidence",
+                        ));
+                    }
+                }
+                ImmutableInventoryLaneCompletenessV1::Missing => {
+                    if evidence.row_count != 0
+                        || !matches!(
+                            &evidence.source_state,
+                            InventorySourceStateV1::Missing { .. }
+                        )
+                    {
+                        return Err(invalid(
+                            "missing immutable lane carries rows or wrong state",
+                        ));
+                    }
+                }
+                ImmutableInventoryLaneCompletenessV1::Corrupt => {
+                    if evidence.row_count != 0
+                        || !matches!(
+                            &evidence.source_state,
+                            InventorySourceStateV1::Corrupt { .. }
+                        )
+                    {
+                        return Err(invalid(
+                            "corrupt immutable lane carries rows or wrong state",
+                        ));
+                    }
+                }
+            }
+        }
+        if lane_kinds != ImmutableInventoryLaneKindV1::all() {
+            return Err(invalid("immutable inventory lane coverage is incomplete"));
+        }
+        let expected_lane_counts = BTreeMap::from([
+            (
+                ImmutableInventoryLaneKindV1::ProjectScopedRefs,
+                self.project_scoped_refs.len() as u64,
+            ),
+            (
+                ImmutableInventoryLaneKindV1::EdgeWorkspaces,
+                self.edge_workspaces.len() as u64,
+            ),
+            (
+                ImmutableInventoryLaneKindV1::GitMetadata,
+                self.git_metadata.len() as u64,
+            ),
+            (
+                ImmutableInventoryLaneKindV1::Checkouts,
+                self.checkouts.len() as u64,
+            ),
+            (
+                ImmutableInventoryLaneKindV1::AttachmentCandidates,
+                self.attachment_candidates.len() as u64,
+            ),
+            (
+                ImmutableInventoryLaneKindV1::InventoryTargets,
+                self.inventory_targets.len() as u64,
+            ),
+            (
+                ImmutableInventoryLaneKindV1::MaterializedAliases,
+                self.materialized_aliases.len() as u64,
+            ),
+            (
+                ImmutableInventoryLaneKindV1::LegacyPathObservations,
+                self.legacy_path_observations.len() as u64,
+            ),
+            (
+                ImmutableInventoryLaneKindV1::RepoGroupingProofs,
+                self.repo_grouping_proofs.len() as u64,
+            ),
+            (
+                ImmutableInventoryLaneKindV1::LegacyNamespaceClusters,
+                self.legacy_namespace_clusters.len() as u64,
+            ),
+        ]);
+        for evidence in &self.immutable_lane_evidence {
+            if evidence.row_count != expected_lane_counts[&evidence.lane_kind] {
+                return Err(invalid("immutable lane row count does not match inventory"));
+            }
         }
 
         for (kind, count) in [
@@ -586,6 +855,23 @@ impl V1ProjectCatalogInventory {
         for source in &self.code_sources {
             insert_observation(&mut observations, &source.observation_id)?;
             ensure_known_project(&projects, &source.project_id)?;
+            if source.generations.len() > MAX_PROJECT_CATALOG_ENTRIES
+                || source.quarantine.len() > MAX_PROJECT_CATALOG_ENTRIES
+            {
+                return Err(limit("code source generations"));
+            }
+            let active_count = source
+                .generations
+                .iter()
+                .filter(|generation| generation.role == CollectedGenerationRoleV1::Active)
+                .count();
+            if active_count > 1
+                || source.planned_activation_v2_hash.is_some() != (active_count == 1)
+            {
+                return Err(invalid(
+                    "code source active generation and planned activation are not exact",
+                ));
+            }
             let mut per_source_generations = BTreeSet::new();
             for generation in &source.generations {
                 insert_observation(&mut observations, &generation.observation_id)?;
@@ -608,6 +894,9 @@ impl V1ProjectCatalogInventory {
                     return Err(invalid("quarantine generation project mismatch"));
                 }
                 validate_token(&generation.generation_id, "quarantine generation id")?;
+                if per_source_generations.contains(generation.generation_id.as_str()) {
+                    return Err(invalid("quarantined generation is also active or retained"));
+                }
             }
         }
 
@@ -794,6 +1083,27 @@ impl V1ProjectCatalogInventory {
 
     pub fn hard_refusals(&self) -> Vec<InventoryRefusalV1> {
         let mut refusals = Vec::new();
+        for source in &self.mutable_source_evidence {
+            if matches!(&source.state, InventorySourceStateV1::Corrupt { .. }) {
+                refusals.push(InventoryRefusalV1 {
+                    record_id: source.source_id.clone(),
+                    diagnostic_code: "mutable_source_corrupt".to_string(),
+                });
+            }
+        }
+        for lane in &self.immutable_lane_evidence {
+            let diagnostic_code = match lane.completeness {
+                ImmutableInventoryLaneCompletenessV1::Complete => None,
+                ImmutableInventoryLaneCompletenessV1::Missing => Some("immutable_lane_missing"),
+                ImmutableInventoryLaneCompletenessV1::Corrupt => Some("immutable_lane_corrupt"),
+            };
+            if let Some(diagnostic_code) = diagnostic_code {
+                refusals.push(InventoryRefusalV1 {
+                    record_id: lane.source_id.clone(),
+                    diagnostic_code: diagnostic_code.to_string(),
+                });
+            }
+        }
         for source in &self.code_sources {
             for generation in &source.generations {
                 let diagnostic_code = match &generation.descriptor {
@@ -831,6 +1141,10 @@ impl V1ProjectCatalogInventory {
     }
 
     fn canonicalize(&mut self) {
+        self.mutable_source_evidence
+            .sort_by(|left, right| left.source_id.cmp(&right.source_id));
+        self.immutable_lane_evidence
+            .sort_by(|left, right| left.lane_kind.cmp(&right.lane_kind));
         self.legacy_projects
             .sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
         self.code_sources
@@ -890,10 +1204,21 @@ pub enum RepoGroupingEvidenceClassV1 {
 #[serde(deny_unknown_fields)]
 pub struct DeterministicRepoHistoryGroupV1 {
     pub group_id: String,
+    pub planned_history_id: RepoHistoryId,
+    pub planned_primary_namespace: CommitNamespace,
+    pub planned_compatibility_namespaces: BTreeSet<CommitNamespace>,
     pub project_ids: BTreeSet<ProjectId>,
     pub evidence_classes: BTreeSet<RepoGroupingEvidenceClassV1>,
     pub proof_ids: BTreeSet<String>,
     pub source_observation_ids: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannedRepoHistoryIdentityV1 {
+    pub planned_history_id: RepoHistoryId,
+    pub planned_primary_namespace: CommitNamespace,
+    pub planned_compatibility_namespaces: BTreeSet<CommitNamespace>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -947,6 +1272,7 @@ pub enum LegacyPathBindingStatusV1 {
 #[serde(deny_unknown_fields)]
 pub struct LegacyPathBindingReportV1 {
     pub observation_id: String,
+    pub planned_binding_id: LegacyPathBindingId,
     pub store_kind: LegacyPathStoreKindV1,
     pub relationship: LegacyPathRelationshipV1,
     pub status: LegacyPathBindingStatusV1,
@@ -1025,6 +1351,7 @@ pub enum ProjectCatalogMigrationStatusV1 {
 #[serde(deny_unknown_fields)]
 pub struct ProjectCatalogMigrationReportV1 {
     pub version: u32,
+    pub transaction_id: ProjectCatalogTransactionId,
     pub inventory_hash: Sha256ValueV1,
     pub plan_hash: Sha256ValueV1,
     pub source_store_hash: Sha256ValueV1,
@@ -1103,6 +1430,16 @@ impl ProjectCatalogMigrationReportV1 {
                 .map(|row| row.group_id.as_str()),
             "report repo history group",
         )?;
+        if self
+            .repo_history_groups
+            .iter()
+            .map(|row| row.planned_history_id.clone())
+            .collect::<BTreeSet<_>>()
+            .len()
+            != self.repo_history_groups.len()
+        {
+            return Err(duplicate("report planned repo history id"));
+        }
         validate_unique_by(
             self.attachments
                 .iter()
@@ -1121,6 +1458,16 @@ impl ProjectCatalogMigrationReportV1 {
                 .map(|row| row.observation_id.as_str()),
             "legacy path binding report row",
         )?;
+        if self
+            .legacy_path_bindings
+            .iter()
+            .map(|row| row.planned_binding_id.clone())
+            .collect::<BTreeSet<_>>()
+            .len()
+            != self.legacy_path_bindings.len()
+        {
+            return Err(duplicate("report planned legacy path binding id"));
+        }
         validate_unique_by(
             self.publisher_bindings
                 .iter()
@@ -1171,6 +1518,14 @@ impl ProjectCatalogMigrationReportV1 {
         for group in &self.repo_history_groups {
             if group.project_ids.is_empty() {
                 return Err(invalid("report repo history group is empty"));
+            }
+            if group
+                .planned_compatibility_namespaces
+                .contains(&group.planned_primary_namespace)
+            {
+                return Err(invalid(
+                    "report primary namespace is repeated as compatibility namespace",
+                ));
             }
             for proof_id in &group.proof_ids {
                 validate_stable_id(proof_id, "report repo grouping proof id")?;
@@ -1758,6 +2113,7 @@ impl ProjectCatalogMigrationResolutionV1 {
 pub struct ResolvedProjectScopeInputV1 {
     pub project_id: ProjectId,
     pub published_scope: Option<PublishedScope>,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1768,12 +2124,14 @@ pub struct AttachmentPostImageInputV1 {
     pub checkout_observation_id: String,
     pub checkout_id: String,
     pub expected_scope: Option<PublishedScope>,
+    pub attached_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LegacyPathBindingPostImageInputV1 {
     pub observation_id: String,
+    pub planned_binding_id: LegacyPathBindingId,
     pub attachment_id: Option<AttachmentId>,
     pub literal_selector: String,
     pub relationship: LegacyPathRelationshipV1,
@@ -1800,6 +2158,7 @@ pub struct PredictedPostImageHashesV1 {
 #[serde(deny_unknown_fields)]
 pub struct DeterministicPostImageInputV1 {
     pub version: u32,
+    pub transaction_id: ProjectCatalogTransactionId,
     pub inventory_hash: Sha256ValueV1,
     pub resolved_project_scopes: Vec<ResolvedProjectScopeInputV1>,
     pub repo_history_groups: Vec<DeterministicRepoHistoryGroupV1>,
@@ -1830,6 +2189,17 @@ impl DeterministicPostImageInputV1 {
             .map(|row| ProjectId::parse(row.record.project_id.clone()))
             .collect::<Result<BTreeSet<_>, _>>()
             .map_err(|_| invalid("legacy project id is invalid"))?;
+        let registered_at = inventory
+            .legacy_projects
+            .iter()
+            .map(|row| {
+                Ok((
+                    ProjectId::parse(row.record.project_id.clone())
+                        .map_err(|_| invalid("legacy project id is invalid"))?,
+                    row.record.registered_at.as_str(),
+                ))
+            })
+            .collect::<InventoryResult<BTreeMap<_, _>>>()?;
         let known_attachments = inventory
             .attachment_candidates
             .iter()
@@ -1863,6 +2233,13 @@ impl DeterministicPostImageInputV1 {
                     ));
                 }
             }
+            if registered_at.get(&row.project_id).copied() != Some(row.created_at.as_str()) {
+                return Err(ProjectCatalogInventoryError::new(
+                    "error.project_catalog_inventory_migration_timestamp_mismatch",
+                    "project creation timestamp does not preserve legacy registered_at",
+                ));
+            }
+            validate_timestamp(&row.created_at)?;
         }
         if resolved_projects != known_projects {
             return Err(invalid("resolved project scopes are incomplete"));
@@ -1880,6 +2257,13 @@ impl DeterministicPostImageInputV1 {
             if !known_checkout_observations.contains(row.checkout_observation_id.as_str()) {
                 return Err(unknown("post-image checkout observation"));
             }
+            if registered_at.get(&row.project_id).copied() != Some(row.attached_at.as_str()) {
+                return Err(ProjectCatalogInventoryError::new(
+                    "error.project_catalog_inventory_migration_timestamp_mismatch",
+                    "attachment timestamp does not preserve legacy registered_at",
+                ));
+            }
+            validate_timestamp(&row.attached_at)?;
             validate_checkout_id(&row.checkout_id)?;
             let checkout = inventory
                 .checkouts
@@ -1939,6 +2323,16 @@ impl DeterministicPostImageInputV1 {
                 .map(|row| row.observation_id.as_str()),
             "post-image legacy path binding",
         )?;
+        if self
+            .legacy_path_bindings
+            .iter()
+            .map(|row| row.planned_binding_id.clone())
+            .collect::<BTreeSet<_>>()
+            .len()
+            != self.legacy_path_bindings.len()
+        {
+            return Err(duplicate("post-image planned legacy path binding id"));
+        }
         for row in &self.legacy_path_bindings {
             let expected = known_path_observations
                 .get(row.observation_id.as_str())
@@ -1975,7 +2369,22 @@ impl DeterministicPostImageInputV1 {
                 .map(|row| row.group_id.as_str()),
             "post-image repo history group",
         )?;
-        validate_post_image_groups(inventory, &known_projects, &self.repo_history_groups)?;
+        if self
+            .repo_history_groups
+            .iter()
+            .map(|row| row.planned_history_id.clone())
+            .collect::<BTreeSet<_>>()
+            .len()
+            != self.repo_history_groups.len()
+        {
+            return Err(duplicate("post-image planned repo history id"));
+        }
+        validate_post_image_groups(
+            inventory,
+            &known_projects,
+            &self.resolved_project_scopes,
+            &self.repo_history_groups,
+        )?;
         let mut publisher_keys = BTreeSet::new();
         for disposition in &self.publisher_binding_dispositions {
             validate_publisher_disposition(disposition)?;
@@ -2071,6 +2480,34 @@ pub fn validate_supported_resolution(
         return Err(ProjectCatalogInventoryError::new(
             "error.project_catalog_inventory_plan_hash_mismatch",
             "report plan hash does not bind the supplied resolution and post-images",
+        ));
+    }
+    if report.transaction_id != post_image.transaction_id {
+        return Err(ProjectCatalogInventoryError::new(
+            "error.project_catalog_inventory_transaction_id_mismatch",
+            "report and deterministic post-image use different migration transaction ids",
+        ));
+    }
+    if report.repo_history_groups != post_image.repo_history_groups {
+        return Err(ProjectCatalogInventoryError::new(
+            "error.project_catalog_inventory_history_plan_mismatch",
+            "report and deterministic post-image use different repository-history plans",
+        ));
+    }
+    let report_binding_ids = report
+        .legacy_path_bindings
+        .iter()
+        .map(|row| (row.observation_id.as_str(), &row.planned_binding_id))
+        .collect::<BTreeMap<_, _>>();
+    let post_image_binding_ids = post_image
+        .legacy_path_bindings
+        .iter()
+        .map(|row| (row.observation_id.as_str(), &row.planned_binding_id))
+        .collect::<BTreeMap<_, _>>();
+    if report_binding_ids != post_image_binding_ids {
+        return Err(ProjectCatalogInventoryError::new(
+            "error.project_catalog_inventory_legacy_path_plan_mismatch",
+            "report and deterministic post-image use different legacy-path binding ids",
         ));
     }
     if report.predicted_catalog_hash != post_image.predicted_hashes.catalog_hash
@@ -2450,9 +2887,86 @@ fn validate_publisher_disposition_set<'a>(
     Ok(())
 }
 
+pub fn deterministic_repo_history_group_ids(
+    inventory: &V1ProjectCatalogInventory,
+    resolved_projects: &[ResolvedProjectScopeInputV1],
+) -> InventoryResult<Vec<String>> {
+    let resolved_scopes = resolved_projects
+        .iter()
+        .map(|row| (row.project_id.clone(), row.published_scope.as_ref()))
+        .collect::<BTreeMap<_, _>>();
+    Ok(build_repo_history_group_evidence(inventory)?
+        .into_iter()
+        .filter(|group| {
+            group.project_ids.iter().any(|project_id| {
+                resolved_scopes
+                    .get(project_id)
+                    .is_some_and(|scope| scope.is_some())
+                    || project_has_repo_history_evidence(inventory, project_id)
+            })
+        })
+        .map(|group| group.group_id)
+        .collect())
+}
+
 pub fn build_deterministic_repo_history_groups(
     inventory: &V1ProjectCatalogInventory,
+    resolved_projects: &[ResolvedProjectScopeInputV1],
+    planned_identities: &BTreeMap<String, PlannedRepoHistoryIdentityV1>,
 ) -> InventoryResult<Vec<DeterministicRepoHistoryGroupV1>> {
+    let required_group_ids = deterministic_repo_history_group_ids(inventory, resolved_projects)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let evidence_groups = build_repo_history_group_evidence(inventory)?
+        .into_iter()
+        .filter(|group| required_group_ids.contains(&group.group_id))
+        .collect::<Vec<_>>();
+    if evidence_groups.len() != planned_identities.len() {
+        return Err(invalid(
+            "planned repository-history identities are incomplete",
+        ));
+    }
+    let mut output = Vec::with_capacity(evidence_groups.len());
+    for evidence in evidence_groups {
+        let planned = planned_identities
+            .get(&evidence.group_id)
+            .ok_or_else(|| unknown("planned repository-history group"))?;
+        output.push(DeterministicRepoHistoryGroupV1 {
+            group_id: evidence.group_id,
+            planned_history_id: planned.planned_history_id.clone(),
+            planned_primary_namespace: planned.planned_primary_namespace.clone(),
+            planned_compatibility_namespaces: planned.planned_compatibility_namespaces.clone(),
+            project_ids: evidence.project_ids,
+            evidence_classes: evidence.evidence_classes,
+            proof_ids: evidence.proof_ids,
+            source_observation_ids: evidence.source_observation_ids,
+        });
+    }
+    for group in &output {
+        validate_planned_namespaces(inventory, group)?;
+    }
+    let known_projects = inventory
+        .legacy_projects
+        .iter()
+        .map(|row| ProjectId::parse(row.record.project_id.clone()))
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(|_| invalid("legacy project id is invalid"))?;
+    validate_post_image_groups(inventory, &known_projects, resolved_projects, &output)?;
+    Ok(output)
+}
+
+#[derive(Debug)]
+struct RepoHistoryGroupEvidenceV1 {
+    group_id: String,
+    project_ids: BTreeSet<ProjectId>,
+    evidence_classes: BTreeSet<RepoGroupingEvidenceClassV1>,
+    proof_ids: BTreeSet<String>,
+    source_observation_ids: BTreeSet<String>,
+}
+
+fn build_repo_history_group_evidence(
+    inventory: &V1ProjectCatalogInventory,
+) -> InventoryResult<Vec<RepoHistoryGroupEvidenceV1>> {
     inventory.validate()?;
     let projects = inventory
         .legacy_projects
@@ -2511,7 +3025,7 @@ pub fn build_deterministic_repo_history_groups(
                 )
             })?;
         let digest = domain_hash(GROUP_ID_DOMAIN, &id_bytes);
-        output.push(DeterministicRepoHistoryGroupV1 {
+        output.push(RepoHistoryGroupEvidenceV1 {
             group_id: format!("group_{}", &digest.as_str()[..32]),
             project_ids,
             evidence_classes,
@@ -2653,6 +3167,7 @@ fn observed_scopes_for_project(
 fn validate_post_image_groups(
     inventory: &V1ProjectCatalogInventory,
     known_projects: &BTreeSet<ProjectId>,
+    resolved_projects: &[ResolvedProjectScopeInputV1],
     groups: &[DeterministicRepoHistoryGroupV1],
 ) -> InventoryResult<()> {
     let proofs = inventory
@@ -2666,6 +3181,7 @@ fn validate_post_image_groups(
         if group.project_ids.is_empty() {
             return Err(invalid("post-image repo history group is empty"));
         }
+        validate_planned_namespaces(inventory, group)?;
         let mut expected_classes = BTreeSet::new();
         let mut expected_observations = BTreeSet::new();
         let mut parent = group
@@ -2725,12 +3241,82 @@ fn validate_post_image_groups(
             }
         }
     }
-    if assigned != *known_projects {
+    let resolved_scopes = resolved_projects
+        .iter()
+        .map(|row| (row.project_id.clone(), row.published_scope.as_ref()))
+        .collect::<BTreeMap<_, _>>();
+    let required_projects = known_projects
+        .iter()
+        .filter(|project_id| {
+            resolved_scopes
+                .get(*project_id)
+                .is_some_and(|scope| scope.is_some())
+                || project_has_repo_history_evidence(inventory, project_id)
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if assigned != required_projects {
         return Err(invalid(
-            "post-image repo history groups do not partition all projects",
+            "post-image repo history groups do not exactly cover projects with history",
         ));
     }
     Ok(())
+}
+
+fn validate_planned_namespaces(
+    inventory: &V1ProjectCatalogInventory,
+    group: &DeterministicRepoHistoryGroupV1,
+) -> InventoryResult<()> {
+    if group
+        .planned_compatibility_namespaces
+        .contains(&group.planned_primary_namespace)
+    {
+        return Err(invalid(
+            "primary namespace is repeated as a compatibility namespace",
+        ));
+    }
+    let inventoried = inventory
+        .git_metadata
+        .iter()
+        .filter(|row| group.project_ids.contains(&row.project_id))
+        .flat_map(|row| row.materialized_commit_namespaces.iter())
+        .map(|namespace| {
+            CommitNamespace::parse(namespace.clone())
+                .map_err(|_| invalid("inventoried commit namespace is invalid"))
+        })
+        .collect::<InventoryResult<BTreeSet<_>>>()?;
+    if !inventoried.is_empty() {
+        let mut planned = group.planned_compatibility_namespaces.clone();
+        planned.insert(group.planned_primary_namespace.clone());
+        if planned != inventoried {
+            return Err(ProjectCatalogInventoryError::new(
+                "error.project_catalog_inventory_namespace_plan_mismatch",
+                "planned primary and compatibility namespaces do not exactly match inventory",
+            ));
+        }
+    } else if !group.planned_compatibility_namespaces.is_empty() {
+        return Err(ProjectCatalogInventoryError::new(
+            "error.project_catalog_inventory_namespace_plan_mismatch",
+            "compatibility namespaces were invented without materialized inventory evidence",
+        ));
+    }
+    Ok(())
+}
+
+fn project_has_repo_history_evidence(
+    inventory: &V1ProjectCatalogInventory,
+    project_id: &ProjectId,
+) -> bool {
+    inventory.git_metadata.iter().any(|row| {
+        row.project_id == *project_id
+            && (row.canonical_common_directory.is_some()
+                || row.full_first_commit.is_some()
+                || !row.materialized_commit_namespaces.is_empty()
+                || row.last_ingested_sha.is_some())
+    }) || inventory
+        .repo_grouping_proofs
+        .iter()
+        .any(|proof| proof.project_ids().contains(project_id))
 }
 
 fn validate_grouping_proof<'a>(
@@ -3135,6 +3721,21 @@ fn validate_artifact(artifact: &ImmutableArtifactObservationV1) -> InventoryResu
     }
 }
 
+fn validate_inventory_source_state(state: &InventorySourceStateV1) -> InventoryResult<()> {
+    match state {
+        InventorySourceStateV1::Present { byte_len, .. } => {
+            if *byte_len > MAX_PROJECT_CATALOG_INVENTORY_BYTES as u64 {
+                return Err(limit("inventory source bytes"));
+            }
+        }
+        InventorySourceStateV1::Missing { .. } => {}
+        InventorySourceStateV1::Corrupt {
+            diagnostic_code, ..
+        } => validate_diagnostic_code(diagnostic_code)?,
+    }
+    Ok(())
+}
+
 fn validate_marker_state(state: &CheckoutMarkerStateV1) -> InventoryResult<()> {
     match state {
         CheckoutMarkerStateV1::Valid { checkout_id } => validate_checkout_id(checkout_id),
@@ -3302,12 +3903,59 @@ mod tests {
         AttachmentId::parse(format!("att_{}", hex_digit.to_string().repeat(32))).unwrap()
     }
 
+    fn transaction_id(hex_digit: char) -> ProjectCatalogTransactionId {
+        ProjectCatalogTransactionId::parse(format!("pct_{}", hex_digit.to_string().repeat(32)))
+            .unwrap()
+    }
+
+    fn history_id(hex_digit: char) -> RepoHistoryId {
+        RepoHistoryId::parse(format!("rh_{}", hex_digit.to_string().repeat(32))).unwrap()
+    }
+
+    fn binding_id(hex_digit: char) -> LegacyPathBindingId {
+        LegacyPathBindingId::parse(format!("lpb_{}", hex_digit.to_string().repeat(32))).unwrap()
+    }
+
     fn scope(root: &str) -> PublishedScope {
         PublishedScope::try_new("acme_repo", root).unwrap()
     }
 
     fn hash(label: &str) -> Sha256ValueV1 {
         Sha256ValueV1::digest(label.as_bytes())
+    }
+
+    fn lane_evidence(
+        lane_kind: ImmutableInventoryLaneKindV1,
+        source_id: &str,
+        row_count: u64,
+    ) -> ImmutableInventoryLaneEvidenceV1 {
+        ImmutableInventoryLaneEvidenceV1 {
+            lane_kind,
+            source_id: source_id.to_string(),
+            source_state: InventorySourceStateV1::Present {
+                fingerprint: hash(&format!("{source_id}_fingerprint")),
+                content_hash: hash(&format!("{source_id}_content")),
+                byte_len: row_count,
+            },
+            completeness: ImmutableInventoryLaneCompletenessV1::Complete,
+            row_count,
+        }
+    }
+
+    fn mutable_evidence(
+        source_id: &str,
+        source_kind: MutableInventorySourceKindV1,
+        content_hash: Sha256ValueV1,
+    ) -> MutableInventorySourceEvidenceV1 {
+        MutableInventorySourceEvidenceV1 {
+            source_id: source_id.to_string(),
+            source_kind,
+            state: InventorySourceStateV1::Present {
+                fingerprint: hash(&format!("{source_id}_fingerprint")),
+                content_hash,
+                byte_len: 1,
+            },
+        }
     }
 
     fn legacy_project(
@@ -3338,16 +3986,118 @@ mod tests {
     fn fixture_inventory() -> V1ProjectCatalogInventory {
         let source_store_bytes = br#"{"version":1,"projects":[]}"#.to_vec();
         let publisher_ref_source_bytes = br#"{"refs":[]}"#.to_vec();
+        let source_store_hash = Sha256ValueV1::digest(&source_store_bytes);
+        let publisher_ref_source_hash = Sha256ValueV1::digest(&publisher_ref_source_bytes);
         let alpha = project_id("alpha");
         let beta = project_id("beta");
         let alpha_attachment = attachment_id('1');
         let beta_attachment = attachment_id('2');
         V1ProjectCatalogInventory {
             version: PROJECT_CATALOG_INVENTORY_VERSION_V1,
-            source_store_hash: Sha256ValueV1::digest(&source_store_bytes),
+            source_store_hash: source_store_hash.clone(),
             source_store_bytes,
-            publisher_ref_source_hash: Sha256ValueV1::digest(&publisher_ref_source_bytes),
+            publisher_ref_source_hash: publisher_ref_source_hash.clone(),
             publisher_ref_source_bytes,
+            mutable_source_evidence: vec![
+                mutable_evidence(
+                    "source_legacy_store",
+                    MutableInventorySourceKindV1::LegacyProjectStore,
+                    source_store_hash,
+                ),
+                mutable_evidence(
+                    "source_publisher_store",
+                    MutableInventorySourceKindV1::PublisherRefStore,
+                    publisher_ref_source_hash,
+                ),
+                mutable_evidence(
+                    "source_effective_manifest",
+                    MutableInventorySourceKindV1::EffectiveSourceManifest,
+                    hash("effective_manifest"),
+                ),
+                mutable_evidence(
+                    "source_activation",
+                    MutableInventorySourceKindV1::CodeSourceActivation,
+                    hash("activation"),
+                ),
+                mutable_evidence(
+                    "source_metadata",
+                    MutableInventorySourceKindV1::CodeSourceGenerationMetadata,
+                    hash("metadata"),
+                ),
+                mutable_evidence(
+                    "source_manifest",
+                    MutableInventorySourceKindV1::CodeSourceGenerationManifest,
+                    hash("manifest"),
+                ),
+                mutable_evidence(
+                    "source_authority_alpha",
+                    MutableInventorySourceKindV1::CommittedAuthorityProbe,
+                    hash("authority_alpha"),
+                ),
+                mutable_evidence(
+                    "source_authority_beta",
+                    MutableInventorySourceKindV1::CommittedAuthorityProbe,
+                    hash("authority_beta"),
+                ),
+                mutable_evidence(
+                    "source_checkout_root",
+                    MutableInventorySourceKindV1::CheckoutRoot,
+                    hash("checkout_root"),
+                ),
+                mutable_evidence(
+                    "source_checkout_marker",
+                    MutableInventorySourceKindV1::CheckoutMarker,
+                    hash("checkout_marker"),
+                ),
+            ],
+            immutable_lane_evidence: vec![
+                lane_evidence(
+                    ImmutableInventoryLaneKindV1::ProjectScopedRefs,
+                    "lane_project_refs",
+                    2,
+                ),
+                lane_evidence(
+                    ImmutableInventoryLaneKindV1::EdgeWorkspaces,
+                    "lane_edge_workspaces",
+                    1,
+                ),
+                lane_evidence(
+                    ImmutableInventoryLaneKindV1::GitMetadata,
+                    "lane_git_metadata",
+                    2,
+                ),
+                lane_evidence(ImmutableInventoryLaneKindV1::Checkouts, "lane_checkouts", 1),
+                lane_evidence(
+                    ImmutableInventoryLaneKindV1::AttachmentCandidates,
+                    "lane_attachments",
+                    2,
+                ),
+                lane_evidence(
+                    ImmutableInventoryLaneKindV1::InventoryTargets,
+                    "lane_targets",
+                    1,
+                ),
+                lane_evidence(
+                    ImmutableInventoryLaneKindV1::MaterializedAliases,
+                    "lane_aliases",
+                    1,
+                ),
+                lane_evidence(
+                    ImmutableInventoryLaneKindV1::LegacyPathObservations,
+                    "lane_legacy_paths",
+                    1,
+                ),
+                lane_evidence(
+                    ImmutableInventoryLaneKindV1::RepoGroupingProofs,
+                    "lane_repo_proofs",
+                    1,
+                ),
+                lane_evidence(
+                    ImmutableInventoryLaneKindV1::LegacyNamespaceClusters,
+                    "lane_namespace_clusters",
+                    0,
+                ),
+            ],
             legacy_projects: vec![
                 legacy_project(
                     "legacy_alpha",
@@ -3380,8 +4130,11 @@ mod tests {
                     },
                     selector_hash: hash("selector"),
                     checkout_missing: false,
+                    planned_metadata_v2_hash: hash("metadata_v2"),
                 }],
                 quarantine: Vec::new(),
+                effective_manifest_hash: hash("effective_manifest"),
+                planned_activation_v2_hash: Some(hash("activation_v2")),
             }],
             publisher_pins: vec![PublisherPinObservationV1 {
                 observation_id: "pin_alpha".to_string(),
@@ -3524,20 +4277,40 @@ mod tests {
     fn fixture_post_image(inventory: &V1ProjectCatalogInventory) -> DeterministicPostImageInputV1 {
         let inventory_hash = inventory.inventory_hash().unwrap();
         let checkout_id = "e".repeat(32);
+        let registered_at = "2026-01-02T03:04:05Z".to_string();
+        let resolved_project_scopes = vec![
+            ResolvedProjectScopeInputV1 {
+                project_id: project_id("alpha"),
+                published_scope: Some(scope("services/alpha")),
+                created_at: registered_at.clone(),
+            },
+            ResolvedProjectScopeInputV1 {
+                project_id: project_id("beta"),
+                published_scope: Some(scope("services/beta")),
+                created_at: registered_at.clone(),
+            },
+        ];
+        let group_ids =
+            deterministic_repo_history_group_ids(inventory, &resolved_project_scopes).unwrap();
+        let planned_groups = BTreeMap::from([(
+            group_ids[0].clone(),
+            PlannedRepoHistoryIdentityV1 {
+                planned_history_id: history_id('3'),
+                planned_primary_namespace: CommitNamespace::parse("legacy_namespace").unwrap(),
+                planned_compatibility_namespaces: BTreeSet::new(),
+            },
+        )]);
         DeterministicPostImageInputV1 {
             version: PROJECT_CATALOG_MIGRATION_REPORT_VERSION_V1,
+            transaction_id: transaction_id('4'),
             inventory_hash,
-            resolved_project_scopes: vec![
-                ResolvedProjectScopeInputV1 {
-                    project_id: project_id("alpha"),
-                    published_scope: Some(scope("services/alpha")),
-                },
-                ResolvedProjectScopeInputV1 {
-                    project_id: project_id("beta"),
-                    published_scope: Some(scope("services/beta")),
-                },
-            ],
-            repo_history_groups: build_deterministic_repo_history_groups(inventory).unwrap(),
+            repo_history_groups: build_deterministic_repo_history_groups(
+                inventory,
+                &resolved_project_scopes,
+                &planned_groups,
+            )
+            .unwrap(),
+            resolved_project_scopes,
             attachments: vec![
                 AttachmentPostImageInputV1 {
                     attachment_id: attachment_id('1'),
@@ -3545,6 +4318,7 @@ mod tests {
                     checkout_observation_id: "checkout_acme".to_string(),
                     checkout_id: checkout_id.clone(),
                     expected_scope: Some(scope("services/alpha")),
+                    attached_at: registered_at.clone(),
                 },
                 AttachmentPostImageInputV1 {
                     attachment_id: attachment_id('2'),
@@ -3552,6 +4326,7 @@ mod tests {
                     checkout_observation_id: "checkout_acme".to_string(),
                     checkout_id: checkout_id.clone(),
                     expected_scope: Some(scope("services/beta")),
+                    attached_at: registered_at,
                 },
             ],
             checkout_identity_actions: vec![CheckoutIdentityActionV1 {
@@ -3561,6 +4336,7 @@ mod tests {
             }],
             legacy_path_bindings: vec![LegacyPathBindingPostImageInputV1 {
                 observation_id: "legacy_path_alpha".to_string(),
+                planned_binding_id: binding_id('5'),
                 attachment_id: Some(attachment_id('1')),
                 literal_selector: "/workspace/acme/alpha/src/Example.java".to_string(),
                 relationship: LegacyPathRelationshipV1::Contained,
@@ -3591,6 +4367,7 @@ mod tests {
         let pin = &inventory.publisher_pins[0];
         ProjectCatalogMigrationReportV1 {
             version: PROJECT_CATALOG_MIGRATION_REPORT_VERSION_V1,
+            transaction_id: post_image.transaction_id.clone(),
             inventory_hash: inventory.inventory_hash().unwrap(),
             plan_hash: canonical_plan_hash(inventory, resolution, post_image).unwrap(),
             source_store_hash: inventory.source_store_hash.clone(),
@@ -3626,6 +4403,7 @@ mod tests {
             checkout_identity_actions: post_image.checkout_identity_actions.clone(),
             legacy_path_bindings: vec![LegacyPathBindingReportV1 {
                 observation_id: "legacy_path_alpha".to_string(),
+                planned_binding_id: binding_id('5'),
                 store_kind: LegacyPathStoreKindV1::Knowledge,
                 relationship: LegacyPathRelationshipV1::Contained,
                 status: LegacyPathBindingStatusV1::Planned,
@@ -3677,7 +4455,8 @@ mod tests {
     #[test]
     fn grouping_uses_only_cross_checked_strong_evidence() {
         let inventory = fixture_inventory();
-        let groups = build_deterministic_repo_history_groups(&inventory).unwrap();
+        let post_image = fixture_post_image(&inventory);
+        let groups = post_image.repo_history_groups;
         assert_eq!(groups.len(), 1);
         assert_eq!(
             groups[0].project_ids,
@@ -3815,6 +4594,82 @@ mod tests {
         assert_ne!(
             canonical_plan_hash(&inventory, &resolution, &changed).unwrap(),
             report.plan_hash
+        );
+    }
+
+    #[test]
+    fn separate_preflight_and_apply_preserve_all_planned_identities() {
+        let inventory = fixture_inventory();
+        let resolution =
+            ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
+        let post_image = fixture_post_image(&inventory);
+        let report = fixture_report(&inventory, &resolution, &post_image);
+        let persisted = serde_json::to_vec(&post_image).unwrap();
+        let reopened: DeterministicPostImageInputV1 = serde_json::from_slice(&persisted).unwrap();
+
+        assert_eq!(reopened.transaction_id, report.transaction_id);
+        assert_eq!(reopened.repo_history_groups, report.repo_history_groups);
+        assert_eq!(
+            reopened.legacy_path_bindings[0].planned_binding_id,
+            report.legacy_path_bindings[0].planned_binding_id
+        );
+        assert_eq!(
+            canonical_plan_hash(&inventory, &resolution, &reopened).unwrap(),
+            report.plan_hash
+        );
+        validate_supported_resolution(&inventory, &report, &resolution, &reopened).unwrap();
+    }
+
+    #[test]
+    fn report_cannot_substitute_any_planned_identity() {
+        let inventory = fixture_inventory();
+        let resolution =
+            ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
+        let post_image = fixture_post_image(&inventory);
+
+        let mut report = fixture_report(&inventory, &resolution, &post_image);
+        report.transaction_id = transaction_id('9');
+        assert_eq!(
+            validate_supported_resolution(&inventory, &report, &resolution, &post_image)
+                .unwrap_err()
+                .code(),
+            "error.project_catalog_inventory_transaction_id_mismatch"
+        );
+
+        let mut report = fixture_report(&inventory, &resolution, &post_image);
+        report.repo_history_groups[0].planned_history_id = history_id('9');
+        assert_eq!(
+            validate_supported_resolution(&inventory, &report, &resolution, &post_image)
+                .unwrap_err()
+                .code(),
+            "error.project_catalog_inventory_history_plan_mismatch"
+        );
+
+        let mut report = fixture_report(&inventory, &resolution, &post_image);
+        report.legacy_path_bindings[0].planned_binding_id = binding_id('9');
+        assert_eq!(
+            validate_supported_resolution(&inventory, &report, &resolution, &post_image)
+                .unwrap_err()
+                .code(),
+            "error.project_catalog_inventory_legacy_path_plan_mismatch"
+        );
+    }
+
+    #[test]
+    fn predicted_timestamps_must_preserve_registered_at() {
+        let inventory = fixture_inventory();
+        let mut post_image = fixture_post_image(&inventory);
+        post_image.resolved_project_scopes[0].created_at = "2026-01-02T03:04:06Z".to_string();
+        assert_eq!(
+            post_image.validate(&inventory).unwrap_err().code(),
+            "error.project_catalog_inventory_migration_timestamp_mismatch"
+        );
+
+        let mut post_image = fixture_post_image(&inventory);
+        post_image.attachments[0].attached_at = "2026-01-02T03:04:06Z".to_string();
+        assert_eq!(
+            post_image.validate(&inventory).unwrap_err().code(),
+            "error.project_catalog_inventory_migration_timestamp_mismatch"
         );
     }
 
