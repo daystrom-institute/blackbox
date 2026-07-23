@@ -786,8 +786,15 @@ fn observe_legacy_projects(
         observations,
         source_evidence,
         owner_state: if source.was_missing {
-            InventorySourceStateV1::Missing {
+            // A no-follow observed absence accepted by the first-install
+            // bootstrap is complete evidence for the empty v1 owner. Preserve
+            // the physical absence separately in `was_missing` and mutable
+            // source evidence, but do not turn a complete empty owner into an
+            // incomplete immutable lane.
+            InventorySourceStateV1::Present {
                 fingerprint: missing_source_fingerprint("legacy-project-store"),
+                content_hash: source.source.content_hash.clone(),
+                byte_len: 0,
             }
         } else {
             present_source_state(&source.source)
@@ -4740,6 +4747,26 @@ mod tests {
             AuthorizedFileObservationV1::Invalid { diagnostic_code }
                 if diagnostic_code == "source_path_changed"
         ));
+    }
+
+    #[test]
+    fn accepted_missing_legacy_store_is_complete_empty_owner_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("projects.json");
+        let authorized = AuthorizedInventoryPath::new(&path).unwrap();
+        let source = accept_missing_legacy_projects_source(
+            capture_legacy_projects_source(&authorized).unwrap(),
+        )
+        .unwrap();
+        assert!(source.was_missing);
+        let captured = observe_legacy_projects(&source, Vec::new()).unwrap();
+        assert!(captured.observations.is_empty());
+        assert!(matches!(
+            captured.owner_state,
+            InventorySourceStateV1::Present { byte_len: 0, .. }
+        ));
+        assert!(!path.exists());
     }
 
     #[test]

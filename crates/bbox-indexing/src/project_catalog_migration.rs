@@ -341,7 +341,7 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
             artifacts_dir: state_dir.join("artifacts"),
             backup_dir: state_dir.join("backups"),
             checkout_replicas_root: rehearsal_root.map(|root| root.join("checkouts")),
-            provenance_notes_ref: format!("refs/notes/{notes_namespace}"),
+            provenance_notes_ref: validated_notes_ref(&notes_namespace)?,
             bro_home,
             state_dir,
             store_limits,
@@ -352,11 +352,8 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
         for path in self.all_paths() {
             validate_absolute_path(path)?;
         }
-        validated_notes_ref(
-            self.provenance_notes_ref
-                .strip_prefix("refs/notes/")
-                .unwrap_or_default(),
-        )?;
+        bbox_provenance::validate_notes_ref(&self.provenance_notes_ref)
+            .map_err(|_| unsafe_layout("provenance notes ref is invalid"))?;
         if let Some(root) = &self.rehearsal_root {
             for path in self.all_paths() {
                 if !path.starts_with(root) {
@@ -537,6 +534,7 @@ fn validated_notes_ref(namespace: &str) -> Result<String, ProjectCatalogMigratio
         || namespace.len() > 256
         || namespace.starts_with('/')
         || namespace.ends_with('/')
+        || namespace.contains('/')
         || namespace.contains("..")
         || namespace
             .bytes()
@@ -544,7 +542,10 @@ fn validated_notes_ref(namespace: &str) -> Result<String, ProjectCatalogMigratio
     {
         return Err(unsafe_layout("provenance notes namespace is invalid"));
     }
-    Ok(format!("refs/notes/{namespace}"))
+    let notes_ref = format!("refs/notes/{namespace}/provenance");
+    bbox_provenance::validate_notes_ref(&notes_ref)
+        .map_err(|_| unsafe_layout("provenance notes namespace is invalid"))?;
+    Ok(notes_ref)
 }
 
 fn validate_absolute_path(path: &Path) -> Result<(), ProjectCatalogMigrationError> {
@@ -4980,6 +4981,11 @@ mod tests {
         assert_eq!(
             layout.checkout_replicas_root,
             Some(rehearsal.join("checkouts"))
+        );
+        assert_eq!(layout.provenance_notes_ref, "refs/notes/bb/provenance");
+        assert_eq!(
+            owner_inventory_paths(&layout, Vec::new()).whiteboard_root,
+            rehearsal.join("state").join("bro").join("whiteboards")
         );
         assert!(
             layout
