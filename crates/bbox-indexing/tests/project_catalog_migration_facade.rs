@@ -21,9 +21,8 @@ use bbox_corpus_core::project_catalog::{
 use bbox_corpus_index::index::TranscriptIndex;
 use bbox_edge_sidecar::manifest::ManifestIndex;
 use bbox_indexing::project_catalog_inventory::{
-    ExcludedAttachmentV1, ProjectCatalogMigrationStatusV1, QuarantineCollectedV1,
-    RequiredResolutionKindV1, SelectedScopeOwnerV1, decode_migration_report_v1,
-    decode_migration_resolution_v1, encode_migration_resolution_v1,
+    ProjectCatalogMigrationStatusV1, QuarantineCollectedV1, SelectedScopeOwnerV1,
+    decode_migration_report_v1, decode_migration_resolution_v1, encode_migration_resolution_v1,
 };
 use bbox_indexing::project_catalog_migration::{
     ProjectCatalogMigrationApplyOutcomeV1, ProjectCatalogMigrationApplyRequestV1,
@@ -514,25 +513,6 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
         losing_project_ids: [fixture.loser_project.clone()].into_iter().collect(),
         owned_aliases: Default::default(),
     });
-    let losing_attachment = assessment_report
-        .attachments
-        .iter()
-        .find(|row| row.project_id == fixture.loser_project)
-        .unwrap();
-    let exclusion = assessment_report
-        .required_resolutions
-        .iter()
-        .find(|row| {
-            row.kind == RequiredResolutionKindV1::ExcludeAttachment
-                && row
-                    .candidate_record_ids
-                    .contains(&losing_attachment.observation_id)
-        })
-        .unwrap();
-    resolution.excluded_attachments.push(ExcludedAttachmentV1 {
-        resolution_id: exclusion.resolution_id.clone(),
-        attachment_id: losing_attachment.attachment_id.clone(),
-    });
     fs::write(
         &resolution_path,
         encode_migration_resolution_v1(&resolution).unwrap(),
@@ -575,11 +555,11 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
         ProjectCatalogMigrationStatusV1::Clean
     );
     assert_public_value_is_path_redacted(&preflight.receipt, &rehearsal_root);
-    assert_eq!(preflight.receipt.checkout_action_count, 2);
+    assert_eq!(preflight.receipt.checkout_action_count, 3);
     assert_eq!(preflight.receipt.publisher_pin_count, 1);
     assert_eq!(preflight.receipt.quarantine_root_count, 1);
-    assert_eq!(preflight.receipt.attached_project_count, 2);
-    assert_eq!(preflight.receipt.omitted_catalog_count, 1);
+    assert_eq!(preflight.receipt.attached_project_count, 3);
+    assert_eq!(preflight.receipt.omitted_catalog_count, 0);
 
     let reviewed_report_bytes = fs::read(&report_path).unwrap();
     let mut tampered_report: serde_json::Value =
@@ -653,20 +633,26 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
         .unwrap();
     assert_public_value_is_path_redacted(verified.receipt(), &rehearsal_root);
     assert_eq!(verified.receipt(), &applied.receipt.verification);
-    assert_eq!(verified.compatibility().records().len(), 2);
-    assert_eq!(verified.compatibility().omitted_catalog_count(), 1);
+    assert_eq!(verified.compatibility().records().len(), 3);
+    assert_eq!(verified.compatibility().omitted_catalog_count(), 0);
     for (project_id, checkout, repo_id, registered_at) in [
         (
             &fixture.winner_project,
             &fixture.winner_checkout,
-            "neutral-repository",
+            Some("neutral-repository"),
             "2026-01-02T03:04:05Z",
         ),
         (
             &fixture.collision_winner_project,
             &fixture.collision_winner_checkout,
-            "neutral-collision",
+            Some("neutral-collision"),
             "2026-01-02T03:04:06Z",
+        ),
+        (
+            &fixture.loser_project,
+            &fixture.loser_checkout,
+            None,
+            "2026-01-02T03:04:07Z",
         ),
     ] {
         let record = verified
@@ -676,7 +662,7 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
             .find(|record| record.project_id == project_id.as_str())
             .unwrap();
         assert_eq!(record.canonical_path, checkout.to_str().unwrap());
-        assert_eq!(record.repo_id.as_deref(), Some(repo_id));
+        assert_eq!(record.repo_id.as_deref(), repo_id);
         assert_eq!(record.registered_at, registered_at);
         assert!(record.is_git_repo);
         assert!(record.languages.is_empty());
@@ -686,7 +672,11 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
         &fs::read(rehearsal_root.join("state/project-attachments.json")).unwrap(),
     )
     .unwrap();
-    for project_id in [&fixture.winner_project, &fixture.collision_winner_project] {
+    for project_id in [
+        &fixture.winner_project,
+        &fixture.collision_winner_project,
+        &fixture.loser_project,
+    ] {
         assert_eq!(
             attachment_snapshot
                 .attachments
@@ -710,6 +700,7 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
             &fixture.collision_winner_project,
             &fixture.collision_winner_checkout,
         ),
+        (&fixture.loser_project, &fixture.loser_checkout),
     ] {
         let observation_id = &executable_report
             .attachments
@@ -727,12 +718,6 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
             format!("{}\n", action.planned_checkout_id)
         );
     }
-    assert!(
-        !fixture
-            .loser_checkout
-            .join(".bbox/local/checkout-id")
-            .exists()
-    );
     let effective = decode_migration_effective_source_manifest_v1(
         &fs::read(code_source_paths.anchor()).unwrap(),
     )
