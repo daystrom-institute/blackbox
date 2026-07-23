@@ -10,23 +10,75 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-use bbox_code_source_store::StoreLimits;
+use bbox_code_source_store::{
+    ActivationRecordV2, CollisionRetirementEntryV1, CollisionRetirementLifecycleStateV1,
+    CollisionRetirementLifecycleV1, CollisionRetirementSelectorEvidenceV1,
+    MigrationEffectiveSourceManifestV1, MigrationEffectiveSourceSelectionV1, StoreLimits,
+    StoredGenerationV2, encode_activation_v2_for_migration,
+    encode_collision_retirement_pending_for_migration,
+    encode_migration_effective_source_manifest_v1, encode_stored_generation_v2_for_migration,
+};
 use bbox_config::config::Config;
+use bbox_corpus_core::git::{
+    list_verified_committed_dir_bounded, read_verified_committed_file_bytes_bounded,
+    verify_commit_oid_with_alternate,
+};
 use bbox_corpus_core::json_store::{NofollowDirectory, canonical_store_lock_path};
 use bbox_corpus_core::project_catalog::{
-    AttachmentKind, AttachmentStatus, CatalogOriginV2, ProjectCatalogTransactionId,
-    validate_catalog_attachments,
+    AmbiguousNamespaceRecord, AmbiguousNamespaceStatus, AttachmentCapabilities, AttachmentId,
+    AttachmentKind, AttachmentSnapshotV1, AttachmentStatus, CatalogOriginV2, CatalogSnapshotV2,
+    CheckoutAttachment, CommitNamespace, CorpusProject, LegacyPathBindingId,
+    LegacyPathBindingStatus, LegacyPathLedgerEntry, LegacyPathRelationship,
+    MAX_PROJECT_CATALOG_ENTRIES, ProjectCatalogTransactionId, ProjectId, ProjectScope,
+    RecordedRepoAuthority, RepoHistoryAuthority, RepoHistoryId, RepoHistoryRecord,
+    encode_attachment_snapshot, encode_catalog_snapshot, validate_catalog_attachments,
 };
 use bbox_corpus_core::project_record::ProjectRecord;
 use serde::Serialize;
 
+use crate::accepted_publication_store::{
+    AcceptedGapSourceV1, AcceptedKnowledgeSourceV1, AcceptedPublicationBuildInputV1,
+    AcceptedPublicationLimits, FullPublisherRef, GitObjectId, PreparedAcceptedPublicationV1,
+    prepare_accepted_publication_v1,
+};
 use crate::project_catalog_inventory::{
-    MAX_PROJECT_CATALOG_REPORT_BYTES, MAX_PROJECT_CATALOG_RESOLUTION_BYTES,
-    ProjectCatalogMigrationReportV1, ProjectCatalogMigrationResolutionV1,
-    ProjectCatalogMigrationStatusV1, Sha256ValueV1, decode_migration_report_v1,
-    decode_migration_resolution_v1,
+    AttachmentMigrationReportRowV1, AttachmentPostImageInputV1, CheckoutIdentityActionV1,
+    ConflictReportV1, DeterministicPostImageInputV1, DeterministicRepoHistoryGroupV1,
+    InventorySourceStateV1, LegacyPathBindingPostImageInputV1, LegacyPathBindingReportV1,
+    LegacyPathBindingStatusV1, LegacyPathRelationshipV1, MAX_PROJECT_CATALOG_REPORT_BYTES,
+    MAX_PROJECT_CATALOG_RESOLUTION_BYTES, MissingPathReportV1, MutableInventorySourceKindV1,
+    PlannedRepoHistoryIdentityV1, PredictedAssetV1, PredictedPostImageHashesV1,
+    ProjectCatalogMigrationPlanKindV1, ProjectCatalogMigrationReportV1,
+    ProjectCatalogMigrationResolutionV1, ProjectCatalogMigrationStatusV1,
+    ProjectMigrationReportRowV1, PublicationPayloadHashesV1, PublisherBindingDispositionV1,
+    PublisherBindingReportStatusV1, PublisherBindingReportV1, QuarantinePostImageInputV1,
+    RequiredResolutionKindV1, RequiredResolutionV1, ResolvedProjectScopeInputV1,
+    SensitiveLocalPathReportV1, SensitiveLocalPathRowV1, Sha256ValueV1, V1ProjectCatalogInventory,
+    build_deterministic_repo_history_groups, canonical_plan_hash, canonical_scope_conflicts,
+    canonical_scope_resolution_id, decode_migration_report_v1, decode_migration_resolution_v1,
+    deterministic_repo_history_group_ids, deterministic_repo_history_group_memberships,
+    digest_path, digest_published_scope, digest_publisher_full_ref, encode_migration_report_v1,
+    encode_migration_resolution_v1, encode_sensitive_local_path_report_v1, project_authority_scope,
+    validated_quarantine_bindings,
+};
+use crate::project_catalog_inventory_adapters::{
+    AttachmentCandidateIdentityPlanV1, AttachmentCandidateKeyV1,
+    ProjectCatalogAttachmentCandidateDiscoveryRequestV1, ProjectCatalogMigrationInventoryFacadeV1,
+    ProjectCatalogMigrationInventoryRequestV1, ProjectCatalogOwnerInventoryLimitsV1,
+    ProjectCatalogOwnerInventoryPathsV1, attachment_observation_id,
 };
 use crate::project_catalog_migration_lock::project_catalog_migration_lock_path;
+use crate::project_catalog_store::{
+    ImmutableAssetRoleV1, MigrationCheckoutIdentityActionDraftV1,
+    MigrationCodeSourceActivationDraftV1, MigrationCodeSourceDispositionV1,
+    MigrationCodeSourceGenerationDraftV1, MigrationCodeSourceSnapshotDraftV1,
+    MigrationImmutableAssetDraftV1, MigrationLegacyProjectSourceDraftV1,
+    MigrationParticipantDraftV1, MigrationParticipantRegistry, MigrationPlanDraftV1,
+    MigrationPublisherSourceDraftV1, ParticipantRoleV1, ProjectCatalogStore,
+    PublisherDispositionEvidenceV1, PublisherPinEvidenceV1, Sha256Hex, ValidatedMigrationPlanV1,
+    transact_migration, validate_migration_plan,
+};
+use crate::publisher::PublisherRefStore;
 
 const FACADE_VERSION_V1: u32 = 1;
 const MAX_FACADE_DIAGNOSTIC_BYTES: usize = 512;
@@ -709,9 +761,23 @@ where
                 )
             })?;
         }
+        let existing_report = read_artifact_optional(
+            &request.report_path,
+            MAX_PROJECT_CATALOG_REPORT_BYTES,
+            "report",
+        )?;
+        if let Some(bytes) = &existing_report {
+            decode_migration_report_v1(bytes).map_err(|_| {
+                ProjectCatalogMigrationError::no_mutation(
+                    "error.project_catalog_migration_invalid_report_artifact",
+                    "existing report artifact is not a strict nonempty v1 document",
+                )
+            })?;
+        }
         let prepared = self.integration.prepare_preflight(
             &request.layout,
             existing_resolution.as_deref(),
+            existing_report.as_deref(),
             request.sensitive_report_path.is_some(),
         )?;
         validate_prepared_preflight(
@@ -790,10 +856,12 @@ where
                 "resolution artifact is not a strict nonempty v1 document",
             )
         })?;
-        if report.status != ProjectCatalogMigrationStatusV1::Clean {
+        if report.status != ProjectCatalogMigrationStatusV1::Clean
+            || report.plan_kind != ProjectCatalogMigrationPlanKindV1::Executable
+        {
             return Err(ProjectCatalogMigrationError::no_mutation(
                 "error.project_catalog_migration_report_not_clean",
-                "rehearsal apply requires a clean report",
+                "rehearsal apply requires a clean executable report",
             ));
         }
         if report.resolution_artifact_hash != Sha256ValueV1::digest(&resolution_bytes) {
@@ -851,6 +919,7 @@ pub(crate) trait ClosedMigrationIntegrationV1 {
         &self,
         layout: &ProjectCatalogMigrationResolvedLayoutV1,
         existing_resolution: Option<&[u8]>,
+        existing_report: Option<&[u8]>,
         include_sensitive_paths: bool,
     ) -> Result<PreparedPreflightV1, ProjectCatalogMigrationError>;
 
@@ -869,67 +938,3289 @@ pub(crate) trait ClosedMigrationIntegrationV1 {
     ) -> Result<ProjectCatalogMigrationVerifyResultV1, ProjectCatalogMigrationError>;
 }
 
-/// Typed, crate-internal connection point for strict owner snapshots.
-///
-/// This staging implementation must remain fail-closed. In particular it must
-/// not call `CodeSourceStore::open`, which creates missing directories, and it
-/// must not replace the closed ten-lane census with empty observations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MigrationPersistedIdentityPlanV1 {
+    transaction_id: ProjectCatalogTransactionId,
+    repo_history_groups: Vec<DeterministicRepoHistoryGroupV1>,
+    checkout_identity_actions: Vec<CheckoutIdentityActionV1>,
+    legacy_path_binding_ids: BTreeMap<String, LegacyPathBindingId>,
+    attachment_ids: BTreeMap<String, AttachmentId>,
+}
+
+#[derive(Debug, Clone)]
+struct MigrationRuntimeBindingsViewV1 {
+    legacy_project_store_bytes: Vec<u8>,
+    legacy_project_store_was_missing: bool,
+    legacy_project_paths: BTreeMap<String, PathBuf>,
+    checkout_paths: BTreeMap<String, PathBuf>,
+    git_common_directories: BTreeMap<String, PathBuf>,
+    legacy_selectors: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+struct MigrationBasePostImagesV1 {
+    catalog: CatalogSnapshotV2,
+    attachments: AttachmentSnapshotV1,
+    post_image_attachments: Vec<AttachmentPostImageInputV1>,
+    post_image_legacy_bindings: Vec<LegacyPathBindingPostImageInputV1>,
+    legacy_binding_report: Vec<LegacyPathBindingReportV1>,
+    sensitive_report: SensitiveLocalPathReportV1,
+    missing_paths: Vec<MissingPathReportV1>,
+    unscoped_legacy_counts: BTreeMap<crate::project_catalog_inventory::LegacyPathStoreKindV1, u64>,
+    refusal_count: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedPublisherPlanV1 {
+    dispositions: Vec<PublisherBindingDispositionV1>,
+    prepared: BTreeMap<ProjectId, PreparedAcceptedPublicationV1>,
+}
+
+#[derive(Debug, Clone)]
+struct MigrationStorePlanPartsV1 {
+    participants: Vec<MigrationParticipantDraftV1>,
+    immutable_assets: Vec<MigrationImmutableAssetDraftV1>,
+    code_source_snapshot: MigrationCodeSourceSnapshotDraftV1,
+    publisher_pins: Vec<PublisherPinEvidenceV1>,
+    publisher_dispositions: Vec<PublisherDispositionEvidenceV1>,
+}
+
+#[derive(Debug, Serialize)]
+struct FacadeSensitiveReviewV1<'a> {
+    version: u32,
+    inventory_hash: &'a Sha256ValueV1,
+    local_paths_included: bool,
+    warning: &'static str,
+    legacy_paths: &'a SensitiveLocalPathReportV1,
+    attachment_paths: Vec<FacadeSensitiveAttachmentPathV1>,
+}
+
+#[derive(Debug, Serialize)]
+struct FacadeSensitiveAttachmentPathV1 {
+    observation_id: String,
+    attachment_id: AttachmentId,
+    checkout_observation_id: String,
+    checkout_root: String,
+    checkout_root_digest: Sha256ValueV1,
+    project_path: String,
+    project_path_digest: Sha256ValueV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MigrationSemanticAssessmentV1 {
+    resolved_project_scopes: Vec<ResolvedProjectScopeInputV1>,
+    namespace_conflicts: Vec<ConflictReportV1>,
+    scope_conflicts: Vec<ConflictReportV1>,
+    alias_conflicts: Vec<ConflictReportV1>,
+    activation_conflicts: Vec<ConflictReportV1>,
+    publisher_bindings: Vec<PublisherBindingReportV1>,
+    publisher_binding_conflicts: Vec<ConflictReportV1>,
+    retained_attachment_ids: BTreeSet<AttachmentId>,
+    required_resolutions: Vec<RequiredResolutionV1>,
+    unresolved_resolution_ids: BTreeSet<String>,
+    refusal_count: u64,
+}
+
+impl MigrationSemanticAssessmentV1 {
+    fn status(&self) -> ProjectCatalogMigrationStatusV1 {
+        if self.refusal_count != 0 {
+            ProjectCatalogMigrationStatusV1::Refused
+        } else if !self.unresolved_resolution_ids.is_empty() {
+            ProjectCatalogMigrationStatusV1::ResolutionRequired
+        } else {
+            ProjectCatalogMigrationStatusV1::Clean
+        }
+    }
+}
+
+impl MigrationPersistedIdentityPlanV1 {
+    fn transaction_id(&self) -> &ProjectCatalogTransactionId {
+        &self.transaction_id
+    }
+}
+
+fn assess_migration_semantics(
+    inventory: &V1ProjectCatalogInventory,
+    resolution: &ProjectCatalogMigrationResolutionV1,
+) -> Result<MigrationSemanticAssessmentV1, ProjectCatalogMigrationError> {
+    inventory.validate().map_err(inventory_error)?;
+    let inventory_hash = inventory.inventory_hash().map_err(inventory_error)?;
+    if resolution.inventory_hash != inventory_hash {
+        return Err(ProjectCatalogMigrationError::no_mutation(
+            "error.project_catalog_inventory_stale_resolution",
+            "resolution artifact belongs to a different captured inventory",
+        ));
+    }
+
+    let mut refusal_count = u64::try_from(inventory.hard_refusals().len()).unwrap_or(u64::MAX);
+    let mut resolved_project_scopes = Vec::with_capacity(inventory.legacy_projects.len());
+    for project in &inventory.legacy_projects {
+        let project_id = ProjectId::parse(project.record.project_id.clone())
+            .map_err(|_| planner_error("legacy project id is invalid"))?;
+        let published_scope = match project_authority_scope(inventory, &project_id) {
+            Ok(scope) => scope.cloned(),
+            Err(_) => {
+                refusal_count = refusal_count.saturating_add(1);
+                None
+            }
+        };
+        resolved_project_scopes.push(ResolvedProjectScopeInputV1 {
+            project_id,
+            published_scope,
+            created_at: project.record.registered_at.clone(),
+        });
+    }
+    resolved_project_scopes.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+
+    let scope_projects = match canonical_scope_conflicts(inventory) {
+        Ok(conflicts) => conflicts,
+        Err(_) => {
+            refusal_count = refusal_count.saturating_add(1);
+            BTreeMap::new()
+        }
+    };
+    let selected_owners = resolution
+        .selected_scope_owners
+        .iter()
+        .map(|selection| (selection.scope.clone(), selection))
+        .collect::<BTreeMap<_, _>>();
+    if selected_owners.len() != resolution.selected_scope_owners.len() {
+        refusal_count = refusal_count.saturating_add(1);
+    }
+
+    let mut scope_conflicts = Vec::new();
+    let mut required_resolutions = Vec::new();
+    let mut unresolved_resolution_ids = BTreeSet::new();
+    let mut canonical_conflict_scopes = BTreeSet::new();
+    for (scope, candidates) in scope_projects
+        .iter()
+        .filter(|(_, candidates)| candidates.len() > 1)
+    {
+        canonical_conflict_scopes.insert(scope.clone());
+        let resolution_id =
+            canonical_scope_resolution_id(scope, candidates).map_err(inventory_error)?;
+        let candidate_record_ids = candidates
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>();
+        scope_conflicts.push(ConflictReportV1 {
+            conflict_id: resolution_id.clone(),
+            affected_record_ids: candidate_record_ids.clone(),
+            diagnostic_code: "duplicate_published_scope".to_string(),
+        });
+        required_resolutions.push(RequiredResolutionV1 {
+            resolution_id: resolution_id.clone(),
+            kind: RequiredResolutionKindV1::ScopeOwner,
+            candidate_record_ids,
+        });
+        let Some(selection) = selected_owners.get(scope).copied() else {
+            unresolved_resolution_ids.insert(resolution_id);
+            for project in &mut resolved_project_scopes {
+                if candidates.contains(&project.project_id) {
+                    project.published_scope = None;
+                }
+            }
+            continue;
+        };
+        let mut selected_candidates = selection.losing_project_ids.clone();
+        selected_candidates.insert(selection.owner_project_id.clone());
+        if selection.resolution_id != resolution_id
+            || selected_candidates != *candidates
+            || !candidates.contains(&selection.owner_project_id)
+        {
+            refusal_count = refusal_count.saturating_add(1);
+            for project in &mut resolved_project_scopes {
+                if candidates.contains(&project.project_id) {
+                    project.published_scope = None;
+                }
+            }
+            continue;
+        }
+        for project in &mut resolved_project_scopes {
+            if candidates.contains(&project.project_id) {
+                if project.project_id == selection.owner_project_id {
+                    project.published_scope = Some(scope.clone());
+                } else {
+                    project.published_scope = None;
+                }
+            }
+        }
+    }
+    if selected_owners
+        .keys()
+        .any(|scope| !canonical_conflict_scopes.contains(scope))
+    {
+        refusal_count = refusal_count.saturating_add(1);
+    }
+
+    let resolved_alias_owners = resolution
+        .selected_scope_owners
+        .iter()
+        .flat_map(|selection| {
+            selection
+                .owned_aliases
+                .iter()
+                .map(move |alias| (alias.as_str(), &selection.owner_project_id))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let resolved_alias_count = resolution
+        .selected_scope_owners
+        .iter()
+        .map(|selection| selection.owned_aliases.len())
+        .sum::<usize>();
+    if resolved_alias_owners.len() != resolved_alias_count {
+        refusal_count = refusal_count.saturating_add(1);
+    }
+    let mut aliases = BTreeMap::<String, BTreeSet<ProjectId>>::new();
+    for project in &inventory.legacy_projects {
+        let project_id = ProjectId::parse(project.record.project_id.clone())
+            .map_err(|_| planner_error("legacy project id is invalid"))?;
+        for alias in &project.record.aliases {
+            aliases
+                .entry(alias.clone())
+                .or_default()
+                .insert(project_id.clone());
+        }
+    }
+    for alias in &inventory.materialized_aliases {
+        aliases
+            .entry(alias.alias.clone())
+            .or_default()
+            .insert(alias.project_id.clone());
+    }
+    let mut alias_conflicts = Vec::new();
+    for (alias, candidates) in aliases
+        .iter()
+        .filter(|(_, candidates)| candidates.len() > 1)
+    {
+        let candidate_record_ids = candidates
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>();
+        alias_conflicts.push(ConflictReportV1 {
+            conflict_id: stable_conflict_id("alias_conflict", &(alias, candidates))?,
+            affected_record_ids: candidate_record_ids,
+            diagnostic_code: "duplicate_materialized_alias".to_string(),
+        });
+        let exact_owner = resolution.selected_scope_owners.iter().any(|selection| {
+            if !selection.owned_aliases.contains(alias) {
+                return false;
+            }
+            let mut selected_candidates = selection.losing_project_ids.clone();
+            selected_candidates.insert(selection.owner_project_id.clone());
+            selected_candidates == *candidates && candidates.contains(&selection.owner_project_id)
+        });
+        if !exact_owner {
+            // V1 has no free-standing alias-owner disposition. An alias may
+            // only ride on the exact duplicate-scope owner selection that
+            // already names it; otherwise it is a non-overridable conflict.
+            refusal_count = refusal_count.saturating_add(1);
+        }
+    }
+    if resolved_alias_owners
+        .iter()
+        .any(|(alias, owner)| !aliases.get(*alias).is_some_and(|set| set.contains(*owner)))
+    {
+        refusal_count = refusal_count.saturating_add(1);
+    }
+
+    let resolved_scopes = resolved_project_scopes
+        .iter()
+        .map(|row| (row.project_id.clone(), row.published_scope.as_ref()))
+        .collect::<BTreeMap<_, _>>();
+    let exclusion_rows = resolution
+        .excluded_attachments
+        .iter()
+        .map(|row| (row.attachment_id.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    if exclusion_rows.len() != resolution.excluded_attachments.len() {
+        refusal_count = refusal_count.saturating_add(1);
+    }
+    let duplicate_attachment_keys = inventory
+        .attachment_candidates
+        .iter()
+        .fold(
+            BTreeMap::<(&str, &str), Vec<&str>>::new(),
+            |mut groups, attachment| {
+                groups
+                    .entry((
+                        attachment.checkout_observation_id.as_str(),
+                        attachment.base_relpath.as_str(),
+                    ))
+                    .or_default()
+                    .push(attachment.observation_id.as_str());
+                groups
+            },
+        )
+        .into_iter()
+        .filter(|(_, observations)| observations.len() > 1)
+        .flat_map(|(_, observations)| observations)
+        .collect::<BTreeSet<_>>();
+    let mut canonical_exclusions = BTreeSet::new();
+    let mut retained_attachment_ids = BTreeSet::new();
+    for attachment in &inventory.attachment_candidates {
+        let scope_mismatch = resolved_scopes
+            .get(&attachment.project_id)
+            .map_or(true, |resolved| {
+                *resolved != attachment.observed_scope.as_ref()
+            })
+            || attachment
+                .observed_scope
+                .as_ref()
+                .is_some_and(|scope| scope.bbox_root_relpath() != attachment.base_relpath);
+        let requires_exclusion = scope_mismatch
+            || duplicate_attachment_keys.contains(attachment.observation_id.as_str());
+        if !requires_exclusion {
+            retained_attachment_ids.insert(attachment.attachment_id.clone());
+            continue;
+        }
+        canonical_exclusions.insert(attachment.attachment_id.clone());
+        let resolution_id = stable_conflict_id("attachment_conflict", &attachment.observation_id)?;
+        let candidate_record_ids = BTreeSet::from([attachment.observation_id.clone()]);
+        required_resolutions.push(RequiredResolutionV1 {
+            resolution_id: resolution_id.clone(),
+            kind: RequiredResolutionKindV1::ExcludeAttachment,
+            candidate_record_ids,
+        });
+        match exclusion_rows.get(&attachment.attachment_id).copied() {
+            None => {
+                unresolved_resolution_ids.insert(resolution_id);
+            }
+            Some(row) if row.resolution_id != resolution_id => {
+                refusal_count = refusal_count.saturating_add(1);
+            }
+            Some(_) => {}
+        }
+    }
+    if exclusion_rows
+        .keys()
+        .any(|attachment_id| !canonical_exclusions.contains(attachment_id))
+    {
+        refusal_count = refusal_count.saturating_add(1);
+    }
+
+    let group_memberships =
+        deterministic_repo_history_group_memberships(inventory, &resolved_project_scopes)
+            .map_err(inventory_error)?
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+    let split_rows = resolution
+        .repo_history_group_splits
+        .iter()
+        .map(|row| (row.source_cluster_id.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
+    if split_rows.len() != resolution.repo_history_group_splits.len() {
+        refusal_count = refusal_count.saturating_add(1);
+    }
+    let mut namespace_conflicts = Vec::new();
+    for cluster in &inventory.legacy_namespace_clusters {
+        let resolution_id = cluster.observation_id.clone();
+        let candidate_record_ids = cluster
+            .project_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>();
+        namespace_conflicts.push(ConflictReportV1 {
+            conflict_id: resolution_id.clone(),
+            affected_record_ids: candidate_record_ids.clone(),
+            diagnostic_code: "ambiguous_legacy_namespace".to_string(),
+        });
+        required_resolutions.push(RequiredResolutionV1 {
+            resolution_id: resolution_id.clone(),
+            kind: RequiredResolutionKindV1::RepoHistoryGroupSplit,
+            candidate_record_ids,
+        });
+        let Some(split) = split_rows.get(cluster.cluster_id.as_str()).copied() else {
+            unresolved_resolution_ids.insert(resolution_id);
+            continue;
+        };
+        let partitioned = split
+            .partitions
+            .iter()
+            .flat_map(|partition| partition.project_ids.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let partitions_are_exact = partitioned == cluster.project_ids
+            && split.resolution_id == resolution_id
+            && split.partitions.iter().all(|partition| {
+                group_memberships.get(&partition.target_group_id) == Some(&partition.project_ids)
+            });
+        if !partitions_are_exact {
+            refusal_count = refusal_count.saturating_add(1);
+        }
+    }
+    if split_rows.keys().any(|cluster_id| {
+        !inventory
+            .legacy_namespace_clusters
+            .iter()
+            .any(|cluster| cluster.cluster_id == **cluster_id)
+    }) {
+        refusal_count = refusal_count.saturating_add(1);
+    }
+    if !resolution.repo_history_group_merges.is_empty() {
+        return Err(ProjectCatalogMigrationError::no_mutation(
+            "error.project_catalog_inventory_unsupported_merge",
+            "repository-history groups already reflect every strong same-repository proof",
+        ));
+    }
+
+    let quarantine_rows = resolution
+        .quarantine_collected
+        .iter()
+        .map(|row| ((row.project_id.clone(), row.generation_id.as_str()), row))
+        .collect::<BTreeMap<_, _>>();
+    if quarantine_rows.len() != resolution.quarantine_collected.len() {
+        refusal_count = refusal_count.saturating_add(1);
+    }
+    let mut expected_quarantines = BTreeSet::new();
+    let mut activation_conflicts = Vec::new();
+    for selection in &resolution.selected_scope_owners {
+        for source in &inventory.code_sources {
+            if !selection.losing_project_ids.contains(&source.project_id) {
+                continue;
+            }
+            for generation in &source.generations {
+                let key = (
+                    generation.project_id.clone(),
+                    generation.generation_id.as_str(),
+                );
+                expected_quarantines.insert((key.0.clone(), key.1.to_string()));
+                let resolution_id =
+                    stable_conflict_id("activation_conflict", &generation.observation_id)?;
+                let candidate_record_ids = BTreeSet::from([generation.observation_id.clone()]);
+                activation_conflicts.push(ConflictReportV1 {
+                    conflict_id: resolution_id.clone(),
+                    affected_record_ids: candidate_record_ids.clone(),
+                    diagnostic_code: "losing_collected_generation".to_string(),
+                });
+                required_resolutions.push(RequiredResolutionV1 {
+                    resolution_id: resolution_id.clone(),
+                    kind: RequiredResolutionKindV1::QuarantineCollected,
+                    candidate_record_ids,
+                });
+                match quarantine_rows.get(&key).copied() {
+                    None => {
+                        unresolved_resolution_ids.insert(resolution_id);
+                    }
+                    Some(row) if row.resolution_id != resolution_id => {
+                        refusal_count = refusal_count.saturating_add(1);
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+    if quarantine_rows.keys().any(|(project_id, generation_id)| {
+        !expected_quarantines.contains(&(project_id.clone(), (*generation_id).to_string()))
+    }) {
+        refusal_count = refusal_count.saturating_add(1);
+    }
+
+    let resolution_publishers = resolution
+        .publisher_binding_dispositions
+        .iter()
+        .map(|row| {
+            (
+                (
+                    row.project_id().clone(),
+                    row.expected_scope().clone(),
+                    row.full_ref().to_string(),
+                ),
+                row,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if resolution_publishers.len() != resolution.publisher_binding_dispositions.len() {
+        refusal_count = refusal_count.saturating_add(1);
+    }
+    let mut publisher_bindings = Vec::new();
+    let mut publisher_binding_conflicts = Vec::new();
+    for pin in &inventory.publisher_pins {
+        let key = (
+            pin.project_id.clone(),
+            pin.expected_scope.clone(),
+            pin.full_ref.clone(),
+        );
+        let retained_pin_candidates = pin
+            .candidate_attachment_ids
+            .intersection(&retained_attachment_ids)
+            .count();
+        let automatic = retained_pin_candidates == 1
+            && pin.resolved_commit.is_some()
+            && pin.resolved_scope.as_ref() == Some(&pin.expected_scope);
+        let status = if automatic {
+            if resolution_publishers.contains_key(&key) {
+                refusal_count = refusal_count.saturating_add(1);
+            }
+            PublisherBindingReportStatusV1::SeedG1Predicted
+        } else {
+            let resolution_id = stable_conflict_id("publisher_binding", &pin.observation_id)?;
+            let mut candidate_record_ids = BTreeSet::from([pin.observation_id.clone()]);
+            candidate_record_ids.extend(
+                inventory
+                    .attachment_candidates
+                    .iter()
+                    .filter(|attachment| {
+                        pin.candidate_attachment_ids
+                            .contains(&attachment.attachment_id)
+                    })
+                    .map(|attachment| attachment.observation_id.clone()),
+            );
+            publisher_binding_conflicts.push(ConflictReportV1 {
+                conflict_id: resolution_id.clone(),
+                affected_record_ids: candidate_record_ids.clone(),
+                diagnostic_code: "publisher_binding_ambiguous".to_string(),
+            });
+            required_resolutions.push(RequiredResolutionV1 {
+                resolution_id: resolution_id.clone(),
+                kind: RequiredResolutionKindV1::PublisherBindingDisposition,
+                candidate_record_ids,
+            });
+            match resolution_publishers.get(&key) {
+                None => {
+                    unresolved_resolution_ids.insert(resolution_id);
+                    PublisherBindingReportStatusV1::ResolutionRequired
+                }
+                Some(PublisherBindingDispositionV1::SeedG1 { .. }) => {
+                    PublisherBindingReportStatusV1::ResolutionRequired
+                }
+                Some(PublisherBindingDispositionV1::NoPublishedContentAcknowledged { .. }) => {
+                    PublisherBindingReportStatusV1::ResolutionRequired
+                }
+            }
+        };
+        publisher_bindings.push(PublisherBindingReportV1 {
+            pin_observation_id: pin.observation_id.clone(),
+            project_id: pin.project_id.clone(),
+            expected_scope_digest: digest_published_scope(&pin.expected_scope)
+                .map_err(inventory_error)?,
+            full_ref_digest: digest_publisher_full_ref(&pin.full_ref).map_err(inventory_error)?,
+            status,
+        });
+    }
+    if resolution_publishers.keys().any(|key| {
+        !inventory.publisher_pins.iter().any(|pin| {
+            pin.project_id == key.0 && pin.expected_scope == key.1 && pin.full_ref == key.2
+        })
+    }) {
+        refusal_count = refusal_count.saturating_add(1);
+    }
+
+    for checkout in &inventory.checkouts {
+        if matches!(
+            &checkout.marker_state,
+            crate::project_catalog_inventory::CheckoutMarkerStateV1::Malformed { .. }
+                | crate::project_catalog_inventory::CheckoutMarkerStateV1::Unreadable { .. }
+                | crate::project_catalog_inventory::CheckoutMarkerStateV1::Symlinked
+        ) {
+            refusal_count = refusal_count.saturating_add(1);
+        }
+    }
+    for namespace in &inventory.legacy_commit_namespaces {
+        use crate::project_catalog_inventory::LegacyCommitNamespaceAttributionV1 as Attribution;
+        let supported = match &namespace.attribution {
+            Attribution::Proved { .. } => true,
+            Attribution::Ambiguous {
+                candidate_project_ids,
+            } => inventory.legacy_namespace_clusters.iter().any(|cluster| {
+                cluster.materialized_namespace == namespace.namespace.as_str()
+                    && &cluster.project_ids == candidate_project_ids
+            }),
+            Attribution::Unclaimed => false,
+        };
+        if !supported {
+            refusal_count = refusal_count.saturating_add(1);
+        }
+    }
+    namespace_conflicts.sort_by(|left, right| left.conflict_id.cmp(&right.conflict_id));
+    scope_conflicts.sort_by(|left, right| left.conflict_id.cmp(&right.conflict_id));
+    alias_conflicts.sort_by(|left, right| left.conflict_id.cmp(&right.conflict_id));
+    activation_conflicts.sort_by(|left, right| left.conflict_id.cmp(&right.conflict_id));
+    publisher_bindings
+        .sort_by(|left, right| left.pin_observation_id.cmp(&right.pin_observation_id));
+    publisher_binding_conflicts.sort_by(|left, right| left.conflict_id.cmp(&right.conflict_id));
+    required_resolutions.sort_by(|left, right| left.resolution_id.cmp(&right.resolution_id));
+    Ok(MigrationSemanticAssessmentV1 {
+        resolved_project_scopes,
+        namespace_conflicts,
+        scope_conflicts,
+        alias_conflicts,
+        activation_conflicts,
+        publisher_bindings,
+        publisher_binding_conflicts,
+        retained_attachment_ids,
+        required_resolutions,
+        unresolved_resolution_ids,
+        refusal_count,
+    })
+}
+
+fn build_persisted_identity_plan(
+    inventory: &V1ProjectCatalogInventory,
+    resolved_project_scopes: &[ResolvedProjectScopeInputV1],
+    retained_attachment_ids: &BTreeSet<AttachmentId>,
+    prior_report: Option<&ProjectCatalogMigrationReportV1>,
+) -> Result<MigrationPersistedIdentityPlanV1, ProjectCatalogMigrationError> {
+    inventory.validate().map_err(inventory_error)?;
+    let inventory_hash = inventory.inventory_hash().map_err(inventory_error)?;
+    let prior_report = match prior_report {
+        Some(report) if report.inventory_hash == inventory_hash => {
+            report
+                .validate_against_inventory(inventory)
+                .map_err(inventory_error)?;
+            Some(report)
+        }
+        Some(_) | None => None,
+    };
+
+    let transaction_id = prior_report
+        .map(|report| report.transaction_id.clone())
+        .unwrap_or_else(ProjectCatalogTransactionId::mint);
+    let prior_groups = prior_report
+        .into_iter()
+        .flat_map(|report| &report.repo_history_groups)
+        .map(|group| (group.group_id.as_str(), group))
+        .collect::<BTreeMap<_, _>>();
+    let mut planned_groups = BTreeMap::new();
+    let mut used_history_ids = prior_report
+        .into_iter()
+        .flat_map(|report| &report.repo_history_groups)
+        .map(|group| group.planned_history_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut used_namespaces = prior_report
+        .into_iter()
+        .flat_map(|report| &report.repo_history_groups)
+        .flat_map(|group| {
+            std::iter::once(group.planned_primary_namespace.clone())
+                .chain(group.planned_compatibility_namespaces.iter().cloned())
+        })
+        .collect::<BTreeSet<_>>();
+    for group_id in deterministic_repo_history_group_ids(inventory, resolved_project_scopes)
+        .map_err(inventory_error)?
+    {
+        let prior = prior_groups.get(group_id.as_str()).copied();
+        let planned_history_id = match prior {
+            Some(group) => group.planned_history_id.clone(),
+            None => mint_unique_repo_history_id(&mut used_history_ids),
+        };
+        used_history_ids.insert(planned_history_id.clone());
+
+        let inventoried_namespaces =
+            inventoried_group_namespaces(inventory, resolved_project_scopes, &group_id)?;
+        let (planned_primary_namespace, planned_compatibility_namespaces) =
+            if inventoried_namespaces.is_empty() {
+                let namespace = prior
+                    .map(|group| group.planned_primary_namespace.clone())
+                    .unwrap_or_else(|| mint_local_namespace(&mut used_namespaces));
+                (namespace, BTreeSet::new())
+            } else {
+                let primary = prior
+                    .filter(|group| {
+                        inventoried_namespaces.contains(&group.planned_primary_namespace)
+                    })
+                    .map(|group| group.planned_primary_namespace.clone())
+                    .unwrap_or_else(|| {
+                        inventoried_namespaces
+                            .first()
+                            .expect("nonempty inventoried namespace set")
+                            .clone()
+                    });
+                let mut compatibility = inventoried_namespaces.clone();
+                compatibility.remove(&primary);
+                (primary, compatibility)
+            };
+        used_namespaces.insert(planned_primary_namespace.clone());
+        used_namespaces.extend(planned_compatibility_namespaces.iter().cloned());
+        planned_groups.insert(
+            group_id,
+            PlannedRepoHistoryIdentityV1 {
+                planned_history_id,
+                planned_primary_namespace,
+                planned_compatibility_namespaces,
+            },
+        );
+    }
+    let repo_history_groups = build_deterministic_repo_history_groups(
+        inventory,
+        resolved_project_scopes,
+        &planned_groups,
+    )
+    .map_err(inventory_error)?;
+
+    let prior_actions = prior_report
+        .into_iter()
+        .flat_map(|report| &report.checkout_identity_actions)
+        .map(|action| (action.observation_id.as_str(), action))
+        .collect::<BTreeMap<_, _>>();
+    let used_checkout_observations = inventory
+        .attachment_candidates
+        .iter()
+        .filter(|attachment| retained_attachment_ids.contains(&attachment.attachment_id))
+        .map(|attachment| attachment.checkout_observation_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let checkout_identity_actions = inventory
+        .checkouts
+        .iter()
+        .filter(|checkout| used_checkout_observations.contains(checkout.observation_id.as_str()))
+        .filter_map(|checkout| match &checkout.marker_state {
+            crate::project_catalog_inventory::CheckoutMarkerStateV1::MissingOrEmpty => {
+                let planned_checkout_id = prior_actions
+                    .get(checkout.observation_id.as_str())
+                    .map(|action| action.planned_checkout_id.clone())
+                    .unwrap_or_else(mint_checkout_id);
+                Some(CheckoutIdentityActionV1 {
+                    observation_id: checkout.observation_id.clone(),
+                    canonical_root_digest: checkout.canonical_root_digest.clone(),
+                    planned_checkout_id,
+                })
+            }
+            crate::project_catalog_inventory::CheckoutMarkerStateV1::Valid { .. }
+            | crate::project_catalog_inventory::CheckoutMarkerStateV1::Malformed { .. }
+            | crate::project_catalog_inventory::CheckoutMarkerStateV1::Unreadable { .. }
+            | crate::project_catalog_inventory::CheckoutMarkerStateV1::Symlinked => None,
+        })
+        .collect();
+
+    let prior_bindings = prior_report
+        .into_iter()
+        .flat_map(|report| &report.legacy_path_bindings)
+        .map(|binding| {
+            (
+                binding.observation_id.as_str(),
+                binding.planned_binding_id.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut used_binding_ids = prior_bindings.values().cloned().collect::<BTreeSet<_>>();
+    let legacy_path_binding_ids = inventory
+        .legacy_path_observations
+        .iter()
+        .map(|observation| {
+            let binding_id = prior_bindings
+                .get(observation.observation_id.as_str())
+                .cloned()
+                .unwrap_or_else(|| mint_unique_binding_id(&mut used_binding_ids));
+            used_binding_ids.insert(binding_id.clone());
+            (observation.observation_id.clone(), binding_id)
+        })
+        .collect();
+
+    let prior_attachments = prior_report
+        .into_iter()
+        .flat_map(|report| &report.attachments)
+        .map(|attachment| {
+            (
+                attachment.observation_id.as_str(),
+                attachment.attachment_id.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let attachment_ids = inventory
+        .attachment_candidates
+        .iter()
+        .map(|attachment| {
+            if let Some(prior_id) = prior_attachments.get(attachment.observation_id.as_str())
+                && *prior_id != &attachment.attachment_id
+            {
+                return Err(ProjectCatalogMigrationError::no_mutation(
+                    "error.project_catalog_migration_identity_remint",
+                    "recaptured attachment candidate changed its persisted strong identity",
+                ));
+            }
+            Ok((
+                attachment.observation_id.clone(),
+                attachment.attachment_id.clone(),
+            ))
+        })
+        .collect::<Result<_, _>>()?;
+
+    Ok(MigrationPersistedIdentityPlanV1 {
+        transaction_id,
+        repo_history_groups,
+        checkout_identity_actions,
+        legacy_path_binding_ids,
+        attachment_ids,
+    })
+}
+
+fn build_base_post_images(
+    inventory: &V1ProjectCatalogInventory,
+    runtime: &MigrationRuntimeBindingsViewV1,
+    assessment: &MigrationSemanticAssessmentV1,
+    identities: &MigrationPersistedIdentityPlanV1,
+    resolution: &ProjectCatalogMigrationResolutionV1,
+) -> Result<MigrationBasePostImagesV1, ProjectCatalogMigrationError> {
+    let resolved_scopes = assessment
+        .resolved_project_scopes
+        .iter()
+        .map(|row| (row.project_id.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let project_history_ids = identities
+        .repo_history_groups
+        .iter()
+        .flat_map(|group| {
+            group
+                .project_ids
+                .iter()
+                .map(move |project_id| (project_id.clone(), group.planned_history_id.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut repo_histories = BTreeMap::new();
+    for group in &identities.repo_history_groups {
+        let published_repo_ids = group
+            .project_ids
+            .iter()
+            .filter_map(|project_id| {
+                resolved_scopes
+                    .get(project_id)
+                    .and_then(|row| row.published_scope.as_ref())
+                    .map(|scope| scope.repo_id().to_string())
+            })
+            .collect::<BTreeSet<_>>();
+        let authority = match published_repo_ids.len() {
+            1 => RepoHistoryAuthority::Recorded(
+                RecordedRepoAuthority::parse(
+                    published_repo_ids
+                        .first()
+                        .expect("one published repository authority")
+                        .clone(),
+                )
+                .map_err(|_| planner_error("resolved repository authority is invalid"))?,
+            ),
+            0 if group.project_ids.len() == 1
+                && group
+                    .planned_primary_namespace
+                    .as_str()
+                    .starts_with("local_") =>
+            {
+                RepoHistoryAuthority::LocalProject(
+                    group
+                        .project_ids
+                        .first()
+                        .expect("single-project history group")
+                        .clone(),
+                )
+            }
+            0 => RepoHistoryAuthority::LegacyNamespace(group.planned_primary_namespace.clone()),
+            _ => {
+                return Err(planner_error(
+                    "one repository-history group contains conflicting published authorities",
+                ));
+            }
+        };
+        repo_histories.insert(
+            group.planned_history_id.clone(),
+            RepoHistoryRecord {
+                repo_history_id: group.planned_history_id.clone(),
+                authority,
+                primary_namespace: group.planned_primary_namespace.clone(),
+                compatibility_namespaces: group.planned_compatibility_namespaces.clone(),
+            },
+        );
+    }
+
+    let alias_candidates = inventory
+        .legacy_projects
+        .iter()
+        .flat_map(|project| {
+            let project_id = ProjectId::parse(project.record.project_id.clone())
+                .expect("validated inventory project id");
+            project
+                .record
+                .aliases
+                .iter()
+                .cloned()
+                .map(move |alias| (alias, project_id.clone()))
+        })
+        .chain(
+            inventory
+                .materialized_aliases
+                .iter()
+                .map(|row| (row.alias.clone(), row.project_id.clone())),
+        )
+        .fold(
+            BTreeMap::<String, BTreeSet<ProjectId>>::new(),
+            |mut owners, (alias, project_id)| {
+                owners.entry(alias).or_default().insert(project_id);
+                owners
+            },
+        );
+    let selected_alias_owners = resolution
+        .selected_scope_owners
+        .iter()
+        .flat_map(|selection| {
+            selection
+                .owned_aliases
+                .iter()
+                .cloned()
+                .map(move |alias| (alias, selection.owner_project_id.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let accepted_aliases = alias_candidates
+        .into_iter()
+        .filter_map(|(alias, owners)| {
+            if owners.len() == 1 {
+                Some((alias, owners.into_iter().next().expect("one alias owner")))
+            } else {
+                selected_alias_owners
+                    .get(&alias)
+                    .filter(|owner| owners.contains(*owner))
+                    .cloned()
+                    .map(|owner| (alias, owner))
+            }
+        })
+        .fold(
+            BTreeMap::<ProjectId, BTreeSet<String>>::new(),
+            |mut by_project, (alias, owner)| {
+                by_project.entry(owner).or_default().insert(alias);
+                by_project
+            },
+        );
+
+    let mut projects = BTreeMap::new();
+    let mut missing_paths = Vec::new();
+    for observed in &inventory.legacy_projects {
+        let project_id = ProjectId::parse(observed.record.project_id.clone())
+            .map_err(|_| planner_error("legacy project id is invalid"))?;
+        let resolved = resolved_scopes
+            .get(&project_id)
+            .ok_or_else(|| planner_error("resolved project scope is incomplete"))?;
+        let scope = resolved
+            .published_scope
+            .clone()
+            .map(ProjectScope::Published)
+            .unwrap_or(ProjectScope::LegacyLocal);
+        if observed.path_status
+            == crate::project_catalog_inventory::LegacyProjectPathStatusV1::Missing
+        {
+            missing_paths.push(MissingPathReportV1 {
+                project_id: project_id.clone(),
+                path_digest: observed.record.canonical_path_digest.clone(),
+            });
+        }
+        projects.insert(
+            project_id.clone(),
+            CorpusProject {
+                project_id: project_id.clone(),
+                scope,
+                operator_aliases: accepted_aliases.remove(&project_id).unwrap_or_default(),
+                nominated_aliases: BTreeSet::new(),
+                display_name: project_id.to_string(),
+                created_at: observed.record.registered_at.clone(),
+                registered_at_compat: Some(observed.record.registered_at.clone()),
+                repo_history: project_history_ids.get(&project_id).cloned(),
+                languages: observed.record.languages.clone(),
+            },
+        );
+    }
+    missing_paths.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+
+    let mut ambiguous_namespaces = BTreeMap::new();
+    for cluster in &inventory.legacy_namespace_clusters {
+        let namespace = CommitNamespace::parse(cluster.materialized_namespace.clone())
+            .map_err(|_| planner_error("legacy namespace cluster is invalid"))?;
+        let candidates = cluster
+            .project_ids
+            .iter()
+            .filter_map(|project_id| project_history_ids.get(project_id).cloned())
+            .collect::<BTreeSet<_>>();
+        if candidates.len() < 2 {
+            return Err(planner_error(
+                "legacy namespace ambiguity lacks two planned history candidates",
+            ));
+        }
+        ambiguous_namespaces.insert(
+            namespace.clone(),
+            AmbiguousNamespaceRecord {
+                namespace,
+                candidate_repo_history_ids: candidates,
+                status: AmbiguousNamespaceStatus::Quarantined,
+            },
+        );
+    }
+    let catalog = CatalogSnapshotV2 {
+        version: 2,
+        epoch: 1,
+        origin: CatalogOriginV2::MigratedV1 {
+            transaction_id: identities.transaction_id.clone(),
+        },
+        projects,
+        repo_histories,
+        ambiguous_namespaces,
+        scope_migrations: BTreeMap::new(),
+    };
+
+    let checkout_actions = identities
+        .checkout_identity_actions
+        .iter()
+        .map(|action| {
+            (
+                action.observation_id.as_str(),
+                action.planned_checkout_id.as_str(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let checkout_ids = inventory
+        .checkouts
+        .iter()
+        .map(|checkout| {
+            let checkout_id = match &checkout.marker_state {
+                crate::project_catalog_inventory::CheckoutMarkerStateV1::Valid { checkout_id } => {
+                    checkout_id.as_str()
+                }
+                crate::project_catalog_inventory::CheckoutMarkerStateV1::MissingOrEmpty => {
+                    checkout_actions
+                        .get(checkout.observation_id.as_str())
+                        .copied()
+                        .ok_or_else(|| {
+                            planner_error("missing checkout marker lacks its persisted planned id")
+                        })?
+                }
+                crate::project_catalog_inventory::CheckoutMarkerStateV1::Malformed { .. }
+                | crate::project_catalog_inventory::CheckoutMarkerStateV1::Unreadable { .. }
+                | crate::project_catalog_inventory::CheckoutMarkerStateV1::Symlinked => {
+                    return Err(planner_error(
+                        "unsafe checkout marker cannot form a post-image",
+                    ));
+                }
+            };
+            Ok((checkout.observation_id.as_str(), checkout_id))
+        })
+        .collect::<Result<BTreeMap<_, _>, ProjectCatalogMigrationError>>()?;
+    let registered_at = inventory
+        .legacy_projects
+        .iter()
+        .map(|project| {
+            Ok((
+                ProjectId::parse(project.record.project_id.clone())
+                    .map_err(|_| planner_error("legacy project id is invalid"))?,
+                project.record.registered_at.as_str(),
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, ProjectCatalogMigrationError>>()?;
+
+    let mut post_image_attachments = Vec::new();
+    let mut attachments_by_project = BTreeMap::<ProjectId, Vec<AttachmentId>>::new();
+    let mut base_attachment_projects = BTreeSet::new();
+    let mut attachment_snapshot_rows = BTreeMap::new();
+    for observed in inventory.attachment_candidates.iter().filter(|row| {
+        assessment
+            .retained_attachment_ids
+            .contains(&row.attachment_id)
+    }) {
+        let checkout_root = runtime
+            .checkout_paths
+            .get(&observed.checkout_observation_id)
+            .ok_or_else(|| planner_error("attachment checkout runtime binding is missing"))?;
+        let checkout_dir = checkout_root
+            .to_str()
+            .ok_or_else(|| planner_error("attachment checkout runtime path is not utf8"))?
+            .to_string();
+        let project_dir = checkout_root.join(&observed.base_relpath);
+        let checkout_project_dir = project_dir
+            .to_str()
+            .ok_or_else(|| planner_error("attachment project runtime path is not utf8"))?
+            .to_string();
+        let checkout_id = checkout_ids
+            .get(observed.checkout_observation_id.as_str())
+            .copied()
+            .ok_or_else(|| planner_error("attachment checkout identity is missing"))?
+            .to_string();
+        let attached_at = registered_at
+            .get(&observed.project_id)
+            .copied()
+            .ok_or_else(|| planner_error("attachment project timestamp is missing"))?
+            .to_string();
+        let legacy_project = inventory
+            .legacy_projects
+            .iter()
+            .find(|project| project.record.project_id == observed.project_id.as_str())
+            .ok_or_else(|| planner_error("attachment project is absent from legacy inventory"))?;
+        let legacy_project_path = runtime
+            .legacy_project_paths
+            .get(&legacy_project.observation_id)
+            .ok_or_else(|| planner_error("legacy project runtime binding is missing"))?;
+        let kind = if &project_dir == legacy_project_path {
+            if !base_attachment_projects.insert(observed.project_id.clone()) {
+                return Err(planner_error(
+                    "project has more than one exact base attachment candidate",
+                ));
+            }
+            AttachmentKind::Base
+        } else {
+            AttachmentKind::Worktree
+        };
+        let project_attachments = attachments_by_project
+            .entry(observed.project_id.clone())
+            .or_default();
+        project_attachments.push(observed.attachment_id.clone());
+        let has_history = project_history_ids.contains_key(&observed.project_id);
+        attachment_snapshot_rows.insert(
+            observed.attachment_id.clone(),
+            CheckoutAttachment {
+                attachment_id: observed.attachment_id.clone(),
+                project_id: observed.project_id.clone(),
+                checkout_id: checkout_id.clone(),
+                checkout_dir,
+                checkout_project_dir,
+                project_root_relpath: observed.base_relpath.clone(),
+                kind,
+                validated_scope: observed.observed_scope.clone(),
+                computed_repo_hint: None,
+                branch_ref: None,
+                capabilities: AttachmentCapabilities {
+                    local_code_source: true,
+                    git_history: has_history,
+                    blame: has_history,
+                    repo_knowledge: true,
+                    repo_mutation: true,
+                    render_output: true,
+                    provenance_note_io: true,
+                    artifact_watching: true,
+                },
+                status: AttachmentStatus::Attached,
+                attached_at: attached_at.clone(),
+                detached_at: None,
+            },
+        );
+        post_image_attachments.push(AttachmentPostImageInputV1 {
+            attachment_id: observed.attachment_id.clone(),
+            project_id: observed.project_id.clone(),
+            checkout_observation_id: observed.checkout_observation_id.clone(),
+            checkout_id,
+            expected_scope: observed.observed_scope.clone(),
+            attached_at,
+        });
+    }
+    for (project_id, attachment_ids) in &attachments_by_project {
+        if !attachment_ids.is_empty() && !base_attachment_projects.contains(project_id) {
+            return Err(planner_error(
+                "attached migrated project lacks an exact legacy base attachment",
+            ));
+        }
+    }
+    post_image_attachments.sort_by(|left, right| left.attachment_id.cmp(&right.attachment_id));
+
+    let mut post_image_legacy_bindings = Vec::new();
+    let mut legacy_binding_report = Vec::new();
+    let mut legacy_path_bindings = BTreeMap::new();
+    let mut sensitive_rows = Vec::new();
+    let mut unscoped_legacy_counts = BTreeMap::new();
+    let mut refusal_count = 0_u64;
+    for observed in &inventory.legacy_path_observations {
+        let literal = runtime
+            .legacy_selectors
+            .get(&observed.observation_id)
+            .ok_or_else(|| planner_error("legacy selector runtime binding is missing"))?;
+        let literal_path = Path::new(literal);
+        let mut matching_projects = inventory
+            .legacy_projects
+            .iter()
+            .filter_map(|project| {
+                runtime
+                    .legacy_project_paths
+                    .get(&project.observation_id)
+                    .filter(|root| literal_path.starts_with(root))
+                    .map(|root| (project, root.components().count()))
+            })
+            .collect::<Vec<_>>();
+        matching_projects.sort_by(|(left, left_depth), (right, right_depth)| {
+            right_depth
+                .cmp(left_depth)
+                .then_with(|| left.observation_id.cmp(&right.observation_id))
+        });
+        let deepest_tied = matching_projects
+            .first()
+            .map(|(_, depth)| {
+                matching_projects
+                    .iter()
+                    .take_while(|(_, candidate_depth)| candidate_depth == depth)
+                    .count()
+            })
+            .unwrap_or(0);
+        let (relationship, report_status, ledger_status, attachment_id) =
+            match (matching_projects.first(), deepest_tied) {
+                (None, _) => {
+                    *unscoped_legacy_counts
+                        .entry(observed.store_kind)
+                        .or_default() += 1;
+                    (
+                        LegacyPathRelationshipV1::Unscoped,
+                        LegacyPathBindingStatusV1::UnscopedPreserved,
+                        LegacyPathBindingStatus::Unscoped {},
+                        None,
+                    )
+                }
+                (Some((project, _)), 1)
+                    if project.path_status
+                        == crate::project_catalog_inventory::LegacyProjectPathStatusV1::Missing =>
+                {
+                    refusal_count = refusal_count.saturating_add(1);
+                    (
+                        LegacyPathRelationshipV1::MissingProject,
+                        LegacyPathBindingStatusV1::Refused,
+                        LegacyPathBindingStatus::Quarantined {},
+                        None,
+                    )
+                }
+                (Some((project, _)), 1) => {
+                    let project_id = ProjectId::parse(project.record.project_id.clone())
+                        .map_err(|_| planner_error("legacy project id is invalid"))?;
+                    let root = runtime
+                        .legacy_project_paths
+                        .get(&project.observation_id)
+                        .expect("matched legacy project path");
+                    let relationship = if literal_path == root {
+                        LegacyPathRelationshipV1::ExactRoot
+                    } else {
+                        LegacyPathRelationshipV1::Contained
+                    };
+                    let ledger_relationship = if relationship == LegacyPathRelationshipV1::ExactRoot
+                    {
+                        LegacyPathRelationship::Root
+                    } else {
+                        LegacyPathRelationship::ContainedSubdirectory
+                    };
+                    let attachment_id = attachment_snapshot_rows
+                        .values()
+                        .filter(|attachment| {
+                            attachment.project_id == project_id
+                                && literal_path.starts_with(&attachment.checkout_project_dir)
+                        })
+                        .max_by_key(|attachment| {
+                            Path::new(&attachment.checkout_project_dir)
+                                .components()
+                                .count()
+                        })
+                        .map(|attachment| attachment.attachment_id.clone());
+                    (
+                        relationship,
+                        LegacyPathBindingStatusV1::Planned,
+                        LegacyPathBindingStatus::Mapped {
+                            project_id,
+                            relationship: ledger_relationship,
+                        },
+                        attachment_id,
+                    )
+                }
+                (Some(_), _) => {
+                    refusal_count = refusal_count.saturating_add(1);
+                    (
+                        LegacyPathRelationshipV1::Ambiguous,
+                        LegacyPathBindingStatusV1::Refused,
+                        LegacyPathBindingStatus::Quarantined {},
+                        None,
+                    )
+                }
+            };
+        let planned_binding_id = identities
+            .legacy_path_binding_ids
+            .get(&observed.observation_id)
+            .ok_or_else(|| planner_error("legacy path binding identity is missing"))?
+            .clone();
+        post_image_legacy_bindings.push(LegacyPathBindingPostImageInputV1 {
+            observation_id: observed.observation_id.clone(),
+            planned_binding_id: planned_binding_id.clone(),
+            attachment_id,
+            literal_selector: literal.clone(),
+            relationship,
+        });
+        legacy_binding_report.push(LegacyPathBindingReportV1 {
+            observation_id: observed.observation_id.clone(),
+            planned_binding_id: planned_binding_id.clone(),
+            store_kind: observed.store_kind,
+            relationship,
+            status: report_status,
+            path_digest: digest_path(literal),
+        });
+        legacy_path_bindings.insert(
+            planned_binding_id.clone(),
+            LegacyPathLedgerEntry {
+                legacy_path_binding_id: planned_binding_id,
+                historical_path: literal.clone(),
+                source_store: legacy_store_kind_token(observed.store_kind).to_string(),
+                source_row_id: observed.stable_row_id.clone(),
+                inventory_epoch: 1,
+                status: ledger_status,
+            },
+        );
+        sensitive_rows.push(SensitiveLocalPathRowV1 {
+            observation_id: observed.observation_id.clone(),
+            store_kind: observed.store_kind,
+            stable_row_id: observed.stable_row_id.clone(),
+            literal_selector: literal.clone(),
+        });
+    }
+    post_image_legacy_bindings
+        .sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
+    legacy_binding_report.sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
+    let sensitive_report = SensitiveLocalPathReportV1::from_runtime_rows(inventory, sensitive_rows)
+        .map_err(inventory_error)?;
+    let attachments = AttachmentSnapshotV1 {
+        version: 1,
+        epoch: 1,
+        attachments: attachment_snapshot_rows,
+        scope_migration_proofs: BTreeMap::new(),
+        legacy_path_bindings,
+    };
+    validate_catalog_attachments(&catalog, &attachments)
+        .map_err(|_| planner_error("catalog and attachment post-images are inconsistent"))?;
+    Ok(MigrationBasePostImagesV1 {
+        catalog,
+        attachments,
+        post_image_attachments,
+        post_image_legacy_bindings,
+        legacy_binding_report,
+        sensitive_report,
+        missing_paths,
+        unscoped_legacy_counts,
+        refusal_count,
+    })
+}
+
+fn legacy_store_kind_token(
+    kind: crate::project_catalog_inventory::LegacyPathStoreKindV1,
+) -> &'static str {
+    use crate::project_catalog_inventory::LegacyPathStoreKindV1 as Kind;
+    match kind {
+        Kind::Knowledge => "knowledge",
+        Kind::Gap => "gap",
+        Kind::Thread => "thread",
+        Kind::Note => "note",
+        Kind::Pin => "pin",
+        Kind::Roadmap => "roadmap",
+        Kind::Packet => "packet",
+        Kind::Task => "task",
+        Kind::Proposal => "proposal",
+        Kind::SlackBinding => "slack_binding",
+        Kind::Whiteboard => "whiteboard",
+        Kind::Artifact => "artifact",
+        Kind::Provenance => "provenance",
+        Kind::TranscriptEdge => "transcript_edge",
+    }
+}
+
+fn prepare_publisher_plan(
+    inventory: &V1ProjectCatalogInventory,
+    runtime: &MigrationRuntimeBindingsViewV1,
+    assessment: &MigrationSemanticAssessmentV1,
+    resolution: &ProjectCatalogMigrationResolutionV1,
+) -> Result<PreparedPublisherPlanV1, ProjectCatalogMigrationError> {
+    let requested = resolution
+        .publisher_binding_dispositions
+        .iter()
+        .map(|row| {
+            (
+                (
+                    row.project_id().clone(),
+                    row.expected_scope().clone(),
+                    row.full_ref().to_string(),
+                ),
+                row,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut dispositions = Vec::new();
+    let mut prepared_by_project = BTreeMap::new();
+    for pin in &inventory.publisher_pins {
+        let key = (
+            pin.project_id.clone(),
+            pin.expected_scope.clone(),
+            pin.full_ref.clone(),
+        );
+        let retained_candidates = pin
+            .candidate_attachment_ids
+            .intersection(&assessment.retained_attachment_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let automatic = retained_candidates.len() == 1
+            && pin.resolved_commit.is_some()
+            && pin.resolved_scope.as_ref() == Some(&pin.expected_scope);
+        let disposition = if automatic {
+            let attachment_id = retained_candidates
+                .first()
+                .expect("one automatic publisher attachment")
+                .clone();
+            let accepted_commit = pin
+                .resolved_commit
+                .as_deref()
+                .expect("automatic publisher commit");
+            let prepared = prepare_publisher_generation(
+                inventory,
+                runtime,
+                &pin.project_id,
+                &attachment_id,
+                &pin.expected_scope,
+                &pin.full_ref,
+                accepted_commit,
+            )?;
+            let disposition =
+                publisher_seed_disposition(&pin.project_id, &attachment_id, &prepared)?;
+            prepared_by_project.insert(pin.project_id.clone(), prepared);
+            disposition
+        } else {
+            match requested.get(&key).copied().ok_or_else(|| {
+                planner_error("clean publisher binding lacks its reviewed disposition")
+            })? {
+                PublisherBindingDispositionV1::SeedG1 {
+                    attachment_id,
+                    accepted_commit,
+                    ..
+                } => {
+                    if !assessment.retained_attachment_ids.contains(attachment_id) {
+                        return Err(planner_error(
+                            "publisher disposition selects an excluded attachment",
+                        ));
+                    }
+                    let prepared = prepare_publisher_generation(
+                        inventory,
+                        runtime,
+                        &pin.project_id,
+                        attachment_id,
+                        &pin.expected_scope,
+                        &pin.full_ref,
+                        accepted_commit,
+                    )?;
+                    let exact =
+                        publisher_seed_disposition(&pin.project_id, attachment_id, &prepared)?;
+                    if requested.get(&key).copied() != Some(&exact) {
+                        return Err(ProjectCatalogMigrationError::no_mutation(
+                            "error.project_catalog_migration_publisher_prediction_mismatch",
+                            "reviewed publisher seed does not match exact committed source bytes",
+                        ));
+                    }
+                    prepared_by_project.insert(pin.project_id.clone(), prepared);
+                    exact
+                }
+                disposition @ PublisherBindingDispositionV1::NoPublishedContentAcknowledged {
+                    ..
+                } => disposition.clone(),
+            }
+        };
+        dispositions.push(disposition);
+    }
+    dispositions.sort_by(|left, right| {
+        (left.project_id(), left.expected_scope(), left.full_ref()).cmp(&(
+            right.project_id(),
+            right.expected_scope(),
+            right.full_ref(),
+        ))
+    });
+    Ok(PreparedPublisherPlanV1 {
+        dispositions,
+        prepared: prepared_by_project,
+    })
+}
+
+fn prepare_publisher_generation(
+    inventory: &V1ProjectCatalogInventory,
+    runtime: &MigrationRuntimeBindingsViewV1,
+    project_id: &ProjectId,
+    attachment_id: &AttachmentId,
+    scope: &bbox_corpus_core::identity::PublishedScope,
+    full_ref: &str,
+    accepted_commit: &str,
+) -> Result<PreparedAcceptedPublicationV1, ProjectCatalogMigrationError> {
+    let attachment = inventory
+        .attachment_candidates
+        .iter()
+        .find(|row| &row.attachment_id == attachment_id && &row.project_id == project_id)
+        .ok_or_else(|| planner_error("publisher attachment is not inventoried for the project"))?;
+    let checkout_root = runtime
+        .checkout_paths
+        .get(&attachment.checkout_observation_id)
+        .ok_or_else(|| planner_error("publisher checkout runtime binding is missing"))?;
+    let commit = verify_commit_oid_with_alternate(checkout_root, accepted_commit, None)
+        .map_err(|_| planner_error("publisher accepted commit cannot be verified exactly"))?;
+    let scope_root = scope.bbox_root_relpath();
+    let knowledge_root = repo_relative_lane_root(scope_root, "knowledge");
+    let gap_root = repo_relative_lane_root(scope_root, "gaps");
+    let knowledge = read_publication_lane(&commit, &knowledge_root)?
+        .into_iter()
+        .map(
+            |(repository_relative_filename, source_bytes)| AcceptedKnowledgeSourceV1 {
+                repository_relative_filename,
+                source_bytes,
+            },
+        )
+        .collect();
+    let gaps = read_publication_lane(&commit, &gap_root)?
+        .into_iter()
+        .map(
+            |(repository_relative_filename, source_bytes)| AcceptedGapSourceV1 {
+                repository_relative_filename,
+                source_bytes,
+            },
+        )
+        .collect();
+    let full_ref = FullPublisherRef::parse(full_ref.to_string())
+        .map_err(|_| planner_error("publisher full ref is invalid"))?;
+    let accepted_commit = GitObjectId::parse(accepted_commit.to_string())
+        .map_err(|_| planner_error("publisher accepted commit is invalid"))?;
+    prepare_accepted_publication_v1(
+        AcceptedPublicationBuildInputV1 {
+            project_id: project_id.clone(),
+            attachment_id: attachment_id.clone(),
+            scope: scope.clone(),
+            full_ref,
+            accepted_commit,
+            knowledge,
+            gaps,
+            prior_pointer: None,
+        },
+        &AcceptedPublicationLimits::default(),
+    )
+    .map_err(|error| ProjectCatalogMigrationError::no_mutation(error.code(), error.to_string()))
+}
+
+fn repo_relative_lane_root(scope_root: &str, lane: &str) -> String {
+    if scope_root == "." {
+        format!(".bbox/{lane}")
+    } else {
+        format!("{scope_root}/.bbox/{lane}")
+    }
+}
+
+fn read_publication_lane(
+    commit: &bbox_corpus_core::git::VerifiedCommit,
+    root: &str,
+) -> Result<Vec<(String, Vec<u8>)>, ProjectCatalogMigrationError> {
+    use crate::accepted_publication_store::{
+        MAX_ACCEPTED_PUBLICATION_ENTRIES_PER_LANE, MAX_ACCEPTED_PUBLICATION_SOURCE_BYTES_PER_LANE,
+        MAX_ACCEPTED_PUBLICATION_SOURCE_FILE_BYTES,
+    };
+    let max_listing_bytes =
+        usize::try_from(MAX_ACCEPTED_PUBLICATION_SOURCE_BYTES_PER_LANE).unwrap_or(usize::MAX);
+    let paths = list_verified_committed_dir_bounded(
+        commit,
+        root,
+        MAX_ACCEPTED_PUBLICATION_ENTRIES_PER_LANE,
+        max_listing_bytes,
+    )
+    .map_err(|_| planner_error("publisher committed lane cannot be enumerated safely"))?;
+    paths
+        .into_iter()
+        .map(|path| {
+            let bytes = read_verified_committed_file_bytes_bounded(
+                commit,
+                &path,
+                usize::try_from(MAX_ACCEPTED_PUBLICATION_SOURCE_FILE_BYTES).unwrap_or(usize::MAX),
+            )
+            .map_err(|_| planner_error("publisher committed source cannot be read safely"))?;
+            Ok((path, bytes))
+        })
+        .collect()
+}
+
+fn publisher_seed_disposition(
+    project_id: &ProjectId,
+    attachment_id: &AttachmentId,
+    prepared: &PreparedAcceptedPublicationV1,
+) -> Result<PublisherBindingDispositionV1, ProjectCatalogMigrationError> {
+    let hashes = &prepared.generation.hashes;
+    Ok(PublisherBindingDispositionV1::SeedG1 {
+        project_id: project_id.clone(),
+        attachment_id: attachment_id.clone(),
+        expected_scope: prepared.generation.scope.clone(),
+        full_ref: prepared.generation.full_ref.as_str().to_string(),
+        accepted_commit: prepared.generation.accepted_commit.as_str().to_string(),
+        generation_id: prepared.generation_id.as_str().to_string(),
+        payload_hashes: PublicationPayloadHashesV1 {
+            knowledge_manifest_hash: Sha256ValueV1::parse(
+                hashes.knowledge_file_manifest_sha256.as_str().to_string(),
+            )
+            .map_err(inventory_error)?,
+            gap_manifest_hash: Sha256ValueV1::parse(
+                hashes.gap_file_manifest_sha256.as_str().to_string(),
+            )
+            .map_err(inventory_error)?,
+            knowledge_payload_hash: Sha256ValueV1::parse(
+                hashes.normalized_knowledge_sha256.as_str().to_string(),
+            )
+            .map_err(inventory_error)?,
+            gap_payload_hash: Sha256ValueV1::parse(
+                hashes.normalized_gaps_sha256.as_str().to_string(),
+            )
+            .map_err(inventory_error)?,
+        },
+        pointer_hash: Sha256ValueV1::parse(prepared.pointer_hash.as_str().to_string())
+            .map_err(inventory_error)?,
+    })
+}
+
+fn prepare_store_plan_parts(
+    inventory: &V1ProjectCatalogInventory,
+    legacy_code_source: &bbox_code_source_store::MigrationLegacyInventoryV1,
+    post_image: &DeterministicPostImageInputV1,
+    plan_hash: &Sha256ValueV1,
+    publisher: &PreparedPublisherPlanV1,
+) -> Result<MigrationStorePlanPartsV1, ProjectCatalogMigrationError> {
+    let quarantined = post_image
+        .quarantined_collected
+        .iter()
+        .map(|row| (row.project_id.clone(), row.generation_id.as_str()))
+        .collect::<BTreeSet<_>>();
+    let legacy_activations = legacy_code_source
+        .activations
+        .iter()
+        .map(|row| (row.project_id.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let mut generation_plans = Vec::new();
+    let mut generation_dispositions = BTreeMap::new();
+    let mut participants = Vec::new();
+    let mut immutable_assets = Vec::new();
+    for generation in &legacy_code_source.generations {
+        let (project_id, observation_id) =
+            resolved_generation_owner(inventory, post_image, generation)?;
+        let disposition = if quarantined
+            .contains(&(project_id.clone(), generation.generation_id.as_str()))
+        {
+            MigrationCodeSourceDispositionV1::QuarantinedCollision
+        } else if legacy_activations
+            .get(&project_id)
+            .is_some_and(|activation| activation.record.generation_id == generation.generation_id)
+        {
+            MigrationCodeSourceDispositionV1::SurvivingActive
+        } else {
+            MigrationCodeSourceDispositionV1::SurvivingRetained
+        };
+        let generation_id = store_sha256(&generation.generation_id)?;
+        let stored = StoredGenerationV2::from_v1_for_migration(
+            generation.record.clone(),
+            generation.published_scope.clone(),
+        )
+        .map_err(|_| planner_error("legacy stored generation cannot convert to v2"))?;
+        let stored_bytes = encode_stored_generation_v2_for_migration(&stored)
+            .map_err(|_| planner_error("v2 stored generation cannot be encoded"))?;
+        participants.push(MigrationParticipantDraftV1::new(
+            ParticipantRoleV1::StoredGenerationMetadata {
+                project_id: project_id.clone(),
+                published_scope: generation.published_scope.clone(),
+                generation_id: generation_id.clone(),
+            },
+            Some(store_sha256(&generation.metadata_sha256)?),
+            Some(stored_bytes),
+        ));
+        immutable_assets.push(MigrationImmutableAssetDraftV1::pinned_existing(
+            ImmutableAssetRoleV1::CollectedGenerationManifest {
+                published_scope: generation.published_scope.clone(),
+                generation_id: generation_id.clone(),
+            },
+            store_sha256(&generation.manifest_sha256)?,
+        ));
+        generation_plans.push(MigrationCodeSourceGenerationDraftV1 {
+            observation_id,
+            project_id: project_id.clone(),
+            generation_id: generation_id.clone(),
+            disposition,
+        });
+        generation_dispositions.insert(
+            generation.generation_id.as_str(),
+            (project_id, disposition, generation),
+        );
+    }
+
+    let mut activation_plans = Vec::new();
+    let mut effective_selections = Vec::new();
+    for activation in &legacy_code_source.activations {
+        let (project_id, disposition, generation) = generation_dispositions
+            .get(activation.record.generation_id.as_str())
+            .map(|(project_id, disposition, generation)| {
+                (project_id.clone(), *disposition, *generation)
+            })
+            .ok_or_else(|| planner_error("legacy activation generation is not protected"))?;
+        if project_id != activation.project_id {
+            return Err(planner_error(
+                "legacy activation and generation ownership disagree",
+            ));
+        }
+        let observation_id = inventory
+            .code_sources
+            .iter()
+            .find(|source| source.project_id == project_id)
+            .map(|source| source.observation_id.clone())
+            .ok_or_else(|| planner_error("activation observation is missing"))?;
+        activation_plans.push(MigrationCodeSourceActivationDraftV1 {
+            observation_id,
+            project_id: project_id.clone(),
+            disposition,
+        });
+        let role = ParticipantRoleV1::Activation {
+            project_id: project_id.clone(),
+        };
+        let post_bytes = if disposition == MigrationCodeSourceDispositionV1::SurvivingActive {
+            let stored = StoredGenerationV2::from_v1_for_migration(
+                generation.record.clone(),
+                generation.published_scope.clone(),
+            )
+            .map_err(|_| planner_error("legacy active generation cannot convert to v2"))?;
+            let converted =
+                ActivationRecordV2::from_v1_for_migration(activation.record.clone(), &stored)
+                    .map_err(|_| planner_error("legacy activation cannot convert to v2"))?;
+            effective_selections.push(MigrationEffectiveSourceSelectionV1 {
+                project_id: project_id.clone(),
+                published_scope: generation.published_scope.clone(),
+                generation_id: generation.generation_id.clone(),
+                selector: activation.record.selector.clone(),
+            });
+            Some(
+                encode_activation_v2_for_migration(&converted)
+                    .map_err(|_| planner_error("v2 activation cannot be encoded"))?,
+            )
+        } else {
+            None
+        };
+        participants.push(MigrationParticipantDraftV1::new(
+            role,
+            Some(store_sha256(&activation.sha256)?),
+            post_bytes,
+        ));
+    }
+    effective_selections.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+    let effective_bytes =
+        encode_migration_effective_source_manifest_v1(&MigrationEffectiveSourceManifestV1 {
+            version: 1,
+            selections: effective_selections,
+        })
+        .map_err(|_| planner_error("effective source manifest cannot be encoded"))?;
+    let effective_old = match &legacy_code_source.anchor {
+        bbox_code_source_store::MigrationLegacyAnchorEvidenceV1::Missing => None,
+        bbox_code_source_store::MigrationLegacyAnchorEvidenceV1::Present { sha256, .. } => {
+            Some(store_sha256(sha256)?)
+        }
+    };
+    participants.push(MigrationParticipantDraftV1::new(
+        ParticipantRoleV1::EffectiveSourceManifest,
+        effective_old,
+        Some(effective_bytes),
+    ));
+
+    let collision_projects = generation_dispositions
+        .values()
+        .filter(|(_, disposition, _)| {
+            *disposition == MigrationCodeSourceDispositionV1::QuarantinedCollision
+        })
+        .map(|(project_id, _, _)| project_id.clone())
+        .collect::<BTreeSet<_>>();
+    for project_id in collision_projects {
+        let mut entries = BTreeMap::new();
+        for (generation_id, (owner, disposition, generation)) in &generation_dispositions {
+            if owner != &project_id
+                || *disposition != MigrationCodeSourceDispositionV1::QuarantinedCollision
+            {
+                continue;
+            }
+            let activation = legacy_activations
+                .get(&project_id)
+                .filter(|activation| activation.record.generation_id == **generation_id);
+            let selector_evidence = activation.map_or(
+                CollisionRetirementSelectorEvidenceV1::NoDurableSelector,
+                |activation| {
+                    CollisionRetirementSelectorEvidenceV1::ExactMaterialized(
+                        activation.record.selector.clone(),
+                    )
+                },
+            );
+            let snapshot_id = activation.map_or_else(
+                || format!("collected-{}", &generation.generation_id[..32]),
+                |activation| activation.record.snapshot_id.clone(),
+            );
+            entries.insert(
+                (*generation_id).to_string(),
+                CollisionRetirementEntryV1 {
+                    state: CollisionRetirementLifecycleStateV1::Pending,
+                    former_scope: generation.published_scope.clone(),
+                    selector_evidence,
+                    snapshot_id,
+                    manifest_sha256: generation.manifest_sha256.clone(),
+                    inventory_hash: post_image.inventory_hash.to_string(),
+                    plan_hash: plan_hash.to_string(),
+                },
+            );
+        }
+        let lifecycle = CollisionRetirementLifecycleV1 {
+            version: 1,
+            project_id: project_id.clone(),
+            entries,
+        };
+        let bytes = encode_collision_retirement_pending_for_migration(&lifecycle)
+            .map_err(|_| planner_error("collision retirement lifecycle cannot be encoded"))?;
+        let old_hash = legacy_code_source
+            .collision_pending
+            .iter()
+            .find(|row| row.project_id == project_id)
+            .map(|row| store_sha256(&row.sha256))
+            .transpose()?;
+        participants.push(MigrationParticipantDraftV1::new(
+            ParticipantRoleV1::CollisionRetirement { project_id },
+            old_hash,
+            Some(bytes),
+        ));
+    }
+
+    let (publisher_pins, publisher_dispositions) =
+        prepare_publisher_store_evidence(inventory, publisher)?;
+    for (project_id, prepared) in &publisher.prepared {
+        participants.push(MigrationParticipantDraftV1::new(
+            ParticipantRoleV1::AcceptedPublicationPointer {
+                project_id: project_id.clone(),
+            },
+            None,
+            Some(prepared.pointer_bytes.clone()),
+        ));
+        immutable_assets.push(MigrationImmutableAssetDraftV1::new(
+            ImmutableAssetRoleV1::AcceptedPublicationGeneration {
+                project_id: project_id.clone(),
+                generation_id: prepared.generation_id.clone(),
+            },
+            prepared.generation_bytes.clone(),
+        ));
+    }
+    Ok(MigrationStorePlanPartsV1 {
+        participants,
+        immutable_assets,
+        code_source_snapshot: MigrationCodeSourceSnapshotDraftV1 {
+            legacy_inventory: legacy_code_source.clone(),
+            activations: activation_plans,
+            generations: generation_plans,
+        },
+        publisher_pins,
+        publisher_dispositions,
+    })
+}
+
+fn resolved_generation_owner<'a>(
+    inventory: &V1ProjectCatalogInventory,
+    post_image: &DeterministicPostImageInputV1,
+    generation: &bbox_code_source_store::MigrationLegacyGenerationEvidenceV1,
+) -> Result<(ProjectId, String), ProjectCatalogMigrationError> {
+    for source in &inventory.code_sources {
+        if let Some(observed) = source
+            .generations
+            .iter()
+            .find(|row| row.generation_id == generation.generation_id)
+        {
+            return Ok((observed.project_id.clone(), observed.observation_id.clone()));
+        }
+        if let Some(observed) = source
+            .quarantine
+            .iter()
+            .find(|row| row.generation_id == generation.generation_id)
+        {
+            return Ok((observed.project_id.clone(), observed.observation_id.clone()));
+        }
+    }
+    let retained = inventory
+        .retained_owner_resolutions
+        .iter()
+        .find(|row| row.generation_id == generation.generation_id)
+        .ok_or_else(|| planner_error("protected generation lacks an inventory observation"))?;
+    if let Some(quarantine) = post_image
+        .quarantined_collected
+        .iter()
+        .find(|row| row.generation_id == generation.generation_id)
+    {
+        if retained
+            .candidate_project_ids
+            .contains(&quarantine.project_id)
+        {
+            return Ok((
+                quarantine.project_id.clone(),
+                retained.observation_id.clone(),
+            ));
+        }
+    }
+    let owners = post_image
+        .resolved_project_scopes
+        .iter()
+        .filter(|row| {
+            retained.candidate_project_ids.contains(&row.project_id)
+                && row.published_scope.as_ref() == Some(&retained.published_scope)
+        })
+        .map(|row| row.project_id.clone())
+        .collect::<BTreeSet<_>>();
+    if owners.len() != 1 {
+        return Err(planner_error(
+            "retained generation lacks one reviewed canonical owner",
+        ));
+    }
+    Ok((
+        owners.into_iter().next().expect("one retained owner"),
+        retained.observation_id.clone(),
+    ))
+}
+
+fn prepare_publisher_store_evidence(
+    inventory: &V1ProjectCatalogInventory,
+    publisher: &PreparedPublisherPlanV1,
+) -> Result<
+    (
+        Vec<PublisherPinEvidenceV1>,
+        Vec<PublisherDispositionEvidenceV1>,
+    ),
+    ProjectCatalogMigrationError,
+> {
+    let pins = inventory
+        .publisher_pins
+        .iter()
+        .map(|pin| {
+            Ok(PublisherPinEvidenceV1 {
+                observation_id: pin.observation_id.clone(),
+                project_id: pin.project_id.clone(),
+                expected_scope: pin.expected_scope.clone(),
+                full_ref: FullPublisherRef::parse(pin.full_ref.clone())
+                    .map_err(|_| planner_error("publisher full ref is invalid"))?,
+                candidate_attachment_ids: pin.candidate_attachment_ids.clone(),
+                resolved_commit: pin
+                    .resolved_commit
+                    .as_ref()
+                    .map(|commit| {
+                        GitObjectId::parse(commit.clone())
+                            .map_err(|_| planner_error("publisher commit is invalid"))
+                    })
+                    .transpose()?,
+                resolved_scope: pin.resolved_scope.clone(),
+                source_observation_ids: pin.source_observation_ids.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, ProjectCatalogMigrationError>>()?;
+    let observations = inventory
+        .publisher_pins
+        .iter()
+        .map(|pin| {
+            (
+                (
+                    pin.project_id.clone(),
+                    pin.expected_scope.clone(),
+                    pin.full_ref.as_str(),
+                ),
+                pin.observation_id.as_str(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let dispositions = publisher
+        .dispositions
+        .iter()
+        .map(|disposition| {
+            let observation_id = observations
+                .get(&(
+                    disposition.project_id().clone(),
+                    disposition.expected_scope().clone(),
+                    disposition.full_ref(),
+                ))
+                .copied()
+                .ok_or_else(|| planner_error("publisher disposition lacks an inventory pin"))?
+                .to_string();
+            match disposition {
+                PublisherBindingDispositionV1::SeedG1 {
+                    project_id,
+                    attachment_id,
+                    expected_scope,
+                    full_ref,
+                    accepted_commit,
+                    ..
+                } => {
+                    let prepared = publisher.prepared.get(project_id).ok_or_else(|| {
+                        planner_error("publisher seed lacks its prepared generation")
+                    })?;
+                    Ok(PublisherDispositionEvidenceV1::SeedG1 {
+                        observation_id,
+                        project_id: project_id.clone(),
+                        attachment_id: attachment_id.clone(),
+                        expected_scope: expected_scope.clone(),
+                        full_ref: FullPublisherRef::parse(full_ref.clone())
+                            .map_err(|_| planner_error("publisher full ref is invalid"))?,
+                        accepted_commit: GitObjectId::parse(accepted_commit.clone())
+                            .map_err(|_| planner_error("publisher commit is invalid"))?,
+                        generation_id: prepared.generation_id.clone(),
+                        generation_sha256: store_sha256(prepared.generation_hash.as_str())?,
+                        pointer_sha256: store_sha256(prepared.pointer_hash.as_str())?,
+                    })
+                }
+                PublisherBindingDispositionV1::NoPublishedContentAcknowledged {
+                    project_id,
+                    expected_scope,
+                    full_ref,
+                    bounded_reason,
+                } => Ok(
+                    PublisherDispositionEvidenceV1::NoPublishedContentAcknowledged {
+                        observation_id,
+                        project_id: project_id.clone(),
+                        expected_scope: expected_scope.clone(),
+                        full_ref: FullPublisherRef::parse(full_ref.clone())
+                            .map_err(|_| planner_error("publisher full ref is invalid"))?,
+                        bounded_reason: bounded_reason.clone(),
+                    },
+                ),
+            }
+        })
+        .collect::<Result<Vec<_>, ProjectCatalogMigrationError>>()?;
+    Ok((pins, dispositions))
+}
+
+fn store_sha256(value: &str) -> Result<Sha256Hex, ProjectCatalogMigrationError> {
+    Sha256Hex::parse(value.to_string())
+        .map_err(|_| planner_error("planned SHA-256 identity is invalid"))
+}
+
+fn build_migration_report(
+    inventory: &V1ProjectCatalogInventory,
+    resolution_bytes: &[u8],
+    assessment: &MigrationSemanticAssessmentV1,
+    identities: &MigrationPersistedIdentityPlanV1,
+    plan_hash: Sha256ValueV1,
+    predicted: PredictedPostImageHashesV1,
+    legacy_path_bindings: Vec<LegacyPathBindingReportV1>,
+    missing_paths: Vec<MissingPathReportV1>,
+    unscoped_legacy_counts: BTreeMap<crate::project_catalog_inventory::LegacyPathStoreKindV1, u64>,
+    status: ProjectCatalogMigrationStatusV1,
+) -> Result<ProjectCatalogMigrationReportV1, ProjectCatalogMigrationError> {
+    let generated_at = inventory
+        .legacy_projects
+        .iter()
+        .map(|project| project.record.registered_at.as_str())
+        .max()
+        .unwrap_or("1970-01-01T00:00:00Z")
+        .to_string();
+    let projects = inventory
+        .legacy_projects
+        .iter()
+        .map(|row| {
+            Ok(ProjectMigrationReportRowV1 {
+                observation_id: row.observation_id.clone(),
+                project_id: ProjectId::parse(row.record.project_id.clone())
+                    .map_err(|_| planner_error("legacy project id is invalid"))?,
+                path_status: row.path_status,
+                path_digest: row.record.canonical_path_digest.clone(),
+                committed_authority_present: row.committed_authority.is_some(),
+            })
+        })
+        .collect::<Result<Vec<_>, ProjectCatalogMigrationError>>()?;
+    let attachments = inventory
+        .attachment_candidates
+        .iter()
+        .map(|row| {
+            Ok(AttachmentMigrationReportRowV1 {
+                observation_id: row.observation_id.clone(),
+                attachment_id: identities
+                    .attachment_ids
+                    .get(&row.observation_id)
+                    .ok_or_else(|| planner_error("attachment identity plan is incomplete"))?
+                    .clone(),
+                project_id: row.project_id.clone(),
+                checkout_observation_id: row.checkout_observation_id.clone(),
+                scope_digest: row
+                    .observed_scope
+                    .as_ref()
+                    .map(digest_published_scope)
+                    .transpose()
+                    .map_err(inventory_error)?,
+            })
+        })
+        .collect::<Result<Vec<_>, ProjectCatalogMigrationError>>()?;
+    let report = ProjectCatalogMigrationReportV1 {
+        version: 1,
+        transaction_id: identities.transaction_id.clone(),
+        inventory_hash: inventory.inventory_hash().map_err(inventory_error)?,
+        plan_hash,
+        resolution_artifact_hash: Sha256ValueV1::digest(resolution_bytes),
+        source_store_hash: inventory.source_store_hash.clone(),
+        publisher_ref_source_hash: inventory.publisher_ref_source_hash.clone(),
+        generated_at,
+        status,
+        plan_kind: if status == ProjectCatalogMigrationStatusV1::Clean {
+            ProjectCatalogMigrationPlanKindV1::Executable
+        } else {
+            ProjectCatalogMigrationPlanKindV1::AssessmentOnly
+        },
+        projects,
+        repo_history_groups: identities.repo_history_groups.clone(),
+        attachments,
+        checkout_identity_actions: identities.checkout_identity_actions.clone(),
+        legacy_path_bindings,
+        namespace_conflicts: assessment.namespace_conflicts.clone(),
+        scope_conflicts: assessment.scope_conflicts.clone(),
+        alias_conflicts: assessment.alias_conflicts.clone(),
+        activation_conflicts: assessment.activation_conflicts.clone(),
+        publisher_bindings: assessment.publisher_bindings.clone(),
+        publisher_binding_conflicts: assessment.publisher_binding_conflicts.clone(),
+        predicted_g1_assets: predicted.g1_assets.clone(),
+        predicted_accepted_pointer_hashes: predicted.accepted_pointer_hashes.clone(),
+        missing_paths,
+        unscoped_legacy_counts,
+        required_resolutions: assessment.required_resolutions.clone(),
+        predicted_catalog_hash: predicted.catalog_hash.clone(),
+        predicted_attachment_hash: predicted.attachment_hash.clone(),
+        predicted_participant_hashes: predicted.participant_hashes.clone(),
+    };
+    report
+        .validate_against_inventory(inventory)
+        .map_err(inventory_error)?;
+    Ok(report)
+}
+
+fn build_non_executable_review_rows(
+    inventory: &V1ProjectCatalogInventory,
+    runtime: &MigrationRuntimeBindingsViewV1,
+    identities: &MigrationPersistedIdentityPlanV1,
+    status: ProjectCatalogMigrationStatusV1,
+) -> Result<
+    (
+        Vec<LegacyPathBindingReportV1>,
+        Vec<MissingPathReportV1>,
+        BTreeMap<crate::project_catalog_inventory::LegacyPathStoreKindV1, u64>,
+        SensitiveLocalPathReportV1,
+    ),
+    ProjectCatalogMigrationError,
+> {
+    let binding_status = match status {
+        ProjectCatalogMigrationStatusV1::Refused => LegacyPathBindingStatusV1::Refused,
+        ProjectCatalogMigrationStatusV1::ResolutionRequired => {
+            LegacyPathBindingStatusV1::ResolutionRequired
+        }
+        ProjectCatalogMigrationStatusV1::Clean => LegacyPathBindingStatusV1::Planned,
+    };
+    let mut bindings = Vec::new();
+    let mut sensitive_rows = Vec::new();
+    let mut counts = BTreeMap::new();
+    for observed in &inventory.legacy_path_observations {
+        let literal = runtime
+            .legacy_selectors
+            .get(&observed.observation_id)
+            .ok_or_else(|| planner_error("legacy selector runtime binding is missing"))?;
+        *counts.entry(observed.store_kind).or_default() += 1;
+        bindings.push(LegacyPathBindingReportV1 {
+            observation_id: observed.observation_id.clone(),
+            planned_binding_id: identities
+                .legacy_path_binding_ids
+                .get(&observed.observation_id)
+                .ok_or_else(|| planner_error("legacy path identity plan is incomplete"))?
+                .clone(),
+            store_kind: observed.store_kind,
+            relationship: LegacyPathRelationshipV1::Unscoped,
+            status: binding_status,
+            path_digest: digest_path(literal),
+        });
+        sensitive_rows.push(SensitiveLocalPathRowV1 {
+            observation_id: observed.observation_id.clone(),
+            store_kind: observed.store_kind,
+            stable_row_id: observed.stable_row_id.clone(),
+            literal_selector: literal.clone(),
+        });
+    }
+    let missing = inventory
+        .legacy_projects
+        .iter()
+        .filter(|project| {
+            project.path_status
+                == crate::project_catalog_inventory::LegacyProjectPathStatusV1::Missing
+        })
+        .map(|project| {
+            Ok(MissingPathReportV1 {
+                project_id: ProjectId::parse(project.record.project_id.clone())
+                    .map_err(|_| planner_error("legacy project id is invalid"))?,
+                path_digest: project.record.canonical_path_digest.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, ProjectCatalogMigrationError>>()?;
+    let sensitive = SensitiveLocalPathReportV1::from_runtime_rows(inventory, sensitive_rows)
+        .map_err(inventory_error)?;
+    Ok((bindings, missing, counts, sensitive))
+}
+
+fn non_executable_assessment_hash(
+    inventory: &V1ProjectCatalogInventory,
+    resolution_bytes: &[u8],
+    identities: &MigrationPersistedIdentityPlanV1,
+    status: ProjectCatalogMigrationStatusV1,
+) -> Result<Sha256ValueV1, ProjectCatalogMigrationError> {
+    let bytes = serde_json::to_vec(&(
+        "blackbox.project-catalog.non-executable-assessment.v1",
+        inventory.inventory_hash().map_err(inventory_error)?,
+        Sha256ValueV1::digest(resolution_bytes),
+        identities.transaction_id.as_str(),
+        status,
+    ))
+    .map_err(|_| planner_error("non-executable assessment identity cannot be encoded"))?;
+    Ok(Sha256ValueV1::digest(&bytes))
+}
+
+fn encode_facade_sensitive_review(
+    inventory: &V1ProjectCatalogInventory,
+    runtime: &MigrationRuntimeBindingsViewV1,
+    legacy_paths: &SensitiveLocalPathReportV1,
+) -> Result<(Vec<u8>, u64), ProjectCatalogMigrationError> {
+    let checkouts = inventory
+        .checkouts
+        .iter()
+        .map(|row| (row.observation_id.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
+    let mut attachment_paths = Vec::new();
+    for attachment in &inventory.attachment_candidates {
+        let checkout = checkouts
+            .get(attachment.checkout_observation_id.as_str())
+            .ok_or_else(|| planner_error("sensitive attachment checkout is missing"))?;
+        let checkout_root = runtime
+            .checkout_paths
+            .get(&attachment.checkout_observation_id)
+            .ok_or_else(|| planner_error("sensitive attachment runtime root is missing"))?;
+        let checkout_root_text = checkout_root
+            .to_str()
+            .ok_or_else(|| planner_error("sensitive attachment runtime root is not utf8"))?
+            .to_string();
+        if digest_path(&checkout_root_text) != checkout.canonical_root_digest {
+            return Err(planner_error(
+                "sensitive attachment checkout digest disagrees with inventory",
+            ));
+        }
+        let project_path = checkout_root.join(&attachment.base_relpath);
+        let project_path_text = project_path
+            .to_str()
+            .ok_or_else(|| planner_error("sensitive attachment project path is not utf8"))?
+            .to_string();
+        attachment_paths.push(FacadeSensitiveAttachmentPathV1 {
+            observation_id: attachment.observation_id.clone(),
+            attachment_id: attachment.attachment_id.clone(),
+            checkout_observation_id: attachment.checkout_observation_id.clone(),
+            checkout_root: checkout_root_text,
+            checkout_root_digest: checkout.canonical_root_digest.clone(),
+            project_path_digest: digest_path(&project_path_text),
+            project_path: project_path_text,
+        });
+    }
+    attachment_paths.sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
+    let inventory_hash = inventory.inventory_hash().map_err(inventory_error)?;
+    let value = FacadeSensitiveReviewV1 {
+        version: 1,
+        inventory_hash: &inventory_hash,
+        local_paths_included: true,
+        warning: "host_local_sensitive_do_not_commit",
+        legacy_paths,
+        attachment_paths,
+    };
+    let mut bytes = serde_json::to_vec_pretty(&value)
+        .map_err(|_| planner_error("sensitive review cannot be encoded"))?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_SENSITIVE_REVIEW_BYTES {
+        return Err(ProjectCatalogMigrationError::no_mutation(
+            "error.project_catalog_migration_artifact_limit",
+            "sensitive review exceeds its byte limit",
+        ));
+    }
+    Ok((
+        bytes,
+        u64::try_from(value.attachment_paths.len()).unwrap_or(u64::MAX),
+    ))
+}
+
+fn inventoried_group_namespaces(
+    inventory: &V1ProjectCatalogInventory,
+    resolved_project_scopes: &[ResolvedProjectScopeInputV1],
+    group_id: &str,
+) -> Result<BTreeSet<CommitNamespace>, ProjectCatalogMigrationError> {
+    let memberships =
+        deterministic_repo_history_group_memberships(inventory, resolved_project_scopes)
+            .map_err(inventory_error)?;
+    let project_ids = memberships
+        .iter()
+        .find(|(candidate, _)| candidate == group_id)
+        .map(|(_, projects)| projects)
+        .ok_or_else(|| planner_error("repository-history group disappeared during planning"))?;
+    let ambiguous = inventory
+        .legacy_namespace_clusters
+        .iter()
+        .map(|cluster| {
+            CommitNamespace::parse(cluster.materialized_namespace.clone())
+                .map_err(|_| planner_error("legacy namespace cluster is invalid"))
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    Ok(inventory
+        .git_metadata
+        .iter()
+        .filter(|row| project_ids.contains(&row.project_id))
+        .flat_map(|row| &row.materialized_commit_namespaces)
+        .map(|namespace| {
+            CommitNamespace::parse(namespace.clone())
+                .map_err(|_| planner_error("inventoried commit namespace is invalid"))
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?
+        .difference(&ambiguous)
+        .cloned()
+        .collect())
+}
+
+fn mint_unique_repo_history_id(used: &mut BTreeSet<RepoHistoryId>) -> RepoHistoryId {
+    loop {
+        let candidate = RepoHistoryId::mint();
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+    }
+}
+
+fn mint_unique_binding_id(used: &mut BTreeSet<LegacyPathBindingId>) -> LegacyPathBindingId {
+    loop {
+        let candidate = LegacyPathBindingId::mint();
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+    }
+}
+
+fn mint_local_namespace(used: &mut BTreeSet<CommitNamespace>) -> CommitNamespace {
+    loop {
+        let random = RepoHistoryId::mint();
+        let suffix = random
+            .as_str()
+            .strip_prefix("rh_")
+            .expect("minted repository-history id has its code-owned prefix");
+        let candidate = CommitNamespace::parse(format!("local_{suffix}"))
+            .expect("code-owned local namespace must validate");
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+    }
+}
+
+fn mint_checkout_id() -> String {
+    ProjectCatalogTransactionId::mint()
+        .as_str()
+        .strip_prefix("pct_")
+        .expect("minted transaction id has its code-owned prefix")
+        .to_string()
+}
+
+fn stable_conflict_id(
+    prefix: &'static str,
+    value: &impl Serialize,
+) -> Result<String, ProjectCatalogMigrationError> {
+    let mut bytes = format!("blackbox.project-catalog.{prefix}.v1\0").into_bytes();
+    bytes.extend_from_slice(
+        &serde_json::to_vec(value)
+            .map_err(|_| planner_error("canonical conflict identity cannot be encoded"))?,
+    );
+    let digest = Sha256ValueV1::digest(&bytes);
+    Ok(format!("{prefix}_{}", &digest.as_str()[..32]))
+}
+
+fn inventory_error(
+    error: crate::project_catalog_inventory::ProjectCatalogInventoryError,
+) -> ProjectCatalogMigrationError {
+    ProjectCatalogMigrationError::no_mutation(error.code(), "migration inventory contract failed")
+}
+
+fn planner_error(message: &'static str) -> ProjectCatalogMigrationError {
+    ProjectCatalogMigrationError::no_mutation("error.project_catalog_migration_planner", message)
+}
+
 struct CurrentClosedMigrationIntegrationV1;
 
 impl ClosedMigrationIntegrationV1 for CurrentClosedMigrationIntegrationV1 {
     fn prepare_preflight(
         &self,
-        _layout: &ProjectCatalogMigrationResolvedLayoutV1,
-        _existing_resolution: Option<&[u8]>,
-        _include_sensitive_paths: bool,
+        layout: &ProjectCatalogMigrationResolvedLayoutV1,
+        existing_resolution: Option<&[u8]>,
+        existing_report: Option<&[u8]>,
+        include_sensitive_paths: bool,
     ) -> Result<PreparedPreflightV1, ProjectCatalogMigrationError> {
-        Err(ProjectCatalogMigrationIntegrationBlockerV1::OwnerLaneSnapshots.into_error())
+        Ok(prepare_closed_migration(
+            layout,
+            existing_resolution,
+            existing_report,
+            include_sensitive_paths,
+        )?
+        .preflight)
     }
 
     fn apply_rehearsal(
         &self,
-        _layout: &ProjectCatalogMigrationResolvedLayoutV1,
-        _report_bytes: &[u8],
-        _report: &ProjectCatalogMigrationReportV1,
-        _resolution_bytes: &[u8],
+        layout: &ProjectCatalogMigrationResolvedLayoutV1,
+        report_bytes: &[u8],
+        report: &ProjectCatalogMigrationReportV1,
+        resolution_bytes: &[u8],
         _resolution: &ProjectCatalogMigrationResolutionV1,
     ) -> Result<ProjectCatalogMigrationApplyResultV1, ProjectCatalogMigrationError> {
-        Err(ProjectCatalogMigrationIntegrationBlockerV1::TransactionAssembly.into_error())
+        if let Some(result) =
+            verify_exact_installed_review(layout, report_bytes, report, resolution_bytes)?
+        {
+            return Ok(ProjectCatalogMigrationApplyResultV1 {
+                receipt: ProjectCatalogMigrationApplyReceiptV1 {
+                    version: FACADE_VERSION_V1,
+                    outcome: ProjectCatalogMigrationApplyOutcomeV1::AlreadyApplied,
+                    verification: result.receipt,
+                },
+            });
+        }
+        let prepared =
+            prepare_closed_migration(layout, Some(resolution_bytes), Some(report_bytes), false)?;
+        if prepared.preflight.report_bytes != report_bytes
+            || prepared.preflight.resolution_bytes != resolution_bytes
+        {
+            return Err(ProjectCatalogMigrationError::no_mutation(
+                "error.project_catalog_migration_artifact_identity",
+                "recaptured executable plan does not match exact reviewed artifacts",
+            ));
+        }
+        let plan = prepared.plan.ok_or_else(|| {
+            ProjectCatalogMigrationError::no_mutation(
+                "error.project_catalog_migration_report_not_clean",
+                "reviewed migration is not executable",
+            )
+        })?;
+        transact_migration(&layout.projects_path, plan).map_err(|error| {
+            ProjectCatalogMigrationError::new(
+                error.code(),
+                "migration transaction failed after exact-plan validation",
+                ProjectCatalogMigrationMutationDispositionV1::RetryExactPlanRequired,
+            )
+        })?;
+        let verified = verify_installed(layout)?;
+        Ok(ProjectCatalogMigrationApplyResultV1 {
+            receipt: ProjectCatalogMigrationApplyReceiptV1 {
+                version: FACADE_VERSION_V1,
+                outcome: ProjectCatalogMigrationApplyOutcomeV1::Applied,
+                verification: verified.receipt,
+            },
+        })
     }
 
     fn verify(
         &self,
-        _layout: &ProjectCatalogMigrationResolvedLayoutV1,
+        layout: &ProjectCatalogMigrationResolvedLayoutV1,
     ) -> Result<ProjectCatalogMigrationVerifyResultV1, ProjectCatalogMigrationError> {
-        Err(ProjectCatalogMigrationIntegrationBlockerV1::VerificationBootstrap.into_error())
+        verify_installed(layout)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProjectCatalogMigrationIntegrationBlockerV1 {
-    OwnerLaneSnapshots,
-    TransactionAssembly,
-    VerificationBootstrap,
+struct PreparedClosedMigrationV1 {
+    preflight: PreparedPreflightV1,
+    plan: Option<ValidatedMigrationPlanV1>,
 }
 
-impl ProjectCatalogMigrationIntegrationBlockerV1 {
-    fn into_error(self) -> ProjectCatalogMigrationError {
-        let message = match self {
-            Self::OwnerLaneSnapshots => {
-                "one or more required migration owners lack a strict no-create snapshot adapter"
-            }
-            Self::TransactionAssembly => {
-                "closed transaction assembly does not yet bind exact reviewed artifacts"
-            }
-            Self::VerificationBootstrap => {
-                "fresh verification bootstrap is unavailable for one or more owners"
-            }
-        };
-        ProjectCatalogMigrationError::no_mutation(
-            "error.project_catalog_migration_owner_adapter_missing",
-            message,
+fn prepare_closed_migration(
+    layout: &ProjectCatalogMigrationResolvedLayoutV1,
+    existing_resolution: Option<&[u8]>,
+    existing_report: Option<&[u8]>,
+    include_sensitive_paths: bool,
+) -> Result<PreparedClosedMigrationV1, ProjectCatalogMigrationError> {
+    let checkout_roots = discover_checkout_roots(layout)?;
+    let prior_report = existing_report
+        .map(decode_migration_report_v1)
+        .transpose()
+        .map_err(inventory_error)?;
+    let candidate_keys =
+        ProjectCatalogMigrationInventoryFacadeV1::discover_attachment_candidate_keys(
+            ProjectCatalogAttachmentCandidateDiscoveryRequestV1 {
+                legacy_project_store_path: layout.projects_path.clone(),
+                checkout_roots: checkout_roots.clone(),
+            },
         )
+        .map_err(adapter_error)?;
+    let attachment_identity_plan =
+        prepare_attachment_identity_plan(&candidate_keys, prior_report.as_ref())?;
+    let publisher_ref_store =
+        PublisherRefStore::open(&layout.publisher_refs_path).map_err(|_| {
+            ProjectCatalogMigrationError::no_mutation(
+                "error.project_catalog_migration_owner_snapshot",
+                "publisher-ref source cannot be opened without mutation",
+            )
+        })?;
+    let captured = ProjectCatalogMigrationInventoryFacadeV1::capture(
+        ProjectCatalogMigrationInventoryRequestV1 {
+            legacy_project_store_path: layout.projects_path.clone(),
+            publisher_ref_store: &publisher_ref_store,
+            code_source_store_root: layout.code_source_root.clone(),
+            code_source_store_limits: layout.store_limits,
+            checkout_roots,
+            owner_paths: owner_inventory_paths(layout),
+            owner_limits: ProjectCatalogOwnerInventoryLimitsV1::default(),
+            attachment_identity_plan: &attachment_identity_plan,
+        },
+    )
+    .map_err(adapter_error)?;
+    let runtime = MigrationRuntimeBindingsViewV1 {
+        legacy_project_store_bytes: captured
+            .runtime_bindings()
+            .legacy_project_store_bytes()
+            .to_vec(),
+        legacy_project_store_was_missing: captured
+            .runtime_bindings()
+            .legacy_project_store_was_missing(),
+        legacy_project_paths: captured
+            .runtime_bindings()
+            .legacy_project_paths()
+            .map(|(id, path)| (id.to_string(), path.to_path_buf()))
+            .collect(),
+        checkout_paths: captured
+            .runtime_bindings()
+            .checkout_paths()
+            .map(|(id, path)| (id.to_string(), path.to_path_buf()))
+            .collect(),
+        git_common_directories: captured
+            .runtime_bindings()
+            .git_common_directories()
+            .map(|(id, path)| (id.to_string(), path.to_path_buf()))
+            .collect(),
+        legacy_selectors: captured
+            .runtime_bindings()
+            .legacy_selectors()
+            .map(|(id, value)| (id.to_string(), value.to_string()))
+            .collect(),
+    };
+    let inventory = &captured.inventory;
+    let inventory_hash = inventory.inventory_hash().map_err(inventory_error)?;
+    let resolution = match existing_resolution {
+        Some(bytes) => decode_migration_resolution_v1(bytes).map_err(inventory_error)?,
+        None => ProjectCatalogMigrationResolutionV1::empty(inventory_hash.clone()),
+    };
+    let resolution_bytes = match existing_resolution {
+        Some(bytes) => bytes.to_vec(),
+        None => encode_migration_resolution_v1(&resolution).map_err(inventory_error)?,
+    };
+    let assessment = assess_migration_semantics(inventory, &resolution)?;
+    let identities = build_persisted_identity_plan(
+        inventory,
+        &assessment.resolved_project_scopes,
+        &assessment.retained_attachment_ids,
+        prior_report.as_ref(),
+    )?;
+    if assessment.status() != ProjectCatalogMigrationStatusV1::Clean {
+        return prepare_assessment_only(
+            inventory,
+            &runtime,
+            &resolution_bytes,
+            &assessment,
+            &identities,
+            include_sensitive_paths,
+        );
     }
+
+    let base = build_base_post_images(inventory, &runtime, &assessment, &identities, &resolution)?;
+    if base.refusal_count != 0 {
+        return Err(planner_error(
+            "post-image path joins contain a non-overridable refusal",
+        ));
+    }
+    let publisher = prepare_publisher_plan(inventory, &runtime, &assessment, &resolution)?;
+    let catalog_bytes = encode_catalog_snapshot(&base.catalog).map_err(inventory_error)?;
+    let attachment_bytes =
+        encode_attachment_snapshot(&base.attachments).map_err(inventory_error)?;
+    let mut predicted = PredictedPostImageHashesV1 {
+        catalog_hash: Sha256ValueV1::digest(&catalog_bytes),
+        attachment_hash: Sha256ValueV1::digest(&attachment_bytes),
+        participant_hashes: BTreeMap::new(),
+        g1_assets: publisher
+            .prepared
+            .values()
+            .map(|prepared| {
+                Ok(PredictedAssetV1 {
+                    asset_id: prepared.generation_id.as_str().to_string(),
+                    content_hash: Sha256ValueV1::parse(
+                        prepared.generation_hash.as_str().to_string(),
+                    )
+                    .map_err(inventory_error)?,
+                })
+            })
+            .collect::<Result<Vec<_>, ProjectCatalogMigrationError>>()?,
+        accepted_pointer_hashes: publisher
+            .prepared
+            .iter()
+            .map(|(project_id, prepared)| {
+                Ok((
+                    project_id.clone(),
+                    Sha256ValueV1::parse(prepared.pointer_hash.as_str().to_string())
+                        .map_err(inventory_error)?,
+                ))
+            })
+            .collect::<Result<_, ProjectCatalogMigrationError>>()?,
+    };
+    let mut post_image = DeterministicPostImageInputV1 {
+        version: 1,
+        transaction_id: identities.transaction_id.clone(),
+        inventory_hash: inventory_hash.clone(),
+        resolved_project_scopes: assessment.resolved_project_scopes.clone(),
+        repo_history_groups: identities.repo_history_groups.clone(),
+        attachments: base.post_image_attachments.clone(),
+        checkout_identity_actions: identities.checkout_identity_actions.clone(),
+        legacy_path_bindings: base.post_image_legacy_bindings.clone(),
+        quarantined_collected: resolution
+            .quarantine_collected
+            .iter()
+            .map(|row| QuarantinePostImageInputV1 {
+                project_id: row.project_id.clone(),
+                generation_id: row.generation_id.clone(),
+            })
+            .collect(),
+        publisher_binding_dispositions: publisher.dispositions.clone(),
+        predicted_hashes: predicted.clone(),
+    };
+    let plan_hash =
+        canonical_plan_hash(inventory, &resolution, &post_image).map_err(inventory_error)?;
+    let mut store_parts = prepare_store_plan_parts(
+        inventory,
+        &captured.code_source_owner_inventory,
+        &post_image,
+        &plan_hash,
+        &publisher,
+    )?;
+    let (legacy_source, publisher_source, source_assets) = prepare_source_drafts(
+        inventory,
+        &runtime,
+        captured.publisher_ref_source_was_missing,
+    )?;
+    store_parts.immutable_assets.extend(source_assets);
+    predicted.participant_hashes = store_parts
+        .participants
+        .iter()
+        .filter_map(MigrationParticipantDraftV1::predicted_post_image)
+        .map(|(token, hash)| {
+            Ok((
+                token,
+                Sha256ValueV1::parse(hash.to_string()).map_err(inventory_error)?,
+            ))
+        })
+        .collect::<Result<_, ProjectCatalogMigrationError>>()?;
+    post_image.predicted_hashes = predicted.clone();
+    let report = build_migration_report(
+        inventory,
+        &resolution_bytes,
+        &assessment,
+        &identities,
+        plan_hash.clone(),
+        predicted,
+        base.legacy_binding_report.clone(),
+        base.missing_paths.clone(),
+        base.unscoped_legacy_counts.clone(),
+        ProjectCatalogMigrationStatusV1::Clean,
+    )?;
+    let report_bytes = encode_migration_report_v1(&report).map_err(inventory_error)?;
+    let quarantine_authority =
+        validated_quarantine_bindings(inventory, &report, &resolution, &post_image)
+            .map_err(inventory_error)?;
+    let registry = build_registry(layout, &runtime.checkout_paths)?;
+    let immutable_predictions = store_parts
+        .immutable_assets
+        .iter()
+        .map(MigrationImmutableAssetDraftV1::predicted_identity)
+        .map(|(token, hash)| {
+            Ok((
+                token,
+                Sha256ValueV1::parse(hash.to_string()).map_err(inventory_error)?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, ProjectCatalogMigrationError>>()?;
+    let draft = MigrationPlanDraftV1 {
+        transaction_id: identities.transaction_id.clone(),
+        plan_hash: store_sha256(plan_hash.as_str())?,
+        report_artifact_sha256: store_sha256(Sha256ValueV1::digest(&report_bytes).as_str())?,
+        resolution_artifact_sha256: store_sha256(
+            Sha256ValueV1::digest(&resolution_bytes).as_str(),
+        )?,
+        legacy_project_source: legacy_source,
+        publisher_ref_source: publisher_source,
+        inventory_sha256: store_sha256(inventory_hash.as_str())?,
+        code_source_inventory_sha256: store_sha256(captured.code_source_canonical_sha256.as_str())?,
+        catalog: base.catalog.clone(),
+        attachments: base.attachments.clone(),
+        participants: store_parts.participants,
+        immutable_assets: store_parts.immutable_assets,
+        code_source_snapshot: store_parts.code_source_snapshot,
+        quarantine_authority,
+        publisher_pins: store_parts.publisher_pins,
+        publisher_dispositions: store_parts.publisher_dispositions,
+        checkout_identity_actions: identities
+            .checkout_identity_actions
+            .iter()
+            .map(|action| {
+                MigrationCheckoutIdentityActionDraftV1::new(
+                    action.observation_id.clone(),
+                    action.planned_checkout_id.clone(),
+                )
+            })
+            .collect(),
+    };
+    let plan = validate_migration_plan(&layout.projects_path, registry, draft)
+        .map_err(store_validation_error)?;
+    validate_planned_identity(
+        &plan,
+        &report_bytes,
+        &resolution_bytes,
+        &report,
+        &immutable_predictions,
+    )?;
+    let sensitive_review = prepare_sensitive_review(
+        inventory,
+        &runtime,
+        &base.sensitive_report,
+        include_sensitive_paths,
+    )?;
+    let receipt = preflight_receipt(
+        &report,
+        &report_bytes,
+        &resolution_bytes,
+        assessment.refusal_count,
+        &immutable_predictions,
+        sensitive_review.as_ref(),
+        u64::try_from(
+            base.attachments
+                .attachments
+                .values()
+                .filter(|row| row.kind == AttachmentKind::Base)
+                .count(),
+        )
+        .unwrap_or(u64::MAX),
+        u64::try_from(base.catalog.projects.len()).unwrap_or(u64::MAX),
+    );
+    Ok(PreparedClosedMigrationV1 {
+        preflight: PreparedPreflightV1 {
+            report_bytes,
+            resolution_bytes,
+            receipt,
+            sensitive_review,
+        },
+        plan: Some(plan),
+    })
+}
+
+fn prepare_assessment_only(
+    inventory: &V1ProjectCatalogInventory,
+    runtime: &MigrationRuntimeBindingsViewV1,
+    resolution_bytes: &[u8],
+    assessment: &MigrationSemanticAssessmentV1,
+    identities: &MigrationPersistedIdentityPlanV1,
+    include_sensitive_paths: bool,
+) -> Result<PreparedClosedMigrationV1, ProjectCatalogMigrationError> {
+    let status = assessment.status();
+    let (legacy_bindings, missing_paths, unscoped, sensitive_paths) =
+        build_non_executable_review_rows(inventory, runtime, identities, status)?;
+    let plan_hash =
+        non_executable_assessment_hash(inventory, resolution_bytes, identities, status)?;
+    let predicted = PredictedPostImageHashesV1 {
+        catalog_hash: assessment_prediction(&plan_hash, "catalog"),
+        attachment_hash: assessment_prediction(&plan_hash, "attachments"),
+        participant_hashes: BTreeMap::new(),
+        g1_assets: Vec::new(),
+        accepted_pointer_hashes: BTreeMap::new(),
+    };
+    let report = build_migration_report(
+        inventory,
+        resolution_bytes,
+        assessment,
+        identities,
+        plan_hash,
+        predicted,
+        legacy_bindings,
+        missing_paths,
+        unscoped,
+        status,
+    )?;
+    let report_bytes = encode_migration_report_v1(&report).map_err(inventory_error)?;
+    let sensitive_review = prepare_sensitive_review(
+        inventory,
+        runtime,
+        &sensitive_paths,
+        include_sensitive_paths,
+    )?;
+    let receipt = preflight_receipt(
+        &report,
+        &report_bytes,
+        resolution_bytes,
+        assessment.refusal_count,
+        &BTreeMap::new(),
+        sensitive_review.as_ref(),
+        0,
+        u64::try_from(inventory.legacy_projects.len()).unwrap_or(u64::MAX),
+    );
+    Ok(PreparedClosedMigrationV1 {
+        preflight: PreparedPreflightV1 {
+            report_bytes,
+            resolution_bytes: resolution_bytes.to_vec(),
+            receipt,
+            sensitive_review,
+        },
+        plan: None,
+    })
+}
+
+fn assessment_prediction(plan_hash: &Sha256ValueV1, role: &str) -> Sha256ValueV1 {
+    Sha256ValueV1::digest(
+        format!(
+            "blackbox.project-catalog.assessment-prediction.v1\0{}\0{}",
+            plan_hash, role
+        )
+        .as_bytes(),
+    )
+}
+
+fn prepare_attachment_identity_plan(
+    keys: &[AttachmentCandidateKeyV1],
+    prior_report: Option<&ProjectCatalogMigrationReportV1>,
+) -> Result<AttachmentCandidateIdentityPlanV1, ProjectCatalogMigrationError> {
+    let prior = prior_report
+        .into_iter()
+        .flat_map(|report| &report.attachments)
+        .map(|row| (row.observation_id.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
+    let mut used = BTreeSet::new();
+    let mut identities = BTreeMap::new();
+    for key in keys {
+        let observation_id = attachment_observation_id(key).map_err(adapter_error)?;
+        let attachment_id = prior
+            .get(observation_id.as_str())
+            .filter(|row| {
+                row.project_id == key.project_id
+                    && row.checkout_observation_id == key.checkout_observation_id
+            })
+            .map(|row| row.attachment_id.clone())
+            .unwrap_or_else(AttachmentId::mint);
+        if !used.insert(attachment_id.clone()) {
+            return Err(ProjectCatalogMigrationError::no_mutation(
+                "error.project_catalog_migration_identity_remint",
+                "reviewed attachment identity is reused by another candidate",
+            ));
+        }
+        identities.insert(key.clone(), attachment_id);
+    }
+    Ok(AttachmentCandidateIdentityPlanV1 { identities })
+}
+
+fn owner_inventory_paths(
+    layout: &ProjectCatalogMigrationResolvedLayoutV1,
+) -> ProjectCatalogOwnerInventoryPathsV1 {
+    ProjectCatalogOwnerInventoryPathsV1 {
+        corpus_index_root: layout.index_root.clone(),
+        git_cursor_root: layout.git_meta_root.clone(),
+        vector_root: layout.vector_root.clone(),
+        edge_root: layout.edge_root.clone(),
+        knowledge_store_path: layout.knowledge_path.clone(),
+        gap_store_path: layout.gaps_path.clone(),
+        thread_store_path: layout.threads_path.clone(),
+        note_store_path: layout.notes_path.clone(),
+        pin_store_path: layout.pins_path.clone(),
+        roadmap_store_path: layout.roadmap_path.clone(),
+        packet_root: layout.packets_dir.clone(),
+        task_store_path: layout.bro_home.join("tasks.json"),
+        proposal_root: layout.bro_home.join("badgey").join("proposals"),
+        slack_store_root: layout.bro_home.clone(),
+        whiteboard_root: layout.bro_home.clone(),
+        artifact_root: layout.artifacts_dir.clone(),
+        provenance_sources: Vec::new(),
+    }
+}
+
+fn discover_checkout_roots(
+    layout: &ProjectCatalogMigrationResolvedLayoutV1,
+) -> Result<Vec<PathBuf>, ProjectCatalogMigrationError> {
+    let Some(root) = &layout.checkout_replicas_root else {
+        return Ok(Vec::new());
+    };
+    let metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => {
+            return Err(ProjectCatalogMigrationError::no_mutation(
+                "error.project_catalog_migration_owner_snapshot",
+                "checkout replica root cannot be inspected",
+            ));
+        }
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(ProjectCatalogMigrationError::no_mutation(
+            "error.project_catalog_migration_owner_snapshot",
+            "checkout replica root is not a no-follow directory",
+        ));
+    }
+    let entries = std::fs::read_dir(root).map_err(|_| {
+        ProjectCatalogMigrationError::no_mutation(
+            "error.project_catalog_migration_owner_snapshot",
+            "checkout replica root cannot be enumerated",
+        )
+    })?;
+    let mut roots = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|_| {
+            ProjectCatalogMigrationError::no_mutation(
+                "error.project_catalog_migration_owner_snapshot",
+                "checkout replica entry cannot be inspected",
+            )
+        })?;
+        let file_type = entry.file_type().map_err(|_| {
+            ProjectCatalogMigrationError::no_mutation(
+                "error.project_catalog_migration_owner_snapshot",
+                "checkout replica entry type is unavailable",
+            )
+        })?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            return Err(ProjectCatalogMigrationError::no_mutation(
+                "error.project_catalog_migration_owner_snapshot",
+                "checkout replica root contains a non-directory entry",
+            ));
+        }
+        roots.push(entry.path());
+        if roots.len() > MAX_PROJECT_CATALOG_ENTRIES {
+            return Err(ProjectCatalogMigrationError::no_mutation(
+                "error.project_catalog_migration_owner_snapshot",
+                "checkout replica root exceeds its cardinality limit",
+            ));
+        }
+    }
+    roots.sort();
+    Ok(roots)
+}
+
+fn build_registry(
+    layout: &ProjectCatalogMigrationResolvedLayoutV1,
+    checkout_bindings: &BTreeMap<String, PathBuf>,
+) -> Result<MigrationParticipantRegistry, ProjectCatalogMigrationError> {
+    let mut registry = MigrationParticipantRegistry::new(
+        &layout.projects_path,
+        layout.code_source_root.clone(),
+        layout.publisher_refs_path.clone(),
+        layout.store_limits,
+    )
+    .map_err(store_validation_error)?;
+    for (observation_id, root) in checkout_bindings {
+        registry
+            .register_checkout_identity(observation_id.clone(), root.clone())
+            .map_err(store_validation_error)?;
+    }
+    registry.validate().map_err(store_validation_error)
+}
+
+fn prepare_source_drafts(
+    inventory: &V1ProjectCatalogInventory,
+    runtime: &MigrationRuntimeBindingsViewV1,
+    publisher_was_missing: bool,
+) -> Result<
+    (
+        MigrationLegacyProjectSourceDraftV1,
+        MigrationPublisherSourceDraftV1,
+        Vec<MigrationImmutableAssetDraftV1>,
+    ),
+    ProjectCatalogMigrationError,
+> {
+    let legacy = exact_source_state(inventory, MutableInventorySourceKindV1::LegacyProjectStore)?;
+    let publisher = exact_source_state(inventory, MutableInventorySourceKindV1::PublisherRefStore)?;
+    let mut assets = Vec::new();
+    let legacy_draft = match legacy {
+        InventorySourceStateV1::Missing { .. }
+            if runtime.legacy_project_store_was_missing
+                && runtime.legacy_project_store_bytes.is_empty() =>
+        {
+            MigrationLegacyProjectSourceDraftV1::Missing
+        }
+        InventorySourceStateV1::Present {
+            content_hash,
+            byte_len,
+            ..
+        } if !runtime.legacy_project_store_was_missing
+            && content_hash == &Sha256ValueV1::digest(&runtime.legacy_project_store_bytes)
+            && *byte_len
+                == u64::try_from(runtime.legacy_project_store_bytes.len()).unwrap_or(u64::MAX) =>
+        {
+            assets.push(MigrationImmutableAssetDraftV1::new(
+                ImmutableAssetRoleV1::LegacyProjectStoreBackup,
+                runtime.legacy_project_store_bytes.clone(),
+            ));
+            MigrationLegacyProjectSourceDraftV1::Present(runtime.legacy_project_store_bytes.clone())
+        }
+        _ => {
+            return Err(planner_error(
+                "legacy project source state and exact runtime bytes disagree",
+            ));
+        }
+    };
+    let publisher_draft = match publisher {
+        InventorySourceStateV1::Missing { .. }
+            if publisher_was_missing && inventory.publisher_ref_source_bytes.is_empty() =>
+        {
+            MigrationPublisherSourceDraftV1::Missing
+        }
+        InventorySourceStateV1::Present {
+            content_hash,
+            byte_len,
+            ..
+        } if !publisher_was_missing
+            && content_hash == &inventory.publisher_ref_source_hash
+            && *byte_len
+                == u64::try_from(inventory.publisher_ref_source_bytes.len())
+                    .unwrap_or(u64::MAX) =>
+        {
+            assets.push(MigrationImmutableAssetDraftV1::new(
+                ImmutableAssetRoleV1::LegacyPublisherRefBackup,
+                inventory.publisher_ref_source_bytes.clone(),
+            ));
+            MigrationPublisherSourceDraftV1::Present(inventory.publisher_ref_source_bytes.clone())
+        }
+        _ => {
+            return Err(planner_error(
+                "publisher source state and exact captured bytes disagree",
+            ));
+        }
+    };
+    Ok((legacy_draft, publisher_draft, assets))
+}
+
+fn exact_source_state(
+    inventory: &V1ProjectCatalogInventory,
+    kind: MutableInventorySourceKindV1,
+) -> Result<&InventorySourceStateV1, ProjectCatalogMigrationError> {
+    let mut matches = inventory
+        .mutable_source_evidence
+        .iter()
+        .filter(|row| row.source_kind == kind);
+    let state = &matches
+        .next()
+        .ok_or_else(|| planner_error("required mutable source evidence is missing"))?
+        .state;
+    if matches.next().is_some() || matches!(state, InventorySourceStateV1::Corrupt { .. }) {
+        return Err(planner_error(
+            "required mutable source evidence is duplicated or corrupt",
+        ));
+    }
+    Ok(state)
+}
+
+fn prepare_sensitive_review(
+    inventory: &V1ProjectCatalogInventory,
+    runtime: &MigrationRuntimeBindingsViewV1,
+    sensitive_paths: &SensitiveLocalPathReportV1,
+    include: bool,
+) -> Result<Option<PreparedSensitiveReviewV1>, ProjectCatalogMigrationError> {
+    if !include {
+        return Ok(None);
+    }
+    let (bytes, _) = encode_facade_sensitive_review(inventory, runtime, sensitive_paths)?;
+    Ok(Some(PreparedSensitiveReviewV1 { bytes }))
+}
+
+fn preflight_receipt(
+    report: &ProjectCatalogMigrationReportV1,
+    report_bytes: &[u8],
+    resolution_bytes: &[u8],
+    refusal_count: u64,
+    immutable_predictions: &BTreeMap<String, Sha256ValueV1>,
+    sensitive: Option<&PreparedSensitiveReviewV1>,
+    attached_project_count: u64,
+    catalog_project_count: u64,
+) -> ProjectCatalogMigrationPreflightReceiptV1 {
+    let quarantine_root_count = report
+        .activation_conflicts
+        .iter()
+        .flat_map(|row| &row.affected_record_ids)
+        .count();
+    ProjectCatalogMigrationPreflightReceiptV1 {
+        version: FACADE_VERSION_V1,
+        status: report.status,
+        transaction_id: report.transaction_id.clone(),
+        inventory_hash: report.inventory_hash.clone(),
+        plan_hash: report.plan_hash.clone(),
+        report_artifact_hash: Sha256ValueV1::digest(report_bytes),
+        resolution_artifact_hash: Sha256ValueV1::digest(resolution_bytes),
+        predicted_catalog_hash: report.predicted_catalog_hash.clone(),
+        predicted_attachment_hash: report.predicted_attachment_hash.clone(),
+        predicted_participant_hashes: report.predicted_participant_hashes.clone(),
+        predicted_immutable_asset_hashes: immutable_predictions.clone(),
+        required_resolution_count: u64::try_from(report.required_resolutions.len())
+            .unwrap_or(u64::MAX),
+        refusal_count,
+        checkout_action_count: u64::try_from(report.checkout_identity_actions.len())
+            .unwrap_or(u64::MAX),
+        publisher_pin_count: u64::try_from(report.publisher_bindings.len()).unwrap_or(u64::MAX),
+        quarantine_root_count: u64::try_from(quarantine_root_count).unwrap_or(u64::MAX),
+        attached_project_count,
+        omitted_catalog_count: catalog_project_count.saturating_sub(attached_project_count),
+        sensitive_review: sensitive.map(|review| SensitiveReviewReceiptV1 {
+            artifact_hash: Sha256ValueV1::digest(&review.bytes),
+            legacy_path_row_count: u64::try_from(report.legacy_path_bindings.len())
+                .unwrap_or(u64::MAX),
+            attachment_path_row_count: u64::try_from(report.attachments.len()).unwrap_or(u64::MAX),
+        }),
+    }
+}
+
+fn validate_planned_identity(
+    plan: &ValidatedMigrationPlanV1,
+    report_bytes: &[u8],
+    resolution_bytes: &[u8],
+    report: &ProjectCatalogMigrationReportV1,
+    immutable_predictions: &BTreeMap<String, Sha256ValueV1>,
+) -> Result<(), ProjectCatalogMigrationError> {
+    let identity = plan.artifact_identity();
+    let projections = identity_projections(&identity)?;
+    if identity.transaction_id != report.transaction_id
+        || identity.plan_hash.as_str() != report.plan_hash.as_str()
+        || identity.inventory_sha256.as_str() != report.inventory_hash.as_str()
+        || identity.report_artifact_sha256.as_str() != Sha256ValueV1::digest(report_bytes).as_str()
+        || identity.resolution_artifact_sha256.as_str()
+            != Sha256ValueV1::digest(resolution_bytes).as_str()
+        || projections.catalog_hash != report.predicted_catalog_hash
+        || projections.attachment_hash != report.predicted_attachment_hash
+        || projections.participant_hashes != report.predicted_participant_hashes
+        || &projections.immutable_hashes != immutable_predictions
+    {
+        return Err(ProjectCatalogMigrationError::no_mutation(
+            "error.project_catalog_migration_artifact_identity",
+            "validated transaction plan disagrees with reviewed predictions",
+        ));
+    }
+    Ok(())
+}
+
+struct IdentityProjectionsV1 {
+    catalog_hash: Sha256ValueV1,
+    attachment_hash: Sha256ValueV1,
+    participant_hashes: BTreeMap<String, Sha256ValueV1>,
+    immutable_hashes: BTreeMap<String, Sha256ValueV1>,
+    backup_hashes: BTreeMap<String, Sha256ValueV1>,
+}
+
+fn identity_projections(
+    identity: &crate::project_catalog_store::MigrationArtifactIdentityV1,
+) -> Result<IdentityProjectionsV1, ProjectCatalogMigrationError> {
+    let mut catalog_hash = None;
+    let mut attachment_hash = None;
+    let mut participants = BTreeMap::new();
+    let mut backups = BTreeMap::new();
+    for participant in &identity.participants {
+        let token = participant.role.artifact_token();
+        if let Some(old) = &participant.old_sha256 {
+            backups.insert(
+                format!("backup-{token}"),
+                Sha256ValueV1::parse(old.to_string()).map_err(inventory_error)?,
+            );
+        }
+        let Some(new) = &participant.new_sha256 else {
+            continue;
+        };
+        let hash = Sha256ValueV1::parse(new.to_string()).map_err(inventory_error)?;
+        match participant.role {
+            ParticipantRoleV1::Catalog => catalog_hash = Some(hash),
+            ParticipantRoleV1::Attachments => attachment_hash = Some(hash),
+            ParticipantRoleV1::MigrationMarker => {}
+            _ => {
+                participants.insert(token, hash);
+            }
+        }
+    }
+    let immutable_hashes = identity
+        .immutable_assets
+        .iter()
+        .map(|asset| {
+            Ok((
+                asset.role.artifact_token(),
+                Sha256ValueV1::parse(asset.sha256.to_string()).map_err(inventory_error)?,
+            ))
+        })
+        .collect::<Result<_, ProjectCatalogMigrationError>>()?;
+    Ok(IdentityProjectionsV1 {
+        catalog_hash: catalog_hash.ok_or_else(|| planner_error("catalog identity is missing"))?,
+        attachment_hash: attachment_hash
+            .ok_or_else(|| planner_error("attachment identity is missing"))?,
+        participant_hashes: participants,
+        immutable_hashes,
+        backup_hashes: backups,
+    })
+}
+
+fn verify_exact_installed_review(
+    layout: &ProjectCatalogMigrationResolvedLayoutV1,
+    report_bytes: &[u8],
+    report: &ProjectCatalogMigrationReportV1,
+    resolution_bytes: &[u8],
+) -> Result<Option<ProjectCatalogMigrationVerifyResultV1>, ProjectCatalogMigrationError> {
+    match verify_installed(layout) {
+        Ok(result) => {
+            let receipt = &result.receipt;
+            if receipt.transaction_id != report.transaction_id
+                || receipt.plan_hash != report.plan_hash
+                || receipt.inventory_hash != report.inventory_hash
+                || receipt.report_artifact_hash != Sha256ValueV1::digest(report_bytes)
+                || receipt.resolution_artifact_hash != Sha256ValueV1::digest(resolution_bytes)
+                || receipt.expected_catalog_hash != report.predicted_catalog_hash
+                || receipt.expected_attachment_hash != report.predicted_attachment_hash
+                || receipt.expected_participant_hashes != report.predicted_participant_hashes
+            {
+                return Err(ProjectCatalogMigrationError::no_mutation(
+                    "error.project_catalog_migration_artifact_identity",
+                    "installed migration belongs to a different reviewed artifact set",
+                ));
+            }
+            Ok(Some(result))
+        }
+        Err(error) if error.code == "error.project_catalog_invalid_snapshot" => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn verify_installed(
+    layout: &ProjectCatalogMigrationResolvedLayoutV1,
+) -> Result<ProjectCatalogMigrationVerifyResultV1, ProjectCatalogMigrationError> {
+    let checkout_roots = discover_checkout_roots(layout)?;
+    let checkout_bindings =
+        ProjectCatalogMigrationInventoryFacadeV1::discover_checkout_observation_bindings(
+            checkout_roots,
+        )
+        .map_err(adapter_error)?;
+    let registry = build_registry(layout, &checkout_bindings)?;
+    let store =
+        ProjectCatalogStore::open_existing_after_migration(layout.projects_path.clone(), registry)
+            .map_err(store_validation_error)?;
+    let identity = store
+        .migration_artifact_identity()
+        .map_err(store_validation_error)?;
+    let state = store.snapshot().map_err(store_validation_error)?;
+    let compatibility = build_compatibility_projection(&state)?;
+    let projections = identity_projections(&identity)?;
+    let receipt = MigrationVerificationReceiptV1 {
+        version: FACADE_VERSION_V1,
+        transaction_id: identity.transaction_id,
+        inventory_hash: Sha256ValueV1::parse(identity.inventory_sha256.to_string())
+            .map_err(inventory_error)?,
+        plan_hash: Sha256ValueV1::parse(identity.plan_hash.to_string()).map_err(inventory_error)?,
+        report_artifact_hash: Sha256ValueV1::parse(identity.report_artifact_sha256.to_string())
+            .map_err(inventory_error)?,
+        resolution_artifact_hash: Sha256ValueV1::parse(
+            identity.resolution_artifact_sha256.to_string(),
+        )
+        .map_err(inventory_error)?,
+        expected_catalog_hash: projections.catalog_hash.clone(),
+        observed_catalog_hash: Sha256ValueV1::parse(state.catalog_sha256().to_string())
+            .map_err(inventory_error)?,
+        expected_attachment_hash: projections.attachment_hash.clone(),
+        observed_attachment_hash: Sha256ValueV1::parse(state.attachments_sha256().to_string())
+            .map_err(inventory_error)?,
+        expected_participant_hashes: projections.participant_hashes.clone(),
+        observed_participant_hashes: projections.participant_hashes,
+        expected_immutable_asset_hashes: projections.immutable_hashes.clone(),
+        observed_immutable_asset_hashes: projections.immutable_hashes,
+        backup_hashes: projections.backup_hashes,
+        epoch: identity.epoch,
+        checkout_action_count: identity.checkout_action_count,
+        publisher_pin_count: identity.publisher_pin_count,
+        quarantine_root_count: identity.quarantine_root_count,
+        attached_project_count: u64::try_from(compatibility.records.len()).unwrap_or(u64::MAX),
+        omitted_catalog_count: compatibility.omitted_catalog_count,
+    };
+    Ok(ProjectCatalogMigrationVerifyResultV1 {
+        receipt,
+        compatibility,
+    })
+}
+
+fn adapter_error(
+    error: crate::project_catalog_inventory_adapters::InventoryAdapterError,
+) -> ProjectCatalogMigrationError {
+    ProjectCatalogMigrationError::no_mutation(
+        error.code(),
+        "migration owner snapshot contract failed",
+    )
+}
+
+fn store_validation_error(
+    error: crate::project_catalog_store::ProjectCatalogStoreError,
+) -> ProjectCatalogMigrationError {
+    ProjectCatalogMigrationError::no_mutation(error.code(), "migration store contract failed")
 }
 
 fn validate_prepared_preflight(
@@ -1526,34 +4817,71 @@ mod tests {
     }
 
     #[test]
-    fn current_public_preflight_fails_before_writing_when_owner_is_missing() {
-        let dir = tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let config = test_config(&root);
-        let layout = ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(
-            root.join("rehearsal"),
-            &config,
+    fn production_identity_planner_reuses_every_reported_random_identity() {
+        let inventory = crate::project_catalog_inventory::tests::fixture_inventory();
+        let resolution =
+            ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
+        let post_image = crate::project_catalog_inventory::tests::fixture_post_image(&inventory);
+        let report = crate::project_catalog_inventory::tests::fixture_report(
+            &inventory,
+            &resolution,
+            &post_image,
+        );
+
+        let first = build_persisted_identity_plan(
+            &inventory,
+            &post_image.resolved_project_scopes,
+            Some(&report),
         )
         .unwrap();
-        let report = root.join("review").join("report.json");
-        let resolution = root.join("review").join("resolution.json");
-        let error =
-            ProjectCatalogMigrationFacadeV1::preflight(ProjectCatalogMigrationPreflightRequestV1 {
-                layout,
-                report_path: report.clone(),
-                resolution_path: resolution.clone(),
-                sensitive_report_path: None,
-            })
-            .unwrap_err();
+        let second = build_persisted_identity_plan(
+            &inventory,
+            &post_image.resolved_project_scopes,
+            Some(&report),
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.transaction_id(), &report.transaction_id);
+        assert_eq!(first.repo_history_groups, report.repo_history_groups);
         assert_eq!(
-            error.code,
-            "error.project_catalog_migration_owner_adapter_missing"
+            first.checkout_identity_actions,
+            report.checkout_identity_actions
         );
         assert_eq!(
-            error.mutation_disposition,
-            ProjectCatalogMigrationMutationDispositionV1::NoDurableMutation
+            first.legacy_path_binding_ids,
+            report
+                .legacy_path_bindings
+                .iter()
+                .map(|row| { (row.observation_id.clone(), row.planned_binding_id.clone(),) })
+                .collect()
         );
-        assert!(!report.exists());
-        assert!(!resolution.exists());
+        assert_eq!(
+            first.attachment_ids,
+            report
+                .attachments
+                .iter()
+                .map(|row| (row.observation_id.clone(), row.attachment_id.clone()))
+                .collect()
+        );
+    }
+
+    #[test]
+    fn production_semantic_planner_returns_refused_for_unsafe_checkout_evidence() {
+        let mut inventory = crate::project_catalog_inventory::tests::fixture_inventory();
+        inventory.checkouts[0].marker_state =
+            crate::project_catalog_inventory::CheckoutMarkerStateV1::Malformed {
+                diagnostic_code: "invalid_checkout_marker".to_string(),
+            };
+        let resolution =
+            ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
+
+        let assessment = assess_migration_semantics(&inventory, &resolution).unwrap();
+
+        assert_eq!(
+            assessment.status(),
+            ProjectCatalogMigrationStatusV1::Refused
+        );
+        assert_eq!(assessment.refusal_count, 1);
     }
 }

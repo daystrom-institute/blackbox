@@ -956,6 +956,12 @@ impl MigrationParticipantDraftV1 {
             post_image,
         }
     }
+
+    pub(crate) fn predicted_post_image(&self) -> Option<(String, Sha256Hex)> {
+        self.post_image
+            .as_ref()
+            .map(|bytes| (self.role.artifact_token(), sha256(bytes)))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -985,6 +991,16 @@ impl MigrationImmutableAssetDraftV1 {
             role,
             source: MigrationImmutableAssetSourceV1::PinnedExisting { expected_sha256 },
         }
+    }
+
+    pub(crate) fn predicted_identity(&self) -> (String, Sha256Hex) {
+        let hash = match &self.source {
+            MigrationImmutableAssetSourceV1::InstallableBytes(bytes) => sha256(bytes),
+            MigrationImmutableAssetSourceV1::PinnedExisting { expected_sha256 } => {
+                expected_sha256.clone()
+            }
+        };
+        (self.role.artifact_token(), hash)
     }
 }
 
@@ -2479,6 +2495,7 @@ pub(crate) struct MigrationPlanDraftV1 {
     pub(crate) legacy_project_source: MigrationLegacyProjectSourceDraftV1,
     pub(crate) publisher_ref_source: MigrationPublisherSourceDraftV1,
     pub(crate) inventory_sha256: Sha256Hex,
+    pub(crate) code_source_inventory_sha256: Sha256Hex,
     pub(crate) catalog: CatalogSnapshotV2,
     pub(crate) attachments: AttachmentSnapshotV1,
     pub(crate) participants: Vec<MigrationParticipantDraftV1>,
@@ -2527,6 +2544,10 @@ pub(crate) struct MigrationArtifactIdentityV1 {
     pub(crate) resolution_artifact_sha256: Sha256Hex,
     pub(crate) participants: Vec<MigrationParticipantArtifactIdentityV1>,
     pub(crate) immutable_assets: Vec<MigrationImmutableAssetIdentityV1>,
+    pub(crate) epoch: u64,
+    pub(crate) checkout_action_count: u64,
+    pub(crate) publisher_pin_count: u64,
+    pub(crate) quarantine_root_count: u64,
 }
 
 impl ValidatedMigrationPlanV1 {
@@ -2917,7 +2938,7 @@ pub(crate) fn validate_migration_plan(
             .clone(),
     )
     .map_err(contract_error)?
-        != draft.inventory_sha256
+        != draft.code_source_inventory_sha256
     {
         return Err(ProjectCatalogStoreError::new(
             "error.project_catalog_invalid_migration_plan",
@@ -7327,6 +7348,20 @@ fn migration_artifact_identity_from_journal(
                 sha256: asset.sha256.clone(),
             })
             .collect(),
+        epoch: journal.new_epoch,
+        checkout_action_count: u64::try_from(journal.monotonic_checkout_identity_actions.len())
+            .unwrap_or(u64::MAX),
+        publisher_pin_count: u64::try_from(journal.publisher_pins.len()).unwrap_or(u64::MAX),
+        quarantine_root_count: u64::try_from(
+            journal
+                .resolved_quarantine_bindings
+                .iter()
+                .flatten()
+                .map(|(project_id, _)| project_id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+        )
+        .unwrap_or(u64::MAX),
     })
 }
 
@@ -8818,7 +8853,8 @@ mod tests {
                 legacy_bytes.to_vec(),
             ),
             publisher_ref_source: MigrationPublisherSourceDraftV1::Missing,
-            inventory_sha256,
+            inventory_sha256: inventory_sha256.clone(),
+            code_source_inventory_sha256: inventory_sha256,
             catalog,
             attachments,
             participants: vec![MigrationParticipantDraftV1::new(

@@ -1731,6 +1731,13 @@ pub enum ProjectCatalogMigrationStatusV1 {
     Refused,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectCatalogMigrationPlanKindV1 {
+    Executable,
+    AssessmentOnly,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectCatalogMigrationReportV1 {
@@ -1743,6 +1750,7 @@ pub struct ProjectCatalogMigrationReportV1 {
     pub publisher_ref_source_hash: Sha256ValueV1,
     pub generated_at: String,
     pub status: ProjectCatalogMigrationStatusV1,
+    pub plan_kind: ProjectCatalogMigrationPlanKindV1,
     pub projects: Vec<ProjectMigrationReportRowV1>,
     pub repo_history_groups: Vec<DeterministicRepoHistoryGroupV1>,
     pub attachments: Vec<AttachmentMigrationReportRowV1>,
@@ -1933,13 +1941,21 @@ impl ProjectCatalogMigrationReportV1 {
             validate_stable_id(role, "predicted participant role")?;
         }
         match self.status {
-            ProjectCatalogMigrationStatusV1::Clean if !self.required_resolutions.is_empty() => {
-                Err(invalid("clean report still requires resolution"))
-            }
             ProjectCatalogMigrationStatusV1::ResolutionRequired
                 if self.required_resolutions.is_empty() =>
             {
                 Err(invalid("resolution-required report has no requirements"))
+            }
+            ProjectCatalogMigrationStatusV1::Clean
+                if self.plan_kind != ProjectCatalogMigrationPlanKindV1::Executable =>
+            {
+                Err(invalid("clean report lacks an executable plan"))
+            }
+            ProjectCatalogMigrationStatusV1::ResolutionRequired
+            | ProjectCatalogMigrationStatusV1::Refused
+                if self.plan_kind != ProjectCatalogMigrationPlanKindV1::AssessmentOnly =>
+            {
+                Err(invalid("non-clean report claims an executable plan"))
             }
             _ => Ok(()),
         }
@@ -2072,13 +2088,17 @@ impl ProjectCatalogMigrationReportV1 {
             ));
         }
         for retained in &inventory.retained_owner_resolutions {
+            let expected_resolution_id = canonical_scope_resolution_id(
+                &retained.published_scope,
+                &retained.candidate_project_ids,
+            )?;
             let expected_candidates = retained
                 .candidate_project_ids
                 .iter()
                 .map(ToString::to_string)
                 .collect::<BTreeSet<_>>();
             if !self.required_resolutions.iter().any(|resolution| {
-                resolution.resolution_id == retained.observation_id
+                resolution.resolution_id == expected_resolution_id
                     && resolution.kind == RequiredResolutionKindV1::ScopeOwner
                     && resolution.candidate_record_ids == expected_candidates
             }) {
@@ -2855,7 +2875,21 @@ struct CanonicalPlanHashInputV1<'a> {
     version: u32,
     inventory_hash: &'a Sha256ValueV1,
     resolution: &'a ProjectCatalogMigrationResolutionV1,
-    post_image: &'a DeterministicPostImageInputV1,
+    post_image: CanonicalSemanticPostImageV1<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct CanonicalSemanticPostImageV1<'a> {
+    version: u32,
+    transaction_id: &'a ProjectCatalogTransactionId,
+    inventory_hash: &'a Sha256ValueV1,
+    resolved_project_scopes: &'a [ResolvedProjectScopeInputV1],
+    repo_history_groups: &'a [DeterministicRepoHistoryGroupV1],
+    attachments: &'a [AttachmentPostImageInputV1],
+    checkout_identity_actions: &'a [CheckoutIdentityActionV1],
+    legacy_path_bindings: &'a [LegacyPathBindingPostImageInputV1],
+    quarantined_collected: &'a [QuarantinePostImageInputV1],
+    publisher_binding_dispositions: &'a [PublisherBindingDispositionV1],
 }
 
 pub fn canonical_plan_hash(
@@ -2881,7 +2915,21 @@ pub fn canonical_plan_hash(
         version: PROJECT_CATALOG_MIGRATION_REPORT_VERSION_V1,
         inventory_hash: &inventory_hash,
         resolution: &canonical_resolution,
-        post_image: &canonical_post_image,
+        // Participant bytes such as collision-retirement records embed this
+        // semantic plan hash. Their predicted hashes are therefore excluded
+        // from semantic intent and bound later by exact report/marker bytes.
+        post_image: CanonicalSemanticPostImageV1 {
+            version: canonical_post_image.version,
+            transaction_id: &canonical_post_image.transaction_id,
+            inventory_hash: &canonical_post_image.inventory_hash,
+            resolved_project_scopes: &canonical_post_image.resolved_project_scopes,
+            repo_history_groups: &canonical_post_image.repo_history_groups,
+            attachments: &canonical_post_image.attachments,
+            checkout_identity_actions: &canonical_post_image.checkout_identity_actions,
+            legacy_path_bindings: &canonical_post_image.legacy_path_bindings,
+            quarantined_collected: &canonical_post_image.quarantined_collected,
+            publisher_binding_dispositions: &canonical_post_image.publisher_binding_dispositions,
+        },
     };
     let bytes = serde_json::to_vec(&input).map_err(|error| {
         ProjectCatalogInventoryError::new("error.project_catalog_plan_encode", error.to_string())
@@ -2971,23 +3019,7 @@ pub fn validate_supported_resolution(
         .collect::<BTreeMap<_, _>>();
     let mut satisfied = BTreeSet::new();
     let mut expected_quarantines = BTreeMap::new();
-    let canonical_scope_conflicts = projects
-        .iter()
-        .flat_map(|project_id| {
-            observed_scopes_for_project(inventory, project_id)
-                .into_iter()
-                .map(move |scope| (scope, project_id.clone()))
-        })
-        .fold(
-            BTreeMap::<PublishedScope, BTreeSet<ProjectId>>::new(),
-            |mut conflicts, (scope, project_id)| {
-                conflicts.entry(scope).or_default().insert(project_id);
-                conflicts
-            },
-        )
-        .into_iter()
-        .filter(|(_, candidates)| candidates.len() > 1)
-        .collect::<BTreeMap<_, _>>();
+    let canonical_scope_conflicts = canonical_scope_conflicts(inventory)?;
     let selected_scope_owners = resolution
         .selected_scope_owners
         .iter()
@@ -3070,14 +3102,7 @@ pub fn validate_supported_resolution(
         }
         for source in &inventory.code_sources {
             for generation in &source.generations {
-                let ImmutableCollectedDescriptorV1::Valid {
-                    published_scope, ..
-                } = &generation.descriptor
-                else {
-                    continue;
-                };
-                if published_scope == &row.scope
-                    && row.losing_project_ids.contains(&generation.project_id)
+                if row.losing_project_ids.contains(&generation.project_id)
                     && expected_quarantines
                         .insert(
                             (
@@ -3094,12 +3119,27 @@ pub fn validate_supported_resolution(
         }
         for alias in &row.owned_aliases {
             let alias_owners = inventory
-                .materialized_aliases
+                .legacy_projects
                 .iter()
-                .filter(|candidate| candidate.alias == *alias)
-                .map(|candidate| candidate.project_id.clone())
+                .filter(|candidate| candidate.record.aliases.contains(alias))
+                .map(|candidate| ProjectId::parse(candidate.record.project_id.clone()))
+                .collect::<Result<BTreeSet<_>, _>>()
+                .map_err(|_| invalid("legacy project id is invalid"))?
+                .into_iter()
+                .chain(
+                    inventory
+                        .materialized_aliases
+                        .iter()
+                        .filter(|candidate| candidate.alias == *alias)
+                        .map(|candidate| candidate.project_id.clone()),
+                )
                 .collect::<BTreeSet<_>>();
-            if alias_owners.len() < 2 || !alias_owners.contains(&row.owner_project_id) {
+            let mut selected_alias_owners = row.losing_project_ids.clone();
+            selected_alias_owners.insert(row.owner_project_id.clone());
+            if alias_owners.len() < 2
+                || alias_owners != selected_alias_owners
+                || !alias_owners.contains(&row.owner_project_id)
+            {
                 return Err(unknown("selected alias conflict"));
             }
             let conflicted_owner_ids = alias_owners
@@ -3574,6 +3614,18 @@ pub fn deterministic_repo_history_group_ids(
     inventory: &V1ProjectCatalogInventory,
     resolved_projects: &[ResolvedProjectScopeInputV1],
 ) -> InventoryResult<Vec<String>> {
+    Ok(
+        deterministic_repo_history_group_memberships(inventory, resolved_projects)?
+            .into_iter()
+            .map(|(group_id, _)| group_id)
+            .collect(),
+    )
+}
+
+pub(crate) fn deterministic_repo_history_group_memberships(
+    inventory: &V1ProjectCatalogInventory,
+    resolved_projects: &[ResolvedProjectScopeInputV1],
+) -> InventoryResult<Vec<(String, BTreeSet<ProjectId>)>> {
     let resolved_scopes = resolved_projects
         .iter()
         .map(|row| (row.project_id.clone(), row.published_scope.as_ref()))
@@ -3588,7 +3640,7 @@ pub fn deterministic_repo_history_group_ids(
                     || project_has_repo_history_evidence(inventory, project_id)
             })
         })
-        .map(|group| group.group_id)
+        .map(|group| (group.group_id, group.project_ids))
         .collect())
 }
 
@@ -3808,7 +3860,7 @@ pub fn digest_publisher_full_ref(full_ref: &str) -> InventoryResult<Sha256ValueV
     ))
 }
 
-fn canonical_scope_resolution_id(
+pub(crate) fn canonical_scope_resolution_id(
     scope: &PublishedScope,
     candidates: &BTreeSet<ProjectId>,
 ) -> InventoryResult<String> {
@@ -3993,7 +4045,19 @@ fn validate_planned_namespaces(
             CommitNamespace::parse(namespace.clone())
                 .map_err(|_| invalid("inventoried commit namespace is invalid"))
         })
-        .collect::<InventoryResult<BTreeSet<_>>>()?;
+        .collect::<InventoryResult<BTreeSet<_>>>()?
+        .difference(
+            &inventory
+                .legacy_namespace_clusters
+                .iter()
+                .map(|cluster| {
+                    CommitNamespace::parse(cluster.materialized_namespace.clone())
+                        .map_err(|_| invalid("legacy namespace cluster is invalid"))
+                })
+                .collect::<InventoryResult<BTreeSet<_>>>()?,
+        )
+        .cloned()
+        .collect::<BTreeSet<_>>();
     if !inventoried.is_empty() {
         let mut planned = group.planned_compatibility_namespaces.clone();
         planned.insert(group.planned_primary_namespace.clone());
@@ -4374,7 +4438,7 @@ fn validate_publisher_source_membership(
     Ok(())
 }
 
-fn project_authority_scope<'a>(
+pub(crate) fn project_authority_scope<'a>(
     inventory: &'a V1ProjectCatalogInventory,
     project_id: &ProjectId,
 ) -> InventoryResult<Option<&'a PublishedScope>> {
@@ -4415,6 +4479,25 @@ fn project_authority_scope<'a>(
         (None, Some((active, true))) => Ok(Some(active)),
         (None, Some((_, false)) | None) => Ok(None),
     }
+}
+
+pub(crate) fn canonical_scope_conflicts(
+    inventory: &V1ProjectCatalogInventory,
+) -> InventoryResult<BTreeMap<PublishedScope, BTreeSet<ProjectId>>> {
+    inventory.validate()?;
+    let mut conflicts = BTreeMap::<PublishedScope, BTreeSet<ProjectId>>::new();
+    for project in &inventory.legacy_projects {
+        let project_id = ProjectId::parse(project.record.project_id.clone())
+            .map_err(|_| invalid("legacy project id is invalid"))?;
+        if let Some(scope) = project_authority_scope(inventory, &project_id)? {
+            conflicts
+                .entry(scope.clone())
+                .or_default()
+                .insert(project_id);
+        }
+    }
+    conflicts.retain(|_, candidates| candidates.len() > 1);
+    Ok(conflicts)
 }
 
 fn publisher_pin_key(
@@ -5557,7 +5640,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn fixture_inventory() -> V1ProjectCatalogInventory {
+    pub(crate) fn fixture_inventory() -> V1ProjectCatalogInventory {
         let source_store_bytes = br#"{"version":1,"projects":[]}"#.to_vec();
         let publisher_ref_source_bytes = serde_json::to_vec(&serde_json::json!({
             "version": 1,
@@ -6020,7 +6103,9 @@ pub(crate) mod tests {
         assert!(project_authority_scope(&inventory, &project_id).is_err());
     }
 
-    fn fixture_post_image(inventory: &V1ProjectCatalogInventory) -> DeterministicPostImageInputV1 {
+    pub(crate) fn fixture_post_image(
+        inventory: &V1ProjectCatalogInventory,
+    ) -> DeterministicPostImageInputV1 {
         let inventory_hash = inventory.inventory_hash().unwrap();
         let checkout_id = "e".repeat(32);
         let registered_at = "2026-01-02T03:04:05Z".to_string();
@@ -6105,7 +6190,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn fixture_report(
+    pub(crate) fn fixture_report(
         inventory: &V1ProjectCatalogInventory,
         resolution: &ProjectCatalogMigrationResolutionV1,
         post_image: &DeterministicPostImageInputV1,
@@ -6123,6 +6208,7 @@ pub(crate) mod tests {
             publisher_ref_source_hash: inventory.publisher_ref_source_hash.clone(),
             generated_at: "2026-01-02T03:04:05Z".to_string(),
             status: ProjectCatalogMigrationStatusV1::Clean,
+            plan_kind: ProjectCatalogMigrationPlanKindV1::Executable,
             projects: inventory
                 .legacy_projects
                 .iter()
@@ -7018,7 +7104,7 @@ pub(crate) mod tests {
 
         let mut changed = post_image;
         changed.predicted_hashes.catalog_hash = hash("different_catalog");
-        assert_ne!(
+        assert_eq!(
             canonical_plan_hash(&inventory, &resolution, &changed).unwrap(),
             report.plan_hash
         );

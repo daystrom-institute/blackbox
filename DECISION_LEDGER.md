@@ -669,3 +669,27 @@ until a later entry explicitly supersedes it.
 - Revisit only if: a different durable history store supplies the same
   complete-count/hash proof, namespace quarantine, reference tracking, and
   checkout-independent rematerialization.
+
+## D-028: Migration reports distinguish executable plans from assessments
+
+- Date: 2026-07-23
+- Phase: durable project catalog, migration facade
+- Status: accepted during facade integration repair
+- Decision: Every migration report carries `plan_kind` as either `executable`
+  or `assessment_only`. A clean report must be executable. Resolution-required
+  and refused reports must be assessment-only and carry a domain-separated
+  assessment hash that is never accepted as a transaction plan identity.
+- Evidence:
+  - An unsafe checkout marker correctly refuses migration, but the strict
+    deterministic post-image cannot represent an attachment through that
+    checkout.
+  - An unresolved attachment exclusion cannot both preserve every candidate
+    and satisfy the exact post-image attachment set.
+  - Existing report fields require a hash even when no valid executable
+    post-image exists.
+- Rationale: Explicit plan kind preserves the stable report field shape while
+  preventing diagnostic review state from masquerading as installable state.
+  Apply rejects assessment-only identity before participant or transaction
+  assembly.
+- Revisit only if: a later report version makes executable plan and prediction
+  fields explicitly optional and preserves the same fail-closed apply check.
