@@ -1995,12 +1995,15 @@ mod tests {
     #[test]
     fn preparation_is_deterministic_and_counts_exact_source_bytes() {
         let input = build_input();
+        let identical_input = input.clone();
         let expected_bytes =
             input.knowledge[0].source_bytes.len() + input.gaps[0].source_bytes.len();
         let expected_knowledge_hash = PublicationSha256::digest(&input.knowledge[0].source_bytes);
         let first =
             prepare_accepted_publication_v1(input, &AcceptedPublicationLimits::default()).unwrap();
-        let second = prepared();
+        let second =
+            prepare_accepted_publication_v1(identical_input, &AcceptedPublicationLimits::default())
+                .unwrap();
         assert_eq!(first.generation_bytes, second.generation_bytes);
         assert_eq!(first.pointer_bytes, second.pointer_bytes);
         assert_eq!(first.generation_id, second.generation_id);
