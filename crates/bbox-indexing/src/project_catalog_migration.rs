@@ -3689,13 +3689,7 @@ impl ClosedMigrationIntegrationV1 for CurrentClosedMigrationIntegrationV1 {
                 facade_mutation_disposition(failure.disposition),
             )
         })?;
-        let verified = verify_installed(layout).map_err(|error| {
-            ProjectCatalogMigrationError::new(
-                error.code,
-                "installed migration verification failed after commit",
-                ProjectCatalogMigrationMutationDispositionV1::RecoveredToCommittedState,
-            )
-        })?;
+        let verified = verify_installed(layout).map_err(post_commit_verification_error)?;
         if verified.receipt.predicted_marker_hash != predicted_marker_hash {
             return Err(ProjectCatalogMigrationError::new(
                 "error.project_catalog_migration_artifact_identity",
@@ -4548,28 +4542,47 @@ fn verify_exact_installed_review(
 ) -> Result<Option<ProjectCatalogMigrationVerifyResultV1>, ProjectCatalogMigrationError> {
     match verify_installed_optional(layout)? {
         Some(result) => {
-            let receipt = &result.receipt;
-            if receipt.transaction_id != report.transaction_id
-                || receipt.plan_hash != report.plan_hash
-                || receipt.inventory_hash != report.inventory_hash
-                || receipt.report_artifact_hash != Sha256ValueV1::digest(report_bytes)
-                || receipt.resolution_artifact_hash != Sha256ValueV1::digest(resolution_bytes)
-                || receipt.expected_catalog_hash != report.predicted_catalog_hash
-                || receipt.expected_attachment_hash != report.predicted_attachment_hash
-                || receipt.expected_participant_hashes != report.predicted_participant_hashes
-                || receipt.expected_immutable_asset_hashes
-                    != report.predicted_immutable_asset_hashes
-            {
-                return Err(ProjectCatalogMigrationError::new(
-                    "error.project_catalog_migration_artifact_identity",
-                    "installed migration belongs to a different reviewed artifact set",
-                    result.mutation_disposition,
-                ));
-            }
+            validate_exact_installed_review(&result, report_bytes, report, resolution_bytes)?;
             Ok(Some(result))
         }
         None => Ok(None),
     }
+}
+
+fn validate_exact_installed_review(
+    result: &ProjectCatalogMigrationVerifyResultV1,
+    report_bytes: &[u8],
+    report: &ProjectCatalogMigrationReportV1,
+    resolution_bytes: &[u8],
+) -> Result<(), ProjectCatalogMigrationError> {
+    let receipt = &result.receipt;
+    if receipt.transaction_id != report.transaction_id
+        || receipt.plan_hash != report.plan_hash
+        || receipt.inventory_hash != report.inventory_hash
+        || receipt.report_artifact_hash != Sha256ValueV1::digest(report_bytes)
+        || receipt.resolution_artifact_hash != Sha256ValueV1::digest(resolution_bytes)
+        || receipt.expected_catalog_hash != report.predicted_catalog_hash
+        || receipt.expected_attachment_hash != report.predicted_attachment_hash
+        || receipt.expected_participant_hashes != report.predicted_participant_hashes
+        || receipt.expected_immutable_asset_hashes != report.predicted_immutable_asset_hashes
+    {
+        return Err(ProjectCatalogMigrationError::new(
+            "error.project_catalog_migration_artifact_identity",
+            "installed migration belongs to a different reviewed artifact set",
+            result.mutation_disposition,
+        ));
+    }
+    Ok(())
+}
+
+fn post_commit_verification_error(
+    error: ProjectCatalogMigrationError,
+) -> ProjectCatalogMigrationError {
+    ProjectCatalogMigrationError::new(
+        error.code,
+        "installed migration verification failed after commit",
+        ProjectCatalogMigrationMutationDispositionV1::RecoveredToCommittedState,
+    )
 }
 
 fn verify_installed(
@@ -5805,6 +5818,43 @@ mod tests {
         assert_eq!(
             error.mutation_disposition,
             ProjectCatalogMigrationMutationDispositionV1::RecoveredToOldState
+        );
+    }
+
+    #[test]
+    fn exact_artifact_mismatch_inherits_recovered_committed_disposition() {
+        let (report, _, resolution_bytes, receipt) = verification_validation_fixture();
+        let result = ProjectCatalogMigrationVerifyResultV1 {
+            receipt,
+            compatibility: ProjectCatalogCompatibilityProjectionV1 {
+                records: Vec::new(),
+                omitted_catalog_count: 0,
+            },
+            mutation_disposition:
+                ProjectCatalogMigrationMutationDispositionV1::RecoveredToCommittedState,
+        };
+
+        let error =
+            validate_exact_installed_review(&result, b"different", &report, &resolution_bytes)
+                .unwrap_err();
+
+        assert_eq!(
+            error.mutation_disposition,
+            ProjectCatalogMigrationMutationDispositionV1::RecoveredToCommittedState
+        );
+    }
+
+    #[test]
+    fn post_commit_verification_failure_forces_committed_disposition() {
+        let error = post_commit_verification_error(ProjectCatalogMigrationError::new(
+            "error.test_recovery_uncertain",
+            "test",
+            ProjectCatalogMigrationMutationDispositionV1::RetryExactPlanRequired,
+        ));
+
+        assert_eq!(
+            error.mutation_disposition,
+            ProjectCatalogMigrationMutationDispositionV1::RecoveredToCommittedState
         );
     }
 
