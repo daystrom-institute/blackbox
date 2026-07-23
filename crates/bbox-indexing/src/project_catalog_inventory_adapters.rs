@@ -525,7 +525,6 @@ fn capture_publisher_ref_source(
 #[derive(Debug, Clone)]
 struct CommittedConfigSourceV1 {
     pub repository_root: PathBuf,
-    pub repository: StableGitRepository,
     pub commit: VerifiedCommit,
 }
 
@@ -713,9 +712,6 @@ fn derive_legacy_project_probes_with_hook(
                         .expect("verified commit has a repository authority")
                         .repository_root()
                         .to_path_buf(),
-                    repository: repository
-                        .clone()
-                        .expect("verified commit has a repository authority"),
                     commit,
                 });
             Ok(LegacyProjectProbeInputV1 {
@@ -4335,7 +4331,6 @@ mod tests {
             &root,
             Some(&CommittedConfigSourceV1 {
                 repository_root: root.as_path().to_path_buf(),
-                repository,
                 commit: verified_commit,
             }),
         )

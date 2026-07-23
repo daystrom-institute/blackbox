@@ -5559,7 +5559,9 @@ mod tests {
 
     #[test]
     fn canonical_legacy_path_classification_is_reused_by_assessment_and_executable_paths() {
-        let inventory = crate::project_catalog_inventory::tests::fixture_inventory();
+        let mut inventory = crate::project_catalog_inventory::tests::fixture_inventory();
+        inventory.legacy_path_observations[0].selector_digest =
+            digest_path("/workspace/acme/services/alpha/src/Example.java");
         let resolution =
             ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
         let assessment = assess_migration_semantics(&inventory, &resolution).unwrap();
@@ -5576,11 +5578,11 @@ mod tests {
             legacy_project_paths: BTreeMap::from([
                 (
                     "legacy_alpha".to_string(),
-                    PathBuf::from("/workspace/acme/alpha"),
+                    PathBuf::from("/workspace/acme/services/alpha"),
                 ),
                 (
                     "legacy_beta".to_string(),
-                    PathBuf::from("/workspace/acme/beta"),
+                    PathBuf::from("/workspace/acme/services/beta"),
                 ),
             ]),
             checkout_paths: BTreeMap::from([(
@@ -5590,7 +5592,7 @@ mod tests {
             git_common_directories: BTreeMap::new(),
             legacy_selectors: BTreeMap::from([(
                 "legacy_path_alpha".to_string(),
-                "/workspace/acme/alpha/src/Example.java".to_string(),
+                "/workspace/acme/services/alpha/src/Example.java".to_string(),
             )]),
         };
 
@@ -5629,11 +5631,11 @@ mod tests {
 
         runtime.legacy_selectors.insert(
             "legacy_path_alpha".to_string(),
-            "/workspace/acme/alpha".to_string(),
+            "/workspace/acme/services/alpha".to_string(),
         );
         let mut exact_inventory = inventory.clone();
         exact_inventory.legacy_path_observations[0].selector_digest =
-            digest_path("/workspace/acme/alpha");
+            digest_path("/workspace/acme/services/alpha");
         assert_eq!(
             classify_legacy_paths(&exact_inventory, &runtime, &identities)
                 .unwrap()
@@ -5662,7 +5664,7 @@ mod tests {
 
         runtime.legacy_selectors.insert(
             "legacy_path_alpha".to_string(),
-            "/workspace/acme/alpha/src/Example.java".to_string(),
+            "/workspace/acme/services/alpha/src/Example.java".to_string(),
         );
         let mut missing_inventory = inventory.clone();
         missing_inventory.legacy_projects[0].path_status =
@@ -5676,7 +5678,7 @@ mod tests {
 
         runtime.legacy_project_paths.insert(
             "legacy_beta".to_string(),
-            PathBuf::from("/workspace/acme/alpha"),
+            PathBuf::from("/workspace/acme/services/alpha"),
         );
         let ambiguous = classify_legacy_paths(&inventory, &runtime, &identities).unwrap();
         assert_eq!(
@@ -5687,11 +5689,11 @@ mod tests {
 
         runtime.legacy_selectors.insert(
             "legacy_path_alpha".to_string(),
-            "/workspace/acme/alpha/../beta".to_string(),
+            "/workspace/acme/services/alpha/../beta".to_string(),
         );
         let mut unsafe_inventory = inventory.clone();
         unsafe_inventory.legacy_path_observations[0].selector_digest =
-            digest_path("/workspace/acme/alpha/../beta");
+            digest_path("/workspace/acme/services/alpha/../beta");
         let unsafe_selector =
             classify_legacy_paths(&unsafe_inventory, &runtime, &identities).unwrap();
         assert_eq!(
