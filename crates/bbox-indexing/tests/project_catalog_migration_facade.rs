@@ -400,6 +400,10 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
         applied.receipt.verification.expected_immutable_asset_hashes,
         preflight.receipt.predicted_immutable_asset_hashes
     );
+    assert_eq!(
+        Some(applied.receipt.verification.predicted_marker_hash.clone()),
+        preflight.receipt.predicted_marker_hash
+    );
 
     let verified =
         ProjectCatalogMigrationFacadeV1::verify(ProjectCatalogMigrationVerifyRequestV1 {
@@ -514,6 +518,14 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
     );
     let marker_bytes =
         fs::read(rehearsal_root.join("state/project-catalog-migration.json")).unwrap();
+    assert_eq!(
+        applied.receipt.verification.predicted_marker_hash,
+        bbox_indexing::project_catalog_inventory::Sha256ValueV1::digest(&marker_bytes)
+    );
+    assert_eq!(
+        applied.receipt.verification.observed_marker_hash,
+        applied.receipt.verification.predicted_marker_hash
+    );
     let marker: serde_json::Value = serde_json::from_slice(&marker_bytes).unwrap();
     assert_eq!(
         marker["transaction_id"],
