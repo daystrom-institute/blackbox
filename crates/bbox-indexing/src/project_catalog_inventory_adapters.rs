@@ -1836,6 +1836,7 @@ mod tests {
             logical_bytes: content.len() as u64,
         };
         let generation_id = generation_id("host-a", &descriptor);
+        let descriptor_manifest_sha256 = descriptor.manifest_sha256.clone();
         let stored = StoredGeneration {
             version: 1,
             generation_id: generation_id.clone(),
@@ -1871,7 +1872,7 @@ mod tests {
                 source_selector(project_id.as_str(), &generation_id)
             ),
             snapshot_id: format!("collected-{}", "e".repeat(32)),
-            manifest_sha256: hex::encode(Sha256::digest(&manifest)),
+            manifest_sha256: descriptor_manifest_sha256,
             inventory_hash: "d".repeat(64),
             plan_hash: "f".repeat(64),
         };

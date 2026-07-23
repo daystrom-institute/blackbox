@@ -3878,7 +3878,7 @@ fn validate_mutable_source_row_coverage(
             } => generation_row_by_identity.iter().find_map(
                 |(observation_id, (observed_generation_id, scope))| {
                     (*observed_generation_id == generation_id
-                        && scope.is_some_and(|scope| {
+                        && scope.is_none_or(|scope| {
                             Sha256ValueV1::parse(bbox_code_source::scope_hash(scope))
                                 .ok()
                                 .as_ref()
