@@ -339,22 +339,6 @@ impl NofollowDirectory {
             .try_clone()
             .context("duplicating held no-follow directory descriptor")
     }
-
-    #[cfg(unix)]
-    pub(crate) fn configure_child_cwd(&self, command: &mut std::process::Command) {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::process::CommandExt;
-
-        let descriptor = self.file.as_raw_fd();
-        unsafe {
-            command.pre_exec(move || {
-                if libc::fchdir(descriptor) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
 }
 
 fn validate_relative_basename(name: &str) -> Result<()> {

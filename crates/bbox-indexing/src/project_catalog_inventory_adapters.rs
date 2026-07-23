@@ -2680,7 +2680,10 @@ fn capture_durable_owner_snapshots(
                 &paths.provenance_notes_ref,
                 project_id.as_str(),
                 limits,
-            ),
+            )
+            .map_err(|error| {
+                invalid_input(format!("owner snapshot limits are invalid: {}", error.code))
+            })?,
         );
     }
     Ok(DurableOwnerSnapshotsV1 {
