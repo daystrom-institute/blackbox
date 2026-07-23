@@ -365,6 +365,100 @@ pub fn list_committed_dir_result_with_alternate(
         .collect())
 }
 
+/// Strict bounded committed-tree enumeration for publication builders.
+///
+/// Git emits NUL-delimited repository-relative paths. The child drain retains
+/// at most `max_listing_bytes + 1`, then this parser rejects oversized,
+/// non-UTF-8, non-confined, duplicate, out-of-directory, or over-count
+/// listings. Returned paths are sorted independently of input order.
+pub fn list_committed_dir_bounded_with_alternate(
+    root: &Path,
+    r#ref: &str,
+    dir_rel: &str,
+    alternate_root: Option<&Path>,
+    max_entries: usize,
+    max_listing_bytes: usize,
+) -> Result<Vec<String>> {
+    validate_repository_relative_git_path(dir_rel, "committed directory")?;
+    let retained_limit = max_listing_bytes
+        .checked_add(1)
+        .context("committed directory listing byte limit overflowed")?;
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(root)
+        .args(["ls-tree", "-r", "-z", "--name-only", r#ref, "--", dir_rel]);
+    configure_alternate_objects(&mut command, alternate_root);
+    let output = run_bounded_with_timeout_and_stdout_limit(
+        command,
+        root,
+        "listing bounded committed directory",
+        GIT_OUTPUT_TIMEOUT,
+        Some(retained_limit),
+    )
+    .with_context(|| format!("listing bounded committed directory in {}", root.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git ls-tree failed in {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    parse_bounded_committed_tree_paths(&output.stdout, dir_rel, max_entries, max_listing_bytes)
+}
+
+fn parse_bounded_committed_tree_paths(
+    listing: &[u8],
+    dir_rel: &str,
+    max_entries: usize,
+    max_listing_bytes: usize,
+) -> Result<Vec<String>> {
+    if listing.len() > max_listing_bytes {
+        anyhow::bail!("committed directory listing exceeds its byte limit");
+    }
+    if listing.is_empty() {
+        return Ok(Vec::new());
+    }
+    if listing.last() != Some(&0) {
+        anyhow::bail!("committed directory listing is not NUL terminated");
+    }
+
+    let prefix = format!("{dir_rel}/");
+    let mut paths = std::collections::BTreeSet::new();
+    for raw_path in listing[..listing.len() - 1].split(|byte| *byte == 0) {
+        if paths.len() >= max_entries {
+            anyhow::bail!("committed directory listing exceeds its entry limit");
+        }
+        let path = std::str::from_utf8(raw_path)
+            .context("committed directory listing contains a non-UTF-8 path")?;
+        validate_repository_relative_git_path(path, "committed tree path")?;
+        if !path.starts_with(&prefix) {
+            anyhow::bail!("committed tree path is outside its requested directory");
+        }
+        if !paths.insert(path.to_string()) {
+            anyhow::bail!("committed directory listing contains a duplicate path");
+        }
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn validate_repository_relative_git_path(path: &str, label: &str) -> Result<()> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.ends_with('/')
+        || path.contains('\\')
+        || path
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        anyhow::bail!("{label} is not a confined repository-relative path");
+    }
+    Ok(())
+}
+
 /// The best common ancestor of two commit-ishes via `git merge-base <a> <b>`,
 /// used to compute a checkout's provisional overlay as a merge-base-relative
 /// diff against the published tree (design §4.1). Returns `None` when there is
@@ -1262,6 +1356,33 @@ mod tests {
             .as_deref(),
             Some(b"published-two".as_slice())
         );
+        assert_eq!(
+            list_committed_dir_bounded_with_alternate(
+                &checkout,
+                &publisher_head,
+                ".bbox/knowledge",
+                Some(&publisher),
+                10,
+                4096,
+            )
+            .unwrap(),
+            vec![
+                ".bbox/knowledge/first.json".to_string(),
+                ".bbox/knowledge/second.json".to_string(),
+            ]
+        );
+        assert_eq!(
+            read_committed_file_bytes_bounded_with_alternate(
+                &checkout,
+                &publisher_head,
+                ".bbox/knowledge/second.json",
+                Some(&publisher),
+                64,
+            )
+            .unwrap()
+            .as_deref(),
+            Some(b"published-two".as_slice())
+        );
     }
 
     #[test]
@@ -1289,6 +1410,78 @@ mod tests {
             list_committed_dir_result(&root, "refs/heads/missing", ".bbox/knowledge").is_err(),
             "strict callers must not mistake an invalid ref for an empty tree"
         );
+    }
+
+    #[test]
+    fn bounded_committed_listing_enforces_bytes_count_and_ordering() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        init_repo(&root);
+        write(&root, ".bbox/knowledge/z.json", "z");
+        write(&root, ".bbox/knowledge/a.json", "a");
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-q", "-m", "c1"]);
+
+        let paths = list_committed_dir_bounded_with_alternate(
+            &root,
+            "HEAD",
+            ".bbox/knowledge",
+            None,
+            2,
+            4096,
+        )
+        .unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                ".bbox/knowledge/a.json".to_string(),
+                ".bbox/knowledge/z.json".to_string(),
+            ]
+        );
+        assert!(
+            list_committed_dir_bounded_with_alternate(
+                &root,
+                "HEAD",
+                ".bbox/knowledge",
+                None,
+                1,
+                4096,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("entry limit")
+        );
+        assert!(
+            list_committed_dir_bounded_with_alternate(
+                &root,
+                "HEAD",
+                ".bbox/knowledge",
+                None,
+                2,
+                1,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("byte limit")
+        );
+    }
+
+    #[test]
+    fn bounded_committed_listing_rejects_malformed_paths() {
+        for malformed in [
+            b".bbox/knowledge/good.json".as_slice(),
+            b".bbox/knowledge/../escape.json\0".as_slice(),
+            b".bbox/knowledge/nested\\bad.json\0".as_slice(),
+            b".bbox/knowledge/\xff.json\0".as_slice(),
+            b"outside/file.json\0".as_slice(),
+            b".bbox/knowledge/a.json\0.bbox/knowledge/a.json\0".as_slice(),
+        ] {
+            assert!(
+                parse_bounded_committed_tree_paths(malformed, ".bbox/knowledge", 10, 4096,)
+                    .is_err(),
+                "malformed listing was accepted: {malformed:?}"
+            );
+        }
     }
 
     #[test]
