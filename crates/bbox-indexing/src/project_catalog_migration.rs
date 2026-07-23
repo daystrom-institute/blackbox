@@ -2934,7 +2934,7 @@ fn prepare_store_plan_parts(
                     former_scope: generation.published_scope.clone(),
                     selector_evidence,
                     snapshot_id,
-                    manifest_sha256: generation.manifest_sha256.clone(),
+                    manifest_sha256: generation.record.descriptor.manifest_sha256.clone(),
                     inventory_hash: post_image.inventory_hash.to_string(),
                     plan_hash: plan_hash.to_string(),
                 },
