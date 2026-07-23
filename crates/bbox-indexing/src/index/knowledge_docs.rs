@@ -338,10 +338,7 @@ pub fn reindex_knowledge_store_with_access(
                 access.publisher_checkout_root,
                 access.publisher_project_root,
             )
-            .map(|bbox_root_relpath| PublishedScope {
-                repo_id,
-                bbox_root_relpath,
-            })
+            .and_then(|bbox_root_relpath| PublishedScope::try_new(repo_id, bbox_root_relpath).ok())
         });
         if pinned_scope.as_ref() != Some(&scope) {
             tracing::warn!(
@@ -824,13 +821,12 @@ mod tests {
             .unwrap();
             project
         };
-        let scope = PublishedScope {
-            repo_id: resolve_recorded_repo_id(&bbox_config::config::read_repo_id_inputs(
-                &repo_root,
-            ))
-            .unwrap(),
-            bbox_root_relpath: ".".into(),
-        };
+        let scope = PublishedScope::try_new(
+            resolve_recorded_repo_id(&bbox_config::config::read_repo_id_inputs(&repo_root))
+                .unwrap(),
+            ".",
+        )
+        .unwrap();
 
         let (schema, fields) = crate::index::build_schema();
         let index = Index::create_in_ram(schema);

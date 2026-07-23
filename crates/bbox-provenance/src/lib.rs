@@ -334,10 +334,7 @@ pub fn resolve_committed_scope(root: &Path) -> Result<PublishedScope> {
     })?;
     let bbox_root_relpath = bbox_root_relpath(&git_root, &root)
         .ok_or_else(|| anyhow!("project root is outside its Git repository"))?;
-    Ok(PublishedScope {
-        repo_id,
-        bbox_root_relpath,
-    })
+    Ok(PublishedScope::try_new(repo_id, bbox_root_relpath)?)
 }
 
 pub fn apply_export_page(
@@ -734,10 +731,11 @@ mod tests {
             .remove(0);
         let document = ProvenanceExportDocument::from_note(&part).expect("document");
         ProvenanceExportPage {
-            scope: PublishedScope {
-                repo_id: repo_id.into(),
-                bbox_root_relpath: bbox_root_relpath(root, root).expect("root scope"),
-            },
+            scope: PublishedScope::try_new(
+                repo_id,
+                bbox_root_relpath(root, root).expect("root scope"),
+            )
+            .expect("valid scope"),
             project_id: project_id.into(),
             notes_ref: "refs/notes/bbox/provenance".into(),
             generation: "generation".into(),
@@ -842,10 +840,7 @@ mod tests {
             .iter()
             .map(|part| ProvenanceExportDocument::from_note(part).expect("document"))
             .collect();
-        let scope = PublishedScope {
-            repo_id: "repo".into(),
-            bbox_root_relpath: ".".into(),
-        };
+        let scope = PublishedScope::try_new("repo", ".").unwrap();
         let first = ProvenanceExportPlan::new(
             scope.clone(),
             "project1",
@@ -887,10 +882,7 @@ mod tests {
 
         assert_eq!(
             resolve_committed_scope(&root).expect("scope"),
-            PublishedScope {
-                repo_id: "repo-a".into(),
-                bbox_root_relpath: ".".into(),
-            }
+            PublishedScope::try_new("repo-a", ".").unwrap()
         );
     }
 
@@ -964,7 +956,8 @@ mod tests {
         let mut cases = Vec::new();
 
         let mut wrong_scope = valid.clone();
-        wrong_scope.scope.repo_id = "repo-b".into();
+        wrong_scope.scope =
+            PublishedScope::try_new("repo-b", wrong_scope.scope.bbox_root_relpath()).unwrap();
         cases.push(wrong_scope);
 
         let mut wrong_ref = valid.clone();

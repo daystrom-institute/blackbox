@@ -429,10 +429,7 @@ fn persist_schema_epoch_inventory_inner(
                 outcome = Some(None);
                 return Ok(());
             };
-            let scope = PublishedScope {
-                repo_id,
-                bbox_root_relpath: relpath,
-            };
+            let scope = PublishedScope::try_new(repo_id, relpath)?;
             let scope_file_quarantine =
                 inspect_repo_owned_files(project_root, &carrier.project, entries);
             let files_clean = scope_file_quarantine.is_empty();
@@ -446,8 +443,8 @@ fn persist_schema_epoch_inventory_inner(
                     .all(|entry| {
                         inventory.resolved.get(&entry.id)
                             == Some(&ResolvedKey {
-                                repo_id: scope.repo_id.clone(),
-                                bbox_root_relpath: scope.bbox_root_relpath.clone(),
+                                repo_id: scope.repo_id().to_string(),
+                                bbox_root_relpath: scope.bbox_root_relpath().to_string(),
                             })
                     });
             if !clean {
@@ -457,8 +454,8 @@ fn persist_schema_epoch_inventory_inner(
             let marker_path = knowledge_dir.join(SCHEMA_EPOCH_MARKER);
             let marker = SchemaEpochMarker {
                 schema_epoch: SCHEMA_EPOCH,
-                repo_id: scope.repo_id.clone(),
-                bbox_root_relpath: scope.bbox_root_relpath.clone(),
+                repo_id: scope.repo_id().to_string(),
+                bbox_root_relpath: scope.bbox_root_relpath().to_string(),
             };
             let marker_present = if repo_write.is_some() {
                 write_json_if_changed(&marker_path, &marker)?;

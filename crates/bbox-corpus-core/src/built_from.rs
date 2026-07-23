@@ -79,10 +79,7 @@ mod tests {
     use super::*;
 
     fn scope() -> PublishedScope {
-        PublishedScope {
-            repo_id: "repo".into(),
-            bbox_root_relpath: ".".into(),
-        }
+        PublishedScope::try_new("repo", ".").unwrap()
     }
 
     #[test]

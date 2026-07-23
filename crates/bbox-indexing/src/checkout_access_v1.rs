@@ -284,15 +284,15 @@ fn resolve_checkout(
             "registered checkout identity marker is missing or changed",
         ));
     }
-    let project_root = join_scope_relpath(&checkout_root, &expected_scope.bbox_root_relpath)?;
+    let project_root = join_scope_relpath(&checkout_root, expected_scope.bbox_root_relpath())?;
     let project_root = canonical_directory(&project_root)?;
     let attachment_id = deterministic_id(
         "v1-attachment",
         &[
             &project.project_id,
             checkout_id,
-            &expected_scope.repo_id,
-            &expected_scope.bbox_root_relpath,
+            expected_scope.repo_id(),
+            expected_scope.bbox_root_relpath(),
         ],
     );
     Ok(CheckoutAccessCandidate {
@@ -853,10 +853,7 @@ mod tests {
             .acquire(request(
                 &fixture.record.project_id,
                 CheckoutAttachmentSelector::CheckoutId(fixture.checkout_id.clone()),
-                Some(PublishedScope {
-                    repo_id: "different-family".into(),
-                    bbox_root_relpath: ".".into(),
-                }),
+                Some(PublishedScope::try_new("different-family", ".").unwrap()),
                 CheckoutAccessKind::GitHistory,
                 CheckoutAccessIntent::Read,
             ))
@@ -886,8 +883,8 @@ mod tests {
                     .join("missing")
                     .to_string_lossy()
                     .into(),
-                repo_id: Some(fixture.scope.repo_id.clone()),
-                bbox_root_relpath: Some(fixture.scope.bbox_root_relpath.clone()),
+                repo_id: Some(fixture.scope.repo_id().to_string()),
+                bbox_root_relpath: Some(fixture.scope.bbox_root_relpath().to_string()),
                 branch_ref: None,
             })
             .unwrap();
@@ -907,8 +904,8 @@ mod tests {
             project_id: None,
             checkout_id: fixture.checkout_id.clone(),
             checkout_dir: fixture.checkout_root.to_string_lossy().into(),
-            repo_id: Some(fixture.scope.repo_id.clone()),
-            bbox_root_relpath: Some(fixture.scope.bbox_root_relpath.clone()),
+            repo_id: Some(fixture.scope.repo_id().to_string()),
+            bbox_root_relpath: Some(fixture.scope.bbox_root_relpath().to_string()),
             branch_ref: None,
         };
         std::fs::write(
@@ -952,18 +949,15 @@ mod tests {
             let checkout_root = checkout.canonicalize().unwrap();
             let checkout_id =
                 bbox_corpus_core::identity::ensure_checkout_id(&checkout_root).unwrap();
-            let scope = PublishedScope {
-                repo_id: "repo-family".into(),
-                bbox_root_relpath: ".".into(),
-            };
+            let scope = PublishedScope::try_new("repo-family", ".").unwrap();
             checkouts
                 .write()
                 .register(CheckoutRow {
                     project_id: None,
                     checkout_id: checkout_id.clone(),
                     checkout_dir: checkout_root.to_string_lossy().into(),
-                    repo_id: Some(scope.repo_id.clone()),
-                    bbox_root_relpath: Some(scope.bbox_root_relpath.clone()),
+                    repo_id: Some(scope.repo_id().to_string()),
+                    bbox_root_relpath: Some(scope.bbox_root_relpath().to_string()),
                     branch_ref: Some(format!("refs/heads/{branch}")),
                 })
                 .unwrap();

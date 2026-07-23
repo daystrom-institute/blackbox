@@ -380,10 +380,7 @@ mod tests {
         std::fs::create_dir_all(&state_dir).unwrap();
         let state = Arc::new(crate::server::SharedState::for_test(&state_dir));
         let record = state.projects.write().register_path(&project).unwrap();
-        let scope = PublishedScope {
-            repo_id: repo_id.repo_id,
-            bbox_root_relpath: ".".into(),
-        };
+        let scope = PublishedScope::try_new(repo_id.repo_id, ".").unwrap();
         let own_id = "own-visibility";
         let peer_id = "peer-visibility";
         let mut own_values = BTreeMap::new();

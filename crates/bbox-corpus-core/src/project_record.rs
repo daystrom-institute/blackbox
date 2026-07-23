@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::PublishedScope;
 use crate::language::Language;
+use crate::project_catalog::{
+    AttachmentStatus, CorpusProject, LegacyProjectRecordV1, ProjectScope,
+    ValidatedCheckoutAttachment,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct ProjectRecord {
@@ -25,6 +29,110 @@ pub struct ProjectRecord {
     /// unique across the registry — conflicting claims fail closed.
     #[serde(default)]
     pub aliases: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectRecordJoinError {
+    reason: &'static str,
+}
+
+impl std::fmt::Display for ProjectRecordJoinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "catalog project and attachment cannot form a compatibility record: {}",
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for ProjectRecordJoinError {}
+
+impl ProjectRecord {
+    /// Build the temporary path-bearing v1 view from a logical project and an
+    /// attachment obtained from a fully cross-validated snapshot pair.
+    ///
+    /// A detached, cross-project, or scope-mismatched attachment is refused.
+    /// Remote catalog projects therefore never receive a fabricated path.
+    pub fn from_catalog_attachment(
+        project: &CorpusProject,
+        validated_attachment: ValidatedCheckoutAttachment<'_>,
+    ) -> Result<Self, ProjectRecordJoinError> {
+        let attachment = validated_attachment.attachment();
+        if validated_attachment.project() != project {
+            return Err(ProjectRecordJoinError {
+                reason: "project is not the validated catalog record",
+            });
+        }
+        if attachment.status != AttachmentStatus::Attached {
+            return Err(ProjectRecordJoinError {
+                reason: "attachment is detached",
+            });
+        }
+        if attachment.project_id != project.project_id {
+            return Err(ProjectRecordJoinError {
+                reason: "attachment belongs to another project",
+            });
+        }
+        let published_repo_id = match (&project.scope, &attachment.validated_scope) {
+            (ProjectScope::Published(project_scope), Some(attachment_scope))
+                if project_scope == attachment_scope =>
+            {
+                Some(project_scope.repo_id().to_string())
+            }
+            (ProjectScope::LegacyLocal, None) => None,
+            _ => {
+                return Err(ProjectRecordJoinError {
+                    reason: "attachment scope disagrees with project",
+                });
+            }
+        };
+        let repo_id = validated_attachment
+            .repo_history()
+            .map(|history| history.primary_namespace.as_str().to_string())
+            .or(published_repo_id);
+        Ok(Self {
+            project_id: project.project_id.as_str().to_string(),
+            repo_id,
+            canonical_path: attachment.checkout_project_dir.clone(),
+            registered_at: project
+                .registered_at_compat
+                .clone()
+                .unwrap_or_else(|| project.created_at.clone()),
+            is_git_repo: validated_attachment.repo_history().is_some()
+                || attachment.validated_scope.is_some(),
+            languages: project.languages.clone(),
+            aliases: project.operator_aliases.clone(),
+        })
+    }
+}
+
+impl From<LegacyProjectRecordV1> for ProjectRecord {
+    fn from(record: LegacyProjectRecordV1) -> Self {
+        Self {
+            project_id: record.project_id,
+            repo_id: record.repo_id,
+            canonical_path: record.canonical_path,
+            registered_at: record.registered_at,
+            is_git_repo: record.is_git_repo,
+            languages: record.languages,
+            aliases: record.aliases,
+        }
+    }
+}
+
+impl From<ProjectRecord> for LegacyProjectRecordV1 {
+    fn from(record: ProjectRecord) -> Self {
+        Self {
+            project_id: record.project_id,
+            repo_id: record.repo_id,
+            canonical_path: record.canonical_path,
+            registered_at: record.registered_at,
+            is_git_repo: record.is_git_repo,
+            languages: record.languages,
+            aliases: record.aliases,
+        }
+    }
 }
 
 /// Resolved project identity plus the concrete checkout view that produced
@@ -199,9 +307,9 @@ fn unique_deepest_project<'a>(
 }
 
 /// Minimal read-side view of the on-disk project registry file
-/// (`projects.json`). The authoritative store type (versioning, writes,
-/// migration) lives daemon-side in `projects::ProjectStore`; this
-/// deserializer reads only what consumers below the daemon need.
+/// (`projects.json`). The version-1 persistence input is represented
+/// explicitly as `project_catalog::LegacyProjectStoreV1`; this deserializer
+/// reads only what consumers below the daemon need.
 #[derive(Debug, Default, Deserialize)]
 struct ProjectStoreView {
     #[serde(default)]

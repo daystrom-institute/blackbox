@@ -445,10 +445,7 @@ fn resolve_committed_scope(root: &Path, head_commit: &str) -> Result<PublishedSc
         .ok_or_else(|| anyhow!("committed project config has no recorded repo authority"))?;
     let bbox_root_relpath = bbox_root_relpath(&git_root, root)
         .ok_or_else(|| anyhow!("project root is outside Git root"))?;
-    Ok(PublishedScope {
-        repo_id,
-        bbox_root_relpath,
-    })
+    Ok(PublishedScope::try_new(repo_id, bbox_root_relpath)?)
 }
 
 #[cfg(unix)]

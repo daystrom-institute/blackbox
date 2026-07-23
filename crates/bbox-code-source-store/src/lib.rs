@@ -1649,10 +1649,7 @@ mod tests {
         GenerationDescriptor {
             schema_version: SCHEMA_VERSION,
             walker_policy_version: WALKER_POLICY_VERSION.into(),
-            scope: PublishedScope {
-                repo_id: "repo-family".into(),
-                bbox_root_relpath: ".".into(),
-            },
+            scope: PublishedScope::try_new("repo-family", ".").unwrap(),
             head_commit: head.clone(),
             dirty_fingerprint: dirty_fingerprint(&head, entries),
             manifest_sha256: manifest_sha256(entries),

@@ -50,10 +50,7 @@ pub fn project_published_scope(
     let repo_id = resolve_recorded_repo_id(&resolve_inputs(root))?;
     let git_root = git::git_root_for_path(root)?;
     let relpath = bbox_root_relpath(&git_root, root)?;
-    Some(PublishedScope {
-        repo_id,
-        bbox_root_relpath: relpath,
-    })
+    PublishedScope::try_new(repo_id, relpath).ok()
 }
 
 /// The outcome of electing a publisher for a scope.
@@ -271,8 +268,8 @@ mod tests {
         init_repo(&root);
         let p = project("p1", &root);
         let scope = project_published_scope(&p, |_| recorded("fam")).unwrap();
-        assert_eq!(scope.repo_id, "fam");
-        assert_eq!(scope.bbox_root_relpath, ".");
+        assert_eq!(scope.repo_id(), "fam");
+        assert_eq!(scope.bbox_root_relpath(), ".");
     }
 
     #[test]
@@ -298,10 +295,7 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         init_repo(&root);
         let projects = vec![project("p1", &root)];
-        let scope = PublishedScope {
-            repo_id: "fam".into(),
-            bbox_root_relpath: ".".into(),
-        };
+        let scope = PublishedScope::try_new("fam", ".").unwrap();
         assert_eq!(
             elect_publisher(&projects, &scope, |_| recorded("fam")),
             PublisherResolution::One(root.to_string_lossy().into_owned())
@@ -314,10 +308,7 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         init_repo(&root);
         let projects = vec![project("p1", &root)];
-        let scope = PublishedScope {
-            repo_id: "other".into(),
-            bbox_root_relpath: ".".into(),
-        };
+        let scope = PublishedScope::try_new("other", ".").unwrap();
         assert_eq!(
             elect_publisher(&projects, &scope, |_| recorded("fam")),
             PublisherResolution::None
@@ -335,10 +326,7 @@ mod tests {
         let r2 = d2.path().canonicalize().unwrap();
         init_repo(&r2);
         let projects = vec![project("p1", &r1), project("p2", &r2)];
-        let scope = PublishedScope {
-            repo_id: "fam".into(),
-            bbox_root_relpath: ".".into(),
-        };
+        let scope = PublishedScope::try_new("fam", ".").unwrap();
         // Both resolve to repo_id "fam" (override wins regardless of path).
         let res = elect_publisher(&projects, &scope, |_| recorded("fam"));
         match res {
@@ -362,10 +350,7 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         init_repo(&root);
         let state = tempfile::tempdir().unwrap();
-        let scope = PublishedScope {
-            repo_id: "fam".into(),
-            bbox_root_relpath: ".".into(),
-        };
+        let scope = PublishedScope::try_new("fam", ".").unwrap();
         let mut store = PublisherRefStore::open(state.path().join("publisher-refs.json")).unwrap();
         let first = store.ensure_pinned(&scope, &root).unwrap();
         assert!(first.branch_ref.starts_with("refs/heads/"));
@@ -398,10 +383,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let scope = PublishedScope {
-            repo_id: "fam".into(),
-            bbox_root_relpath: ".".into(),
-        };
+        let scope = PublishedScope::try_new("fam", ".").unwrap();
         let state = tempfile::tempdir().unwrap();
         let mut store = PublisherRefStore::open(state.path().join("publisher-refs.json")).unwrap();
 
@@ -419,10 +401,7 @@ mod tests {
         let path = blocked_parent.join("publisher-refs.json");
         let mut store = PublisherRefStore::open(&path).unwrap();
         std::fs::write(&blocked_parent, "blocked").unwrap();
-        let scope = PublishedScope {
-            repo_id: "fam".into(),
-            bbox_root_relpath: ".".into(),
-        };
+        let scope = PublishedScope::try_new("fam", ".").unwrap();
 
         assert!(store.ensure_pinned(&scope, &root).is_err());
         assert!(store.pinned(&scope).is_none());
@@ -442,10 +421,7 @@ mod tests {
     #[test]
     fn repin_requires_full_branch_ref() {
         let state = tempfile::tempdir().unwrap();
-        let scope = PublishedScope {
-            repo_id: "fam".into(),
-            bbox_root_relpath: ".".into(),
-        };
+        let scope = PublishedScope::try_new("fam", ".").unwrap();
         let mut store = PublisherRefStore::open(state.path().join("publisher-refs.json")).unwrap();
         assert!(store.repin(&scope, "main").is_err());
         let row = store.repin(&scope, "refs/heads/main").unwrap();

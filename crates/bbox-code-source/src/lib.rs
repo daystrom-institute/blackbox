@@ -214,17 +214,17 @@ pub struct ErrorResponse {
 }
 
 pub fn validate_scope(scope: &PublishedScope) -> Result<(), ContractError> {
-    if scope.repo_id.trim().is_empty()
-        || scope.repo_id.trim() != scope.repo_id
-        || scope.repo_id.len() > 256
-        || scope.repo_id.bytes().any(|byte| byte.is_ascii_control())
+    if scope.repo_id().trim().is_empty()
+        || scope.repo_id().trim() != scope.repo_id()
+        || scope.repo_id().len() > 256
+        || scope.repo_id().bytes().any(|byte| byte.is_ascii_control())
     {
         return Err(ContractError::InvalidScope("repo_id".into()));
     }
-    if scope.bbox_root_relpath == "." {
+    if scope.bbox_root_relpath() == "." {
         return Ok(());
     }
-    validate_relative_path(&scope.bbox_root_relpath)
+    validate_relative_path(scope.bbox_root_relpath())
         .map_err(|_| ContractError::InvalidScope("bbox_root_relpath".into()))
 }
 
@@ -477,8 +477,8 @@ pub fn source_entry_key(selector: &str, relative_path: &str) -> String {
 }
 
 fn put_scope(hasher: &mut Sha256, scope: &PublishedScope) {
-    put_field(hasher, scope.repo_id.as_bytes());
-    put_field(hasher, scope.bbox_root_relpath.as_bytes());
+    put_field(hasher, scope.repo_id().as_bytes());
+    put_field(hasher, scope.bbox_root_relpath().as_bytes());
 }
 
 fn put_field(hasher: &mut Sha256, bytes: &[u8]) {
@@ -491,10 +491,7 @@ mod tests {
     use super::*;
 
     fn scope() -> PublishedScope {
-        PublishedScope {
-            repo_id: "repo-family".into(),
-            bbox_root_relpath: ".".into(),
-        }
+        PublishedScope::try_new("repo-family", ".").unwrap()
     }
 
     #[test]

@@ -266,11 +266,11 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
 
 impl CheckoutRow {
     pub fn published_scope(&self) -> Option<PublishedScope> {
-        Some(PublishedScope {
-            repo_id: self.repo_id.as_deref()?.trim().to_string(),
-            bbox_root_relpath: self.bbox_root_relpath.as_deref()?.trim().to_string(),
-        })
-        .filter(|scope| !scope.repo_id.is_empty() && !scope.bbox_root_relpath.is_empty())
+        PublishedScope::try_new(
+            self.repo_id.as_deref()?.trim(),
+            self.bbox_root_relpath.as_deref()?.trim(),
+        )
+        .ok()
     }
 
     fn matches(&self, checkout_id: &str, scope: &PublishedScope) -> bool {
@@ -349,10 +349,7 @@ mod tests {
     }
 
     fn root_scope() -> PublishedScope {
-        PublishedScope {
-            repo_id: "repofam".into(),
-            bbox_root_relpath: ".".into(),
-        }
+        PublishedScope::try_new("repofam", ".").unwrap()
     }
 
     #[test]
@@ -508,14 +505,8 @@ mod tests {
         registry.register(web).unwrap();
         assert_eq!(registry.rows_for_checkout("c1").count(), 2);
 
-        let api_scope = PublishedScope {
-            repo_id: "repofam".into(),
-            bbox_root_relpath: "services/api".into(),
-        };
-        let web_scope = PublishedScope {
-            repo_id: "repofam".into(),
-            bbox_root_relpath: "services/web".into(),
-        };
+        let api_scope = PublishedScope::try_new("repofam", "services/api").unwrap();
+        let web_scope = PublishedScope::try_new("repofam", "services/web").unwrap();
         assert!(registry.get("c1", &api_scope).is_some());
         assert!(registry.get("c1", &web_scope).is_some());
         assert!(registry.deregister_scope("c1", &api_scope).unwrap());

@@ -872,10 +872,7 @@ mod tests {
         let state = Arc::new(crate::server::SharedState::for_test(&state_dir));
         let project = state.projects.write().register_path(&base).unwrap();
         let server = BlackboxServer::new(state.clone());
-        let scope = PublishedScope {
-            repo_id: repo_id.repo_id,
-            bbox_root_relpath: ".".into(),
-        };
+        let scope = PublishedScope::try_new(repo_id.repo_id, ".").unwrap();
 
         let own_id = bbox_corpus_core::identity::ensure_checkout_id(&base).unwrap();
         let peer_id = "peer-checkout";

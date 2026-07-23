@@ -49,7 +49,7 @@ pub(crate) fn append_built_from_section(mut output: String, table: &BuiltFromTab
 }
 
 fn format_scope(scope: &bbox_corpus_core::identity::PublishedScope) -> String {
-    format!("{}:{}", scope.repo_id, scope.bbox_root_relpath)
+    format!("{}:{}", scope.repo_id(), scope.bbox_root_relpath())
 }
 
 #[cfg(test)]
@@ -61,10 +61,7 @@ mod tests {
     fn text_table_emits_each_interned_stamp_once() {
         let mut table = BuiltFromTable::default();
         let stamp = BuiltFromStamp::Published {
-            published_scope: PublishedScope {
-                repo_id: "repo".into(),
-                bbox_root_relpath: ".".into(),
-            },
+            published_scope: PublishedScope::try_new("repo", ".").unwrap(),
             published_ref: "refs/heads/main".into(),
             publisher_commit: "abc123".into(),
         };

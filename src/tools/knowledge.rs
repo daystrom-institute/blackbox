@@ -286,8 +286,8 @@ impl BlackboxServer {
                 project_id: Some(checkout.project_id.clone()),
                 checkout_id: checkout.checkout_id.clone(),
                 checkout_dir: checkout.checkout_dir.clone(),
-                repo_id: Some(checkout.published_scope.repo_id.clone()),
-                bbox_root_relpath: Some(checkout.published_scope.bbox_root_relpath.clone()),
+                repo_id: Some(checkout.published_scope.repo_id().to_string()),
+                bbox_root_relpath: Some(checkout.published_scope.bbox_root_relpath().to_string()),
                 branch_ref: checkout.branch_ref.clone(),
             },
         )?;
@@ -1420,10 +1420,7 @@ mod tests {
         // Slice 3.3 dark state: the composite registry row was durable before
         // the write, and the post-write overlay sees the new untracked entry
         // without affecting the still-legacy retrieval behavior asserted above.
-        let scope = bbox_corpus_core::identity::PublishedScope {
-            repo_id,
-            bbox_root_relpath: ".".into(),
-        };
+        let scope = bbox_corpus_core::identity::PublishedScope::try_new(repo_id, ".").unwrap();
         let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&wt_canon).unwrap();
         assert!(
             server

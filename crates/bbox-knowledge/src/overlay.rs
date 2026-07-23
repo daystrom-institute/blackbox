@@ -268,10 +268,10 @@ impl KnowledgeOverlayStore {
 pub fn published_scope_hash(scope: &PublishedScope) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"bbox-published-scope-v1\0");
-    hasher.update((scope.repo_id.len() as u64).to_be_bytes());
-    hasher.update(scope.repo_id.as_bytes());
-    hasher.update((scope.bbox_root_relpath.len() as u64).to_be_bytes());
-    hasher.update(scope.bbox_root_relpath.as_bytes());
+    hasher.update((scope.repo_id().len() as u64).to_be_bytes());
+    hasher.update(scope.repo_id().as_bytes());
+    hasher.update((scope.bbox_root_relpath().len() as u64).to_be_bytes());
+    hasher.update(scope.bbox_root_relpath().as_bytes());
     hex_digest(hasher.finalize())
 }
 
@@ -564,10 +564,10 @@ fn validate_knowledge_map(files: &BTreeMap<String, Vec<u8>>, label: &str) -> Res
 }
 
 fn knowledge_tree_dir(scope: &PublishedScope) -> String {
-    if scope.bbox_root_relpath == "." {
+    if scope.bbox_root_relpath() == "." {
         ".bbox/knowledge".to_string()
     } else {
-        format!("{}/.bbox/knowledge", scope.bbox_root_relpath)
+        format!("{}/.bbox/knowledge", scope.bbox_root_relpath())
     }
 }
 
@@ -778,10 +778,7 @@ mod tests {
         write_entry(&worktree, &entry("new", "untracked"));
         std::fs::remove_file(worktree.join(".bbox/knowledge/remove.json")).unwrap();
 
-        let scope = PublishedScope {
-            repo_id: "repo".into(),
-            bbox_root_relpath: ".".into(),
-        };
+        let scope = PublishedScope::try_new("repo", ".").unwrap();
         let checkout = ResolvedCheckoutScope {
             project_id: "test-project".into(),
             published_scope: scope,
@@ -857,10 +854,7 @@ mod tests {
 
         let checkout = ResolvedCheckoutScope {
             project_id: "test-project".into(),
-            published_scope: PublishedScope {
-                repo_id: "repo".into(),
-                bbox_root_relpath: ".".into(),
-            },
+            published_scope: PublishedScope::try_new("repo", ".").unwrap(),
             checkout_id: "checkout".into(),
             checkout_dir: worktree.to_string_lossy().into_owned(),
             checkout_project_dir: worktree.to_string_lossy().into_owned(),
@@ -903,10 +897,7 @@ mod tests {
 
         let checkout = ResolvedCheckoutScope {
             project_id: "test-project".into(),
-            published_scope: PublishedScope {
-                repo_id: "repo".into(),
-                bbox_root_relpath: ".".into(),
-            },
+            published_scope: PublishedScope::try_new("repo", ".").unwrap(),
             checkout_id: "checkout".into(),
             checkout_dir: worktree.to_string_lossy().into_owned(),
             checkout_project_dir: worktree.to_string_lossy().into_owned(),
@@ -947,10 +938,7 @@ mod tests {
         write_entry(&worktree_project, &entry("web", "changed"));
         let checkout = ResolvedCheckoutScope {
             project_id: "test-project".into(),
-            published_scope: PublishedScope {
-                repo_id: "repo".into(),
-                bbox_root_relpath: "services/web".into(),
-            },
+            published_scope: PublishedScope::try_new("repo", "services/web").unwrap(),
             checkout_id: "checkout".into(),
             checkout_dir: worktree.to_string_lossy().into_owned(),
             checkout_project_dir: worktree_project.to_string_lossy().into_owned(),
@@ -971,10 +959,7 @@ mod tests {
     fn invalid_snapshot_replaces_previous_valid_state() {
         let checkout = ResolvedCheckoutScope {
             project_id: "test-project".into(),
-            published_scope: PublishedScope {
-                repo_id: "repo".into(),
-                bbox_root_relpath: ".".into(),
-            },
+            published_scope: PublishedScope::try_new("repo", ".").unwrap(),
             checkout_id: "checkout".into(),
             checkout_dir: "/missing".into(),
             checkout_project_dir: "/missing".into(),
@@ -1020,10 +1005,7 @@ mod tests {
         );
         let checkout = ResolvedCheckoutScope {
             project_id: "test-project".into(),
-            published_scope: PublishedScope {
-                repo_id: "repo".into(),
-                bbox_root_relpath: ".".into(),
-            },
+            published_scope: PublishedScope::try_new("repo", ".").unwrap(),
             checkout_id: "checkout".into(),
             checkout_dir: worktree.to_string_lossy().into_owned(),
             checkout_project_dir: worktree.to_string_lossy().into_owned(),
@@ -1061,10 +1043,7 @@ mod tests {
     fn stale_refresh_cannot_overwrite_newer_snapshot() {
         let checkout = ResolvedCheckoutScope {
             project_id: "test-project".into(),
-            published_scope: PublishedScope {
-                repo_id: "repo".into(),
-                bbox_root_relpath: ".".into(),
-            },
+            published_scope: PublishedScope::try_new("repo", ".").unwrap(),
             checkout_id: "checkout".into(),
             checkout_dir: "/missing".into(),
             checkout_project_dir: "/missing".into(),
@@ -1092,10 +1071,7 @@ mod tests {
     #[test]
     fn snapshot_id_ignores_hash_map_iteration_order() {
         let stamp = OverlayStamp {
-            published_scope: PublishedScope {
-                repo_id: "repo".into(),
-                bbox_root_relpath: ".".into(),
-            },
+            published_scope: PublishedScope::try_new("repo", ".").unwrap(),
             checkout_id: "checkout".into(),
             published_ref: "refs/heads/main".into(),
             publisher_commit: "p".into(),

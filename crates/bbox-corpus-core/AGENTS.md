@@ -6,11 +6,20 @@ below bbox-indexing (ingest passes, sidecars) can call them.
 
 ## Project identity
 
-- `project_id` is a HOST-SCOPED realpath hash, not durable identity. A fresh
-  registration of the same repo at another path or host mints a different id.
-  Cross-host/cross-checkout durability is `repo_id` (first-commit SHA) plus
-  declared aliases. Never persist `project_id` where a repo is expected to
-  travel.
+- Version-1 `ProjectRecord.project_id` is a HOST-SCOPED realpath hash. The v2
+  catalog `ProjectId` is a path-free opaque logical id: migration preserves
+  accepted legacy ids, while new records mint strong-random `p_` ids. Never
+  infer either meaning from string shape. Exact catalog membership determines
+  whether a parsed selector is a v2 project id.
+- Catalog snapshots contain no host path or attachment identity. Host-local
+  paths, checkout ids, and capabilities live only in the separately validated
+  attachment snapshot. A path-bearing `ProjectRecord` is a temporary v1 view
+  that can be constructed only from a catalog project plus a cross-validated
+  active attachment.
+- Published wire authority is the typed `(repo authority,
+  bbox_root_relpath)` scope. Bootstrap hints, commit namespaces, recorded
+  authority, and logical project ids remain distinct even when legacy bytes
+  happen to match.
 - `resolve_base_project_for_scope` lives here (not bbox-indexing) so index
   ingest can stamp docs with it. It is the BROAD read gate: descendants and
   ANY worktree of a registered repo alias to the base. The conservative

@@ -451,10 +451,10 @@ fn validate_gap_map(files: &BTreeMap<String, Vec<u8>>, label: &str) -> Result<()
 }
 
 fn gaps_tree_dir(scope: &PublishedScope) -> String {
-    if scope.bbox_root_relpath == "." {
+    if scope.bbox_root_relpath() == "." {
         ".bbox/gaps".to_string()
     } else {
-        format!("{}/.bbox/gaps", scope.bbox_root_relpath)
+        format!("{}/.bbox/gaps", scope.bbox_root_relpath())
     }
 }
 
@@ -651,10 +651,7 @@ mod tests {
 
         let checkout = ResolvedCheckoutScope {
             project_id: "test-project".into(),
-            published_scope: PublishedScope {
-                repo_id: "repo".into(),
-                bbox_root_relpath: ".".into(),
-            },
+            published_scope: PublishedScope::try_new("repo", ".").unwrap(),
             checkout_id: "checkout".into(),
             checkout_dir: worktree.to_string_lossy().into_owned(),
             checkout_project_dir: worktree.to_string_lossy().into_owned(),
@@ -728,10 +725,7 @@ mod tests {
         );
         let checkout = ResolvedCheckoutScope {
             project_id: "test-project".into(),
-            published_scope: PublishedScope {
-                repo_id: "repo".into(),
-                bbox_root_relpath: ".".into(),
-            },
+            published_scope: PublishedScope::try_new("repo", ".").unwrap(),
             checkout_id: "checkout".into(),
             checkout_dir: worktree.to_string_lossy().into_owned(),
             checkout_project_dir: worktree.to_string_lossy().into_owned(),
@@ -780,10 +774,7 @@ mod tests {
     fn stale_refresh_cannot_overwrite_newer_snapshot() {
         let checkout = ResolvedCheckoutScope {
             project_id: "test-project".into(),
-            published_scope: PublishedScope {
-                repo_id: "repo".into(),
-                bbox_root_relpath: ".".into(),
-            },
+            published_scope: PublishedScope::try_new("repo", ".").unwrap(),
             checkout_id: "checkout".into(),
             checkout_dir: "/missing".into(),
             checkout_project_dir: "/missing".into(),

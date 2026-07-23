@@ -139,12 +139,119 @@ pub struct RepoIdInputs {
 /// The durable identity of one repo-owned project scope. `repo_id` identifies
 /// the repository family across hosts; `bbox_root_relpath` distinguishes
 /// independently-owned `.bbox/` roots inside one monorepo checkout.
-#[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
 pub struct PublishedScope {
-    pub repo_id: String,
-    pub bbox_root_relpath: String,
+    repo_id: String,
+    bbox_root_relpath: String,
+}
+
+/// Strict validation failure for a durable published scope.
+///
+/// The error names only the field class. It never echoes authority or path
+/// bytes because those values may be operator-sensitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishedScopeValidationError {
+    field: &'static str,
+}
+
+impl PublishedScopeValidationError {
+    pub fn field(&self) -> &'static str {
+        self.field
+    }
+}
+
+impl std::fmt::Display for PublishedScopeValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid published scope {}", self.field)
+    }
+}
+
+impl std::error::Error for PublishedScopeValidationError {}
+
+impl PublishedScope {
+    /// Construct and validate a durable scope, including compatibility input.
+    pub fn try_new(
+        repo_id: impl Into<String>,
+        bbox_root_relpath: impl Into<String>,
+    ) -> std::result::Result<Self, PublishedScopeValidationError> {
+        let scope = Self {
+            repo_id: repo_id.into(),
+            bbox_root_relpath: bbox_root_relpath.into(),
+        };
+        scope.validate()?;
+        Ok(scope)
+    }
+
+    pub fn repo_id(&self) -> &str {
+        &self.repo_id
+    }
+
+    pub fn bbox_root_relpath(&self) -> &str {
+        &self.bbox_root_relpath
+    }
+
+    /// Validate the path-free repository authority and portable monorepo
+    /// discriminator used by strict catalog snapshots.
+    pub fn validate(&self) -> std::result::Result<(), PublishedScopeValidationError> {
+        if !valid_scope_authority(&self.repo_id) {
+            return Err(PublishedScopeValidationError { field: "repo_id" });
+        }
+        if self.bbox_root_relpath == "." {
+            return Ok(());
+        }
+        if !valid_scope_relative_path(&self.bbox_root_relpath) {
+            return Err(PublishedScopeValidationError {
+                field: "bbox_root_relpath",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for PublishedScope {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PublishedScopeWire {
+            repo_id: String,
+            bbox_root_relpath: String,
+        }
+
+        let wire = PublishedScopeWire::deserialize(deserializer)?;
+        Self::try_new(wire.repo_id, wire.bbox_root_relpath).map_err(serde::de::Error::custom)
+    }
+}
+
+fn valid_scope_authority(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && !matches!(value, "." | "..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn valid_scope_relative_path(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 4096
+        || value.starts_with('/')
+        || value.contains('\\')
+        || value
+            .as_bytes()
+            .get(1)
+            .is_some_and(|byte| *byte == b':' && value.as_bytes()[0].is_ascii_alphabetic())
+        || value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+    {
+        return false;
+    }
+    value.split('/').all(|component| {
+        !component.is_empty() && !matches!(component, "." | "..") && component.len() <= 255
+    })
 }
 
 /// Resolve the authoritative durable `repo_id` for a project, walking the

@@ -11,6 +11,7 @@ pub use bbox_corpus_core::language::Language;
 pub use bbox_corpus_core::project_record::{CheckoutContext, ProjectContext, ProjectRecord};
 
 use bbox_corpus_core::entity_ref;
+use bbox_corpus_core::project_catalog::{LegacyProjectRecordV1, LegacyProjectStoreV1};
 use bbox_stores::store_persister::StoreSnapshot;
 use bbox_util::util;
 
@@ -84,20 +85,7 @@ pub struct ProjectInitParams {
     pub force: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProjectStore {
-    version: u32,
-    projects: Vec<ProjectRecord>,
-}
-
-impl Default for ProjectStore {
-    fn default() -> Self {
-        Self {
-            version: 1,
-            projects: Vec::new(),
-        }
-    }
-}
+pub type ProjectStore = LegacyProjectStoreV1;
 
 #[derive(Debug, Clone)]
 pub struct ProjectRegistry {
@@ -167,7 +155,7 @@ impl ProjectRegistry {
             .iter()
             .find(|project| project.canonical_path == canonical_path)
         {
-            return Ok(existing.clone());
+            return Ok(existing.clone().into());
         }
         let project_id = entity_ref::project_id_for_path(&canonical)?;
         if let Some(existing) = self
@@ -176,7 +164,7 @@ impl ProjectRegistry {
             .iter()
             .find(|project| project.project_id == project_id)
         {
-            return Ok(existing.clone());
+            return Ok(existing.clone().into());
         }
 
         let git_root = entity_ref::git_root_for_path(&canonical);
@@ -187,7 +175,7 @@ impl ProjectRegistry {
         let repo_id = repo_id.flatten();
         let is_git_repo = git_root.is_some();
         let languages = detect_languages(&canonical);
-        let record = ProjectRecord {
+        let record = LegacyProjectRecordV1 {
             project_id,
             repo_id,
             canonical_path,
@@ -200,7 +188,7 @@ impl ProjectRegistry {
         self.store
             .projects
             .sort_by(|a, b| a.canonical_path.cmp(&b.canonical_path));
-        Ok(record)
+        Ok(record.into())
     }
 
     pub fn rename_project(&mut self, p: &ProjectRenameParams) -> Result<ProjectRenameResponse> {
@@ -301,8 +289,8 @@ impl ProjectRegistry {
         }
 
         Ok(ProjectRenameResponse {
-            old_record,
-            record,
+            old_record: old_record.into(),
+            record: record.into(),
             moved_on_disk: move_on_disk && !dry_run,
             dry_run,
         })
@@ -313,7 +301,7 @@ impl ProjectRegistry {
     pub fn resolve(&self, raw: &str) -> Result<Option<ProjectRecord>> {
         Ok(self
             .resolve_project_index(raw)?
-            .map(|idx| self.store.projects[idx].clone()))
+            .map(|idx| self.store.projects[idx].clone().into()))
     }
 
     pub fn unregister_project(&mut self, raw: &str) -> Result<ProjectRecord> {
@@ -321,15 +309,24 @@ impl ProjectRegistry {
         let idx = self
             .resolve_project_index(&raw)?
             .with_context(|| format!("project not registered: {raw}"))?;
-        Ok(self.store.projects.remove(idx))
+        Ok(self.store.projects.remove(idx).into())
     }
 
     pub fn list(&self) -> Vec<ProjectRecord> {
-        self.store.projects.clone()
+        self.store
+            .projects
+            .iter()
+            .cloned()
+            .map(ProjectRecord::from)
+            .collect()
     }
 
     pub fn load_records(path: impl AsRef<Path>) -> Result<Vec<ProjectRecord>> {
-        Ok(load_store(path.as_ref())?.projects)
+        Ok(load_store(path.as_ref())?
+            .projects
+            .into_iter()
+            .map(ProjectRecord::from)
+            .collect())
     }
 
     fn resolve_project_index(&self, raw: &str) -> Result<Option<usize>> {
@@ -416,11 +413,27 @@ fn computed_repo_id_for_registry(git_root: &Path) -> Result<Option<String>> {
 /// An alias resolves only when exactly one registered project claims it —
 /// ambiguity fails closed (registry sync enforces uniqueness, but a
 /// hand-edited store must not resolve arbitrarily).
-fn unique_alias_index(raw: &str, projects: &[ProjectRecord]) -> Option<usize> {
+trait ProjectAliases {
+    fn aliases(&self) -> &BTreeSet<String>;
+}
+
+impl ProjectAliases for LegacyProjectRecordV1 {
+    fn aliases(&self) -> &BTreeSet<String> {
+        &self.aliases
+    }
+}
+
+impl ProjectAliases for ProjectRecord {
+    fn aliases(&self) -> &BTreeSet<String> {
+        &self.aliases
+    }
+}
+
+fn unique_alias_index<T: ProjectAliases>(raw: &str, projects: &[T]) -> Option<usize> {
     let mut matches = projects
         .iter()
         .enumerate()
-        .filter(|(_, project)| project.aliases.contains(raw));
+        .filter(|(_, project)| project.aliases().contains(raw));
     let (idx, _) = matches.next()?;
     matches.next().is_none().then_some(idx)
 }

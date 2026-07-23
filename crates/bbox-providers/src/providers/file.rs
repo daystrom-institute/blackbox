@@ -261,10 +261,10 @@ enum AbsoluteSelection {
 }
 
 fn scope_root(checkout_root: &Path, scope: &PublishedScope) -> Result<PathBuf> {
-    if scope.bbox_root_relpath == "." {
+    if scope.bbox_root_relpath() == "." {
         return Ok(checkout_root.to_path_buf());
     }
-    let relative = Path::new(&scope.bbox_root_relpath);
+    let relative = Path::new(scope.bbox_root_relpath());
     if relative.as_os_str().is_empty()
         || relative.is_absolute()
         || relative
@@ -481,10 +481,7 @@ mod tests {
     }
 
     fn scope() -> PublishedScope {
-        PublishedScope {
-            repo_id: "repo-file-provider".into(),
-            bbox_root_relpath: ".".into(),
-        }
+        PublishedScope::try_new("repo-file-provider", ".").unwrap()
     }
 
     fn project(project_id: &str, root: &Path) -> ProjectRecord {

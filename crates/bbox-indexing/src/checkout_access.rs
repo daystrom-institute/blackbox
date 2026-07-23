@@ -1555,10 +1555,7 @@ mod tests {
     }
 
     fn scope() -> PublishedScope {
-        PublishedScope {
-            repo_id: "repo-1".into(),
-            bbox_root_relpath: ".".into(),
-        }
+        PublishedScope::try_new("repo-1", ".").unwrap()
     }
 
     fn request(kind: CheckoutAccessKind, intent: CheckoutAccessIntent) -> CheckoutAccessRequest {

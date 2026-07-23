@@ -1408,10 +1408,7 @@ mod tests {
         let descriptor = bbox_code_source::GenerationDescriptor {
             schema_version: bbox_code_source::SCHEMA_VERSION,
             walker_policy_version: bbox_code_source::WALKER_POLICY_VERSION.into(),
-            scope: bbox_corpus_core::identity::PublishedScope {
-                repo_id: "repo-family".into(),
-                bbox_root_relpath: ".".into(),
-            },
+            scope: bbox_corpus_core::identity::PublishedScope::try_new("repo-family", ".").unwrap(),
             head_commit: head_commit.clone(),
             dirty_fingerprint: bbox_code_source::dirty_fingerprint(&head_commit, &entries),
             manifest_sha256: bbox_code_source::manifest_sha256(&entries),

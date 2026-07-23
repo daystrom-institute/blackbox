@@ -1398,10 +1398,7 @@ mod tests {
 
     #[test]
     fn knowledge_vectors_are_kept_only_for_exactly_visible_entities() {
-        let scope = bbox_corpus_core::identity::PublishedScope {
-            repo_id: "repo".into(),
-            bbox_root_relpath: ".".into(),
-        };
+        let scope = bbox_corpus_core::identity::PublishedScope::try_new("repo", ".").unwrap();
         let provisional_ref =
             bbox_knowledge::overlay::provisional_entity_ref(&scope, "checkout", "changed");
         let mut provisional = visible_knowledge_entry("changed");

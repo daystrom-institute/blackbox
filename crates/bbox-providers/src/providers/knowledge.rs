@@ -140,8 +140,11 @@ impl InspectableEntityProvider for ProvisionalKnowledgeProvider {
         insert_entry_properties(&mut properties, entry);
         if let Some(metadata) = kb.view_metadata(&ref_string) {
             if let Some(scope) = &metadata.published_scope {
-                properties.insert("repo_id".into(), scope.repo_id.clone());
-                properties.insert("bbox_root_relpath".into(), scope.bbox_root_relpath.clone());
+                properties.insert("repo_id".into(), scope.repo_id().to_string());
+                properties.insert(
+                    "bbox_root_relpath".into(),
+                    scope.bbox_root_relpath().to_string(),
+                );
             }
             if let Some(content_hash) = &metadata.content_hash {
                 properties.insert("content_hash".into(), content_hash.clone());

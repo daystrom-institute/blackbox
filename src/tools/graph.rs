@@ -109,10 +109,10 @@ fn unique_project(projects: &[ProjectRecord], project_id: &str) -> Result<Projec
 }
 
 fn safe_scope_root(checkout_root: &Path, scope: &PublishedScope) -> Result<PathBuf> {
-    if scope.bbox_root_relpath == "." {
+    if scope.bbox_root_relpath() == "." {
         return Ok(checkout_root.to_path_buf());
     }
-    let relative = Path::new(&scope.bbox_root_relpath);
+    let relative = Path::new(scope.bbox_root_relpath());
     if relative.as_os_str().is_empty()
         || relative.is_absolute()
         || relative
@@ -829,8 +829,12 @@ impl BlackboxServer {
                 )
             })?;
             if checkout.project_id.trim().is_empty()
-                || checkout.published_scope.repo_id.trim().is_empty()
-                || checkout.published_scope.bbox_root_relpath.trim().is_empty()
+                || checkout.published_scope.repo_id().trim().is_empty()
+                || checkout
+                    .published_scope
+                    .bbox_root_relpath()
+                    .trim()
+                    .is_empty()
             {
                 anyhow::bail!(
                     "error.invalid_checkout_scope: authoritative checkout has no durable project scope"
@@ -1044,10 +1048,7 @@ mod tests {
     fn selected_operation_discovers_then_pins_exact_scope() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let scope = PublishedScope {
-            repo_id: "repo-one".into(),
-            bbox_root_relpath: ".".into(),
-        };
+        let scope = PublishedScope::try_new("repo-one", ".").unwrap();
         let (broker, requests, _) = recording_broker_with_scopes(
             HashMap::from([("project-one".into(), root)]),
             HashMap::from([("project-one".into(), scope.clone())]),
@@ -1113,10 +1114,7 @@ mod tests {
             recording_broker(HashMap::from([(project.project_id.clone(), root.clone())]));
         let session = ResolvedCheckoutScope {
             project_id: project.project_id.clone(),
-            published_scope: PublishedScope {
-                repo_id: "repo-one".into(),
-                bbox_root_relpath: ".".into(),
-            },
+            published_scope: PublishedScope::try_new("repo-one", ".").unwrap(),
             checkout_id: "checkout-one".into(),
             checkout_dir: root.to_string_lossy().into_owned(),
             checkout_project_dir: root.to_string_lossy().into_owned(),
@@ -1163,16 +1161,13 @@ mod tests {
             None,
             "weak repo hint must not be required"
         );
-        let scope = PublishedScope {
-            repo_id: "repo-one".into(),
-            bbox_root_relpath: ".".into(),
-        };
+        let scope = PublishedScope::try_new("repo-one", ".").unwrap();
         let row = CheckoutRow {
             project_id: None,
             checkout_id: "checkout-one".into(),
             checkout_dir: checkout.to_string_lossy().into_owned(),
-            repo_id: Some(scope.repo_id.clone()),
-            bbox_root_relpath: Some(scope.bbox_root_relpath.clone()),
+            repo_id: Some(scope.repo_id().to_string()),
+            bbox_root_relpath: Some(scope.bbox_root_relpath().to_string()),
             branch_ref: None,
         };
         let (broker, requests, _) = recording_broker_with_scopes(
@@ -1598,10 +1593,7 @@ mod tests {
         let server = test_server(&tmp);
         server.set_session_checkout_for_test(
             "unregistered-project".into(),
-            bbox_corpus_core::identity::PublishedScope {
-                repo_id: "repo".into(),
-                bbox_root_relpath: ".".into(),
-            },
+            bbox_corpus_core::identity::PublishedScope::try_new("repo", ".").unwrap(),
             "checkout".into(),
             root,
         );

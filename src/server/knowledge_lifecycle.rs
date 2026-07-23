@@ -744,7 +744,7 @@ impl BlackboxServer {
                     None => continue,
                 };
                 let checkout_project_dir =
-                    join_repo_relpath(&checkout_dir, &expected_scope.bbox_root_relpath);
+                    join_repo_relpath(&checkout_dir, expected_scope.bbox_root_relpath());
                 let Some(raw) = checkout_project_dir.to_str() else {
                     continue;
                 };
@@ -762,7 +762,7 @@ impl BlackboxServer {
                 }
                 let key = (
                     checkout.checkout_id.clone(),
-                    checkout.published_scope.clone(),
+                    Some(checkout.published_scope.clone()),
                 );
                 if discovered_keys.insert(key) {
                     discovered += 1;
@@ -1066,8 +1066,8 @@ impl BlackboxServer {
             match marker {
                 Ok(marker)
                     if marker.schema_epoch == bbox_knowledge::inventory::SCHEMA_EPOCH
-                        && marker.repo_id == scope.repo_id
-                        && marker.bbox_root_relpath == scope.bbox_root_relpath => {}
+                        && marker.repo_id == scope.repo_id()
+                        && marker.bbox_root_relpath == scope.bbox_root_relpath() => {}
                 Ok(_) => blockers.push(format!(
                     "scope {scope:?} has a mismatched committed schema epoch marker"
                 )),
@@ -1384,10 +1384,9 @@ fn committed_project_scope_at_root(
     let Some(repo_id) = resolve_recorded_repo_id(&inputs) else {
         return Ok(None);
     };
-    Ok(Some(PublishedScope {
-        repo_id,
-        bbox_root_relpath,
-    }))
+    PublishedScope::try_new(repo_id, bbox_root_relpath)
+        .map(Some)
+        .map_err(|error| PublisherAuthorizationError::invalid(error.to_string()))
 }
 
 fn classify_publisher_access_error(error: anyhow::Error) -> PublisherAuthorizationError {
@@ -1434,18 +1433,12 @@ fn resolve_pinned_commit(
     Ok(commit.to_string())
 }
 
-fn registry_key(row: &CheckoutRow) -> (String, PublishedScope) {
-    (
-        row.checkout_id.clone(),
-        row.published_scope().unwrap_or(PublishedScope {
-            repo_id: String::new(),
-            bbox_root_relpath: String::new(),
-        }),
-    )
+fn registry_key(row: &CheckoutRow) -> (String, Option<PublishedScope>) {
+    (row.checkout_id.clone(), row.published_scope())
 }
 
 fn schema_epoch_repo_path(scope: &PublishedScope) -> String {
-    if scope.bbox_root_relpath == "." {
+    if scope.bbox_root_relpath() == "." {
         format!(
             ".bbox/knowledge/{}",
             bbox_knowledge::inventory::SCHEMA_EPOCH_MARKER
@@ -1453,7 +1446,7 @@ fn schema_epoch_repo_path(scope: &PublishedScope) -> String {
     } else {
         format!(
             "{}/.bbox/knowledge/{}",
-            scope.bbox_root_relpath,
+            scope.bbox_root_relpath(),
             bbox_knowledge::inventory::SCHEMA_EPOCH_MARKER
         )
     }
@@ -1628,10 +1621,7 @@ mod tests {
             server,
             base,
             worktree,
-            PublishedScope {
-                repo_id: "repo-family-lifecycle".into(),
-                bbox_root_relpath: ".".into(),
-            },
+            PublishedScope::try_new("repo-family-lifecycle", ".").unwrap(),
         )
     }
 
@@ -2333,10 +2323,7 @@ mod tests {
 
     #[test]
     fn authority_cache_rejects_insert_from_pre_invalidation_generation() {
-        let scope = PublishedScope {
-            repo_id: "repo-generation".into(),
-            bbox_root_relpath: ".".into(),
-        };
+        let scope = PublishedScope::try_new("repo-generation", ".").unwrap();
         let mut cache = PublisherAuthorizationCache::default();
         let stale_generation = cache.generation(&scope);
         cache.invalidate(&scope);

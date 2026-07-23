@@ -315,10 +315,7 @@ mod tests {
         let state = Arc::new(SharedState::for_test(&state_dir));
         state.projects.write().register_path(&project).unwrap();
         let server = BlackboxServer::new(state.clone());
-        let scope = PublishedScope {
-            repo_id: repo_id.repo_id,
-            bbox_root_relpath: ".".into(),
-        };
+        let scope = PublishedScope::try_new(repo_id.repo_id, ".").unwrap();
         let checkout_id = "embedding-checkout";
         let provisional = knowledge_entry("shared", "provisional embedding marker");
         let mut values = BTreeMap::new();

@@ -900,7 +900,7 @@ fn cutback_to_local(
     bbox_edge_sidecar::snapshot::activate_local_snapshot_with(
         &edges_dir,
         project_id,
-        &scope.repo_id,
+        scope.repo_id(),
         &staged.head_commit,
         &staged.selector,
         &staged.snapshot_id,
@@ -1205,7 +1205,7 @@ fn activate_desired_loop(
         bbox_edge_sidecar::snapshot::activate_collected_snapshot_with(
             &edges_dir,
             project_id,
-            &scope.repo_id,
+            scope.repo_id(),
             &desired.descriptor.head_commit,
             &desired.generation_id,
             &staged.selector,

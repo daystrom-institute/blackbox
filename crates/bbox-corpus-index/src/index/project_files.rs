@@ -942,7 +942,7 @@ pub fn stage_local_project_generation(
         bbox_edge_sidecar::snapshot::nongit_snapshot_id(&project.project_id, &dirty_fingerprint)
     } else {
         bbox_edge_sidecar::snapshot::clean_snapshot_id(
-            &scope.repo_id,
+            scope.repo_id(),
             &project.project_id,
             &head_commit,
         )
@@ -1066,7 +1066,7 @@ where
             Some(snapshot_id),
         ));
         current_chunk_targets.extend(git_targets_for_scope(
-            &descriptor.scope.bbox_root_relpath,
+            descriptor.scope.bbox_root_relpath(),
             &chunks,
             Some(snapshot_id),
         ));
