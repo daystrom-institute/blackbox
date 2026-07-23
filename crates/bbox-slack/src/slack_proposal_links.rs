@@ -91,6 +91,43 @@ struct StoreData {
     by_proposal: HashMap<String, String>,
 }
 
+/// Capture Slack proposal links that retain the legacy project directory.
+pub fn capture_project_catalog_owner_snapshot(
+    store_dir: &Path,
+    limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
+) -> std::result::Result<
+    bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotError,
+> {
+    use bbox_corpus_core::project_catalog_snapshot::{
+        LegacyProjectSelectorKindV1, OwnerSnapshotRowV1, capture_json_owner,
+    };
+
+    capture_json_owner(
+        &store_dir.join(STORE_FILE),
+        "slack_binding_proposal_link",
+        "slack_binding_proposal_link:central-json",
+        limits,
+        |bytes| {
+            let store: StoreData = serde_json::from_slice(bytes).map_err(|_| ())?;
+            Ok(store
+                .links
+                .into_values()
+                .filter_map(|link| {
+                    let selector = link.project_dir.trim().to_string();
+                    (!selector.is_empty()).then(|| {
+                        OwnerSnapshotRowV1::legacy_selector(
+                            format!("{}:{}:{}", link.team_id, link.channel_id, link.msg_ts),
+                            LegacyProjectSelectorKindV1::Project,
+                            selector,
+                        )
+                    })
+                })
+                .collect())
+        },
+    )
+}
+
 #[derive(Debug)]
 pub struct SlackProposalLinks {
     path: PathBuf,

@@ -1,0 +1,1044 @@
+//! Read-only owner snapshots used by the durable project-catalog migration.
+//!
+//! These values intentionally do not implement `Serialize`. Legacy selector
+//! literals are host-local migration evidence and must not accidentally enter
+//! a persisted report. Owner crates decode their own durable schemas and use
+//! this module only for the common bounded snapshot and commitment contract.
+
+use std::collections::BTreeSet;
+use std::path::{Component, Path, PathBuf};
+
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnerSnapshotLimitsV1 {
+    pub max_source_bytes: usize,
+    pub max_subsources: usize,
+    pub max_rows: usize,
+    pub max_selector_bytes: usize,
+}
+
+impl Default for OwnerSnapshotLimitsV1 {
+    fn default() -> Self {
+        Self {
+            max_source_bytes: 16 * 1024 * 1024,
+            max_subsources: 100_000,
+            max_rows: 100_000,
+            max_selector_bytes: 16 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerSnapshotStateV1 {
+    Present {
+        content_sha256: String,
+        byte_len: u64,
+    },
+    Missing {
+        fingerprint: String,
+    },
+    Corrupt {
+        diagnostic_code: String,
+        fingerprint: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LegacyProjectSelectorKindV1 {
+    Project,
+    ProjectAndRelativePath,
+    AbsolutePath,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerSnapshotRowValueV1 {
+    LegacyProjectSelector {
+        selector_kind: LegacyProjectSelectorKindV1,
+        literal_selector: String,
+    },
+    InventoryTarget {
+        project_id: String,
+        target_sha256: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerSnapshotRowV1 {
+    pub stable_row_id: String,
+    pub value: OwnerSnapshotRowValueV1,
+}
+
+impl OwnerSnapshotRowV1 {
+    pub fn legacy_selector(
+        stable_row_id: impl Into<String>,
+        selector_kind: LegacyProjectSelectorKindV1,
+        literal_selector: impl Into<String>,
+    ) -> Self {
+        Self {
+            stable_row_id: stable_row_id.into(),
+            value: OwnerSnapshotRowValueV1::LegacyProjectSelector {
+                selector_kind,
+                literal_selector: literal_selector.into(),
+            },
+        }
+    }
+
+    pub fn inventory_target(
+        stable_row_id: impl Into<String>,
+        project_id: impl Into<String>,
+        target_sha256: impl Into<String>,
+    ) -> Self {
+        Self {
+            stable_row_id: stable_row_id.into(),
+            value: OwnerSnapshotRowValueV1::InventoryTarget {
+                project_id: project_id.into(),
+                target_sha256: target_sha256.into(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerSubsourceSnapshotV1 {
+    pub subsource_id: String,
+    pub state: OwnerSnapshotStateV1,
+    pub row_ids: BTreeSet<String>,
+    pub row_count: u64,
+    pub canonical_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerSnapshotV1 {
+    pub source_id: String,
+    pub state: OwnerSnapshotStateV1,
+    pub subsources: Vec<OwnerSubsourceSnapshotV1>,
+    pub rows: Vec<OwnerSnapshotRowV1>,
+    pub row_count: u64,
+    pub canonical_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerSnapshotError {
+    pub code: &'static str,
+}
+
+impl std::fmt::Display for OwnerSnapshotError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.code)
+    }
+}
+
+impl std::error::Error for OwnerSnapshotError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedOwnerBytesV1 {
+    pub state: OwnerSnapshotStateV1,
+    pub bytes: Option<Vec<u8>>,
+}
+
+pub fn capture_regular_file_nofollow(
+    path: &Path,
+    source_id: &str,
+    subsource_id: &str,
+    max_bytes: usize,
+) -> CapturedOwnerBytesV1 {
+    let missing = || OwnerSnapshotStateV1::Missing {
+        fingerprint: state_fingerprint("missing", source_id, subsource_id),
+    };
+    let corrupt = |diagnostic_code: &str| OwnerSnapshotStateV1::Corrupt {
+        diagnostic_code: diagnostic_code.to_string(),
+        fingerprint: state_fingerprint(diagnostic_code, source_id, subsource_id),
+    };
+    let Some(parent) = path.parent() else {
+        return CapturedOwnerBytesV1 {
+            state: corrupt("owner_path_has_no_parent"),
+            bytes: None,
+        };
+    };
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return CapturedOwnerBytesV1 {
+            state: corrupt("owner_filename_invalid"),
+            bytes: None,
+        };
+    };
+    let directory = match crate::json_store::NofollowDirectory::open_existing(parent) {
+        Ok(Some(directory)) => directory,
+        Ok(None) => {
+            return CapturedOwnerBytesV1 {
+                state: missing(),
+                bytes: None,
+            };
+        }
+        Err(_) => {
+            return CapturedOwnerBytesV1 {
+                state: corrupt("owner_parent_unsafe"),
+                bytes: None,
+            };
+        }
+    };
+    match directory.read_regular(name, max_bytes, "owner source") {
+        Ok(Some(bytes)) => CapturedOwnerBytesV1 {
+            state: OwnerSnapshotStateV1::Present {
+                content_sha256: sha256_hex(&bytes),
+                byte_len: bytes.len() as u64,
+            },
+            bytes: Some(bytes),
+        },
+        Ok(None) => CapturedOwnerBytesV1 {
+            state: missing(),
+            bytes: None,
+        },
+        Err(_) => CapturedOwnerBytesV1 {
+            state: corrupt("owner_source_unreadable"),
+            bytes: None,
+        },
+    }
+}
+
+pub fn capture_json_owner(
+    path: &Path,
+    source_id: &str,
+    subsource_id: &str,
+    limits: OwnerSnapshotLimitsV1,
+    decode: impl FnOnce(&[u8]) -> Result<Vec<OwnerSnapshotRowV1>, ()>,
+) -> Result<OwnerSnapshotV1, OwnerSnapshotError> {
+    validate_limits(limits)?;
+    let captured =
+        capture_regular_file_nofollow(path, source_id, subsource_id, limits.max_source_bytes);
+    let Some(bytes) = captured.bytes else {
+        return build_owner_snapshot(
+            source_id,
+            vec![owner_subsource(subsource_id, captured.state, &[])],
+            Vec::new(),
+            limits,
+        );
+    };
+    let rows = match decode(&bytes) {
+        Ok(rows) => rows,
+        Err(()) => {
+            return corrupt_owner_snapshot(source_id, subsource_id, "owner_source_invalid", limits);
+        }
+    };
+    finalize_owner_snapshot(
+        source_id,
+        subsource_id,
+        vec![owner_subsource(subsource_id, captured.state, &rows)],
+        rows,
+        limits,
+    )
+}
+
+/// Minimal dependency-safe projection of the root daemon's persisted
+/// `tasks.json` schema. The orchestration cwd is the only field that is a
+/// legacy path selector; all other task payload remains owned by the root
+/// runtime.
+pub fn capture_legacy_task_owner_snapshot(
+    tasks_path: &Path,
+    limits: OwnerSnapshotLimitsV1,
+) -> Result<OwnerSnapshotV1, OwnerSnapshotError> {
+    #[derive(Deserialize)]
+    struct PersistedTaskSelector {
+        id: String,
+        #[serde(default)]
+        cwd: Option<String>,
+    }
+
+    capture_json_owner(tasks_path, "task", "task:central-json", limits, |bytes| {
+        let tasks: Vec<PersistedTaskSelector> = serde_json::from_slice(bytes).map_err(|_| ())?;
+        Ok(tasks
+            .into_iter()
+            .filter_map(|task| {
+                let selector = task.cwd?.trim().to_string();
+                (!selector.is_empty()).then(|| {
+                    OwnerSnapshotRowV1::legacy_selector(
+                        task.id,
+                        LegacyProjectSelectorKindV1::AbsolutePath,
+                        selector,
+                    )
+                })
+            })
+            .collect())
+    })
+}
+
+/// Minimal dependency-safe projection of the root consultant proposal store.
+/// Current proposal records carry stable project ids through their owning
+/// consultant instance, not literal paths. Optional legacy path fields are
+/// nevertheless captured if an older record contains them.
+pub fn capture_legacy_proposal_owner_snapshot(
+    proposals_root: &Path,
+    limits: OwnerSnapshotLimitsV1,
+) -> Result<OwnerSnapshotV1, OwnerSnapshotError> {
+    #[derive(Deserialize)]
+    struct PersistedProposalSelector {
+        id: String,
+        #[serde(default)]
+        project: Option<String>,
+        #[serde(default)]
+        project_dir: Option<String>,
+    }
+
+    match std::fs::symlink_metadata(proposals_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return missing_owner_snapshot("proposal", "proposal:root", limits);
+        }
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        _ => {
+            return corrupt_owner_snapshot(
+                "proposal",
+                "proposal:root",
+                "owner_tree_unsafe",
+                limits,
+            );
+        }
+    }
+    let captures =
+        match capture_stable_regular_tree_nofollow(proposals_root, "proposal", limits, |relative| {
+            relative
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("json")
+        }) {
+            Ok(captures) => captures,
+            Err(error) => {
+                return corrupt_owner_snapshot("proposal", "proposal:root", error.code, limits);
+            }
+        };
+    if captures.is_empty() {
+        let state = OwnerSnapshotStateV1::Present {
+            content_sha256: sha256_hex(b""),
+            byte_len: 0,
+        };
+        return build_owner_snapshot(
+            "proposal",
+            vec![owner_subsource("proposal:root", state, &[])],
+            Vec::new(),
+            limits,
+        );
+    }
+    let mut rows = Vec::new();
+    let mut subsources = Vec::new();
+    for (relative, captured) in captures {
+        let subsource_id = stable_subsource_id("proposal", &relative);
+        let Some(bytes) = captured.bytes else {
+            return corrupt_owner_snapshot(
+                "proposal",
+                &subsource_id,
+                "owner_source_unreadable",
+                limits,
+            );
+        };
+        let proposal: PersistedProposalSelector = match serde_json::from_slice(&bytes) {
+            Ok(proposal) => proposal,
+            Err(_) => {
+                return corrupt_owner_snapshot(
+                    "proposal",
+                    &subsource_id,
+                    "owner_source_invalid",
+                    limits,
+                );
+            }
+        };
+        let selector = proposal
+            .project_dir
+            .or(proposal.project)
+            .map(|selector| selector.trim().to_string())
+            .filter(|selector| !selector.is_empty());
+        let subsource_rows = selector
+            .map(|selector| {
+                vec![OwnerSnapshotRowV1::legacy_selector(
+                    format!("{subsource_id}:{}", proposal.id),
+                    LegacyProjectSelectorKindV1::Project,
+                    selector,
+                )]
+            })
+            .unwrap_or_default();
+        subsources.push(owner_subsource(
+            subsource_id,
+            captured.state,
+            &subsource_rows,
+        ));
+        rows.extend(subsource_rows);
+    }
+    finalize_owner_snapshot("proposal", "proposal:root", subsources, rows, limits)
+}
+
+pub fn capture_stable_regular_tree_nofollow(
+    root: &Path,
+    source_id: &str,
+    limits: OwnerSnapshotLimitsV1,
+    include: impl Fn(&Path) -> bool + Copy,
+) -> Result<Vec<(PathBuf, CapturedOwnerBytesV1)>, OwnerSnapshotError> {
+    let authority = crate::json_store::NofollowDirectory::open_existing(root)
+        .map_err(|_| OwnerSnapshotError {
+            code: "owner_tree_unsafe",
+        })?
+        .ok_or(OwnerSnapshotError {
+            code: "owner_tree_changed_during_capture",
+        })?;
+    let mut prior = capture_regular_tree_nofollow(root, source_id, limits, include)?;
+    for _ in 0..3 {
+        let current = capture_regular_tree_nofollow(root, source_id, limits, include)?;
+        if current == prior {
+            authority
+                .ensure_still_current()
+                .map_err(|_| OwnerSnapshotError {
+                    code: "owner_tree_changed_during_capture",
+                })?;
+            return Ok(current);
+        }
+        prior = current;
+    }
+    Err(OwnerSnapshotError {
+        code: "owner_tree_changed_during_capture",
+    })
+}
+
+pub fn capture_regular_tree_nofollow(
+    root: &Path,
+    source_id: &str,
+    limits: OwnerSnapshotLimitsV1,
+    include: impl Fn(&Path) -> bool,
+) -> Result<Vec<(PathBuf, CapturedOwnerBytesV1)>, OwnerSnapshotError> {
+    validate_limits(limits)?;
+    let metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => {
+            return Err(OwnerSnapshotError {
+                code: "owner_tree_unreadable",
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(OwnerSnapshotError {
+            code: "owner_tree_unsafe",
+        });
+    }
+
+    let mut pending = vec![PathBuf::new()];
+    let mut files = Vec::new();
+    let mut total_bytes = 0usize;
+    while let Some(relative_dir) = pending.pop() {
+        let absolute_dir = root.join(&relative_dir);
+        let mut entries = std::fs::read_dir(&absolute_dir)
+            .map_err(|_| OwnerSnapshotError {
+                code: "owner_tree_unreadable",
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| OwnerSnapshotError {
+                code: "owner_tree_unreadable",
+            })?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            let relative = relative_dir.join(&name);
+            if relative
+                .components()
+                .any(|component| {
+                    !matches!(component, Component::Normal(name) if name.to_str().is_some())
+                })
+            {
+                return Err(OwnerSnapshotError {
+                    code: "owner_tree_entry_invalid",
+                });
+            }
+            let file_type = entry.file_type().map_err(|_| OwnerSnapshotError {
+                code: "owner_tree_unreadable",
+            })?;
+            if file_type.is_symlink() {
+                return Err(OwnerSnapshotError {
+                    code: "owner_tree_symlink",
+                });
+            }
+            if file_type.is_dir() {
+                pending.push(relative);
+                continue;
+            }
+            if !file_type.is_file() || !include(&relative) {
+                continue;
+            }
+            if files.len() >= limits.max_subsources {
+                return Err(OwnerSnapshotError {
+                    code: "owner_subsource_limit",
+                });
+            }
+            let subsource_id = stable_subsource_id(source_id, &relative);
+            let captured = capture_regular_file_nofollow(
+                &entry.path(),
+                source_id,
+                &subsource_id,
+                limits.max_source_bytes.saturating_sub(total_bytes),
+            );
+            if let OwnerSnapshotStateV1::Present { byte_len, .. } = &captured.state {
+                total_bytes =
+                    total_bytes
+                        .checked_add(*byte_len as usize)
+                        .ok_or(OwnerSnapshotError {
+                            code: "owner_source_byte_limit",
+                        })?;
+                if total_bytes > limits.max_source_bytes {
+                    return Err(OwnerSnapshotError {
+                        code: "owner_source_byte_limit",
+                    });
+                }
+            }
+            files.push((relative, captured));
+        }
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(files)
+}
+
+pub fn owner_subsource(
+    subsource_id: impl Into<String>,
+    state: OwnerSnapshotStateV1,
+    rows: &[OwnerSnapshotRowV1],
+) -> OwnerSubsourceSnapshotV1 {
+    let subsource_id = subsource_id.into();
+    let row_ids = rows
+        .iter()
+        .map(|row| row.stable_row_id.clone())
+        .collect::<BTreeSet<_>>();
+    let canonical_sha256 = rows_commitment(&subsource_id, rows);
+    OwnerSubsourceSnapshotV1 {
+        subsource_id,
+        state,
+        row_count: row_ids.len() as u64,
+        row_ids,
+        canonical_sha256,
+    }
+}
+
+pub fn build_owner_snapshot(
+    source_id: impl Into<String>,
+    mut subsources: Vec<OwnerSubsourceSnapshotV1>,
+    mut rows: Vec<OwnerSnapshotRowV1>,
+    limits: OwnerSnapshotLimitsV1,
+) -> Result<OwnerSnapshotV1, OwnerSnapshotError> {
+    validate_limits(limits)?;
+    let source_id = source_id.into();
+    if source_id.is_empty() || source_id.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(OwnerSnapshotError {
+            code: "owner_source_id_invalid",
+        });
+    }
+    if subsources.len() > limits.max_subsources {
+        return Err(OwnerSnapshotError {
+            code: "owner_subsource_limit",
+        });
+    }
+    if rows.len() > limits.max_rows {
+        return Err(OwnerSnapshotError {
+            code: "owner_row_limit",
+        });
+    }
+    subsources.sort_by(|left, right| left.subsource_id.cmp(&right.subsource_id));
+    if subsources
+        .windows(2)
+        .any(|pair| pair[0].subsource_id == pair[1].subsource_id)
+    {
+        return Err(OwnerSnapshotError {
+            code: "owner_subsource_duplicate",
+        });
+    }
+    for subsource in &subsources {
+        if subsource.subsource_id.is_empty()
+            || subsource
+                .subsource_id
+                .bytes()
+                .any(|byte| byte.is_ascii_control())
+            || subsource.row_count != subsource.row_ids.len() as u64
+            || !valid_sha256(&subsource.canonical_sha256)
+            || !valid_state(&subsource.state)
+        {
+            return Err(OwnerSnapshotError {
+                code: "owner_subsource_invalid",
+            });
+        }
+    }
+    rows.sort_by(|left, right| left.stable_row_id.cmp(&right.stable_row_id));
+    if rows
+        .windows(2)
+        .any(|pair| pair[0].stable_row_id == pair[1].stable_row_id)
+    {
+        return Err(OwnerSnapshotError {
+            code: "owner_row_duplicate",
+        });
+    }
+    for row in &rows {
+        if row.stable_row_id.is_empty()
+            || row
+                .stable_row_id
+                .bytes()
+                .any(|byte| byte.is_ascii_control())
+        {
+            return Err(OwnerSnapshotError {
+                code: "owner_row_id_invalid",
+            });
+        }
+        if let OwnerSnapshotRowValueV1::LegacyProjectSelector {
+            literal_selector, ..
+        } = &row.value
+            && (literal_selector.is_empty()
+                || literal_selector.len() > limits.max_selector_bytes
+                || literal_selector
+                    .bytes()
+                    .any(|byte| byte == 0 || byte.is_ascii_control()))
+        {
+            return Err(OwnerSnapshotError {
+                code: "owner_selector_invalid",
+            });
+        }
+        if let OwnerSnapshotRowValueV1::InventoryTarget {
+            project_id,
+            target_sha256,
+        } = &row.value
+            && (project_id.is_empty()
+                || project_id.bytes().any(|byte| byte.is_ascii_control())
+                || !valid_sha256(target_sha256))
+        {
+            return Err(OwnerSnapshotError {
+                code: "owner_inventory_target_invalid",
+            });
+        }
+    }
+    let row_ids = rows
+        .iter()
+        .map(|row| row.stable_row_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let subsource_row_ids = subsources
+        .iter()
+        .flat_map(|subsource| subsource.row_ids.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+    if row_ids != subsource_row_ids {
+        return Err(OwnerSnapshotError {
+            code: "owner_subsource_rows_mismatch",
+        });
+    }
+    let state = aggregate_state(&source_id, &subsources);
+    let canonical_sha256 = snapshot_commitment(&source_id, &subsources, &rows);
+    Ok(OwnerSnapshotV1 {
+        source_id,
+        state,
+        row_count: rows.len() as u64,
+        subsources,
+        rows,
+        canonical_sha256,
+    })
+}
+
+pub fn finalize_owner_snapshot(
+    source_id: &str,
+    corrupt_subsource_id: &str,
+    subsources: Vec<OwnerSubsourceSnapshotV1>,
+    rows: Vec<OwnerSnapshotRowV1>,
+    limits: OwnerSnapshotLimitsV1,
+) -> Result<OwnerSnapshotV1, OwnerSnapshotError> {
+    match build_owner_snapshot(source_id, subsources, rows, limits) {
+        Ok(snapshot) => Ok(snapshot),
+        Err(error) if error.code != "owner_snapshot_limits_invalid" => {
+            corrupt_owner_snapshot(source_id, corrupt_subsource_id, error.code, limits)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn missing_owner_snapshot(
+    source_id: &str,
+    subsource_id: &str,
+    limits: OwnerSnapshotLimitsV1,
+) -> Result<OwnerSnapshotV1, OwnerSnapshotError> {
+    let state = OwnerSnapshotStateV1::Missing {
+        fingerprint: state_fingerprint("missing", source_id, subsource_id),
+    };
+    build_owner_snapshot(
+        source_id,
+        vec![owner_subsource(subsource_id, state, &[])],
+        Vec::new(),
+        limits,
+    )
+}
+
+pub fn corrupt_owner_snapshot(
+    source_id: &str,
+    subsource_id: &str,
+    diagnostic_code: &str,
+    limits: OwnerSnapshotLimitsV1,
+) -> Result<OwnerSnapshotV1, OwnerSnapshotError> {
+    let state = OwnerSnapshotStateV1::Corrupt {
+        diagnostic_code: diagnostic_code.to_string(),
+        fingerprint: state_fingerprint(diagnostic_code, source_id, subsource_id),
+    };
+    build_owner_snapshot(
+        source_id,
+        vec![owner_subsource(subsource_id, state, &[])],
+        Vec::new(),
+        limits,
+    )
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+pub fn stable_subsource_id(source_id: &str, relative_path: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, source_id.as_bytes());
+    for component in relative_path.components() {
+        if let Component::Normal(component) = component {
+            hash_field(&mut hasher, component.to_string_lossy().as_bytes());
+        }
+    }
+    format!("{source_id}:{}", hex::encode(hasher.finalize()))
+}
+
+fn validate_limits(limits: OwnerSnapshotLimitsV1) -> Result<(), OwnerSnapshotError> {
+    if limits.max_source_bytes == 0
+        || limits.max_subsources == 0
+        || limits.max_rows == 0
+        || limits.max_selector_bytes == 0
+    {
+        return Err(OwnerSnapshotError {
+            code: "owner_snapshot_limits_invalid",
+        });
+    }
+    Ok(())
+}
+
+fn valid_state(state: &OwnerSnapshotStateV1) -> bool {
+    match state {
+        OwnerSnapshotStateV1::Present { content_sha256, .. } => valid_sha256(content_sha256),
+        OwnerSnapshotStateV1::Missing { fingerprint } => valid_sha256(fingerprint),
+        OwnerSnapshotStateV1::Corrupt {
+            diagnostic_code,
+            fingerprint,
+        } => {
+            !diagnostic_code.is_empty()
+                && diagnostic_code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+                && valid_sha256(fingerprint)
+        }
+    }
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn aggregate_state(
+    source_id: &str,
+    subsources: &[OwnerSubsourceSnapshotV1],
+) -> OwnerSnapshotStateV1 {
+    if let Some(OwnerSubsourceSnapshotV1 {
+        state: OwnerSnapshotStateV1::Corrupt {
+            diagnostic_code, ..
+        },
+        ..
+    }) = subsources
+        .iter()
+        .find(|subsource| matches!(&subsource.state, OwnerSnapshotStateV1::Corrupt { .. }))
+    {
+        return OwnerSnapshotStateV1::Corrupt {
+            diagnostic_code: diagnostic_code.clone(),
+            fingerprint: state_fingerprint(diagnostic_code, source_id, "aggregate"),
+        };
+    }
+    if subsources
+        .iter()
+        .any(|subsource| matches!(&subsource.state, OwnerSnapshotStateV1::Missing { .. }))
+    {
+        return OwnerSnapshotStateV1::Missing {
+            fingerprint: state_fingerprint("missing", source_id, "aggregate"),
+        };
+    }
+    let mut hasher = Sha256::new();
+    let mut byte_len = 0u64;
+    for subsource in subsources {
+        hash_field(&mut hasher, subsource.subsource_id.as_bytes());
+        hash_field(&mut hasher, subsource.canonical_sha256.as_bytes());
+        if let OwnerSnapshotStateV1::Present {
+            content_sha256,
+            byte_len: subsource_len,
+        } = &subsource.state
+        {
+            hash_field(&mut hasher, content_sha256.as_bytes());
+            byte_len = byte_len.saturating_add(*subsource_len);
+        }
+    }
+    OwnerSnapshotStateV1::Present {
+        content_sha256: hex::encode(hasher.finalize()),
+        byte_len,
+    }
+}
+
+fn state_fingerprint(kind: &str, source_id: &str, subsource_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, kind.as_bytes());
+    hash_field(&mut hasher, source_id.as_bytes());
+    hash_field(&mut hasher, subsource_id.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn rows_commitment(source_id: &str, rows: &[OwnerSnapshotRowV1]) -> String {
+    let mut ordered = rows.to_vec();
+    ordered.sort_by(|left, right| left.stable_row_id.cmp(&right.stable_row_id));
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, source_id.as_bytes());
+    for row in &ordered {
+        hash_row(&mut hasher, row);
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn snapshot_commitment(
+    source_id: &str,
+    subsources: &[OwnerSubsourceSnapshotV1],
+    rows: &[OwnerSnapshotRowV1],
+) -> String {
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, source_id.as_bytes());
+    for subsource in subsources {
+        hash_field(&mut hasher, subsource.subsource_id.as_bytes());
+        hash_state(&mut hasher, &subsource.state);
+        hash_field(&mut hasher, subsource.canonical_sha256.as_bytes());
+    }
+    for row in rows {
+        hash_row(&mut hasher, row);
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn hash_state(hasher: &mut Sha256, state: &OwnerSnapshotStateV1) {
+    match state {
+        OwnerSnapshotStateV1::Present {
+            content_sha256,
+            byte_len,
+        } => {
+            hash_field(hasher, b"present");
+            hash_field(hasher, content_sha256.as_bytes());
+            hash_field(hasher, &byte_len.to_be_bytes());
+        }
+        OwnerSnapshotStateV1::Missing { fingerprint } => {
+            hash_field(hasher, b"missing");
+            hash_field(hasher, fingerprint.as_bytes());
+        }
+        OwnerSnapshotStateV1::Corrupt {
+            diagnostic_code,
+            fingerprint,
+        } => {
+            hash_field(hasher, b"corrupt");
+            hash_field(hasher, diagnostic_code.as_bytes());
+            hash_field(hasher, fingerprint.as_bytes());
+        }
+    }
+}
+
+fn hash_row(hasher: &mut Sha256, row: &OwnerSnapshotRowV1) {
+    hash_field(hasher, row.stable_row_id.as_bytes());
+    match &row.value {
+        OwnerSnapshotRowValueV1::LegacyProjectSelector {
+            selector_kind,
+            literal_selector,
+        } => {
+            hash_field(hasher, b"legacy_selector");
+            hash_field(
+                hasher,
+                match selector_kind {
+                    LegacyProjectSelectorKindV1::Project => b"project",
+                    LegacyProjectSelectorKindV1::ProjectAndRelativePath => {
+                        b"project_and_relative_path"
+                    }
+                    LegacyProjectSelectorKindV1::AbsolutePath => b"absolute_path",
+                },
+            );
+            hash_field(hasher, literal_selector.as_bytes());
+        }
+        OwnerSnapshotRowValueV1::InventoryTarget {
+            project_id,
+            target_sha256,
+        } => {
+            hash_field(hasher, b"inventory_target");
+            hash_field(hasher, project_id.as_bytes());
+            hash_field(hasher, target_sha256.as_bytes());
+        }
+    }
+}
+
+fn hash_field(hasher: &mut Sha256, field: &[u8]) {
+    hasher.update((field.len() as u64).to_be_bytes());
+    hasher.update(field);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_commitment_is_canonical_and_carries_literal_selector() {
+        let limits = OwnerSnapshotLimitsV1::default();
+        let a = OwnerSnapshotRowV1::legacy_selector(
+            "a",
+            LegacyProjectSelectorKindV1::Project,
+            "/repo/a",
+        );
+        let b = OwnerSnapshotRowV1::legacy_selector(
+            "b",
+            LegacyProjectSelectorKindV1::AbsolutePath,
+            "/repo/b/file",
+        );
+        let state = OwnerSnapshotStateV1::Present {
+            content_sha256: sha256_hex(b"source"),
+            byte_len: 6,
+        };
+        let first = build_owner_snapshot(
+            "owner",
+            vec![owner_subsource(
+                "owner:file",
+                state.clone(),
+                &[a.clone(), b.clone()],
+            )],
+            vec![b.clone(), a.clone()],
+            limits,
+        )
+        .unwrap();
+        let second = build_owner_snapshot(
+            "owner",
+            vec![owner_subsource("owner:file", state, &[b, a])],
+            first.rows.clone(),
+            limits,
+        )
+        .unwrap();
+        assert_eq!(first.canonical_sha256, second.canonical_sha256);
+        let changed = OwnerSnapshotRowV1::legacy_selector(
+            "a",
+            LegacyProjectSelectorKindV1::Project,
+            "/repo/changed",
+        );
+        let changed_snapshot = build_owner_snapshot(
+            "owner",
+            vec![owner_subsource(
+                "owner:file",
+                OwnerSnapshotStateV1::Present {
+                    content_sha256: sha256_hex(b"source"),
+                    byte_len: 6,
+                },
+                &[changed.clone(), first.rows[1].clone()],
+            )],
+            vec![changed, first.rows[1].clone()],
+            limits,
+        )
+        .unwrap();
+        assert_ne!(first.canonical_sha256, changed_snapshot.canonical_sha256);
+    }
+
+    #[test]
+    fn nofollow_capture_distinguishes_missing_present_and_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("owner.json");
+        let missing = capture_regular_file_nofollow(&path, "owner", "owner:file", 32);
+        assert!(matches!(
+            missing.state,
+            OwnerSnapshotStateV1::Missing { .. }
+        ));
+        std::fs::write(&path, b"{}").unwrap();
+        let present = capture_regular_file_nofollow(&path, "owner", "owner:file", 32);
+        assert_eq!(present.bytes.as_deref(), Some(b"{}".as_slice()));
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(root.join("target"), &path).unwrap();
+            let unsafe_source = capture_regular_file_nofollow(&path, "owner", "owner:file", 32);
+            assert!(matches!(
+                unsafe_source.state,
+                OwnerSnapshotStateV1::Corrupt { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn task_projection_is_read_only_bounded_and_exact() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("tasks.json");
+        let missing =
+            capture_legacy_task_owner_snapshot(&path, OwnerSnapshotLimitsV1::default()).unwrap();
+        assert!(matches!(
+            missing.state,
+            OwnerSnapshotStateV1::Missing { .. }
+        ));
+        assert!(!path.exists());
+
+        std::fs::write(
+            &path,
+            br#"[
+              {"id":"task-b","provider":"glm","cwd":null},
+              {"id":"task-a","provider":"claude","cwd":"/repo/a"}
+            ]"#,
+        )
+        .unwrap();
+        let present =
+            capture_legacy_task_owner_snapshot(&path, OwnerSnapshotLimitsV1::default()).unwrap();
+        assert!(matches!(
+            present.state,
+            OwnerSnapshotStateV1::Present { .. }
+        ));
+        assert_eq!(present.row_count, 1);
+        assert_eq!(present.rows[0].stable_row_id, "task-a");
+        assert!(matches!(
+            &present.rows[0].value,
+            OwnerSnapshotRowValueV1::LegacyProjectSelector {
+                selector_kind: LegacyProjectSelectorKindV1::AbsolutePath,
+                literal_selector,
+            } if literal_selector == "/repo/a"
+        ));
+
+        let too_small = OwnerSnapshotLimitsV1 {
+            max_source_bytes: 4,
+            ..OwnerSnapshotLimitsV1::default()
+        };
+        let bounded = capture_legacy_task_owner_snapshot(&path, too_small).unwrap();
+        assert!(matches!(
+            bounded.state,
+            OwnerSnapshotStateV1::Corrupt { .. }
+        ));
+    }
+
+    #[test]
+    fn proposal_projection_accepts_current_rows_and_captures_legacy_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let instance = root.join("bg-00000000-00000000");
+        std::fs::create_dir(&instance).unwrap();
+        std::fs::write(
+            instance.join("P-1.json"),
+            br#"{"id":"P-1","instance_id":"bg-00000000-00000000","kind":"packet","state":"pending","draft":{},"created_at":"now","updated_at":"now"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            instance.join("P-2.json"),
+            br#"{"id":"P-2","project_dir":"/repo/legacy"}"#,
+        )
+        .unwrap();
+
+        let snapshot =
+            capture_legacy_proposal_owner_snapshot(&root, OwnerSnapshotLimitsV1::default())
+                .unwrap();
+        assert_eq!(snapshot.subsources.len(), 2);
+        assert_eq!(snapshot.row_count, 1);
+        assert!(matches!(
+            &snapshot.rows[0].value,
+            OwnerSnapshotRowValueV1::LegacyProjectSelector {
+                literal_selector,
+                ..
+            } if literal_selector == "/repo/legacy"
+        ));
+    }
+}

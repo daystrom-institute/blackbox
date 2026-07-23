@@ -41,6 +41,13 @@ below bbox-indexing (ingest passes, sidecars) can call them.
   `NofollowDirectory`: open or create every component without following links,
   hold and lock the directory descriptor, perform leaf I/O relative to that
   descriptor, then verify the path still names the held inode before publish.
+- Project-catalog owner snapshots are raw, read-only migration inputs. Owner
+  crates decode their own formats and return the non-serializable snapshot
+  contract from `project_catalog_snapshot`; bbox-indexing maps it into its
+  durable inventory types. Literal selectors never leave the host-local
+  snapshot. The task and consultant proposal projections live here only to
+  break the root-crate dependency cycle and expose their narrow persisted
+  selector surface.
 
 ## Rerank math (search/rerank.rs)
 

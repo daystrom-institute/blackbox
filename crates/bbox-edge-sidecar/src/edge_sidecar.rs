@@ -37,6 +37,144 @@ pub struct EdgeKey {
     confidence: EdgeConfidence,
 }
 
+/// Capture edge rows whose metadata retains a literal execution directory.
+///
+/// Every JSONL file is read by an exact no-follow file descriptor and the
+/// complete tree is accepted only after two identical scans. This makes the
+/// read-only capture coherent with atomic lane replacement without creating
+/// an edge store or coordination file.
+pub fn capture_project_catalog_owner_snapshot(
+    edges_dir: &Path,
+    limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
+) -> std::result::Result<
+    bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotError,
+> {
+    use bbox_corpus_core::project_catalog_snapshot::{
+        LegacyProjectSelectorKindV1, OwnerSnapshotRowV1, OwnerSnapshotStateV1,
+        build_owner_snapshot, capture_stable_regular_tree_nofollow, corrupt_owner_snapshot,
+        finalize_owner_snapshot, missing_owner_snapshot, owner_subsource, sha256_hex,
+        stable_subsource_id,
+    };
+
+    match std::fs::symlink_metadata(edges_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return missing_owner_snapshot("transcript_edge", "transcript_edge:root", limits);
+        }
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        _ => {
+            return corrupt_owner_snapshot(
+                "transcript_edge",
+                "transcript_edge:root",
+                "owner_tree_unsafe",
+                limits,
+            );
+        }
+    }
+    let captures = match capture_stable_regular_tree_nofollow(
+        edges_dir,
+        "transcript_edge",
+        limits,
+        |relative| {
+            relative
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("jsonl")
+        },
+    ) {
+        Ok(captures) => captures,
+        Err(error) => {
+            return corrupt_owner_snapshot(
+                "transcript_edge",
+                "transcript_edge:root",
+                error.code,
+                limits,
+            );
+        }
+    };
+    if captures.is_empty() {
+        let state = OwnerSnapshotStateV1::Present {
+            content_sha256: sha256_hex(b""),
+            byte_len: 0,
+        };
+        return build_owner_snapshot(
+            "transcript_edge",
+            vec![owner_subsource("transcript_edge:root", state, &[])],
+            Vec::new(),
+            limits,
+        );
+    }
+    let mut rows = Vec::new();
+    let mut subsources = Vec::new();
+    for (relative, captured) in captures {
+        let subsource_id = stable_subsource_id("transcript_edge", &relative);
+        let Some(bytes) = captured.bytes else {
+            return corrupt_owner_snapshot(
+                "transcript_edge",
+                &subsource_id,
+                "owner_source_unreadable",
+                limits,
+            );
+        };
+        let body = match std::str::from_utf8(&bytes) {
+            Ok(body) => body,
+            Err(_) => {
+                return corrupt_owner_snapshot(
+                    "transcript_edge",
+                    &subsource_id,
+                    "transcript_edge_invalid",
+                    limits,
+                );
+            }
+        };
+        let mut occurrence_by_hash = BTreeMap::<String, usize>::new();
+        let mut subsource_rows = Vec::new();
+        for line in body.lines().filter(|line| !line.trim().is_empty()) {
+            let edge: Edge = match serde_json::from_str(line) {
+                Ok(edge) => edge,
+                Err(_) => {
+                    return corrupt_owner_snapshot(
+                        "transcript_edge",
+                        &subsource_id,
+                        "transcript_edge_invalid",
+                        limits,
+                    );
+                }
+            };
+            let Some(cwd) = edge
+                .metadata
+                .get("cwd")
+                .map(|cwd| cwd.trim())
+                .filter(|cwd| !cwd.is_empty())
+            else {
+                continue;
+            };
+            let row_hash = sha256_hex(line.as_bytes());
+            let occurrence = occurrence_by_hash.entry(row_hash.clone()).or_default();
+            let stable_row_id = format!("{subsource_id}:{row_hash}:{}", *occurrence);
+            *occurrence += 1;
+            subsource_rows.push(OwnerSnapshotRowV1::legacy_selector(
+                stable_row_id,
+                LegacyProjectSelectorKindV1::AbsolutePath,
+                cwd,
+            ));
+        }
+        subsources.push(owner_subsource(
+            subsource_id,
+            captured.state,
+            &subsource_rows,
+        ));
+        rows.extend(subsource_rows);
+    }
+    finalize_owner_snapshot(
+        "transcript_edge",
+        "transcript_edge:root",
+        subsources,
+        rows,
+        limits,
+    )
+}
+
 impl Edge {
     pub fn dedup_key(&self) -> EdgeKey {
         EdgeKey {
@@ -801,4 +939,68 @@ pub fn plan_legacy_edge_extraction(
 
     plan.extractable = plan.managed_replacement_exists && plan.derived_lines > 0;
     Ok(plan)
+}
+
+#[cfg(test)]
+mod project_catalog_snapshot_tests {
+    use super::*;
+    use bbox_corpus_core::project_catalog_snapshot::{
+        OwnerSnapshotLimitsV1, OwnerSnapshotRowValueV1, OwnerSnapshotStateV1,
+    };
+
+    #[test]
+    fn migration_snapshot_is_no_create_and_captures_only_literal_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("edges");
+        let missing =
+            capture_project_catalog_owner_snapshot(&root, OwnerSnapshotLimitsV1::default())
+                .unwrap();
+        assert!(matches!(
+            missing.state,
+            OwnerSnapshotStateV1::Missing { .. }
+        ));
+        assert!(!root.exists());
+
+        std::fs::create_dir(&root).unwrap();
+        let mut with_cwd = Edge {
+            source: EntityRef::parse("task:one").unwrap(),
+            kind: "RAN_BASH".into(),
+            target: EntityRef::parse("task:two").unwrap(),
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Exact,
+            metadata: BTreeMap::new(),
+        };
+        with_cwd
+            .metadata
+            .insert("cwd".into(), "/repo/worktree".into());
+        let without_cwd = Edge {
+            source: EntityRef::parse("task:two").unwrap(),
+            kind: "RELATED_TO".into(),
+            target: EntityRef::parse("task:one").unwrap(),
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+            metadata: BTreeMap::new(),
+        };
+        std::fs::write(
+            root.join("tool.jsonl"),
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&with_cwd).unwrap(),
+                serde_json::to_string(&without_cwd).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let snapshot =
+            capture_project_catalog_owner_snapshot(&root, OwnerSnapshotLimitsV1::default())
+                .unwrap();
+        assert_eq!(snapshot.row_count, 1);
+        assert!(matches!(
+            &snapshot.rows[0].value,
+            OwnerSnapshotRowValueV1::LegacyProjectSelector {
+                literal_selector,
+                ..
+            } if literal_selector == "/repo/worktree"
+        ));
+    }
 }
