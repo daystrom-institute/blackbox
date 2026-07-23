@@ -22,6 +22,24 @@ pub struct GitCommit {
     pub message: String,
 }
 
+/// A full object id verified to name a commit in one exact repository/object
+/// environment. The repository root and explicit alternate object directory
+/// are captured once so every subsequent tree/blob read uses the same
+/// authority inputs without resolving a movable ref again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedCommit {
+    repository_root: PathBuf,
+    oid: String,
+    alternate_objects: Option<PathBuf>,
+    object_id_hex_len: usize,
+}
+
+impl VerifiedCommit {
+    pub fn oid(&self) -> &str {
+        &self.oid
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitBlameLine {
     pub commit_sha: String,
@@ -276,44 +294,196 @@ pub fn read_committed_file_bytes_with_alternate(
     Some(output.stdout)
 }
 
-/// Strict bounded counterpart for migration and publication builders.
+/// Verify a full object id as a commit under the hardened exact-read
+/// environment used by publication builders.
 ///
-/// The stdout drain retains at most `max_bytes + 1` bytes while continuing to
-/// drain the child into a sink. This makes the limit an allocation bound, not
-/// a check performed after `Command::output()` has already retained an
-/// arbitrarily large blob.
-pub fn read_committed_file_bytes_bounded_with_alternate(
+/// Replacement objects, lazy fetching, ambient repository/ref/object
+/// redirection, and inherited alternate object directories are disabled.
+/// `alternate_root` is the only additional object store honored.
+pub fn verify_commit_oid_with_alternate(
     root: &Path,
-    r#ref: &str,
-    repo_rel: &str,
+    oid: &str,
     alternate_root: Option<&Path>,
+) -> Result<VerifiedCommit> {
+    if !matches!(oid.len(), 40 | 64)
+        || !oid
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        anyhow::bail!("exact commit must be a full lowercase hexadecimal object id");
+    }
+    let repository_root = root
+        .canonicalize()
+        .with_context(|| format!("canonicalizing exact-read repository {}", root.display()))?;
+    let repository_objects = resolve_hardened_git_objects_dir(&repository_root)?;
+    reject_repository_configured_alternates(&repository_objects)?;
+    let alternate_objects = alternate_root
+        .map(resolve_hardened_git_objects_dir)
+        .transpose()?;
+    if let Some(alternate_objects) = alternate_objects.as_deref() {
+        reject_repository_configured_alternates(alternate_objects)?;
+    }
+
+    let mut format_command = Command::new("git");
+    format_command
+        .arg("-C")
+        .arg(&repository_root)
+        .args(["rev-parse", "--show-object-format=storage"]);
+    configure_exact_read_environment(&mut format_command, alternate_objects.as_deref())?;
+    let format_output = run_bounded_with_timeout_and_stdout_limit(
+        format_command,
+        &repository_root,
+        "reading repository object format",
+        GIT_OUTPUT_TIMEOUT,
+        Some(32),
+    )
+    .context("running git to read repository object format")?;
+    ensure_exact_git_success(
+        &format_output,
+        &repository_root,
+        "reading repository object format",
+    )?;
+    if format_output.stdout_overflowed {
+        anyhow::bail!("repository object format output exceeded its byte limit");
+    }
+    let object_format = std::str::from_utf8(&format_output.stdout)
+        .context("repository object format is not UTF-8")?
+        .trim();
+    let object_id_hex_len = match object_format {
+        "sha1" => 40,
+        "sha256" => 64,
+        _ => anyhow::bail!("unsupported repository object format: {object_format:?}"),
+    };
+    if oid.len() != object_id_hex_len {
+        anyhow::bail!("exact commit object id length does not match repository object format");
+    }
+
+    let mut type_command = Command::new("git");
+    type_command
+        .arg("-C")
+        .arg(&repository_root)
+        .args(["cat-file", "-t", oid]);
+    configure_exact_read_environment(&mut type_command, alternate_objects.as_deref())?;
+    let type_output = run_bounded_with_timeout_and_stdout_limit(
+        type_command,
+        &repository_root,
+        "verifying exact commit object",
+        GIT_OUTPUT_TIMEOUT,
+        Some(32),
+    )
+    .context("running git to verify exact commit object")?;
+    ensure_exact_git_success(
+        &type_output,
+        &repository_root,
+        "verifying exact commit object",
+    )?;
+    if type_output.stdout_overflowed {
+        anyhow::bail!("exact commit type output exceeded its byte limit");
+    }
+    if type_output.stdout != b"commit\n" {
+        anyhow::bail!("exact commit object id does not name a commit");
+    }
+
+    Ok(VerifiedCommit {
+        repository_root,
+        oid: oid.to_string(),
+        alternate_objects,
+        object_id_hex_len,
+    })
+}
+
+/// Strict bounded blob read for a previously verified exact commit.
+///
+/// The stdout drain retains at most `max_bytes` while continuing to drain the
+/// child into a sink. Oversized output is reported separately from bounded
+/// diagnostics.
+pub fn read_verified_committed_file_bytes_bounded(
+    commit: &VerifiedCommit,
+    repo_rel: &str,
     max_bytes: usize,
-) -> Result<Option<Vec<u8>>> {
-    let retained_limit = max_bytes
-        .checked_add(1)
-        .context("committed file byte limit overflowed")?;
-    let spec = format!("{}:{}", r#ref, repo_rel);
+) -> Result<Vec<u8>> {
+    validate_repository_relative_git_path(repo_rel, "committed file")?;
+    let spec = format!("{}:{}", commit.oid, repo_rel);
     let mut command = Command::new("git");
     command
         .arg("-C")
-        .arg(root)
+        .arg(&commit.repository_root)
         .args(["cat-file", "blob", &spec]);
-    configure_alternate_objects(&mut command, alternate_root);
+    configure_exact_read_environment(&mut command, commit.alternate_objects.as_deref())?;
     let output = run_bounded_with_timeout_and_stdout_limit(
         command,
-        root,
+        &commit.repository_root,
         "reading bounded committed file",
         GIT_OUTPUT_TIMEOUT,
-        Some(retained_limit),
+        Some(max_bytes),
     )
-    .with_context(|| format!("reading bounded committed file in {}", root.display()))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    if output.stdout.len() > max_bytes {
+    .with_context(|| {
+        format!(
+            "reading bounded committed file in {}",
+            commit.repository_root.display()
+        )
+    })?;
+    ensure_exact_git_success(
+        &output,
+        &commit.repository_root,
+        "reading exact committed file",
+    )?;
+    if output.stdout_overflowed {
         anyhow::bail!("committed file exceeds its byte limit");
     }
-    Ok(Some(output.stdout))
+    Ok(output.stdout)
+}
+
+fn resolve_hardened_git_objects_dir(root: &Path) -> Result<PathBuf> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("canonicalizing alternate repository {}", root.display()))?;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(&root).args([
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "objects",
+    ]);
+    configure_exact_read_environment(&mut command, None)?;
+    let output = run_bounded_with_timeout_and_stdout_limit(
+        command,
+        &root,
+        "resolving explicit alternate object directory",
+        GIT_OUTPUT_TIMEOUT,
+        Some(16 * 1024),
+    )
+    .context("running git to resolve explicit alternate object directory")?;
+    ensure_exact_git_success(
+        &output,
+        &root,
+        "resolving explicit alternate object directory",
+    )?;
+    if output.stdout_overflowed {
+        anyhow::bail!("alternate object directory output exceeded its byte limit");
+    }
+    let raw = std::str::from_utf8(&output.stdout)
+        .context("alternate object directory is not UTF-8")?
+        .trim();
+    if raw.is_empty() || raw.contains('\n') || raw.contains('\r') {
+        anyhow::bail!("alternate object directory output is malformed");
+    }
+    PathBuf::from(raw)
+        .canonicalize()
+        .with_context(|| format!("canonicalizing alternate object directory {raw}"))
+}
+
+fn reject_repository_configured_alternates(objects: &Path) -> Result<()> {
+    let alternates_file = objects.join("info/alternates");
+    if alternates_file
+        .try_exists()
+        .with_context(|| format!("checking {}", alternates_file.display()))?
+    {
+        anyhow::bail!(
+            "exact publication reads do not honor repository-configured object alternates"
+        );
+    }
+    Ok(())
 }
 
 /// List the files under a directory in a COMMITTED tree via
@@ -367,44 +537,57 @@ pub fn list_committed_dir_result_with_alternate(
 
 /// Strict bounded committed-tree enumeration for publication builders.
 ///
-/// Git emits NUL-delimited repository-relative paths. The child drain retains
-/// at most `max_listing_bytes + 1`, then this parser rejects oversized,
-/// non-UTF-8, non-confined, duplicate, out-of-directory, or over-count
-/// listings. Returned paths are sorted independently of input order.
-pub fn list_committed_dir_bounded_with_alternate(
-    root: &Path,
-    r#ref: &str,
+/// Git emits NUL-delimited mode/type/object/path records. The child drain
+/// retains at most `max_listing_bytes`, then this parser rejects overflow,
+/// non-regular entries, non-UTF-8 or non-confined paths, duplicates, paths
+/// outside the requested directory, and over-count listings. Returned paths
+/// are sorted independently of input order.
+pub fn list_verified_committed_dir_bounded(
+    commit: &VerifiedCommit,
     dir_rel: &str,
-    alternate_root: Option<&Path>,
     max_entries: usize,
     max_listing_bytes: usize,
 ) -> Result<Vec<String>> {
     validate_repository_relative_git_path(dir_rel, "committed directory")?;
-    let retained_limit = max_listing_bytes
-        .checked_add(1)
-        .context("committed directory listing byte limit overflowed")?;
     let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(root)
-        .args(["ls-tree", "-r", "-z", "--name-only", r#ref, "--", dir_rel]);
-    configure_alternate_objects(&mut command, alternate_root);
+    command.arg("-C").arg(&commit.repository_root).args([
+        "--literal-pathspecs",
+        "ls-tree",
+        "-r",
+        "-z",
+        &commit.oid,
+        "--",
+        dir_rel,
+    ]);
+    configure_exact_read_environment(&mut command, commit.alternate_objects.as_deref())?;
     let output = run_bounded_with_timeout_and_stdout_limit(
         command,
-        root,
+        &commit.repository_root,
         "listing bounded committed directory",
         GIT_OUTPUT_TIMEOUT,
-        Some(retained_limit),
+        Some(max_listing_bytes),
     )
-    .with_context(|| format!("listing bounded committed directory in {}", root.display()))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git ls-tree failed in {}: {}",
-            root.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+    .with_context(|| {
+        format!(
+            "listing bounded committed directory in {}",
+            commit.repository_root.display()
+        )
+    })?;
+    ensure_exact_git_success(
+        &output,
+        &commit.repository_root,
+        "listing exact committed directory",
+    )?;
+    if output.stdout_overflowed {
+        anyhow::bail!("committed directory listing exceeds its byte limit");
     }
-    parse_bounded_committed_tree_paths(&output.stdout, dir_rel, max_entries, max_listing_bytes)
+    parse_bounded_committed_tree_paths(
+        &output.stdout,
+        dir_rel,
+        max_entries,
+        max_listing_bytes,
+        commit.object_id_hex_len,
+    )
 }
 
 fn parse_bounded_committed_tree_paths(
@@ -412,6 +595,7 @@ fn parse_bounded_committed_tree_paths(
     dir_rel: &str,
     max_entries: usize,
     max_listing_bytes: usize,
+    object_id_hex_len: usize,
 ) -> Result<Vec<String>> {
     if listing.len() > max_listing_bytes {
         anyhow::bail!("committed directory listing exceeds its byte limit");
@@ -425,9 +609,34 @@ fn parse_bounded_committed_tree_paths(
 
     let prefix = format!("{dir_rel}/");
     let mut paths = std::collections::BTreeSet::new();
-    for raw_path in listing[..listing.len() - 1].split(|byte| *byte == 0) {
+    for raw_record in listing[..listing.len() - 1].split(|byte| *byte == 0) {
         if paths.len() >= max_entries {
             anyhow::bail!("committed directory listing exceeds its entry limit");
+        }
+        let path_delimiter = raw_record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .context("committed directory listing entry has no path delimiter")?;
+        let metadata = &raw_record[..path_delimiter];
+        let raw_path = &raw_record[path_delimiter + 1..];
+        let mut fields = metadata.split(|byte| *byte == b' ');
+        let mode = fields
+            .next()
+            .context("committed directory listing entry has no mode")?;
+        let object_type = fields
+            .next()
+            .context("committed directory listing entry has no type")?;
+        let object_id = fields
+            .next()
+            .context("committed directory listing entry has no object id")?;
+        if fields.next().is_some()
+            || object_id.len() != object_id_hex_len
+            || !object_id.iter().all(|byte| byte.is_ascii_hexdigit())
+        {
+            anyhow::bail!("committed directory listing entry metadata is malformed");
+        }
+        if object_type != b"blob" || (mode != b"100644" && mode != b"100755") {
+            anyhow::bail!("committed directory listing contains a non-regular-file entry");
         }
         let path = std::str::from_utf8(raw_path)
             .context("committed directory listing contains a non-UTF-8 path")?;
@@ -917,6 +1126,58 @@ pub fn parse_commit_log(stdout: &[u8]) -> Result<Vec<GitCommit>> {
 /// all indexing until the child was killed by hand. 10s is generous for
 /// every metadata/log invocation these helpers make against healthy repos.
 const GIT_OUTPUT_TIMEOUT: Duration = Duration::from_secs(10);
+const GIT_STDERR_RETAINED_LIMIT: usize = 64 * 1024;
+
+struct BoundedGitOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_overflowed: bool,
+    stderr_overflowed: bool,
+}
+
+impl BoundedGitOutput {
+    fn into_output(mut self) -> Output {
+        if self.stderr_overflowed {
+            append_truncation_marker(
+                &mut self.stderr,
+                GIT_STDERR_RETAINED_LIMIT,
+                b"\n[git stderr truncated]\n",
+            );
+        }
+        Output {
+            status: self.status,
+            stdout: self.stdout,
+            stderr: self.stderr,
+        }
+    }
+}
+
+fn append_truncation_marker(bytes: &mut Vec<u8>, limit: usize, marker: &[u8]) {
+    if marker.len() > limit {
+        bytes.truncate(limit);
+        return;
+    }
+    bytes.truncate(limit - marker.len());
+    bytes.extend_from_slice(marker);
+}
+
+fn ensure_exact_git_success(output: &BoundedGitOutput, root: &Path, action: &str) -> Result<()> {
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let suffix = if output.stderr_overflowed {
+            " [stderr truncated]"
+        } else {
+            ""
+        };
+        anyhow::bail!(
+            "{action} failed in {}: {}{suffix}",
+            root.display(),
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
 
 pub fn git_output(path: &Path, args: &[&str], action: &'static str) -> Option<Output> {
     git_output_with_alternate(path, args, None, action)
@@ -934,6 +1195,10 @@ fn git_output_with_alternate(
     run_git_bounded(cmd, path, action)
 }
 
+// Compatibility Git helpers intentionally preserve their historical ambient
+// repository and alternate-object behavior. Publication reads use the
+// VerifiedCommit path below, which scrubs ambient authority and captures only
+// one explicit alternate object directory.
 fn configure_alternate_objects(command: &mut Command, alternate_root: Option<&Path>) {
     if let Some(alternate_root) = alternate_root
         && let Some(objects) = git_objects_dir(alternate_root)
@@ -948,6 +1213,54 @@ fn configure_alternate_objects(command: &mut Command, alternate_root: Option<&Pa
             command.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", joined);
         }
     }
+}
+
+fn configure_exact_read_environment(
+    command: &mut Command,
+    alternate_objects: Option<&Path>,
+) -> Result<()> {
+    const SCRUBBED_GIT_ENVIRONMENT: &[&str] = &[
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_DIR",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_GRAFT_FILE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_QUARANTINE_PATH",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_SHALLOW_FILE",
+        "GIT_WORK_TREE",
+    ];
+    for key in SCRUBBED_GIT_ENVIRONMENT {
+        command.env_remove(key);
+    }
+    for (key, _) in std::env::vars_os() {
+        let key_text = key.to_string_lossy();
+        if key_text.starts_with("GIT_CONFIG_KEY_") || key_text.starts_with("GIT_CONFIG_VALUE_") {
+            command.env_remove(key);
+        }
+    }
+    command
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    if let Some(objects) = alternate_objects {
+        let joined = std::env::join_paths([objects])
+            .context("encoding explicit alternate object directory")?;
+        command.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", joined);
+    }
+    Ok(())
 }
 
 fn git_objects_dir(root: &Path) -> Option<PathBuf> {
@@ -997,6 +1310,7 @@ fn run_bounded_with_timeout(
     timeout: Duration,
 ) -> Option<Output> {
     run_bounded_with_timeout_and_stdout_limit(cmd, path, action, timeout, None)
+        .map(BoundedGitOutput::into_output)
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -1006,9 +1320,7 @@ fn run_bounded_with_timeout_and_stdout_limit(
     action: &'static str,
     timeout: Duration,
     retained_stdout_limit: Option<usize>,
-) -> Option<Output> {
-    use std::io::Read;
-
+) -> Option<BoundedGitOutput> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1027,21 +1339,10 @@ fn run_bounded_with_timeout_and_stdout_limit(
     let mut stdout_pipe = child.stdout.take()?;
     let mut stderr_pipe = child.stderr.take()?;
     let stdout_drain = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(limit) = retained_stdout_limit {
-            let mut retained = stdout_pipe.by_ref().take(limit as u64);
-            let _ = retained.read_to_end(&mut buf);
-            drop(retained);
-            let _ = std::io::copy(&mut stdout_pipe, &mut std::io::sink());
-        } else {
-            let _ = stdout_pipe.read_to_end(&mut buf);
-        }
-        buf
+        drain_with_retention_limit(&mut stdout_pipe, retained_stdout_limit)
     });
     let stderr_drain = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
+        drain_with_retention_limit(&mut stderr_pipe, Some(GIT_STDERR_RETAINED_LIMIT))
     });
 
     let deadline = std::time::Instant::now() + timeout;
@@ -1054,12 +1355,16 @@ fn run_bounded_with_timeout_and_stdout_limit(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let stdout = stdout_drain.join().unwrap_or_default();
-                let stderr = stderr_drain.join().unwrap_or_default();
-                return Some(Output {
+                let (stdout, stdout_overflowed) =
+                    stdout_drain.join().unwrap_or_else(|_| (Vec::new(), false));
+                let (stderr, stderr_overflowed) =
+                    stderr_drain.join().unwrap_or_else(|_| (Vec::new(), false));
+                return Some(BoundedGitOutput {
                     status,
                     stdout,
                     stderr,
+                    stdout_overflowed,
+                    stderr_overflowed,
                 });
             }
             Ok(None) => {
@@ -1102,6 +1407,27 @@ fn run_bounded_with_timeout_and_stdout_limit(
     }
 }
 
+fn drain_with_retention_limit(
+    pipe: &mut impl std::io::Read,
+    retained_limit: Option<usize>,
+) -> (Vec<u8>, bool) {
+    use std::io::Read;
+
+    let mut retained_bytes = Vec::new();
+    let Some(limit) = retained_limit else {
+        let _ = pipe.read_to_end(&mut retained_bytes);
+        return (retained_bytes, false);
+    };
+
+    let mut retained = pipe.by_ref().take(limit as u64);
+    let _ = retained.read_to_end(&mut retained_bytes);
+    drop(retained);
+    let mut overflow_probe = [0_u8; 1];
+    let overflowed = pipe.read(&mut overflow_probe).unwrap_or(0) != 0;
+    let _ = std::io::copy(pipe, &mut std::io::sink());
+    (retained_bytes, overflowed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1137,6 +1463,62 @@ mod tests {
                 .expect("fast child must succeed");
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "bounded-ok");
+    }
+
+    #[test]
+    fn bounded_runner_caps_stderr_and_preserves_overflow_diagnostic() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "head -c 70000 /dev/zero >&2; exit 7"]);
+        let output = run_bounded_with_timeout_and_stdout_limit(
+            cmd,
+            Path::new("/tmp"),
+            "test-stderr-bound",
+            Duration::from_secs(10),
+            Some(16),
+        )
+        .unwrap();
+        assert_eq!(output.stderr.len(), GIT_STDERR_RETAINED_LIMIT);
+        assert!(output.stderr_overflowed);
+        let process_output = output.into_output();
+        assert_eq!(process_output.stderr.len(), GIT_STDERR_RETAINED_LIMIT);
+        assert!(
+            process_output
+                .stderr
+                .ends_with(b"\n[git stderr truncated]\n")
+        );
+    }
+
+    #[test]
+    fn exact_read_environment_scrubs_redirection_and_disables_lazy_fetch() {
+        let alternate = tempfile::tempdir().unwrap();
+        let mut command = Command::new("git");
+        command
+            .env("GIT_DIR", "/ambient/repository")
+            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", "/ambient/objects");
+        configure_exact_read_environment(&mut command, Some(alternate.path())).unwrap();
+        let environment = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(environment.get("GIT_DIR"), Some(&None));
+        assert_eq!(
+            environment.get("GIT_NO_LAZY_FETCH"),
+            Some(&Some("1".to_string()))
+        );
+        assert_eq!(
+            environment.get("GIT_NO_REPLACE_OBJECTS"),
+            Some(&Some("1".to_string()))
+        );
+        assert_ne!(
+            environment.get("GIT_ALTERNATE_OBJECT_DIRECTORIES"),
+            Some(&Some("/ambient/objects".to_string()))
+        );
     }
 
     #[test]
@@ -1268,38 +1650,25 @@ mod tests {
         write(&root, ".bbox/knowledge/e1.json", "0123456789");
         run_git(&root, &["add", "."]);
         run_git(&root, &["commit", "-q", "-m", "c1"]);
+        let oid = resolve_commit(&root, "HEAD").unwrap();
+        let commit = verify_commit_oid_with_alternate(&root, &oid, None).unwrap();
 
         assert_eq!(
-            read_committed_file_bytes_bounded_with_alternate(
-                &root,
-                "HEAD",
-                ".bbox/knowledge/e1.json",
-                None,
-                10,
-            )
-            .unwrap()
-            .as_deref(),
-            Some(b"0123456789".as_slice())
+            read_verified_committed_file_bytes_bounded(&commit, ".bbox/knowledge/e1.json", 10,)
+                .unwrap(),
+            b"0123456789"
         );
-        let error = read_committed_file_bytes_bounded_with_alternate(
-            &root,
-            "HEAD",
-            ".bbox/knowledge/e1.json",
-            None,
-            9,
-        )
-        .unwrap_err();
+        let error =
+            read_verified_committed_file_bytes_bounded(&commit, ".bbox/knowledge/e1.json", 9)
+                .unwrap_err();
         assert!(error.to_string().contains("exceeds its byte limit"));
         assert!(
-            read_committed_file_bytes_bounded_with_alternate(
-                &root,
-                "HEAD",
+            read_verified_committed_file_bytes_bounded(
+                &commit,
                 ".bbox/knowledge/missing.json",
-                None,
                 10,
             )
-            .unwrap()
-            .is_none()
+            .is_err()
         );
     }
 
@@ -1356,32 +1725,23 @@ mod tests {
             .as_deref(),
             Some(b"published-two".as_slice())
         );
+        let verified =
+            verify_commit_oid_with_alternate(&checkout, &publisher_head, Some(&publisher)).unwrap();
         assert_eq!(
-            list_committed_dir_bounded_with_alternate(
-                &checkout,
-                &publisher_head,
-                ".bbox/knowledge",
-                Some(&publisher),
-                10,
-                4096,
-            )
-            .unwrap(),
+            list_verified_committed_dir_bounded(&verified, ".bbox/knowledge", 10, 4096,).unwrap(),
             vec![
                 ".bbox/knowledge/first.json".to_string(),
                 ".bbox/knowledge/second.json".to_string(),
             ]
         );
         assert_eq!(
-            read_committed_file_bytes_bounded_with_alternate(
-                &checkout,
-                &publisher_head,
+            read_verified_committed_file_bytes_bounded(
+                &verified,
                 ".bbox/knowledge/second.json",
-                Some(&publisher),
                 64,
             )
-            .unwrap()
-            .as_deref(),
-            Some(b"published-two".as_slice())
+            .unwrap(),
+            b"published-two"
         );
     }
 
@@ -1421,16 +1781,11 @@ mod tests {
         write(&root, ".bbox/knowledge/a.json", "a");
         run_git(&root, &["add", "."]);
         run_git(&root, &["commit", "-q", "-m", "c1"]);
+        let oid = resolve_commit(&root, "HEAD").unwrap();
+        let commit = verify_commit_oid_with_alternate(&root, &oid, None).unwrap();
 
-        let paths = list_committed_dir_bounded_with_alternate(
-            &root,
-            "HEAD",
-            ".bbox/knowledge",
-            None,
-            2,
-            4096,
-        )
-        .unwrap();
+        let paths =
+            list_verified_committed_dir_bounded(&commit, ".bbox/knowledge", 2, 4096).unwrap();
         assert_eq!(
             paths,
             vec![
@@ -1439,49 +1794,214 @@ mod tests {
             ]
         );
         assert!(
-            list_committed_dir_bounded_with_alternate(
-                &root,
-                "HEAD",
-                ".bbox/knowledge",
-                None,
-                1,
-                4096,
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("entry limit")
+            list_verified_committed_dir_bounded(&commit, ".bbox/knowledge", 1, 4096)
+                .unwrap_err()
+                .to_string()
+                .contains("entry limit")
         );
         assert!(
-            list_committed_dir_bounded_with_alternate(
-                &root,
-                "HEAD",
-                ".bbox/knowledge",
-                None,
-                2,
-                1,
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("byte limit")
+            list_verified_committed_dir_bounded(&commit, ".bbox/knowledge", 2, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("byte limit")
         );
+    }
+
+    fn ls_tree_record(mode: &str, object_type: &str, path: &[u8]) -> Vec<u8> {
+        let mut record = format!("{mode} {object_type} {}\t", "a".repeat(40)).into_bytes();
+        record.extend_from_slice(path);
+        record.push(0);
+        record
     }
 
     #[test]
     fn bounded_committed_listing_rejects_malformed_paths() {
+        let mut unterminated = ls_tree_record("100644", "blob", b".bbox/knowledge/good.json");
+        unterminated.pop();
+        let mut duplicate = ls_tree_record("100644", "blob", b".bbox/knowledge/a.json");
+        duplicate.extend(ls_tree_record("100644", "blob", b".bbox/knowledge/a.json"));
         for malformed in [
-            b".bbox/knowledge/good.json".as_slice(),
-            b".bbox/knowledge/../escape.json\0".as_slice(),
-            b".bbox/knowledge/nested\\bad.json\0".as_slice(),
-            b".bbox/knowledge/\xff.json\0".as_slice(),
-            b"outside/file.json\0".as_slice(),
-            b".bbox/knowledge/a.json\0.bbox/knowledge/a.json\0".as_slice(),
+            unterminated,
+            ls_tree_record("100644", "blob", b".bbox/knowledge/../escape.json"),
+            ls_tree_record("100644", "blob", b".bbox/knowledge/nested\\bad.json"),
+            ls_tree_record("100644", "blob", b".bbox/knowledge/\xff.json"),
+            ls_tree_record("100644", "blob", b"outside/file.json"),
+            duplicate,
         ] {
             assert!(
-                parse_bounded_committed_tree_paths(malformed, ".bbox/knowledge", 10, 4096,)
+                parse_bounded_committed_tree_paths(&malformed, ".bbox/knowledge", 10, 4096, 40,)
                     .is_err(),
                 "malformed listing was accepted: {malformed:?}"
             );
         }
+    }
+
+    #[test]
+    fn bounded_committed_listing_rejects_non_regular_entries() {
+        for listing in [
+            ls_tree_record("120000", "blob", b".bbox/knowledge/link.json"),
+            ls_tree_record("160000", "commit", b".bbox/knowledge/module.json"),
+            ls_tree_record("040000", "tree", b".bbox/knowledge/nested"),
+            b"malformed metadata\t.bbox/knowledge/a.json\0".to_vec(),
+        ] {
+            assert!(
+                parse_bounded_committed_tree_paths(&listing, ".bbox/knowledge", 10, 4096, 40,)
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_listing_rejects_committed_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        init_repo(&root);
+        let knowledge = root.join(".bbox/knowledge");
+        fs::create_dir_all(&knowledge).unwrap();
+        symlink("target.json", knowledge.join("link.json")).unwrap();
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-q", "-m", "symlink"]);
+        let oid = resolve_commit(&root, "HEAD").unwrap();
+        let verified = verify_commit_oid_with_alternate(&root, &oid, None).unwrap();
+
+        assert!(
+            list_verified_committed_dir_bounded(&verified, ".bbox/knowledge", 10, 4096)
+                .unwrap_err()
+                .to_string()
+                .contains("non-regular-file")
+        );
+    }
+
+    #[test]
+    fn exact_commit_reads_ignore_ref_movement_and_replacement_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        init_repo(&root);
+        write(&root, ".bbox/knowledge/entry.json", "first");
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-q", "-m", "first"]);
+        let first = resolve_commit(&root, "HEAD").unwrap();
+        let verified = verify_commit_oid_with_alternate(&root, &first, None).unwrap();
+
+        write(&root, ".bbox/knowledge/entry.json", "second");
+        run_git(&root, &["commit", "-q", "-am", "second"]);
+        let second = resolve_commit(&root, "HEAD").unwrap();
+        run_git(&root, &["replace", &first, &second]);
+
+        assert_eq!(verified.oid(), first);
+        assert_eq!(
+            read_verified_committed_file_bytes_bounded(
+                &verified,
+                ".bbox/knowledge/entry.json",
+                16,
+            )
+            .unwrap(),
+            b"first"
+        );
+        assert!(
+            verify_commit_oid_with_alternate(&root, &first[..12], None).is_err(),
+            "abbreviated object ids must not cross the exact-read boundary"
+        );
+    }
+
+    #[test]
+    fn exact_commit_verification_rejects_repository_configured_alternates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        init_repo(&root);
+        write(&root, "entry", "one");
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-q", "-m", "one"]);
+        let oid = resolve_commit(&root, "HEAD").unwrap();
+        let info = root.join(".git/objects/info");
+        fs::create_dir_all(&info).unwrap();
+        fs::write(info.join("alternates"), b"/untrusted/object/store\n").unwrap();
+
+        assert!(verify_commit_oid_with_alternate(&root, &oid, None).is_err());
+    }
+
+    #[test]
+    fn exact_listing_treats_special_pathspec_characters_literally() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        init_repo(&root);
+        let tree_dir = ".bbox/knowledge/literal*?[x]!:scope";
+        write(&root, &format!("{tree_dir}/entry.json"), "exact");
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-q", "-m", "special-path"]);
+        let oid = resolve_commit(&root, "HEAD").unwrap();
+        let verified = verify_commit_oid_with_alternate(&root, &oid, None).unwrap();
+
+        assert_eq!(
+            list_verified_committed_dir_bounded(&verified, tree_dir, 1, 4096).unwrap(),
+            vec![format!("{tree_dir}/entry.json")]
+        );
+    }
+
+    #[test]
+    fn exact_blob_read_does_not_lazy_fetch_missing_promised_objects() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        fs::create_dir_all(&root).unwrap();
+        init_repo(&root);
+        write(&root, ".bbox/knowledge/entry.json", "promised");
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-q", "-m", "promised"]);
+        let oid = resolve_commit(&root, "HEAD").unwrap();
+
+        let remote = temp.path().join("remote.git");
+        let clone = Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                "-q",
+                root.to_str().unwrap(),
+                remote.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(clone.status.success());
+        run_git(
+            &root,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run_git(&root, &["config", "core.repositoryformatversion", "1"]);
+        run_git(&root, &["config", "remote.origin.promisor", "true"]);
+        run_git(
+            &root,
+            &["config", "remote.origin.partialclonefilter", "blob:none"],
+        );
+        run_git(&root, &["config", "extensions.partialClone", "origin"]);
+
+        let blob = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["rev-parse", "HEAD:.bbox/knowledge/entry.json"])
+            .output()
+            .unwrap();
+        assert!(blob.status.success());
+        let blob = String::from_utf8(blob.stdout).unwrap();
+        let blob = blob.trim();
+        let loose_blob = root.join(".git/objects").join(&blob[..2]).join(&blob[2..]);
+        assert!(loose_blob.is_file());
+        fs::remove_file(&loose_blob).unwrap();
+
+        let verified = verify_commit_oid_with_alternate(&root, &oid, None).unwrap();
+        assert!(
+            read_verified_committed_file_bytes_bounded(
+                &verified,
+                ".bbox/knowledge/entry.json",
+                64,
+            )
+            .is_err()
+        );
+        assert!(
+            !loose_blob.exists(),
+            "the hardened read must not fetch a missing promised blob"
+        );
     }
 
     #[test]

@@ -59,21 +59,81 @@ pub struct PublishedKnowledgeSnapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublishedKnowledgeSourceLimits {
-    pub max_entries: usize,
-    pub max_file_bytes: usize,
-    pub max_total_bytes: usize,
-    pub max_listing_bytes: usize,
+    max_entries: usize,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+    max_listing_bytes: usize,
+}
+
+impl PublishedKnowledgeSourceLimits {
+    pub const MAX_ENTRIES: usize = 100_000;
+    pub const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
+    pub const MAX_TOTAL_BYTES: usize = 128 * 1024 * 1024;
+    pub const MAX_LISTING_BYTES: usize = 32 * 1024 * 1024;
+
+    pub fn try_new(
+        max_entries: usize,
+        max_file_bytes: usize,
+        max_total_bytes: usize,
+        max_listing_bytes: usize,
+    ) -> Result<Self> {
+        validate_source_limit(max_entries, Self::MAX_ENTRIES, "published knowledge entry")?;
+        validate_source_limit(
+            max_file_bytes,
+            Self::MAX_FILE_BYTES,
+            "published knowledge per-file byte",
+        )?;
+        validate_source_limit(
+            max_total_bytes,
+            Self::MAX_TOTAL_BYTES,
+            "published knowledge total byte",
+        )?;
+        validate_source_limit(
+            max_listing_bytes,
+            Self::MAX_LISTING_BYTES,
+            "published knowledge listing byte",
+        )?;
+        Ok(Self {
+            max_entries,
+            max_file_bytes,
+            max_total_bytes,
+            max_listing_bytes,
+        })
+    }
+
+    pub fn max_entries(self) -> usize {
+        self.max_entries
+    }
+
+    pub fn max_file_bytes(self) -> usize {
+        self.max_file_bytes
+    }
+
+    pub fn max_total_bytes(self) -> usize {
+        self.max_total_bytes
+    }
+
+    pub fn max_listing_bytes(self) -> usize {
+        self.max_listing_bytes
+    }
 }
 
 impl Default for PublishedKnowledgeSourceLimits {
     fn default() -> Self {
         Self {
-            max_entries: 100_000,
-            max_file_bytes: 2 * 1024 * 1024,
-            max_total_bytes: 128 * 1024 * 1024,
-            max_listing_bytes: 32 * 1024 * 1024,
+            max_entries: Self::MAX_ENTRIES,
+            max_file_bytes: Self::MAX_FILE_BYTES,
+            max_total_bytes: Self::MAX_TOTAL_BYTES,
+            max_listing_bytes: Self::MAX_LISTING_BYTES,
         }
     }
+}
+
+fn validate_source_limit(value: usize, ceiling: usize, label: &str) -> Result<()> {
+    if value == 0 || value > ceiling {
+        anyhow::bail!("{label} limit must be between 1 and {ceiling}");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -421,17 +481,25 @@ pub fn load_published_knowledge_sources_at_commit(
     alternate_root: Option<&Path>,
     limits: PublishedKnowledgeSourceLimits,
 ) -> Result<Vec<PublishedKnowledgeSourceFile>> {
+    const MAX_TREE_ENTRIES: usize = 200_000;
+
     scope
         .validate()
         .context("invalid published knowledge scope")?;
+    let verified_commit =
+        git::verify_commit_oid_with_alternate(publisher_root, publisher_commit, alternate_root)
+            .with_context(|| {
+                format!(
+                    "verifying exact published knowledge commit in {}",
+                    publisher_root.display()
+                )
+            })?;
     let tree_dir = knowledge_tree_dir(scope);
     let prefix = format!("{tree_dir}/");
-    let repo_paths = git::list_committed_dir_bounded_with_alternate(
-        publisher_root,
-        publisher_commit,
+    let repo_paths = git::list_verified_committed_dir_bounded(
+        &verified_commit,
         &tree_dir,
-        alternate_root,
-        limits.max_entries,
+        MAX_TREE_ENTRIES,
         limits.max_listing_bytes,
     )
     .with_context(|| {
@@ -442,16 +510,23 @@ pub fn load_published_knowledge_sources_at_commit(
     })?;
 
     let mut total_bytes = 0_usize;
+    let mut entry_count = 0_usize;
     let mut ids = BTreeSet::new();
-    let mut sources = Vec::with_capacity(repo_paths.len());
+    let mut sources = Vec::with_capacity(repo_paths.len().min(limits.max_entries));
     for repo_path in repo_paths {
         let filename = repo_path.strip_prefix(&prefix).ok_or_else(|| {
             anyhow::anyhow!("committed knowledge path is outside its published scope")
         })?;
-        validate_snapshot_filename(filename, "published knowledge")?;
-        if filename.contains('/') {
-            anyhow::bail!("published knowledge source must be a flat JSON file");
+        if !filename.ends_with(".json") {
+            continue;
         }
+        entry_count = entry_count
+            .checked_add(1)
+            .context("published knowledge entry count overflowed")?;
+        if entry_count > limits.max_entries {
+            anyhow::bail!("published knowledge sources exceed their entry limit");
+        }
+        validate_snapshot_filename(filename, "published knowledge")?;
         let remaining = limits
             .max_total_bytes
             .checked_sub(total_bytes)
@@ -459,20 +534,13 @@ pub fn load_published_knowledge_sources_at_commit(
                 anyhow::anyhow!("published knowledge sources exceed their total byte limit")
             })?;
         let read_limit = limits.max_file_bytes.min(remaining);
-        let source_bytes = git::read_committed_file_bytes_bounded_with_alternate(
-            publisher_root,
-            publisher_commit,
+        let source_bytes = git::read_verified_committed_file_bytes_bounded(
+            &verified_commit,
             &repo_path,
-            alternate_root,
             read_limit,
         )
         .with_context(|| {
             format!("reading bounded committed knowledge file {repo_path} at {publisher_commit}")
-        })?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "committed knowledge file disappeared from immutable commit {publisher_commit}"
-            )
         })?;
         total_bytes = total_bytes.checked_add(source_bytes.len()).ok_or_else(|| {
             anyhow::anyhow!("published knowledge source total byte count overflowed")
@@ -1231,6 +1299,7 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("z.json"), &second).unwrap();
         std::fs::write(directory.join("a.json"), &first).unwrap();
+        std::fs::write(directory.join(".schema-epoch"), b"{\"schema_epoch\":1}\n").unwrap();
         run(&root, &["add", ".bbox/knowledge"]);
         run(&root, &["commit", "-q", "-m", "seed"]);
         let commit = git::resolve_commit(&root, "HEAD").unwrap();
@@ -1241,7 +1310,13 @@ mod tests {
             &commit,
             &scope,
             None,
-            PublishedKnowledgeSourceLimits::default(),
+            PublishedKnowledgeSourceLimits::try_new(
+                2,
+                PublishedKnowledgeSourceLimits::MAX_FILE_BYTES,
+                PublishedKnowledgeSourceLimits::MAX_TOTAL_BYTES,
+                PublishedKnowledgeSourceLimits::MAX_LISTING_BYTES,
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -1256,29 +1331,83 @@ mod tests {
 
         let defaults = PublishedKnowledgeSourceLimits::default();
         for limits in [
-            PublishedKnowledgeSourceLimits {
-                max_entries: 1,
-                ..defaults
-            },
-            PublishedKnowledgeSourceLimits {
-                max_file_bytes: sources[0].source_bytes.len() - 1,
-                ..defaults
-            },
-            PublishedKnowledgeSourceLimits {
-                max_total_bytes: sources
+            PublishedKnowledgeSourceLimits::try_new(
+                1,
+                defaults.max_file_bytes(),
+                defaults.max_total_bytes(),
+                defaults.max_listing_bytes(),
+            )
+            .unwrap(),
+            PublishedKnowledgeSourceLimits::try_new(
+                defaults.max_entries(),
+                sources[0].source_bytes.len() - 1,
+                defaults.max_total_bytes(),
+                defaults.max_listing_bytes(),
+            )
+            .unwrap(),
+            PublishedKnowledgeSourceLimits::try_new(
+                defaults.max_entries(),
+                defaults.max_file_bytes(),
+                sources
                     .iter()
                     .map(|source| source.source_bytes.len())
                     .sum::<usize>()
                     - 1,
-                ..defaults
-            },
-            PublishedKnowledgeSourceLimits {
-                max_listing_bytes: 1,
-                ..defaults
-            },
+                defaults.max_listing_bytes(),
+            )
+            .unwrap(),
+            PublishedKnowledgeSourceLimits::try_new(
+                defaults.max_entries(),
+                defaults.max_file_bytes(),
+                defaults.max_total_bytes(),
+                1,
+            )
+            .unwrap(),
         ] {
             assert!(
                 load_published_knowledge_sources_at_commit(&root, &commit, &scope, None, limits)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn publication_source_limits_reject_zero_and_above_ceiling_values() {
+        let defaults = PublishedKnowledgeSourceLimits::default();
+        for values in [
+            (
+                0,
+                defaults.max_file_bytes(),
+                defaults.max_total_bytes(),
+                defaults.max_listing_bytes(),
+            ),
+            (
+                PublishedKnowledgeSourceLimits::MAX_ENTRIES + 1,
+                defaults.max_file_bytes(),
+                defaults.max_total_bytes(),
+                defaults.max_listing_bytes(),
+            ),
+            (
+                defaults.max_entries(),
+                PublishedKnowledgeSourceLimits::MAX_FILE_BYTES + 1,
+                defaults.max_total_bytes(),
+                defaults.max_listing_bytes(),
+            ),
+            (
+                defaults.max_entries(),
+                defaults.max_file_bytes(),
+                PublishedKnowledgeSourceLimits::MAX_TOTAL_BYTES + 1,
+                defaults.max_listing_bytes(),
+            ),
+            (
+                defaults.max_entries(),
+                defaults.max_file_bytes(),
+                defaults.max_total_bytes(),
+                PublishedKnowledgeSourceLimits::MAX_LISTING_BYTES + 1,
+            ),
+        ] {
+            assert!(
+                PublishedKnowledgeSourceLimits::try_new(values.0, values.1, values.2, values.3)
                     .is_err()
             );
         }
@@ -1300,6 +1429,33 @@ mod tests {
         .unwrap();
         run(&root, &["add", ".bbox/knowledge"]);
         run(&root, &["commit", "-q", "-m", "nested"]);
+        let commit = git::resolve_commit(&root, "HEAD").unwrap();
+
+        assert!(
+            load_published_knowledge_sources_at_commit(
+                &root,
+                &commit,
+                &PublishedScope::try_new("repo", ".").unwrap(),
+                None,
+                PublishedKnowledgeSourceLimits::default(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn publication_source_loader_rejects_invalid_top_level_json_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        run(&root, &["init", "-q", "-b", "main"]);
+        run(&root, &["config", "user.email", "test@example.com"]);
+        run(&root, &["config", "user.name", "Test"]);
+        let directory = root.join(".bbox/knowledge");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(".schema-epoch"), b"metadata\n").unwrap();
+        std::fs::write(directory.join("broken.json"), b"{").unwrap();
+        run(&root, &["add", ".bbox/knowledge"]);
+        run(&root, &["commit", "-q", "-m", "broken"]);
         let commit = git::resolve_commit(&root, "HEAD").unwrap();
 
         assert!(
