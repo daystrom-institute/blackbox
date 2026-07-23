@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use bbox_code_source_store::encode_migration_effective_source_manifest_v1;
 use bbox_code_source_store::{
     CodeSourceStorePaths, CollisionRetirementLifecycleStateV1, MAX_MIGRATION_INVENTORY_GENERATIONS,
     MigrationEffectiveSourceManifestV1, MigrationLegacyAnchorEvidenceV1,
@@ -773,7 +775,7 @@ fn validate_checkout_bindings(
     attachments: &AttachmentSnapshotV1,
     actions: &[CheckoutIdentityActionV1],
 ) -> ProjectCatalogStoreResult<()> {
-    let fail = |detail| {
+    let fail = |detail: &str| {
         ProjectCatalogStoreError::new(
             "error.project_catalog_invalid_migration_plan",
             format!("checkout identity binding validation failed: {detail}"),
@@ -1724,7 +1726,7 @@ fn validate_new_side_cross_roles(
         publisher_dispositions,
         "migration cross-role state",
     )?;
-    let fail = |detail| {
+    let fail = |detail: &str| {
         ProjectCatalogStoreError::new(
             error_code,
             format!("migration cross-role validation failed: {detail}"),
@@ -1745,7 +1747,7 @@ fn validate_new_side_cross_roles(
         .as_deref()
         .ok_or_else(|| fail("effective source manifest post-image is absent"))?;
     let effective = decode_migration_effective_source_manifest_v1(effective_bytes)
-        .map_err(|error| fail(error.to_string()))?;
+        .map_err(|error| fail(&error.to_string()))?;
     let effective_by_project = effective
         .selections
         .iter()
@@ -1761,7 +1763,7 @@ fn validate_new_side_cross_roles(
             .as_deref()
             .ok_or_else(|| fail("collision retirement post-image is absent"))?;
         let retirement = decode_collision_retirement_pending_for_migration(bytes)
-            .map_err(|error| fail(error.to_string()))?;
+            .map_err(|error| fail(&error.to_string()))?;
         if retirement.state != CollisionRetirementLifecycleStateV1::Pending
             || retirement.project_id != *project_id
             || collision_owner_scopes
@@ -1790,7 +1792,7 @@ fn validate_new_side_cross_roles(
             .as_ref()
             .expect("absent stored post-image was handled above");
         let record = decode_stored_generation_v2_for_migration(bytes)
-            .map_err(|error| fail(error.to_string()))?;
+            .map_err(|error| fail(&error.to_string()))?;
         let project = catalog
             .projects
             .get(project_id)
@@ -1828,7 +1830,7 @@ fn validate_new_side_cross_roles(
                     continue;
                 };
                 let activation = decode_activation_v2_for_migration(bytes)
-                    .map_err(|error| fail(error.to_string()))?;
+                    .map_err(|error| fail(&error.to_string()))?;
                 let project = catalog
                     .projects
                     .get(project_id)
@@ -1851,7 +1853,7 @@ fn validate_new_side_cross_roles(
                     })?;
                 activation
                     .validate_against_generation(generation)
-                    .map_err(|error| fail(error.to_string()))?;
+                    .map_err(|error| fail(&error.to_string()))?;
                 let selection = effective_by_project.get(project_id).ok_or_else(|| {
                     fail("active generation lacks its effective source selection")
                 })?;
@@ -1870,7 +1872,7 @@ fn validate_new_side_cross_roles(
                     fail("collision retirement participant must install a record")
                 })?;
                 let retirement = decode_collision_retirement_pending_for_migration(bytes)
-                    .map_err(|error| fail(error.to_string()))?;
+                    .map_err(|error| fail(&error.to_string()))?;
                 let project = catalog
                     .projects
                     .get(project_id)
@@ -2045,7 +2047,7 @@ fn validate_new_side_cross_roles(
             .as_deref()
             .ok_or_else(|| fail("publisher seed pointer post-image is absent"))?;
         let pointer =
-            decode_pointer_v1(pointer_bytes, &limits).map_err(|error| fail(error.to_string()))?;
+            decode_pointer_v1(pointer_bytes, &limits).map_err(|error| fail(&error.to_string()))?;
         let generation_role = ImmutableAssetRoleV1::AcceptedPublicationGeneration {
             project_id: project_id.clone(),
             generation_id: generation_id.clone(),
@@ -2055,9 +2057,9 @@ fn validate_new_side_cross_roles(
             .get(&generation_role)
             .ok_or_else(|| fail("publisher seed generation bytes are absent"))?;
         let generation = decode_generation_v1(generation_bytes, &limits)
-            .map_err(|error| fail(error.to_string()))?;
+            .map_err(|error| fail(&error.to_string()))?;
         verify_pointer_generation_v1(&pointer, generation_bytes, &limits)
-            .map_err(|error| fail(error.to_string()))?;
+            .map_err(|error| fail(&error.to_string()))?;
         if &pointer.project_id != project_id
             || &pointer.attachment_id != attachment_id
             || &pointer.full_ref != full_ref
@@ -4623,7 +4625,7 @@ impl ProjectCatalogTransactionOwner {
                 "journaled source verification requires the complete registry",
             ));
         };
-        let fail = |detail| {
+        let fail = |detail: &str| {
             ProjectCatalogStoreError::new(
                 "error.project_catalog_recovery_incomplete",
                 format!("journaled code-source transition is invalid: {detail}"),
@@ -4661,14 +4663,14 @@ impl ProjectCatalogTransactionOwner {
             .as_deref()
             .map(decode_migration_effective_source_manifest_v1)
             .transpose()
-            .map_err(|error| fail(error.to_string()))?;
+            .map_err(|error| fail(&error.to_string()))?;
         let new_effective = post_images
             .get(&ParticipantRoleV1::EffectiveSourceManifest)
             .and_then(Option::as_deref)
             .ok_or_else(|| fail("effective source post-image is missing"))
             .and_then(|bytes| {
                 decode_migration_effective_source_manifest_v1(bytes)
-                    .map_err(|error| fail(error.to_string()))
+                    .map_err(|error| fail(&error.to_string()))
             })?;
         let old_selections = old_effective
             .as_ref()
@@ -4702,7 +4704,7 @@ impl ProjectCatalogTransactionOwner {
             let old_stored_bytes = read_old(stored_participant)?
                 .ok_or_else(|| fail("stored generation lacks exact old bytes"))?;
             let old_stored = decode_stored_generation_v1_for_migration(&old_stored_bytes)
-                .map_err(|error| fail(error.to_string()))?;
+                .map_err(|error| fail(&error.to_string()))?;
             if old_stored.generation_id != generation_id.as_str()
                 || &old_stored.descriptor.scope != published_scope
             {
@@ -4713,7 +4715,7 @@ impl ProjectCatalogTransactionOwner {
                     old_stored.clone(),
                     published_scope.clone(),
                 )
-                .map_err(|error| fail(error.to_string()))?;
+                .map_err(|error| fail(&error.to_string()))?;
             let manifest_asset = journal
                 .immutable_assets
                 .iter()
@@ -4743,7 +4745,7 @@ impl ProjectCatalogTransactionOwner {
                 generation_id.as_str(),
                 &registry.code_source_limits,
             )
-            .map_err(|error| fail(error.to_string()))?;
+            .map_err(|error| fail(&error.to_string()))?;
             let selection_matches =
                 |selection: &&bbox_code_source_store::MigrationEffectiveSourceSelectionV1,
                  selector: &str| {
@@ -4764,7 +4766,7 @@ impl ProjectCatalogTransactionOwner {
                         .and_then(Option::as_deref)
                         .ok_or_else(|| fail("surviving stored generation is absent"))?;
                     let new_stored = decode_stored_generation_v2_for_migration(new_stored_bytes)
-                        .map_err(|error| fail(error.to_string()))?;
+                        .map_err(|error| fail(&error.to_string()))?;
                     if new_stored != expected_stored {
                         return Err(fail("surviving stored generation rewrites old evidence"));
                     }
@@ -4773,7 +4775,7 @@ impl ProjectCatalogTransactionOwner {
                             let bytes = read_old(activation_participant)?
                                 .ok_or_else(|| fail("activation lacks exact old bytes"))?;
                             let activation = decode_activation_v1_for_migration(&bytes)
-                                .map_err(|error| fail(error.to_string()))?;
+                                .map_err(|error| fail(&error.to_string()))?;
                             Ok::<_, ProjectCatalogStoreError>((activation_participant, activation))
                         })
                         .transpose()?
@@ -4792,14 +4794,14 @@ impl ProjectCatalogTransactionOwner {
                                     old_activation,
                                     &expected_stored,
                                 )
-                                .map_err(|error| fail(error.to_string()))?;
+                                .map_err(|error| fail(&error.to_string()))?;
                             let new_activation_bytes = post_images
                                 .get(&activation_role)
                                 .and_then(Option::as_deref)
                                 .ok_or_else(|| fail("active generation is absent"))?;
                             let new_activation =
                                 decode_activation_v2_for_migration(new_activation_bytes)
-                                    .map_err(|error| fail(error.to_string()))?;
+                                    .map_err(|error| fail(&error.to_string()))?;
                             if new_activation != expected_activation
                                 || old_effective.is_some()
                                     && !old_selection.is_some_and(|selection| {
@@ -4846,7 +4848,7 @@ impl ProjectCatalogTransactionOwner {
                                 })?;
                             let retirement =
                                 decode_collision_retirement_pending_for_migration(retirement_bytes)
-                                    .map_err(|error| fail(error.to_string()))?;
+                                    .map_err(|error| fail(&error.to_string()))?;
                             if &retirement.project_id != project_id
                                 || &retirement.former_scope != published_scope
                                 || retirement.generation_id != generation_id.as_str()
@@ -4886,7 +4888,7 @@ impl ProjectCatalogTransactionOwner {
                             let bytes = read_old(activation_participant)?
                                 .ok_or_else(|| fail("activation lacks exact old bytes"))?;
                             let activation = decode_activation_v1_for_migration(&bytes)
-                                .map_err(|error| fail(error.to_string()))?;
+                                .map_err(|error| fail(&error.to_string()))?;
                             Ok::<_, ProjectCatalogStoreError>(
                                 activation.generation_id == generation_id.as_str(),
                             )
@@ -9403,7 +9405,7 @@ mod tests {
                     })
             })
             .unwrap();
-        assert!(participant.expected_old.is_none());
+        assert!(participant.expected_old_sha256.is_none());
         assert!(!lifecycle_path.exists());
         let plan = validate_migration_plan(&path, registry, draft).unwrap();
 
@@ -10067,7 +10069,7 @@ mod tests {
                 ArtifactKind::Backup,
             )
             .unwrap(),
-            sha256: legacy_hash,
+            sha256: legacy_hash.clone(),
         };
         for role in [
             ParticipantRoleV1::EffectiveSourceManifest,
