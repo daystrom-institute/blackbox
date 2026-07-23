@@ -1236,6 +1236,15 @@ fn validate_code_source_snapshot(
     inventory_sha256: &Sha256Hex,
     plan_hash: &Sha256Hex,
 ) -> ProjectCatalogStoreResult<()> {
+    snapshot
+        .legacy_inventory
+        .validate_evidence()
+        .map_err(|error| {
+            ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_migration_plan",
+                error.to_string(),
+            )
+        })?;
     let fail = |detail| {
         ProjectCatalogStoreError::new(
             "error.project_catalog_invalid_migration_plan",
@@ -1368,6 +1377,79 @@ fn validate_code_source_snapshot(
             .collect::<BTreeSet<_>>()
     {
         return Err(fail("generation plan omits an inventoried generation"));
+    }
+
+    let mut collision_owner_scopes = BTreeMap::new();
+    for activation in planned_activations.values().filter(|activation| {
+        activation.disposition == MigrationCodeSourceDispositionV1::QuarantinedCollision
+    }) {
+        let inventory_activation = inventory_activations[&activation.project_id];
+        let generation = inventory_generations
+            .get(inventory_activation.record.generation_id.as_str())
+            .ok_or_else(|| fail("collision activation references an omitted generation"))?;
+        if collision_owner_scopes
+            .insert(
+                activation.project_id.clone(),
+                generation.published_scope.clone(),
+            )
+            .is_some()
+        {
+            return Err(fail("collision activation owner is duplicated"));
+        }
+    }
+    let mut collision_pending_projects = BTreeSet::new();
+    for pending in &snapshot.legacy_inventory.collision_pending {
+        if !collision_pending_projects.insert(pending.project_id.clone()) {
+            return Err(fail("legacy collision pending owner is duplicated"));
+        }
+        let generation = inventory_generations
+            .get(pending.record.generation_id.as_str())
+            .ok_or_else(|| fail("legacy collision pending generation is omitted"))?;
+        let retirement_role = ParticipantRoleV1::CollisionRetirement {
+            project_id: pending.project_id.clone(),
+        };
+        if expected_old.get(&retirement_role).and_then(Option::as_ref)
+            != Some(&sha256(&pending.bytes))
+        {
+            return Err(fail(
+                "legacy collision pending bytes lack their exact participant pre-image",
+            ));
+        }
+        let planned = planned_generations
+            .get(pending.record.generation_id.as_str())
+            .filter(|planned| {
+                planned.project_id == pending.project_id
+                    && planned.disposition == MigrationCodeSourceDispositionV1::QuarantinedCollision
+            })
+            .ok_or_else(|| fail("legacy collision pending row is not exactly accounted"))?;
+        let _ = planned;
+        if generation.published_scope != pending.record.former_scope {
+            return Err(fail(
+                "legacy collision pending scope and generation scope disagree",
+            ));
+        }
+        match collision_owner_scopes.get(&pending.project_id) {
+            Some(scope) if scope != &generation.published_scope => {
+                return Err(fail("collision owner has conflicting published scopes"));
+            }
+            Some(_) => {}
+            None => {
+                collision_owner_scopes.insert(
+                    pending.project_id.clone(),
+                    generation.published_scope.clone(),
+                );
+            }
+        }
+    }
+    for generation in planned_generations.values().filter(|generation| {
+        generation.disposition == MigrationCodeSourceDispositionV1::QuarantinedCollision
+    }) {
+        let inventory = inventory_generations[generation.generation_id.as_str()];
+        if collision_owner_scopes.get(&generation.project_id) != Some(&inventory.published_scope) {
+            return Err(fail(
+                "quarantined generation is assigned to the wrong collision owner or scope",
+            ));
+        }
     }
 
     let mut accounted_roles = BTreeSet::from([ParticipantRoleV1::EffectiveSourceManifest]);
@@ -2745,6 +2827,33 @@ impl ProjectCatalogTransactionOwner {
                 ));
             }
         }
+        for pending in &current.collision_pending {
+            let project = state
+                .catalog
+                .projects
+                .get(&pending.project_id)
+                .ok_or_else(|| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_migration_incomplete",
+                        "current collision project is absent from catalog",
+                    )
+                })?;
+            let participant = journal.participants.iter().find(|candidate| {
+                candidate.role
+                    == (ParticipantRoleV1::CollisionRetirement {
+                        project_id: pending.project_id.clone(),
+                    })
+            });
+            if project.scope != ProjectScope::LegacyLocal
+                || participant.and_then(|participant| participant.new.sha256())
+                    != Some(&sha256(&pending.bytes))
+            {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_migration_incomplete",
+                    "current collision pending lacks its LegacyLocal catalog owner and typed successor evidence",
+                ));
+            }
+        }
         for participant in &journal.participants {
             let ParticipantRoleV1::CollisionRetirement { project_id } = &participant.role else {
                 continue;
@@ -2809,10 +2918,11 @@ impl ProjectCatalogTransactionOwner {
                     "historical collision source became active again without a successor",
                 ));
             }
-            if let Some(pending) = current
+            let pending = current
                 .collision_pending
                 .iter()
-                .find(|row| row.project_id == *project_id)
+                .find(|row| row.project_id == *project_id);
+            if let Some(pending) = pending
                 && (pending.record.selector != old_activation.selector
                     || pending.record.snapshot_id != old_activation.snapshot_id
                     || pending.record.generation_id != old_activation.generation_id)
@@ -2822,10 +2932,11 @@ impl ProjectCatalogTransactionOwner {
                     "current collision pending rewrites historical retirement evidence",
                 ));
             }
-            if let Some(retirement) = current
+            let retirement = current
                 .retirements
                 .iter()
-                .find(|row| row.record.selector == old_activation.selector)
+                .find(|row| row.record.selector == old_activation.selector);
+            if let Some(retirement) = retirement
                 && (retirement.record.project_id != old_activation.project_id
                     || retirement.record.snapshot_id != old_activation.snapshot_id
                     || retirement.record.generation_id.as_deref()
@@ -2834,6 +2945,12 @@ impl ProjectCatalogTransactionOwner {
                 return Err(ProjectCatalogStoreError::new(
                     "error.project_catalog_migration_incomplete",
                     "retirement successor rewrites historical collision evidence",
+                ));
+            }
+            if pending.is_some() == retirement.is_some() {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_migration_incomplete",
+                    "historical collision must have exactly one typed pending or retired successor",
                 ));
             }
         }
@@ -3777,23 +3894,48 @@ impl ProjectCatalogTransactionOwner {
                 self.verify_journal_pair_invariants(&journal, ExpectedSide::Old)
             }
             (TransactionStateV1::Prepared, None) => {
-                let checkout_locks = self.acquire_checkout_action_locks(&journal)?;
-                let forward_bindings_available = journal.kind != TransactionKindV1::V1Migration
-                    || self
-                        .migration_forward_bindings_available(&journal, &checkout_locks)
-                        .unwrap_or(false);
-                let checkout_state =
-                    self.classify_checkout_action_recovery(&journal, &checkout_locks)?;
-                if forward_bindings_available
-                    && checkout_state == CheckoutActionRecoveryState::Compatible
-                {
-                    self.execute_monotonic_checkout_actions_locked(&journal, &checkout_locks)?;
+                let rollback_available =
+                    self.classify_recovery(&journal, true)? == RecoveryDecision::Rollback;
+                let mut forward_available =
+                    self.classify_recovery(&journal, false)? == RecoveryDecision::Forward;
+                let mut checkout_locks = Vec::new();
+                if forward_available {
+                    match self.acquire_checkout_action_locks(&journal) {
+                        Ok(locks) => checkout_locks = locks,
+                        Err(_) => forward_available = false,
+                    }
                 }
-                let decision = self.classify_recovery(
-                    &journal,
-                    !forward_bindings_available
-                        || checkout_state == CheckoutActionRecoveryState::ConflictingValid,
-                )?;
+                if forward_available && journal.kind == TransactionKindV1::V1Migration {
+                    forward_available = self
+                        .migration_forward_sources_available(&journal)
+                        .unwrap_or(false)
+                        && self
+                            .migration_forward_bindings_available(&journal, &checkout_locks)
+                            .unwrap_or(false);
+                }
+                let checkout_state = if forward_available {
+                    self.classify_checkout_action_recovery(&journal, &checkout_locks)
+                        .ok()
+                } else {
+                    None
+                };
+                forward_available &=
+                    checkout_state == Some(CheckoutActionRecoveryState::Compatible);
+                if forward_available {
+                    if self
+                        .execute_monotonic_checkout_actions_locked(&journal, &checkout_locks)
+                        .is_err()
+                    {
+                        forward_available = false;
+                    }
+                }
+                let decision = if forward_available {
+                    RecoveryDecision::Forward
+                } else if rollback_available {
+                    RecoveryDecision::Rollback
+                } else {
+                    RecoveryDecision::Incomplete
+                };
                 match decision {
                     RecoveryDecision::Forward => {
                         self.install_immutable_assets(&journal)?;
@@ -3873,6 +4015,56 @@ impl ProjectCatalogTransactionOwner {
         Ok(self
             .verify_nonaction_checkout_bindings_locked(&attachments, journal, checkout_locks)
             .is_ok())
+    }
+
+    fn migration_forward_sources_available(
+        &self,
+        journal: &ProjectCatalogTransactionJournalV1,
+    ) -> ProjectCatalogStoreResult<bool> {
+        let ParticipantRegistry::Migration(registry) = &self.registry else {
+            return Ok(false);
+        };
+        let publisher = self.io.read_regular_nofollow(
+            &registry.legacy_publisher_ref_source,
+            MAX_LEGACY_PUBLISHER_REF_SOURCE_BYTES,
+        )?;
+        let publisher_matches = match (journal.publisher_ref_source.as_ref(), publisher.as_deref())
+        {
+            (Some(MigrationPublisherSourceEvidenceV1::Missing { .. }), None) => true,
+            (
+                Some(MigrationPublisherSourceEvidenceV1::Present { sha256: expected }),
+                Some(bytes),
+            ) => sha256(bytes) == *expected,
+            _ => false,
+        };
+        if !publisher_matches {
+            return Ok(false);
+        }
+        let marker_participant = journal
+            .participants
+            .iter()
+            .find(|participant| participant.role == ParticipantRoleV1::MigrationMarker);
+        let Some(marker_participant) = marker_participant else {
+            return Ok(false);
+        };
+        let ExpectedImageV1::Present { artifact_name, .. } = &marker_participant.new else {
+            return Ok(false);
+        };
+        let Some(marker_bytes) = self.io.read_regular_nofollow(
+            &self.paths.stage_dir.join(artifact_name.as_str()),
+            MAX_MARKER_BYTES,
+        )?
+        else {
+            return Ok(false);
+        };
+        let marker: ProjectCatalogMigrationMarkerV1 =
+            decode_bounded_json(&marker_bytes, MAX_MARKER_BYTES, "migration marker")?;
+        let inventory = enumerate_legacy_migration_inventory_locked(
+            &registry.code_source_paths,
+            &StoreLimits::default(),
+        );
+        Ok(inventory
+            .is_ok_and(|inventory| inventory.canonical_sha256 == marker.inventory_sha256.as_str()))
     }
 
     fn classify_recovery(
@@ -6942,10 +7134,48 @@ mod tests {
     use super::*;
 
     fn historical_selector(project_id: &str, generation_id: &str) -> String {
-        format!(
-            "{}:m0123456789abcdef",
-            bbox_code_source::source_selector(project_id, generation_id)
+        bbox_corpus_index::index::project_files::collected_materialization_selector(
+            project_id,
+            generation_id,
         )
+    }
+
+    fn write_unprotected_legacy_generation(paths: &CodeSourceStorePaths) {
+        let entries = Vec::new();
+        let head = "b".repeat(40);
+        let scope = PublishedScope::try_new("unexplained-repo", ".").unwrap();
+        let descriptor = bbox_code_source::GenerationDescriptor {
+            schema_version: bbox_code_source::SCHEMA_VERSION,
+            walker_policy_version: bbox_code_source::WALKER_POLICY_VERSION.into(),
+            scope: scope.clone(),
+            head_commit: head.clone(),
+            dirty_fingerprint: bbox_code_source::dirty_fingerprint(&head, &entries),
+            manifest_sha256: bbox_code_source::manifest_sha256(&entries),
+            file_count: 0,
+            logical_bytes: 0,
+        };
+        let producer_id = "recovery-probe";
+        let generation_id = bbox_code_source::generation_id(producer_id, &descriptor);
+        let record = bbox_code_source_store::StoredGeneration {
+            version: 1,
+            generation_id: generation_id.clone(),
+            producer_id: producer_id.into(),
+            ordinal: 1,
+            descriptor,
+            state: bbox_code_source::GenerationState::Failed,
+            diagnostic: None,
+            created_unix_secs: 1,
+            materialized_doc_count: None,
+            entity_inventory_sha256: None,
+        };
+        let metadata = paths.generation_metadata(&scope, &generation_id).unwrap();
+        fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+        fs::write(metadata, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        fs::write(
+            paths.generation_manifest(&scope, &generation_id).unwrap(),
+            [],
+        )
+        .unwrap();
     }
 
     #[derive(Debug)]
@@ -7570,12 +7800,16 @@ mod tests {
         (registry, draft, pointer_role, generation_role)
     }
 
-    fn add_collision_retirement_to_draft(
+    fn add_named_collision_retirement_to_draft(
         registry: &MigrationParticipantRegistry,
         draft: &mut MigrationPlanDraftV1,
+        project_name: &str,
+        repo_name: &str,
+        producer_name: &str,
+        observation_prefix: &str,
     ) -> (ImmutableAssetRoleV1, PathBuf, Vec<u8>) {
-        let project_id = ProjectId::parse("collision-project").unwrap();
-        let former_scope = PublishedScope::try_new("collision-repo", ".").unwrap();
+        let project_id = ProjectId::parse(project_name).unwrap();
+        let former_scope = PublishedScope::try_new(repo_name, ".").unwrap();
         let entries = Vec::<bbox_code_source::ManifestEntry>::new();
         let head_commit = "d".repeat(40);
         let descriptor = bbox_code_source::GenerationDescriptor {
@@ -7588,7 +7822,7 @@ mod tests {
             file_count: 0,
             logical_bytes: 0,
         };
-        let producer_id = "collision-producer";
+        let producer_id = producer_name;
         let generation_id =
             Sha256Hex::parse(bbox_code_source::generation_id(producer_id, &descriptor)).unwrap();
         let selector = historical_selector(project_id.as_str(), generation_id.as_str());
@@ -7680,6 +7914,92 @@ mod tests {
         let manifest_target = registry.immutable_target(&manifest_role, &manifest_name);
         fs::create_dir_all(manifest_target.parent().unwrap()).unwrap();
         fs::write(&manifest_target, &manifest_bytes).unwrap();
+        let retained_descriptor = bbox_code_source::GenerationDescriptor {
+            head_commit: "e".repeat(40),
+            dirty_fingerprint: bbox_code_source::dirty_fingerprint(&"e".repeat(40), &entries),
+            ..descriptor.clone()
+        };
+        let retained_producer = format!("{producer_name}-retained");
+        let retained_generation_id = Sha256Hex::parse(bbox_code_source::generation_id(
+            &retained_producer,
+            &retained_descriptor,
+        ))
+        .unwrap();
+        let retained_stored = bbox_code_source_store::StoredGeneration {
+            version: 1,
+            generation_id: retained_generation_id.to_string(),
+            producer_id: retained_producer,
+            ordinal: 0,
+            descriptor: retained_descriptor,
+            state: bbox_code_source::GenerationState::Superseded,
+            diagnostic: None,
+            created_unix_secs: 0,
+            materialized_doc_count: Some(0),
+            entity_inventory_sha256: Some("c".repeat(64)),
+        };
+        let retained_bytes = serde_json::to_vec_pretty(&retained_stored).unwrap();
+        let retained_target = registry
+            .code_source_paths
+            .generation_metadata(&former_scope, retained_generation_id.as_str())
+            .unwrap();
+        fs::create_dir_all(retained_target.parent().unwrap()).unwrap();
+        fs::write(&retained_target, &retained_bytes).unwrap();
+        fs::write(
+            registry
+                .code_source_paths
+                .generation_manifest(&former_scope, retained_generation_id.as_str())
+                .unwrap(),
+            &manifest_bytes,
+        )
+        .unwrap();
+        let retained_v2 = bbox_code_source_store::StoredGenerationV2::from_v1_for_migration(
+            retained_stored,
+            former_scope.clone(),
+        )
+        .unwrap();
+        draft.participants.push(MigrationParticipantDraftV1::new(
+            ParticipantRoleV1::StoredGenerationMetadata {
+                project_id: project_id.clone(),
+                published_scope: former_scope.clone(),
+                generation_id: retained_generation_id.clone(),
+            },
+            Some(Sha256Hex::digest(&retained_bytes)),
+            Some(
+                bbox_code_source_store::encode_stored_generation_v2_for_migration(&retained_v2)
+                    .unwrap(),
+            ),
+        ));
+        let retained_manifest_role = ImmutableAssetRoleV1::CollectedGenerationManifest {
+            published_scope: former_scope.clone(),
+            generation_id: retained_generation_id.clone(),
+        };
+        draft
+            .immutable_assets
+            .push(MigrationImmutableAssetDraftV1::pinned_existing(
+                retained_manifest_role,
+                manifest_sha256.clone(),
+            ));
+        let legacy_retirement = bbox_code_source_store::CollisionRetirementPendingV1 {
+            version: 1,
+            project_id: project_id.clone(),
+            former_scope: former_scope.clone(),
+            generation_id: generation_id.to_string(),
+            selector: selector.clone(),
+            snapshot_id: activation.snapshot_id.clone(),
+            manifest_sha256: descriptor.manifest_sha256.clone(),
+            inventory_hash: "0".repeat(64),
+            plan_hash: draft.plan_hash.to_string(),
+        };
+        let legacy_retirement_bytes =
+            bbox_code_source_store::encode_collision_retirement_pending_for_migration(
+                &legacy_retirement,
+            )
+            .unwrap();
+        let legacy_retirement_target = registry
+            .code_source_paths
+            .collision_retirement_pending(&project_id);
+        fs::create_dir_all(legacy_retirement_target.parent().unwrap()).unwrap();
+        fs::write(&legacy_retirement_target, &legacy_retirement_bytes).unwrap();
         let legacy_inventory = enumerate_legacy_migration_inventory_locked(
             &registry.code_source_paths,
             &StoreLimits::default(),
@@ -7705,7 +8025,7 @@ mod tests {
             ParticipantRoleV1::CollisionRetirement {
                 project_id: project_id.clone(),
             },
-            None,
+            Some(Sha256Hex::digest(&legacy_retirement_bytes)),
             Some(retirement_bytes),
         ));
         draft
@@ -7718,7 +8038,7 @@ mod tests {
             .code_source_snapshot
             .activations
             .push(MigrationCodeSourceActivationDraftV1 {
-                observation_id: "collision-activation-observation-1".into(),
+                observation_id: format!("{observation_prefix}-activation"),
                 project_id: project_id.clone(),
                 disposition: MigrationCodeSourceDispositionV1::QuarantinedCollision,
             });
@@ -7726,13 +8046,56 @@ mod tests {
             .code_source_snapshot
             .generations
             .push(MigrationCodeSourceGenerationDraftV1 {
-                observation_id: "collision-generation-observation-1".into(),
-                project_id,
+                observation_id: format!("{observation_prefix}-generation"),
+                project_id: project_id.clone(),
                 generation_id,
                 disposition: MigrationCodeSourceDispositionV1::QuarantinedCollision,
             });
+        draft
+            .code_source_snapshot
+            .generations
+            .push(MigrationCodeSourceGenerationDraftV1 {
+                observation_id: format!("{observation_prefix}-retained-generation"),
+                project_id,
+                generation_id: retained_generation_id,
+                disposition: MigrationCodeSourceDispositionV1::QuarantinedCollision,
+            });
         draft.code_source_snapshot.legacy_inventory = legacy_inventory;
+        for participant in &mut draft.participants {
+            if !matches!(
+                participant.role,
+                ParticipantRoleV1::CollisionRetirement { .. }
+            ) {
+                continue;
+            }
+            let bytes = participant
+                .post_image
+                .as_deref()
+                .expect("collision retirement has a post-image");
+            let mut retirement = decode_collision_retirement_pending_for_migration(bytes).unwrap();
+            retirement.inventory_hash = draft.inventory_sha256.to_string();
+            participant.post_image = Some(
+                bbox_code_source_store::encode_collision_retirement_pending_for_migration(
+                    &retirement,
+                )
+                .unwrap(),
+            );
+        }
         (manifest_role, manifest_target, manifest_bytes)
+    }
+
+    fn add_collision_retirement_to_draft(
+        registry: &MigrationParticipantRegistry,
+        draft: &mut MigrationPlanDraftV1,
+    ) -> (ImmutableAssetRoleV1, PathBuf, Vec<u8>) {
+        add_named_collision_retirement_to_draft(
+            registry,
+            draft,
+            "collision-project",
+            "collision-repo",
+            "collision-producer",
+            "collision-observation-1",
+        )
     }
 
     fn add_retained_generation_to_draft(
@@ -7877,6 +8240,63 @@ mod tests {
         add_retained_generation_to_draft(&registry, &mut draft);
         let plan = validate_migration_plan(&path, registry, draft).unwrap();
         (directory, path, plan, manifest_target, manifest_bytes)
+    }
+
+    #[test]
+    fn collision_generation_ownership_rejects_a_two_project_swap() {
+        let (_directory, path) = projects_path();
+        let legacy_bytes = b"{\"version\":1,\"projects\":[]}\n";
+        fs::write(&path, legacy_bytes).unwrap();
+        let (registry, mut draft, _) = basic_migration_draft(&path, legacy_bytes);
+        add_named_collision_retirement_to_draft(
+            &registry,
+            &mut draft,
+            "collision-project-a",
+            "collision-repo-a",
+            "collision-producer-a",
+            "collision-observation-a",
+        );
+        add_named_collision_retirement_to_draft(
+            &registry,
+            &mut draft,
+            "collision-project-b",
+            "collision-repo-b",
+            "collision-producer-b",
+            "collision-observation-b",
+        );
+        let project_a = ProjectId::parse("collision-project-a").unwrap();
+        let project_b = ProjectId::parse("collision-project-b").unwrap();
+        assert_eq!(
+            draft
+                .code_source_snapshot
+                .generations
+                .iter()
+                .filter(|row| row.project_id == project_a)
+                .count(),
+            2
+        );
+        assert_eq!(
+            draft
+                .code_source_snapshot
+                .generations
+                .iter()
+                .filter(|row| row.project_id == project_b)
+                .count(),
+            2
+        );
+        assert!(validate_migration_plan(&path, registry.clone(), draft.clone()).is_ok());
+
+        for generation in &mut draft.code_source_snapshot.generations {
+            generation.project_id = if generation.project_id == project_a {
+                project_b.clone()
+            } else if generation.project_id == project_b {
+                project_a.clone()
+            } else {
+                generation.project_id.clone()
+            };
+        }
+        let error = validate_migration_plan(&path, registry, draft).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_invalid_migration_plan");
     }
 
     fn activation_migration_draft(
@@ -8043,6 +8463,70 @@ mod tests {
                 manifest_role,
                 manifest_sha256.clone(),
             ));
+        let retained_descriptor = bbox_code_source::GenerationDescriptor {
+            head_commit: "c".repeat(40),
+            dirty_fingerprint: bbox_code_source::dirty_fingerprint(&"c".repeat(40), &entries),
+            ..descriptor.clone()
+        };
+        let retained_producer = "migration-retained-producer";
+        let retained_generation_id = Sha256Hex::parse(bbox_code_source::generation_id(
+            retained_producer,
+            &retained_descriptor,
+        ))
+        .unwrap();
+        let retained_old = bbox_code_source_store::StoredGeneration {
+            version: 1,
+            generation_id: retained_generation_id.to_string(),
+            producer_id: retained_producer.into(),
+            ordinal: 0,
+            descriptor: retained_descriptor,
+            state: bbox_code_source::GenerationState::Superseded,
+            diagnostic: None,
+            created_unix_secs: 0,
+            materialized_doc_count: Some(0),
+            entity_inventory_sha256: Some("c".repeat(64)),
+        };
+        let retained_new = bbox_code_source_store::StoredGenerationV2::from_v1_for_migration(
+            retained_old.clone(),
+            scope.clone(),
+        )
+        .unwrap();
+        let retained_old_bytes = serde_json::to_vec_pretty(&retained_old).unwrap();
+        let retained_target = registry
+            .code_source_paths
+            .generation_metadata(&scope, retained_generation_id.as_str())
+            .unwrap();
+        fs::create_dir_all(retained_target.parent().unwrap()).unwrap();
+        fs::write(&retained_target, &retained_old_bytes).unwrap();
+        fs::write(
+            registry
+                .code_source_paths
+                .generation_manifest(&scope, retained_generation_id.as_str())
+                .unwrap(),
+            &manifest_bytes,
+        )
+        .unwrap();
+        draft.participants.push(MigrationParticipantDraftV1::new(
+            ParticipantRoleV1::StoredGenerationMetadata {
+                project_id: project_id.clone(),
+                published_scope: scope.clone(),
+                generation_id: retained_generation_id.clone(),
+            },
+            Some(Sha256Hex::digest(&retained_old_bytes)),
+            Some(
+                bbox_code_source_store::encode_stored_generation_v2_for_migration(&retained_new)
+                    .unwrap(),
+            ),
+        ));
+        draft
+            .immutable_assets
+            .push(MigrationImmutableAssetDraftV1::pinned_existing(
+                ImmutableAssetRoleV1::CollectedGenerationManifest {
+                    published_scope: scope.clone(),
+                    generation_id: retained_generation_id.clone(),
+                },
+                manifest_sha256,
+            ));
         let legacy_inventory = enumerate_legacy_migration_inventory_locked(
             &registry.code_source_paths,
             &StoreLimits::default(),
@@ -8057,12 +8541,20 @@ mod tests {
                 project_id: project_id.clone(),
                 disposition: MigrationCodeSourceDispositionV1::SurvivingActive,
             }],
-            generations: vec![MigrationCodeSourceGenerationDraftV1 {
-                observation_id: "active-generation-observation-1".into(),
-                project_id,
-                generation_id,
-                disposition: MigrationCodeSourceDispositionV1::SurvivingActive,
-            }],
+            generations: vec![
+                MigrationCodeSourceGenerationDraftV1 {
+                    observation_id: "active-generation-observation-1".into(),
+                    project_id: project_id.clone(),
+                    generation_id,
+                    disposition: MigrationCodeSourceDispositionV1::SurvivingActive,
+                },
+                MigrationCodeSourceGenerationDraftV1 {
+                    observation_id: "active-retained-generation-observation-1".into(),
+                    project_id,
+                    generation_id: retained_generation_id,
+                    disposition: MigrationCodeSourceDispositionV1::SurvivingRetained,
+                },
+            ],
         };
         (registry, draft, activation_role, stored_role)
     }
@@ -9736,6 +10228,133 @@ mod tests {
     }
 
     #[test]
+    fn prepared_recovery_rolls_back_when_missing_publisher_source_appears() {
+        let (_trace_directory, trace_path, trace_plan, _, _) = migration_fault_fixture();
+        let recording = Arc::new(TracingIo::recording());
+        transact_migration_with_io(&trace_path, trace_plan, recording.clone()).unwrap();
+        let fail_after_prepared = recording
+            .trace()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, point)| {
+                (*point == FaultPoint::PreparedJournalWrite).then_some(index)
+            })
+            .nth(1)
+            .unwrap();
+
+        let (_directory, path, plan, _, legacy_bytes) = migration_fault_fixture();
+        let registry = plan.registry.clone();
+        let publisher_source = registry.legacy_publisher_ref_source.clone();
+        assert!(
+            transact_migration_with_io(
+                &path,
+                plan,
+                Arc::new(TracingIo::failing_at(fail_after_prepared)),
+            )
+            .is_err()
+        );
+        fs::write(&publisher_source, b"new publisher source").unwrap();
+
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
+        assert_eq!(fs::read(publisher_source).unwrap(), b"new publisher source");
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        let journal: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
+            &fs::read(paths.journal).unwrap(),
+            MAX_JOURNAL_BYTES,
+            "transaction journal",
+        )
+        .unwrap();
+        assert_eq!(journal.outcome, Some(TransactionOutcomeV1::RolledBack));
+    }
+
+    #[test]
+    fn prepared_recovery_rolls_back_when_present_publisher_source_changes() {
+        let make_plan = |path: &Path, legacy: &[u8]| {
+            let (registry, draft, _, _) = publisher_seed_migration_draft(path, legacy);
+            validate_migration_plan(path, registry, draft).unwrap()
+        };
+        let (_trace_directory, trace_path) = projects_path();
+        let legacy_bytes = b"{\"version\":1,\"projects\":[]}\n".to_vec();
+        fs::write(&trace_path, &legacy_bytes).unwrap();
+        let trace_plan = make_plan(&trace_path, &legacy_bytes);
+        let recording = Arc::new(TracingIo::recording());
+        transact_migration_with_io(&trace_path, trace_plan, recording.clone()).unwrap();
+        let fail_after_prepared = recording
+            .trace()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, point)| {
+                (*point == FaultPoint::PreparedJournalWrite).then_some(index)
+            })
+            .nth(1)
+            .unwrap();
+
+        let (_directory, path) = projects_path();
+        fs::write(&path, &legacy_bytes).unwrap();
+        let plan = make_plan(&path, &legacy_bytes);
+        let registry = plan.registry.clone();
+        let publisher_source = registry.legacy_publisher_ref_source.clone();
+        assert!(
+            transact_migration_with_io(
+                &path,
+                plan,
+                Arc::new(TracingIo::failing_at(fail_after_prepared)),
+            )
+            .is_err()
+        );
+        fs::write(&publisher_source, b"changed publisher source").unwrap();
+
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
+        assert_eq!(
+            fs::read(publisher_source).unwrap(),
+            b"changed publisher source"
+        );
+    }
+
+    #[test]
+    fn prepared_recovery_rolls_back_on_an_unexplained_code_source_row() {
+        let (_trace_directory, trace_path, trace_plan, _, _) = migration_fault_fixture();
+        let recording = Arc::new(TracingIo::recording());
+        transact_migration_with_io(&trace_path, trace_plan, recording.clone()).unwrap();
+        let fail_after_prepared = recording
+            .trace()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, point)| {
+                (*point == FaultPoint::PreparedJournalWrite).then_some(index)
+            })
+            .nth(1)
+            .unwrap();
+
+        let (_directory, path, plan, _, legacy_bytes) = migration_fault_fixture();
+        let registry = plan.registry.clone();
+        assert!(
+            transact_migration_with_io(
+                &path,
+                plan,
+                Arc::new(TracingIo::failing_at(fail_after_prepared)),
+            )
+            .is_err()
+        );
+        write_unprotected_legacy_generation(&registry.code_source_paths);
+
+        recover_migration_with_io(&path, registry.clone(), Arc::new(RealCatalogStoreIo)).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
+        let inventory = {
+            let guard = registry
+                .code_source_paths
+                .lock_migration_inventory()
+                .unwrap();
+            guard.snapshot_legacy_v1(&StoreLimits::default()).unwrap()
+        };
+        assert_eq!(inventory.generation_count, 1);
+        assert_eq!(inventory.unprotected_generation_count, 1);
+        assert!(inventory.generations.is_empty());
+    }
+
+    #[test]
     fn same_plan_retry_resyncs_preexisting_artifacts() {
         let (_directory, path, plan, _, _) = migration_fault_fixture();
         let retry = plan.clone();
@@ -9844,6 +10463,60 @@ mod tests {
                 .to_string_lossy()
                 .contains(".rollback-journal.")
         }));
+    }
+
+    #[test]
+    fn malformed_or_unavailable_checkout_state_does_not_block_prepared_rollback() {
+        let (_trace_directory, trace_path, trace_plan, _, _) = migration_fault_fixture();
+        let recording = Arc::new(TracingIo::recording());
+        transact_migration_with_io(&trace_path, trace_plan, recording.clone()).unwrap();
+        let fail_after_prepared = recording
+            .trace()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, point)| {
+                (*point == FaultPoint::PreparedJournalWrite).then_some(index)
+            })
+            .nth(1)
+            .unwrap();
+
+        for unavailable in [false, true] {
+            let (_directory, path, plan, _, legacy_bytes) = migration_fault_fixture();
+            let registry = plan.registry.clone();
+            assert!(
+                transact_migration_with_io(
+                    &path,
+                    plan,
+                    Arc::new(TracingIo::failing_at(fail_after_prepared)),
+                )
+                .is_err()
+            );
+            let checkout_root = path.parent().unwrap().join("checkout");
+            fs::create_dir_all(&checkout_root).unwrap();
+            if unavailable {
+                let bbox = checkout_root.join(".bbox");
+                if bbox.exists() {
+                    fs::remove_dir_all(&bbox).unwrap();
+                }
+                fs::write(bbox, b"not a directory").unwrap();
+            } else {
+                let checkout_local = checkout_root.join(".bbox/local");
+                fs::create_dir_all(&checkout_local).unwrap();
+                fs::write(checkout_local.join("checkout-id"), b"malformed\n").unwrap();
+            }
+
+            recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
+            let paths = ProjectCatalogPaths::derive(&path).unwrap();
+            assert!(!paths.attachments.exists());
+            let journal: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
+                &fs::read(paths.journal).unwrap(),
+                MAX_JOURNAL_BYTES,
+                "transaction journal",
+            )
+            .unwrap();
+            assert_eq!(journal.outcome, Some(TransactionOutcomeV1::RolledBack));
+        }
     }
 
     #[test]

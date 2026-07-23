@@ -521,9 +521,17 @@ pub struct MigrationLegacyCollisionEvidenceV1 {
 pub struct MigrationLegacyInventoryV1 {
     pub anchor: MigrationLegacyAnchorEvidenceV1,
     pub activations: Vec<MigrationLegacyActivationEvidenceV1>,
+    /// The bounded set of rows that migration must preserve. Rows outside this
+    /// set are fully enumerated in the generation-set evidence below, but are
+    /// classified as non-surviving GC candidates and never become transaction
+    /// participants.
     pub generations: Vec<MigrationLegacyGenerationEvidenceV1>,
     pub collision_pending: Vec<MigrationLegacyCollisionEvidenceV1>,
     pub protected_generation_ids: BTreeSet<String>,
+    pub generation_count: u64,
+    pub generation_set_sha256: String,
+    pub unprotected_generation_count: u64,
+    pub unprotected_generation_set_sha256: String,
     pub canonical_sha256: String,
 }
 
@@ -572,6 +580,30 @@ pub struct MigrationCurrentInventoryV1 {
     pub collision_pending: Vec<MigrationCurrentCollisionEvidenceV1>,
     pub retirements: Vec<MigrationCurrentRetirementEvidenceV1>,
     pub canonical_sha256: String,
+}
+
+impl MigrationLegacyInventoryV1 {
+    pub fn validate_evidence(&self) -> Result<()> {
+        validate_sha256(&self.generation_set_sha256)?;
+        validate_sha256(&self.unprotected_generation_set_sha256)?;
+        validate_sha256(&self.canonical_sha256)?;
+        let survivor_ids = self
+            .generations
+            .iter()
+            .map(|row| row.generation_id.clone())
+            .collect::<BTreeSet<_>>();
+        if survivor_ids.len() != self.generations.len()
+            || survivor_ids != self.protected_generation_ids
+            || self.generation_count
+                != (self.generations.len() as u64)
+                    .checked_add(self.unprotected_generation_count)
+                    .ok_or_else(|| anyhow!("legacy generation evidence count overflowed"))?
+            || self.canonical_sha256 != legacy_inventory_digest(self)
+        {
+            bail!("legacy migration inventory evidence is incomplete or inconsistent");
+        }
+        Ok(())
+    }
 }
 
 impl MigrationEffectiveSourceManifestV1 {
@@ -633,6 +665,147 @@ pub fn decode_migration_effective_source_manifest_v1(
     Ok(manifest)
 }
 
+#[derive(Default)]
+struct MigrationGenerationSetAccumulator {
+    count: u64,
+    sum: [u8; 32],
+}
+
+impl MigrationGenerationSetAccumulator {
+    fn add(&mut self, row: &MigrationLegacyGenerationEvidenceV1) -> Result<()> {
+        fn field(hasher: &mut Sha256, value: &[u8]) {
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value);
+        }
+
+        let mut leaf = Sha256::new();
+        field(&mut leaf, b"bbox-code-source-legacy-generation-row-v1");
+        field(&mut leaf, row.published_scope.repo_id().as_bytes());
+        field(
+            &mut leaf,
+            row.published_scope.bbox_root_relpath().as_bytes(),
+        );
+        field(&mut leaf, row.generation_id.as_bytes());
+        field(&mut leaf, row.metadata_sha256.as_bytes());
+        field(&mut leaf, row.manifest_sha256.as_bytes());
+        field(&mut leaf, row.record.descriptor.manifest_sha256.as_bytes());
+        let digest: [u8; 32] = leaf.finalize().into();
+        let mut carry = 0_u16;
+        for (target, source) in self.sum.iter_mut().rev().zip(digest.iter().rev()) {
+            let value = u16::from(*target) + u16::from(*source) + carry;
+            *target = value as u8;
+            carry = value >> 8;
+        }
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("legacy generation count overflowed"))?;
+        Ok(())
+    }
+
+    fn digest(&self, domain: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update((domain.len() as u64).to_be_bytes());
+        hasher.update(domain);
+        hasher.update(self.count.to_be_bytes());
+        hasher.update(self.sum);
+        hex::encode(hasher.finalize())
+    }
+}
+
+fn walk_legacy_generation_rows(
+    paths: &CodeSourceStorePaths,
+    limits: &StoreLimits,
+    mut visit: impl FnMut(MigrationLegacyGenerationEvidenceV1) -> Result<()>,
+) -> Result<()> {
+    let scopes_path = paths.root().join("scopes");
+    let Some(scopes_directory) = NofollowDirectory::open_existing(&scopes_path)? else {
+        return Ok(());
+    };
+    for scope_entry in fs::read_dir(&scopes_path)? {
+        let scope_entry = scope_entry?;
+        let file_type = scope_entry.file_type()?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            bail!("legacy scope directory contains an unexpected entry type");
+        }
+        let scope_name = scope_entry
+            .file_name()
+            .to_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("legacy scope directory contains a non-utf8 entry"))?;
+        validate_sha256(&scope_name)?;
+        let scope_path = scopes_path.join(&scope_name);
+        let scope_entries = sorted_directory_entry_names(&scope_path, 1, "legacy scope")?;
+        if scope_entries.len() != 1 || scope_entries[0] != "generations" {
+            bail!("legacy scope directory has an incomplete or unexpected row set");
+        }
+        let generations_path = scope_path.join("generations");
+        let generations_directory = NofollowDirectory::open_existing(&generations_path)?
+            .ok_or_else(|| anyhow!("legacy generations directory disappeared"))?;
+        for generation_entry in fs::read_dir(&generations_path)? {
+            let generation_entry = generation_entry?;
+            let file_type = generation_entry.file_type()?;
+            if !file_type.is_dir() || file_type.is_symlink() {
+                bail!("legacy generation directory contains an unexpected entry type");
+            }
+            let generation_id = generation_entry
+                .file_name()
+                .to_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("legacy generation directory contains a non-utf8 entry"))?;
+            validate_sha256(&generation_id)?;
+            let generation_path = generations_path.join(&generation_id);
+            let directory = NofollowDirectory::open_existing(&generation_path)?
+                .ok_or_else(|| anyhow!("legacy generation directory disappeared"))?;
+            let entries = sorted_regular_entry_names(&generation_path, 2, "legacy generation")?;
+            if entries.len() != 2 || entries[0] != "manifest.jsonl" || entries[1] != "metadata.json"
+            {
+                bail!("legacy generation directory has an incomplete or unexpected row set");
+            }
+            let metadata_bytes = directory
+                .read_regular(
+                    "metadata.json",
+                    MAX_STORED_GENERATION_RECORD_BYTES,
+                    "legacy generation metadata",
+                )?
+                .ok_or_else(|| anyhow!("legacy generation metadata is missing"))?;
+            let record = decode_stored_generation_v1_for_migration(&metadata_bytes)?;
+            if record.generation_id != generation_id
+                || scope_hash(&record.descriptor.scope) != scope_name
+            {
+                bail!("legacy generation path and metadata disagree");
+            }
+            let manifest_bytes = directory
+                .read_regular(
+                    "manifest.jsonl",
+                    MAX_MIGRATION_RECORD_BYTES,
+                    "legacy generation manifest",
+                )?
+                .ok_or_else(|| anyhow!("legacy generation manifest is missing"))?;
+            verify_generation_manifest_for_migration(
+                &manifest_bytes,
+                &record.descriptor,
+                &record.producer_id,
+                &record.generation_id,
+                limits,
+            )?;
+            visit(MigrationLegacyGenerationEvidenceV1 {
+                published_scope: record.descriptor.scope.clone(),
+                generation_id,
+                metadata_sha256: sha256_hex(&metadata_bytes),
+                metadata_bytes,
+                manifest_sha256: sha256_hex(&manifest_bytes),
+                manifest_bytes,
+                record,
+            })?;
+            directory.ensure_still_current()?;
+        }
+        generations_directory.ensure_still_current()?;
+    }
+    scopes_directory.ensure_still_current()?;
+    Ok(())
+}
+
 /// Enumerate the complete legacy v1 source store without creating state.
 ///
 /// The caller must hold the mutation lock for [`CodeSourceStorePaths::anchor`]
@@ -661,9 +834,16 @@ pub fn enumerate_legacy_migration_inventory_locked(
             generations: Vec::new(),
             collision_pending: Vec::new(),
             protected_generation_ids: BTreeSet::new(),
+            generation_count: 0,
+            generation_set_sha256: MigrationGenerationSetAccumulator::default()
+                .digest(b"bbox-code-source-legacy-generation-set-v1"),
+            unprotected_generation_count: 0,
+            unprotected_generation_set_sha256: MigrationGenerationSetAccumulator::default()
+                .digest(b"bbox-code-source-legacy-unprotected-generation-set-v1"),
             canonical_sha256: String::new(),
         };
         inventory.canonical_sha256 = legacy_inventory_digest(&inventory);
+        inventory.validate_evidence()?;
         return Ok(inventory);
     };
 
@@ -700,97 +880,6 @@ pub fn enumerate_legacy_migration_inventory_locked(
             });
         }
     }
-
-    let mut generations = Vec::new();
-    let scopes_path = paths.root().join("scopes");
-    if NofollowDirectory::open_existing(&scopes_path)?.is_some() {
-        for scope_name in sorted_directory_entry_names(
-            &scopes_path,
-            MAX_MIGRATION_INVENTORY_GENERATIONS,
-            "legacy scope",
-        )? {
-            validate_sha256(&scope_name)?;
-            let scope_path = scopes_path.join(&scope_name);
-            let scope_entries = sorted_directory_entry_names(&scope_path, 1, "legacy scope")?;
-            if scope_entries.len() != 1 || scope_entries[0] != "generations" {
-                bail!("legacy scope directory has an incomplete or unexpected row set");
-            }
-            let generations_path = scope_path.join("generations");
-            let Some(_held_generations) = NofollowDirectory::open_existing(&generations_path)?
-            else {
-                continue;
-            };
-            for generation_id in sorted_directory_entry_names(
-                &generations_path,
-                MAX_MIGRATION_INVENTORY_GENERATIONS,
-                "legacy generation",
-            )? {
-                if generations.len() >= MAX_MIGRATION_INVENTORY_GENERATIONS {
-                    bail!("legacy generation inventory exceeds its row limit");
-                }
-                validate_sha256(&generation_id)?;
-                let generation_path = generations_path.join(&generation_id);
-                let directory = NofollowDirectory::open_existing(&generation_path)?
-                    .ok_or_else(|| anyhow!("legacy generation directory disappeared"))?;
-                let entries = sorted_regular_entry_names(&generation_path, 2, "legacy generation")?;
-                if entries.len() != 2
-                    || entries[0] != "manifest.jsonl"
-                    || entries[1] != "metadata.json"
-                {
-                    bail!("legacy generation directory has an incomplete or unexpected row set");
-                }
-                let metadata_bytes = directory
-                    .read_regular(
-                        "metadata.json",
-                        MAX_STORED_GENERATION_RECORD_BYTES,
-                        "legacy generation metadata",
-                    )?
-                    .ok_or_else(|| anyhow!("legacy generation metadata is missing"))?;
-                let record = decode_stored_generation_v1_for_migration(&metadata_bytes)?;
-                if record.generation_id != generation_id
-                    || scope_hash(&record.descriptor.scope) != scope_name
-                {
-                    bail!("legacy generation path and metadata disagree");
-                }
-                let manifest_bytes = directory
-                    .read_regular(
-                        "manifest.jsonl",
-                        MAX_MIGRATION_RECORD_BYTES,
-                        "legacy generation manifest",
-                    )?
-                    .ok_or_else(|| anyhow!("legacy generation manifest is missing"))?;
-                total_encoded_bytes = total_encoded_bytes
-                    .checked_add(metadata_bytes.len())
-                    .and_then(|total| total.checked_add(manifest_bytes.len()))
-                    .ok_or_else(|| anyhow!("legacy inventory byte count overflowed"))?;
-                if total_encoded_bytes > MAX_MIGRATION_INVENTORY_MANIFEST_BYTES {
-                    bail!("legacy inventory exceeds its aggregate byte limit");
-                }
-                verify_generation_manifest_for_migration(
-                    &manifest_bytes,
-                    &record.descriptor,
-                    &record.producer_id,
-                    &record.generation_id,
-                    limits,
-                )?;
-                generations.push(MigrationLegacyGenerationEvidenceV1 {
-                    published_scope: record.descriptor.scope.clone(),
-                    generation_id,
-                    metadata_sha256: sha256_hex(&metadata_bytes),
-                    metadata_bytes,
-                    manifest_sha256: sha256_hex(&manifest_bytes),
-                    manifest_bytes,
-                    record,
-                });
-                directory.ensure_still_current()?;
-            }
-        }
-    }
-    generations.sort_by(|left, right| {
-        left.published_scope
-            .cmp(&right.published_scope)
-            .then_with(|| left.generation_id.cmp(&right.generation_id))
-    });
 
     let mut collision_pending = Vec::new();
     let collision_path = paths.root().join("collision-retirements");
@@ -831,6 +920,74 @@ pub fn enumerate_legacy_migration_inventory_locked(
         }
     }
 
+    let root_generation_ids = activations
+        .iter()
+        .map(|row| row.record.generation_id.clone())
+        .chain(
+            collision_pending
+                .iter()
+                .map(|row| row.record.generation_id.clone()),
+        )
+        .collect::<BTreeSet<_>>();
+    let mut found_root_generation_ids = BTreeSet::new();
+    let mut full_generation_set = MigrationGenerationSetAccumulator::default();
+    let mut generations = Vec::new();
+    let mut protected_identities = BTreeSet::new();
+    let mut retained_by_scope =
+        BTreeMap::<PublishedScope, Vec<MigrationLegacyGenerationEvidenceV1>>::new();
+    walk_legacy_generation_rows(paths, limits, |row| {
+        full_generation_set.add(&row)?;
+        let rooted = root_generation_ids.contains(&row.generation_id);
+        if rooted {
+            found_root_generation_ids.insert(row.generation_id.clone());
+        }
+        let intrinsically_protected = rooted
+            || matches!(
+                row.record.state,
+                GenerationState::MissingBlobs
+                    | GenerationState::Ready
+                    | GenerationState::StagingIndex
+                    | GenerationState::Active
+                    | GenerationState::MissingBlobData
+            );
+        if intrinsically_protected {
+            if generations.len() >= MAX_MIGRATION_INVENTORY_GENERATIONS {
+                bail!("protected legacy generation inventory exceeds its row limit");
+            }
+            protected_identities
+                .insert((scope_hash(&row.published_scope), row.generation_id.clone()));
+            generations.push(row);
+        } else if row.record.state == GenerationState::Superseded && limits.retained_generations > 0
+        {
+            let scope = row.published_scope.clone();
+            let candidates = retained_by_scope.entry(scope).or_default();
+            candidates.push(row);
+            candidates.sort_by(|left, right| {
+                right
+                    .record
+                    .ordinal
+                    .cmp(&left.record.ordinal)
+                    .then_with(|| left.generation_id.cmp(&right.generation_id))
+            });
+            candidates.truncate(limits.retained_generations);
+        }
+        Ok(())
+    })?;
+    if found_root_generation_ids != root_generation_ids {
+        bail!("legacy activation or collision references missing generation metadata");
+    }
+    for candidates in retained_by_scope.into_values() {
+        for row in candidates {
+            protected_identities
+                .insert((scope_hash(&row.published_scope), row.generation_id.clone()));
+            generations.push(row);
+        }
+    }
+    generations.sort_by(|left, right| {
+        left.published_scope
+            .cmp(&right.published_scope)
+            .then_with(|| left.generation_id.cmp(&right.generation_id))
+    });
     let activation_records = activations
         .iter()
         .map(|row| row.record.clone())
@@ -849,6 +1006,53 @@ pub fn enumerate_legacy_migration_inventory_locked(
         &collision_records,
         limits.retained_generations,
     )?;
+    if protected_generation_ids.iter().any(|generation_id| {
+        !generations
+            .iter()
+            .any(|row| &row.generation_id == generation_id)
+    }) {
+        bail!("bounded legacy survivor materialization omits a protected generation");
+    }
+    generations.retain(|row| protected_generation_ids.contains(&row.generation_id));
+    if generations.len() > MAX_MIGRATION_INVENTORY_GENERATIONS {
+        bail!("protected legacy generation inventory exceeds its row limit");
+    }
+    protected_identities = generations
+        .iter()
+        .map(|row| (scope_hash(&row.published_scope), row.generation_id.clone()))
+        .collect();
+    let survivor_bytes = generations.iter().try_fold(0_usize, |total, row| {
+        total
+            .checked_add(row.metadata_bytes.len())
+            .and_then(|value| value.checked_add(row.manifest_bytes.len()))
+            .ok_or_else(|| anyhow!("protected legacy inventory byte count overflowed"))
+    })?;
+    total_encoded_bytes = total_encoded_bytes
+        .checked_add(survivor_bytes)
+        .ok_or_else(|| anyhow!("protected legacy inventory byte count overflowed"))?;
+    if total_encoded_bytes > MAX_MIGRATION_INVENTORY_MANIFEST_BYTES {
+        bail!("protected legacy inventory exceeds its aggregate byte limit");
+    }
+
+    let mut repeated_full_generation_set = MigrationGenerationSetAccumulator::default();
+    let mut unprotected_generation_set = MigrationGenerationSetAccumulator::default();
+    walk_legacy_generation_rows(paths, limits, |row| {
+        repeated_full_generation_set.add(&row)?;
+        let identity = (scope_hash(&row.published_scope), row.generation_id.clone());
+        if !protected_identities.contains(&identity) {
+            unprotected_generation_set.add(&row)?;
+        }
+        Ok(())
+    })?;
+    let generation_set_sha256 =
+        full_generation_set.digest(b"bbox-code-source-legacy-generation-set-v1");
+    if repeated_full_generation_set.count != full_generation_set.count
+        || repeated_full_generation_set.digest(b"bbox-code-source-legacy-generation-set-v1")
+            != generation_set_sha256
+    {
+        bail!("legacy generation row set changed during enumeration");
+    }
+
     if let MigrationLegacyAnchorEvidenceV1::Present { bytes, .. } = &anchor {
         let effective = decode_migration_effective_source_manifest_v1(bytes)?;
         let activations_by_project = activations
@@ -883,9 +1087,15 @@ pub fn enumerate_legacy_migration_inventory_locked(
         generations,
         collision_pending,
         protected_generation_ids,
+        generation_count: full_generation_set.count,
+        generation_set_sha256,
+        unprotected_generation_count: unprotected_generation_set.count,
+        unprotected_generation_set_sha256: unprotected_generation_set
+            .digest(b"bbox-code-source-legacy-unprotected-generation-set-v1"),
         canonical_sha256: String::new(),
     };
     inventory.canonical_sha256 = legacy_inventory_digest(&inventory);
+    inventory.validate_evidence()?;
     Ok(inventory)
 }
 
@@ -893,6 +1103,8 @@ pub fn enumerate_legacy_migration_inventory_locked(
 ///
 /// The caller must hold the mutation lock for [`CodeSourceStorePaths::anchor`]
 /// for the full call. Valid later generations and selections are accepted.
+/// Scopeless v1 rows classified as non-surviving GC candidates are ignored;
+/// any active, rooted, or retention-protected v1 row fails closed.
 pub fn enumerate_current_migration_inventory_locked(
     paths: &CodeSourceStorePaths,
     limits: &StoreLimits,
@@ -938,105 +1150,6 @@ pub fn enumerate_current_migration_inventory_locked(
         directory.ensure_still_current()?;
     }
 
-    let scopes_path = paths.root().join("scopes");
-    let mut generations = Vec::new();
-    if NofollowDirectory::open_existing(&scopes_path)?.is_some() {
-        for scope_name in sorted_directory_entry_names(
-            &scopes_path,
-            MAX_MIGRATION_INVENTORY_GENERATIONS,
-            "current scope",
-        )? {
-            validate_sha256(&scope_name)?;
-            let scope_path = scopes_path.join(&scope_name);
-            let scope_entries = sorted_directory_entry_names(&scope_path, 1, "current scope")?;
-            if scope_entries.len() != 1 || scope_entries[0] != "generations" {
-                bail!("current scope directory has an incomplete or unexpected row set");
-            }
-            let generations_path = scope_path.join("generations");
-            if NofollowDirectory::open_existing(&generations_path)?.is_none() {
-                continue;
-            }
-            for generation_id in sorted_directory_entry_names(
-                &generations_path,
-                MAX_MIGRATION_INVENTORY_GENERATIONS,
-                "current generation",
-            )? {
-                if generations.len() >= MAX_MIGRATION_INVENTORY_GENERATIONS {
-                    bail!("current generation inventory exceeds its row limit");
-                }
-                validate_sha256(&generation_id)?;
-                let generation_path = generations_path.join(&generation_id);
-                let directory = NofollowDirectory::open_existing(&generation_path)?
-                    .ok_or_else(|| anyhow!("current generation directory disappeared"))?;
-                let entries =
-                    sorted_regular_entry_names(&generation_path, 2, "current generation")?;
-                if entries.len() != 2
-                    || entries[0] != "manifest.jsonl"
-                    || entries[1] != "metadata.json"
-                {
-                    bail!("current generation directory has an incomplete or unexpected row set");
-                }
-                let metadata_bytes = directory
-                    .read_regular(
-                        "metadata.json",
-                        MAX_STORED_GENERATION_RECORD_BYTES,
-                        "current generation metadata",
-                    )?
-                    .ok_or_else(|| anyhow!("current generation metadata is missing"))?;
-                let record = decode_stored_generation_v2_for_migration(&metadata_bytes)?;
-                if record.generation_id != generation_id
-                    || scope_hash(&record.published_scope) != scope_name
-                {
-                    bail!("current generation path and metadata disagree");
-                }
-                let manifest_bytes = directory
-                    .read_regular(
-                        "manifest.jsonl",
-                        MAX_MIGRATION_RECORD_BYTES,
-                        "current generation manifest",
-                    )?
-                    .ok_or_else(|| anyhow!("current generation manifest is missing"))?;
-                total_encoded_bytes = checked_inventory_bytes(
-                    checked_inventory_bytes(total_encoded_bytes, metadata_bytes.len())?,
-                    manifest_bytes.len(),
-                )?;
-                verify_generation_manifest_for_migration(
-                    &manifest_bytes,
-                    &record.descriptor,
-                    &record.producer_id,
-                    &record.generation_id,
-                    limits,
-                )?;
-                generations.push(MigrationCurrentGenerationEvidenceV1 {
-                    published_scope: record.published_scope.clone(),
-                    generation_id,
-                    metadata_sha256: sha256_hex(&metadata_bytes),
-                    metadata_bytes,
-                    manifest_sha256: sha256_hex(&manifest_bytes),
-                    manifest_bytes,
-                    record,
-                });
-                directory.ensure_still_current()?;
-            }
-        }
-    }
-    generations.sort_by(|left, right| {
-        left.published_scope
-            .cmp(&right.published_scope)
-            .then_with(|| left.generation_id.cmp(&right.generation_id))
-    });
-    let generations_by_id = generations
-        .iter()
-        .map(|row| (row.generation_id.as_str(), row))
-        .collect::<BTreeMap<_, _>>();
-    let scope_ordinals = generations
-        .iter()
-        .map(|row| (scope_hash(&row.published_scope), row.record.ordinal))
-        .collect::<BTreeSet<_>>();
-    if generations_by_id.len() != generations.len() || scope_ordinals.len() != generations.len() {
-        bail!("current generation inventory contains duplicate ids or scope ordinals");
-    }
-
     let collision_path = paths.root().join("collision-retirements");
     let mut collision_pending = Vec::new();
     if let Some(directory) = NofollowDirectory::open_existing(&collision_path)? {
@@ -1059,14 +1172,8 @@ pub fn enumerate_current_migration_inventory_locked(
                 .ok_or_else(|| anyhow!("current collision retirement disappeared"))?;
             total_encoded_bytes = checked_inventory_bytes(total_encoded_bytes, bytes.len())?;
             let record = decode_collision_retirement_pending_for_migration(&bytes)?;
-            let generation = generations_by_id
-                .get(record.generation_id.as_str())
-                .ok_or_else(|| anyhow!("current collision retirement lacks generation metadata"))?;
-            if record.project_id != project_id
-                || record.former_scope != generation.published_scope
-                || record.manifest_sha256 != generation.record.descriptor.manifest_sha256
-            {
-                bail!("current collision retirement rewrites generation evidence");
+            if record.project_id != project_id {
+                bail!("current collision retirement path and project disagree");
             }
             collision_pending.push(MigrationCurrentCollisionEvidenceV1 {
                 project_id,
@@ -1076,6 +1183,184 @@ pub fn enumerate_current_migration_inventory_locked(
             });
         }
         directory.ensure_still_current()?;
+    }
+    let current_root_generation_ids = activations
+        .iter()
+        .map(|row| row.record.generation_id.as_str())
+        .chain(
+            collision_pending
+                .iter()
+                .map(|row| row.record.generation_id.as_str()),
+        )
+        .collect::<BTreeSet<_>>();
+
+    let scopes_path = paths.root().join("scopes");
+    let mut generations = Vec::new();
+    if NofollowDirectory::open_existing(&scopes_path)?.is_some() {
+        for scope_name in sorted_directory_entry_names(
+            &scopes_path,
+            MAX_MIGRATION_INVENTORY_GENERATIONS,
+            "current scope",
+        )? {
+            validate_sha256(&scope_name)?;
+            let scope_path = scopes_path.join(&scope_name);
+            let scope_entries = sorted_directory_entry_names(&scope_path, 1, "current scope")?;
+            if scope_entries.len() != 1 || scope_entries[0] != "generations" {
+                bail!("current scope directory has an incomplete or unexpected row set");
+            }
+            let generations_path = scope_path.join("generations");
+            if NofollowDirectory::open_existing(&generations_path)?.is_none() {
+                continue;
+            }
+            let mut retained_candidates = Vec::new();
+            for generation_entry in fs::read_dir(&generations_path)? {
+                let generation_entry = generation_entry?;
+                let file_type = generation_entry.file_type()?;
+                if !file_type.is_dir() || file_type.is_symlink() {
+                    bail!("current generation directory contains an unexpected entry type");
+                }
+                let generation_id = generation_entry
+                    .file_name()
+                    .to_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        anyhow!("current generation directory contains a non-utf8 entry")
+                    })?;
+                validate_sha256(&generation_id)?;
+                let generation_path = generations_path.join(&generation_id);
+                let directory = NofollowDirectory::open_existing(&generation_path)?
+                    .ok_or_else(|| anyhow!("current generation directory disappeared"))?;
+                let entries =
+                    sorted_regular_entry_names(&generation_path, 2, "current generation")?;
+                if entries.len() != 2
+                    || entries[0] != "manifest.jsonl"
+                    || entries[1] != "metadata.json"
+                {
+                    bail!("current generation directory has an incomplete or unexpected row set");
+                }
+                let metadata_bytes = directory
+                    .read_regular(
+                        "metadata.json",
+                        MAX_STORED_GENERATION_RECORD_BYTES,
+                        "current generation metadata",
+                    )?
+                    .ok_or_else(|| anyhow!("current generation metadata is missing"))?;
+                let manifest_bytes = directory
+                    .read_regular(
+                        "manifest.jsonl",
+                        MAX_MIGRATION_RECORD_BYTES,
+                        "current generation manifest",
+                    )?
+                    .ok_or_else(|| anyhow!("current generation manifest is missing"))?;
+                match decode_stored_generation_v2_for_migration(&metadata_bytes) {
+                    Ok(record) => {
+                        if record.generation_id != generation_id
+                            || scope_hash(&record.published_scope) != scope_name
+                        {
+                            bail!("current generation path and metadata disagree");
+                        }
+                        verify_generation_manifest_for_migration(
+                            &manifest_bytes,
+                            &record.descriptor,
+                            &record.producer_id,
+                            &record.generation_id,
+                            limits,
+                        )?;
+                        if record.state == GenerationState::Superseded {
+                            retained_candidates.push((
+                                record.ordinal,
+                                generation_id.clone(),
+                                false,
+                            ));
+                        }
+                        if generations.len() >= MAX_MIGRATION_INVENTORY_GENERATIONS {
+                            bail!("current v2 generation inventory exceeds its row limit");
+                        }
+                        total_encoded_bytes = checked_inventory_bytes(
+                            checked_inventory_bytes(total_encoded_bytes, metadata_bytes.len())?,
+                            manifest_bytes.len(),
+                        )?;
+                        generations.push(MigrationCurrentGenerationEvidenceV1 {
+                            published_scope: record.published_scope.clone(),
+                            generation_id,
+                            metadata_sha256: sha256_hex(&metadata_bytes),
+                            metadata_bytes,
+                            manifest_sha256: sha256_hex(&manifest_bytes),
+                            manifest_bytes,
+                            record,
+                        });
+                    }
+                    Err(v2_error) => {
+                        let record = decode_stored_generation_v1_for_migration(&metadata_bytes)
+                            .map_err(|_| v2_error)?;
+                        if record.generation_id != generation_id
+                            || scope_hash(&record.descriptor.scope) != scope_name
+                        {
+                            bail!("legacy leftover generation path and metadata disagree");
+                        }
+                        verify_generation_manifest_for_migration(
+                            &manifest_bytes,
+                            &record.descriptor,
+                            &record.producer_id,
+                            &record.generation_id,
+                            limits,
+                        )?;
+                        if current_root_generation_ids.contains(generation_id.as_str())
+                            || matches!(
+                                record.state,
+                                GenerationState::MissingBlobs
+                                    | GenerationState::Ready
+                                    | GenerationState::StagingIndex
+                                    | GenerationState::Active
+                                    | GenerationState::MissingBlobData
+                            )
+                        {
+                            bail!("protected current generation retains scopeless legacy metadata");
+                        }
+                        if record.state == GenerationState::Superseded {
+                            retained_candidates.push((record.ordinal, generation_id, true));
+                        }
+                    }
+                }
+                directory.ensure_still_current()?;
+            }
+            retained_candidates
+                .sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+            if retained_candidates
+                .iter()
+                .take(limits.retained_generations)
+                .any(|candidate| candidate.2)
+            {
+                bail!("protected retained generation keeps scopeless legacy metadata");
+            }
+        }
+    }
+    generations.sort_by(|left, right| {
+        left.published_scope
+            .cmp(&right.published_scope)
+            .then_with(|| left.generation_id.cmp(&right.generation_id))
+    });
+    let generations_by_id = generations
+        .iter()
+        .map(|row| (row.generation_id.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
+    let scope_ordinals = generations
+        .iter()
+        .map(|row| (scope_hash(&row.published_scope), row.record.ordinal))
+        .collect::<BTreeSet<_>>();
+    if generations_by_id.len() != generations.len() || scope_ordinals.len() != generations.len() {
+        bail!("current generation inventory contains duplicate ids or scope ordinals");
+    }
+
+    for pending in &collision_pending {
+        let generation = generations_by_id
+            .get(pending.record.generation_id.as_str())
+            .ok_or_else(|| anyhow!("current collision retirement lacks generation metadata"))?;
+        if pending.record.former_scope != generation.published_scope
+            || pending.record.manifest_sha256 != generation.record.descriptor.manifest_sha256
+        {
+            bail!("current collision retirement rewrites generation evidence");
+        }
     }
 
     let retirement_path = paths.root().join("retirements");
@@ -3076,6 +3361,13 @@ fn legacy_inventory_digest(inventory: &MigrationLegacyInventoryV1) -> String {
         text(&mut hasher, row.project_id.as_str());
         text(&mut hasher, &row.sha256);
     }
+    field(&mut hasher, &inventory.generation_count.to_be_bytes());
+    text(&mut hasher, &inventory.generation_set_sha256);
+    field(
+        &mut hasher,
+        &inventory.unprotected_generation_count.to_be_bytes(),
+    );
+    text(&mut hasher, &inventory.unprotected_generation_set_sha256);
     field(
         &mut hasher,
         &(inventory.generations.len() as u64).to_be_bytes(),
@@ -3307,6 +3599,182 @@ mod tests {
             materialized_doc_count: Some(1),
             entity_inventory_sha256: Some("c".repeat(64)),
         }
+    }
+
+    fn write_legacy_generation_fixture(
+        paths: &CodeSourceStorePaths,
+        producer_id: &str,
+        ordinal: u64,
+        state: GenerationState,
+    ) -> StoredGeneration {
+        let entries = Vec::new();
+        let descriptor = descriptor(&entries);
+        let mut record = stored_generation_v1(producer_id, descriptor.clone());
+        record.ordinal = ordinal;
+        record.state = state;
+        if !matches!(
+            state,
+            GenerationState::Ready
+                | GenerationState::StagingIndex
+                | GenerationState::Active
+                | GenerationState::Superseded
+                | GenerationState::MissingBlobData
+        ) {
+            record.materialized_doc_count = None;
+            record.entity_inventory_sha256 = None;
+        }
+        let metadata = paths
+            .generation_metadata(&descriptor.scope, &record.generation_id)
+            .unwrap();
+        fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+        fs::write(&metadata, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        fs::write(
+            paths
+                .generation_manifest(&descriptor.scope, &record.generation_id)
+                .unwrap(),
+            manifest_bytes(&entries),
+        )
+        .unwrap();
+        record
+    }
+
+    #[test]
+    fn generation_set_evidence_is_order_independent_and_detects_set_changes() {
+        let row = |generation_id: String| MigrationLegacyGenerationEvidenceV1 {
+            published_scope: PublishedScope::try_new("repo-family", ".").unwrap(),
+            generation_id,
+            metadata_bytes: Vec::new(),
+            metadata_sha256: "a".repeat(64),
+            record: stored_generation_v1("host-a", descriptor(&[])),
+            manifest_bytes: Vec::new(),
+            manifest_sha256: "b".repeat(64),
+        };
+        let rows = vec![
+            row("1".repeat(64)),
+            row("2".repeat(64)),
+            row("3".repeat(64)),
+        ];
+        let digest = |rows: &[MigrationLegacyGenerationEvidenceV1]| {
+            let mut accumulator = MigrationGenerationSetAccumulator::default();
+            for row in rows {
+                accumulator.add(row).unwrap();
+            }
+            accumulator.digest(b"test-generation-set")
+        };
+        let expected = digest(&rows);
+        let mut reordered = rows.clone();
+        reordered.reverse();
+        assert_eq!(digest(&reordered), expected);
+        assert_ne!(digest(&rows[..2]), expected);
+        let mut swapped = rows.clone();
+        swapped[2] = row("4".repeat(64));
+        assert_ne!(digest(&swapped), expected);
+    }
+
+    #[test]
+    fn unprotected_history_can_exceed_the_survivor_row_cap() {
+        let mut accumulator = MigrationGenerationSetAccumulator::default();
+        let mut row = MigrationLegacyGenerationEvidenceV1 {
+            published_scope: PublishedScope::try_new("repo-family", ".").unwrap(),
+            generation_id: "0".repeat(64),
+            metadata_bytes: Vec::new(),
+            metadata_sha256: "a".repeat(64),
+            record: stored_generation_v1("host-a", descriptor(&[])),
+            manifest_bytes: Vec::new(),
+            manifest_sha256: "b".repeat(64),
+        };
+        for index in 0..=MAX_MIGRATION_INVENTORY_GENERATIONS {
+            row.generation_id = format!("{index:064x}");
+            accumulator.add(&row).unwrap();
+        }
+        assert_eq!(
+            accumulator.count,
+            MAX_MIGRATION_INVENTORY_GENERATIONS as u64 + 1
+        );
+        validate_sha256(&accumulator.digest(b"test-unprotected-generation-set")).unwrap();
+    }
+
+    #[test]
+    fn inventory_refuses_an_omitted_protected_survivor() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("source");
+        let paths = CodeSourceStorePaths::new(root).unwrap();
+        let generation =
+            write_legacy_generation_fixture(&paths, "host-protected", 1, GenerationState::Active);
+        let guard = paths.lock_migration_inventory().unwrap();
+        let mut inventory = guard.snapshot_legacy_v1(&StoreLimits::default()).unwrap();
+        assert_eq!(
+            inventory.protected_generation_ids,
+            BTreeSet::from([generation.generation_id])
+        );
+
+        inventory.generations.clear();
+        assert!(inventory.validate_evidence().is_err());
+    }
+
+    #[test]
+    fn current_inventory_ignores_unprotected_v1_leftovers_but_refuses_protected_ones() {
+        let effective =
+            encode_migration_effective_source_manifest_v1(&MigrationEffectiveSourceManifestV1 {
+                version: 1,
+                selections: Vec::new(),
+            })
+            .unwrap();
+
+        let unprotected_directory = tempfile::tempdir().unwrap();
+        let unprotected_root = unprotected_directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("source");
+        let unprotected_paths = CodeSourceStorePaths::new(unprotected_root).unwrap();
+        fs::create_dir_all(unprotected_paths.root()).unwrap();
+        fs::write(unprotected_paths.anchor(), &effective).unwrap();
+        write_legacy_generation_fixture(
+            &unprotected_paths,
+            "host-unprotected",
+            1,
+            GenerationState::Failed,
+        );
+        let guard = unprotected_paths.lock_migration_inventory().unwrap();
+        let first = guard.snapshot_current_v2(&StoreLimits::default()).unwrap();
+        let second = guard.snapshot_current_v2(&StoreLimits::default()).unwrap();
+        assert!(first.generations.is_empty());
+        assert!(first.effective_manifest.selections.is_empty());
+        assert_eq!(first.canonical_sha256, second.canonical_sha256);
+        drop(guard);
+        CodeSourceStore::open(
+            unprotected_paths.root().to_path_buf(),
+            StoreLimits::default(),
+        )
+        .unwrap()
+        .gc_blobs()
+        .unwrap();
+
+        let protected_directory = tempfile::tempdir().unwrap();
+        let protected_root = protected_directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("source");
+        let protected_paths = CodeSourceStorePaths::new(protected_root).unwrap();
+        fs::create_dir_all(protected_paths.root()).unwrap();
+        fs::write(protected_paths.anchor(), effective).unwrap();
+        write_legacy_generation_fixture(
+            &protected_paths,
+            "host-protected-current",
+            1,
+            GenerationState::Active,
+        );
+        let guard = protected_paths.lock_migration_inventory().unwrap();
+        let error = guard
+            .snapshot_current_v2(&StoreLimits::default())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("protected current generation retains scopeless legacy metadata")
+        );
     }
 
     fn activation_v1(generation_id: &str) -> ActivationRecord {
