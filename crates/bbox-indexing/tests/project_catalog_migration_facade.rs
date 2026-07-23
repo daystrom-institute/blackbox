@@ -531,7 +531,25 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
         resolution_id: exclusion.resolution_id.clone(),
         attachment_id: losing_attachment.attachment_id.clone(),
     });
-    let quarantine = assessment_report.activation_conflicts.first().unwrap();
+    fs::write(
+        &resolution_path,
+        encode_migration_resolution_v1(&resolution).unwrap(),
+    )
+    .unwrap();
+    let activation_assessment =
+        ProjectCatalogMigrationFacadeV1::preflight(ProjectCatalogMigrationPreflightRequestV1 {
+            layout: rehearsal.clone(),
+            report_path: report_path.clone(),
+            resolution_path: resolution_path.clone(),
+            sensitive_report_path: None,
+        })
+        .unwrap();
+    assert_eq!(
+        activation_assessment.receipt.status,
+        ProjectCatalogMigrationStatusV1::ResolutionRequired
+    );
+    let activation_report = decode_migration_report_v1(&fs::read(&report_path).unwrap()).unwrap();
+    let quarantine = activation_report.activation_conflicts.first().unwrap();
     resolution.quarantine_collected.push(QuarantineCollectedV1 {
         resolution_id: quarantine.conflict_id.clone(),
         project_id: fixture.loser_project.clone(),
