@@ -899,22 +899,29 @@ checkout path and no Git ancestry. Phase 1 exposes strict verify and migration
 write APIs only; publisher advance and query integration remain Phase 5.
 
 `bbox-code-source-store` adds a strict
-`CollisionRetirementLifecycleV1` containing project id, former scope,
-generation, `selector_evidence`, snapshot and manifest hashes, inventory hash,
-plan hash, and a typed `Pending`, `Queued`, or `Completed` state.
-`selector_evidence` is exactly `ExactMaterialized(selector)` for an active
-loser or `NoDurableSelector` for a retained-only loser. Its target path is
-code-derived from the validated project id. The migration transaction installs
-`Pending` while its complete manifest participant removes any losing active
-row. Ordinary retirement advances `Pending` to `Queued` atomically under the
-store lock and treats the queue row as subordinate execution state. Physical
-retirement is keyed by exact project/generation identity; a retained-only row
-never acquires selector authority during cleanup. Completion atomically
-installs the durable `Completed` receipt before removing the matching queue
-row. A matching lagging queue row beside `Completed` is tolerated and cleaned
-idempotently; contradictory or regressed state fails closed. The immutable
-collected generation remains a journal/marker/lifecycle GC root until the
-completed receipt proves retirement.
+`CollisionRetirementLifecycleV1` document keyed by validated project id. It
+contains a bounded canonical `BTreeMap<GenerationId,
+CollisionRetirementEntryV1>`. Every entry contains former scope,
+`selector_evidence`, snapshot and manifest hashes, inventory hash, plan hash,
+and a typed `Pending`, `Queued`, or `Completed` state. `selector_evidence` is
+exactly `ExactMaterialized(selector)` for an active loser or
+`NoDurableSelector` for a retained-only loser.
+
+The migration transaction atomically installs the complete entry map for every
+active and owner-policy-retained generation of the losing project while its
+complete manifest participant removes any losing active row. Entry evidence
+and membership are immutable after install; only monotonic state transitions
+are allowed. Each entry has a subordinate collision-retirement work row with a
+code-derived id over project and generation. `Pending` publishes or verifies
+that row before advancing to `Queued`; `Queued` requires or recreates the same
+row; physical completion is invoked by project/generation identity and
+atomically installs the durable `Completed` entry before removing the matching
+work row. An active entry's exact selector is a deletion target. A
+retained-only entry never acquires selector authority during cleanup. A
+matching lagging work row beside `Completed` is tolerated and cleaned
+idempotently; contradictory, duplicate, missing, or regressed state fails
+closed. Only Pending/Queued entries keep their immutable generations as
+journal/marker/lifecycle GC roots; Completed entries remain terminal receipts.
 
 The same crate adds strict `ActivationRecordV2` and `StoredGenerationV2`
 metadata with explicit `published_scope` and no serde default. Migration
@@ -927,10 +934,11 @@ descriptor, manifest, generation id, project, and scope, and records typed
 retained scope ownership yields a bounded resolution conflict carrying its
 candidate set. Each rewritten metadata file is a code-owned migration
 participant. A losing collision writes no active v2 record; its former scope
-and typed selector evidence live only in `CollisionRetirementLifecycleV1`.
-Active losers require an exact materialized selector; retained-only losers
-require `NoDurableSelector` and exact project/generation identity. First v2
-startup rejects scopeless metadata instead of inferring scope from project id.
+and per-generation typed selector evidence live only in
+`CollisionRetirementLifecycleV1`. Active losers require an exact materialized
+selector; every retained-only loser requires its own `NoDurableSelector` entry
+and exact project/generation identity. First v2 startup rejects scopeless
+metadata instead of inferring scope from project id.
 
 ### 6.6 Deterministic post-image construction
 
@@ -969,8 +977,8 @@ one transaction plan containing:
 - the complete effective source-manifest post-image;
 - strict scope-bearing activation and retained-generation metadata post-images
   for every surviving collected generation;
-- typed `CollisionRetirementLifecycleV1::Pending` records and removal of any
-  corresponding legacy activation;
+- one typed `CollisionRetirementLifecycleV1` document containing the complete
+  Pending entry map and removal of any corresponding legacy activation;
 - every accepted-publication pointer post-image;
 - the migration marker;
 - immutable G1 knowledge/gap generation assets with canonical relative-filename
@@ -1066,6 +1074,11 @@ Fixture and property tests cover:
   matching lagging queue row;
 - retained-only collision retirement keyed by exact project/generation
   identity without manufacturing selector authority;
+- one losing project with an active generation and multiple retained
+  generations, proving complete lifecycle membership, independent entry
+  transitions, and immutable terminal receipts;
+- production startup reconciliation of selector-backed and selectorless
+  Pending/Queued entries through code-derived project/generation work ids;
 - mixed v1/v2 maintenance and GC, proving unprotected leftovers remain
   non-selectable and protected scopeless legacy state refuses;
 - lock overlap with a live bridge registry;

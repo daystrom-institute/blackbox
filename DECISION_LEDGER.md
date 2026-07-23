@@ -443,12 +443,13 @@ until a later entry explicitly supersedes it.
 - Phase: durable project catalog, collision retirement
 - Status: accepted after independent plan re-review
 - Decision: One project-scoped lifecycle record advances through typed
-  `Pending`, `Queued`, and `Completed` states while preserving the original
-  losing project, former scope, generation, typed selector evidence, and
-  migration evidence. Active losers carry their exact materialized selector;
-  retained-only losers carry `NoDurableSelector`. The completed record is
-  retained as the terminal receipt. The physical queue is subordinate execution
-  state; a matching lagging row is tolerated and removed idempotently.
+  per-generation `Pending`, `Queued`, and `Completed` states while preserving
+  the original losing project, former scope, generation, typed selector
+  evidence, and migration evidence. Active losers carry their exact
+  materialized selector; retained-only losers carry `NoDurableSelector`.
+  Completed entries are retained as terminal receipts. Physical work rows are
+  subordinate execution state; a matching lagging row is tolerated and removed
+  idempotently.
 - Evidence:
   - Deleting the only collision record after retirement erases the durable
     explanation for unavailable migrated state.
@@ -556,3 +557,29 @@ until a later entry explicitly supersedes it.
   surface.
 - Revisit only if: a different non-serializable capability model provides the
   same digest-bound classification and apply-time recapture guarantees.
+
+## D-024: Collision lifecycle is a bounded per-generation map
+
+- Date: 2026-07-23
+- Phase: durable project catalog, collision retirement
+- Status: accepted after independent plan re-review
+- Decision: One project-scoped collision lifecycle document contains a bounded
+  canonical map with one immutable-evidence entry for every active and
+  owner-policy-retained generation of the losing project. Entries transition
+  independently through `Pending`, `Queued`, and `Completed`. Subordinate work
+  is keyed by a code-derived id over project and generation, and workers
+  complete by that identity; selector evidence is an optional deletion target,
+  never the work identity.
+- Evidence:
+  - One losing project can have one active generation plus multiple retained
+    generations, while a scalar lifecycle can represent only one.
+  - Retained-only generations have no durable materialized selector, so a
+    selector-keyed queue cannot execute or complete their retirement.
+  - A project-scoped document preserves the durable terminal-receipt model while
+    allowing atomic installation of the complete collision set.
+- Rationale: Per-generation entries make the quarantine complete and
+  crash-recoverable without fabricating selectors or multiplying project-level
+  authority records.
+- Revisit only if: the owner store adopts an equally complete bounded
+  generation-indexed lifecycle with the same immutable evidence and monotonic
+  transition guarantees.

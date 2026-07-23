@@ -607,15 +607,25 @@ succeeds or the project is explicitly retired. Without the disposition, apply
 refuses. The migration report lists the exact search, graph, vector, and source
 generations made unavailable.
 
-Collision quarantine has one project-scoped durable lifecycle record. Its
-typed states are `Pending`, `Queued`, and `Completed`, and every state preserves
-the losing project, former scope, generation, typed selector evidence, and
-migration evidence.
-The ordinary retirement queue is subordinate execution state, not the terminal
-proof. A completed lifecycle record remains as the durable receipt after
-physical retirement; a matching lagging queue row is tolerated and removed
-idempotently. Startup and GC reject missing, regressed, or cross-bound lifecycle
-evidence instead of requiring an ephemeral queue row to survive forever.
+Collision quarantine has one project-scoped durable lifecycle document with a
+bounded, canonical map keyed by generation id. Each immutable entry preserves
+former scope, typed selector evidence, snapshot and manifest hashes, and
+migration evidence, and advances independently through `Pending`, `Queued`,
+and `Completed`. The migration transaction installs the complete entry set for
+all active and owner-policy-retained generations of the losing project; later
+transitions may advance state but may not add, remove, or rewrite entry
+evidence.
+
+Each entry has subordinate execution state keyed by a code-derived collision
+work id over project and generation, not by selector. An active entry includes
+its exact selector as a deletion target; a retained-only entry has none.
+Startup reconciles every entry: `Pending` publishes or verifies its work row
+before advancing to `Queued`, `Queued` recreates or verifies missing work, and
+`Completed` tolerates and removes a matching lagging row. The worker completes
+an entry by exact project/generation identity. Completed entries remain in the
+project document as terminal receipts. Startup and GC reject missing,
+regressed, duplicate, or cross-bound evidence; only Pending/Queued entries root
+immutable generation bytes.
 
 The staged complete active-manifest post-image removes every losing workspace
 row in the same migration transaction that installs the catalog. This is the
