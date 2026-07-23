@@ -13753,7 +13753,7 @@ mod tests {
                 ExpectedImageV1::Present { artifact_name, .. } => {
                     Some(paths.stage_dir.join(artifact_name.as_str()))
                 }
-                ExpectedImageV1::Absent => None,
+                ExpectedImageV1::Absent {} => None,
             })
             .unwrap();
 
