@@ -46,6 +46,10 @@ struct PreparedProjectArtifact {
     value: Value,
 }
 
+// The registration path invokes this helper only from its surrounding
+// `spawn_blocking` phase. Keeping the filesystem read here preserves the
+// prepare-then-publish boundary while making the blocking-pool contract explicit.
+#[allow(clippy::disallowed_methods)]
 fn prepare_project_artifacts(project_root: &Path) -> anyhow::Result<Vec<PreparedProjectArtifact>> {
     let mut prepared = Vec::new();
     for artifact in artifacts::discover_project_artifacts(project_root)? {
