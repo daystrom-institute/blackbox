@@ -1216,6 +1216,12 @@ For each legacy record:
 - use committed recorded scope or a fully agreeing active collected descriptor
   for `Published`;
 - otherwise create `LegacyLocal`;
+- when an exact `selected_scope_owner` disposition makes a present duplicate
+  scope project a losing `LegacyLocal` project, retain its exact base
+  attachment but clear the attachment's validated/expected published scope;
+  this downgrade is authorized only for the disposition's named losing project
+  and exact duplicate scope, does not require `excluded_attachments`, and does
+  not preserve any collected selector or activation authority;
 - create an attachment only after canonical path, planned or existing checkout
   identity, and scope validation; and
 - never drop a missing path.
@@ -1360,6 +1366,9 @@ Fixture and property tests cover:
   namespace;
 - Git, non-Git, monorepo, shallow, missing, and moved projects;
 - duplicate ids, scopes, aliases, and weak namespaces;
+- duplicate-scope survivor selection retaining every present losing checkout
+  as one `LegacyLocal` base attachment with no validated published scope, while
+  removing the loser's effective source selection and activation;
 - planned random attachment ids reproduced across separate preflight/apply,
   plus refusal of path-derived, order-derived, reminted, or missing ids;
 - cross-project duplicate active `(checkout_id, project_root_relpath)`
