@@ -3,12 +3,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use bbox_code_source::{
-    GenerationDescriptor, ManifestEntry, SCHEMA_VERSION, WALKER_POLICY_VERSION, dirty_fingerprint,
-    generation_id, manifest_sha256, source_selector,
+    GenerationDescriptor, GenerationState, ManifestEntry, SCHEMA_VERSION, WALKER_POLICY_VERSION,
+    dirty_fingerprint, generation_id, manifest_sha256, source_selector,
 };
 use bbox_code_source_store::{
-    ActivationRecord, CodeSourceStore, CodeSourceStorePaths, GenerationState,
-    MigrationEffectiveSourceManifestV1, MigrationEffectiveSourceSelectionV1, StoredGeneration,
+    ActivationRecord, CodeSourceStore, CodeSourceStorePaths, MigrationEffectiveSourceManifestV1,
+    MigrationEffectiveSourceSelectionV1, StoredGeneration, decode_activation_v2_for_migration,
     decode_collision_retirement_pending_for_migration,
     decode_migration_effective_source_manifest_v1, decode_stored_generation_v2_for_migration,
     encode_migration_effective_source_manifest_v1,
@@ -412,6 +412,18 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
 
     let code_source_paths =
         CodeSourceStorePaths::new(rehearsal_root.join("state/code-sources")).unwrap();
+    let executable_report = decode_migration_report_v1(&fs::read(&report_path).unwrap()).unwrap();
+    let checkout_action = executable_report.checkout_identity_actions.first().unwrap();
+    assert_eq!(
+        fs::read_to_string(fixture.winner_checkout.join(".bbox/local/checkout-id")).unwrap(),
+        format!("{}\n", checkout_action.planned_checkout_id)
+    );
+    assert!(
+        !fixture
+            .loser_checkout
+            .join(".bbox/local/checkout-id")
+            .exists()
+    );
     let effective = decode_migration_effective_source_manifest_v1(
         &fs::read(code_source_paths.anchor()).unwrap(),
     )
@@ -421,6 +433,18 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
     assert_eq!(
         effective.selections[0].generation_id,
         fixture.winner_generation
+    );
+    let winner_activation = decode_activation_v2_for_migration(
+        &fs::read(code_source_paths.activation(&fixture.winner_project)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(winner_activation.project_id, fixture.winner_project);
+    assert_eq!(winner_activation.published_scope, fixture.scope);
+    assert_eq!(winner_activation.generation_id, fixture.winner_generation);
+    assert!(
+        !code_source_paths
+            .activation(&fixture.loser_project)
+            .exists()
     );
     let winner_metadata = decode_stored_generation_v2_for_migration(
         &fs::read(
@@ -452,6 +476,63 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
         preflight.receipt.inventory_hash.to_string()
     );
     assert_eq!(retired.plan_hash, preflight.receipt.plan_hash.to_string());
+    let pointer_path = rehearsal_root
+        .join("state/accepted-publications/pointers")
+        .join(format!("{}.json", fixture.winner_project));
+    let pointer_bytes = fs::read(&pointer_path).unwrap();
+    let pointer: serde_json::Value = serde_json::from_slice(&pointer_bytes).unwrap();
+    assert_eq!(
+        pointer["accepted_scope"],
+        serde_json::to_value(&fixture.scope).unwrap()
+    );
+    let generation_id = pointer["accepted_generation"].as_str().unwrap();
+    let generation_path = rehearsal_root
+        .join("state/accepted-publications/generations")
+        .join(fixture.winner_project.as_str())
+        .join(format!("{generation_id}.json"));
+    let generation_bytes = fs::read(&generation_path).unwrap();
+    let generation: serde_json::Value = serde_json::from_slice(&generation_bytes).unwrap();
+    assert_eq!(
+        generation["scope"],
+        serde_json::to_value(&fixture.scope).unwrap()
+    );
+    assert_eq!(
+        executable_report
+            .predicted_accepted_pointer_hashes
+            .get(&fixture.winner_project)
+            .unwrap(),
+        &bbox_indexing::project_catalog_inventory::Sha256ValueV1::digest(&pointer_bytes)
+    );
+    let g1 = executable_report
+        .predicted_g1_assets
+        .iter()
+        .find(|row| row.asset_id == generation_id)
+        .unwrap();
+    assert_eq!(
+        g1.content_hash,
+        bbox_indexing::project_catalog_inventory::Sha256ValueV1::digest(&generation_bytes)
+    );
+    let marker_bytes =
+        fs::read(rehearsal_root.join("state/project-catalog-migration.json")).unwrap();
+    let marker: serde_json::Value = serde_json::from_slice(&marker_bytes).unwrap();
+    assert_eq!(
+        marker["transaction_id"],
+        preflight.receipt.transaction_id.to_string()
+    );
+    assert_eq!(marker["plan_hash"], preflight.receipt.plan_hash.to_string());
+    assert_eq!(
+        marker["report_artifact_sha256"],
+        preflight.receipt.report_artifact_hash.to_string()
+    );
+    assert_eq!(
+        marker["resolution_artifact_sha256"],
+        preflight.receipt.resolution_artifact_hash.to_string()
+    );
+    assert_eq!(
+        marker["inventory_sha256"],
+        preflight.receipt.inventory_hash.to_string()
+    );
+    assert_eq!(marker["migration_epoch"], 1);
     assert!(!applied.receipt.verification.backup_hashes.is_empty());
     assert!(
         applied

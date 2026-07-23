@@ -585,6 +585,30 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn migration_source_first_read_refuses_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let state = tempfile::tempdir().unwrap();
+        let root = state.path().canonicalize().unwrap();
+        let path = root.join("publisher-refs.json");
+        let outside = root.join("outside.json");
+        let expected = br#"{"version":1,"refs":[]}"#;
+        std::fs::write(&outside, expected).unwrap();
+        let source = PublisherRefStore::migration_source(&path);
+        symlink(&outside, &path).unwrap();
+
+        assert!(source.snapshot_migration_source().is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), expected);
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
     #[test]
     fn repin_requires_full_branch_ref() {
         let state = tempfile::tempdir().unwrap();

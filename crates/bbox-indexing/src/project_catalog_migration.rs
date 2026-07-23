@@ -73,9 +73,9 @@ use crate::project_catalog_store::{
     MigrationCodeSourceGenerationDraftV1, MigrationCodeSourceSnapshotDraftV1,
     MigrationImmutableAssetDraftV1, MigrationLegacyProjectSourceDraftV1,
     MigrationParticipantDraftV1, MigrationParticipantRegistry, MigrationPlanDraftV1,
-    MigrationPublisherSourceDraftV1, ParticipantRoleV1, ProjectCatalogStore,
-    PublisherDispositionEvidenceV1, PublisherPinEvidenceV1, Sha256Hex, ValidatedMigrationPlanV1,
-    transact_migration, validate_migration_plan,
+    MigrationPublisherSourceDraftV1, MigrationTransactionFailureDispositionV1, ParticipantRoleV1,
+    ProjectCatalogStore, PublisherDispositionEvidenceV1, PublisherPinEvidenceV1, Sha256Hex,
+    ValidatedMigrationPlanV1, transact_migration_classified, validate_migration_plan,
 };
 use crate::publisher::PublisherRefStore;
 
@@ -2969,6 +2969,7 @@ fn build_migration_report(
     identities: &MigrationPersistedIdentityPlanV1,
     plan_hash: Sha256ValueV1,
     predicted: PredictedPostImageHashesV1,
+    predicted_immutable_asset_hashes: BTreeMap<String, Sha256ValueV1>,
     legacy_path_bindings: Vec<LegacyPathBindingReportV1>,
     missing_paths: Vec<MissingPathReportV1>,
     unscoped_legacy_counts: BTreeMap<crate::project_catalog_inventory::LegacyPathStoreKindV1, u64>,
@@ -3051,6 +3052,7 @@ fn build_migration_report(
         predicted_catalog_hash: predicted.catalog_hash.clone(),
         predicted_attachment_hash: predicted.attachment_hash.clone(),
         predicted_participant_hashes: predicted.participant_hashes.clone(),
+        predicted_immutable_asset_hashes,
     };
     report
         .validate_against_inventory(inventory)
@@ -3366,11 +3368,25 @@ impl ClosedMigrationIntegrationV1 for CurrentClosedMigrationIntegrationV1 {
                 "reviewed migration is not executable",
             )
         })?;
-        transact_migration(&layout.projects_path, plan).map_err(|error| {
+        transact_migration_classified(&layout.projects_path, plan).map_err(|failure| {
+            let mutation_disposition = match failure.disposition {
+                MigrationTransactionFailureDispositionV1::NoDurableMutation => {
+                    ProjectCatalogMigrationMutationDispositionV1::NoDurableMutation
+                }
+                MigrationTransactionFailureDispositionV1::RecoveredToOldState => {
+                    ProjectCatalogMigrationMutationDispositionV1::RecoveredToOldState
+                }
+                MigrationTransactionFailureDispositionV1::RecoveredToCommittedState => {
+                    ProjectCatalogMigrationMutationDispositionV1::RecoveredToCommittedState
+                }
+                MigrationTransactionFailureDispositionV1::RetryExactPlanRequired => {
+                    ProjectCatalogMigrationMutationDispositionV1::RetryExactPlanRequired
+                }
+            };
             ProjectCatalogMigrationError::new(
-                error.code(),
+                failure.error.code(),
                 "migration transaction failed after exact-plan validation",
-                ProjectCatalogMigrationMutationDispositionV1::RetryExactPlanRequired,
+                mutation_disposition,
             )
         })?;
         let verified = verify_installed(layout)?;
@@ -3477,7 +3493,7 @@ fn prepare_closed_migration(
         Some(bytes) => bytes.to_vec(),
         None => encode_migration_resolution_v1(&resolution).map_err(inventory_error)?,
     };
-    let assessment = assess_migration_semantics(inventory, &resolution)?;
+    let mut assessment = assess_migration_semantics(inventory, &resolution)?;
     let identities = build_persisted_identity_plan(
         inventory,
         &assessment.resolved_project_scopes,
@@ -3495,11 +3511,35 @@ fn prepare_closed_migration(
         );
     }
 
-    let base = build_base_post_images(inventory, &runtime, &assessment, &identities, &resolution)?;
+    let base =
+        match build_base_post_images(inventory, &runtime, &assessment, &identities, &resolution) {
+            Ok(base) => base,
+            Err(_) => {
+                assessment.refusal_count = assessment.refusal_count.saturating_add(1);
+                return prepare_assessment_only(
+                    inventory,
+                    &runtime,
+                    &resolution_bytes,
+                    &assessment,
+                    &identities,
+                    include_sensitive_paths,
+                );
+            }
+        };
     if base.refusal_count != 0 {
-        return Err(planner_error(
-            "post-image path joins contain a non-overridable refusal",
-        ));
+        assessment.refusal_count = assessment.refusal_count.saturating_add(base.refusal_count);
+        return prepare_assessment_only_with_rows(
+            inventory,
+            &runtime,
+            &resolution_bytes,
+            &assessment,
+            &identities,
+            include_sensitive_paths,
+            base.legacy_binding_report,
+            base.missing_paths,
+            base.unscoped_legacy_counts,
+            base.sensitive_report,
+        );
     }
     let publisher = prepare_publisher_plan(inventory, &runtime, &assessment, &resolution)?;
     let catalog_bytes = encode_catalog_snapshot(&base.catalog)
@@ -3582,23 +3622,6 @@ fn prepare_closed_migration(
         })
         .collect::<Result<_, ProjectCatalogMigrationError>>()?;
     post_image.predicted_hashes = predicted.clone();
-    let report = build_migration_report(
-        inventory,
-        &resolution_bytes,
-        &assessment,
-        &identities,
-        plan_hash.clone(),
-        predicted,
-        base.legacy_binding_report.clone(),
-        base.missing_paths.clone(),
-        base.unscoped_legacy_counts.clone(),
-        ProjectCatalogMigrationStatusV1::Clean,
-    )?;
-    let report_bytes = encode_migration_report_v1(&report, inventory).map_err(inventory_error)?;
-    let quarantine_authority =
-        validated_quarantine_bindings(inventory, &report, &resolution, &post_image)
-            .map_err(inventory_error)?;
-    let registry = build_registry(layout, &runtime.checkout_paths)?;
     let immutable_predictions = store_parts
         .immutable_assets
         .iter()
@@ -3610,6 +3633,24 @@ fn prepare_closed_migration(
             ))
         })
         .collect::<Result<BTreeMap<_, _>, ProjectCatalogMigrationError>>()?;
+    let report = build_migration_report(
+        inventory,
+        &resolution_bytes,
+        &assessment,
+        &identities,
+        plan_hash.clone(),
+        predicted,
+        immutable_predictions.clone(),
+        base.legacy_binding_report.clone(),
+        base.missing_paths.clone(),
+        base.unscoped_legacy_counts.clone(),
+        ProjectCatalogMigrationStatusV1::Clean,
+    )?;
+    let report_bytes = encode_migration_report_v1(&report, inventory).map_err(inventory_error)?;
+    let quarantine_authority =
+        validated_quarantine_bindings(inventory, &report, &resolution, &post_image)
+            .map_err(inventory_error)?;
+    let registry = build_registry(layout, &runtime.checkout_paths)?;
     let draft = MigrationPlanDraftV1 {
         transaction_id: identities.transaction_id.clone(),
         plan_hash: store_sha256(plan_hash.as_str())?,
@@ -3694,6 +3735,34 @@ fn prepare_assessment_only(
     let status = assessment.status();
     let (legacy_bindings, missing_paths, unscoped, sensitive_paths) =
         build_non_executable_review_rows(inventory, runtime, identities, status)?;
+    prepare_assessment_only_with_rows(
+        inventory,
+        runtime,
+        resolution_bytes,
+        assessment,
+        identities,
+        include_sensitive_paths,
+        legacy_bindings,
+        missing_paths,
+        unscoped,
+        sensitive_paths,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_assessment_only_with_rows(
+    inventory: &V1ProjectCatalogInventory,
+    runtime: &MigrationRuntimeBindingsViewV1,
+    resolution_bytes: &[u8],
+    assessment: &MigrationSemanticAssessmentV1,
+    identities: &MigrationPersistedIdentityPlanV1,
+    include_sensitive_paths: bool,
+    legacy_bindings: Vec<LegacyPathBindingReportV1>,
+    missing_paths: Vec<MissingPathReportV1>,
+    unscoped: BTreeMap<crate::project_catalog_inventory::LegacyPathStoreKindV1, u64>,
+    sensitive_paths: SensitiveLocalPathReportV1,
+) -> Result<PreparedClosedMigrationV1, ProjectCatalogMigrationError> {
+    let status = assessment.status();
     let plan_hash =
         non_executable_assessment_hash(inventory, resolution_bytes, identities, status)?;
     let predicted = PredictedPostImageHashesV1 {
@@ -3710,6 +3779,7 @@ fn prepare_assessment_only(
         identities,
         plan_hash,
         predicted,
+        BTreeMap::new(),
         legacy_bindings,
         missing_paths,
         unscoped,
@@ -3727,7 +3797,7 @@ fn prepare_assessment_only(
         &report_bytes,
         resolution_bytes,
         assessment.refusal_count,
-        &BTreeMap::new(),
+        &report.predicted_immutable_asset_hashes,
         sensitive_review.as_ref(),
         0,
         u64::try_from(inventory.legacy_projects.len()).unwrap_or(u64::MAX),
@@ -4024,7 +4094,7 @@ fn preflight_receipt(
         predicted_catalog_hash: report.predicted_catalog_hash.clone(),
         predicted_attachment_hash: report.predicted_attachment_hash.clone(),
         predicted_participant_hashes: report.predicted_participant_hashes.clone(),
-        predicted_immutable_asset_hashes: immutable_predictions.clone(),
+        predicted_immutable_asset_hashes: report.predicted_immutable_asset_hashes.clone(),
         required_resolution_count: u64::try_from(report.required_resolutions.len())
             .unwrap_or(u64::MAX),
         refusal_count,
@@ -4062,6 +4132,7 @@ fn validate_planned_identity(
         || projections.attachment_hash != report.predicted_attachment_hash
         || projections.participant_hashes != report.predicted_participant_hashes
         || &projections.immutable_hashes != immutable_predictions
+        || projections.immutable_hashes != report.predicted_immutable_asset_hashes
     {
         return Err(ProjectCatalogMigrationError::no_mutation(
             "error.project_catalog_migration_artifact_identity",
@@ -4144,6 +4215,8 @@ fn verify_exact_installed_review(
                 || receipt.expected_catalog_hash != report.predicted_catalog_hash
                 || receipt.expected_attachment_hash != report.predicted_attachment_hash
                 || receipt.expected_participant_hashes != report.predicted_participant_hashes
+                || receipt.expected_immutable_asset_hashes
+                    != report.predicted_immutable_asset_hashes
             {
                 return Err(ProjectCatalogMigrationError::no_mutation(
                     "error.project_catalog_migration_artifact_identity",
@@ -4264,6 +4337,8 @@ fn validate_prepared_preflight(
         || prepared.receipt.predicted_catalog_hash != report.predicted_catalog_hash
         || prepared.receipt.predicted_attachment_hash != report.predicted_attachment_hash
         || prepared.receipt.predicted_participant_hashes != report.predicted_participant_hashes
+        || prepared.receipt.predicted_immutable_asset_hashes
+            != report.predicted_immutable_asset_hashes
         || prepared.receipt.required_resolution_count
             != u64::try_from(report.required_resolutions.len()).unwrap_or(u64::MAX)
         || prepared.receipt.checkout_action_count
@@ -4310,6 +4385,7 @@ fn validate_apply_result(
         || verification.expected_catalog_hash != report.predicted_catalog_hash
         || verification.expected_attachment_hash != report.predicted_attachment_hash
         || verification.expected_participant_hashes != report.predicted_participant_hashes
+        || verification.expected_immutable_asset_hashes != report.predicted_immutable_asset_hashes
         || !verification_receipt_observations_match(verification)
     {
         return Err(ProjectCatalogMigrationError::new(
