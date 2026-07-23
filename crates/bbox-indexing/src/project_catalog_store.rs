@@ -3116,8 +3116,10 @@ impl ProjectCatalogTransactionOwner {
                 .find(|candidate| match &candidate.role {
                     ParticipantRoleV1::StoredGenerationMetadata {
                         project_id: owner,
+                        published_scope,
                         generation_id,
                     } if owner == project_id
+                        && published_scope == &lifecycle.record.former_scope
                         && generation_id.as_str() == old_activation.generation_id =>
                     {
                         true
