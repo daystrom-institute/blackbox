@@ -10,7 +10,7 @@ use std::path::{Component, Path};
 use sha2::{Digest, Sha256};
 
 use crate::manifest::{
-    manifest_index_path, materialized_dir, ManifestIndex, WorkspaceManifest, MANIFEST_VERSION,
+    MANIFEST_VERSION, ManifestIndex, WorkspaceManifest, manifest_index_path, materialized_dir,
 };
 use crate::snapshot::with_manifest_coordinator;
 

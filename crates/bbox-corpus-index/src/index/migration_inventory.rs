@@ -17,7 +17,7 @@ use tantivy::{Index, TantivyDocument};
 
 use bbox_corpus_core::entity_ref::EntityRef;
 
-use super::{optional_text, FileMeta, FileMetaSource, INDEX_SCHEMA_VERSION, SCHEMA_VERSION_FILE};
+use super::{FileMeta, FileMetaSource, INDEX_SCHEMA_VERSION, SCHEMA_VERSION_FILE, optional_text};
 
 const SNAPSHOT_VERSION_V1: u32 = 1;
 const INDEX_SCHEMA_HASH_DOMAIN: &[u8] = b"blackbox.corpus-index.schema.v1\0";

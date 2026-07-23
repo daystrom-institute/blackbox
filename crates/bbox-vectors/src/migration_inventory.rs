@@ -12,7 +12,7 @@ use std::path::{Component, Path};
 use sha2::{Digest, Sha256};
 
 use super::{
-    read_snapshot, PartitionSnapshot, VectorStore, VECTOR_SCHEMA_VERSION, VECTOR_SNAPSHOT_VERSION,
+    PartitionSnapshot, VECTOR_SCHEMA_VERSION, VECTOR_SNAPSHOT_VERSION, VectorStore, read_snapshot,
 };
 use crate::wal::WalRecord;
 
