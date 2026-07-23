@@ -1081,8 +1081,10 @@ Unknown resolution keys, unknown record ids, stale inventory hashes, duplicate
 dispositions, incomplete dispositions, and attempts to remint/reassign a
 preserved project id fail closed. Syntactically valid but semantically unknown,
 duplicated, stale, mismatched, or unsupported dispositions are invalid
-resolution artifacts and return a path-redacted `NoDurableMutation` error;
-they are not converted into a successful `refused` inventory result.
+resolution artifacts and return a path-redacted artifact error. Preflight uses
+the facade's artifact-identity error code; apply additionally reports
+`NoDurableMutation`. Neither operation converts them into a successful
+`refused` inventory result.
 
 A publisher disposition is exactly one of:
 
