@@ -9517,8 +9517,10 @@ mod tests {
             &inventory_scopes,
         )
         .unwrap();
-        draft.inventory_sha256 =
+        let code_source_inventory_sha256 =
             Sha256Hex::parse(legacy_inventory.canonical_sha256.clone()).unwrap();
+        draft.inventory_sha256 = code_source_inventory_sha256.clone();
+        draft.code_source_inventory_sha256 = code_source_inventory_sha256;
         draft.code_source_snapshot.legacy_inventory = legacy_inventory;
         for participant in &mut draft.participants {
             if !matches!(
@@ -10536,8 +10538,10 @@ mod tests {
             &published_catalog_scopes(&draft.catalog),
         )
         .unwrap();
-        draft.inventory_sha256 =
+        let code_source_inventory_sha256 =
             Sha256Hex::parse(legacy_inventory.canonical_sha256.clone()).unwrap();
+        draft.inventory_sha256 = code_source_inventory_sha256.clone();
+        draft.code_source_inventory_sha256 = code_source_inventory_sha256;
         draft.code_source_snapshot = MigrationCodeSourceSnapshotDraftV1 {
             legacy_inventory,
             activations: vec![MigrationCodeSourceActivationDraftV1 {

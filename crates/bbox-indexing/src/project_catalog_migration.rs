@@ -3750,13 +3750,6 @@ fn prepare_closed_migration(
         .map_err(adapter_error)?;
     let attachment_identity_plan =
         prepare_attachment_identity_plan(&candidate_keys, prior_report.as_ref())?;
-    let provenance_sources =
-        ProjectCatalogMigrationInventoryFacadeV1::discover_provenance_owner_sources(
-            layout.projects_path.clone(),
-            layout.provenance_notes_ref.clone(),
-            layout.rehearsal_root.clone(),
-        )
-        .map_err(adapter_error)?;
     let publisher_ref_store =
         PublisherRefStore::migration_source(layout.publisher_refs_path.clone());
     let captured = ProjectCatalogMigrationInventoryFacadeV1::capture(
@@ -3767,7 +3760,7 @@ fn prepare_closed_migration(
             code_source_store_root: layout.code_source_root.clone(),
             code_source_store_limits: layout.store_limits.clone(),
             checkout_roots,
-            owner_paths: owner_inventory_paths(layout, provenance_sources),
+            owner_paths: owner_inventory_paths(layout),
             owner_limits: ProjectCatalogOwnerInventoryLimitsV1::default(),
             attachment_identity_plan: &attachment_identity_plan,
         },
@@ -4206,9 +4199,6 @@ fn prepare_attachment_identity_plan(
 
 fn owner_inventory_paths(
     layout: &ProjectCatalogMigrationResolvedLayoutV1,
-    provenance_sources: Vec<
-        crate::project_catalog_inventory_adapters::ProjectCatalogProvenanceOwnerSourceV1,
-    >,
 ) -> ProjectCatalogOwnerInventoryPathsV1 {
     ProjectCatalogOwnerInventoryPathsV1 {
         corpus_index_root: layout.index_root.clone(),
@@ -4227,7 +4217,7 @@ fn owner_inventory_paths(
         slack_store_root: layout.bro_home.clone(),
         whiteboard_root: layout.bro_home.join("whiteboards"),
         artifact_root: layout.artifacts_dir.clone(),
-        provenance_sources,
+        provenance_notes_ref: layout.provenance_notes_ref.clone(),
     }
 }
 
