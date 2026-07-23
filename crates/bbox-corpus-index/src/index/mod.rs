@@ -1714,6 +1714,7 @@ pub mod code_tokenizer;
 pub mod embed_hook;
 pub mod git_history;
 pub mod helpers;
+pub mod migration_inventory;
 pub mod passes;
 pub mod project_files;
 pub mod search;

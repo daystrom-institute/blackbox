@@ -9,4 +9,5 @@
 
 pub mod edge_sidecar;
 pub mod manifest;
+pub mod migration_inventory;
 pub mod snapshot;

@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-const MANIFEST_VERSION: u32 = 1;
+pub(crate) const MANIFEST_VERSION: u32 = 1;
 const MANIFEST_INDEX_FILENAME: &str = "manifest-index.json";
 const OVERLAY_MANIFEST_FILENAME: &str = "overlay_manifest.json";
 const OVERLAY_MANIFEST_VERSION: u32 = 1;
