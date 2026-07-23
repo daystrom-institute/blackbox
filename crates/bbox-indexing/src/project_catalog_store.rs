@@ -539,6 +539,7 @@ impl MigrationParticipantRegistry {
         projects_path: &Path,
         code_source_root: PathBuf,
         legacy_publisher_ref_source: PathBuf,
+        code_source_limits: StoreLimits,
     ) -> ProjectCatalogStoreResult<Self> {
         let paths = ProjectCatalogPaths::derive(projects_path)?;
         let code_source_paths = CodeSourceStorePaths::new(code_source_root).map_err(|error| {
@@ -561,14 +562,9 @@ impl MigrationParticipantRegistry {
             legacy_publisher_ref_source,
             catalog_immutable_root: paths.backup_dir.join("immutable"),
             checkout_identity_markers: std::collections::BTreeMap::new(),
-            code_source_limits: StoreLimits::default(),
+            code_source_limits,
         }
         .validate()
-    }
-
-    pub(crate) fn with_code_source_limits(mut self, limits: StoreLimits) -> Self {
-        self.code_source_limits = limits;
-        self
     }
 
     pub(crate) fn register_checkout_identity(
@@ -1265,12 +1261,12 @@ fn validate_code_source_snapshot(
                 error.to_string(),
             )
         })?;
-    let fail = |detail| {
+    fn fail(detail: impl std::fmt::Display) -> ProjectCatalogStoreError {
         ProjectCatalogStoreError::new(
             "error.project_catalog_invalid_migration_plan",
             format!("code-source snapshot validation failed: {detail}"),
         )
-    };
+    }
     if snapshot.activations.len() > MAX_PROJECT_CATALOG_ENTRIES
         || snapshot.generations.len() > MAX_MIGRATION_INVENTORY_GENERATIONS
     {
@@ -7716,12 +7712,28 @@ mod tests {
         MigrationPlanDraftV1,
         (u64, String, String),
     ) {
+        basic_migration_draft_with_limits(path, legacy_bytes, StoreLimits::default())
+    }
+
+    fn basic_migration_draft_with_limits(
+        path: &Path,
+        legacy_bytes: &[u8],
+        code_source_limits: StoreLimits,
+    ) -> (
+        MigrationParticipantRegistry,
+        MigrationPlanDraftV1,
+        (u64, String, String),
+    ) {
         let root = path.parent().unwrap();
         let transaction_id = ProjectCatalogTransactionId::mint();
         let publisher_source = root.join("publisher-refs.json");
-        let mut registry =
-            MigrationParticipantRegistry::new(path, root.join("code-source"), publisher_source)
-                .unwrap();
+        let mut registry = MigrationParticipantRegistry::new(
+            path,
+            root.join("code-source"),
+            publisher_source,
+            code_source_limits,
+        )
+        .unwrap();
         let checkout_root = root.join("checkout");
         registry
             .register_checkout_identity("checkout-observation-1".into(), checkout_root.clone())
@@ -9037,6 +9049,7 @@ mod tests {
                 &path,
                 root.join("code-source/../escape"),
                 root.join("publisher-refs.json"),
+                StoreLimits::default(),
             )
             .is_err()
         );
@@ -9045,6 +9058,7 @@ mod tests {
             &path,
             root.join("code-source"),
             root.join("publisher-refs.json"),
+            StoreLimits::default(),
         )
         .unwrap();
         registry
@@ -9054,6 +9068,36 @@ mod tests {
             .register_checkout_identity("second".into(), root.join("checkout"))
             .unwrap();
         assert!(registry.validate().is_err());
+    }
+
+    #[test]
+    fn migration_registry_propagates_non_default_owner_limits_to_live_inventory() {
+        let (_directory, path) = projects_path();
+        let legacy = b"{\"version\":1,\"projects\":[]}\n";
+        fs::write(&path, legacy).unwrap();
+        let effective =
+            encode_migration_effective_source_manifest_v1(&MigrationEffectiveSourceManifestV1 {
+                version: 1,
+                selections: Vec::new(),
+            })
+            .unwrap();
+        let limits = StoreLimits {
+            max_migration_survivor_bytes: effective.len() - 1,
+            ..StoreLimits::default()
+        };
+        let (registry, draft, _) = basic_migration_draft_with_limits(&path, legacy, limits);
+        let anchor = registry.code_source_paths.anchor();
+        let plan = validate_migration_plan(&path, registry, draft).unwrap();
+        fs::create_dir_all(anchor.parent().unwrap()).unwrap();
+        fs::write(&anchor, effective).unwrap();
+
+        let error = transact_migration(&path, plan).unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_migration_inventory_stale"
+        );
+        assert!(error.to_string().contains("byte limit"));
     }
 
     #[test]
@@ -9130,6 +9174,7 @@ mod tests {
                 &root.join("effective-source-manifest.toml"),
                 root.clone(),
                 root.join("publisher-refs.json"),
+                StoreLimits::default(),
             )
             .is_err()
         );
@@ -9138,6 +9183,7 @@ mod tests {
                 &root.join("projects.json"),
                 root.join("project-catalog-stage/code-source"),
                 root.join("publisher-refs.json"),
+                StoreLimits::default(),
             )
             .is_err()
         );
@@ -9146,6 +9192,7 @@ mod tests {
             &root.join("projects.json"),
             root.join("code-source"),
             root.join("publisher-refs.json"),
+            StoreLimits::default(),
         )
         .unwrap();
         registry
@@ -10259,6 +10306,7 @@ mod tests {
             &path,
             path.parent().unwrap().join("code-source"),
             path.parent().unwrap().join("publisher-refs.json"),
+            StoreLimits::default(),
         )
         .unwrap();
         let owner = ProjectCatalogTransactionOwner {

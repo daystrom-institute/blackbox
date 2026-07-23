@@ -135,6 +135,10 @@ struct RawCodeCollectionConfig {
     pub retained_generations: usize,
     #[serde(default = "default_code_collection_blob_grace_hours")]
     pub unreferenced_blob_grace_hours: u64,
+    #[serde(default = "default_code_collection_migration_survivor_rows")]
+    pub max_migration_survivor_rows: usize,
+    #[serde(default = "default_code_collection_migration_survivor_bytes")]
+    pub max_migration_survivor_bytes: usize,
     #[serde(default = "default_code_collection_stale_warning_hours")]
     pub stale_warning_hours: u64,
     #[serde(default)]
@@ -150,6 +154,8 @@ impl Default for RawCodeCollectionConfig {
             max_open_uploads_per_producer: default_code_collection_max_open_uploads(),
             retained_generations: default_code_collection_retained_generations(),
             unreferenced_blob_grace_hours: default_code_collection_blob_grace_hours(),
+            max_migration_survivor_rows: default_code_collection_migration_survivor_rows(),
+            max_migration_survivor_bytes: default_code_collection_migration_survivor_bytes(),
             stale_warning_hours: default_code_collection_stale_warning_hours(),
             producers: Vec::new(),
         }
@@ -174,6 +180,14 @@ fn default_code_collection_retained_generations() -> usize {
 
 fn default_code_collection_blob_grace_hours() -> u64 {
     168
+}
+
+fn default_code_collection_migration_survivor_rows() -> usize {
+    100_000
+}
+
+fn default_code_collection_migration_survivor_bytes() -> usize {
+    512 * 1024 * 1024
 }
 
 fn default_code_collection_stale_warning_hours() -> u64 {
@@ -472,6 +486,8 @@ pub struct CodeCollectionConfig {
     pub max_open_uploads_per_producer: usize,
     pub retained_generations: usize,
     pub unreferenced_blob_grace_hours: u64,
+    pub max_migration_survivor_rows: usize,
+    pub max_migration_survivor_bytes: usize,
     pub stale_warning_hours: u64,
     pub producers: Vec<CodeCollectionProducerConfig>,
 }
@@ -865,6 +881,8 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             max_open_uploads_per_producer: raw.code_collection.max_open_uploads_per_producer,
             retained_generations: raw.code_collection.retained_generations,
             unreferenced_blob_grace_hours: raw.code_collection.unreferenced_blob_grace_hours,
+            max_migration_survivor_rows: raw.code_collection.max_migration_survivor_rows,
+            max_migration_survivor_bytes: raw.code_collection.max_migration_survivor_bytes,
             stale_warning_hours: raw.code_collection.stale_warning_hours,
             producers: code_collection_producers,
         },

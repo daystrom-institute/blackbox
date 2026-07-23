@@ -226,6 +226,8 @@ fn build_snapshot(
         && (limits.max_manifest_files == 0
             || limits.max_manifest_logical_bytes == 0
             || limits.max_open_uploads_per_producer == 0
+            || limits.max_migration_survivor_rows == 0
+            || limits.max_migration_survivor_bytes == 0
             || config.code_collection.stale_warning_hours == 0)
     {
         bail!("code-collection limits and stale warning hours must be nonzero");
@@ -329,6 +331,8 @@ fn store_limits(config: &crate::config::Config) -> StoreLimits {
         max_open_uploads_per_producer: config.code_collection.max_open_uploads_per_producer,
         retained_generations: config.code_collection.retained_generations,
         unreferenced_blob_grace_hours: config.code_collection.unreferenced_blob_grace_hours,
+        max_migration_survivor_rows: config.code_collection.max_migration_survivor_rows,
+        max_migration_survivor_bytes: config.code_collection.max_migration_survivor_bytes,
     }
 }
 
@@ -724,7 +728,7 @@ pub(crate) fn resume_pending_activations(state: Arc<SharedState>) {
         }
         Err(error) => tracing::error!(%error, "loading code-source activations failed"),
     }
-    match store.retirement_records() {
+    match retirement_records_for_recovery(&store) {
         Ok(records) => {
             for record in records {
                 spawn_retirement(state.clone(), record, None);
@@ -732,6 +736,11 @@ pub(crate) fn resume_pending_activations(state: Arc<SharedState>) {
         }
         Err(error) => tracing::error!(%error, "loading code-source retirements failed"),
     }
+}
+
+fn retirement_records_for_recovery(store: &CodeSourceStore) -> Result<Vec<RetirementRecord>> {
+    store.reconcile_collision_retirements()?;
+    store.retirement_records()
 }
 
 pub(crate) fn apply_source_transitions(state: Arc<SharedState>, transitions: SourceTransitions) {
@@ -1648,5 +1657,61 @@ fn store_error_is_not_found(error: &anyhow::Error) -> bool {
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
         (self.status, Json(self.body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use bbox_code_source::source_selector;
+    use bbox_code_source_store::{
+        CodeSourceStorePaths, CollisionRetirementLifecycleStateV1, CollisionRetirementLifecycleV1,
+        decode_collision_retirement_pending_for_migration,
+        encode_collision_retirement_pending_for_migration,
+    };
+    use bbox_corpus_core::project_catalog::ProjectId;
+
+    use super::*;
+
+    #[test]
+    fn startup_recovery_publishes_a_pending_collision_lifecycle() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("code-source");
+        let store = CodeSourceStore::open(&root, StoreLimits::default()).unwrap();
+        let paths = CodeSourceStorePaths::new(root).unwrap();
+        let project_id = ProjectId::parse("startup-collision").unwrap();
+        let generation_id = "a".repeat(64);
+        let lifecycle = CollisionRetirementLifecycleV1 {
+            version: 1,
+            state: CollisionRetirementLifecycleStateV1::Pending,
+            project_id: project_id.clone(),
+            former_scope: PublishedScope::try_new("startup-repo", ".").unwrap(),
+            generation_id: generation_id.clone(),
+            selector: format!(
+                "{}:m0123456789abcdef",
+                source_selector(project_id.as_str(), &generation_id)
+            ),
+            snapshot_id: format!("collected-{}", "b".repeat(32)),
+            manifest_sha256: "c".repeat(64),
+            inventory_hash: "d".repeat(64),
+            plan_hash: "e".repeat(64),
+        };
+        let lifecycle_path = paths.collision_retirement_pending(&project_id);
+        fs::create_dir_all(lifecycle_path.parent().unwrap()).unwrap();
+        fs::write(
+            &lifecycle_path,
+            encode_collision_retirement_pending_for_migration(&lifecycle).unwrap(),
+        )
+        .unwrap();
+
+        let records = retirement_records_for_recovery(&store).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].selector, lifecycle.selector);
+        let repaired =
+            decode_collision_retirement_pending_for_migration(&fs::read(lifecycle_path).unwrap())
+                .unwrap();
+        assert_eq!(repaired.state, CollisionRetirementLifecycleStateV1::Queued);
     }
 }
