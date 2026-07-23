@@ -1597,7 +1597,7 @@ pub fn enumerate_legacy_migration_inventory_for_scopes_locked(
     if protected_generation_ids != materialized_generation_ids {
         bail!("bounded legacy survivor materialization includes a non-protected generation");
     }
-    let protected_identities = generations
+    let protected_identities: BTreeSet<(String, String)> = generations
         .iter()
         .map(|row| (scope_hash(&row.published_scope), row.generation_id.clone()))
         .collect();
