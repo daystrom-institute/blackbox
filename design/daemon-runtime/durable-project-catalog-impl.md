@@ -589,15 +589,25 @@ before apply.
 A losing duplicate-scope id with active or retained collected state requires an
 explicit `quarantine_collected` disposition in the resolution file. Apply moves
 its activation and selector to
-`CollisionRetirementPending { former_scope, generation }`, preserves immutable
-bytes for rollback, and removes it from effective/read-view selection before v2
-can bind. It does not relabel the generation as LegacyLocal and does not serve
-the former scope. Startup scope-agreement validation accepts this one typed
-quarantine state, then resumes the normal journaled selector/vector/edge
-retirement. The losing project remains `Unavailable::ScopeCollision` until an
-attachment-backed local generation succeeds or the project is explicitly
-retired. Without the disposition, apply refuses. The migration report lists
-the exact search, graph, vector, and source generations made unavailable.
+`CollisionRetirementLifecycle::Pending { former_scope, generation }`, preserves
+immutable bytes for rollback, and removes it from effective/read-view selection
+before v2 can bind. It does not relabel the generation as LegacyLocal and does
+not serve the former scope. Startup scope-agreement validation accepts this one
+typed quarantine state, then resumes the normal journaled
+selector/vector/edge retirement. The losing project remains
+`Unavailable::ScopeCollision` until an attachment-backed local generation
+succeeds or the project is explicitly retired. Without the disposition, apply
+refuses. The migration report lists the exact search, graph, vector, and source
+generations made unavailable.
+
+Collision quarantine has one project-scoped durable lifecycle record. Its
+typed states are `Pending`, `Queued`, and `Completed`, and every state preserves
+the losing project, former scope, generation, selector, and migration evidence.
+The ordinary retirement queue is subordinate execution state, not the terminal
+proof. A completed lifecycle record remains as the durable receipt after
+physical retirement; a matching lagging queue row is tolerated and removed
+idempotently. Startup and GC reject missing, regressed, or cross-bound lifecycle
+evidence instead of requiring an ephemeral queue row to survive forever.
 
 The staged complete active-manifest post-image removes every losing workspace
 row in the same migration transaction that installs the catalog. This is the
@@ -620,6 +630,17 @@ never guesses scope from project id.
 An active or retained legacy generation whose descriptor is missing or corrupt
 keeps preflight refused. No resolution may invent its scope; the operator must
 repair or retire it with the bridge-compatible v1 tooling and rerun preflight.
+
+Migration streams the complete legacy generation namespace into a canonical,
+ordered SHA-256 commitment and row count. Only effective roots and generations
+retained by the code-source store's actual owner policy for catalog,
+activation, or collision-lifecycle scopes survive into catalog state,
+selectors, or migration participants. Other historical and orphan rows remain
+covered by the complete-set proof but are inert, non-selectable GC candidates;
+they never become v2 authority merely because their immutable bytes exist.
+Current-state validation and GC use the same classifier. A protected legacy row
+whose project/scope ownership cannot be proved from strict v2 state refuses
+startup rather than being treated as an orphan.
 
 Every legacy publisher pin has exactly one migration disposition. A uniquely
 resolved old publisher produces `SeedG1` with project id, attachment id,

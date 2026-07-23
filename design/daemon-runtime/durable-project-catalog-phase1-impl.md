@@ -614,7 +614,7 @@ Add:
 - `crates/bbox-indexing/src/project_catalog_migration.rs`;
 - `crates/bbox-indexing/src/project_catalog_inventory.rs`; and
 - `crates/bbox-indexing/src/accepted_publication_store.rs`;
-- migration-only `CollisionRetirementPending` persistence in
+- migration-only `CollisionRetirementLifecycleV1` persistence in
   `bbox-code-source-store`; and
 - versioned fixture trees under
   `crates/bbox-indexing/tests/fixtures/project-catalog-migration/`.
@@ -673,6 +673,27 @@ inventory JSON. File mtimes and directory enumeration order are excluded.
 An active or retained generation with a missing or corrupt immutable descriptor
 is refused with the exact bridge-v1 repair/retire instruction. Resolution
 cannot invent its scope.
+
+Code-source inventory is memory-bounded without imposing a lifetime
+cardinality cap on a valid store. Under the owner store's lock, a streaming
+radix walk orders validated `scope-hash/generation-id` keys lexically without
+trusting filesystem enumeration order or writing scratch state. It feeds a
+domain-separated sequential SHA-256 commitment and row count for the complete
+legacy generation namespace. Per-row size and validation limits are checked
+before allocation or replacement, and the inventory adapter receives the
+owner store's configured `StoreLimits`; it never substitutes defaults.
+
+The adapter retains full row evidence only for effective roots and generations
+selected by that same owner policy as retained for catalog, activation, or
+collision-lifecycle scopes. Historical and orphan rows remain represented by
+the complete-set commitment and bounded counts but are non-surviving GC
+candidates: they are never migration participants, selectors, or authority.
+Apply and recovery rerun the same commitment and classifier under the lock.
+Current v2 validation streams lifetime history and retirement state through the
+same classifier. Mixed v1/v2 stores may contain only unprotected,
+non-selectable v1 leftovers; a protected v1 row without exact strict-v2
+project/scope ownership refuses startup. Maintenance and GC use this classifier
+too, so they cannot reinterpret an omitted row as authority.
 
 Preflight plans and persists every strong-random value that will enter a
 predicted post-image:
@@ -865,11 +886,18 @@ checkout path and no Git ancestry. Phase 1 exposes strict verify and migration
 write APIs only; publisher advance and query integration remain Phase 5.
 
 `bbox-code-source-store` adds a strict
-`CollisionRetirementPendingV1` containing project id, former scope, generation,
-selector, snapshot and manifest hashes, inventory hash, and plan hash. Its
-target path is code-derived from the validated project id. The corresponding
-complete manifest participant removes the losing active row. The immutable
-collected generation remains a journal/marker GC root until retirement.
+`CollisionRetirementLifecycleV1` containing project id, former scope,
+generation, selector, snapshot and manifest hashes, inventory hash, plan hash,
+and a typed `Pending`, `Queued`, or `Completed` state. Its target path is
+code-derived from the validated project id. The migration transaction installs
+`Pending` while its complete manifest participant removes the losing active
+row. Ordinary retirement advances `Pending` to `Queued` atomically under the
+store lock and treats the queue row as subordinate execution state. Physical
+completion atomically installs the durable `Completed` receipt before removing
+the matching queue row. A matching lagging queue row beside `Completed` is
+tolerated and cleaned idempotently; contradictory or regressed state fails
+closed. The immutable collected generation remains a journal/marker/lifecycle
+GC root until the completed receipt proves retirement.
 
 The same crate adds strict `ActivationRecordV2` and `StoredGenerationV2`
 metadata with explicit `published_scope` and no serde default. Migration
@@ -877,7 +905,7 @@ backfills scope only when the legacy immutable generation descriptor, manifest,
 activation, effective selector, and migrated published catalog project agree
 exactly. Each rewritten metadata file is a code-owned migration participant.
 A losing collision writes no active v2 record; its former scope lives only in
-`CollisionRetirementPendingV1`. First v2 startup rejects scopeless metadata
+`CollisionRetirementLifecycleV1`. First v2 startup rejects scopeless metadata
 instead of inferring scope from project id.
 
 ### 6.6 Deterministic post-image construction
@@ -917,8 +945,8 @@ one transaction plan containing:
 - the complete effective source-manifest post-image;
 - strict scope-bearing activation and retained-generation metadata post-images
   for every surviving collected generation;
-- typed `CollisionRetirementPending` records and removal of the corresponding
-  legacy activation;
+- typed `CollisionRetirementLifecycleV1::Pending` records and removal of the
+  corresponding legacy activation;
 - every accepted-publication pointer post-image;
 - the migration marker;
 - immutable G1 knowledge/gap generation assets with canonical relative-filename
@@ -990,6 +1018,11 @@ Fixture and property tests cover:
 - duplicate ids, scopes, aliases, and weak namespaces;
 - same-repo and false-same-repo evidence;
 - active and retained collected generations;
+- complete generation history beyond reduced row and aggregate-byte limits,
+  proving bounded streaming, ordered commitment stability, and that historical
+  or orphan rows do not survive;
+- refusal when a protected generation is omitted or lacks exact owner/scope
+  evidence;
 - descriptor/activation/manifest disagreement;
 - legacy scopeless active/retained metadata rewritten from exact descriptor
   agreement, plus every missing or ambiguous scope join refusal;
@@ -999,6 +1032,11 @@ Fixture and property tests cover:
 - missing/corrupt index, vector, edge, artifact, and coordination inventory;
 - accepted resolution, stale resolution, and unsupported override;
 - losing collected state with and without quarantine disposition;
+- collision lifecycle crash/retry at `Pending` to `Queued` and `Queued` to
+  `Completed`, durable terminal-receipt validation, and idempotent cleanup of a
+  matching lagging queue row;
+- mixed v1/v2 maintenance and GC, proving unprotected leftovers remain
+  non-selectable and protected scopeless legacy state refuses;
 - lock overlap with a live bridge registry;
 - contention with a bridge `StorePersister` on `projects.json.lock`;
 - missing marker planning and materialization, a shared monorepo checkout root,

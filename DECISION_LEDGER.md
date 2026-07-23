@@ -411,3 +411,51 @@ until a later entry explicitly supersedes it.
   post-images without inventing precision or another planned timestamp.
 - Revisit only if: a stronger exact source timestamp is inventoried and bound
   into the same plan before its predicted post-image is hashed.
+
+## D-018: Stream all generation history and migrate only protected survivors
+
+- Date: 2026-07-22
+- Phase: durable project catalog, migration inventory
+- Status: accepted after independent plan re-review
+- Decision: Inventory streams the complete legacy generation namespace into a
+  canonical ordered SHA-256 commitment and row count. Only effective roots and
+  generations retained by the code-source store's actual owner policy for
+  catalog, activation, or collision-lifecycle scopes become v2 participants.
+  Other historical and orphan rows are inert, non-selectable GC candidates
+  covered by the complete-set proof. Current validation and GC use the same
+  mixed-store classifier.
+- Evidence:
+  - A valid long-lived store can contain more historical generations than a
+    bounded migration report may materialize.
+  - Aggregate commutative digests are weaker than a canonical ordered
+    commitment and do not preserve sequence structure.
+  - Treating every immutable directory as authority would revive orphan state;
+    ignoring it entirely would make the migration inventory incomplete.
+- Rationale: Streaming separates complete source-set evidence from the small
+  protected subset that actually carries authority, bounding memory without
+  imposing an arbitrary lifetime cardinality limit.
+- Revisit only if: the owner store adopts a stronger bounded index that commits
+  the complete namespace and applies the same survivor classification.
+
+## D-019: Collision retirement ends in a durable terminal receipt
+
+- Date: 2026-07-22
+- Phase: durable project catalog, collision retirement
+- Status: accepted after independent plan re-review
+- Decision: One project-scoped lifecycle record advances through typed
+  `Pending`, `Queued`, and `Completed` states while preserving the original
+  losing project, former scope, generation, selector, and migration evidence.
+  The completed record is retained as the terminal receipt. The physical queue
+  is subordinate execution state; a matching lagging row is tolerated and
+  removed idempotently.
+- Evidence:
+  - Deleting the only collision record after retirement erases the durable
+    explanation for unavailable migrated state.
+  - Requiring a queue row forever confuses execution work with terminal proof
+    and prevents normal queue completion.
+  - Crash windows exist both before queue publication and between physical
+    completion, receipt installation, and queue cleanup.
+- Rationale: A monotonic durable lifecycle gives startup, recovery, and GC one
+  auditable authority surface while allowing the execution queue to drain.
+- Revisit only if: a different durable store retains equivalent immutable
+  migration evidence and monotonic crash-safe terminal state.
