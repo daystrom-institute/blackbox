@@ -4233,6 +4233,7 @@ impl ProjectCatalogTransactionOwner {
                 self.verify_journal_pair_invariants(&journal, ExpectedSide::Old)
             }
             (TransactionStateV1::Prepared, None) => {
+                self.verify_pinned_immutable_assets_for_recovery(&journal)?;
                 let rollback_available =
                     self.classify_recovery(&journal, true)? == RecoveryDecision::Rollback;
                 let mut forward_available =
@@ -5219,6 +5220,47 @@ impl ProjectCatalogTransactionOwner {
                 ));
             }
             self.io.checkpoint(FaultPoint::ImmutableAssetVerify)?;
+        }
+        Ok(())
+    }
+
+    fn verify_pinned_immutable_assets_for_recovery(
+        &self,
+        journal: &ProjectCatalogTransactionJournalV1,
+    ) -> ProjectCatalogStoreResult<()> {
+        if !journal
+            .immutable_assets
+            .iter()
+            .any(|asset| asset.mode == ImmutableAssetModeV1::PinnedExisting)
+        {
+            return Ok(());
+        }
+        let ParticipantRegistry::Migration(registry) = &self.registry else {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_registry_required",
+                "pinned immutable recovery evidence requires the complete registry",
+            ));
+        };
+        for asset in &journal.immutable_assets {
+            if asset.mode != ImmutableAssetModeV1::PinnedExisting {
+                continue;
+            }
+            let target = registry.immutable_target(&asset.role, &asset.validated_name);
+            let bytes = self
+                .io
+                .read_regular_nofollow(&target, asset.role.max_bytes())?
+                .ok_or_else(|| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_recovery_incomplete",
+                        "pinned immutable recovery asset is missing",
+                    )
+                })?;
+            if sha256(&bytes) != asset.sha256 {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_recovery_incomplete",
+                    "pinned immutable recovery asset has unexpected bytes",
+                ));
+            }
         }
         Ok(())
     }
@@ -9349,11 +9391,25 @@ mod tests {
             max_migration_survivor_bytes: effective.len() - 1,
             ..StoreLimits::default()
         };
-        let (registry, draft, _) = basic_migration_draft_with_limits(&path, legacy, limits);
+        let (registry, mut draft, _) = basic_migration_draft_with_limits(&path, legacy, limits);
         let anchor = registry.code_source_paths.anchor();
-        let plan = validate_migration_plan(&path, registry, draft).unwrap();
         fs::create_dir_all(anchor.parent().unwrap()).unwrap();
-        fs::write(&anchor, effective).unwrap();
+        fs::write(&anchor, &effective).unwrap();
+        draft
+            .participants
+            .iter_mut()
+            .find(|participant| participant.role == ParticipantRoleV1::EffectiveSourceManifest)
+            .unwrap()
+            .expected_old_sha256 = Some(Sha256Hex::digest(&effective));
+        let inventory = enumerate_legacy_migration_inventory_for_scopes_locked(
+            &registry.code_source_paths,
+            &StoreLimits::default(),
+            &published_catalog_scopes(&draft.catalog),
+        )
+        .unwrap();
+        draft.inventory_sha256 = Sha256Hex::parse(inventory.canonical_sha256.clone()).unwrap();
+        draft.code_source_snapshot.legacy_inventory = inventory;
+        let plan = validate_migration_plan(&path, registry, draft).unwrap();
 
         let error = transact_migration(&path, plan).unwrap_err();
 
@@ -9361,7 +9417,12 @@ mod tests {
             error.code(),
             "error.project_catalog_migration_inventory_stale"
         );
-        assert!(error.to_string().contains("byte limit"));
+        assert!(
+            error
+                .to_string()
+                .contains("protected legacy inventory exceeds its aggregate byte limit"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -9710,10 +9771,32 @@ mod tests {
         let failing = Arc::new(TracingIo::failing_points([FaultPoint::ParticipantInstall]));
         let error = transact_migration_with_io(&path, plan, failing).unwrap_err();
         assert_eq!(error.code(), "error.project_catalog_injected_fault");
+        fs::remove_file(&manifest_target).unwrap();
+        let error =
+            recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_recovery_incomplete");
+        assert!(
+            error
+                .to_string()
+                .contains("pinned immutable recovery asset is missing"),
+            "{error}"
+        );
+
+        let (_directory, path, plan, manifest_target, _) = extended_migration_fault_fixture();
+        let registry = plan.registry.clone();
+        let failing = Arc::new(TracingIo::failing_points([FaultPoint::ParticipantInstall]));
+        let error = transact_migration_with_io(&path, plan, failing).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_injected_fault");
         fs::write(&manifest_target, b"corrupt manifest").unwrap();
         let error =
             recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap_err();
         assert_eq!(error.code(), "error.project_catalog_recovery_incomplete");
+        assert!(
+            error
+                .to_string()
+                .contains("pinned immutable recovery asset has unexpected bytes"),
+            "{error}"
+        );
     }
 
     #[test]
