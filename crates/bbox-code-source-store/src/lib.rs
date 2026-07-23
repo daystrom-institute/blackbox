@@ -38,6 +38,7 @@ const MAX_MIGRATION_RECORD_BYTES: usize = 512 * 1024 * 1024;
 const MAX_STORED_GENERATION_RECORD_BYTES: usize = 64 * 1024;
 const MAX_COLLISION_RETIREMENT_RECORD_BYTES: usize = 64 * 1024;
 const MAX_MIGRATION_INVENTORY_MANIFEST_BYTES: usize = 512 * 1024 * 1024;
+const RADIX_BUCKET_MAX_NAMES: usize = 1_024;
 pub const MAX_MIGRATION_INVENTORY_ACTIVATIONS: usize = MAX_PROJECT_CATALOG_ENTRIES;
 pub const MAX_MIGRATION_INVENTORY_GENERATIONS: usize = MAX_PROJECT_CATALOG_ENTRIES;
 pub const MAX_MIGRATION_INVENTORY_COLLISION_RECORDS: usize = MAX_PROJECT_CATALOG_ENTRIES;
@@ -50,6 +51,8 @@ pub struct StoreLimits {
     pub max_open_uploads_per_producer: usize,
     pub retained_generations: usize,
     pub unreferenced_blob_grace_hours: u64,
+    pub max_migration_survivor_rows: usize,
+    pub max_migration_survivor_bytes: usize,
 }
 
 impl Default for StoreLimits {
@@ -60,6 +63,8 @@ impl Default for StoreLimits {
             max_open_uploads_per_producer: 2,
             retained_generations: 2,
             unreferenced_blob_grace_hours: 168,
+            max_migration_survivor_rows: MAX_MIGRATION_INVENTORY_GENERATIONS,
+            max_migration_survivor_bytes: MAX_MIGRATION_INVENTORY_MANIFEST_BYTES,
         }
     }
 }
@@ -199,8 +204,30 @@ impl MigrationCodeSourceInventoryGuard<'_> {
         enumerate_legacy_migration_inventory_locked(self.paths, limits)
     }
 
+    pub fn snapshot_legacy_v1_for_scopes(
+        &self,
+        limits: &StoreLimits,
+        catalog_scopes: &BTreeSet<PublishedScope>,
+    ) -> Result<MigrationLegacyInventoryV1> {
+        enumerate_legacy_migration_inventory_for_scopes_locked(self.paths, limits, catalog_scopes)
+    }
+
     pub fn snapshot_current_v2(&self, limits: &StoreLimits) -> Result<MigrationCurrentInventoryV1> {
         enumerate_current_migration_inventory_locked(self.paths, limits)
+    }
+
+    pub fn snapshot_current_v2_for_scopes(
+        &self,
+        limits: &StoreLimits,
+        catalog_scopes: &BTreeSet<PublishedScope>,
+        expected_retirement_selectors: &BTreeSet<String>,
+    ) -> Result<MigrationCurrentInventoryV1> {
+        enumerate_current_migration_inventory_for_scopes_locked(
+            self.paths,
+            limits,
+            catalog_scopes,
+            expected_retirement_selectors,
+        )
     }
 }
 
@@ -338,6 +365,124 @@ impl StoredGenerationV2 {
     }
 }
 
+#[derive(Debug, Clone)]
+enum MixedStoredGeneration {
+    LegacyV1(StoredGeneration),
+    CurrentV2(StoredGenerationV2),
+}
+
+impl MixedStoredGeneration {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::LegacyV1(record) => validate_stored_generation_v1(record),
+            Self::CurrentV2(record) => record.validate(),
+        }
+    }
+
+    fn generation_id(&self) -> &str {
+        match self {
+            Self::LegacyV1(record) => &record.generation_id,
+            Self::CurrentV2(record) => &record.generation_id,
+        }
+    }
+
+    fn ordinal(&self) -> u64 {
+        match self {
+            Self::LegacyV1(record) => record.ordinal,
+            Self::CurrentV2(record) => record.ordinal,
+        }
+    }
+
+    fn descriptor(&self) -> &GenerationDescriptor {
+        match self {
+            Self::LegacyV1(record) => &record.descriptor,
+            Self::CurrentV2(record) => &record.descriptor,
+        }
+    }
+
+    fn state(&self) -> GenerationState {
+        match self {
+            Self::LegacyV1(record) => record.state,
+            Self::CurrentV2(record) => record.state,
+        }
+    }
+
+    fn materialized_doc_count(&self) -> Option<u64> {
+        match self {
+            Self::LegacyV1(record) => record.materialized_doc_count,
+            Self::CurrentV2(record) => record.materialized_doc_count,
+        }
+    }
+
+    fn entity_inventory_sha256(&self) -> Option<&str> {
+        match self {
+            Self::LegacyV1(record) => record.entity_inventory_sha256.as_deref(),
+            Self::CurrentV2(record) => record.entity_inventory_sha256.as_deref(),
+        }
+    }
+
+    fn is_legacy_v1(&self) -> bool {
+        matches!(self, Self::LegacyV1(_))
+    }
+
+    fn mark_missing_blob_data(&mut self) {
+        let diagnostic = Some("one or more retained source blobs failed verification".to_string());
+        match self {
+            Self::LegacyV1(record) => {
+                record.state = GenerationState::MissingBlobData;
+                record.diagnostic = diagnostic;
+            }
+            Self::CurrentV2(record) => {
+                record.state = GenerationState::MissingBlobData;
+                record.diagnostic = diagnostic;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum MixedActivationRecord {
+    LegacyV1(ActivationRecord),
+    CurrentV2(ActivationRecordV2),
+}
+
+impl MixedActivationRecord {
+    fn project_id(&self) -> &str {
+        match self {
+            Self::LegacyV1(record) => &record.project_id,
+            Self::CurrentV2(record) => record.project_id.as_str(),
+        }
+    }
+
+    fn generation_id(&self) -> &str {
+        match self {
+            Self::LegacyV1(record) => &record.generation_id,
+            Self::CurrentV2(record) => &record.generation_id,
+        }
+    }
+
+    fn published_scope(&self) -> Option<&PublishedScope> {
+        match self {
+            Self::LegacyV1(_) => None,
+            Self::CurrentV2(record) => Some(&record.published_scope),
+        }
+    }
+
+    fn document_count(&self) -> u64 {
+        match self {
+            Self::LegacyV1(record) => record.document_count,
+            Self::CurrentV2(record) => record.document_count,
+        }
+    }
+
+    fn entity_inventory_sha256(&self) -> &str {
+        match self {
+            Self::LegacyV1(record) => &record.entity_inventory_sha256,
+            Self::CurrentV2(record) => &record.entity_inventory_sha256,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ActivationRecordV2 {
@@ -429,8 +574,9 @@ impl ActivationRecordV2 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct CollisionRetirementPendingV1 {
+pub struct CollisionRetirementLifecycleV1 {
     pub version: u32,
+    pub state: CollisionRetirementLifecycleStateV1,
     pub project_id: ProjectId,
     pub former_scope: PublishedScope,
     pub generation_id: String,
@@ -441,10 +587,18 @@ pub struct CollisionRetirementPendingV1 {
     pub plan_hash: String,
 }
 
-impl CollisionRetirementPendingV1 {
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CollisionRetirementLifecycleStateV1 {
+    Pending,
+    Queued,
+    Completed,
+}
+
+impl CollisionRetirementLifecycleV1 {
     pub fn validate(&self) -> Result<()> {
         if self.version != STORE_VERSION {
-            bail!("invalid collision retirement pending version");
+            bail!("invalid collision retirement lifecycle version");
         }
         ProjectId::parse(self.project_id.to_string()).map_err(|error| anyhow!(error))?;
         self.former_scope.validate()?;
@@ -460,6 +614,13 @@ impl CollisionRetirementPendingV1 {
         validate_sha256(&self.inventory_hash)?;
         validate_sha256(&self.plan_hash)?;
         Ok(())
+    }
+
+    fn matches_queue(&self, record: &RetirementRecord) -> bool {
+        record.project_id == self.project_id.as_str()
+            && record.selector == self.selector
+            && record.snapshot_id == self.snapshot_id
+            && record.generation_id.as_deref() == Some(self.generation_id.as_str())
     }
 }
 
@@ -514,7 +675,7 @@ pub struct MigrationLegacyCollisionEvidenceV1 {
     pub project_id: ProjectId,
     pub bytes: Vec<u8>,
     pub sha256: String,
-    pub record: CollisionRetirementPendingV1,
+    pub record: CollisionRetirementLifecycleV1,
 }
 
 #[derive(Debug, Clone)]
@@ -559,7 +720,7 @@ pub struct MigrationCurrentCollisionEvidenceV1 {
     pub project_id: ProjectId,
     pub bytes: Vec<u8>,
     pub sha256: String,
-    pub record: CollisionRetirementPendingV1,
+    pub record: CollisionRetirementLifecycleV1,
 }
 
 #[derive(Debug, Clone)]
@@ -665,37 +826,51 @@ pub fn decode_migration_effective_source_manifest_v1(
     Ok(manifest)
 }
 
-#[derive(Default)]
-struct MigrationGenerationSetAccumulator {
+struct CanonicalGenerationSetCommitment {
     count: u64,
-    sum: [u8; 32],
+    hasher: Sha256,
+    prior_key: Option<String>,
 }
 
-impl MigrationGenerationSetAccumulator {
+impl CanonicalGenerationSetCommitment {
+    fn new(domain: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update((domain.len() as u64).to_be_bytes());
+        hasher.update(domain);
+        Self {
+            count: 0,
+            hasher,
+            prior_key: None,
+        }
+    }
+
     fn add(&mut self, row: &MigrationLegacyGenerationEvidenceV1) -> Result<()> {
         fn field(hasher: &mut Sha256, value: &[u8]) {
             hasher.update((value.len() as u64).to_be_bytes());
             hasher.update(value);
         }
 
-        let mut leaf = Sha256::new();
-        field(&mut leaf, b"bbox-code-source-legacy-generation-row-v1");
-        field(&mut leaf, row.published_scope.repo_id().as_bytes());
+        let key = format!("{}/{}", scope_hash(&row.published_scope), row.generation_id);
+        if self.prior_key.as_ref().is_some_and(|prior| prior >= &key) {
+            bail!("canonical generation rows are duplicated or out of order");
+        }
         field(
-            &mut leaf,
+            &mut self.hasher,
+            b"bbox-code-source-legacy-generation-row-v1",
+        );
+        field(&mut self.hasher, key.as_bytes());
+        field(&mut self.hasher, row.published_scope.repo_id().as_bytes());
+        field(
+            &mut self.hasher,
             row.published_scope.bbox_root_relpath().as_bytes(),
         );
-        field(&mut leaf, row.generation_id.as_bytes());
-        field(&mut leaf, row.metadata_sha256.as_bytes());
-        field(&mut leaf, row.manifest_sha256.as_bytes());
-        field(&mut leaf, row.record.descriptor.manifest_sha256.as_bytes());
-        let digest: [u8; 32] = leaf.finalize().into();
-        let mut carry = 0_u16;
-        for (target, source) in self.sum.iter_mut().rev().zip(digest.iter().rev()) {
-            let value = u16::from(*target) + u16::from(*source) + carry;
-            *target = value as u8;
-            carry = value >> 8;
-        }
+        field(&mut self.hasher, row.metadata_sha256.as_bytes());
+        field(&mut self.hasher, row.manifest_sha256.as_bytes());
+        field(
+            &mut self.hasher,
+            row.record.descriptor.manifest_sha256.as_bytes(),
+        );
+        self.prior_key = Some(key);
         self.count = self
             .count
             .checked_add(1)
@@ -703,14 +878,220 @@ impl MigrationGenerationSetAccumulator {
         Ok(())
     }
 
-    fn digest(&self, domain: &[u8]) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update((domain.len() as u64).to_be_bytes());
-        hasher.update(domain);
-        hasher.update(self.count.to_be_bytes());
-        hasher.update(self.sum);
-        hex::encode(hasher.finalize())
+    fn finish(mut self) -> String {
+        self.hasher.update(self.count.to_be_bytes());
+        hex::encode(self.hasher.finalize())
     }
+}
+
+fn walk_sha256_names_lexically(
+    path: &Path,
+    label: &str,
+    directories: bool,
+    visit: &mut impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let Some(directory) = NofollowDirectory::open_existing(path)? else {
+        return Ok(());
+    };
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("{label} directory contains a non-utf8 entry"))?;
+        validate_sha256(&name)?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink()
+            || if directories {
+                !file_type.is_dir()
+            } else {
+                !file_type.is_file()
+            }
+        {
+            bail!("{label} directory contains an unexpected entry type");
+        }
+    }
+
+    fn walk_prefix(
+        path: &Path,
+        label: &str,
+        prefix: &mut String,
+        visit: &mut impl FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
+        let mut count = 0_usize;
+        let mut next_digits = [false; 16];
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let name = entry
+                .file_name()
+                .to_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("{label} directory contains a non-utf8 entry"))?;
+            validate_sha256(&name)?;
+            if !name.starts_with(prefix.as_str()) {
+                continue;
+            }
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("{label} directory row count overflowed"))?;
+            if prefix.len() < 64 {
+                let digit = name.as_bytes()[prefix.len()];
+                let index = match digit {
+                    b'0'..=b'9' => usize::from(digit - b'0'),
+                    b'a'..=b'f' => usize::from(digit - b'a') + 10,
+                    _ => unreachable!("validated sha256 names contain only lowercase hex"),
+                };
+                next_digits[index] = true;
+            }
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        if count <= RADIX_BUCKET_MAX_NAMES {
+            let mut names = Vec::with_capacity(count);
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                let name = entry
+                    .file_name()
+                    .to_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow!("{label} directory contains a non-utf8 entry"))?;
+                validate_sha256(&name)?;
+                if name.starts_with(prefix.as_str()) {
+                    names.push(name);
+                }
+            }
+            names.sort_unstable();
+            for name in names {
+                visit(&name)?;
+            }
+            return Ok(());
+        }
+        for (index, present) in next_digits.into_iter().enumerate() {
+            if present {
+                let digit = if index < 10 {
+                    b'0' + index as u8
+                } else {
+                    b'a' + (index - 10) as u8
+                };
+                prefix.push(char::from(digit));
+                walk_prefix(path, label, prefix, visit)?;
+                prefix.pop();
+            }
+        }
+        Ok(())
+    }
+
+    walk_prefix(path, label, &mut String::with_capacity(64), visit)?;
+    directory.ensure_still_current()?;
+    Ok(())
+}
+
+fn walk_sha256_json_files_lexically(
+    path: &Path,
+    label: &str,
+    visit: &mut impl FnMut(&str, &str) -> Result<()>,
+) -> Result<()> {
+    let Some(directory) = NofollowDirectory::open_existing(path)? else {
+        return Ok(());
+    };
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("{label} directory contains a non-utf8 entry"))?;
+        let hash = name
+            .strip_suffix(".json")
+            .ok_or_else(|| anyhow!("{label} filename is not canonical"))?;
+        validate_sha256(hash)?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            bail!("{label} directory contains an unexpected entry type");
+        }
+    }
+
+    fn walk_prefix(
+        path: &Path,
+        label: &str,
+        prefix: &mut String,
+        visit: &mut impl FnMut(&str, &str) -> Result<()>,
+    ) -> Result<()> {
+        let mut count = 0_usize;
+        let mut next_digits = [false; 16];
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let name = entry
+                .file_name()
+                .to_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("{label} directory contains a non-utf8 entry"))?;
+            let hash = name
+                .strip_suffix(".json")
+                .ok_or_else(|| anyhow!("{label} filename is not canonical"))?;
+            validate_sha256(hash)?;
+            if !hash.starts_with(prefix.as_str()) {
+                continue;
+            }
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("{label} directory row count overflowed"))?;
+            if prefix.len() < 64 {
+                let digit = hash.as_bytes()[prefix.len()];
+                let index = match digit {
+                    b'0'..=b'9' => usize::from(digit - b'0'),
+                    b'a'..=b'f' => usize::from(digit - b'a') + 10,
+                    _ => unreachable!("validated sha256 names contain only lowercase hex"),
+                };
+                next_digits[index] = true;
+            }
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        if count <= RADIX_BUCKET_MAX_NAMES {
+            let mut hashes = Vec::with_capacity(count);
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                let name = entry
+                    .file_name()
+                    .to_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow!("{label} directory contains a non-utf8 entry"))?;
+                let hash = name
+                    .strip_suffix(".json")
+                    .ok_or_else(|| anyhow!("{label} filename is not canonical"))?;
+                validate_sha256(hash)?;
+                if hash.starts_with(prefix.as_str()) {
+                    hashes.push(hash.to_string());
+                }
+            }
+            hashes.sort_unstable();
+            for hash in hashes {
+                visit(&hash, &format!("{hash}.json"))?;
+            }
+            return Ok(());
+        }
+        for (index, present) in next_digits.into_iter().enumerate() {
+            if present {
+                let digit = if index < 10 {
+                    b'0' + index as u8
+                } else {
+                    b'a' + (index - 10) as u8
+                };
+                prefix.push(char::from(digit));
+                walk_prefix(path, label, prefix, visit)?;
+                prefix.pop();
+            }
+        }
+        Ok(())
+    }
+
+    walk_prefix(path, label, &mut String::with_capacity(64), visit)?;
+    directory.ensure_still_current()?;
+    Ok(())
 }
 
 fn walk_legacy_generation_rows(
@@ -719,90 +1100,196 @@ fn walk_legacy_generation_rows(
     mut visit: impl FnMut(MigrationLegacyGenerationEvidenceV1) -> Result<()>,
 ) -> Result<()> {
     let scopes_path = paths.root().join("scopes");
-    let Some(scopes_directory) = NofollowDirectory::open_existing(&scopes_path)? else {
-        return Ok(());
-    };
-    for scope_entry in fs::read_dir(&scopes_path)? {
-        let scope_entry = scope_entry?;
-        let file_type = scope_entry.file_type()?;
-        if !file_type.is_dir() || file_type.is_symlink() {
-            bail!("legacy scope directory contains an unexpected entry type");
-        }
-        let scope_name = scope_entry
-            .file_name()
-            .to_str()
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("legacy scope directory contains a non-utf8 entry"))?;
-        validate_sha256(&scope_name)?;
+    walk_sha256_names_lexically(&scopes_path, "legacy scope", true, &mut |scope_name| {
         let scope_path = scopes_path.join(&scope_name);
         let scope_entries = sorted_directory_entry_names(&scope_path, 1, "legacy scope")?;
         if scope_entries.len() != 1 || scope_entries[0] != "generations" {
             bail!("legacy scope directory has an incomplete or unexpected row set");
         }
         let generations_path = scope_path.join("generations");
-        let generations_directory = NofollowDirectory::open_existing(&generations_path)?
-            .ok_or_else(|| anyhow!("legacy generations directory disappeared"))?;
-        for generation_entry in fs::read_dir(&generations_path)? {
-            let generation_entry = generation_entry?;
-            let file_type = generation_entry.file_type()?;
-            if !file_type.is_dir() || file_type.is_symlink() {
-                bail!("legacy generation directory contains an unexpected entry type");
-            }
-            let generation_id = generation_entry
-                .file_name()
-                .to_str()
-                .map(str::to_string)
-                .ok_or_else(|| anyhow!("legacy generation directory contains a non-utf8 entry"))?;
-            validate_sha256(&generation_id)?;
-            let generation_path = generations_path.join(&generation_id);
-            let directory = NofollowDirectory::open_existing(&generation_path)?
-                .ok_or_else(|| anyhow!("legacy generation directory disappeared"))?;
-            let entries = sorted_regular_entry_names(&generation_path, 2, "legacy generation")?;
-            if entries.len() != 2 || entries[0] != "manifest.jsonl" || entries[1] != "metadata.json"
-            {
-                bail!("legacy generation directory has an incomplete or unexpected row set");
-            }
-            let metadata_bytes = directory
-                .read_regular(
-                    "metadata.json",
-                    MAX_STORED_GENERATION_RECORD_BYTES,
-                    "legacy generation metadata",
-                )?
-                .ok_or_else(|| anyhow!("legacy generation metadata is missing"))?;
-            let record = decode_stored_generation_v1_for_migration(&metadata_bytes)?;
-            if record.generation_id != generation_id
-                || scope_hash(&record.descriptor.scope) != scope_name
-            {
-                bail!("legacy generation path and metadata disagree");
-            }
-            let manifest_bytes = directory
-                .read_regular(
-                    "manifest.jsonl",
-                    MAX_MIGRATION_RECORD_BYTES,
-                    "legacy generation manifest",
-                )?
-                .ok_or_else(|| anyhow!("legacy generation manifest is missing"))?;
-            verify_generation_manifest_for_migration(
-                &manifest_bytes,
-                &record.descriptor,
-                &record.producer_id,
-                &record.generation_id,
-                limits,
-            )?;
-            visit(MigrationLegacyGenerationEvidenceV1 {
-                published_scope: record.descriptor.scope.clone(),
-                generation_id,
-                metadata_sha256: sha256_hex(&metadata_bytes),
-                metadata_bytes,
-                manifest_sha256: sha256_hex(&manifest_bytes),
-                manifest_bytes,
-                record,
-            })?;
-            directory.ensure_still_current()?;
-        }
-        generations_directory.ensure_still_current()?;
+        walk_sha256_names_lexically(
+            &generations_path,
+            "legacy generation",
+            true,
+            &mut |generation_id| {
+                let generation_path = generations_path.join(&generation_id);
+                let directory = NofollowDirectory::open_existing(&generation_path)?
+                    .ok_or_else(|| anyhow!("legacy generation directory disappeared"))?;
+                let entries = sorted_regular_entry_names(&generation_path, 2, "legacy generation")?;
+                if entries.len() != 2
+                    || entries[0] != "manifest.jsonl"
+                    || entries[1] != "metadata.json"
+                {
+                    bail!("legacy generation directory has an incomplete or unexpected row set");
+                }
+                let metadata_bytes = directory
+                    .read_regular(
+                        "metadata.json",
+                        MAX_STORED_GENERATION_RECORD_BYTES,
+                        "legacy generation metadata",
+                    )?
+                    .ok_or_else(|| anyhow!("legacy generation metadata is missing"))?;
+                let record = decode_stored_generation_v1_for_migration(&metadata_bytes)?;
+                if record.generation_id != generation_id
+                    || scope_hash(&record.descriptor.scope) != scope_name
+                {
+                    bail!("legacy generation path and metadata disagree");
+                }
+                let manifest_bytes = directory
+                    .read_regular(
+                        "manifest.jsonl",
+                        MAX_MIGRATION_RECORD_BYTES,
+                        "legacy generation manifest",
+                    )?
+                    .ok_or_else(|| anyhow!("legacy generation manifest is missing"))?;
+                verify_generation_manifest_for_migration(
+                    &manifest_bytes,
+                    &record.descriptor,
+                    &record.producer_id,
+                    &record.generation_id,
+                    limits,
+                )?;
+                visit(MigrationLegacyGenerationEvidenceV1 {
+                    published_scope: record.descriptor.scope.clone(),
+                    generation_id: generation_id.to_string(),
+                    metadata_sha256: sha256_hex(&metadata_bytes),
+                    metadata_bytes,
+                    manifest_sha256: sha256_hex(&manifest_bytes),
+                    manifest_bytes,
+                    record,
+                })?;
+                directory.ensure_still_current()?;
+                Ok(())
+            },
+        )?;
+        Ok(())
+    })
+}
+
+struct LegacyRetentionCandidate {
+    ordinal: u64,
+    generation_id: String,
+    evidence: Option<MigrationLegacyGenerationEvidenceV1>,
+}
+
+impl LegacyRetentionCandidate {
+    fn evidence_bytes(&self) -> Result<usize> {
+        self.evidence.as_ref().map_or(Ok(0), |row| {
+            row.metadata_bytes
+                .len()
+                .checked_add(row.manifest_bytes.len())
+                .ok_or_else(|| anyhow!("retained legacy generation byte count overflowed"))
+        })
     }
-    scopes_directory.ensure_still_current()?;
+}
+
+fn insert_legacy_retention_candidate(
+    candidates_by_scope: &mut BTreeMap<PublishedScope, Vec<LegacyRetentionCandidate>>,
+    scope: PublishedScope,
+    candidate: LegacyRetentionCandidate,
+    retained_generations: usize,
+    materialized_candidate_count: &mut usize,
+    materialized_candidate_bytes: &mut usize,
+) -> Result<()> {
+    if retained_generations == 0 {
+        return Ok(());
+    }
+    let added_bytes = candidate.evidence_bytes()?;
+    let added_materialized = usize::from(candidate.evidence.is_some());
+    let candidates = candidates_by_scope.entry(scope).or_default();
+    candidates.push(candidate);
+    candidates.sort_by(|left, right| {
+        right
+            .ordinal
+            .cmp(&left.ordinal)
+            .then_with(|| left.generation_id.cmp(&right.generation_id))
+    });
+    *materialized_candidate_count = materialized_candidate_count
+        .checked_add(added_materialized)
+        .ok_or_else(|| anyhow!("retained legacy candidate count overflowed"))?;
+    *materialized_candidate_bytes = materialized_candidate_bytes
+        .checked_add(added_bytes)
+        .ok_or_else(|| anyhow!("retained legacy candidate byte count overflowed"))?;
+    if candidates.len() > retained_generations {
+        let removed = candidates
+            .pop()
+            .expect("oversized retained candidate set has a worst row");
+        *materialized_candidate_count = materialized_candidate_count
+            .checked_sub(usize::from(removed.evidence.is_some()))
+            .ok_or_else(|| anyhow!("retained legacy candidate count underflowed"))?;
+        *materialized_candidate_bytes = materialized_candidate_bytes
+            .checked_sub(removed.evidence_bytes()?)
+            .ok_or_else(|| anyhow!("retained legacy candidate byte count underflowed"))?;
+    }
+    Ok(())
+}
+
+enum CurrentRetentionEvidence {
+    RootMarker,
+    LegacyV1,
+    CurrentV2(MigrationCurrentGenerationEvidenceV1),
+}
+
+struct CurrentRetentionCandidate {
+    ordinal: u64,
+    generation_id: String,
+    evidence: CurrentRetentionEvidence,
+}
+
+impl CurrentRetentionCandidate {
+    fn evidence_bytes(&self) -> Result<usize> {
+        match &self.evidence {
+            CurrentRetentionEvidence::RootMarker | CurrentRetentionEvidence::LegacyV1 => Ok(0),
+            CurrentRetentionEvidence::CurrentV2(row) => row
+                .metadata_bytes
+                .len()
+                .checked_add(row.manifest_bytes.len())
+                .ok_or_else(|| anyhow!("current retained generation byte count overflowed")),
+        }
+    }
+
+    fn materialized(&self) -> usize {
+        usize::from(matches!(
+            &self.evidence,
+            CurrentRetentionEvidence::CurrentV2(_)
+        ))
+    }
+}
+
+fn insert_current_retention_candidate(
+    candidates: &mut Vec<CurrentRetentionCandidate>,
+    candidate: CurrentRetentionCandidate,
+    retained_generations: usize,
+    materialized_count: &mut usize,
+    materialized_bytes: &mut usize,
+) -> Result<()> {
+    if retained_generations == 0 {
+        return Ok(());
+    }
+    *materialized_count = materialized_count
+        .checked_add(candidate.materialized())
+        .ok_or_else(|| anyhow!("current retained generation count overflowed"))?;
+    *materialized_bytes = materialized_bytes
+        .checked_add(candidate.evidence_bytes()?)
+        .ok_or_else(|| anyhow!("current retained generation byte count overflowed"))?;
+    candidates.push(candidate);
+    candidates.sort_by(|left, right| {
+        right
+            .ordinal
+            .cmp(&left.ordinal)
+            .then_with(|| left.generation_id.cmp(&right.generation_id))
+    });
+    if candidates.len() > retained_generations {
+        let removed = candidates
+            .pop()
+            .expect("oversized current retained candidate set has a worst row");
+        *materialized_count = materialized_count
+            .checked_sub(removed.materialized())
+            .ok_or_else(|| anyhow!("current retained generation count underflowed"))?;
+        *materialized_bytes = materialized_bytes
+            .checked_sub(removed.evidence_bytes()?)
+            .ok_or_else(|| anyhow!("current retained generation byte count underflowed"))?;
+    }
     Ok(())
 }
 
@@ -813,6 +1300,14 @@ fn walk_legacy_generation_rows(
 pub fn enumerate_legacy_migration_inventory_locked(
     paths: &CodeSourceStorePaths,
     limits: &StoreLimits,
+) -> Result<MigrationLegacyInventoryV1> {
+    enumerate_legacy_migration_inventory_for_scopes_locked(paths, limits, &BTreeSet::new())
+}
+
+pub fn enumerate_legacy_migration_inventory_for_scopes_locked(
+    paths: &CodeSourceStorePaths,
+    limits: &StoreLimits,
+    catalog_scopes: &BTreeSet<PublishedScope>,
 ) -> Result<MigrationLegacyInventoryV1> {
     let anchor_bytes = read_optional_regular_nofollow(
         &paths.anchor(),
@@ -835,11 +1330,15 @@ pub fn enumerate_legacy_migration_inventory_locked(
             collision_pending: Vec::new(),
             protected_generation_ids: BTreeSet::new(),
             generation_count: 0,
-            generation_set_sha256: MigrationGenerationSetAccumulator::default()
-                .digest(b"bbox-code-source-legacy-generation-set-v1"),
+            generation_set_sha256: CanonicalGenerationSetCommitment::new(
+                b"bbox-code-source-legacy-generation-set-v1",
+            )
+            .finish(),
             unprotected_generation_count: 0,
-            unprotected_generation_set_sha256: MigrationGenerationSetAccumulator::default()
-                .digest(b"bbox-code-source-legacy-unprotected-generation-set-v1"),
+            unprotected_generation_set_sha256: CanonicalGenerationSetCommitment::new(
+                b"bbox-code-source-legacy-unprotected-generation-set-v1",
+            )
+            .finish(),
             canonical_sha256: String::new(),
         };
         inventory.canonical_sha256 = legacy_inventory_digest(&inventory);
@@ -865,7 +1364,7 @@ pub fn enumerate_legacy_migration_inventory_locked(
             total_encoded_bytes = total_encoded_bytes
                 .checked_add(bytes.len())
                 .ok_or_else(|| anyhow!("legacy inventory byte count overflowed"))?;
-            if total_encoded_bytes > MAX_MIGRATION_INVENTORY_MANIFEST_BYTES {
+            if total_encoded_bytes > limits.max_migration_survivor_bytes {
                 bail!("legacy inventory exceeds its aggregate byte limit");
             }
             let record = decode_activation_v1_for_migration(&bytes)?;
@@ -905,10 +1404,12 @@ pub fn enumerate_legacy_migration_inventory_locked(
             total_encoded_bytes = total_encoded_bytes
                 .checked_add(bytes.len())
                 .ok_or_else(|| anyhow!("legacy inventory byte count overflowed"))?;
-            if total_encoded_bytes > MAX_MIGRATION_INVENTORY_MANIFEST_BYTES {
+            if total_encoded_bytes > limits.max_migration_survivor_bytes {
                 bail!("legacy inventory exceeds its aggregate byte limit");
             }
-            if record.project_id != project_id {
+            if record.project_id != project_id
+                || record.state != CollisionRetirementLifecycleStateV1::Pending
+            {
                 bail!("collision retirement path and record project disagree");
             }
             collision_pending.push(MigrationLegacyCollisionEvidenceV1 {
@@ -929,17 +1430,92 @@ pub fn enumerate_legacy_migration_inventory_locked(
                 .map(|row| row.record.generation_id.clone()),
         )
         .collect::<BTreeSet<_>>();
+    let mut authority_scopes = catalog_scopes.clone();
+    authority_scopes.extend(
+        collision_pending
+            .iter()
+            .map(|row| row.record.former_scope.clone()),
+    );
+    if let MigrationLegacyAnchorEvidenceV1::Present { bytes, .. } = &anchor {
+        authority_scopes.extend(
+            decode_migration_effective_source_manifest_v1(bytes)?
+                .selections
+                .into_iter()
+                .map(|selection| selection.published_scope),
+        );
+    }
+
     let mut found_root_generation_ids = BTreeSet::new();
-    let mut full_generation_set = MigrationGenerationSetAccumulator::default();
-    let mut generations = Vec::new();
-    let mut protected_identities = BTreeSet::new();
-    let mut retained_by_scope =
-        BTreeMap::<PublishedScope, Vec<MigrationLegacyGenerationEvidenceV1>>::new();
+    let mut full_generation_set =
+        CanonicalGenerationSetCommitment::new(b"bbox-code-source-legacy-generation-set-v1");
     walk_legacy_generation_rows(paths, limits, |row| {
         full_generation_set.add(&row)?;
-        let rooted = root_generation_ids.contains(&row.generation_id);
-        if rooted {
+        if root_generation_ids.contains(&row.generation_id) {
             found_root_generation_ids.insert(row.generation_id.clone());
+            authority_scopes.insert(row.published_scope);
+        }
+        Ok(())
+    })?;
+    if found_root_generation_ids != root_generation_ids {
+        bail!("legacy activation or collision references missing generation metadata");
+    }
+
+    let mut repeated_full_generation_set =
+        CanonicalGenerationSetCommitment::new(b"bbox-code-source-legacy-generation-set-v1");
+    let mut generations = Vec::new();
+    let mut retained_by_scope = BTreeMap::<PublishedScope, Vec<LegacyRetentionCandidate>>::new();
+    let mut retained_candidate_count = 0_usize;
+    let mut retained_candidate_bytes = 0_usize;
+    let mut intrinsic_bytes = 0_usize;
+    walk_legacy_generation_rows(paths, limits, |row| {
+        repeated_full_generation_set.add(&row)?;
+        if !authority_scopes.contains(&row.published_scope) {
+            return Ok(());
+        }
+        let rooted = root_generation_ids.contains(&row.generation_id);
+        if row.record.state == GenerationState::Superseded {
+            if rooted {
+                insert_legacy_retention_candidate(
+                    &mut retained_by_scope,
+                    row.published_scope.clone(),
+                    LegacyRetentionCandidate {
+                        ordinal: row.record.ordinal,
+                        generation_id: row.generation_id.clone(),
+                        evidence: None,
+                    },
+                    limits.retained_generations,
+                    &mut retained_candidate_count,
+                    &mut retained_candidate_bytes,
+                )?;
+            } else {
+                insert_legacy_retention_candidate(
+                    &mut retained_by_scope,
+                    row.published_scope.clone(),
+                    LegacyRetentionCandidate {
+                        ordinal: row.record.ordinal,
+                        generation_id: row.generation_id.clone(),
+                        evidence: Some(row),
+                    },
+                    limits.retained_generations,
+                    &mut retained_candidate_count,
+                    &mut retained_candidate_bytes,
+                )?;
+                let materialized_rows = generations
+                    .len()
+                    .checked_add(retained_candidate_count)
+                    .ok_or_else(|| anyhow!("protected legacy generation count overflowed"))?;
+                let materialized_bytes = intrinsic_bytes
+                    .checked_add(retained_candidate_bytes)
+                    .and_then(|bytes| total_encoded_bytes.checked_add(bytes))
+                    .ok_or_else(|| anyhow!("protected legacy inventory byte count overflowed"))?;
+                if materialized_rows > limits.max_migration_survivor_rows {
+                    bail!("protected legacy generation inventory exceeds its row limit");
+                }
+                if materialized_bytes > limits.max_migration_survivor_bytes {
+                    bail!("protected legacy inventory exceeds its aggregate byte limit");
+                }
+                return Ok(());
+            }
         }
         let intrinsically_protected = rooted
             || matches!(
@@ -951,37 +1527,38 @@ pub fn enumerate_legacy_migration_inventory_locked(
                     | GenerationState::MissingBlobData
             );
         if intrinsically_protected {
-            if generations.len() >= MAX_MIGRATION_INVENTORY_GENERATIONS {
-                bail!("protected legacy generation inventory exceeds its row limit");
-            }
-            protected_identities
-                .insert((scope_hash(&row.published_scope), row.generation_id.clone()));
+            let row_bytes = row
+                .metadata_bytes
+                .len()
+                .checked_add(row.manifest_bytes.len())
+                .ok_or_else(|| anyhow!("protected legacy generation byte count overflowed"))?;
+            intrinsic_bytes = intrinsic_bytes
+                .checked_add(row_bytes)
+                .ok_or_else(|| anyhow!("protected legacy inventory byte count overflowed"))?;
             generations.push(row);
-        } else if row.record.state == GenerationState::Superseded && limits.retained_generations > 0
-        {
-            let scope = row.published_scope.clone();
-            let candidates = retained_by_scope.entry(scope).or_default();
-            candidates.push(row);
-            candidates.sort_by(|left, right| {
-                right
-                    .record
-                    .ordinal
-                    .cmp(&left.record.ordinal)
-                    .then_with(|| left.generation_id.cmp(&right.generation_id))
-            });
-            candidates.truncate(limits.retained_generations);
+        }
+        let materialized_rows = generations
+            .len()
+            .checked_add(retained_candidate_count)
+            .ok_or_else(|| anyhow!("protected legacy generation count overflowed"))?;
+        let materialized_bytes = intrinsic_bytes
+            .checked_add(retained_candidate_bytes)
+            .and_then(|bytes| total_encoded_bytes.checked_add(bytes))
+            .ok_or_else(|| anyhow!("protected legacy inventory byte count overflowed"))?;
+        if materialized_rows > limits.max_migration_survivor_rows {
+            bail!("protected legacy generation inventory exceeds its row limit");
+        }
+        if materialized_bytes > limits.max_migration_survivor_bytes {
+            bail!("protected legacy inventory exceeds its aggregate byte limit");
         }
         Ok(())
     })?;
-    if found_root_generation_ids != root_generation_ids {
-        bail!("legacy activation or collision references missing generation metadata");
-    }
     for candidates in retained_by_scope.into_values() {
-        for row in candidates {
-            protected_identities
-                .insert((scope_hash(&row.published_scope), row.generation_id.clone()));
-            generations.push(row);
-        }
+        generations.extend(
+            candidates
+                .into_iter()
+                .filter_map(|candidate| candidate.evidence),
+        );
     }
     generations.sort_by(|left, right| {
         left.published_scope
@@ -1013,11 +1590,14 @@ pub fn enumerate_legacy_migration_inventory_locked(
     }) {
         bail!("bounded legacy survivor materialization omits a protected generation");
     }
-    generations.retain(|row| protected_generation_ids.contains(&row.generation_id));
-    if generations.len() > MAX_MIGRATION_INVENTORY_GENERATIONS {
-        bail!("protected legacy generation inventory exceeds its row limit");
+    let materialized_generation_ids = generations
+        .iter()
+        .map(|row| row.generation_id.clone())
+        .collect::<BTreeSet<_>>();
+    if protected_generation_ids != materialized_generation_ids {
+        bail!("bounded legacy survivor materialization includes a non-protected generation");
     }
-    protected_identities = generations
+    let protected_identities = generations
         .iter()
         .map(|row| (scope_hash(&row.published_scope), row.generation_id.clone()))
         .collect();
@@ -1030,25 +1610,32 @@ pub fn enumerate_legacy_migration_inventory_locked(
     total_encoded_bytes = total_encoded_bytes
         .checked_add(survivor_bytes)
         .ok_or_else(|| anyhow!("protected legacy inventory byte count overflowed"))?;
-    if total_encoded_bytes > MAX_MIGRATION_INVENTORY_MANIFEST_BYTES {
+    if total_encoded_bytes > limits.max_migration_survivor_bytes {
         bail!("protected legacy inventory exceeds its aggregate byte limit");
     }
 
-    let mut repeated_full_generation_set = MigrationGenerationSetAccumulator::default();
-    let mut unprotected_generation_set = MigrationGenerationSetAccumulator::default();
+    let mut unprotected_generation_set = CanonicalGenerationSetCommitment::new(
+        b"bbox-code-source-legacy-unprotected-generation-set-v1",
+    );
+    let mut final_full_generation_set =
+        CanonicalGenerationSetCommitment::new(b"bbox-code-source-legacy-generation-set-v1");
     walk_legacy_generation_rows(paths, limits, |row| {
-        repeated_full_generation_set.add(&row)?;
+        final_full_generation_set.add(&row)?;
         let identity = (scope_hash(&row.published_scope), row.generation_id.clone());
         if !protected_identities.contains(&identity) {
             unprotected_generation_set.add(&row)?;
         }
         Ok(())
     })?;
-    let generation_set_sha256 =
-        full_generation_set.digest(b"bbox-code-source-legacy-generation-set-v1");
-    if repeated_full_generation_set.count != full_generation_set.count
-        || repeated_full_generation_set.digest(b"bbox-code-source-legacy-generation-set-v1")
-            != generation_set_sha256
+    let generation_count = full_generation_set.count;
+    let repeated_generation_count = repeated_full_generation_set.count;
+    let final_generation_count = final_full_generation_set.count;
+    let unprotected_generation_count = unprotected_generation_set.count;
+    let generation_set_sha256 = full_generation_set.finish();
+    if repeated_generation_count != generation_count
+        || repeated_full_generation_set.finish() != generation_set_sha256
+        || final_generation_count != generation_count
+        || final_full_generation_set.finish() != generation_set_sha256
     {
         bail!("legacy generation row set changed during enumeration");
     }
@@ -1087,11 +1674,10 @@ pub fn enumerate_legacy_migration_inventory_locked(
         generations,
         collision_pending,
         protected_generation_ids,
-        generation_count: full_generation_set.count,
+        generation_count,
         generation_set_sha256,
-        unprotected_generation_count: unprotected_generation_set.count,
-        unprotected_generation_set_sha256: unprotected_generation_set
-            .digest(b"bbox-code-source-legacy-unprotected-generation-set-v1"),
+        unprotected_generation_count,
+        unprotected_generation_set_sha256: unprotected_generation_set.finish(),
         canonical_sha256: String::new(),
     };
     inventory.canonical_sha256 = legacy_inventory_digest(&inventory);
@@ -1109,6 +1695,20 @@ pub fn enumerate_current_migration_inventory_locked(
     paths: &CodeSourceStorePaths,
     limits: &StoreLimits,
 ) -> Result<MigrationCurrentInventoryV1> {
+    enumerate_current_migration_inventory_for_scopes_locked(
+        paths,
+        limits,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    )
+}
+
+pub fn enumerate_current_migration_inventory_for_scopes_locked(
+    paths: &CodeSourceStorePaths,
+    limits: &StoreLimits,
+    catalog_scopes: &BTreeSet<PublishedScope>,
+    expected_retirement_selectors: &BTreeSet<String>,
+) -> Result<MigrationCurrentInventoryV1> {
     let effective_manifest_bytes = read_optional_regular_nofollow(
         &paths.anchor(),
         MAX_MIGRATION_RECORD_BYTES,
@@ -1118,6 +1718,9 @@ pub fn enumerate_current_migration_inventory_locked(
     let effective_manifest =
         decode_migration_effective_source_manifest_v1(&effective_manifest_bytes)?;
     let mut total_encoded_bytes = effective_manifest_bytes.len();
+    if total_encoded_bytes > limits.max_migration_survivor_bytes {
+        bail!("current migration inventory exceeds its aggregate byte limit");
+    }
 
     let activation_path = paths.root().join("activations");
     let mut activations = Vec::new();
@@ -1135,7 +1738,11 @@ pub fn enumerate_current_migration_inventory_locked(
             let bytes = directory
                 .read_regular(&name, MAX_MIGRATION_RECORD_BYTES, "current activation")?
                 .ok_or_else(|| anyhow!("current activation disappeared during enumeration"))?;
-            total_encoded_bytes = checked_inventory_bytes(total_encoded_bytes, bytes.len())?;
+            total_encoded_bytes = checked_inventory_bytes(
+                total_encoded_bytes,
+                bytes.len(),
+                limits.max_migration_survivor_bytes,
+            )?;
             let record = decode_activation_v2_for_migration(&bytes)?;
             if record.project_id != project_id {
                 bail!("current activation path and record project disagree");
@@ -1170,7 +1777,11 @@ pub fn enumerate_current_migration_inventory_locked(
                     "current collision retirement",
                 )?
                 .ok_or_else(|| anyhow!("current collision retirement disappeared"))?;
-            total_encoded_bytes = checked_inventory_bytes(total_encoded_bytes, bytes.len())?;
+            total_encoded_bytes = checked_inventory_bytes(
+                total_encoded_bytes,
+                bytes.len(),
+                limits.max_migration_survivor_bytes,
+            )?;
             let record = decode_collision_retirement_pending_for_migration(&bytes)?;
             if record.project_id != project_id {
                 bail!("current collision retirement path and project disagree");
@@ -1184,49 +1795,56 @@ pub fn enumerate_current_migration_inventory_locked(
         }
         directory.ensure_still_current()?;
     }
+    let mut authority_scopes = catalog_scopes.clone();
+    authority_scopes.extend(
+        effective_manifest
+            .selections
+            .iter()
+            .map(|selection| selection.published_scope.clone()),
+    );
+    authority_scopes.extend(
+        activations
+            .iter()
+            .map(|activation| activation.record.published_scope.clone()),
+    );
+    authority_scopes.extend(
+        collision_pending
+            .iter()
+            .filter(|row| row.record.state != CollisionRetirementLifecycleStateV1::Completed)
+            .map(|row| row.record.former_scope.clone()),
+    );
     let current_root_generation_ids = activations
         .iter()
         .map(|row| row.record.generation_id.as_str())
         .chain(
             collision_pending
                 .iter()
+                .filter(|row| row.record.state != CollisionRetirementLifecycleStateV1::Completed)
                 .map(|row| row.record.generation_id.as_str()),
         )
         .collect::<BTreeSet<_>>();
 
     let scopes_path = paths.root().join("scopes");
     let mut generations = Vec::new();
-    if NofollowDirectory::open_existing(&scopes_path)?.is_some() {
-        for scope_name in sorted_directory_entry_names(
-            &scopes_path,
-            MAX_MIGRATION_INVENTORY_GENERATIONS,
-            "current scope",
-        )? {
-            validate_sha256(&scope_name)?;
-            let scope_path = scopes_path.join(&scope_name);
-            let scope_entries = sorted_directory_entry_names(&scope_path, 1, "current scope")?;
-            if scope_entries.len() != 1 || scope_entries[0] != "generations" {
-                bail!("current scope directory has an incomplete or unexpected row set");
-            }
-            let generations_path = scope_path.join("generations");
-            if NofollowDirectory::open_existing(&generations_path)?.is_none() {
-                continue;
-            }
-            let mut retained_candidates = Vec::new();
-            for generation_entry in fs::read_dir(&generations_path)? {
-                let generation_entry = generation_entry?;
-                let file_type = generation_entry.file_type()?;
-                if !file_type.is_dir() || file_type.is_symlink() {
-                    bail!("current generation directory contains an unexpected entry type");
-                }
-                let generation_id = generation_entry
-                    .file_name()
-                    .to_str()
-                    .map(str::to_string)
-                    .ok_or_else(|| {
-                        anyhow!("current generation directory contains a non-utf8 entry")
-                    })?;
-                validate_sha256(&generation_id)?;
+    walk_sha256_names_lexically(&scopes_path, "current scope", true, &mut |scope_name| {
+        validate_sha256(&scope_name)?;
+        let scope_path = scopes_path.join(&scope_name);
+        let scope_entries = sorted_directory_entry_names(&scope_path, 1, "current scope")?;
+        if scope_entries.len() != 1 || scope_entries[0] != "generations" {
+            bail!("current scope directory has an incomplete or unexpected row set");
+        }
+        let generations_path = scope_path.join("generations");
+        if NofollowDirectory::open_existing(&generations_path)?.is_none() {
+            return Ok(());
+        }
+        let mut retained_candidates = Vec::<CurrentRetentionCandidate>::new();
+        let mut retained_candidate_count = 0_usize;
+        let mut retained_candidate_bytes = 0_usize;
+        walk_sha256_names_lexically(
+            &generations_path,
+            "current generation",
+            true,
+            &mut |generation_id| {
                 let generation_path = generations_path.join(&generation_id);
                 let directory = NofollowDirectory::open_existing(&generation_path)?
                     .ok_or_else(|| anyhow!("current generation directory disappeared"))?;
@@ -1266,29 +1884,96 @@ pub fn enumerate_current_migration_inventory_locked(
                             &record.generation_id,
                             limits,
                         )?;
-                        if record.state == GenerationState::Superseded {
-                            retained_candidates.push((
-                                record.ordinal,
-                                generation_id.clone(),
-                                false,
-                            ));
+                        if !authority_scopes.contains(&record.published_scope) {
+                            directory.ensure_still_current()?;
+                            return Ok(());
                         }
-                        if generations.len() >= MAX_MIGRATION_INVENTORY_GENERATIONS {
-                            bail!("current v2 generation inventory exceeds its row limit");
-                        }
-                        total_encoded_bytes = checked_inventory_bytes(
-                            checked_inventory_bytes(total_encoded_bytes, metadata_bytes.len())?,
-                            manifest_bytes.len(),
-                        )?;
-                        generations.push(MigrationCurrentGenerationEvidenceV1 {
+                        let rooted = current_root_generation_ids.contains(generation_id);
+                        let evidence = MigrationCurrentGenerationEvidenceV1 {
                             published_scope: record.published_scope.clone(),
-                            generation_id,
+                            generation_id: generation_id.to_string(),
                             metadata_sha256: sha256_hex(&metadata_bytes),
                             metadata_bytes,
                             manifest_sha256: sha256_hex(&manifest_bytes),
                             manifest_bytes,
                             record,
-                        });
+                        };
+                        if evidence.record.state == GenerationState::Superseded {
+                            if rooted {
+                                insert_current_retention_candidate(
+                                    &mut retained_candidates,
+                                    CurrentRetentionCandidate {
+                                        ordinal: evidence.record.ordinal,
+                                        generation_id: evidence.generation_id.clone(),
+                                        evidence: CurrentRetentionEvidence::RootMarker,
+                                    },
+                                    limits.retained_generations,
+                                    &mut retained_candidate_count,
+                                    &mut retained_candidate_bytes,
+                                )?;
+                            } else {
+                                insert_current_retention_candidate(
+                                    &mut retained_candidates,
+                                    CurrentRetentionCandidate {
+                                        ordinal: evidence.record.ordinal,
+                                        generation_id: evidence.generation_id.clone(),
+                                        evidence: CurrentRetentionEvidence::CurrentV2(evidence),
+                                    },
+                                    limits.retained_generations,
+                                    &mut retained_candidate_count,
+                                    &mut retained_candidate_bytes,
+                                )?;
+                                let materialized_rows = generations
+                                    .len()
+                                    .checked_add(retained_candidate_count)
+                                    .ok_or_else(|| {
+                                        anyhow!("current protected generation count overflowed")
+                                    })?;
+                                if materialized_rows > limits.max_migration_survivor_rows
+                                    || total_encoded_bytes
+                                        .checked_add(retained_candidate_bytes)
+                                        .is_none_or(|bytes| {
+                                            bytes > limits.max_migration_survivor_bytes
+                                        })
+                                {
+                                    bail!(
+                                        "current retained generation inventory exceeds its configured limits"
+                                    );
+                                }
+                                directory.ensure_still_current()?;
+                                return Ok(());
+                            }
+                        }
+                        if rooted
+                            || matches!(
+                                evidence.record.state,
+                                GenerationState::MissingBlobs
+                                    | GenerationState::Ready
+                                    | GenerationState::StagingIndex
+                                    | GenerationState::Active
+                                    | GenerationState::MissingBlobData
+                            )
+                        {
+                            if generations
+                                .len()
+                                .checked_add(retained_candidate_count)
+                                .is_none_or(|rows| rows >= limits.max_migration_survivor_rows)
+                            {
+                                bail!(
+                                    "current protected generation inventory exceeds its row limit"
+                                );
+                            }
+                            total_encoded_bytes = checked_inventory_bytes(
+                                checked_inventory_bytes(
+                                    total_encoded_bytes,
+                                    evidence.metadata_bytes.len(),
+                                    limits.max_migration_survivor_bytes,
+                                )?,
+                                evidence.manifest_bytes.len(),
+                                limits.max_migration_survivor_bytes,
+                            )?;
+                            generations.push(evidence);
+                        }
                     }
                     Err(v2_error) => {
                         let record = decode_stored_generation_v1_for_migration(&metadata_bytes)
@@ -1305,7 +1990,12 @@ pub fn enumerate_current_migration_inventory_locked(
                             &record.generation_id,
                             limits,
                         )?;
-                        if current_root_generation_ids.contains(generation_id.as_str())
+                        if !authority_scopes.contains(&record.descriptor.scope) {
+                            directory.ensure_still_current()?;
+                            return Ok(());
+                        }
+                        let rooted = current_root_generation_ids.contains(generation_id);
+                        if rooted
                             || matches!(
                                 record.state,
                                 GenerationState::MissingBlobs
@@ -1318,23 +2008,49 @@ pub fn enumerate_current_migration_inventory_locked(
                             bail!("protected current generation retains scopeless legacy metadata");
                         }
                         if record.state == GenerationState::Superseded {
-                            retained_candidates.push((record.ordinal, generation_id, true));
+                            insert_current_retention_candidate(
+                                &mut retained_candidates,
+                                CurrentRetentionCandidate {
+                                    ordinal: record.ordinal,
+                                    generation_id: generation_id.to_string(),
+                                    evidence: CurrentRetentionEvidence::LegacyV1,
+                                },
+                                limits.retained_generations,
+                                &mut retained_candidate_count,
+                                &mut retained_candidate_bytes,
+                            )?;
                         }
                     }
                 }
                 directory.ensure_still_current()?;
-            }
-            retained_candidates
-                .sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
-            if retained_candidates
-                .iter()
-                .take(limits.retained_generations)
-                .any(|candidate| candidate.2)
-            {
-                bail!("protected retained generation keeps scopeless legacy metadata");
+                Ok(())
+            },
+        )?;
+        for candidate in retained_candidates {
+            match candidate.evidence {
+                CurrentRetentionEvidence::RootMarker => {}
+                CurrentRetentionEvidence::LegacyV1 => {
+                    bail!("protected retained generation keeps scopeless legacy metadata");
+                }
+                CurrentRetentionEvidence::CurrentV2(evidence) => {
+                    if generations.len() >= limits.max_migration_survivor_rows {
+                        bail!("current protected generation inventory exceeds its row limit");
+                    }
+                    total_encoded_bytes = checked_inventory_bytes(
+                        checked_inventory_bytes(
+                            total_encoded_bytes,
+                            evidence.metadata_bytes.len(),
+                            limits.max_migration_survivor_bytes,
+                        )?,
+                        evidence.manifest_bytes.len(),
+                        limits.max_migration_survivor_bytes,
+                    )?;
+                    generations.push(evidence);
+                }
             }
         }
-    }
+        Ok(())
+    })?;
     generations.sort_by(|left, right| {
         left.published_scope
             .cmp(&right.published_scope)
@@ -1353,11 +2069,15 @@ pub fn enumerate_current_migration_inventory_locked(
     }
 
     for pending in &collision_pending {
-        let generation = generations_by_id
-            .get(pending.record.generation_id.as_str())
-            .ok_or_else(|| anyhow!("current collision retirement lacks generation metadata"))?;
-        if pending.record.former_scope != generation.published_scope
-            || pending.record.manifest_sha256 != generation.record.descriptor.manifest_sha256
+        let generation = generations_by_id.get(pending.record.generation_id.as_str());
+        if pending.record.state != CollisionRetirementLifecycleStateV1::Completed
+            && generation.is_none()
+        {
+            bail!("current collision retirement lacks generation metadata");
+        }
+        if let Some(generation) = generation
+            && (pending.record.former_scope != generation.published_scope
+                || pending.record.manifest_sha256 != generation.record.descriptor.manifest_sha256)
         {
             bail!("current collision retirement rewrites generation evidence");
         }
@@ -1365,36 +2085,50 @@ pub fn enumerate_current_migration_inventory_locked(
 
     let retirement_path = paths.root().join("retirements");
     let mut retirements = Vec::new();
-    if let Some(directory) = NofollowDirectory::open_existing(&retirement_path)? {
-        for name in sorted_regular_entry_names(
-            &retirement_path,
-            MAX_MIGRATION_INVENTORY_RETIREMENTS,
-            "current retirement",
-        )? {
-            let selector_sha256 = name
-                .strip_suffix(".json")
-                .ok_or_else(|| anyhow!("current retirement filename is not canonical"))?
-                .to_string();
-            validate_sha256(&selector_sha256)?;
+    let relevant_retirement_selectors = expected_retirement_selectors
+        .iter()
+        .cloned()
+        .chain(
+            collision_pending
+                .iter()
+                .map(|lifecycle| lifecycle.record.selector.clone()),
+        )
+        .collect::<BTreeSet<_>>();
+    walk_sha256_json_files_lexically(
+        &retirement_path,
+        "current retirement",
+        &mut |selector_sha256, name| {
+            let directory = NofollowDirectory::open_existing(&retirement_path)?
+                .ok_or_else(|| anyhow!("current retirement directory disappeared"))?;
             let bytes = directory
                 .read_regular(&name, MAX_MIGRATION_RECORD_BYTES, "current retirement")?
                 .ok_or_else(|| anyhow!("current retirement disappeared"))?;
-            total_encoded_bytes = checked_inventory_bytes(total_encoded_bytes, bytes.len())?;
             let record: RetirementRecord =
                 decode_bounded_json(&bytes, MAX_MIGRATION_RECORD_BYTES, "current retirement")?;
             validate_retirement_record(&record)?;
             if sha256_hex(record.selector.as_bytes()) != selector_sha256 {
                 bail!("current retirement path and selector disagree");
             }
-            retirements.push(MigrationCurrentRetirementEvidenceV1 {
-                selector_sha256,
-                sha256: sha256_hex(&bytes),
-                bytes,
-                record,
-            });
-        }
-        directory.ensure_still_current()?;
-    }
+            if relevant_retirement_selectors.contains(&record.selector) {
+                if retirements.len() >= limits.max_migration_survivor_rows {
+                    bail!("relevant retirement inventory exceeds its row limit");
+                }
+                total_encoded_bytes = checked_inventory_bytes(
+                    total_encoded_bytes,
+                    bytes.len(),
+                    limits.max_migration_survivor_bytes,
+                )?;
+                retirements.push(MigrationCurrentRetirementEvidenceV1 {
+                    selector_sha256: selector_sha256.to_string(),
+                    sha256: sha256_hex(&bytes),
+                    bytes,
+                    record,
+                });
+            }
+            directory.ensure_still_current()?;
+            Ok(())
+        },
+    )?;
 
     let activations_by_project = activations
         .iter()
@@ -1506,7 +2240,7 @@ pub fn decode_stored_generation_v2_for_migration(bytes: &[u8]) -> Result<StoredG
 }
 
 pub fn encode_collision_retirement_pending_for_migration(
-    record: &CollisionRetirementPendingV1,
+    record: &CollisionRetirementLifecycleV1,
 ) -> Result<Vec<u8>> {
     record.validate()?;
     encode_bounded_json(
@@ -1518,8 +2252,8 @@ pub fn encode_collision_retirement_pending_for_migration(
 
 pub fn decode_collision_retirement_pending_for_migration(
     bytes: &[u8],
-) -> Result<CollisionRetirementPendingV1> {
-    let record: CollisionRetirementPendingV1 = decode_bounded_json(
+) -> Result<CollisionRetirementLifecycleV1> {
+    let record: CollisionRetirementLifecycleV1 = decode_bounded_json(
         bytes,
         MAX_COLLISION_RETIREMENT_RECORD_BYTES,
         "collision retirement pending",
@@ -2161,6 +2895,17 @@ impl CodeSourceStore {
         )
     }
 
+    fn save_mixed_generation_locked(&self, generation: &MixedStoredGeneration) -> Result<()> {
+        generation.validate()?;
+        let path = self
+            .paths
+            .generation_metadata(&generation.descriptor().scope, generation.generation_id())?;
+        match generation {
+            MixedStoredGeneration::LegacyV1(record) => atomic_write_json(&path, record),
+            MixedStoredGeneration::CurrentV2(record) => atomic_write_json(&path, record),
+        }
+    }
+
     pub fn mark_generation_state(
         &self,
         scope: &PublishedScope,
@@ -2314,10 +3059,30 @@ impl CodeSourceStore {
     pub fn enqueue_retirement(&self, record: &RetirementRecord) -> Result<()> {
         let _guard = self.lock_mutation()?;
         validate_retirement_record(record)?;
-        atomic_write_json(
-            &self.paths.retirement_for_selector(&record.selector)?,
-            record,
-        )
+        let queue_path = self.paths.retirement_for_selector(&record.selector)?;
+        let lifecycle = self.collision_lifecycle_for_selector_locked(&record.selector)?;
+        if let Some(mut lifecycle) = lifecycle {
+            if !lifecycle.matches_queue(record) {
+                bail!("collision retirement queue row rewrites lifecycle evidence");
+            }
+            if lifecycle.state == CollisionRetirementLifecycleStateV1::Completed {
+                self.validate_lagging_collision_queue_locked(&lifecycle, &queue_path)?;
+                remove_file_if_exists(&queue_path)?;
+                return Ok(());
+            }
+            atomic_write_json(&queue_path, record)?;
+            if lifecycle.state == CollisionRetirementLifecycleStateV1::Pending {
+                lifecycle.state = CollisionRetirementLifecycleStateV1::Queued;
+                atomic_write_json(
+                    &self
+                        .paths
+                        .collision_retirement_pending(&lifecycle.project_id),
+                    &lifecycle,
+                )?;
+            }
+            return Ok(());
+        }
+        atomic_write_json(&queue_path, record)
     }
 
     pub fn retirement_records(&self) -> Result<Vec<RetirementRecord>> {
@@ -2334,11 +3099,80 @@ impl CodeSourceStore {
     pub fn complete_retirement(&self, selector: &str) -> Result<()> {
         let _guard = self.lock_mutation()?;
         let path = self.paths.retirement_for_selector(selector)?;
-        match fs::remove_file(&path) {
-            Ok(()) => sync_parent(&path),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+        let lifecycle = self.collision_lifecycle_for_selector_locked(selector)?;
+        if let Some(mut lifecycle) = lifecycle {
+            match lifecycle.state {
+                CollisionRetirementLifecycleStateV1::Pending => {
+                    bail!("collision retirement cannot complete before queue publication");
+                }
+                CollisionRetirementLifecycleStateV1::Queued => {
+                    if path.is_file() {
+                        let queued: RetirementRecord = read_json(&path)?;
+                        validate_retirement_record(&queued)?;
+                        if !lifecycle.matches_queue(&queued) {
+                            bail!("collision retirement queue row rewrites lifecycle evidence");
+                        }
+                    }
+                    lifecycle.state = CollisionRetirementLifecycleStateV1::Completed;
+                    atomic_write_json(
+                        &self
+                            .paths
+                            .collision_retirement_pending(&lifecycle.project_id),
+                        &lifecycle,
+                    )?;
+                    remove_file_if_exists(&path)
+                }
+                CollisionRetirementLifecycleStateV1::Completed => {
+                    self.validate_lagging_collision_queue_locked(&lifecycle, &path)?;
+                    remove_file_if_exists(&path)
+                }
+            }
+        } else {
+            remove_file_if_exists(&path)
         }
+    }
+
+    fn validate_lagging_collision_queue_locked(
+        &self,
+        lifecycle: &CollisionRetirementLifecycleV1,
+        path: &Path,
+    ) -> Result<()> {
+        if !path.is_file() {
+            return Ok(());
+        }
+        let queued: RetirementRecord = read_json(path)?;
+        validate_retirement_record(&queued)?;
+        if !lifecycle.matches_queue(&queued) {
+            bail!("collision retirement queue row rewrites lifecycle evidence");
+        }
+        Ok(())
+    }
+
+    fn collision_lifecycle_for_selector_locked(
+        &self,
+        selector: &str,
+    ) -> Result<Option<CollisionRetirementLifecycleV1>> {
+        validate_retirement_selector(selector)?;
+        let path = self.root().join("collision-retirements");
+        if !path.is_dir() {
+            return Ok(None);
+        }
+        let mut matched = None;
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if !file_type.is_file() || file_type.is_symlink() {
+                bail!("collision retirement lifecycle directory contains an unexpected entry");
+            }
+            let lifecycle: CollisionRetirementLifecycleV1 = read_json(&entry.path())?;
+            lifecycle.validate()?;
+            if lifecycle.selector == selector {
+                if matched.replace(lifecycle).is_some() {
+                    bail!("collision retirement selector has multiple lifecycle owners");
+                }
+            }
+        }
+        Ok(matched)
     }
 
     pub fn verified_blob_file(&self, hash: &str, size: u64) -> Result<File> {
@@ -2449,14 +3283,20 @@ impl CodeSourceStore {
             .map_err(|_| anyhow!("code-source limits lock poisoned"))?
             .clone();
         let generations = self.list_generations()?;
-        let protected = self.protected_generation_ids(&generations, limits.retained_generations)?;
+        let protected = self.protected_generation_ids(
+            &generations,
+            limits.retained_generations,
+            &BTreeSet::new(),
+        )?;
         let mut stats = MaintenanceStats::default();
         for mut generation in generations {
-            if !protected.contains(&generation.generation_id) {
+            if !protected.contains(generation.generation_id()) {
                 continue;
             }
-            let entries = self
-                .load_generation_entries(&generation.descriptor.scope, &generation.generation_id)?;
+            let entries = self.load_generation_entries(
+                &generation.descriptor().scope,
+                generation.generation_id(),
+            )?;
             let mut degraded = false;
             for (hash, size) in unique_blob_sizes(&entries)? {
                 stats.scrubbed_blobs += 1;
@@ -2470,15 +3310,13 @@ impl CodeSourceStore {
                 }
             }
             if degraded {
-                generation.state = GenerationState::MissingBlobData;
-                generation.diagnostic =
-                    Some("one or more retained source blobs failed verification".to_string());
-                self.save_generation_locked(&generation)?;
-                self.update_desired_if_same(&generation)?;
+                generation.mark_missing_blob_data();
+                self.save_mixed_generation_locked(&generation)?;
+                self.update_desired_if_same_mixed(&generation)?;
                 self.record_health_failure_locked(
                     &self
-                        .activation_project_for_generation(&generation.generation_id)?
-                        .unwrap_or_else(|| scope_hash(&generation.descriptor.scope)),
+                        .activation_project_for_generation(generation.generation_id())?
+                        .unwrap_or_else(|| scope_hash(&generation.descriptor().scope)),
                     "missing_blob_data",
                     "one or more retained source blobs failed verification",
                 )?;
@@ -2489,6 +3327,13 @@ impl CodeSourceStore {
     }
 
     pub fn gc_blobs(&self) -> Result<MaintenanceStats> {
+        self.gc_blobs_for_scopes(&BTreeSet::new())
+    }
+
+    pub fn gc_blobs_for_scopes(
+        &self,
+        catalog_scopes: &BTreeSet<PublishedScope>,
+    ) -> Result<MaintenanceStats> {
         let _guard = self.lock_mutation()?;
         let limits = self
             .shared
@@ -2497,14 +3342,18 @@ impl CodeSourceStore {
             .map_err(|_| anyhow!("code-source limits lock poisoned"))?
             .clone();
         let generations = self.list_generations()?;
-        let protected = self.protected_generation_ids(&generations, limits.retained_generations)?;
+        let protected = self.protected_generation_ids(
+            &generations,
+            limits.retained_generations,
+            catalog_scopes,
+        )?;
         let mut marked = BTreeSet::new();
         for generation in &generations {
-            if protected.contains(&generation.generation_id) {
+            if protected.contains(generation.generation_id()) {
                 marked.extend(
                     self.load_generation_entries(
-                        &generation.descriptor.scope,
-                        &generation.generation_id,
+                        &generation.descriptor().scope,
+                        generation.generation_id(),
                     )?
                     .into_iter()
                     .map(|entry| entry.content_sha256),
@@ -2584,7 +3433,7 @@ impl CodeSourceStore {
         self.root().join("blobs/sha256").join(&hash[..2]).join(hash)
     }
 
-    fn list_generations(&self) -> Result<Vec<StoredGeneration>> {
+    fn list_generations(&self) -> Result<Vec<MixedStoredGeneration>> {
         let mut generations = Vec::new();
         for scope in fs::read_dir(self.root().join("scopes"))? {
             let scope = scope?;
@@ -2600,7 +3449,7 @@ impl CodeSourceStore {
                 if !generation.file_type()?.is_dir() {
                     continue;
                 }
-                generations.push(read_stored_generation_v1(
+                generations.push(read_mixed_stored_generation(
                     &generation.path().join("metadata.json"),
                 )?);
             }
@@ -2610,27 +3459,95 @@ impl CodeSourceStore {
 
     fn protected_generation_ids(
         &self,
-        generations: &[StoredGeneration],
+        generations: &[MixedStoredGeneration],
         retained_generations: usize,
+        catalog_scopes: &BTreeSet<PublishedScope>,
     ) -> Result<BTreeSet<String>> {
+        let mut authority_scopes = catalog_scopes.clone();
+        let mut effective_roots = BTreeMap::new();
+        let mut has_current_anchor = false;
+        if self.paths.anchor().is_file() {
+            let bytes = fs::read(self.paths.anchor())?;
+            let effective = decode_migration_effective_source_manifest_v1(&bytes)?;
+            has_current_anchor = true;
+            for selection in effective.selections {
+                authority_scopes.insert(selection.published_scope.clone());
+                if effective_roots
+                    .insert(
+                        selection.generation_id,
+                        (selection.project_id.to_string(), selection.published_scope),
+                    )
+                    .is_some()
+                {
+                    bail!("effective source manifest contains a duplicate generation");
+                }
+            }
+        }
+
         let mut activations = Vec::new();
         for activation in fs::read_dir(self.root().join("activations"))? {
             let activation = activation?;
             if activation.file_type()?.is_file() {
-                activations.push(read_activation_v1(&activation.path())?);
+                let activation = read_mixed_activation(&activation.path())?;
+                if let Some(scope) = activation.published_scope() {
+                    authority_scopes.insert(scope.clone());
+                }
+                activations.push(activation);
             }
         }
-        protected_generation_ids_from_records(
+        let collision_lifecycle = self.collision_retirement_pending_records_for_gc()?;
+        for record in &collision_lifecycle {
+            if record.state != CollisionRetirementLifecycleStateV1::Completed {
+                authority_scopes.insert(record.former_scope.clone());
+            }
+        }
+
+        let has_current_rows = generations
+            .iter()
+            .any(|record| matches!(record, MixedStoredGeneration::CurrentV2(_)))
+            || activations
+                .iter()
+                .any(|record| matches!(record, MixedActivationRecord::CurrentV2(_)));
+        if !has_current_anchor && !has_current_rows && catalog_scopes.is_empty() {
+            let legacy_generations = generations
+                .iter()
+                .map(|record| match record {
+                    MixedStoredGeneration::LegacyV1(record) => Ok(record.clone()),
+                    MixedStoredGeneration::CurrentV2(_) => {
+                        bail!("mixed store classification lost a current generation")
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let legacy_activations = activations
+                .iter()
+                .map(|record| match record {
+                    MixedActivationRecord::LegacyV1(record) => Ok(record.clone()),
+                    MixedActivationRecord::CurrentV2(_) => {
+                        bail!("mixed store classification lost a current activation")
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return protected_generation_ids_from_records(
+                &legacy_generations,
+                &legacy_activations,
+                &collision_lifecycle,
+                retained_generations,
+            );
+        }
+
+        mixed_protected_generation_ids_from_records(
             generations,
             &activations,
-            &self.collision_retirement_pending_records_for_gc()?,
+            &collision_lifecycle,
             retained_generations,
+            &authority_scopes,
+            &effective_roots,
         )
     }
 
     fn collision_retirement_pending_records_for_gc(
         &self,
-    ) -> Result<Vec<CollisionRetirementPendingV1>> {
+    ) -> Result<Vec<CollisionRetirementLifecycleV1>> {
         let directory = self.root().join("collision-retirements");
         let Some(held_directory) = NofollowDirectory::open_existing(&directory)? else {
             return Ok(Vec::new());
@@ -2675,15 +3592,23 @@ impl CodeSourceStore {
         Ok(records)
     }
 
-    fn update_desired_if_same(&self, generation: &StoredGeneration) -> Result<()> {
-        let desired_path = self
-            .root()
-            .join("desired")
-            .join(format!("{}.json", scope_hash(&generation.descriptor.scope)));
+    fn update_desired_if_same_mixed(&self, generation: &MixedStoredGeneration) -> Result<()> {
+        let desired_path = self.root().join("desired").join(format!(
+            "{}.json",
+            scope_hash(&generation.descriptor().scope)
+        ));
         if desired_path.is_file()
-            && read_stored_generation_v1(&desired_path)?.generation_id == generation.generation_id
+            && read_mixed_stored_generation(&desired_path)?.generation_id()
+                == generation.generation_id()
         {
-            atomic_write_json(&desired_path, generation)?;
+            match generation {
+                MixedStoredGeneration::LegacyV1(record) => {
+                    atomic_write_json(&desired_path, record)?;
+                }
+                MixedStoredGeneration::CurrentV2(record) => {
+                    atomic_write_json(&desired_path, record)?;
+                }
+            }
         }
         Ok(())
     }
@@ -2705,9 +3630,9 @@ impl CodeSourceStore {
             if !entry.file_type()?.is_file() {
                 continue;
             }
-            let activation = read_activation_v1(&entry.path())?;
-            if activation.generation_id == generation_id {
-                return Ok(Some(activation.project_id));
+            let activation = read_mixed_activation(&entry.path())?;
+            if activation.generation_id() == generation_id {
+                return Ok(Some(activation.project_id().to_string()));
             }
         }
         Ok(None)
@@ -3216,11 +4141,11 @@ fn sorted_entry_names(
     Ok(names)
 }
 
-fn checked_inventory_bytes(current: usize, added: usize) -> Result<usize> {
+fn checked_inventory_bytes(current: usize, added: usize, max_bytes: usize) -> Result<usize> {
     let total = current
         .checked_add(added)
         .ok_or_else(|| anyhow!("migration inventory byte count overflowed"))?;
-    if total > MAX_MIGRATION_INVENTORY_MANIFEST_BYTES {
+    if total > max_bytes {
         bail!("migration inventory exceeds its aggregate byte limit");
     }
     Ok(total)
@@ -3244,10 +4169,143 @@ fn validate_retirement_record(record: &RetirementRecord) -> Result<()> {
     Ok(())
 }
 
+fn mixed_protected_generation_ids_from_records(
+    generations: &[MixedStoredGeneration],
+    activations: &[MixedActivationRecord],
+    collision_lifecycle: &[CollisionRetirementLifecycleV1],
+    retained_generations: usize,
+    authority_scopes: &BTreeSet<PublishedScope>,
+    effective_roots: &BTreeMap<String, (String, PublishedScope)>,
+) -> Result<BTreeSet<String>> {
+    let mut generations_by_id = BTreeMap::new();
+    let mut ordinals_by_scope = BTreeSet::new();
+    let mut by_scope = BTreeMap::<String, Vec<&MixedStoredGeneration>>::new();
+    for generation in generations {
+        generation.validate()?;
+        let scope = scope_hash(&generation.descriptor().scope);
+        if generations_by_id
+            .insert(generation.generation_id(), generation)
+            .is_some()
+        {
+            bail!("generation inventory contains a duplicate generation id");
+        }
+        if !ordinals_by_scope.insert((scope.clone(), generation.ordinal())) {
+            bail!("generation inventory contains a duplicate scope ordinal");
+        }
+        if authority_scopes.contains(&generation.descriptor().scope) {
+            by_scope.entry(scope).or_default().push(generation);
+        }
+    }
+
+    let mut protected = BTreeSet::new();
+    for (generation_id, (_, published_scope)) in effective_roots {
+        let generation = generations_by_id
+            .get(generation_id.as_str())
+            .ok_or_else(|| {
+                anyhow!("effective source manifest references missing generation metadata")
+            })?;
+        if generation.is_legacy_v1() {
+            bail!("protected legacy generation lacks strict v2 ownership");
+        }
+        if generation.descriptor().scope != *published_scope {
+            bail!("effective source manifest scope does not match generation metadata");
+        }
+        protected.insert(generation_id.clone());
+    }
+
+    let mut activation_projects = BTreeSet::new();
+    for activation in activations {
+        if !activation_projects.insert(activation.project_id()) {
+            bail!("activation inventory contains a duplicate project");
+        }
+        let generation = generations_by_id
+            .get(activation.generation_id())
+            .ok_or_else(|| anyhow!("activation references missing generation metadata"))?;
+        if generation.is_legacy_v1() {
+            bail!("protected legacy generation lacks strict v2 ownership");
+        }
+        if let Some(published_scope) = activation.published_scope()
+            && generation.descriptor().scope != *published_scope
+        {
+            bail!("activation scope does not match generation metadata");
+        }
+        if Some(activation.document_count()) != generation.materialized_doc_count()
+            || Some(activation.entity_inventory_sha256()) != generation.entity_inventory_sha256()
+        {
+            bail!("activation materialization evidence does not match generation metadata");
+        }
+        protected.insert(activation.generation_id().to_string());
+    }
+
+    let mut lifecycle_projects = BTreeSet::new();
+    for lifecycle in collision_lifecycle {
+        lifecycle.validate()?;
+        if !lifecycle_projects.insert(&lifecycle.project_id) {
+            bail!("collision retirement inventory contains a duplicate project");
+        }
+        if lifecycle.state == CollisionRetirementLifecycleStateV1::Completed {
+            continue;
+        }
+        let generation = generations_by_id
+            .get(lifecycle.generation_id.as_str())
+            .ok_or_else(|| {
+                anyhow!("collision retirement lifecycle references missing generation metadata")
+            })?;
+        if generation.is_legacy_v1() {
+            bail!("protected legacy generation lacks strict v2 ownership");
+        }
+        if lifecycle.former_scope != generation.descriptor().scope
+            || lifecycle.manifest_sha256 != generation.descriptor().manifest_sha256
+        {
+            bail!("collision retirement lifecycle does not match generation metadata");
+        }
+        protected.insert(lifecycle.generation_id.clone());
+    }
+
+    for generation in generations {
+        if !authority_scopes.contains(&generation.descriptor().scope) {
+            continue;
+        }
+        if matches!(
+            generation.state(),
+            GenerationState::MissingBlobs
+                | GenerationState::Ready
+                | GenerationState::StagingIndex
+                | GenerationState::Active
+                | GenerationState::MissingBlobData
+        ) {
+            if generation.is_legacy_v1() {
+                bail!("protected legacy generation lacks strict v2 ownership");
+            }
+            protected.insert(generation.generation_id().to_string());
+        }
+    }
+
+    for scope_generations in by_scope.values_mut() {
+        scope_generations.sort_by(|left, right| {
+            right
+                .ordinal()
+                .cmp(&left.ordinal())
+                .then_with(|| left.generation_id().cmp(right.generation_id()))
+        });
+        for generation in scope_generations
+            .iter()
+            .filter(|generation| generation.state() == GenerationState::Superseded)
+            .take(retained_generations)
+        {
+            if generation.is_legacy_v1() {
+                bail!("retained legacy generation lacks strict v2 ownership");
+            }
+            protected.insert(generation.generation_id().to_string());
+        }
+    }
+    Ok(protected)
+}
+
 fn protected_generation_ids_from_records(
     generations: &[StoredGeneration],
     activations: &[ActivationRecord],
-    collision_pending: &[CollisionRetirementPendingV1],
+    collision_pending: &[CollisionRetirementLifecycleV1],
     retained_generations: usize,
 ) -> Result<BTreeSet<String>> {
     let mut generations_by_id = BTreeMap::new();
@@ -3292,15 +4350,18 @@ fn protected_generation_ids_from_records(
         if !pending_projects.insert(pending.project_id.clone()) {
             bail!("collision retirement inventory contains a duplicate project");
         }
+        if pending.state == CollisionRetirementLifecycleStateV1::Completed {
+            continue;
+        }
         let generation = generations_by_id
             .get(pending.generation_id.as_str())
             .ok_or_else(|| {
-                anyhow!("collision retirement pending references missing generation metadata")
+                anyhow!("collision retirement lifecycle references missing generation metadata")
             })?;
         if pending.former_scope != generation.descriptor.scope
             || pending.manifest_sha256 != generation.descriptor.manifest_sha256
         {
-            bail!("collision retirement pending does not match generation metadata");
+            bail!("collision retirement lifecycle does not match generation metadata");
         }
         protected.insert(pending.generation_id.clone());
     }
@@ -3497,6 +4558,14 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     sync_parent(path)
 }
 
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => sync_parent(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn sync_parent(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         File::open(parent)?.sync_all()?;
@@ -3515,10 +4584,38 @@ fn read_stored_generation_v1(path: &Path) -> Result<StoredGeneration> {
     Ok(record)
 }
 
+fn read_mixed_stored_generation(path: &Path) -> Result<MixedStoredGeneration> {
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    if bytes.len() > MAX_STORED_GENERATION_RECORD_BYTES {
+        bail!("stored generation record exceeds its byte limit");
+    }
+    if let Ok(record) = decode_stored_generation_v2_for_migration(&bytes) {
+        return Ok(MixedStoredGeneration::CurrentV2(record));
+    }
+    let record: StoredGeneration =
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    validate_stored_generation_v1(&record)?;
+    Ok(MixedStoredGeneration::LegacyV1(record))
+}
+
 fn read_activation_v1(path: &Path) -> Result<ActivationRecord> {
     let record = read_json(path)?;
     validate_activation_v1(&record)?;
     Ok(record)
+}
+
+fn read_mixed_activation(path: &Path) -> Result<MixedActivationRecord> {
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    if bytes.len() > MAX_MIGRATION_RECORD_BYTES {
+        bail!("activation record exceeds its byte limit");
+    }
+    if let Ok(record) = decode_activation_v2_for_migration(&bytes) {
+        return Ok(MixedActivationRecord::CurrentV2(record));
+    }
+    let record: ActivationRecord =
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    validate_activation_v1(&record)?;
+    Ok(MixedActivationRecord::LegacyV1(record))
 }
 
 fn tracing_rename_race(_error: &std::io::Error) {}
@@ -3639,7 +4736,7 @@ mod tests {
     }
 
     #[test]
-    fn generation_set_evidence_is_order_independent_and_detects_set_changes() {
+    fn generation_set_evidence_requires_canonical_order_and_detects_set_changes() {
         let row = |generation_id: String| MigrationLegacyGenerationEvidenceV1 {
             published_scope: PublishedScope::try_new("repo-family", ".").unwrap(),
             generation_id,
@@ -3649,31 +4746,32 @@ mod tests {
             manifest_bytes: Vec::new(),
             manifest_sha256: "b".repeat(64),
         };
-        let rows = vec![
+        let rows = [
             row("1".repeat(64)),
             row("2".repeat(64)),
             row("3".repeat(64)),
         ];
         let digest = |rows: &[MigrationLegacyGenerationEvidenceV1]| {
-            let mut accumulator = MigrationGenerationSetAccumulator::default();
+            let mut accumulator = CanonicalGenerationSetCommitment::new(b"test-generation-set");
             for row in rows {
-                accumulator.add(row).unwrap();
+                accumulator.add(row)?;
             }
-            accumulator.digest(b"test-generation-set")
+            Ok::<_, anyhow::Error>(accumulator.finish())
         };
-        let expected = digest(&rows);
+        let expected = digest(&rows).unwrap();
         let mut reordered = rows.clone();
         reordered.reverse();
-        assert_eq!(digest(&reordered), expected);
-        assert_ne!(digest(&rows[..2]), expected);
+        assert!(digest(&reordered).is_err());
+        assert_ne!(digest(&rows[..2]).unwrap(), expected);
         let mut swapped = rows.clone();
         swapped[2] = row("4".repeat(64));
-        assert_ne!(digest(&swapped), expected);
+        assert_ne!(digest(&swapped).unwrap(), expected);
     }
 
     #[test]
     fn unprotected_history_can_exceed_the_survivor_row_cap() {
-        let mut accumulator = MigrationGenerationSetAccumulator::default();
+        let mut accumulator =
+            CanonicalGenerationSetCommitment::new(b"test-unprotected-generation-set");
         let mut row = MigrationLegacyGenerationEvidenceV1 {
             published_scope: PublishedScope::try_new("repo-family", ".").unwrap(),
             generation_id: "0".repeat(64),
@@ -3691,7 +4789,7 @@ mod tests {
             accumulator.count,
             MAX_MIGRATION_INVENTORY_GENERATIONS as u64 + 1
         );
-        validate_sha256(&accumulator.digest(b"test-unprotected-generation-set")).unwrap();
+        validate_sha256(&accumulator.finish()).unwrap();
     }
 
     #[test]
@@ -3702,7 +4800,12 @@ mod tests {
         let generation =
             write_legacy_generation_fixture(&paths, "host-protected", 1, GenerationState::Active);
         let guard = paths.lock_migration_inventory().unwrap();
-        let mut inventory = guard.snapshot_legacy_v1(&StoreLimits::default()).unwrap();
+        let mut inventory = guard
+            .snapshot_legacy_v1_for_scopes(
+                &StoreLimits::default(),
+                &BTreeSet::from([generation.descriptor.scope.clone()]),
+            )
+            .unwrap();
         assert_eq!(
             inventory.protected_generation_ids,
             BTreeSet::from([generation.generation_id])
@@ -3710,6 +4813,83 @@ mod tests {
 
         inventory.generations.clear();
         assert!(inventory.validate_evidence().is_err());
+    }
+
+    #[test]
+    fn legacy_inventory_applies_owner_limits_only_to_survivors() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("source");
+        let paths = CodeSourceStorePaths::new(root).unwrap();
+        let scope = descriptor(&[]).scope;
+        for index in 0..4 {
+            write_legacy_generation_fixture(
+                &paths,
+                &format!("host-history-{index}"),
+                index + 1,
+                GenerationState::Failed,
+            );
+        }
+        let limits = StoreLimits {
+            max_migration_survivor_rows: 1,
+            max_migration_survivor_bytes: 1,
+            ..StoreLimits::default()
+        };
+        let guard = paths.lock_migration_inventory().unwrap();
+        let inventory = guard
+            .snapshot_legacy_v1_for_scopes(&limits, &BTreeSet::from([scope]))
+            .unwrap();
+
+        assert_eq!(inventory.generation_count, 4);
+        assert_eq!(inventory.unprotected_generation_count, 4);
+        assert!(inventory.generations.is_empty());
+    }
+
+    #[test]
+    fn legacy_inventory_refuses_low_owner_limits_for_a_protected_survivor() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("source");
+        let paths = CodeSourceStorePaths::new(root).unwrap();
+        let generation =
+            write_legacy_generation_fixture(&paths, "host-protected", 1, GenerationState::Active);
+        let scopes = BTreeSet::from([generation.descriptor.scope.clone()]);
+        let guard = paths.lock_migration_inventory().unwrap();
+
+        let row_error = guard
+            .snapshot_legacy_v1_for_scopes(
+                &StoreLimits {
+                    max_migration_survivor_rows: 0,
+                    ..StoreLimits::default()
+                },
+                &scopes,
+            )
+            .unwrap_err();
+        assert!(row_error.to_string().contains("row limit"));
+        let byte_error = guard
+            .snapshot_legacy_v1_for_scopes(
+                &StoreLimits {
+                    max_migration_survivor_bytes: 1,
+                    ..StoreLimits::default()
+                },
+                &scopes,
+            )
+            .unwrap_err();
+        assert!(byte_error.to_string().contains("byte limit"));
+    }
+
+    #[test]
+    fn active_generation_outside_authority_is_an_inert_gc_candidate() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("source");
+        let paths = CodeSourceStorePaths::new(root).unwrap();
+        write_legacy_generation_fixture(&paths, "host-orphan", 1, GenerationState::Active);
+        let guard = paths.lock_migration_inventory().unwrap();
+
+        let inventory = guard.snapshot_legacy_v1(&StoreLimits::default()).unwrap();
+
+        assert_eq!(inventory.generation_count, 1);
+        assert_eq!(inventory.unprotected_generation_count, 1);
+        assert!(inventory.generations.is_empty());
+        assert!(inventory.protected_generation_ids.is_empty());
     }
 
     #[test]
@@ -3760,7 +4940,7 @@ mod tests {
         let protected_paths = CodeSourceStorePaths::new(protected_root).unwrap();
         fs::create_dir_all(protected_paths.root()).unwrap();
         fs::write(protected_paths.anchor(), effective).unwrap();
-        write_legacy_generation_fixture(
+        let protected = write_legacy_generation_fixture(
             &protected_paths,
             "host-protected-current",
             1,
@@ -3768,13 +4948,71 @@ mod tests {
         );
         let guard = protected_paths.lock_migration_inventory().unwrap();
         let error = guard
-            .snapshot_current_v2(&StoreLimits::default())
+            .snapshot_current_v2_for_scopes(
+                &StoreLimits::default(),
+                &BTreeSet::from([protected.descriptor.scope]),
+                &BTreeSet::new(),
+            )
             .unwrap_err();
         assert!(
             error
                 .to_string()
                 .contains("protected current generation retains scopeless legacy metadata")
         );
+    }
+
+    #[test]
+    fn current_inventory_streams_v2_history_beyond_the_survivor_cap() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("source");
+        let paths = CodeSourceStorePaths::new(root).unwrap();
+        fs::create_dir_all(paths.root()).unwrap();
+        fs::write(
+            paths.anchor(),
+            encode_migration_effective_source_manifest_v1(&MigrationEffectiveSourceManifestV1 {
+                version: 1,
+                selections: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut scope = None;
+        for index in 0..4 {
+            let legacy = write_legacy_generation_fixture(
+                &paths,
+                &format!("host-current-history-{index}"),
+                index + 1,
+                GenerationState::Failed,
+            );
+            scope = Some(legacy.descriptor.scope.clone());
+            let current = StoredGenerationV2::from_v1_for_migration(
+                legacy.clone(),
+                legacy.descriptor.scope.clone(),
+            )
+            .unwrap();
+            fs::write(
+                paths
+                    .generation_metadata(&legacy.descriptor.scope, &legacy.generation_id)
+                    .unwrap(),
+                encode_stored_generation_v2_for_migration(&current).unwrap(),
+            )
+            .unwrap();
+        }
+        let limits = StoreLimits {
+            max_migration_survivor_rows: 1,
+            ..StoreLimits::default()
+        };
+        let guard = paths.lock_migration_inventory().unwrap();
+
+        let inventory = guard
+            .snapshot_current_v2_for_scopes(
+                &limits,
+                &BTreeSet::from([scope.unwrap()]),
+                &BTreeSet::new(),
+            )
+            .unwrap();
+
+        assert!(inventory.generations.is_empty());
     }
 
     fn activation_v1(generation_id: &str) -> ActivationRecord {
@@ -4111,8 +5349,9 @@ mod tests {
 
     #[test]
     fn collision_retirement_codec_is_strict() {
-        let record = CollisionRetirementPendingV1 {
+        let record = CollisionRetirementLifecycleV1 {
             version: STORE_VERSION,
+            state: CollisionRetirementLifecycleStateV1::Pending,
             project_id: ProjectId::parse("project-a").unwrap(),
             former_scope: PublishedScope::try_new("repo-family", ".").unwrap(),
             generation_id: "a".repeat(64),
@@ -4147,6 +5386,144 @@ mod tests {
         invalid_hash.plan_hash = "d".repeat(64);
         invalid_hash.snapshot_id = "snapshot-a".into();
         assert!(encode_collision_retirement_pending_for_migration(&invalid_hash).is_err());
+    }
+
+    fn collision_lifecycle_fixture() -> CollisionRetirementLifecycleV1 {
+        CollisionRetirementLifecycleV1 {
+            version: STORE_VERSION,
+            state: CollisionRetirementLifecycleStateV1::Pending,
+            project_id: ProjectId::parse("project-a").unwrap(),
+            former_scope: PublishedScope::try_new("repo-family", ".").unwrap(),
+            generation_id: "a".repeat(64),
+            selector: materialized_selector("project-a", &"a".repeat(64)),
+            snapshot_id: format!("collected-{}", "e".repeat(32)),
+            manifest_sha256: "b".repeat(64),
+            inventory_hash: "c".repeat(64),
+            plan_hash: "d".repeat(64),
+        }
+    }
+
+    fn retirement_for_lifecycle(lifecycle: &CollisionRetirementLifecycleV1) -> RetirementRecord {
+        RetirementRecord {
+            version: STORE_VERSION,
+            project_id: lifecycle.project_id.to_string(),
+            selector: lifecycle.selector.clone(),
+            snapshot_id: lifecycle.snapshot_id.clone(),
+            generation_id: Some(lifecycle.generation_id.clone()),
+        }
+    }
+
+    fn write_collision_lifecycle(
+        store: &CodeSourceStore,
+        lifecycle: &CollisionRetirementLifecycleV1,
+    ) {
+        let path = store
+            .paths
+            .collision_retirement_pending(&lifecycle.project_id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            encode_collision_retirement_pending_for_migration(lifecycle).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn read_collision_lifecycle(
+        store: &CodeSourceStore,
+        project_id: &ProjectId,
+    ) -> CollisionRetirementLifecycleV1 {
+        decode_collision_retirement_pending_for_migration(
+            &fs::read(store.paths.collision_retirement_pending(project_id)).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn collision_lifecycle_recovers_pending_with_published_queue() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = open_store(&root);
+        let lifecycle = collision_lifecycle_fixture();
+        let queue = retirement_for_lifecycle(&lifecycle);
+        write_collision_lifecycle(&store, &lifecycle);
+        let queue_path = store
+            .paths
+            .retirement_for_selector(&lifecycle.selector)
+            .unwrap();
+        fs::write(&queue_path, serde_json::to_vec_pretty(&queue).unwrap()).unwrap();
+
+        store.enqueue_retirement(&queue).unwrap();
+
+        assert_eq!(
+            read_collision_lifecycle(&store, &lifecycle.project_id).state,
+            CollisionRetirementLifecycleStateV1::Queued
+        );
+        assert!(queue_path.is_file());
+    }
+
+    #[test]
+    fn collision_lifecycle_completes_when_queued_row_is_absent() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = open_store(&root);
+        let mut lifecycle = collision_lifecycle_fixture();
+        lifecycle.state = CollisionRetirementLifecycleStateV1::Queued;
+        write_collision_lifecycle(&store, &lifecycle);
+
+        store.complete_retirement(&lifecycle.selector).unwrap();
+
+        assert_eq!(
+            read_collision_lifecycle(&store, &lifecycle.project_id).state,
+            CollisionRetirementLifecycleStateV1::Completed
+        );
+    }
+
+    #[test]
+    fn collision_lifecycle_cleans_a_matching_lagging_queue_after_completion() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = open_store(&root);
+        let mut lifecycle = collision_lifecycle_fixture();
+        lifecycle.state = CollisionRetirementLifecycleStateV1::Completed;
+        let queue = retirement_for_lifecycle(&lifecycle);
+        write_collision_lifecycle(&store, &lifecycle);
+        let queue_path = store
+            .paths
+            .retirement_for_selector(&lifecycle.selector)
+            .unwrap();
+        fs::write(&queue_path, serde_json::to_vec_pretty(&queue).unwrap()).unwrap();
+
+        store.complete_retirement(&lifecycle.selector).unwrap();
+
+        assert!(!queue_path.exists());
+        assert_eq!(
+            read_collision_lifecycle(&store, &lifecycle.project_id).state,
+            CollisionRetirementLifecycleStateV1::Completed
+        );
+    }
+
+    #[test]
+    fn collision_lifecycle_refuses_a_contradictory_lagging_queue() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = open_store(&root);
+        let mut lifecycle = collision_lifecycle_fixture();
+        lifecycle.state = CollisionRetirementLifecycleStateV1::Completed;
+        let mut queue = retirement_for_lifecycle(&lifecycle);
+        queue.snapshot_id = format!("collected-{}", "f".repeat(32));
+        write_collision_lifecycle(&store, &lifecycle);
+        let queue_path = store
+            .paths
+            .retirement_for_selector(&lifecycle.selector)
+            .unwrap();
+        fs::write(&queue_path, serde_json::to_vec_pretty(&queue).unwrap()).unwrap();
+
+        assert!(store.complete_retirement(&lifecycle.selector).is_err());
+        assert!(queue_path.is_file());
+        assert_eq!(
+            read_collision_lifecycle(&store, &lifecycle.project_id).state,
+            CollisionRetirementLifecycleStateV1::Completed
+        );
     }
 
     #[test]
@@ -4648,8 +6025,9 @@ mod tests {
 
         let project_id = ProjectId::parse("project-a").unwrap();
         let selector = materialized_selector(project_id.as_str(), &stored.generation_id);
-        let pending = CollisionRetirementPendingV1 {
+        let pending = CollisionRetirementLifecycleV1 {
             version: STORE_VERSION,
+            state: CollisionRetirementLifecycleStateV1::Pending,
             project_id: project_id.clone(),
             former_scope: descriptor.scope,
             generation_id: stored.generation_id,
@@ -4703,6 +6081,86 @@ mod tests {
         .unwrap();
         assert!(store.gc_blobs().is_err());
         assert!(orphan.is_file());
+    }
+
+    #[test]
+    fn post_migration_gc_classifies_mixed_v1_v2_generations_without_reviving_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let mut limits = StoreLimits::default();
+        limits.retained_generations = 0;
+        limits.unreferenced_blob_grace_hours = 0;
+        let store = CodeSourceStore::open(root.join("code-sources"), limits).unwrap();
+        let protected_bytes = b"protected current generation";
+        let protected_hash = sha256_hex(protected_bytes);
+        let entries = vec![ManifestEntry {
+            relative_path: "src/lib.rs".into(),
+            content_sha256: protected_hash.clone(),
+            size: protected_bytes.len() as u64,
+        }];
+        let descriptor = descriptor(&entries);
+        let legacy = stored_generation_v1("host-current", descriptor.clone());
+        let current =
+            StoredGenerationV2::from_v1_for_migration(legacy, descriptor.scope.clone()).unwrap();
+        let generation_directory = store
+            .paths
+            .generation_metadata(&descriptor.scope, &current.generation_id)
+            .unwrap();
+        fs::create_dir_all(generation_directory.parent().unwrap()).unwrap();
+        fs::write(
+            &generation_directory,
+            encode_stored_generation_v2_for_migration(&current).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            store
+                .paths
+                .generation_manifest(&descriptor.scope, &current.generation_id)
+                .unwrap(),
+            manifest_bytes(&entries),
+        )
+        .unwrap();
+        let activation = ActivationRecordV2::from_v1_for_migration(
+            activation_v1(&current.generation_id),
+            &current,
+        )
+        .unwrap();
+        fs::write(
+            store.paths.activation(&activation.project_id),
+            encode_activation_v2_for_migration(&activation).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            store.paths.anchor(),
+            encode_migration_effective_source_manifest_v1(&MigrationEffectiveSourceManifestV1 {
+                version: 1,
+                selections: vec![MigrationEffectiveSourceSelectionV1 {
+                    project_id: activation.project_id.clone(),
+                    published_scope: descriptor.scope.clone(),
+                    generation_id: current.generation_id.clone(),
+                    selector: activation.selector.clone(),
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        write_legacy_generation_fixture(&store.paths, "host-leftover", 2, GenerationState::Failed);
+        let protected_path = store.blob_path(&protected_hash);
+        fs::create_dir_all(protected_path.parent().unwrap()).unwrap();
+        fs::write(&protected_path, protected_bytes).unwrap();
+        let orphan_bytes = b"post migration orphan";
+        let orphan_hash = sha256_hex(orphan_bytes);
+        let orphan_path = store.blob_path(&orphan_hash);
+        fs::create_dir_all(orphan_path.parent().unwrap()).unwrap();
+        fs::write(&orphan_path, orphan_bytes).unwrap();
+
+        let stats = store
+            .gc_blobs_for_scopes(&BTreeSet::from([descriptor.scope]))
+            .unwrap();
+
+        assert!(protected_path.is_file());
+        assert!(!orphan_path.exists());
+        assert_eq!(stats.reclaimed_blobs, 1);
     }
 
     #[test]
