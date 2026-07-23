@@ -623,6 +623,13 @@ The migration engine consumes explicit paths and immutable inventory inputs. It
 does not read global environment variables. The thin CLI resolves configured or
 explicit paths and passes them in.
 
+P1-C exposes one high-level public facade for preflight, rehearsal apply, and
+complete migration-aware verification. The facade accepts explicit resolved
+paths and typed options and returns typed results and errors. It owns assembly
+of the complete participant registry and is the only public entry point that
+may execute or verify a migration transaction. P1-D must not expose individual
+participant internals or reconstruct the registry in the CLI.
+
 ### 6.2 Stable v1 inventory
 
 Preflight acquires the shared lifetime lock and `projects.json.lock` while
@@ -1094,7 +1101,9 @@ blackbox project-catalog verify --root <path>
 ```
 
 Common options include explicit projects path, state dir, report, and
-resolution. Preflight alone accepts the sensitive opt-in
+resolution. Both preflight and apply accept `--resolution`; preflight binds it
+into the report, and apply requires the exact report/resolution pair and refuses
+unless the report is clean. Preflight alone accepts the sensitive opt-in
 `--include-local-paths` flag. Defaults use the same config loader as the daemon,
 but help and version remain side-effect-free.
 `--preflight` is read-only except for an explicit report. `--apply` refuses
@@ -1102,14 +1111,25 @@ without an exclusive lifetime lock and an isolated rehearsal root in Phase 1.
 The exact `blackbox` name is final: the package and library already own it,
 while `blackboxd` remains daemon-only.
 
+`--root` and `--rehearsal-root` both name the rehearsal state root, never a
+`projects.json` file. The facade derives participant paths from that root.
+Explicit `--projects-path` wins over `--state-dir`; otherwise an explicit
+`--state-dir` derives the projects path; otherwise both come from the shared
+config loader. The CLI reports the resolved source and destination roles
+without echoing private local paths in default JSON.
+
 Update the binary inventory, getting-started and operations documentation,
 release packaging, and Nix app definitions so the CLI is installed
 deliberately. On macOS, resolve `which stablesign` and stable-sign the exact
 built `blackbox` binary before any live CLI rehearsal, using the same operator
 protocol as `blackboxd`.
 
-CLI JSON output is versioned and stable. Human diagnostics go to stderr; JSON
-goes to stdout. A failure exits nonzero and never emits a success-shaped body.
+After command parsing, CLI JSON uses one tagged v1 envelope with `version`,
+`command`, and exactly one of `result` or `error { code, message }`. Human
+diagnostics go to stderr and the envelope goes to stdout. A failure exits
+nonzero and emits only the error-shaped envelope; help, version, and clap parser
+diagnostics retain their conventional side-effect-free streams and never open
+configuration or stores.
 
 ### 7.2 Compatibility proof
 

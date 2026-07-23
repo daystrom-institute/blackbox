@@ -459,3 +459,48 @@ until a later entry explicitly supersedes it.
   auditable authority surface while allowing the execution queue to drain.
 - Revisit only if: a different durable store retains equivalent immutable
   migration evidence and monotonic crash-safe terminal state.
+
+## D-020: The offline catalog CLI has one versioned result envelope
+
+- Date: 2026-07-22
+- Phase: durable project catalog, offline CLI
+- Status: accepted after independent plan re-review
+- Decision: Every parsed migration or verification command writes one tagged
+  v1 JSON envelope containing `version`, `command`, and exactly one of `result`
+  or `error { code, message }`. The envelope goes to stdout, human diagnostics
+  go to stderr, and failures exit nonzero without success-shaped output. Help,
+  version, and parser diagnostics retain conventional side-effect-free streams.
+- Evidence:
+  - "Versioned and stable" alone does not define a wire contract callers can
+    parse or distinguish from a partial success.
+  - A single tagged envelope permits compatible field growth while keeping
+    success and failure structurally exclusive.
+  - Clap must be able to render help and version before configuration or stores
+    are available.
+- Rationale: One explicit response algebra gives automation deterministic
+  output without weakening normal command-line ergonomics.
+- Revisit only if: a versioned protocol with equivalent exclusive
+  success/failure semantics replaces the JSON command surface.
+
+## D-021: CLI roots and resolution precedence are explicit
+
+- Date: 2026-07-22
+- Phase: durable project catalog, offline CLI
+- Status: accepted after independent plan re-review
+- Decision: `verify --root` and apply's `--rehearsal-root` name a rehearsal
+  state root, from which the migration facade derives participant paths.
+  Explicit `--projects-path` wins over `--state-dir`; otherwise explicit
+  `--state-dir` derives the projects path, then shared configuration supplies
+  defaults. Preflight and apply both accept `--resolution`; apply consumes the
+  exact clean report/resolution pair.
+- Evidence:
+  - Treating `--root` as a file on one command and a state root on another
+    would make rehearsal verification ambiguous.
+  - Independent projects and state path overrides can otherwise select
+    different source sets depending on argument order.
+  - Resolution affects preflight classification and must be hash-bound to the
+    report that apply validates.
+- Rationale: A single destination model and fixed override order prevent the
+  CLI adapter from inventing authority or bypassing the migration facade.
+- Revisit only if: the facade adopts one typed location object that makes
+  conflicting overrides unrepresentable while preserving these semantics.
