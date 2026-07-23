@@ -1098,20 +1098,22 @@ fn observe_code_sources(
         }
         owner_by_generation.insert(generation.generation_id.clone(), candidates[0].clone());
     }
-    let collision_by_generation = snapshot
-        .owner
-        .inventory
-        .collision_pending
-        .iter()
-        .flat_map(|row| {
-            row.record.entries.iter().map(|(generation_id, entry)| {
-                (
+    let mut collision_by_generation = BTreeMap::new();
+    for row in &snapshot.owner.inventory.collision_pending {
+        for (generation_id, entry) in &row.record.entries {
+            if collision_by_generation
+                .insert(
                     (row.project_id.clone(), generation_id.clone()),
                     (row, entry),
                 )
-            })
-        })
-        .collect::<BTreeMap<_, _>>();
+                .is_some()
+            {
+                return Err(invalid_source(
+                    "collision_lifecycle_generation_is_duplicated",
+                ));
+            }
+        }
+    }
     let ambiguous_generation_ids = retained_owner_resolutions
         .iter()
         .map(|row| row.generation_id.as_str())

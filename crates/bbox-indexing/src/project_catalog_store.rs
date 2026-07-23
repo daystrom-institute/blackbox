@@ -1589,7 +1589,7 @@ fn validate_code_source_snapshot(
             .collision_pending
             .iter()
             .map(|row| row.record.entries.len())
-            .sum()
+            .sum::<usize>()
     {
         return Err(fail(
             "legacy collision pending rows are not consumed exactly once",
