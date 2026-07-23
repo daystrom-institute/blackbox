@@ -17,10 +17,11 @@ use std::sync::Arc;
 use bbox_code_source::{GenerationState, validate_collected_materialization_selector};
 use bbox_code_source_store::{
     ActivationRecord, ActivationRecordV2, CodeSourceStore, CollisionRetirementLifecycleStateV1,
-    MigrationLegacyAnchorEvidenceV1, MigrationLegacyGenerationEvidenceV1,
-    MigrationOwnedLegacyInventoryV1, StoreLimits, StoredGenerationV2,
-    decode_migration_effective_source_manifest_v1, encode_activation_v2_for_migration,
-    encode_stored_generation_v2_for_migration, verify_generation_manifest_for_migration,
+    CollisionRetirementSelectorEvidenceV1, MigrationLegacyAnchorEvidenceV1,
+    MigrationLegacyGenerationEvidenceV1, MigrationOwnedLegacyInventoryV1, StoreLimits,
+    StoredGenerationV2, decode_migration_effective_source_manifest_v1,
+    encode_activation_v2_for_migration, encode_stored_generation_v2_for_migration,
+    verify_generation_manifest_for_migration,
 };
 use bbox_corpus_core::git::{
     read_verified_committed_file_bytes_optional_bounded, verify_commit_oid_with_alternate,
@@ -86,10 +87,10 @@ impl fmt::Display for InventoryAdapterError {
 
 impl std::error::Error for InventoryAdapterError {}
 
-pub type AdapterResult<T> = Result<T, InventoryAdapterError>;
+type AdapterResult<T> = Result<T, InventoryAdapterError>;
 
 #[derive(Clone)]
-pub struct AuthorizedInventoryPath {
+struct AuthorizedInventoryPath {
     path: PathBuf,
     authority: Arc<NofollowDirectory>,
     authority_canonical_path: PathBuf,
@@ -105,7 +106,7 @@ struct FileIdentityV1 {
 }
 
 impl AuthorizedInventoryPath {
-    pub fn new(path: impl AsRef<Path>) -> AdapterResult<Self> {
+    fn new(path: impl AsRef<Path>) -> AdapterResult<Self> {
         let path = path.as_ref().to_path_buf();
         let byte_len = path
             .to_str()
@@ -257,7 +258,7 @@ fn file_identity(metadata: &fs::Metadata) -> FileIdentityV1 {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct ExactSourceBytesV1 {
+struct ExactSourceBytesV1 {
     bytes: Vec<u8>,
     content_hash: Sha256ValueV1,
     fingerprint: Sha256ValueV1,
@@ -286,38 +287,20 @@ impl ExactSourceBytesV1 {
             fingerprint: Sha256ValueV1::digest(&fingerprint),
         }
     }
-
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    pub fn content_hash(&self) -> &Sha256ValueV1 {
-        &self.content_hash
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AuthorizedFileObservationV1 {
+enum AuthorizedFileObservationV1 {
     NotFound,
     Present(ExactSourceBytesV1),
     Invalid { diagnostic_code: String },
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct ExactDecodedSourceV1<T> {
+struct ExactDecodedSourceV1<T> {
     source: ExactSourceBytesV1,
     value: T,
     was_missing: bool,
-}
-
-impl<T> ExactDecodedSourceV1<T> {
-    pub fn source(&self) -> &ExactSourceBytesV1 {
-        &self.source
-    }
-
-    pub fn value(&self) -> &T {
-        &self.value
-    }
 }
 
 impl<T: fmt::Debug> fmt::Debug for ExactDecodedSourceV1<T> {
@@ -332,7 +315,7 @@ impl<T: fmt::Debug> fmt::Debug for ExactDecodedSourceV1<T> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DecodedSourceObservationV1<T> {
+enum DecodedSourceObservationV1<T> {
     NotFound,
     Valid(ExactDecodedSourceV1<T>),
     Invalid {
@@ -341,21 +324,17 @@ pub enum DecodedSourceObservationV1<T> {
     },
 }
 
-impl<T> DecodedSourceObservationV1<T> {
-    pub fn require_valid(self, label: &'static str) -> AdapterResult<ExactDecodedSourceV1<T>> {
-        match self {
-            Self::Valid(source) => Ok(source),
-            Self::NotFound => Err(invalid_source(format!("{label}_not_found"))),
-            Self::Invalid {
-                diagnostic_code, ..
-            } => Err(invalid_source(format!("{label}_{diagnostic_code}"))),
-        }
-    }
-}
-
-pub fn read_authorized_file(
+fn read_authorized_file(
     path: &AuthorizedInventoryPath,
     max_bytes: usize,
+) -> AdapterResult<AuthorizedFileObservationV1> {
+    read_authorized_file_with_hook(path, max_bytes, || {})
+}
+
+fn read_authorized_file_with_hook(
+    path: &AuthorizedInventoryPath,
+    max_bytes: usize,
+    after_present_inspection: impl FnOnce(),
 ) -> AdapterResult<AuthorizedFileObservationV1> {
     path.ensure_authority()?;
     let refreshed = AuthorizedInventoryPath::new(path.as_path())?;
@@ -375,6 +354,7 @@ pub fn read_authorized_file(
         }
         InspectedPath::Regular { .. } => {}
     }
+    after_present_inspection();
     let parent = refreshed
         .as_path()
         .parent()
@@ -393,7 +373,12 @@ pub fn read_authorized_file(
             .read_regular(name, max_bytes, "migration inventory source")
         {
             Ok(Some(bytes)) => bytes,
-            Ok(None) => return Ok(AuthorizedFileObservationV1::NotFound),
+            Ok(None) => {
+                if refreshed.ensure_authority().is_err() || path.ensure_authority().is_err() {
+                    return Ok(invalid_file("source_path_changed"));
+                }
+                return Ok(invalid_file("source_read_invalid"));
+            }
             Err(_) => return Ok(invalid_file("source_read_invalid")),
         };
     if refreshed.authority.ensure_still_current().is_err() || path.ensure_authority().is_err() {
@@ -459,7 +444,7 @@ fn invalid_file(code: &str) -> AuthorizedFileObservationV1 {
     }
 }
 
-pub(crate) fn capture_legacy_projects_source(
+fn capture_legacy_projects_source(
     path: &AuthorizedInventoryPath,
 ) -> AdapterResult<DecodedSourceObservationV1<LegacyProjectStoreV1>> {
     Ok(decode_source(
@@ -486,7 +471,7 @@ fn accept_missing_legacy_projects_source(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublisherRefInventoryV1 {
+struct PublisherRefInventoryV1 {
     pub rows: Vec<PublisherRefRow>,
 }
 
@@ -515,13 +500,13 @@ fn capture_publisher_ref_source(
 }
 
 #[derive(Debug, Clone)]
-pub struct CommittedConfigSourceV1 {
+struct CommittedConfigSourceV1 {
     pub repository_root: AuthorizedInventoryPath,
     pub commit_oid: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommittedAuthorityProbeV1 {
+struct CommittedAuthorityProbeV1 {
     source_evidence: MutableInventorySourceEvidenceV1,
     pub authority: Option<RecordedRepoAuthority>,
     pub published_scope: Option<PublishedScope>,
@@ -641,7 +626,7 @@ fn observe_committed_authority_probe(
 }
 
 #[derive(Debug, Clone)]
-pub struct LegacyProjectProbeInputV1 {
+struct LegacyProjectProbeInputV1 {
     pub project_id: ProjectId,
     pub authorized_canonical_path: AuthorizedInventoryPath,
     pub committed_config: Option<CommittedConfigSourceV1>,
@@ -756,6 +741,7 @@ fn observe_legacy_projects(
         authority_probe.source_evidence.row_observation_ids = BTreeSet::from([authority_row_id]);
         authority_probe.source_evidence.row_set_sha256 =
             mutable_source_row_set_hash(&authority_probe.source_evidence.row_observation_ids);
+        let committed_scope = authority_probe.published_scope.clone();
         if let Some(scope) = authority_probe.published_scope {
             published_scopes.insert(project_id.clone(), scope);
         }
@@ -767,6 +753,7 @@ fn observe_legacy_projects(
             record: LegacyProjectRecordInventoryV1::from_legacy(record.clone()),
             path_status,
             committed_authority,
+            committed_scope,
         });
     }
     observations.sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
@@ -783,6 +770,7 @@ fn observe_legacy_projects(
 fn derive_publisher_pins(
     source: &ExactDecodedSourceV1<PublisherRefInventoryV1>,
     legacy: &LegacyProjectsCaptureV1,
+    lanes: &ImmutableInventoryLanesV1,
 ) -> AdapterResult<Vec<PublisherPinObservationV1>> {
     let mut rows = Vec::new();
     for publisher in &source.value.rows {
@@ -827,12 +815,42 @@ fn derive_publisher_pins(
         if let Some(authority) = &project.committed_authority {
             source_observation_ids.insert(authority.observation_id.clone());
         }
+        let candidates = lanes
+            .attachment_candidates
+            .rows
+            .iter()
+            .filter(|attachment| {
+                attachment.project_id == project_id
+                    && attachment.observed_scope.as_ref() == Some(&publisher.scope)
+            })
+            .collect::<Vec<_>>();
+        let candidate_attachment_ids = candidates
+            .iter()
+            .map(|attachment| attachment.attachment_id.clone())
+            .collect::<BTreeSet<_>>();
+        for attachment in candidates {
+            source_observation_ids.insert(attachment.observation_id.clone());
+            source_observation_ids.insert(attachment.checkout_observation_id.clone());
+        }
+        if resolved_commit.is_some() {
+            let git_rows = lanes
+                .git_metadata
+                .rows
+                .iter()
+                .filter(|row| row.project_id == project_id)
+                .collect::<Vec<_>>();
+            if git_rows.is_empty() {
+                return Err(invalid_source("publisher_git_evidence_missing"));
+            }
+            source_observation_ids
+                .extend(git_rows.into_iter().map(|row| row.observation_id.clone()));
+        }
         rows.push(PublisherPinObservationV1 {
             observation_id,
             project_id,
             expected_scope: publisher.scope.clone(),
             full_ref: publisher.branch_ref.clone(),
-            candidate_attachment_ids: BTreeSet::new(),
+            candidate_attachment_ids,
             resolved_scope: resolved_commit.as_ref().map(|_| publisher.scope.clone()),
             resolved_commit,
             source_observation_ids,
@@ -898,24 +916,71 @@ fn observe_code_sources(
         .map(|row| (row.generation_id.clone(), row))
         .collect::<BTreeMap<_, _>>();
     let mut owner_by_generation = BTreeMap::<String, ProjectId>::new();
-    if let MigrationLegacyAnchorEvidenceV1::Present { bytes, .. } = &snapshot.owner.inventory.anchor
-    {
-        let manifest = decode_migration_effective_source_manifest_v1(bytes)
-            .map_err(|_| invalid_source("effective_source_manifest_invalid"))?;
-        for selection in manifest.selections {
-            insert_generation_owner(
-                &mut owner_by_generation,
-                &selection.generation_id,
-                &selection.project_id,
-            )?;
+    let effective_by_project = match &snapshot.owner.inventory.anchor {
+        MigrationLegacyAnchorEvidenceV1::Missing => BTreeMap::new(),
+        MigrationLegacyAnchorEvidenceV1::Present { bytes, .. } => {
+            let manifest = decode_migration_effective_source_manifest_v1(bytes)
+                .map_err(|_| invalid_source("effective_source_manifest_invalid"))?;
+            let count = manifest.selections.len();
+            let rows = manifest
+                .selections
+                .into_iter()
+                .map(|selection| (selection.project_id.clone(), selection))
+                .collect::<BTreeMap<_, _>>();
+            if rows.len() != count {
+                return Err(invalid_source("effective_source_project_duplicate"));
+            }
+            rows
         }
-    }
+    };
+    let mut retained_owner_scopes = project_scopes.clone();
     for activation in &snapshot.owner.inventory.activations {
+        let selection = effective_by_project
+            .get(&activation.project_id)
+            .ok_or_else(|| invalid_source("activation_effective_selection_missing"))?;
+        let generation = generations_by_id
+            .get(&activation.record.generation_id)
+            .ok_or_else(|| invalid_source("activation_generation_missing"))?;
+        if selection.generation_id != activation.record.generation_id
+            || selection.selector != activation.record.selector
+            || selection.published_scope != generation.published_scope
+        {
+            return Err(invalid_source(
+                "descriptor_activation_effective_evidence_mismatch",
+            ));
+        }
+        if project_scopes
+            .get(&activation.project_id)
+            .is_some_and(|scope| scope != &selection.published_scope)
+        {
+            return Err(invalid_source("active_descriptor_committed_scope_mismatch"));
+        }
+        if missing_checkout_projects.contains(&activation.project_id) {
+            match retained_owner_scopes.get(&activation.project_id) {
+                Some(scope) if scope != &selection.published_scope => {
+                    return Err(invalid_source(
+                        "active_descriptor_retained_owner_scope_mismatch",
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    retained_owner_scopes.insert(
+                        activation.project_id.clone(),
+                        selection.published_scope.clone(),
+                    );
+                }
+            }
+        }
         insert_generation_owner(
             &mut owner_by_generation,
             &activation.record.generation_id,
             &activation.project_id,
         )?;
+    }
+    if effective_by_project.len() != snapshot.owner.inventory.activations.len() {
+        return Err(invalid_source(
+            "effective_selection_activation_set_mismatch",
+        ));
     }
     for collision in &snapshot.owner.inventory.collision_pending {
         insert_generation_owner(
@@ -930,7 +995,7 @@ fn observe_code_sources(
         if owner_by_generation.contains_key(&generation.generation_id) {
             continue;
         }
-        let candidates = project_scopes
+        let candidates = retained_owner_scopes
             .iter()
             .filter(|(_, scope)| **scope == generation.published_scope)
             .map(|(project_id, _)| project_id)
@@ -1137,16 +1202,15 @@ fn observe_code_sources(
                         project_id: collision.record.project_id.clone(),
                         former_scope: collision.record.former_scope.clone(),
                         generation_id: collision.record.generation_id.clone(),
-                        selector_evidence: if active_generation_id
-                            == Some(generation.generation_id.as_str())
-                        {
-                            DurableSelectorEvidenceV1::ExactMaterialized {
-                                selector_hash: Sha256ValueV1::digest(
-                                    collision.record.selector.as_bytes(),
-                                ),
+                        selector_evidence: match &collision.record.selector_evidence {
+                            CollisionRetirementSelectorEvidenceV1::ExactMaterialized(selector) => {
+                                DurableSelectorEvidenceV1::ExactMaterialized {
+                                    selector_hash: Sha256ValueV1::digest(selector.as_bytes()),
+                                }
                             }
-                        } else {
-                            DurableSelectorEvidenceV1::NoDurableSelector
+                            CollisionRetirementSelectorEvidenceV1::NoDurableSelector => {
+                                DurableSelectorEvidenceV1::NoDurableSelector
+                            }
                         },
                         snapshot_id: collision.record.snapshot_id.clone(),
                         manifest_sha256: Sha256ValueV1::parse(
@@ -1163,6 +1227,17 @@ fn observe_code_sources(
                 });
             } else {
                 let active = active_generation_id == Some(generation.generation_id.as_str());
+                let activation_scope = if active {
+                    Some(
+                        effective_by_project
+                            .get(&project_id)
+                            .ok_or_else(|| invalid_source("active_effective_selection_missing"))?
+                            .published_scope
+                            .clone(),
+                    )
+                } else {
+                    None
+                };
                 let selector_evidence = if active {
                     DurableSelectorEvidenceV1::ExactMaterialized {
                         selector_hash: Sha256ValueV1::digest(
@@ -1185,7 +1260,7 @@ fn observe_code_sources(
                         CollectedGenerationRoleV1::Retained
                     },
                     generation_id: generation.generation_id.clone(),
-                    activation_scope: Some(generation.published_scope.clone()),
+                    activation_scope,
                     descriptor,
                     manifest,
                     selector_evidence,
@@ -1491,14 +1566,14 @@ struct ImmutableInventoryLanesV1 {
 }
 
 pub struct ProjectCatalogMigrationInventoryRequestV1<'a> {
-    pub legacy_project_store_path: AuthorizedInventoryPath,
+    pub legacy_project_store_path: PathBuf,
     pub publisher_ref_store: &'a PublisherRefStore,
     pub code_source_store: &'a CodeSourceStore,
-    pub checkout_roots: Vec<AuthorizedInventoryPath>,
+    pub checkout_roots: Vec<PathBuf>,
 }
 
 #[derive(Clone)]
-pub struct InventoryRuntimeBindingsV1 {
+struct InventoryRuntimeBindingsV1 {
     legacy_project_store_source: ExactSourceBytesV1,
     legacy_project_paths: BTreeMap<String, AuthorizedInventoryPath>,
     checkout_paths: BTreeMap<String, AuthorizedInventoryPath>,
@@ -1623,7 +1698,7 @@ fn validate_authorized_path_bindings(
 pub struct ProjectCatalogMigrationInventoryResultV1 {
     pub inventory: V1ProjectCatalogInventory,
     /// Host-local authorities are retained outside canonical inventory JSON.
-    pub runtime_bindings: InventoryRuntimeBindingsV1,
+    _runtime_bindings: InventoryRuntimeBindingsV1,
     pub code_source_canonical_sha256: Sha256ValueV1,
     pub code_source_generation_count: u64,
     pub code_source_generation_set_sha256: Sha256ValueV1,
@@ -1634,18 +1709,38 @@ pub struct ProjectCatalogMigrationInventoryFacadeV1;
 impl ProjectCatalogMigrationInventoryFacadeV1 {
     pub fn capture(
         request: ProjectCatalogMigrationInventoryRequestV1<'_>,
-    ) -> AdapterResult<ProjectCatalogMigrationInventoryResultV1> {
-        let projects_path = request.legacy_project_store_path.as_path().to_path_buf();
+    ) -> Result<ProjectCatalogMigrationInventoryResultV1, InventoryAdapterError> {
+        let legacy_project_store_path =
+            AuthorizedInventoryPath::new(&request.legacy_project_store_path)?;
+        let checkout_roots = request
+            .checkout_roots
+            .iter()
+            .map(AuthorizedInventoryPath::new)
+            .collect::<AdapterResult<Vec<_>>>()?;
+        let projects_path = legacy_project_store_path.as_path().to_path_buf();
+        let authorized = AuthorizedProjectCatalogMigrationInventoryRequestV1 {
+            legacy_project_store_path,
+            publisher_ref_store: request.publisher_ref_store,
+            code_source_store: request.code_source_store,
+            checkout_roots,
+        };
         crate::project_catalog_store::capture_migration_preflight_with(
             &projects_path,
             |error| invalid_source(error.to_string()),
-            || capture_inventory_locked(request),
+            || capture_inventory_locked(authorized),
         )
     }
 }
 
+struct AuthorizedProjectCatalogMigrationInventoryRequestV1<'a> {
+    legacy_project_store_path: AuthorizedInventoryPath,
+    publisher_ref_store: &'a PublisherRefStore,
+    code_source_store: &'a CodeSourceStore,
+    checkout_roots: Vec<AuthorizedInventoryPath>,
+}
+
 fn capture_inventory_locked(
-    request: ProjectCatalogMigrationInventoryRequestV1<'_>,
+    request: AuthorizedProjectCatalogMigrationInventoryRequestV1<'_>,
 ) -> AdapterResult<ProjectCatalogMigrationInventoryResultV1> {
     let legacy_source = accept_missing_legacy_projects_source(capture_legacy_projects_source(
         &request.legacy_project_store_path,
@@ -1675,7 +1770,6 @@ fn capture_inventory_locked(
     )?;
     let mut code_sources = code_capture.sources;
     let publisher_source = &publisher_locked.source;
-    let publisher_pins = derive_publisher_pins(publisher_source, &legacy)?;
     let mut checkout_paths = BTreeSet::new();
     let mut checkout_identities = BTreeSet::new();
     for root in &request.checkout_roots {
@@ -1707,17 +1801,6 @@ fn capture_inventory_locked(
         legacy_row_ids,
     )];
     mutable_source_evidence.append(&mut legacy.source_evidence);
-    let publisher_row_ids = publisher_pins
-        .iter()
-        .map(|row| row.observation_id.clone())
-        .collect();
-    mutable_source_evidence.push(exact_source_evidence(
-        "publisher-ref-store",
-        MutableInventorySourceKindV1::PublisherRefStore,
-        MutableInventorySourceLocatorV1::PublisherRefStore,
-        publisher_source,
-        publisher_row_ids,
-    ));
     let effective_row_ids = code_sources
         .iter()
         .flat_map(|capture| {
@@ -1774,10 +1857,22 @@ fn capture_inventory_locked(
         mutable_source_evidence.push(capture.root_source_evidence);
         mutable_source_evidence.push(capture.marker_source_evidence);
     }
-    mutable_source_evidence.sort_by(|left, right| left.source_id.cmp(&right.source_id));
     let mut lanes = capture_required_owner_lanes(&checkout_observations)?;
     sort_lane_rows(&mut lanes);
     validate_lane_kinds(&lanes)?;
+    let publisher_pins = derive_publisher_pins(publisher_source, &legacy, &lanes)?;
+    let publisher_row_ids = publisher_pins
+        .iter()
+        .map(|row| row.observation_id.clone())
+        .collect();
+    mutable_source_evidence.push(exact_source_evidence(
+        "publisher-ref-store",
+        MutableInventorySourceKindV1::PublisherRefStore,
+        MutableInventorySourceLocatorV1::PublisherRefStore,
+        publisher_source,
+        publisher_row_ids,
+    ));
+    mutable_source_evidence.sort_by(|left, right| left.source_id.cmp(&right.source_id));
     let runtime_bindings = InventoryRuntimeBindingsV1 {
         legacy_project_store_source: legacy_source.source.clone(),
         legacy_project_paths: legacy.runtime_project_paths,
@@ -1828,7 +1923,7 @@ fn capture_inventory_locked(
         code_source_generation_count: code_snapshot.owner.inventory.generation_count,
         code_source_generation_set_sha256,
         inventory,
-        runtime_bindings,
+        _runtime_bindings: runtime_bindings,
     })
 }
 
@@ -1945,7 +2040,7 @@ fn decode_source<T>(
     }
 }
 
-pub fn stable_observation_id_v1(kind: &str, parts: &[&[u8]]) -> AdapterResult<String> {
+fn stable_observation_id_v1(kind: &str, parts: &[&[u8]]) -> AdapterResult<String> {
     if kind.is_empty()
         || kind.len() > 32
         || !kind
@@ -2092,8 +2187,10 @@ mod tests {
         dirty_fingerprint, generation_id, manifest_sha256, source_selector,
     };
     use bbox_code_source_store::{
-        CodeSourceStorePaths, CollisionRetirementLifecycleV1, StoredGeneration,
+        CodeSourceStorePaths, CollisionRetirementLifecycleV1, MigrationEffectiveSourceManifestV1,
+        MigrationEffectiveSourceSelectionV1, StoredGeneration,
         encode_collision_retirement_pending_for_migration,
+        encode_migration_effective_source_manifest_v1,
     };
 
     fn write(path: &Path, bytes: &[u8]) {
@@ -2206,7 +2303,7 @@ mod tests {
             generation_id: generation_id.clone(),
             producer_id: "host-a".to_string(),
             ordinal: 1,
-            descriptor,
+            descriptor: descriptor.clone(),
             state: GenerationState::Active,
             diagnostic: None,
             created_unix_secs: 1,
@@ -2225,16 +2322,72 @@ mod tests {
             &paths.generation_manifest(&scope, &generation_id).unwrap(),
             &manifest,
         );
-        let collision = CollisionRetirementLifecycleV1 {
+        let retained_generation_id = generation_id("host-retained", &descriptor);
+        write(
+            &paths
+                .generation_metadata(&scope, &retained_generation_id)
+                .unwrap(),
+            &serde_json::to_vec(&StoredGeneration {
+                version: 1,
+                generation_id: retained_generation_id.clone(),
+                producer_id: "host-retained".to_string(),
+                ordinal: 0,
+                descriptor: descriptor.clone(),
+                state: GenerationState::Superseded,
+                diagnostic: None,
+                created_unix_secs: 0,
+                materialized_doc_count: Some(1),
+                entity_inventory_sha256: Some("c".repeat(64)),
+            })
+            .unwrap(),
+        );
+        write(
+            &paths
+                .generation_manifest(&scope, &retained_generation_id)
+                .unwrap(),
+            &manifest,
+        );
+        let selector = format!(
+            "{}:m0123456789abcdef",
+            source_selector(project_id.as_str(), &generation_id)
+        );
+        write(
+            &paths.activation(&project_id),
+            &serde_json::to_vec(&ActivationRecord {
+                version: 1,
+                project_id: project_id.to_string(),
+                generation_id: generation_id.clone(),
+                selector: selector.clone(),
+                snapshot_id: format!("collected-{}", "e".repeat(32)),
+                document_count: 1,
+                entity_inventory_sha256: "c".repeat(64),
+                current_chunk_targets: BTreeMap::new(),
+                activated_unix_secs: 1,
+                cutback_pending: false,
+                diagnostic: None,
+            })
+            .unwrap(),
+        );
+        write(
+            &paths.anchor(),
+            &encode_migration_effective_source_manifest_v1(&MigrationEffectiveSourceManifestV1 {
+                version: 1,
+                selections: vec![MigrationEffectiveSourceSelectionV1 {
+                    project_id: project_id.clone(),
+                    published_scope: scope.clone(),
+                    generation_id: generation_id.clone(),
+                    selector: selector.clone(),
+                }],
+            })
+            .unwrap(),
+        );
+        let mut collision = CollisionRetirementLifecycleV1 {
             version: 1,
             state: CollisionRetirementLifecycleStateV1::Pending,
             project_id: project_id.clone(),
             former_scope: scope.clone(),
             generation_id: generation_id.clone(),
-            selector: format!(
-                "{}:m0123456789abcdef",
-                source_selector(project_id.as_str(), &generation_id)
-            ),
+            selector_evidence: CollisionRetirementSelectorEvidenceV1::ExactMaterialized(selector),
             snapshot_id: format!("collected-{}", "e".repeat(32)),
             manifest_sha256: descriptor_manifest_sha256,
             inventory_hash: "d".repeat(64),
@@ -2244,8 +2397,25 @@ mod tests {
             &paths.collision_retirement_pending(&project_id),
             &encode_collision_retirement_pending_for_migration(&collision).unwrap(),
         );
-        let snapshot = capture_code_source_inventory(&store, &BTreeSet::new()).unwrap();
-        let capture = observe_code_sources(&snapshot, &BTreeMap::new(), &BTreeSet::new()).unwrap();
+        let snapshot =
+            capture_code_source_inventory(&store, &BTreeSet::from([scope.clone()])).unwrap();
+        let mismatched_scope = PublishedScope::try_new("different-repo", ".").unwrap();
+        assert_eq!(
+            observe_code_sources(
+                &snapshot,
+                &BTreeMap::from([(project_id.clone(), mismatched_scope)]),
+                &BTreeSet::new(),
+            )
+            .unwrap_err()
+            .to_string(),
+            "error.project_catalog_inventory_adapter_source: active_descriptor_committed_scope_mismatch"
+        );
+        let capture = observe_code_sources(
+            &snapshot,
+            &BTreeMap::new(),
+            &BTreeSet::from([project_id.clone()]),
+        )
+        .unwrap();
         let quarantined = &capture.sources[0].observation.quarantine[0];
         assert_eq!(quarantined.generation_id, generation_id);
         assert!(matches!(
@@ -2259,7 +2429,9 @@ mod tests {
         assert_eq!(
             quarantined.collision_lifecycle.selector_evidence,
             DurableSelectorEvidenceV1::ExactMaterialized {
-                selector_hash: Sha256ValueV1::digest(collision.selector.as_bytes()),
+                selector_hash: Sha256ValueV1::digest(
+                    collision.exact_selector().unwrap().as_bytes(),
+                ),
             }
         );
         assert!(capture.sources[0].source_evidence.iter().any(|source| {
@@ -2284,6 +2456,72 @@ mod tests {
                     .contains(&quarantined.observation_id)
             });
         assert!(bound);
+        let retained = &capture.sources[0].observation.generations[0];
+        assert_eq!(retained.generation_id, retained_generation_id);
+        assert_eq!(retained.role, CollectedGenerationRoleV1::Retained);
+        assert_eq!(retained.activation_scope, None);
+        assert_eq!(
+            retained.selector_evidence,
+            DurableSelectorEvidenceV1::NoDurableSelector
+        );
+
+        drop(capture);
+        drop(snapshot);
+        fs::remove_file(paths.activation(&project_id)).unwrap();
+        fs::write(
+            paths.anchor(),
+            encode_migration_effective_source_manifest_v1(&MigrationEffectiveSourceManifestV1 {
+                version: 1,
+                selections: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let snapshot =
+            capture_code_source_inventory(&store, &BTreeSet::from([scope.clone()])).unwrap();
+        let capture = observe_code_sources(
+            &snapshot,
+            &BTreeMap::from([(project_id.clone(), scope.clone())]),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert!(matches!(
+            capture.sources[0].observation.quarantine[0]
+                .collision_lifecycle
+                .selector_evidence,
+            DurableSelectorEvidenceV1::ExactMaterialized { .. }
+        ));
+
+        drop(capture);
+        drop(snapshot);
+        fs::remove_file(paths.collision_retirement_pending(&project_id)).unwrap();
+        let retained_project_id = ProjectId::parse("project-retained").unwrap();
+        let mut retained_origin = stored.clone();
+        retained_origin.state = GenerationState::Superseded;
+        write(
+            &paths.generation_metadata(&scope, &generation_id).unwrap(),
+            &serde_json::to_vec(&retained_origin).unwrap(),
+        );
+        collision.project_id = retained_project_id.clone();
+        collision.selector_evidence = CollisionRetirementSelectorEvidenceV1::NoDurableSelector;
+        write(
+            &paths.collision_retirement_pending(&retained_project_id),
+            &encode_collision_retirement_pending_for_migration(&collision).unwrap(),
+        );
+        let snapshot =
+            capture_code_source_inventory(&store, &BTreeSet::from([scope.clone()])).unwrap();
+        let capture = observe_code_sources(
+            &snapshot,
+            &BTreeMap::from([(project_id, scope)]),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            capture.sources[0].observation.quarantine[0]
+                .collision_lifecycle
+                .selector_evidence,
+            DurableSelectorEvidenceV1::NoDurableSelector
+        );
     }
 
     #[test]
@@ -2381,6 +2619,19 @@ mod tests {
             "error.project_catalog_inventory_adapter_source"
         );
         assert!(AuthorizedInventoryPath::new(&source).is_err());
+
+        fs::remove_file(&source).unwrap();
+        write(&source, b"three");
+        let authorized = AuthorizedInventoryPath::new(&source).unwrap();
+        let observed = read_authorized_file_with_hook(&authorized, 32, || {
+            fs::remove_file(&source).unwrap();
+        })
+        .unwrap();
+        assert!(matches!(
+            observed,
+            AuthorizedFileObservationV1::Invalid { diagnostic_code }
+                if diagnostic_code == "source_path_changed"
+        ));
     }
 
     #[test]
@@ -2421,7 +2672,7 @@ mod tests {
             CodeSourceStore::open(root.join("code-sources"), StoreLimits::default()).unwrap();
         let error = ProjectCatalogMigrationInventoryFacadeV1::capture(
             ProjectCatalogMigrationInventoryRequestV1 {
-                legacy_project_store_path: AuthorizedInventoryPath::new(&projects).unwrap(),
+                legacy_project_store_path: projects.clone(),
                 publisher_ref_store: &publisher,
                 code_source_store: &code_source,
                 checkout_roots: Vec::new(),
@@ -2433,13 +2684,12 @@ mod tests {
             "error.project_catalog_inventory_owner_lane_unsupported"
         );
 
-        let checkout = AuthorizedInventoryPath::new(&root).unwrap();
         let error = ProjectCatalogMigrationInventoryFacadeV1::capture(
             ProjectCatalogMigrationInventoryRequestV1 {
-                legacy_project_store_path: AuthorizedInventoryPath::new(&projects).unwrap(),
+                legacy_project_store_path: projects,
                 publisher_ref_store: &publisher,
                 code_source_store: &code_source,
-                checkout_roots: vec![checkout.clone(), checkout],
+                checkout_roots: vec![root.clone(), root],
             },
         )
         .unwrap_err();

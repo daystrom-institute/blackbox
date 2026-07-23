@@ -167,6 +167,7 @@ pub struct LegacyProjectObservationV1 {
     pub record: LegacyProjectRecordInventoryV1,
     pub path_status: LegacyProjectPathStatusV1,
     pub committed_authority: Option<CommittedAuthorityObservationV1>,
+    pub committed_scope: Option<PublishedScope>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -951,6 +952,11 @@ impl V1ProjectCatalogInventory {
                     (project_id, &authority.authority),
                 );
             }
+            if let Some(scope) = &row.committed_scope {
+                scope
+                    .validate()
+                    .map_err(|_| invalid("legacy committed scope is invalid"))?;
+            }
         }
 
         let mut generations = BTreeMap::new();
@@ -987,6 +993,27 @@ impl V1ProjectCatalogInventory {
                 }
                 validate_descriptor(&generation.descriptor)?;
                 validate_artifact(&generation.manifest)?;
+                if generation.role == CollectedGenerationRoleV1::Active
+                    && self
+                        .legacy_projects
+                        .iter()
+                        .find(|row| row.record.project_id == generation.project_id.as_str())
+                        .and_then(|row| row.committed_scope.as_ref())
+                        .is_some_and(|scope| {
+                            generation.activation_scope.as_ref() != Some(scope)
+                                || !matches!(
+                                    &generation.descriptor,
+                                    ImmutableCollectedDescriptorV1::Valid {
+                                        published_scope,
+                                        ..
+                                    } if published_scope == scope
+                                )
+                        })
+                {
+                    return Err(invalid(
+                        "active descriptor and activation disagree with committed scope",
+                    ));
+                }
                 match (&generation.role, &generation.selector_evidence) {
                     (
                         CollectedGenerationRoleV1::Active,
@@ -999,6 +1026,17 @@ impl V1ProjectCatalogInventory {
                     _ => {
                         return Err(invalid(
                             "collected generation selector authority disagrees with role",
+                        ));
+                    }
+                }
+                match (&generation.role, &generation.activation_scope) {
+                    (CollectedGenerationRoleV1::Active, Some(scope)) => scope
+                        .validate()
+                        .map_err(|_| invalid("active generation scope is invalid"))?,
+                    (CollectedGenerationRoleV1::Retained, None) => {}
+                    _ => {
+                        return Err(invalid(
+                            "collected generation activation scope disagrees with role",
                         ));
                     }
                 }
@@ -1255,7 +1293,9 @@ impl V1ProjectCatalogInventory {
                     }
                     ImmutableCollectedDescriptorV1::Valid {
                         published_scope, ..
-                    } if generation.activation_scope.as_ref() != Some(published_scope) => {
+                    } if generation.role == CollectedGenerationRoleV1::Active
+                        && generation.activation_scope.as_ref() != Some(published_scope) =>
+                    {
                         Some("descriptor_activation_scope_mismatch")
                     }
                     ImmutableCollectedDescriptorV1::Valid { .. } => match &generation.manifest {
@@ -3722,6 +3762,43 @@ fn validate_publisher_disposition(
 fn validate_publisher_source_membership(
     inventory: &V1ProjectCatalogInventory,
 ) -> InventoryResult<()> {
+    let publisher_source = inventory
+        .mutable_source_evidence
+        .iter()
+        .find(|row| row.source_kind == MutableInventorySourceKindV1::PublisherRefStore)
+        .ok_or_else(|| invalid("publisher source evidence is missing"))?;
+    let decoded = match &publisher_source.state {
+        InventorySourceStateV1::Missing { .. } => {
+            if !inventory.publisher_ref_source_bytes.is_empty() {
+                return Err(invalid("missing publisher source carries bytes"));
+            }
+            Vec::new()
+        }
+        InventorySourceStateV1::Present { .. } => {
+            crate::publisher::decode_publisher_ref_source_v1(&inventory.publisher_ref_source_bytes)
+                .map_err(|_| invalid("publisher source bytes fail owner codec"))?
+        }
+        InventorySourceStateV1::Corrupt { .. } => {
+            return Err(invalid("publisher source is corrupt"));
+        }
+    };
+    let decoded_keys = decoded
+        .iter()
+        .map(|row| (row.scope.clone(), row.branch_ref.as_str()))
+        .collect::<BTreeSet<_>>();
+    let typed_keys = inventory
+        .publisher_pins
+        .iter()
+        .map(|row| (row.expected_scope.clone(), row.full_ref.as_str()))
+        .collect::<BTreeSet<_>>();
+    if decoded_keys.len() != decoded.len()
+        || typed_keys.len() != inventory.publisher_pins.len()
+        || decoded_keys != typed_keys
+    {
+        return Err(invalid(
+            "publisher typed pins do not exactly match owner-decoded source bytes",
+        ));
+    }
     let projects = inventory
         .legacy_projects
         .iter()
@@ -4688,12 +4765,23 @@ mod tests {
                 observation_id: authority_observation_id.to_string(),
                 authority: RecordedRepoAuthority::parse("acme_repo".to_string()).unwrap(),
             }),
+            committed_scope: Some(scope(&format!("services/{project}"))),
         }
     }
 
     fn fixture_inventory() -> V1ProjectCatalogInventory {
         let source_store_bytes = br#"{"version":1,"projects":[]}"#.to_vec();
-        let publisher_ref_source_bytes = br#"{"refs":[]}"#.to_vec();
+        let publisher_ref_source_bytes = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "refs": [{
+                "scope": {
+                    "repo_id": "repo_family",
+                    "bbox_root_relpath": "services/alpha"
+                },
+                "branch_ref": "refs/heads/main"
+            }]
+        }))
+        .unwrap();
         let source_store_hash = Sha256ValueV1::digest(&source_store_bytes);
         let publisher_ref_source_hash = Sha256ValueV1::digest(&publisher_ref_source_bytes);
         let alpha = project_id("alpha");
@@ -5217,6 +5305,7 @@ mod tests {
         let mut inventory = fixture_inventory();
         let source = &mut inventory.code_sources[0];
         source.generations[0].role = CollectedGenerationRoleV1::Retained;
+        source.generations[0].activation_scope = None;
         source.planned_activation_v2_hash = None;
         assert_eq!(
             inventory.validate().unwrap_err().code(),
@@ -5243,6 +5332,13 @@ mod tests {
             .insert("unknown_observation".to_string());
         assert_eq!(
             unknown.validate().unwrap_err().code(),
+            "error.project_catalog_inventory_invalid"
+        );
+
+        let mut rewritten_pin = fixture_inventory();
+        rewritten_pin.publisher_pins[0].full_ref = "refs/heads/other".to_string();
+        assert_eq!(
+            rewritten_pin.validate().unwrap_err().code(),
             "error.project_catalog_inventory_invalid"
         );
     }

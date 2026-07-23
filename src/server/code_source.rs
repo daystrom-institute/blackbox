@@ -1667,7 +1667,7 @@ mod tests {
     use bbox_code_source::source_selector;
     use bbox_code_source_store::{
         CodeSourceStorePaths, CollisionRetirementLifecycleStateV1, CollisionRetirementLifecycleV1,
-        decode_collision_retirement_pending_for_migration,
+        CollisionRetirementSelectorEvidenceV1, decode_collision_retirement_pending_for_migration,
         encode_collision_retirement_pending_for_migration,
     };
     use bbox_corpus_core::project_catalog::ProjectId;
@@ -1688,10 +1688,10 @@ mod tests {
             project_id: project_id.clone(),
             former_scope: PublishedScope::try_new("startup-repo", ".").unwrap(),
             generation_id: generation_id.clone(),
-            selector: format!(
+            selector_evidence: CollisionRetirementSelectorEvidenceV1::ExactMaterialized(format!(
                 "{}:m0123456789abcdef",
                 source_selector(project_id.as_str(), &generation_id)
-            ),
+            )),
             snapshot_id: format!("collected-{}", "b".repeat(32)),
             manifest_sha256: "c".repeat(64),
             inventory_hash: "d".repeat(64),
@@ -1708,7 +1708,7 @@ mod tests {
         let records = retirement_records_for_recovery(&store).unwrap();
 
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].selector, lifecycle.selector);
+        assert_eq!(records[0].selector, lifecycle.exact_selector().unwrap());
         let repaired =
             decode_collision_retirement_pending_for_migration(&fs::read(lifecycle_path).unwrap())
                 .unwrap();

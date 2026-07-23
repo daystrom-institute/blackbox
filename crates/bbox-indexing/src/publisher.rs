@@ -82,7 +82,7 @@ pub struct PublisherRefRow {
 }
 
 #[derive(Debug)]
-pub struct MigrationPublisherRefSnapshotV1 {
+pub(crate) struct MigrationPublisherRefSnapshotV1 {
     pub bytes: Vec<u8>,
     pub rows: Vec<PublisherRefRow>,
     pub was_missing: bool,
@@ -205,7 +205,7 @@ impl PublisherRefStore {
     ///
     /// The in-memory cache is deliberately not used: migration evidence binds
     /// the current durable bytes, including exact absence.
-    pub fn snapshot_migration_source(&self) -> Result<MigrationPublisherRefSnapshotV1> {
+    pub(crate) fn snapshot_migration_source(&self) -> Result<MigrationPublisherRefSnapshotV1> {
         let lock = acquire_store_lock_nofollow(&self.path)?;
         let parent = self
             .path

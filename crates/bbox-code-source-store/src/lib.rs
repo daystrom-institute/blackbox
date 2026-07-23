@@ -589,11 +589,18 @@ pub struct CollisionRetirementLifecycleV1 {
     pub project_id: ProjectId,
     pub former_scope: PublishedScope,
     pub generation_id: String,
-    pub selector: String,
+    pub selector_evidence: CollisionRetirementSelectorEvidenceV1,
     pub snapshot_id: String,
     pub manifest_sha256: String,
     pub inventory_hash: String,
     pub plan_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CollisionRetirementSelectorEvidenceV1 {
+    ExactMaterialized(String),
+    NoDurableSelector,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -612,12 +619,16 @@ impl CollisionRetirementLifecycleV1 {
         ProjectId::parse(self.project_id.to_string()).map_err(|error| anyhow!(error))?;
         self.former_scope.validate()?;
         validate_sha256(&self.generation_id)?;
-        validate_retirement_selector(&self.selector)?;
-        validate_collected_materialization_selector(
-            self.project_id.as_str(),
-            &self.generation_id,
-            &self.selector,
-        )?;
+        if let CollisionRetirementSelectorEvidenceV1::ExactMaterialized(selector) =
+            &self.selector_evidence
+        {
+            validate_retirement_selector(selector)?;
+            validate_collected_materialization_selector(
+                self.project_id.as_str(),
+                &self.generation_id,
+                selector,
+            )?;
+        }
         validate_migration_snapshot_id(&self.snapshot_id)?;
         validate_sha256(&self.manifest_sha256)?;
         validate_sha256(&self.inventory_hash)?;
@@ -626,10 +637,19 @@ impl CollisionRetirementLifecycleV1 {
     }
 
     fn matches_queue(&self, record: &RetirementRecord) -> bool {
-        record.project_id == self.project_id.as_str()
-            && record.selector == self.selector
-            && record.snapshot_id == self.snapshot_id
-            && record.generation_id.as_deref() == Some(self.generation_id.as_str())
+        self.exact_selector().is_some_and(|selector| {
+            record.project_id == self.project_id.as_str()
+                && record.selector == selector
+                && record.snapshot_id == self.snapshot_id
+                && record.generation_id.as_deref() == Some(self.generation_id.as_str())
+        })
+    }
+
+    pub fn exact_selector(&self) -> Option<&str> {
+        match &self.selector_evidence {
+            CollisionRetirementSelectorEvidenceV1::ExactMaterialized(selector) => Some(selector),
+            CollisionRetirementSelectorEvidenceV1::NoDurableSelector => None,
+        }
     }
 }
 
@@ -2504,7 +2524,7 @@ pub fn enumerate_current_migration_inventory_for_scopes_locked(
         .chain(
             collision_pending
                 .iter()
-                .map(|lifecycle| lifecycle.record.selector.clone()),
+                .filter_map(|lifecycle| lifecycle.record.exact_selector().map(str::to_string)),
         )
         .collect::<BTreeSet<_>>();
     walk_sha256_json_files_lexically(
@@ -3501,13 +3521,10 @@ impl CodeSourceStore {
         let project_id =
             ProjectId::parse(record.project_id.clone()).map_err(|error| anyhow!(error))?;
         let lifecycle = self.collision_lifecycle_for_project_locked(&project_id)?;
-        if lifecycle
-            .as_ref()
-            .is_some_and(|lifecycle| lifecycle.selector != record.selector)
-        {
-            bail!("collision retirement project lifecycle has a different selector");
-        }
         if let Some(mut lifecycle) = lifecycle {
+            if lifecycle.exact_selector() != Some(record.selector.as_str()) {
+                bail!("collision retirement project lifecycle has different selector authority");
+            }
             if !lifecycle.matches_queue(record) {
                 bail!("collision retirement queue row rewrites lifecycle evidence");
             }
@@ -3552,7 +3569,7 @@ impl CodeSourceStore {
             let lifecycle = self.collision_lifecycle_for_project_locked(&project_id)?;
             if lifecycle
                 .as_ref()
-                .is_some_and(|lifecycle| lifecycle.selector != selector)
+                .is_some_and(|lifecycle| lifecycle.exact_selector() != Some(selector))
             {
                 bail!("retirement queue selector and project lifecycle disagree");
             }
@@ -3596,15 +3613,27 @@ impl CodeSourceStore {
             &self.paths,
             "collision retirement lifecycle",
             |_, _, mut lifecycle| {
+                let Some(selector) = lifecycle.exact_selector().map(str::to_string) else {
+                    if lifecycle.state == CollisionRetirementLifecycleStateV1::Pending {
+                        lifecycle.state = CollisionRetirementLifecycleStateV1::Queued;
+                        atomic_write_json(
+                            &self
+                                .paths
+                                .collision_retirement_pending(&lifecycle.project_id),
+                            &lifecycle,
+                        )?;
+                    }
+                    return Ok(());
+                };
                 let queue = RetirementRecord {
                     version: STORE_VERSION,
                     project_id: lifecycle.project_id.to_string(),
-                    selector: lifecycle.selector.clone(),
+                    selector: selector.clone(),
                     snapshot_id: lifecycle.snapshot_id.clone(),
                     generation_id: Some(lifecycle.generation_id.clone()),
                 };
                 validate_retirement_record(&queue)?;
-                let queue_path = self.paths.retirement_for_selector(&lifecycle.selector)?;
+                let queue_path = self.paths.retirement_for_selector(&selector)?;
                 match lifecycle.state {
                     CollisionRetirementLifecycleStateV1::Pending => {
                         if let Some(existing) = read_retirement_record_nofollow(&queue_path)?
@@ -3640,6 +3669,39 @@ impl CodeSourceStore {
         )
     }
 
+    pub fn complete_retained_collision_retirement(
+        &self,
+        project_id: &ProjectId,
+        generation_id: &str,
+    ) -> Result<()> {
+        validate_sha256(generation_id)?;
+        let _guard = self.lock_mutation()?;
+        let Some(mut lifecycle) = self.collision_lifecycle_for_project_locked(project_id)? else {
+            bail!("retained collision retirement lifecycle is missing");
+        };
+        if lifecycle.generation_id != generation_id
+            || lifecycle.selector_evidence
+                != CollisionRetirementSelectorEvidenceV1::NoDurableSelector
+        {
+            bail!("retained collision retirement identity or selector authority disagrees");
+        }
+        match lifecycle.state {
+            CollisionRetirementLifecycleStateV1::Pending => {
+                bail!("retained collision retirement cannot complete before queue transition");
+            }
+            CollisionRetirementLifecycleStateV1::Queued => {
+                lifecycle.state = CollisionRetirementLifecycleStateV1::Completed;
+                atomic_write_json(
+                    &self
+                        .paths
+                        .collision_retirement_pending(&lifecycle.project_id),
+                    &lifecycle,
+                )
+            }
+            CollisionRetirementLifecycleStateV1::Completed => Ok(()),
+        }
+    }
+
     fn validate_lagging_collision_queue_locked(
         &self,
         lifecycle: &CollisionRetirementLifecycleV1,
@@ -3664,7 +3726,7 @@ impl CodeSourceStore {
             &self.paths,
             "collision retirement lifecycle",
             |_, _, lifecycle| {
-                if lifecycle.selector == selector {
+                if lifecycle.exact_selector() == Some(selector) {
                     if matched.replace(lifecycle).is_some() {
                         bail!("collision retirement selector has multiple lifecycle owners");
                     }
@@ -4777,6 +4839,15 @@ fn mixed_protected_generation_ids_from_records(
         {
             bail!("collision retirement lifecycle does not match generation metadata");
         }
+        if lifecycle.selector_evidence == CollisionRetirementSelectorEvidenceV1::NoDurableSelector
+            && (generation.state() == GenerationState::Active
+                || activations.iter().any(|activation| {
+                    activation.project_id() == lifecycle.project_id.as_str()
+                        && activation.generation_id() == lifecycle.generation_id
+                }))
+        {
+            bail!("retained collision lifecycle suppresses active selector authority");
+        }
         protected.insert(lifecycle.generation_id.clone());
     }
 
@@ -4880,6 +4951,15 @@ fn protected_generation_ids_from_records(
             || pending.manifest_sha256 != generation.descriptor.manifest_sha256
         {
             bail!("collision retirement lifecycle does not match generation metadata");
+        }
+        if pending.selector_evidence == CollisionRetirementSelectorEvidenceV1::NoDurableSelector
+            && (generation.state == GenerationState::Active
+                || activations.iter().any(|activation| {
+                    activation.project_id.as_str() == pending.project_id.as_str()
+                        && activation.generation_id == pending.generation_id
+                }))
+        {
+            bail!("retained collision lifecycle suppresses active selector authority");
         }
         protected.insert(pending.generation_id.clone());
     }
@@ -5757,7 +5837,9 @@ mod tests {
                 project_id: project_id.clone(),
                 former_scope: PublishedScope::try_new(format!("repo-{index}"), ".").unwrap(),
                 generation_id: generation_id.clone(),
-                selector: materialized_selector(project_id.as_str(), &generation_id),
+                selector_evidence: CollisionRetirementSelectorEvidenceV1::ExactMaterialized(
+                    materialized_selector(project_id.as_str(), &generation_id),
+                ),
                 snapshot_id: format!("collected-{:032x}", index + 1),
                 manifest_sha256: "b".repeat(64),
                 inventory_hash: "c".repeat(64),
@@ -6123,7 +6205,9 @@ mod tests {
             project_id: ProjectId::parse("project-a").unwrap(),
             former_scope: PublishedScope::try_new("repo-family", ".").unwrap(),
             generation_id: "a".repeat(64),
-            selector: materialized_selector("project-a", &"a".repeat(64)),
+            selector_evidence: CollisionRetirementSelectorEvidenceV1::ExactMaterialized(
+                materialized_selector("project-a", &"a".repeat(64)),
+            ),
             snapshot_id: format!("collected-{}", "e".repeat(32)),
             manifest_sha256: "b".repeat(64),
             inventory_hash: "c".repeat(64),
@@ -6146,7 +6230,8 @@ mod tests {
             .is_err()
         );
         let mut invalid_selector = record.clone();
-        invalid_selector.selector = "selector-a".into();
+        invalid_selector.selector_evidence =
+            CollisionRetirementSelectorEvidenceV1::ExactMaterialized("selector-a".into());
         assert!(encode_collision_retirement_pending_for_migration(&invalid_selector).is_err());
         let mut invalid_hash = record;
         invalid_hash.plan_hash = "not-a-hash".into();
@@ -6163,7 +6248,9 @@ mod tests {
             project_id: ProjectId::parse("project-a").unwrap(),
             former_scope: PublishedScope::try_new("repo-family", ".").unwrap(),
             generation_id: "a".repeat(64),
-            selector: materialized_selector("project-a", &"a".repeat(64)),
+            selector_evidence: CollisionRetirementSelectorEvidenceV1::ExactMaterialized(
+                materialized_selector("project-a", &"a".repeat(64)),
+            ),
             snapshot_id: format!("collected-{}", "e".repeat(32)),
             manifest_sha256: "b".repeat(64),
             inventory_hash: "c".repeat(64),
@@ -6175,7 +6262,7 @@ mod tests {
         RetirementRecord {
             version: STORE_VERSION,
             project_id: lifecycle.project_id.to_string(),
-            selector: lifecycle.selector.clone(),
+            selector: lifecycle.exact_selector().unwrap().to_string(),
             snapshot_id: lifecycle.snapshot_id.clone(),
             generation_id: Some(lifecycle.generation_id.clone()),
         }
@@ -6216,7 +6303,7 @@ mod tests {
         write_collision_lifecycle(&store, &lifecycle);
         let queue_path = store
             .paths
-            .retirement_for_selector(&lifecycle.selector)
+            .retirement_for_selector(lifecycle.exact_selector().unwrap())
             .unwrap();
         fs::write(&queue_path, serde_json::to_vec_pretty(&queue).unwrap()).unwrap();
 
@@ -6238,7 +6325,9 @@ mod tests {
         lifecycle.state = CollisionRetirementLifecycleStateV1::Queued;
         write_collision_lifecycle(&store, &lifecycle);
 
-        store.complete_retirement(&lifecycle.selector).unwrap();
+        store
+            .complete_retirement(lifecycle.exact_selector().unwrap())
+            .unwrap();
 
         assert_eq!(
             read_collision_lifecycle(&store, &lifecycle.project_id).state,
@@ -6257,11 +6346,13 @@ mod tests {
         write_collision_lifecycle(&store, &lifecycle);
         let queue_path = store
             .paths
-            .retirement_for_selector(&lifecycle.selector)
+            .retirement_for_selector(lifecycle.exact_selector().unwrap())
             .unwrap();
         fs::write(&queue_path, serde_json::to_vec_pretty(&queue).unwrap()).unwrap();
 
-        store.complete_retirement(&lifecycle.selector).unwrap();
+        store
+            .complete_retirement(lifecycle.exact_selector().unwrap())
+            .unwrap();
 
         assert!(!queue_path.exists());
         assert_eq!(
@@ -6282,11 +6373,15 @@ mod tests {
         write_collision_lifecycle(&store, &lifecycle);
         let queue_path = store
             .paths
-            .retirement_for_selector(&lifecycle.selector)
+            .retirement_for_selector(lifecycle.exact_selector().unwrap())
             .unwrap();
         fs::write(&queue_path, serde_json::to_vec_pretty(&queue).unwrap()).unwrap();
 
-        assert!(store.complete_retirement(&lifecycle.selector).is_err());
+        assert!(
+            store
+                .complete_retirement(lifecycle.exact_selector().unwrap())
+                .is_err()
+        );
         assert!(queue_path.is_file());
         assert_eq!(
             read_collision_lifecycle(&store, &lifecycle.project_id).state,
@@ -6307,7 +6402,7 @@ mod tests {
 
         let queue_path = store
             .paths
-            .retirement_for_selector(&lifecycle.selector)
+            .retirement_for_selector(lifecycle.exact_selector().unwrap())
             .unwrap();
         assert!(queue_path.is_file());
         lifecycle.state = CollisionRetirementLifecycleStateV1::Completed;
@@ -6319,6 +6414,38 @@ mod tests {
         assert_eq!(
             read_collision_lifecycle(&store, &lifecycle.project_id).state,
             CollisionRetirementLifecycleStateV1::Completed
+        );
+    }
+
+    #[test]
+    fn retained_collision_lifecycle_preserves_typed_selector_absence() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = open_store(&root);
+        let mut lifecycle = collision_lifecycle_fixture();
+        lifecycle.selector_evidence = CollisionRetirementSelectorEvidenceV1::NoDurableSelector;
+        write_collision_lifecycle(&store, &lifecycle);
+
+        store.reconcile_collision_retirements().unwrap();
+        let queued = read_collision_lifecycle(&store, &lifecycle.project_id);
+        assert_eq!(queued.state, CollisionRetirementLifecycleStateV1::Queued);
+        assert_eq!(
+            queued.selector_evidence,
+            CollisionRetirementSelectorEvidenceV1::NoDurableSelector
+        );
+        assert!(store.retirement_records().unwrap().is_empty());
+
+        store
+            .complete_retained_collision_retirement(&lifecycle.project_id, &lifecycle.generation_id)
+            .unwrap();
+        let completed = read_collision_lifecycle(&store, &lifecycle.project_id);
+        assert_eq!(
+            completed.state,
+            CollisionRetirementLifecycleStateV1::Completed
+        );
+        assert_eq!(
+            completed.selector_evidence,
+            CollisionRetirementSelectorEvidenceV1::NoDurableSelector
         );
     }
 
@@ -6883,7 +7010,7 @@ mod tests {
             project_id: project_id.clone(),
             former_scope: descriptor.scope,
             generation_id: stored.generation_id,
-            selector,
+            selector_evidence: CollisionRetirementSelectorEvidenceV1::ExactMaterialized(selector),
             snapshot_id: format!("collected-{}", "e".repeat(32)),
             manifest_sha256: descriptor.manifest_sha256,
             inventory_hash: "c".repeat(64),
@@ -6953,7 +7080,9 @@ mod tests {
                 project_id: project_id.clone(),
                 former_scope: PublishedScope::try_new(format!("gc-repo-{index:04}"), ".").unwrap(),
                 generation_id: generation_id.clone(),
-                selector: materialized_selector(project_id.as_str(), &generation_id),
+                selector_evidence: CollisionRetirementSelectorEvidenceV1::ExactMaterialized(
+                    materialized_selector(project_id.as_str(), &generation_id),
+                ),
                 snapshot_id: format!("collected-{:032x}", index + 1),
                 manifest_sha256: "b".repeat(64),
                 inventory_hash: "c".repeat(64),
