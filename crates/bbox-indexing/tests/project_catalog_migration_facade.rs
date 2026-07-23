@@ -103,7 +103,10 @@ fn initialize_empty_provenance_ref(root: &Path, config: &Config) {
             "initialize empty provenance notes",
         ],
     );
-    let notes_ref = format!("refs/notes/{}", config.provenance.git_notes_namespace);
+    let notes_ref = format!(
+        "refs/notes/{}/provenance",
+        config.provenance.git_notes_namespace
+    );
     git(root, &["update-ref", &notes_ref, &notes_commit]);
 }
 
