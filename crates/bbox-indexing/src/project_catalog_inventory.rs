@@ -1576,6 +1576,13 @@ pub struct InventoryRefusalV1 {
     pub diagnostic_code: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationRefusalReportV1 {
+    pub record_id: String,
+    pub diagnostic_code: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepoGroupingEvidenceClassV1 {
@@ -1768,6 +1775,7 @@ pub struct ProjectCatalogMigrationReportV1 {
     pub missing_paths: Vec<MissingPathReportV1>,
     pub unscoped_legacy_counts: BTreeMap<LegacyPathStoreKindV1, u64>,
     pub required_resolutions: Vec<RequiredResolutionV1>,
+    pub refusals: Vec<MigrationRefusalReportV1>,
     pub predicted_catalog_hash: Sha256ValueV1,
     pub predicted_attachment_hash: Sha256ValueV1,
     pub predicted_participant_hashes: BTreeMap<String, Sha256ValueV1>,
@@ -1809,6 +1817,7 @@ impl ProjectCatalogMigrationReportV1 {
                 "report required resolutions",
                 self.required_resolutions.len(),
             ),
+            ("report refusals", self.refusals.len()),
             (
                 "report predicted participant hashes",
                 self.predicted_participant_hashes.len(),
@@ -1890,6 +1899,14 @@ impl ProjectCatalogMigrationReportV1 {
             "required resolution",
         )?;
         validate_unique_by(
+            self.refusals.iter().map(|row| row.record_id.as_str()),
+            "migration refusal",
+        )?;
+        for refusal in &self.refusals {
+            validate_stable_id(&refusal.record_id, "migration refusal record id")?;
+            validate_diagnostic_code(&refusal.diagnostic_code)?;
+        }
+        validate_unique_by(
             self.namespace_conflicts
                 .iter()
                 .chain(&self.scope_conflicts)
@@ -1954,6 +1971,15 @@ impl ProjectCatalogMigrationReportV1 {
             validate_stable_id(role, "predicted immutable asset role")?;
         }
         match self.status {
+            ProjectCatalogMigrationStatusV1::Clean if !self.refusals.is_empty() => {
+                Err(invalid("clean report carries refusals"))
+            }
+            ProjectCatalogMigrationStatusV1::Refused if self.refusals.is_empty() => {
+                Err(invalid("refused report has no refusal rows"))
+            }
+            ProjectCatalogMigrationStatusV1::ResolutionRequired if !self.refusals.is_empty() => {
+                Err(invalid("resolution-required report carries refusals"))
+            }
             ProjectCatalogMigrationStatusV1::ResolutionRequired
                 if self.required_resolutions.is_empty() =>
             {
@@ -6277,6 +6303,7 @@ pub(crate) mod tests {
             missing_paths: Vec::new(),
             unscoped_legacy_counts: BTreeMap::new(),
             required_resolutions: Vec::new(),
+            refusals: Vec::new(),
             predicted_catalog_hash: post_image.predicted_hashes.catalog_hash.clone(),
             predicted_attachment_hash: post_image.predicted_hashes.attachment_hash.clone(),
             predicted_participant_hashes: post_image.predicted_hashes.participant_hashes.clone(),

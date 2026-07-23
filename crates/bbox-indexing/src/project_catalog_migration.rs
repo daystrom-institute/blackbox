@@ -47,9 +47,9 @@ use crate::project_catalog_inventory::{
     ConflictReportV1, DeterministicPostImageInputV1, DeterministicRepoHistoryGroupV1,
     InventorySourceStateV1, LegacyPathBindingPostImageInputV1, LegacyPathBindingReportV1,
     LegacyPathBindingStatusV1, LegacyPathRelationshipV1, MAX_PROJECT_CATALOG_REPORT_BYTES,
-    MAX_PROJECT_CATALOG_RESOLUTION_BYTES, MissingPathReportV1, MutableInventorySourceKindV1,
-    PlannedRepoHistoryIdentityV1, PredictedAssetV1, PredictedPostImageHashesV1,
-    ProjectCatalogMigrationPlanKindV1, ProjectCatalogMigrationReportV1,
+    MAX_PROJECT_CATALOG_RESOLUTION_BYTES, MigrationRefusalReportV1, MissingPathReportV1,
+    MutableInventorySourceKindV1, PlannedRepoHistoryIdentityV1, PredictedAssetV1,
+    PredictedPostImageHashesV1, ProjectCatalogMigrationPlanKindV1, ProjectCatalogMigrationReportV1,
     ProjectCatalogMigrationResolutionV1, ProjectCatalogMigrationStatusV1,
     ProjectMigrationReportRowV1, PublicationPayloadHashesV1, PublisherBindingDispositionV1,
     PublisherBindingReportStatusV1, PublisherBindingReportV1, QuarantinePostImageInputV1,
@@ -1316,7 +1316,14 @@ fn assess_migration_semantics(
                 .observed_scope
                 .as_ref()
                 .is_some_and(|scope| scope.bbox_root_relpath() != attachment.base_relpath);
-        let requires_exclusion = scope_mismatch
+        let authorized_scope_downgrade = resolution.selected_scope_owners.iter().any(|selection| {
+            selection
+                .losing_project_ids
+                .contains(&attachment.project_id)
+                && attachment.observed_scope.as_ref() == Some(&selection.scope)
+                && resolved_scopes.get(&attachment.project_id) == Some(&None)
+        });
+        let requires_exclusion = scope_mismatch && !authorized_scope_downgrade
             || duplicate_attachment_keys.contains(attachment.observation_id.as_str());
         if !requires_exclusion {
             retained_attachment_ids.insert(attachment.attachment_id.clone());
@@ -2318,6 +2325,11 @@ fn build_base_post_images(
         } else {
             AttachmentKind::Worktree
         };
+        let validated_scope = resolved_scopes
+            .get(&observed.project_id)
+            .ok_or_else(|| planner_error("resolved project scope is incomplete"))?
+            .published_scope
+            .clone();
         let has_history = project_history_ids.contains_key(&observed.project_id);
         attachment_snapshot_rows.insert(
             observed.attachment_id.clone(),
@@ -2329,7 +2341,7 @@ fn build_base_post_images(
                 checkout_project_dir,
                 project_root_relpath: observed.base_relpath.clone(),
                 kind,
-                validated_scope: observed.observed_scope.clone(),
+                validated_scope: validated_scope.clone(),
                 computed_repo_hint: None,
                 branch_ref: None,
                 capabilities: AttachmentCapabilities {
@@ -2352,7 +2364,7 @@ fn build_base_post_images(
             project_id: observed.project_id.clone(),
             checkout_observation_id: observed.checkout_observation_id.clone(),
             checkout_id,
-            expected_scope: observed.observed_scope.clone(),
+            expected_scope: validated_scope,
             attached_at,
         });
     }
@@ -3209,6 +3221,24 @@ fn build_migration_report(
             })
         })
         .collect::<Result<Vec<_>, ProjectCatalogMigrationError>>()?;
+    let inventory_refusals = inventory.hard_refusals();
+    let mut refusals = inventory_refusals
+        .iter()
+        .map(|row| MigrationRefusalReportV1 {
+            record_id: row.record_id.clone(),
+            diagnostic_code: row.diagnostic_code.clone(),
+        })
+        .collect::<Vec<_>>();
+    let semantic_refusal_count = assessment
+        .refusal_count
+        .saturating_sub(u64::try_from(refusals.len()).unwrap_or(u64::MAX));
+    for index in 0..semantic_refusal_count {
+        refusals.push(MigrationRefusalReportV1 {
+            record_id: format!("semantic-refusal-{index:016x}"),
+            diagnostic_code: "semantic_migration_refusal".to_string(),
+        });
+    }
+    refusals.sort_by(|left, right| left.record_id.cmp(&right.record_id));
     let report = ProjectCatalogMigrationReportV1 {
         version: 1,
         transaction_id: identities.transaction_id.clone(),
@@ -3240,6 +3270,7 @@ fn build_migration_report(
         missing_paths,
         unscoped_legacy_counts,
         required_resolutions: assessment.required_resolutions.clone(),
+        refusals,
         predicted_catalog_hash: predicted.catalog_hash.clone(),
         predicted_attachment_hash: predicted.attachment_hash.clone(),
         predicted_participant_hashes: predicted.participant_hashes.clone(),
@@ -4295,7 +4326,7 @@ fn preflight_receipt(
     report: &ProjectCatalogMigrationReportV1,
     report_bytes: &[u8],
     resolution_bytes: &[u8],
-    refusal_count: u64,
+    _refusal_count: u64,
     immutable_predictions: &BTreeMap<String, Sha256ValueV1>,
     predicted_marker_hash: Option<Sha256ValueV1>,
     sensitive: Option<&PreparedSensitiveReviewV1>,
@@ -4322,7 +4353,7 @@ fn preflight_receipt(
         predicted_marker_hash,
         required_resolution_count: u64::try_from(report.required_resolutions.len())
             .unwrap_or(u64::MAX),
-        refusal_count,
+        refusal_count: u64::try_from(report.refusals.len()).unwrap_or(u64::MAX),
         checkout_action_count: u64::try_from(report.checkout_identity_actions.len())
             .unwrap_or(u64::MAX),
         publisher_pin_count: u64::try_from(report.publisher_bindings.len()).unwrap_or(u64::MAX),
