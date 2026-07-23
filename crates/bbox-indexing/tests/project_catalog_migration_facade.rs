@@ -875,7 +875,7 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
 
     let reapplied =
         ProjectCatalogMigrationFacadeV1::apply_rehearsal(ProjectCatalogMigrationApplyRequestV1 {
-            rehearsal_layout: rehearsal,
+            rehearsal_layout: rehearsal.clone(),
             protected_layout: protected,
             report_path,
             resolution_path,
@@ -886,6 +886,25 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
         ProjectCatalogMigrationApplyOutcomeV1::AlreadyApplied
     );
     assert_eq!(reapplied.receipt.verification, applied.receipt.verification);
+
+    fs::write(
+        rehearsal_root.join("checkouts").join("invalid-entry"),
+        b"not a checkout directory",
+    )
+    .unwrap();
+    let verify_error =
+        ProjectCatalogMigrationFacadeV1::verify(ProjectCatalogMigrationVerifyRequestV1 {
+            rehearsal_layout: rehearsal,
+        })
+        .unwrap_err();
+    assert_eq!(
+        verify_error.code,
+        "error.project_catalog_migration_owner_snapshot"
+    );
+    assert_eq!(
+        verify_error.mutation_disposition,
+        ProjectCatalogMigrationMutationDispositionV1::RecoveredToCommittedState
+    );
 }
 
 #[test]
