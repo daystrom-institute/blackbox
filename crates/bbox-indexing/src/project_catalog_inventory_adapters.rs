@@ -667,6 +667,7 @@ struct LegacyProjectsCaptureV1 {
 
 fn derive_legacy_project_probes(
     source: &ExactDecodedSourceV1<LegacyProjectStoreV1>,
+    rehearsal_root: Option<&Path>,
 ) -> AdapterResult<Vec<LegacyProjectProbeInputV1>> {
     source
         .value
@@ -676,6 +677,7 @@ fn derive_legacy_project_probes(
             let project_id = ProjectId::parse(record.project_id.clone())
                 .map_err(|_| invalid_source("legacy_project_id_invalid"))?;
             let project_root = AuthorizedInventoryPath::new(&record.canonical_path)?;
+            validate_authorized_containment(std::slice::from_ref(&project_root), rehearsal_root)?;
             let repository_root = if record.is_git_repo
                 && matches!(
                     inspect_path(project_root.as_path()),
@@ -687,6 +689,12 @@ fn derive_legacy_project_probes(
             } else {
                 None
             };
+            if let Some(repository_root) = &repository_root {
+                validate_authorized_containment(
+                    std::slice::from_ref(repository_root),
+                    rehearsal_root,
+                )?;
+            }
             let committed_config = repository_root.as_ref().and_then(|root| {
                 bbox_corpus_core::git::current_head(root.as_path()).map(|commit_oid| {
                     CommittedConfigSourceV1 {
@@ -2039,7 +2047,8 @@ impl ProjectCatalogMigrationInventoryFacadeV1 {
                 let legacy_source = accept_missing_legacy_projects_source(
                     capture_legacy_projects_source(&legacy_project_store_path)?,
                 )?;
-                let probes = derive_legacy_project_probes(&legacy_source)?;
+                let probes =
+                    derive_legacy_project_probes(&legacy_source, rehearsal_root.as_deref())?;
                 validate_probe_containment(&probes, rehearsal_root.as_deref())?;
                 probes
                     .into_iter()
@@ -2086,7 +2095,10 @@ impl ProjectCatalogMigrationInventoryFacadeV1 {
                 let legacy_source = accept_missing_legacy_projects_source(
                     capture_legacy_projects_source(&legacy_project_store_path)?,
                 )?;
-                let probes = derive_legacy_project_probes(&legacy_source)?;
+                let probes = derive_legacy_project_probes(
+                    &legacy_source,
+                    request.rehearsal_root.as_deref(),
+                )?;
                 validate_probe_containment(&probes, request.rehearsal_root.as_deref())?;
                 validate_authorized_containment(
                     &checkout_roots,
@@ -2163,11 +2175,7 @@ fn validate_authorized_containment(
         .map_err(|_| invalid_input("rehearsal root is not canonicalizable"))?;
     for path in paths {
         path.ensure_authority()?;
-        let canonical = path
-            .as_path()
-            .canonicalize()
-            .map_err(|_| invalid_input("runtime authority is not canonicalizable"))?;
-        if canonical != path.as_path() || !canonical.starts_with(&canonical_root) {
+        if !path.as_path().starts_with(&canonical_root) {
             return Err(invalid_input("runtime authority escapes rehearsal root"));
         }
         path.ensure_authority()?;
@@ -2296,7 +2304,7 @@ fn capture_inventory_locked(
     let legacy_source = accept_missing_legacy_projects_source(capture_legacy_projects_source(
         &request.legacy_project_store_path,
     )?)?;
-    let probes = derive_legacy_project_probes(&legacy_source)?;
+    let probes = derive_legacy_project_probes(&legacy_source, request.rehearsal_root.as_deref())?;
     validate_probe_containment(&probes, request.rehearsal_root.as_deref())?;
     let mut legacy = observe_legacy_projects(&legacy_source, probes)?;
     let catalog_scopes = legacy
