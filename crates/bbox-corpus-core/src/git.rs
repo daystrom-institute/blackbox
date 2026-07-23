@@ -276,6 +276,46 @@ pub fn read_committed_file_bytes_with_alternate(
     Some(output.stdout)
 }
 
+/// Strict bounded counterpart for migration and publication builders.
+///
+/// The stdout drain retains at most `max_bytes + 1` bytes while continuing to
+/// drain the child into a sink. This makes the limit an allocation bound, not
+/// a check performed after `Command::output()` has already retained an
+/// arbitrarily large blob.
+pub fn read_committed_file_bytes_bounded_with_alternate(
+    root: &Path,
+    r#ref: &str,
+    repo_rel: &str,
+    alternate_root: Option<&Path>,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>> {
+    let retained_limit = max_bytes
+        .checked_add(1)
+        .context("committed file byte limit overflowed")?;
+    let spec = format!("{}:{}", r#ref, repo_rel);
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(root)
+        .args(["cat-file", "blob", &spec]);
+    configure_alternate_objects(&mut command, alternate_root);
+    let output = run_bounded_with_timeout_and_stdout_limit(
+        command,
+        root,
+        "reading bounded committed file",
+        GIT_OUTPUT_TIMEOUT,
+        Some(retained_limit),
+    )
+    .with_context(|| format!("reading bounded committed file in {}", root.display()))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    if output.stdout.len() > max_bytes {
+        anyhow::bail!("committed file exceeds its byte limit");
+    }
+    Ok(Some(output.stdout))
+}
+
 /// List the files under a directory in a COMMITTED tree via
 /// `git ls-tree -r --name-only <ref> -- <dir_rel>`. Returns repo-root-relative,
 /// `/`-separated paths (git's native output form), recursively (blobs only).
@@ -796,6 +836,11 @@ fn git_output_with_alternate(
 ) -> Option<Output> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(path).args(args);
+    configure_alternate_objects(&mut cmd, alternate_root);
+    run_git_bounded(cmd, path, action)
+}
+
+fn configure_alternate_objects(command: &mut Command, alternate_root: Option<&Path>) {
     if let Some(alternate_root) = alternate_root
         && let Some(objects) = git_objects_dir(alternate_root)
     {
@@ -806,10 +851,9 @@ fn git_output_with_alternate(
             paths.push(objects);
         }
         if let Ok(joined) = std::env::join_paths(paths) {
-            cmd.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", joined);
+            command.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", joined);
         }
     }
-    run_git_bounded(cmd, path, action)
 }
 
 fn git_objects_dir(root: &Path) -> Option<PathBuf> {
@@ -853,10 +897,21 @@ fn run_git_bounded(cmd: Command, path: &Path, action: &'static str) -> Option<Ou
 
 #[allow(clippy::disallowed_methods)]
 fn run_bounded_with_timeout(
+    cmd: Command,
+    path: &Path,
+    action: &'static str,
+    timeout: Duration,
+) -> Option<Output> {
+    run_bounded_with_timeout_and_stdout_limit(cmd, path, action, timeout, None)
+}
+
+#[allow(clippy::disallowed_methods)]
+fn run_bounded_with_timeout_and_stdout_limit(
     mut cmd: Command,
     path: &Path,
     action: &'static str,
     timeout: Duration,
+    retained_stdout_limit: Option<usize>,
 ) -> Option<Output> {
     use std::io::Read;
 
@@ -879,7 +934,14 @@ fn run_bounded_with_timeout(
     let mut stderr_pipe = child.stderr.take()?;
     let stdout_drain = std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
+        if let Some(limit) = retained_stdout_limit {
+            let mut retained = stdout_pipe.by_ref().take(limit as u64);
+            let _ = retained.read_to_end(&mut buf);
+            drop(retained);
+            let _ = std::io::copy(&mut stdout_pipe, &mut std::io::sink());
+        } else {
+            let _ = stdout_pipe.read_to_end(&mut buf);
+        }
         buf
     });
     let stderr_drain = std::thread::spawn(move || {
@@ -1101,6 +1163,49 @@ mod tests {
             read_committed_file(&root, "HEAD", ".bbox/knowledge/nope.json"),
             None,
             "absent path yields None, not empty string"
+        );
+    }
+
+    #[test]
+    fn bounded_committed_file_read_enforces_limit_before_retaining_full_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        init_repo(&root);
+        write(&root, ".bbox/knowledge/e1.json", "0123456789");
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-q", "-m", "c1"]);
+
+        assert_eq!(
+            read_committed_file_bytes_bounded_with_alternate(
+                &root,
+                "HEAD",
+                ".bbox/knowledge/e1.json",
+                None,
+                10,
+            )
+            .unwrap()
+            .as_deref(),
+            Some(b"0123456789".as_slice())
+        );
+        let error = read_committed_file_bytes_bounded_with_alternate(
+            &root,
+            "HEAD",
+            ".bbox/knowledge/e1.json",
+            None,
+            9,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeds its byte limit"));
+        assert!(
+            read_committed_file_bytes_bounded_with_alternate(
+                &root,
+                "HEAD",
+                ".bbox/knowledge/missing.json",
+                None,
+                10,
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
