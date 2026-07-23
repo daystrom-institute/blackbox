@@ -62,6 +62,10 @@ const MAX_MIGRATION_IMMUTABLE_ASSETS: usize =
     MAX_MIGRATION_INVENTORY_GENERATIONS + MAX_PUBLISHER_REF_ROWS + 2;
 const MAX_MIGRATION_CHECKOUT_ACTIONS: usize = MAX_PROJECT_CATALOG_ENTRIES;
 const MAX_MIGRATION_PUBLISHER_PINS: usize = MAX_PUBLISHER_REF_ROWS;
+// Pins and dispositions share this serialized budget. The compatibility proof
+// below reserves the remaining 384 MiB for the maximum closed participant,
+// immutable-asset, checkout-action, and journal-envelope sets.
+const MAX_MIGRATION_PUBLISHER_EVIDENCE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_JOURNAL_BYTES: usize = 512 * 1024 * 1024;
 const MAX_MARKER_BYTES: usize = 512 * 1024 * 1024;
 const MAX_CODE_SOURCE_EFFECTIVE_MANIFEST_BYTES: usize = 512 * 1024 * 1024;
@@ -1058,6 +1062,7 @@ fn validate_publisher_evidence(
     let mut scopes = BTreeSet::new();
     let mut candidate_attachment_count = 0_usize;
     let mut source_observation_count = 0_usize;
+    let mut encoded_evidence_bytes = 0_usize;
     for pin in pins {
         validate_evidence_id(&pin.observation_id, "publisher pin observation")?;
         pin.expected_scope.validate().map_err(contract_error)?;
@@ -1116,6 +1121,7 @@ fn validate_publisher_evidence(
                 format!("{owner} publisher pin evidence is duplicated"),
             ));
         }
+        add_publisher_evidence_size(&mut encoded_evidence_bytes, pin, owner)?;
     }
     let mut disposition_ids = BTreeSet::new();
     for disposition in dispositions {
@@ -1173,11 +1179,57 @@ fn validate_publisher_evidence(
                 format!("{owner} publisher seed does not resolve its exact inventoried row"),
             ));
         }
+        add_publisher_evidence_size(&mut encoded_evidence_bytes, disposition, owner)?;
     }
     if disposition_ids != pins_by_observation.keys().copied().collect() {
         return Err(ProjectCatalogStoreError::new(
             "error.project_catalog_invalid_publisher_evidence",
             format!("{owner} does not contain exactly one disposition per publisher pin"),
+        ));
+    }
+    Ok(())
+}
+
+fn add_publisher_evidence_size(
+    total: &mut usize,
+    evidence: &impl Serialize,
+    owner: &str,
+) -> ProjectCatalogStoreResult<()> {
+    let encoded = serde_json::to_vec_pretty(evidence).map_err(|error| {
+        ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_publisher_evidence",
+            format!("{owner} publisher evidence could not be encoded: {error}"),
+        )
+    })?;
+    // serde_json's pretty formatter uses two spaces per nesting level. Evidence
+    // rows sit no more than four additional levels deep in either durable
+    // envelope, so eight bytes per emitted newline plus two bytes for the row
+    // separator conservatively bounds the outer journal/marker indentation.
+    let outer_indentation = encoded
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+        .checked_mul(8)
+        .and_then(|bytes| bytes.checked_add(2))
+        .ok_or_else(|| {
+            ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_publisher_evidence",
+                format!("{owner} publisher evidence size overflows"),
+            )
+        })?;
+    *total = total
+        .checked_add(encoded.len())
+        .and_then(|bytes| bytes.checked_add(outer_indentation))
+        .ok_or_else(|| {
+            ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_publisher_evidence",
+                format!("{owner} publisher evidence size overflows"),
+            )
+        })?;
+    if *total > MAX_MIGRATION_PUBLISHER_EVIDENCE_BYTES {
+        return Err(ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_publisher_evidence",
+            format!("{owner} publisher evidence exceeds its aggregate byte limit"),
         ));
     }
     Ok(())
@@ -1442,6 +1494,18 @@ fn validate_code_source_snapshot(
             })
             .ok_or_else(|| fail("legacy collision pending row is not exactly accounted"))?;
         let _ = planned;
+        if !inventory_activations
+            .get(&pending.project_id)
+            .is_some_and(|activation| {
+                activation.record.generation_id == pending.record.generation_id
+                    && activation.record.selector == pending.record.selector
+                    && activation.record.snapshot_id == pending.record.snapshot_id
+            })
+        {
+            return Err(fail(
+                "legacy collision pending row rewrites its activation evidence",
+            ));
+        }
         if generation.published_scope != pending.record.former_scope {
             return Err(fail(
                 "legacy collision pending scope and generation scope disagree",
@@ -1646,6 +1710,16 @@ fn validate_code_source_snapshot(
                     let retirement_role = ParticipantRoleV1::CollisionRetirement {
                         project_id: evidence.project_id.clone(),
                     };
+                    if !collision_pending_projects.contains(&evidence.project_id)
+                        && expected_old
+                            .get(&retirement_role)
+                            .and_then(Option::as_ref)
+                            .is_some()
+                    {
+                        return Err(fail(
+                            "new collision retirement fabricates a participant pre-image",
+                        ));
+                    }
                     let retirement_bytes = post_images
                         .get(&retirement_role)
                         .and_then(Option::as_deref)
@@ -3036,20 +3110,19 @@ impl ProjectCatalogTransactionOwner {
                         "historical collision lacks its durable lifecycle record",
                     )
                 })?;
-            let former_scope = journal
+            let stored_participant = journal
                 .participants
                 .iter()
-                .find_map(|candidate| match &candidate.role {
+                .find(|candidate| match &candidate.role {
                     ParticipantRoleV1::StoredGenerationMetadata {
                         project_id: owner,
-                        published_scope,
                         generation_id,
                     } if owner == project_id
                         && generation_id.as_str() == old_activation.generation_id =>
                     {
-                        Some(published_scope)
+                        true
                     }
-                    _ => None,
+                    _ => false,
                 })
                 .ok_or_else(|| {
                     ProjectCatalogStoreError::new(
@@ -3057,7 +3130,57 @@ impl ProjectCatalogTransactionOwner {
                         "historical collision lacks its scope-bearing generation evidence",
                     )
                 })?;
-            let manifest = journal
+            let ParticipantRoleV1::StoredGenerationMetadata {
+                published_scope: former_scope,
+                ..
+            } = &stored_participant.role
+            else {
+                unreachable!("stored participant role was selected above");
+            };
+            let ExpectedImageV1::Present {
+                sha256: expected_stored,
+                artifact_name: stored_artifact_name,
+            } = &stored_participant.old
+            else {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_migration_incomplete",
+                    "historical collision stored evidence is absent",
+                ));
+            };
+            let old_stored_bytes = self
+                .io
+                .read_regular_nofollow(
+                    &self.paths.backup_dir.join(stored_artifact_name.as_str()),
+                    MAX_CODE_SOURCE_GENERATION_METADATA_BYTES,
+                )?
+                .ok_or_else(|| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_migration_incomplete",
+                        "historical collision stored backup is missing",
+                    )
+                })?;
+            if sha256(&old_stored_bytes) != *expected_stored {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_migration_incomplete",
+                    "historical collision stored backup hash disagrees",
+                ));
+            }
+            let old_stored =
+                decode_stored_generation_v1_for_migration(&old_stored_bytes).map_err(|error| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_migration_incomplete",
+                        error.to_string(),
+                    )
+                })?;
+            if old_stored.generation_id != old_activation.generation_id
+                || &old_stored.descriptor.scope != former_scope
+            {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_migration_incomplete",
+                    "historical collision stored backup rewrites generation evidence",
+                ));
+            }
+            let _manifest = journal
                 .immutable_assets
                 .iter()
                 .find(|asset| {
@@ -3077,8 +3200,9 @@ impl ProjectCatalogTransactionOwner {
             if lifecycle.record.selector != old_activation.selector
                 || lifecycle.record.snapshot_id != old_activation.snapshot_id
                 || lifecycle.record.generation_id != old_activation.generation_id
-                || lifecycle.record.former_scope != *former_scope
-                || lifecycle.record.manifest_sha256 != manifest.sha256.as_str()
+                || &lifecycle.record.former_scope != former_scope
+                || lifecycle.record.manifest_sha256.as_str()
+                    != old_stored.descriptor.manifest_sha256.as_str()
                 || lifecycle.record.inventory_hash != marker.inventory_sha256.as_str()
                 || lifecycle.record.plan_hash != marker.plan_hash.as_str()
             {
@@ -6073,8 +6197,10 @@ impl ProjectCatalogTransactionJournalV1 {
                                         && collision_projects.contains(project_id))
                             }
                             ParticipantRoleV1::CollisionRetirement { project_id } => {
-                                matches!(&participant.old, ExpectedImageV1::Absent {})
-                                    && matches!(&participant.new, ExpectedImageV1::Present { .. })
+                                matches!(
+                                    &participant.old,
+                                    ExpectedImageV1::Absent {} | ExpectedImageV1::Present { .. }
+                                ) && matches!(&participant.new, ExpectedImageV1::Present { .. })
                                     && participant_for(&ParticipantRoleV1::Activation {
                                         project_id: project_id.clone(),
                                     })
@@ -6256,8 +6382,10 @@ impl ProjectCatalogMigrationMarkerV1 {
                             && collision_projects.contains(project_id))
                 }
                 ParticipantRoleV1::CollisionRetirement { project_id } => {
-                    matches!(&participant.old, ExpectedImageV1::Absent {})
-                        && matches!(&participant.new, ExpectedImageV1::Present { .. })
+                    matches!(
+                        &participant.old,
+                        ExpectedImageV1::Absent {} | ExpectedImageV1::Present { .. }
+                    ) && matches!(&participant.new, ExpectedImageV1::Present { .. })
                         && participant_for(&ParticipantRoleV1::Activation {
                             project_id: project_id.clone(),
                         })
@@ -7526,7 +7654,7 @@ mod tests {
         assert!(!paths.attachments.exists());
     }
 
-    fn assert_no_migration_outputs(path: &Path) {
+    fn assert_no_migration_transaction_outputs(path: &Path) {
         let paths = ProjectCatalogPaths::derive(path).unwrap();
         for output in [
             paths.attachments,
@@ -7534,7 +7662,6 @@ mod tests {
             paths.migration_marker,
             paths.stage_dir,
             paths.backup_dir,
-            path.parent().unwrap().join("code-source"),
             path.parent().unwrap().join("checkout"),
         ] {
             assert!(
@@ -7543,6 +7670,16 @@ mod tests {
                 output.display()
             );
         }
+    }
+
+    fn assert_no_migration_outputs(path: &Path) {
+        assert_no_migration_transaction_outputs(path);
+        let code_source_root = path.parent().unwrap().join("code-source");
+        assert!(
+            !code_source_root.exists(),
+            "validation unexpectedly created {}",
+            code_source_root.display()
+        );
     }
 
     fn state_fingerprint(state: &ProjectCatalogState) -> (u64, String, String) {
@@ -7567,6 +7704,27 @@ mod tests {
                 assert_absent_pair(path);
             }
             Err(error) => panic!("unexpected reopen error: {error}"),
+        }
+    }
+
+    fn assert_known_migration_state_or_absent(
+        path: &Path,
+        registry: MigrationParticipantRegistry,
+        allowed_states: &[(u64, String, String)],
+    ) {
+        match ProjectCatalogStore::open_existing_after_migration(path.to_path_buf(), registry) {
+            Ok(store) => {
+                let state = store.snapshot().unwrap();
+                let actual = state_fingerprint(&state);
+                assert!(
+                    allowed_states.contains(&actual),
+                    "unexpected recovered migration state {actual:?}"
+                );
+            }
+            Err(error) if error.code() == "error.project_catalog_not_initialized" => {
+                assert_absent_pair(path);
+            }
+            Err(error) => panic!("unexpected migration reopen error: {error}"),
         }
     }
 
@@ -8792,11 +8950,27 @@ mod tests {
         let legacy_bytes = b"{\"version\":1,\"projects\":[]}\n";
         fs::write(&path, legacy_bytes).unwrap();
         let (registry, mut draft, _, _) = activation_migration_draft(&path, legacy_bytes);
+        let published_scopes = published_catalog_scopes(&draft.catalog);
+        let inventory_before = enumerate_legacy_migration_inventory_for_scopes_locked(
+            &registry.code_source_paths,
+            &registry.code_source_limits,
+            &published_scopes,
+        )
+        .unwrap()
+        .canonical_sha256;
         draft.code_source_snapshot.generations.clear();
 
-        let error = validate_migration_plan(&path, registry, draft).unwrap_err();
+        let error = validate_migration_plan(&path, registry.clone(), draft).unwrap_err();
         assert_eq!(error.code(), "error.project_catalog_invalid_migration_plan");
-        assert_no_migration_outputs(&path);
+        let inventory_after = enumerate_legacy_migration_inventory_for_scopes_locked(
+            &registry.code_source_paths,
+            &registry.code_source_limits,
+            &published_scopes,
+        )
+        .unwrap()
+        .canonical_sha256;
+        assert_eq!(inventory_after, inventory_before);
+        assert_no_migration_transaction_outputs(&path);
     }
 
     #[test]
@@ -9529,49 +9703,39 @@ mod tests {
         })
         .unwrap()
         .len();
-        let long_scope = PublishedScope::try_new(
-            "r".repeat(256),
-            std::iter::repeat_n("p".repeat(255), 15)
-                .collect::<Vec<_>>()
-                .join("/"),
-        )
-        .unwrap();
-        let full_ref =
-            FullPublisherRef::parse(format!("refs/heads/{}", "b".repeat(1_000))).unwrap();
-        let encoded_pin = serde_json::to_vec(&PublisherPinEvidenceV1 {
-            observation_id: "o".repeat(256),
-            project_id: project_id.clone(),
-            expected_scope: long_scope.clone(),
-            full_ref: full_ref.clone(),
-            candidate_attachment_ids: BTreeSet::new(),
-            resolved_commit: None,
-            resolved_scope: None,
-            source_observation_ids: BTreeSet::from(["source".into()]),
-        })
-        .unwrap()
-        .len();
-        let encoded_disposition = serde_json::to_vec(
-            &PublisherDispositionEvidenceV1::NoPublishedContentAcknowledged {
-                observation_id: "o".repeat(256),
-                project_id,
-                expected_scope: long_scope,
-                full_ref,
-                bounded_reason: "r".repeat(4_096),
-            },
-        )
-        .unwrap()
-        .len();
         let conservative_max = encoded_participant
             .saturating_mul(MAX_MIGRATION_PARTICIPANTS)
             .saturating_add(encoded_asset.saturating_mul(MAX_MIGRATION_IMMUTABLE_ASSETS))
             .saturating_add(encoded_action.saturating_mul(MAX_MIGRATION_CHECKOUT_ACTIONS))
-            .saturating_add(
-                encoded_pin
-                    .saturating_add(encoded_disposition)
-                    .saturating_mul(MAX_MIGRATION_PUBLISHER_PINS),
-            )
+            .saturating_add(MAX_MIGRATION_PUBLISHER_EVIDENCE_BYTES)
             .saturating_add(1024 * 1024);
-        assert!(conservative_max <= MAX_JOURNAL_BYTES);
+        assert!(
+            conservative_max <= MAX_JOURNAL_BYTES,
+            "closed evidence maxima require {conservative_max} bytes but the journal allows {MAX_JOURNAL_BYTES}"
+        );
+    }
+
+    #[test]
+    fn publisher_evidence_aggregate_budget_rejects_the_first_excess_byte() {
+        let evidence = PublisherDispositionEvidenceV1::NoPublishedContentAcknowledged {
+            observation_id: "publisher-observation".into(),
+            project_id: ProjectId::parse("published-project").unwrap(),
+            expected_scope: PublishedScope::try_new("published-repo", ".").unwrap(),
+            full_ref: FullPublisherRef::parse("refs/heads/main").unwrap(),
+            bounded_reason: "bounded reason".into(),
+        };
+        let encoded = serde_json::to_vec_pretty(&evidence).unwrap();
+        let charged = encoded.len() + encoded.iter().filter(|byte| **byte == b'\n').count() * 8 + 2;
+        let mut exact = MAX_MIGRATION_PUBLISHER_EVIDENCE_BYTES - charged;
+        add_publisher_evidence_size(&mut exact, &evidence, "test").unwrap();
+        assert_eq!(exact, MAX_MIGRATION_PUBLISHER_EVIDENCE_BYTES);
+
+        let mut excess = MAX_MIGRATION_PUBLISHER_EVIDENCE_BYTES - charged + 1;
+        let error = add_publisher_evidence_size(&mut excess, &evidence, "test").unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_invalid_publisher_evidence"
+        );
     }
 
     #[test]
@@ -10714,6 +10878,7 @@ mod tests {
             .parent()
             .unwrap()
             .join("checkout/.bbox/local/checkout-id");
+        fs::create_dir_all(checkout_id.parent().unwrap()).unwrap();
         fs::write(&checkout_id, b"99999999999999999999999999999999\n").unwrap();
 
         recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
@@ -11078,8 +11243,9 @@ mod tests {
             assert!(transact_migration_with_io(&path, plan, initial).is_err());
             let recovery_failure = Arc::new(TracingIo::failing_at(index));
             let _ = recover_migration_with_io(&path, registry.clone(), recovery_failure);
-            recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
-            assert_known_state_or_absent(&path, &[expected_new]);
+            recover_migration_with_io(&path, registry.clone(), Arc::new(RealCatalogStoreIo))
+                .unwrap();
+            assert_known_migration_state_or_absent(&path, registry, &[expected_new]);
             assert_retained_journal_artifacts(&path);
         }
     }
