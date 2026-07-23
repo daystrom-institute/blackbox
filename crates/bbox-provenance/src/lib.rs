@@ -441,7 +441,10 @@ pub fn capture_project_catalog_owner_snapshot_stable(
     notes_ref: &str,
     project_id: &str,
     limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
-) -> bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotV1 {
+) -> std::result::Result<
+    bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotError,
+> {
     use bbox_corpus_core::project_catalog_snapshot::{
         OwnerSnapshotRowV1, OwnerSnapshotStateV1, build_owner_snapshot, corrupt_owner_snapshot,
         finalize_owner_snapshot, missing_owner_snapshot, owner_subsource,
