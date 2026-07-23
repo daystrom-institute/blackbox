@@ -2,6 +2,7 @@
 
 pub mod distance;
 pub mod hnsw;
+pub mod migration_inventory;
 pub mod slab;
 pub mod wal;
 
