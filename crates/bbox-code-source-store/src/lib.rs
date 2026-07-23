@@ -427,6 +427,82 @@ impl CollisionRetirementPendingV1 {
     }
 }
 
+/// Strict migration-owned view of the complete effective code-source set.
+///
+/// The ordinary code-source store does not infer this state from activation
+/// filenames. Migration supplies and verifies the complete sorted selection
+/// set so removals and quarantines are explicit post-image facts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationEffectiveSourceManifestV1 {
+    pub version: u32,
+    pub selections: Vec<MigrationEffectiveSourceSelectionV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationEffectiveSourceSelectionV1 {
+    pub project_id: ProjectId,
+    pub published_scope: PublishedScope,
+    pub generation_id: String,
+    pub selector: String,
+}
+
+impl MigrationEffectiveSourceManifestV1 {
+    pub fn validate(&self) -> Result<()> {
+        if self.version != 1 {
+            bail!("invalid migration effective-source manifest version");
+        }
+        if self.selections.len() > DEFAULT_MAX_MANIFEST_FILES as usize {
+            bail!("migration effective-source manifest has too many selections");
+        }
+        let mut projects = BTreeSet::new();
+        let mut selectors = BTreeSet::new();
+        let mut prior_project = None;
+        for selection in &self.selections {
+            ProjectId::parse(selection.project_id.to_string()).map_err(|error| anyhow!(error))?;
+            selection.published_scope.validate()?;
+            validate_sha256(&selection.generation_id)?;
+            validate_retirement_selector(&selection.selector)?;
+            if selection.selector
+                != source_selector(selection.project_id.as_str(), &selection.generation_id)
+                || !projects.insert(selection.project_id.clone())
+                || !selectors.insert(selection.selector.clone())
+                || prior_project
+                    .as_ref()
+                    .is_some_and(|project: &ProjectId| project >= &selection.project_id)
+            {
+                bail!("migration effective-source selections are invalid, duplicated, or unsorted");
+            }
+            prior_project = Some(selection.project_id.clone());
+        }
+        Ok(())
+    }
+}
+
+pub fn encode_migration_effective_source_manifest_v1(
+    manifest: &MigrationEffectiveSourceManifestV1,
+) -> Result<Vec<u8>> {
+    manifest.validate()?;
+    encode_bounded_json(
+        manifest,
+        MAX_MIGRATION_RECORD_BYTES,
+        "migration effective-source manifest",
+    )
+}
+
+pub fn decode_migration_effective_source_manifest_v1(
+    bytes: &[u8],
+) -> Result<MigrationEffectiveSourceManifestV1> {
+    let manifest = decode_bounded_json(
+        bytes,
+        MAX_MIGRATION_RECORD_BYTES,
+        "migration effective-source manifest",
+    )?;
+    manifest.validate()?;
+    Ok(manifest)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerationManifestEvidence {
     pub generation_id: String,
@@ -2315,6 +2391,50 @@ mod tests {
             cutback_pending: false,
             diagnostic: None,
         }
+    }
+
+    #[test]
+    fn migration_effective_source_manifest_codec_is_strict_and_canonical() {
+        let scope = PublishedScope::try_new("repo-family", ".").unwrap();
+        let project_a = ProjectId::parse("project-a").unwrap();
+        let project_b = ProjectId::parse("project-b").unwrap();
+        let generation_a = "a".repeat(64);
+        let generation_b = "b".repeat(64);
+        let manifest = MigrationEffectiveSourceManifestV1 {
+            version: 1,
+            selections: vec![
+                MigrationEffectiveSourceSelectionV1 {
+                    project_id: project_a.clone(),
+                    published_scope: scope.clone(),
+                    generation_id: generation_a.clone(),
+                    selector: source_selector(project_a.as_str(), &generation_a),
+                },
+                MigrationEffectiveSourceSelectionV1 {
+                    project_id: project_b.clone(),
+                    published_scope: scope.clone(),
+                    generation_id: generation_b.clone(),
+                    selector: source_selector(project_b.as_str(), &generation_b),
+                },
+            ],
+        };
+        let bytes = encode_migration_effective_source_manifest_v1(&manifest).unwrap();
+        assert_eq!(
+            decode_migration_effective_source_manifest_v1(&bytes).unwrap(),
+            manifest
+        );
+
+        let mut unsorted = manifest.clone();
+        unsorted.selections.reverse();
+        assert!(encode_migration_effective_source_manifest_v1(&unsorted).is_err());
+        let unknown = serde_json::json!({
+            "version": 1,
+            "selections": [],
+            "extra": true,
+        });
+        assert!(
+            decode_migration_effective_source_manifest_v1(&serde_json::to_vec(&unknown).unwrap())
+                .is_err()
+        );
     }
 
     #[test]
