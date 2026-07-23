@@ -973,6 +973,24 @@ struct MigrationBasePostImagesV1 {
     refusal_count: u64,
 }
 
+#[derive(Debug, Clone)]
+struct ClassifiedLegacyPathV1 {
+    observation_id: String,
+    planned_binding_id: LegacyPathBindingId,
+    literal_selector: String,
+    relationship: LegacyPathRelationshipV1,
+    mapped_project_id: Option<ProjectId>,
+}
+
+#[derive(Debug, Clone)]
+struct ClassifiedLegacyPathsV1 {
+    paths: Vec<ClassifiedLegacyPathV1>,
+    report_rows: Vec<LegacyPathBindingReportV1>,
+    sensitive_report: SensitiveLocalPathReportV1,
+    unscoped_counts: BTreeMap<crate::project_catalog_inventory::LegacyPathStoreKindV1, u64>,
+    refusal_count: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LateMigrationDomainRefusalV1 {
     ConflictingPublishedAuthorities,
@@ -1764,12 +1782,141 @@ fn build_persisted_identity_plan(
     })
 }
 
+fn classify_legacy_paths(
+    inventory: &V1ProjectCatalogInventory,
+    runtime: &MigrationRuntimeBindingsViewV1,
+    identities: &MigrationPersistedIdentityPlanV1,
+) -> Result<ClassifiedLegacyPathsV1, ProjectCatalogMigrationError> {
+    let mut paths = Vec::new();
+    let mut report_rows = Vec::new();
+    let mut sensitive_rows = Vec::new();
+    let mut unscoped_counts = BTreeMap::new();
+    let mut refusal_count = 0_u64;
+    for observed in &inventory.legacy_path_observations {
+        let literal = runtime
+            .legacy_selectors
+            .get(&observed.observation_id)
+            .ok_or_else(|| planner_error("legacy selector runtime binding is missing"))?;
+        let literal_path = Path::new(literal);
+        let mut matching_projects = inventory
+            .legacy_projects
+            .iter()
+            .filter_map(|project| {
+                runtime
+                    .legacy_project_paths
+                    .get(&project.observation_id)
+                    .filter(|root| literal_path.starts_with(root))
+                    .map(|root| (project, root.components().count()))
+            })
+            .collect::<Vec<_>>();
+        matching_projects.sort_by(|(left, left_depth), (right, right_depth)| {
+            right_depth
+                .cmp(left_depth)
+                .then_with(|| left.observation_id.cmp(&right.observation_id))
+        });
+        let deepest_tied = matching_projects
+            .first()
+            .map(|(_, depth)| {
+                matching_projects
+                    .iter()
+                    .take_while(|(_, candidate_depth)| candidate_depth == depth)
+                    .count()
+            })
+            .unwrap_or(0);
+        let (relationship, status, mapped_project_id) =
+            match (matching_projects.first(), deepest_tied) {
+                (None, _) => {
+                    *unscoped_counts.entry(observed.store_kind).or_default() += 1;
+                    (
+                        LegacyPathRelationshipV1::Unscoped,
+                        LegacyPathBindingStatusV1::UnscopedPreserved,
+                        None,
+                    )
+                }
+                (Some((project, _)), 1)
+                    if project.path_status
+                        == crate::project_catalog_inventory::LegacyProjectPathStatusV1::Missing =>
+                {
+                    refusal_count = refusal_count.saturating_add(1);
+                    (
+                        LegacyPathRelationshipV1::MissingProject,
+                        LegacyPathBindingStatusV1::Refused,
+                        None,
+                    )
+                }
+                (Some((project, _)), 1) => {
+                    let project_id = ProjectId::parse(project.record.project_id.clone())
+                        .map_err(|_| planner_error("legacy project id is invalid"))?;
+                    let root = runtime
+                        .legacy_project_paths
+                        .get(&project.observation_id)
+                        .expect("matched legacy project path");
+                    (
+                        if literal_path == root {
+                            LegacyPathRelationshipV1::ExactRoot
+                        } else {
+                            LegacyPathRelationshipV1::Contained
+                        },
+                        LegacyPathBindingStatusV1::Planned,
+                        Some(project_id),
+                    )
+                }
+                (Some(_), _) => {
+                    refusal_count = refusal_count.saturating_add(1);
+                    (
+                        LegacyPathRelationshipV1::Ambiguous,
+                        LegacyPathBindingStatusV1::Refused,
+                        None,
+                    )
+                }
+            };
+        let planned_binding_id = identities
+            .legacy_path_binding_ids
+            .get(&observed.observation_id)
+            .ok_or_else(|| planner_error("legacy path binding identity is missing"))?
+            .clone();
+        paths.push(ClassifiedLegacyPathV1 {
+            observation_id: observed.observation_id.clone(),
+            planned_binding_id: planned_binding_id.clone(),
+            literal_selector: literal.clone(),
+            relationship,
+            mapped_project_id,
+        });
+        report_rows.push(LegacyPathBindingReportV1 {
+            observation_id: observed.observation_id.clone(),
+            planned_binding_id,
+            store_kind: observed.store_kind,
+            relationship,
+            status,
+            path_digest: digest_path(literal),
+        });
+        sensitive_rows.push(SensitiveLocalPathRowV1 {
+            observation_id: observed.observation_id.clone(),
+            store_kind: observed.store_kind,
+            stable_row_id: observed.stable_row_id.clone(),
+            literal_selector: literal.clone(),
+        });
+    }
+    paths.sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
+    report_rows.sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
+    let sensitive_report = SensitiveLocalPathReportV1::from_runtime_rows(inventory, sensitive_rows)
+        .map_err(inventory_error)?;
+    Ok(ClassifiedLegacyPathsV1 {
+        paths,
+        report_rows,
+        sensitive_report,
+        unscoped_counts,
+        refusal_count,
+    })
+}
+
 fn build_base_post_images(
     inventory: &V1ProjectCatalogInventory,
     runtime: &MigrationRuntimeBindingsViewV1,
     assessment: &MigrationSemanticAssessmentV1,
     identities: &MigrationPersistedIdentityPlanV1,
     resolution: &ProjectCatalogMigrationResolutionV1,
+    classified_legacy_paths: &ClassifiedLegacyPathsV1,
 ) -> Result<MigrationBasePostImagesV1, MigrationBasePostImagesFailureV1> {
     let resolved_scopes = assessment
         .resolved_project_scopes
@@ -1983,9 +2130,22 @@ fn build_base_post_images(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    let retained_checkout_observation_ids = inventory
+        .attachment_candidates
+        .iter()
+        .filter(|candidate| {
+            assessment
+                .retained_attachment_ids
+                .contains(&candidate.attachment_id)
+        })
+        .map(|candidate| candidate.checkout_observation_id.as_str())
+        .collect::<BTreeSet<_>>();
     let checkout_ids = inventory
         .checkouts
         .iter()
+        .filter(|checkout| {
+            retained_checkout_observation_ids.contains(checkout.observation_id.as_str())
+        })
         .map(|checkout| {
             let checkout_id = match &checkout.marker_state {
                 crate::project_catalog_inventory::CheckoutMarkerStateV1::Valid { checkout_id } => {
@@ -2125,160 +2285,68 @@ fn build_base_post_images(
     post_image_attachments.sort_by(|left, right| left.attachment_id.cmp(&right.attachment_id));
 
     let mut post_image_legacy_bindings = Vec::new();
-    let mut legacy_binding_report = Vec::new();
     let mut legacy_path_bindings = BTreeMap::new();
-    let mut sensitive_rows = Vec::new();
-    let mut unscoped_legacy_counts = BTreeMap::new();
-    let mut refusal_count = 0_u64;
-    for observed in &inventory.legacy_path_observations {
-        let literal = runtime
-            .legacy_selectors
-            .get(&observed.observation_id)
-            .ok_or_else(|| planner_error("legacy selector runtime binding is missing"))?;
-        let literal_path = Path::new(literal);
-        let mut matching_projects = inventory
-            .legacy_projects
+    for classified in &classified_legacy_paths.paths {
+        let source = inventory
+            .legacy_path_observations
             .iter()
-            .filter_map(|project| {
-                runtime
-                    .legacy_project_paths
-                    .get(&project.observation_id)
-                    .filter(|root| literal_path.starts_with(root))
-                    .map(|root| (project, root.components().count()))
-            })
-            .collect::<Vec<_>>();
-        matching_projects.sort_by(|(left, left_depth), (right, right_depth)| {
-            right_depth
-                .cmp(left_depth)
-                .then_with(|| left.observation_id.cmp(&right.observation_id))
-        });
-        let deepest_tied = matching_projects
-            .first()
-            .map(|(_, depth)| {
-                matching_projects
-                    .iter()
-                    .take_while(|(_, candidate_depth)| candidate_depth == depth)
-                    .count()
-            })
-            .unwrap_or(0);
-        let (relationship, report_status, ledger_status, attachment_id) =
-            match (matching_projects.first(), deepest_tied) {
-                (None, _) => {
-                    *unscoped_legacy_counts
-                        .entry(observed.store_kind)
-                        .or_default() += 1;
-                    (
-                        LegacyPathRelationshipV1::Unscoped,
-                        LegacyPathBindingStatusV1::UnscopedPreserved,
-                        LegacyPathBindingStatus::Unscoped {},
-                        None,
-                    )
-                }
-                (Some((project, _)), 1)
-                    if project.path_status
-                        == crate::project_catalog_inventory::LegacyProjectPathStatusV1::Missing =>
-                {
-                    refusal_count = refusal_count.saturating_add(1);
-                    (
-                        LegacyPathRelationshipV1::MissingProject,
-                        LegacyPathBindingStatusV1::Refused,
-                        LegacyPathBindingStatus::Quarantined {},
-                        None,
-                    )
-                }
-                (Some((project, _)), 1) => {
-                    let project_id = ProjectId::parse(project.record.project_id.clone())
-                        .map_err(|_| planner_error("legacy project id is invalid"))?;
-                    let root = runtime
-                        .legacy_project_paths
-                        .get(&project.observation_id)
-                        .expect("matched legacy project path");
-                    let relationship = if literal_path == root {
-                        LegacyPathRelationshipV1::ExactRoot
-                    } else {
-                        LegacyPathRelationshipV1::Contained
-                    };
-                    let ledger_relationship = if relationship == LegacyPathRelationshipV1::ExactRoot
-                    {
+            .find(|row| row.observation_id == classified.observation_id)
+            .ok_or_else(|| planner_error("classified legacy path source is missing"))?;
+        let (ledger_status, attachment_id) = match &classified.mapped_project_id {
+            Some(project_id) => {
+                let ledger_relationship =
+                    if classified.relationship == LegacyPathRelationshipV1::ExactRoot {
                         LegacyPathRelationship::Root
                     } else {
                         LegacyPathRelationship::ContainedSubdirectory
                     };
-                    let attachment_id = attachment_snapshot_rows
-                        .values()
-                        .filter(|attachment| {
-                            attachment.project_id == project_id
-                                && literal_path.starts_with(&attachment.checkout_project_dir)
-                        })
-                        .max_by_key(|attachment| {
-                            Path::new(&attachment.checkout_project_dir)
-                                .components()
-                                .count()
-                        })
-                        .map(|attachment| attachment.attachment_id.clone());
-                    (
-                        relationship,
-                        LegacyPathBindingStatusV1::Planned,
-                        LegacyPathBindingStatus::Mapped {
-                            project_id,
-                            relationship: ledger_relationship,
-                        },
-                        attachment_id,
-                    )
-                }
-                (Some(_), _) => {
-                    refusal_count = refusal_count.saturating_add(1);
-                    (
-                        LegacyPathRelationshipV1::Ambiguous,
-                        LegacyPathBindingStatusV1::Refused,
-                        LegacyPathBindingStatus::Quarantined {},
-                        None,
-                    )
-                }
-            };
-        let planned_binding_id = identities
-            .legacy_path_binding_ids
-            .get(&observed.observation_id)
-            .ok_or_else(|| planner_error("legacy path binding identity is missing"))?
-            .clone();
+                let literal_path = Path::new(&classified.literal_selector);
+                let attachment_id = attachment_snapshot_rows
+                    .values()
+                    .filter(|attachment| {
+                        &attachment.project_id == project_id
+                            && literal_path.starts_with(&attachment.checkout_project_dir)
+                    })
+                    .max_by_key(|attachment| {
+                        Path::new(&attachment.checkout_project_dir)
+                            .components()
+                            .count()
+                    })
+                    .map(|attachment| attachment.attachment_id.clone());
+                (
+                    LegacyPathBindingStatus::Mapped {
+                        project_id: project_id.clone(),
+                        relationship: ledger_relationship,
+                    },
+                    attachment_id,
+                )
+            }
+            None if classified.relationship == LegacyPathRelationshipV1::Unscoped => {
+                (LegacyPathBindingStatus::Unscoped {}, None)
+            }
+            None => (LegacyPathBindingStatus::Quarantined {}, None),
+        };
         post_image_legacy_bindings.push(LegacyPathBindingPostImageInputV1 {
-            observation_id: observed.observation_id.clone(),
-            planned_binding_id: planned_binding_id.clone(),
+            observation_id: classified.observation_id.clone(),
+            planned_binding_id: classified.planned_binding_id.clone(),
             attachment_id,
-            literal_selector: literal.clone(),
-            relationship,
-        });
-        legacy_binding_report.push(LegacyPathBindingReportV1 {
-            observation_id: observed.observation_id.clone(),
-            planned_binding_id: planned_binding_id.clone(),
-            store_kind: observed.store_kind,
-            relationship,
-            status: report_status,
-            path_digest: digest_path(literal),
+            literal_selector: classified.literal_selector.clone(),
+            relationship: classified.relationship,
         });
         legacy_path_bindings.insert(
-            planned_binding_id.clone(),
+            classified.planned_binding_id.clone(),
             LegacyPathLedgerEntry {
-                legacy_path_binding_id: planned_binding_id,
-                historical_path: literal.clone(),
-                source_store: legacy_store_kind_token(observed.store_kind).to_string(),
-                source_row_id: observed.stable_row_id.clone(),
+                legacy_path_binding_id: classified.planned_binding_id.clone(),
+                historical_path: classified.literal_selector.clone(),
+                source_store: legacy_store_kind_token(source.store_kind).to_string(),
+                source_row_id: source.stable_row_id.clone(),
                 inventory_epoch: 1,
                 status: ledger_status,
             },
         );
-        sensitive_rows.push(SensitiveLocalPathRowV1 {
-            observation_id: observed.observation_id.clone(),
-            store_kind: observed.store_kind,
-            stable_row_id: observed.stable_row_id.clone(),
-            literal_selector: literal.clone(),
-        });
     }
     post_image_legacy_bindings
         .sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
-    legacy_binding_report.sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
-    let sensitive_report = SensitiveLocalPathReportV1::from_runtime_rows(inventory, sensitive_rows)
-        .map_err(inventory_error)?;
     let attachments = AttachmentSnapshotV1 {
         version: 1,
         epoch: 1,
@@ -2293,11 +2361,11 @@ fn build_base_post_images(
         attachments,
         post_image_attachments,
         post_image_legacy_bindings,
-        legacy_binding_report,
-        sensitive_report,
+        legacy_binding_report: classified_legacy_paths.report_rows.clone(),
+        sensitive_report: classified_legacy_paths.sensitive_report.clone(),
         missing_paths,
-        unscoped_legacy_counts,
-        refusal_count,
+        unscoped_legacy_counts: classified_legacy_paths.unscoped_counts.clone(),
+        refusal_count: classified_legacy_paths.refusal_count,
     })
 }
 
@@ -3089,56 +3157,10 @@ fn build_migration_report(
     Ok(report)
 }
 
-fn build_non_executable_review_rows(
+fn missing_project_rows(
     inventory: &V1ProjectCatalogInventory,
-    runtime: &MigrationRuntimeBindingsViewV1,
-    identities: &MigrationPersistedIdentityPlanV1,
-    status: ProjectCatalogMigrationStatusV1,
-) -> Result<
-    (
-        Vec<LegacyPathBindingReportV1>,
-        Vec<MissingPathReportV1>,
-        BTreeMap<crate::project_catalog_inventory::LegacyPathStoreKindV1, u64>,
-        SensitiveLocalPathReportV1,
-    ),
-    ProjectCatalogMigrationError,
-> {
-    let binding_status = match status {
-        ProjectCatalogMigrationStatusV1::Refused => LegacyPathBindingStatusV1::Refused,
-        ProjectCatalogMigrationStatusV1::ResolutionRequired => {
-            LegacyPathBindingStatusV1::ResolutionRequired
-        }
-        ProjectCatalogMigrationStatusV1::Clean => LegacyPathBindingStatusV1::Planned,
-    };
-    let mut bindings = Vec::new();
-    let mut sensitive_rows = Vec::new();
-    let mut counts = BTreeMap::new();
-    for observed in &inventory.legacy_path_observations {
-        let literal = runtime
-            .legacy_selectors
-            .get(&observed.observation_id)
-            .ok_or_else(|| planner_error("legacy selector runtime binding is missing"))?;
-        *counts.entry(observed.store_kind).or_default() += 1;
-        bindings.push(LegacyPathBindingReportV1 {
-            observation_id: observed.observation_id.clone(),
-            planned_binding_id: identities
-                .legacy_path_binding_ids
-                .get(&observed.observation_id)
-                .ok_or_else(|| planner_error("legacy path identity plan is incomplete"))?
-                .clone(),
-            store_kind: observed.store_kind,
-            relationship: LegacyPathRelationshipV1::Unscoped,
-            status: binding_status,
-            path_digest: digest_path(literal),
-        });
-        sensitive_rows.push(SensitiveLocalPathRowV1 {
-            observation_id: observed.observation_id.clone(),
-            store_kind: observed.store_kind,
-            stable_row_id: observed.stable_row_id.clone(),
-            literal_selector: literal.clone(),
-        });
-    }
-    let missing = inventory
+) -> Result<Vec<MissingPathReportV1>, ProjectCatalogMigrationError> {
+    inventory
         .legacy_projects
         .iter()
         .filter(|project| {
@@ -3152,10 +3174,7 @@ fn build_non_executable_review_rows(
                 path_digest: project.record.canonical_path_digest.clone(),
             })
         })
-        .collect::<Result<Vec<_>, ProjectCatalogMigrationError>>()?;
-    let sensitive = SensitiveLocalPathReportV1::from_runtime_rows(inventory, sensitive_rows)
-        .map_err(inventory_error)?;
-    Ok((bindings, missing, counts, sensitive))
+        .collect()
 }
 
 fn non_executable_assessment_hash(
@@ -3547,33 +3566,51 @@ fn prepare_closed_migration(
         &assessment.retained_attachment_ids,
         prior_report.as_ref(),
     )?;
+    let classified_legacy_paths = classify_legacy_paths(inventory, &runtime, &identities)?;
+    assessment.refusal_count = assessment
+        .refusal_count
+        .saturating_add(classified_legacy_paths.refusal_count);
     if assessment.status() != ProjectCatalogMigrationStatusV1::Clean {
-        return prepare_assessment_only(
+        return prepare_assessment_only_with_rows(
             inventory,
             &runtime,
             &resolution_bytes,
             &assessment,
             &identities,
             include_sensitive_paths,
+            classified_legacy_paths.report_rows,
+            missing_project_rows(inventory)?,
+            classified_legacy_paths.unscoped_counts,
+            classified_legacy_paths.sensitive_report,
         );
     }
 
-    let base =
-        match build_base_post_images(inventory, &runtime, &assessment, &identities, &resolution) {
-            Ok(base) => base,
-            Err(MigrationBasePostImagesFailureV1::Refused(_)) => {
-                assessment.refusal_count = assessment.refusal_count.saturating_add(1);
-                return prepare_assessment_only(
-                    inventory,
-                    &runtime,
-                    &resolution_bytes,
-                    &assessment,
-                    &identities,
-                    include_sensitive_paths,
-                );
-            }
-            Err(MigrationBasePostImagesFailureV1::Error(error)) => return Err(error),
-        };
+    let base = match build_base_post_images(
+        inventory,
+        &runtime,
+        &assessment,
+        &identities,
+        &resolution,
+        &classified_legacy_paths,
+    ) {
+        Ok(base) => base,
+        Err(MigrationBasePostImagesFailureV1::Refused(_)) => {
+            assessment.refusal_count = assessment.refusal_count.saturating_add(1);
+            return prepare_assessment_only_with_rows(
+                inventory,
+                &runtime,
+                &resolution_bytes,
+                &assessment,
+                &identities,
+                include_sensitive_paths,
+                classified_legacy_paths.report_rows,
+                missing_project_rows(inventory)?,
+                classified_legacy_paths.unscoped_counts,
+                classified_legacy_paths.sensitive_report,
+            );
+        }
+        Err(MigrationBasePostImagesFailureV1::Error(error)) => return Err(error),
+    };
     if base.refusal_count != 0 {
         assessment.refusal_count = assessment.refusal_count.saturating_add(base.refusal_count);
         return prepare_assessment_only_with_rows(
@@ -3804,20 +3841,22 @@ fn prepare_assessment_only(
     identities: &MigrationPersistedIdentityPlanV1,
     include_sensitive_paths: bool,
 ) -> Result<PreparedClosedMigrationV1, ProjectCatalogMigrationError> {
-    let status = assessment.status();
-    let (legacy_bindings, missing_paths, unscoped, sensitive_paths) =
-        build_non_executable_review_rows(inventory, runtime, identities, status)?;
+    let classified = classify_legacy_paths(inventory, runtime, identities)?;
+    let mut assessment = assessment.clone();
+    assessment.refusal_count = assessment
+        .refusal_count
+        .saturating_add(classified.refusal_count);
     prepare_assessment_only_with_rows(
         inventory,
         runtime,
         resolution_bytes,
-        assessment,
+        &assessment,
         identities,
         include_sensitive_paths,
-        legacy_bindings,
-        missing_paths,
-        unscoped,
-        sensitive_paths,
+        classified.report_rows,
+        missing_project_rows(inventory)?,
+        classified.unscoped_counts,
+        classified.sensitive_report,
     )
 }
 
@@ -5120,9 +5159,16 @@ mod tests {
             )]),
         };
 
-        let refusal =
-            build_base_post_images(&inventory, &runtime, &assessment, &identities, &resolution)
-                .unwrap_err();
+        let classified = classify_legacy_paths(&inventory, &runtime, &identities).unwrap();
+        let refusal = build_base_post_images(
+            &inventory,
+            &runtime,
+            &assessment,
+            &identities,
+            &resolution,
+            &classified,
+        )
+        .unwrap_err();
         assert!(matches!(
             refusal,
             MigrationBasePostImagesFailureV1::Refused(
@@ -5153,6 +5199,7 @@ mod tests {
             &assessment,
             &identities,
             &resolution,
+            &classified,
         )
         .unwrap_err();
         assert!(matches!(
@@ -5164,5 +5211,125 @@ mod tests {
         let wrong_resolution =
             ProjectCatalogMigrationResolutionV1::empty(Sha256ValueV1::digest(b"wrong inventory"));
         assert!(assess_migration_semantics(&inventory, &wrong_resolution).is_err());
+    }
+
+    #[test]
+    fn canonical_legacy_path_classification_is_reused_by_assessment_and_executable_paths() {
+        let inventory = crate::project_catalog_inventory::tests::fixture_inventory();
+        let resolution =
+            ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
+        let assessment = assess_migration_semantics(&inventory, &resolution).unwrap();
+        let identities = build_persisted_identity_plan(
+            &inventory,
+            &assessment.resolved_project_scopes,
+            &assessment.retained_attachment_ids,
+            None,
+        )
+        .unwrap();
+        let mut runtime = MigrationRuntimeBindingsViewV1 {
+            legacy_project_store_bytes: Vec::new(),
+            legacy_project_store_was_missing: false,
+            legacy_project_paths: BTreeMap::from([
+                (
+                    "legacy_alpha".to_string(),
+                    PathBuf::from("/workspace/acme/services/alpha"),
+                ),
+                (
+                    "legacy_beta".to_string(),
+                    PathBuf::from("/workspace/acme/services/beta"),
+                ),
+            ]),
+            checkout_paths: BTreeMap::from([(
+                "checkout_acme".to_string(),
+                PathBuf::from("/workspace/acme"),
+            )]),
+            git_common_directories: BTreeMap::new(),
+            legacy_selectors: BTreeMap::from([(
+                "legacy_path_alpha".to_string(),
+                "/workspace/acme/services/alpha/src/Example.java".to_string(),
+            )]),
+        };
+
+        let contained = classify_legacy_paths(&inventory, &runtime, &identities).unwrap();
+        assert_eq!(
+            contained.report_rows[0].relationship,
+            LegacyPathRelationshipV1::Contained
+        );
+        let base = build_base_post_images(
+            &inventory,
+            &runtime,
+            &assessment,
+            &identities,
+            &resolution,
+            &contained,
+        )
+        .unwrap();
+        assert_eq!(base.legacy_binding_report, contained.report_rows);
+
+        let mut refused_assessment = assessment.clone();
+        refused_assessment.refusal_count = 1;
+        let prepared = prepare_assessment_only(
+            &inventory,
+            &runtime,
+            &encode_migration_resolution_v1(&resolution).unwrap(),
+            &refused_assessment,
+            &identities,
+            false,
+        )
+        .unwrap();
+        let report = decode_migration_report_v1(&prepared.preflight.report_bytes).unwrap();
+        assert_eq!(report.legacy_path_bindings, contained.report_rows);
+
+        runtime.legacy_selectors.insert(
+            "legacy_path_alpha".to_string(),
+            "/workspace/acme/services/alpha".to_string(),
+        );
+        assert_eq!(
+            classify_legacy_paths(&inventory, &runtime, &identities)
+                .unwrap()
+                .report_rows[0]
+                .relationship,
+            LegacyPathRelationshipV1::ExactRoot
+        );
+        runtime.legacy_selectors.insert(
+            "legacy_path_alpha".to_string(),
+            "/outside/unscoped".to_string(),
+        );
+        let unscoped = classify_legacy_paths(&inventory, &runtime, &identities).unwrap();
+        assert_eq!(
+            unscoped.report_rows[0].relationship,
+            LegacyPathRelationshipV1::Unscoped
+        );
+        assert_eq!(
+            unscoped
+                .unscoped_counts
+                .get(&crate::project_catalog_inventory::LegacyPathStoreKindV1::Knowledge),
+            Some(&1)
+        );
+
+        runtime.legacy_selectors.insert(
+            "legacy_path_alpha".to_string(),
+            "/workspace/acme/services/alpha/src/Example.java".to_string(),
+        );
+        let mut missing_inventory = inventory.clone();
+        missing_inventory.legacy_projects[0].path_status =
+            crate::project_catalog_inventory::LegacyProjectPathStatusV1::Missing;
+        let missing = classify_legacy_paths(&missing_inventory, &runtime, &identities).unwrap();
+        assert_eq!(
+            missing.report_rows[0].relationship,
+            LegacyPathRelationshipV1::MissingProject
+        );
+        assert_eq!(missing.refusal_count, 1);
+
+        runtime.legacy_project_paths.insert(
+            "legacy_beta".to_string(),
+            PathBuf::from("/workspace/acme/services/alpha"),
+        );
+        let ambiguous = classify_legacy_paths(&inventory, &runtime, &identities).unwrap();
+        assert_eq!(
+            ambiguous.report_rows[0].relationship,
+            LegacyPathRelationshipV1::Ambiguous
+        );
+        assert_eq!(ambiguous.refusal_count, 1);
     }
 }
