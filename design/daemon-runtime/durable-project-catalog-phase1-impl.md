@@ -1001,6 +1001,7 @@ alias_conflicts
 activation_conflicts
 publisher_bindings
 publisher_binding_conflicts
+refusals
 predicted_g1_assets
 predicted_accepted_pointer_hashes
 missing_paths
@@ -1011,10 +1012,22 @@ predicted_attachment_hash
 predicted_participant_hashes
 ```
 
+`refusals` is the complete canonical path-redacted
+`MigrationRefusalReportV1` set. Each row contains a stable diagnostic code and
+the exact bounded set of affected inventory record ids. It includes every
+`V1ProjectCatalogInventory::hard_refusals()` row plus every later
+non-overridable semantic refusal discovered by canonical path, attachment,
+history-group, or authority classification. Report validation derives the
+inventory-owned subset again and requires exact equality. The preflight
+receipt's `refusal_count` equals `refusals.len()`; a nonzero count without the
+matching report rows is invalid output.
+
 `clean` means apply can produce the exact predicted post-images without operator
 judgment. `resolution_required` means every conflict has a supported bounded
 resolution shape. `refused` means the inventory is corrupt, incomplete, or
-contains a conflict no resolution schema may override.
+contains a conflict no resolution schema may override. `refused` requires at
+least one canonical refusal row. `clean` and `resolution_required` require
+none. A successful refusal never leaves the operator with only a count.
 
 Preflight writes no project, checkout marker, attachment, activation, index,
 vector, edge, knowledge, gap, or coordination state. Writing the explicit
@@ -1066,7 +1079,10 @@ without explicit operator authorship.
 
 Unknown resolution keys, unknown record ids, stale inventory hashes, duplicate
 dispositions, incomplete dispositions, and attempts to remint/reassign a
-preserved project id fail closed.
+preserved project id fail closed. Syntactically valid but semantically unknown,
+duplicated, stale, mismatched, or unsupported dispositions are invalid
+resolution artifacts and return a path-redacted `NoDurableMutation` error;
+they are not converted into a successful `refused` inventory result.
 
 A publisher disposition is exactly one of:
 
@@ -1403,6 +1419,10 @@ Fixture and property tests cover:
 - canonical inventory JSON containing no absolute path or literal legacy
   selector, with non-serializable runtime bindings recaptured and digest-joined
   under the same owner locks; and
+- exact redacted refusal rows for every missing/corrupt owner and
+  non-overridable semantic refusal, with `refusal_count` bound to their
+  cardinality, plus proof that unknown or mismatched resolution dispositions
+  return an artifact error rather than a successful refusal;
 - complete mapped/unscoped classification from typed literal observations
   without a second live-store read.
 

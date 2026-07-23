@@ -1806,9 +1806,13 @@ implemented.
   scope-changing rename, corrupt catalog, dangling attachment, and malformed id
   all refuse before replacing v1 state.
 - A refused preflight emits an inventory-hash-bound report; a valid survivor
-  mapping leaves losing ids LegacyLocal; apply succeeds on retry; changed v1
-  state invalidates the mapping; v2 startup before apply gives the offline
-  command and does not bind.
+  mapping leaves losing ids LegacyLocal; the report names the complete
+  path-redacted refusal set by stable diagnostic code and affected record ids;
+  its receipt count matches that set exactly; apply succeeds on retry; changed
+  v1 state invalidates the mapping; v2 startup before apply gives the offline
+  command and does not bind. Unknown, duplicated, or mismatched resolution
+  dispositions fail as invalid artifacts and cannot masquerade as a successful
+  refused inventory.
 - The v1-compatible bridge holds the lifetime migration lock, a concurrent
   apply refuses, and apply succeeds only after bridge shutdown releases it.
 - A duplicate-scope loser with active collected state requires explicit
