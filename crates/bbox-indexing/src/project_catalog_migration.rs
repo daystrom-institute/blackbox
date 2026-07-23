@@ -5274,7 +5274,7 @@ mod tests {
         );
         assert_eq!(layout.provenance_notes_ref, "refs/notes/bb/provenance");
         assert_eq!(
-            owner_inventory_paths(&layout, Vec::new()).whiteboard_root,
+            owner_inventory_paths(&layout).whiteboard_root,
             rehearsal.join("state").join("bro").join("whiteboards")
         );
         assert!(

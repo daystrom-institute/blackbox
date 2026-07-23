@@ -524,7 +524,7 @@ fn capture_publisher_ref_source(
 
 #[derive(Debug, Clone)]
 struct CommittedConfigSourceV1 {
-    pub repository_root: AuthorizedInventoryPath,
+    pub repository_root: PathBuf,
     pub repository: StableGitRepository,
     pub commit: VerifiedCommit,
 }
@@ -561,7 +561,7 @@ fn observe_committed_authority_probe(
     };
     let relative_root = project_root
         .as_path()
-        .strip_prefix(source.repository_root.as_path())
+        .strip_prefix(&source.repository_root)
         .map_err(|_| invalid_input("project root is outside committed repository authority"))?;
     let relative_root = relative_root
         .components()
@@ -647,7 +647,6 @@ fn observe_committed_authority_probe(
 struct LegacyProjectProbeInputV1 {
     pub project_id: ProjectId,
     pub authorized_canonical_path: AuthorizedInventoryPath,
-    pub repository_root: Option<AuthorizedInventoryPath>,
     pub repository: Option<StableGitRepository>,
     pub committed_config: Option<CommittedConfigSourceV1>,
 }
@@ -666,6 +665,14 @@ struct LegacyProjectsCaptureV1 {
 fn derive_legacy_project_probes(
     source: &ExactDecodedSourceV1<LegacyProjectStoreV1>,
     rehearsal_root: Option<&Path>,
+) -> AdapterResult<Vec<LegacyProjectProbeInputV1>> {
+    derive_legacy_project_probes_with_hook(source, rehearsal_root, |_| {})
+}
+
+fn derive_legacy_project_probes_with_hook(
+    source: &ExactDecodedSourceV1<LegacyProjectStoreV1>,
+    rehearsal_root: Option<&Path>,
+    mut after_repository_open: impl FnMut(&StableGitRepository),
 ) -> AdapterResult<Vec<LegacyProjectProbeInputV1>> {
     source
         .value
@@ -688,16 +695,8 @@ fn derive_legacy_project_probes(
             };
             if let Some(repository) = &repository {
                 validate_stable_repository_containment(repository, rehearsal_root)?;
-            }
-            let repository_root = repository
-                .as_ref()
-                .map(|repository| AuthorizedInventoryPath::new(repository.repository_root()))
-                .transpose()?;
-            if let Some(repository_root) = &repository_root {
-                validate_authorized_containment(
-                    std::slice::from_ref(repository_root),
-                    rehearsal_root,
-                )?;
+                after_repository_open(repository);
+                project_root.ensure_authority()?;
             }
             let committed_config = repository
                 .as_ref()
@@ -709,9 +708,11 @@ fn derive_legacy_project_probes(
                 .transpose()?
                 .flatten()
                 .map(|commit| CommittedConfigSourceV1 {
-                    repository_root: repository_root
-                        .clone()
-                        .expect("verified repository has a root authority"),
+                    repository_root: repository
+                        .as_ref()
+                        .expect("verified commit has a repository authority")
+                        .repository_root()
+                        .to_path_buf(),
                     repository: repository
                         .clone()
                         .expect("verified commit has a repository authority"),
@@ -720,7 +721,6 @@ fn derive_legacy_project_probes(
             Ok(LegacyProjectProbeInputV1 {
                 project_id,
                 authorized_canonical_path: project_root,
-                repository_root,
                 repository,
                 committed_config,
             })
@@ -1800,13 +1800,6 @@ pub(crate) struct AttachmentCandidateIdentityPlanV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProjectCatalogProvenanceOwnerSourceV1 {
-    pub(crate) project_id: ProjectId,
-    pub(crate) repository_root: PathBuf,
-    pub(crate) notes_ref: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectCatalogOwnerInventoryPathsV1 {
     pub(crate) corpus_index_root: PathBuf,
     pub(crate) git_cursor_root: PathBuf,
@@ -2064,39 +2057,6 @@ impl ProjectCatalogMigrationInventoryResultV1 {
 pub(crate) struct ProjectCatalogMigrationInventoryFacadeV1;
 
 impl ProjectCatalogMigrationInventoryFacadeV1 {
-    pub(crate) fn discover_provenance_owner_sources(
-        legacy_project_store_path: PathBuf,
-        notes_ref: String,
-        rehearsal_root: Option<PathBuf>,
-    ) -> Result<Vec<ProjectCatalogProvenanceOwnerSourceV1>, InventoryAdapterError> {
-        let legacy_project_store_path = AuthorizedInventoryPath::new(&legacy_project_store_path)?;
-        let projects_path = legacy_project_store_path.as_path().to_path_buf();
-        crate::project_catalog_store::capture_migration_preflight_with(
-            &projects_path,
-            |error| invalid_source(error.to_string()),
-            || {
-                let legacy_source = accept_missing_legacy_projects_source(
-                    capture_legacy_projects_source(&legacy_project_store_path)?,
-                )?;
-                let probes =
-                    derive_legacy_project_probes(&legacy_source, rehearsal_root.as_deref())?;
-                validate_probe_containment(&probes, rehearsal_root.as_deref())?;
-                probes
-                    .into_iter()
-                    .filter_map(|probe| {
-                        probe.repository_root.map(|repository_root| {
-                            Ok(ProjectCatalogProvenanceOwnerSourceV1 {
-                                project_id: probe.project_id,
-                                repository_root: repository_root.as_path().to_path_buf(),
-                                notes_ref: notes_ref.clone(),
-                            })
-                        })
-                    })
-                    .collect()
-            },
-        )
-    }
-
     pub(crate) fn discover_checkout_observation_bindings(
         checkout_roots: Vec<PathBuf>,
     ) -> Result<BTreeMap<String, PathBuf>, InventoryAdapterError> {
@@ -2233,10 +2193,7 @@ fn validate_probe_containment(
 ) -> AdapterResult<()> {
     let paths = probes
         .iter()
-        .flat_map(|probe| {
-            std::iter::once(probe.authorized_canonical_path.clone())
-                .chain(probe.repository_root.iter().cloned())
-        })
+        .map(|probe| probe.authorized_canonical_path.clone())
         .collect::<Vec<_>>();
     validate_authorized_containment(&paths, rehearsal_root)
 }
@@ -4368,13 +4325,18 @@ mod tests {
 
         let project_id = ProjectId::parse("project-a").unwrap();
         let root = AuthorizedInventoryPath::new(&root).unwrap();
+        let repository = open_stable_git_repository(&root.authority)
+            .unwrap()
+            .unwrap();
+        let verified_commit = repository.verify_commit_oid(&commit).unwrap();
         let probe = observe_committed_authority_probe(
             "committed-config-project-a",
             &project_id,
             &root,
             Some(&CommittedConfigSourceV1 {
-                repository_root: root.clone(),
-                commit_oid: commit.clone(),
+                repository_root: root.as_path().to_path_buf(),
+                repository,
+                commit: verified_commit,
             }),
         )
         .unwrap();
@@ -4862,10 +4824,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let authorized = AuthorizedInventoryPath::new(&root).unwrap();
-        let first = observe_checkout(&authorized).unwrap();
+        let first = observe_checkout(&authorized, None).unwrap();
         write(&root.join("temporary"), b"x");
         fs::remove_file(root.join("temporary")).unwrap();
-        let second = observe_checkout(&authorized).unwrap();
+        let second = observe_checkout(&authorized, None).unwrap();
         assert_eq!(
             first.root_source_evidence.state,
             second.root_source_evidence.state
@@ -5008,6 +4970,7 @@ mod tests {
             owner_state: present_owner_state("legacy"),
             published_scopes: BTreeMap::new(),
             project_roots: BTreeMap::new(),
+            repositories: BTreeMap::new(),
             runtime_project_paths: BTreeMap::new(),
         }
     }
@@ -5055,6 +5018,79 @@ mod tests {
                 rows: Vec::new(),
             },
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_probe_rejects_checkout_swap_before_any_repository_read() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let rehearsal = root.join("rehearsal");
+        let project = rehearsal.join("project");
+        let outside = root.join("protected");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        run_git(&project, &["init", "-q"]);
+        run_git(&outside, &["init", "-q"]);
+        write(
+            &project.join(".bbox/config.toml"),
+            b"[project]\nrepo_id = \"inside-authority\"\n",
+        );
+        run_git(&project, &["add", ".bbox/config.toml"]);
+        run_git(&project, &["commit", "-qm", "inside"]);
+        write(
+            &outside.join(".bbox/config.toml"),
+            b"[project]\nrepo_id = \"outside-sentinel\"\n",
+        );
+        run_git(&outside, &["add", ".bbox/config.toml"]);
+        run_git(&outside, &["commit", "-qm", "outside"]);
+        let projects_path = rehearsal.join("projects.json");
+        write(
+            &projects_path,
+            &serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "projects": [{
+                    "project_id": "project-a",
+                    "canonical_path": project,
+                    "registered_at": "2026-01-01T00:00:00Z",
+                    "is_git_repo": true
+                }]
+            }))
+            .unwrap(),
+        );
+        let projects_path = AuthorizedInventoryPath::new(&projects_path).unwrap();
+        let source = accept_missing_legacy_projects_source(
+            capture_legacy_projects_source(&projects_path).unwrap(),
+        )
+        .unwrap();
+        let held = rehearsal.join("held-project");
+        let error =
+            derive_legacy_project_probes_with_hook(&source, Some(&rehearsal), |repository| {
+                fs::rename(&project, &held).unwrap();
+                symlink(&outside, &project).unwrap();
+                let head = repository.verified_head().unwrap().unwrap();
+                let committed = read_verified_committed_file_bytes_optional_bounded(
+                    &head,
+                    ".bbox/config.toml",
+                    MAX_COMMITTED_CONFIG_BYTES,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(committed, b"[project]\nrepo_id = \"inside-authority\"\n");
+                assert!(
+                    !committed
+                        .windows(b"outside-sentinel".len())
+                        .any(|window| window == b"outside-sentinel")
+                );
+            })
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_inventory_adapter_source"
+        );
+        assert!(!error.to_string().contains("outside-sentinel"));
     }
 
     fn namespace_vector_snapshot() -> VectorMigrationSnapshotV1 {
@@ -5209,48 +5245,5 @@ mod tests {
             error.code(),
             "error.project_catalog_inventory_adapter_input"
         );
-    }
-
-    #[test]
-    fn provenance_discovery_includes_an_unborn_git_repository() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().canonicalize().unwrap();
-        let repository = root.join("unborn");
-        fs::create_dir_all(&repository).unwrap();
-        assert!(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(&repository)
-                .args(["init", "-q"])
-                .status()
-                .unwrap()
-                .success()
-        );
-        let projects = root.join("projects.json");
-        write(
-            &projects,
-            &serde_json::to_vec(&serde_json::json!({
-                "version": 1,
-                "projects": [{
-                    "project_id": "unborn-project",
-                    "canonical_path": repository,
-                    "registered_at": "2026-01-01T00:00:00Z",
-                    "is_git_repo": true
-                }]
-            }))
-            .unwrap(),
-        );
-
-        let sources = ProjectCatalogMigrationInventoryFacadeV1::discover_provenance_owner_sources(
-            projects,
-            "refs/notes/blackbox".to_string(),
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].project_id.as_str(), "unborn-project");
-        assert_eq!(sources[0].repository_root, repository);
-        assert_eq!(sources[0].notes_ref, "refs/notes/blackbox");
     }
 }

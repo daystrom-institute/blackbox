@@ -216,17 +216,64 @@ impl StableGitRepository {
                 duplicate_stable_repository(&self.authority)?,
                 &commit_oid,
             )?;
-            let paths = list_verified_committed_dir_bounded(&commit, ".", max_entries, max_bytes)?;
-            let mut total_bytes = 0_usize;
-            let mut entries = Vec::with_capacity(paths.len());
-            for path in paths {
-                let normalized_path = path.strip_prefix("./").unwrap_or(&path);
-                let target_oid = normalized_path.replace('/', "");
+            let listing = run_stable_repository_stdout_bounded(
+                &self.authority,
+                &["ls-tree", "-r", "-z", commit.oid()],
+                "listing exact stable Git notes tree",
+                max_bytes,
+            )?;
+            let mut listed = Vec::new();
+            for raw_entry in listing.split(|byte| *byte == 0) {
+                if raw_entry.is_empty() {
+                    continue;
+                }
+                if listed.len() >= max_entries {
+                    anyhow::bail!("stable Git notes snapshot exceeds its entry limit");
+                }
+                let tab = raw_entry
+                    .iter()
+                    .position(|byte| *byte == b'\t')
+                    .context("stable Git notes tree entry is malformed")?;
+                let header = std::str::from_utf8(&raw_entry[..tab])
+                    .context("stable Git notes tree header is not UTF-8")?;
+                let mut fields = header.split_whitespace();
+                let (Some(mode), Some(kind), Some(note_oid), None) =
+                    (fields.next(), fields.next(), fields.next(), fields.next())
+                else {
+                    anyhow::bail!("stable Git notes tree header is malformed");
+                };
+                if mode != "100644" || kind != "blob" {
+                    anyhow::bail!("stable Git notes tree contains a non-blob entry");
+                }
+                validate_full_object_id(note_oid)?;
+                if note_oid.len() != commit.oid().len() {
+                    anyhow::bail!("stable Git note object id uses the wrong object format");
+                }
+                let path = std::str::from_utf8(&raw_entry[tab + 1..])
+                    .context("stable Git notes tree path is not UTF-8")?;
+                let target_oid = path.replace('/', "");
                 validate_full_object_id(&target_oid)?;
+                if target_oid.len() != commit.oid().len() {
+                    anyhow::bail!("stable Git note target uses the wrong object format");
+                }
+                listed.push((target_oid, note_oid.to_string()));
+            }
+            listed.sort();
+            if listed.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+                anyhow::bail!("stable Git notes tree repeats a target object");
+            }
+            let mut total_bytes = listing.len();
+            let mut entries = Vec::with_capacity(listed.len());
+            for (target_oid, note_oid) in listed {
                 let remaining = max_bytes
                     .checked_sub(total_bytes)
                     .context("stable Git notes snapshot exceeds its aggregate byte limit")?;
-                let bytes = read_verified_committed_file_bytes_bounded(&commit, &path, remaining)?;
+                let bytes = run_stable_repository_stdout_bounded(
+                    &self.authority,
+                    &["cat-file", "blob", &note_oid],
+                    "reading exact stable Git note blob",
+                    remaining,
+                )?;
                 total_bytes = total_bytes
                     .checked_add(bytes.len())
                     .context("stable Git notes snapshot byte count overflow")?;
@@ -4023,5 +4070,120 @@ mod tests {
             Some(base.as_str()),
             "merge-base of diverged branches is their common ancestor"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_repository_keeps_exact_authority_across_path_and_git_swaps() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let checkout = root.join("rehearsal/checkout");
+        let outside = root.join("protected");
+        fs::create_dir_all(&checkout).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        init_repo(&checkout);
+        init_repo(&outside);
+        write(&checkout, ".bbox/config.toml", "inside-authority\n");
+        write(&checkout, "tracked.txt", "inside\n");
+        run_git(&checkout, &["add", "."]);
+        run_git(&checkout, &["commit", "-q", "-m", "inside"]);
+        let inside_head = current_head(&checkout).unwrap();
+        run_git(
+            &checkout,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/stable-test",
+                "add",
+                "-m",
+                "inside-note",
+                &inside_head,
+            ],
+        );
+        write(&outside, ".bbox/config.toml", "outside-sentinel\n");
+        write(&outside, "tracked.txt", "outside\n");
+        run_git(&outside, &["add", "."]);
+        run_git(&outside, &["commit", "-q", "-m", "outside"]);
+        let outside_head = current_head(&outside).unwrap();
+        assert_ne!(inside_head, outside_head);
+
+        let authority = NofollowDirectory::open_existing(&checkout)
+            .unwrap()
+            .unwrap();
+        let repository = open_stable_git_repository(&authority).unwrap().unwrap();
+        let first_snapshot = repository
+            .snapshot_notes_bounded("refs/notes/stable-test", 16, 64 * 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_snapshot.len(), 1);
+        assert_eq!(first_snapshot[0].target_oid, inside_head);
+        assert_eq!(first_snapshot[0].bytes, b"inside-note\n");
+
+        run_git(
+            &checkout,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/stable-test",
+                "add",
+                "-f",
+                "-m",
+                "moved-note",
+                &inside_head,
+            ],
+        );
+        assert_eq!(
+            first_snapshot[0].bytes, b"inside-note\n",
+            "an already captured immutable snapshot must not follow a moved notes ref"
+        );
+        let moved_snapshot = repository
+            .snapshot_notes_bounded("refs/notes/stable-test", 16, 64 * 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(moved_snapshot[0].bytes, b"moved-note\n");
+
+        let held_checkout = root.join("rehearsal/held-checkout");
+        fs::rename(&checkout, &held_checkout).unwrap();
+        symlink(&outside, &checkout).unwrap();
+        fs::rename(held_checkout.join(".git"), held_checkout.join(".git-held")).unwrap();
+        symlink(outside.join(".git"), held_checkout.join(".git")).unwrap();
+
+        let head = repository.verified_head().unwrap().unwrap();
+        assert_eq!(head.oid(), inside_head);
+        assert_eq!(
+            repository.resolve_commit_oid("HEAD").unwrap().as_deref(),
+            Some(inside_head.as_str())
+        );
+        assert_eq!(
+            repository.first_commit_oid(head.oid()).unwrap().as_deref(),
+            Some(inside_head.as_str())
+        );
+        assert_eq!(
+            read_verified_committed_file_bytes_bounded(&head, ".bbox/config.toml", 1024,).unwrap(),
+            b"inside-authority\n"
+        );
+        let after_swap = repository
+            .snapshot_notes_bounded("refs/notes/stable-test", 16, 64 * 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_swap[0].bytes, b"moved-note\n");
+        assert!(after_swap.iter().all(|entry| {
+            !entry
+                .bytes
+                .windows(16)
+                .any(|window| window == b"outside-sentinel")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_repository_rejects_linked_worktree_git_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        fs::write(root.join(".git"), "gitdir: /outside/repository\n").unwrap();
+        let authority = NofollowDirectory::open_existing(&root).unwrap().unwrap();
+        assert!(open_stable_git_repository(&authority).is_err());
     }
 }

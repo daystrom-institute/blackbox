@@ -614,43 +614,6 @@ pub fn append_note_documents_dedup(
     })
 }
 
-fn git_stdout_bounded(
-    root: &Path,
-    args: &[&str],
-    max_bytes: usize,
-) -> std::result::Result<Vec<u8>, &'static str> {
-    use std::io::Read;
-    use std::process::Stdio;
-
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| "provenance_git_unavailable")?;
-    let mut stdout = child.stdout.take().ok_or("provenance_git_unavailable")?;
-    let limit = max_bytes.checked_add(1).ok_or("owner_source_byte_limit")?;
-    let mut bytes = Vec::new();
-    stdout
-        .by_ref()
-        .take(limit as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "provenance_git_read_failed")?;
-    if bytes.len() > max_bytes {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err("owner_source_byte_limit");
-    }
-    let status = child.wait().map_err(|_| "provenance_git_read_failed")?;
-    if !status.success() {
-        return Err("provenance_git_read_failed");
-    }
-    Ok(bytes)
-}
-
 fn validate_page(root: &Path, page: &ProvenanceExportPage) -> Result<()> {
     if page.project_id.trim().is_empty() {
         bail!("provenance export page project_id must not be empty");
