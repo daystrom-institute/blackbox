@@ -2015,6 +2015,21 @@ impl ProjectCatalogMigrationInventoryResultV1 {
 pub(crate) struct ProjectCatalogMigrationInventoryFacadeV1;
 
 impl ProjectCatalogMigrationInventoryFacadeV1 {
+    pub(crate) fn discover_checkout_observation_bindings(
+        checkout_roots: Vec<PathBuf>,
+    ) -> Result<BTreeMap<String, PathBuf>, InventoryAdapterError> {
+        let checkout_roots = authorize_checkout_roots(&checkout_roots)?;
+        capture_checkout_roots(&checkout_roots)?
+            .into_iter()
+            .map(|capture| {
+                Ok((
+                    capture.observation.observation_id,
+                    capture.runtime_root.as_path().to_path_buf(),
+                ))
+            })
+            .collect()
+    }
+
     pub(crate) fn discover_attachment_candidate_keys(
         request: ProjectCatalogAttachmentCandidateDiscoveryRequestV1,
     ) -> Result<Vec<AttachmentCandidateKeyV1>, InventoryAdapterError> {
@@ -2946,7 +2961,7 @@ fn capture_checkouts_lane(
     )
 }
 
-fn attachment_observation_id(key: &AttachmentCandidateKeyV1) -> AdapterResult<String> {
+pub(crate) fn attachment_observation_id(key: &AttachmentCandidateKeyV1) -> AdapterResult<String> {
     stable_observation_id_v1(
         "attachment",
         &[
