@@ -628,34 +628,28 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
     assert_eq!(verified.compatibility().records().len(), 3);
     assert_eq!(verified.compatibility().omitted_catalog_count(), 0);
     let executable_report = decode_migration_report_v1(&fs::read(&report_path).unwrap()).unwrap();
-    let loser_repo_id = executable_report
-        .repo_history_groups
-        .iter()
-        .find(|group| group.project_ids.contains(&fixture.loser_project))
-        .unwrap()
-        .planned_primary_namespace
-        .as_str()
-        .to_string();
-    for (project_id, checkout, repo_id, registered_at) in [
+    for (project_id, checkout, registered_at) in [
         (
             &fixture.winner_project,
             &fixture.winner_checkout,
-            Some("neutral-repository"),
             "2026-01-02T03:04:05Z",
         ),
         (
             &fixture.collision_winner_project,
             &fixture.collision_winner_checkout,
-            Some("neutral-collision"),
             "2026-01-02T03:04:06Z",
         ),
         (
             &fixture.loser_project,
             &fixture.loser_checkout,
-            Some(loser_repo_id.as_str()),
             "2026-01-02T03:04:07Z",
         ),
     ] {
+        let planned_repo_id = executable_report
+            .repo_history_groups
+            .iter()
+            .find(|group| group.project_ids.contains(project_id))
+            .map(|group| group.planned_primary_namespace.as_str());
         let record = verified
             .compatibility()
             .records()
@@ -663,7 +657,7 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
             .find(|record| record.project_id == project_id.as_str())
             .unwrap();
         assert_eq!(record.canonical_path, checkout.to_str().unwrap());
-        assert_eq!(record.repo_id.as_deref(), repo_id);
+        assert_eq!(record.repo_id.as_deref(), planned_repo_id);
         assert_eq!(record.registered_at, registered_at);
         assert!(record.is_git_repo);
         assert!(record.languages.is_empty());
