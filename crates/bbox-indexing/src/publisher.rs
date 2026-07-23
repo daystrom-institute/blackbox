@@ -32,9 +32,12 @@ use serde::{Deserialize, Serialize};
 use bbox_corpus_core::git;
 use bbox_corpus_core::identity::{RepoIdInputs, bbox_root_relpath, resolve_recorded_repo_id};
 use bbox_corpus_core::json_store::atomic_write_json_locked;
+use bbox_corpus_core::project_catalog::MAX_PROJECT_CATALOG_ENTRIES;
 use bbox_corpus_core::project_record::ProjectRecord;
 
 pub use bbox_corpus_core::identity::PublishedScope;
+
+pub(crate) const MAX_PUBLISHER_REF_ROWS: usize = MAX_PROJECT_CATALOG_ENTRIES;
 
 /// Resolve the published scope a registered project publishes into, if any.
 ///
@@ -130,6 +133,9 @@ fn validate_full_publisher_ref(value: &str) -> Result<()> {
 fn validate_publisher_ref_data(data: &PublisherRefData) -> Result<()> {
     if data.version != 1 {
         anyhow::bail!("unsupported publisher ref source version");
+    }
+    if data.refs.len() > MAX_PUBLISHER_REF_ROWS {
+        anyhow::bail!("publisher ref source exceeds its row limit");
     }
     let mut scopes = BTreeSet::new();
     let mut prior_scope = None;

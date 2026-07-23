@@ -15,15 +15,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bbox_code_source::{
-    GenerationDescriptor, generation_id as code_generation_id, source_selector,
-};
 use bbox_code_source_store::{
-    CodeSourceStorePaths, MigrationEffectiveSourceManifestV1, StoreLimits,
+    CodeSourceStorePaths, MAX_MIGRATION_INVENTORY_GENERATIONS, MigrationEffectiveSourceManifestV1,
+    MigrationLegacyAnchorEvidenceV1, MigrationLegacyInventoryV1, StoreLimits,
     decode_activation_v1_for_migration, decode_activation_v2_for_migration,
     decode_collision_retirement_pending_for_migration,
     decode_migration_effective_source_manifest_v1, decode_stored_generation_v1_for_migration,
-    decode_stored_generation_v2_for_migration, verify_generation_manifest_for_migration,
+    decode_stored_generation_v2_for_migration, enumerate_current_migration_inventory_locked,
+    enumerate_legacy_migration_inventory_locked, verify_generation_manifest_for_migration,
 };
 use bbox_corpus_core::identity::CHECKOUT_LOCAL_GITIGNORE_BYTES;
 use bbox_corpus_core::identity::PublishedScope;
@@ -49,14 +48,16 @@ use crate::accepted_publication_store::{
 use crate::project_catalog_migration_lock::{
     ProjectCatalogMigrationLock, project_catalog_migration_lock_path,
 };
-use crate::publisher::{PublisherRefRow, decode_publisher_ref_source_v1};
+use crate::publisher::{MAX_PUBLISHER_REF_ROWS, PublisherRefRow, decode_publisher_ref_source_v1};
 
 const JOURNAL_VERSION: u32 = 1;
 const MIGRATION_MARKER_VERSION: u32 = 1;
-const MAX_MIGRATION_PARTICIPANTS: usize = MAX_PROJECT_CATALOG_ENTRIES * 5 + 4;
-const MAX_MIGRATION_IMMUTABLE_ASSETS: usize = MAX_PROJECT_CATALOG_ENTRIES * 2 + 2;
+const MAX_MIGRATION_PARTICIPANTS: usize =
+    MAX_MIGRATION_INVENTORY_GENERATIONS + MAX_PROJECT_CATALOG_ENTRIES * 3 + 4;
+const MAX_MIGRATION_IMMUTABLE_ASSETS: usize =
+    MAX_MIGRATION_INVENTORY_GENERATIONS + MAX_PUBLISHER_REF_ROWS + 2;
 const MAX_MIGRATION_CHECKOUT_ACTIONS: usize = MAX_PROJECT_CATALOG_ENTRIES;
-const MAX_MIGRATION_PUBLISHER_PINS: usize = 4 * 1024;
+const MAX_MIGRATION_PUBLISHER_PINS: usize = MAX_PUBLISHER_REF_ROWS;
 const MAX_JOURNAL_BYTES: usize = 512 * 1024 * 1024;
 const MAX_MARKER_BYTES: usize = 512 * 1024 * 1024;
 const MAX_CODE_SOURCE_EFFECTIVE_MANIFEST_BYTES: usize = 512 * 1024 * 1024;
@@ -885,24 +886,24 @@ pub(crate) enum MigrationCodeSourceDispositionV1 {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct MigrationCodeSourceActivationDraftV1 {
+    pub(crate) observation_id: String,
+    pub(crate) project_id: ProjectId,
+    pub(crate) disposition: MigrationCodeSourceDispositionV1,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct MigrationCodeSourceGenerationDraftV1 {
     pub(crate) observation_id: String,
     pub(crate) project_id: ProjectId,
-    pub(crate) published_scope: PublishedScope,
     pub(crate) generation_id: Sha256Hex,
-    pub(crate) selector: String,
-    pub(crate) producer_id: String,
-    pub(crate) descriptor: GenerationDescriptor,
-    pub(crate) manifest_sha256: Sha256Hex,
-    pub(crate) manifest_bytes: Vec<u8>,
-    pub(crate) old_activation: Option<Vec<u8>>,
-    pub(crate) old_stored_metadata: Vec<u8>,
     pub(crate) disposition: MigrationCodeSourceDispositionV1,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct MigrationCodeSourceSnapshotDraftV1 {
-    pub(crate) effective_manifest_old: Option<Vec<u8>>,
+    pub(crate) legacy_inventory: MigrationLegacyInventoryV1,
+    pub(crate) activations: Vec<MigrationCodeSourceActivationDraftV1>,
     pub(crate) generations: Vec<MigrationCodeSourceGenerationDraftV1>,
 }
 
@@ -911,6 +912,39 @@ pub(crate) struct MigrationCodeSourceSnapshotDraftV1 {
 pub(crate) struct MigrationCheckoutIdentityActionDraftV1 {
     observation_id: String,
     planned_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum MigrationPublisherSourceDraftV1 {
+    Missing,
+    Present(Vec<u8>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+enum MigrationPublisherSourceEvidenceV1 {
+    Missing { absence_sha256: Sha256Hex },
+    Present { sha256: Sha256Hex },
+}
+
+impl MigrationPublisherSourceEvidenceV1 {
+    fn missing() -> Self {
+        Self::Missing {
+            absence_sha256: publisher_source_absence_sha256(),
+        }
+    }
+
+    fn validate(&self) -> ProjectCatalogStoreResult<()> {
+        if let Self::Missing { absence_sha256 } = self
+            && absence_sha256 != &publisher_source_absence_sha256()
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_publisher_evidence",
+                "publisher source absence fingerprint is invalid",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[allow(dead_code)] // P1-B transaction input consumed by P1-C.
@@ -1208,35 +1242,39 @@ fn validate_code_source_snapshot(
             format!("code-source snapshot validation failed: {detail}"),
         )
     };
-    if snapshot.generations.len() > MAX_PROJECT_CATALOG_ENTRIES {
-        return Err(fail("generation evidence exceeds its cardinality limit"));
+    if snapshot.activations.len() > MAX_PROJECT_CATALOG_ENTRIES
+        || snapshot.generations.len() > MAX_MIGRATION_INVENTORY_GENERATIONS
+    {
+        return Err(fail("source evidence exceeds its cardinality limit"));
     }
-    let old_effective = match &snapshot.effective_manifest_old {
-        Some(bytes) => {
-            if expected_old
-                .get(&ParticipantRoleV1::EffectiveSourceManifest)
-                .and_then(Option::as_ref)
-                != Some(&sha256(bytes))
-            {
-                return Err(fail(
-                    "effective source old bytes disagree with participant evidence",
-                ));
-            }
-            Some(
-                decode_migration_effective_source_manifest_v1(bytes)
-                    .map_err(|error| fail(error.to_string()))?,
-            )
-        }
-        None => {
+    let old_effective = match &snapshot.legacy_inventory.anchor {
+        MigrationLegacyAnchorEvidenceV1::Missing => {
             if expected_old
                 .get(&ParticipantRoleV1::EffectiveSourceManifest)
                 .is_some_and(Option::is_some)
             {
                 return Err(fail(
-                    "effective source old absence disagrees with participant",
+                    "legacy effective source absence disagrees with participant",
                 ));
             }
             None
+        }
+        MigrationLegacyAnchorEvidenceV1::Present {
+            bytes,
+            sha256: anchor_sha256,
+        } => {
+            if Sha256Hex::parse(anchor_sha256.clone()).map_err(contract_error)? != sha256(bytes)
+                || expected_old
+                    .get(&ParticipantRoleV1::EffectiveSourceManifest)
+                    .and_then(Option::as_ref)
+                    != Some(&sha256(bytes))
+            {
+                return Err(fail("legacy effective source bytes or hash disagree"));
+            }
+            Some(
+                decode_migration_effective_source_manifest_v1(bytes)
+                    .map_err(|error| fail(error.to_string()))?,
+            )
         }
     };
     let new_effective_bytes = post_images
@@ -1261,107 +1299,104 @@ fn validate_code_source_snapshot(
         .iter()
         .map(|selection| (selection.project_id.clone(), selection))
         .collect::<BTreeMap<_, _>>();
+
+    let inventory_activations = snapshot
+        .legacy_inventory
+        .activations
+        .iter()
+        .map(|row| (row.project_id.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let inventory_generations = snapshot
+        .legacy_inventory
+        .generations
+        .iter()
+        .map(|row| (row.generation_id.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
+    if inventory_activations.len() != snapshot.legacy_inventory.activations.len()
+        || inventory_generations.len() != snapshot.legacy_inventory.generations.len()
+    {
+        return Err(fail("legacy inventory contains duplicate identities"));
+    }
+
     let mut observation_ids = BTreeSet::new();
-    let mut generation_keys = BTreeSet::new();
+    let mut planned_activations = BTreeMap::new();
+    for activation in &snapshot.activations {
+        validate_evidence_id(
+            &activation.observation_id,
+            "code-source activation observation",
+        )?;
+        if !observation_ids.insert(activation.observation_id.as_str())
+            || planned_activations
+                .insert(activation.project_id.clone(), activation)
+                .is_some()
+            || !inventory_activations.contains_key(&activation.project_id)
+            || matches!(
+                activation.disposition,
+                MigrationCodeSourceDispositionV1::SurvivingRetained
+            )
+        {
+            return Err(fail(
+                "activation disposition is duplicated, unknown, or invalid",
+            ));
+        }
+    }
+    if planned_activations.keys().collect::<BTreeSet<_>>()
+        != inventory_activations.keys().collect::<BTreeSet<_>>()
+    {
+        return Err(fail("activation plan omits an inventoried activation"));
+    }
+
+    let mut planned_generations = BTreeMap::new();
+    for generation in &snapshot.generations {
+        validate_evidence_id(
+            &generation.observation_id,
+            "code-source generation observation",
+        )?;
+        if !observation_ids.insert(generation.observation_id.as_str())
+            || planned_generations
+                .insert(generation.generation_id.as_str(), generation)
+                .is_some()
+            || !inventory_generations.contains_key(generation.generation_id.as_str())
+        {
+            return Err(fail("generation disposition is duplicated or unknown"));
+        }
+    }
+    if planned_generations.keys().copied().collect::<BTreeSet<_>>()
+        != inventory_generations
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>()
+    {
+        return Err(fail("generation plan omits an inventoried generation"));
+    }
+
     let mut accounted_roles = BTreeSet::from([ParticipantRoleV1::EffectiveSourceManifest]);
     let mut accounted_manifests = BTreeSet::new();
     let mut accounted_old_selections = BTreeSet::new();
     let mut accounted_new_selections = BTreeSet::new();
 
     for evidence in &snapshot.generations {
-        validate_evidence_id(&evidence.observation_id, "code-source observation")?;
-        evidence
-            .published_scope
-            .validate()
-            .map_err(contract_error)?;
-        if !observation_ids.insert(evidence.observation_id.as_str())
-            || !generation_keys
-                .insert((evidence.project_id.clone(), evidence.generation_id.clone()))
-            || evidence.descriptor.scope != evidence.published_scope
-            || code_generation_id(&evidence.producer_id, &evidence.descriptor)
-                != evidence.generation_id.as_str()
-            || evidence.selector
-                != source_selector(
-                    evidence.project_id.as_str(),
-                    evidence.generation_id.as_str(),
-                )
-            || sha256(&evidence.manifest_bytes) != evidence.manifest_sha256
-        {
-            return Err(fail(
-                "generation identity, descriptor, selector, or manifest evidence disagrees",
-            ));
-        }
-        let manifest = verify_generation_manifest_for_migration(
-            &evidence.manifest_bytes,
-            &evidence.descriptor,
-            &evidence.producer_id,
-            evidence.generation_id.as_str(),
-            &StoreLimits::default(),
-        )
-        .map_err(|error| fail(error.to_string()))?;
-        if manifest.raw_manifest_sha256 != evidence.manifest_sha256.as_str() {
-            return Err(fail("generation raw manifest hash disagrees with evidence"));
-        }
-        let old_stored = decode_stored_generation_v1_for_migration(&evidence.old_stored_metadata)
-            .map_err(|error| fail(error.to_string()))?;
-        if old_stored.generation_id != evidence.generation_id.as_str()
-            || old_stored.producer_id != evidence.producer_id
-            || old_stored.descriptor != evidence.descriptor
-        {
-            return Err(fail(
-                "old stored metadata disagrees with typed generation evidence",
-            ));
-        }
+        let inventory = inventory_generations[evidence.generation_id.as_str()];
+        let old_stored = inventory.record.clone();
         let expected_stored = bbox_code_source_store::StoredGenerationV2::from_v1_for_migration(
             old_stored,
-            evidence.published_scope.clone(),
+            inventory.published_scope.clone(),
         )
         .map_err(|error| fail(error.to_string()))?;
         let stored_role = ParticipantRoleV1::StoredGenerationMetadata {
             project_id: evidence.project_id.clone(),
-            published_scope: evidence.published_scope.clone(),
+            published_scope: inventory.published_scope.clone(),
             generation_id: evidence.generation_id.clone(),
         };
         if expected_old.get(&stored_role).and_then(Option::as_ref)
-            != Some(&sha256(&evidence.old_stored_metadata))
+            != Some(&sha256(&inventory.metadata_bytes))
         {
-            return Err(fail(
-                "old stored metadata bytes disagree with participant evidence",
-            ));
+            return Err(fail("stored metadata participant omits exact legacy bytes"));
         }
         accounted_roles.insert(stored_role.clone());
 
-        let activation_role = ParticipantRoleV1::Activation {
-            project_id: evidence.project_id.clone(),
-        };
-        let old_activation = evidence
-            .old_activation
-            .as_deref()
-            .map(decode_activation_v1_for_migration)
-            .transpose()
-            .map_err(|error| fail(error.to_string()))?;
-        if evidence
-            .old_activation
-            .as_ref()
-            .map(|bytes| sha256(bytes))
-            .as_ref()
-            != expected_old.get(&activation_role).and_then(Option::as_ref)
-        {
-            return Err(fail(
-                "old activation bytes disagree with participant evidence",
-            ));
-        }
-        if let Some(activation) = &old_activation
-            && (activation.project_id != evidence.project_id.as_str()
-                || activation.generation_id != evidence.generation_id.as_str()
-                || activation.selector != evidence.selector)
-        {
-            return Err(fail(
-                "old activation disagrees with typed generation evidence",
-            ));
-        }
         let manifest_role = ImmutableAssetRoleV1::CollectedGenerationManifest {
-            published_scope: evidence.published_scope.clone(),
+            published_scope: inventory.published_scope.clone(),
             generation_id: evidence.generation_id.clone(),
         };
         let pinned_manifest = immutable_assets
@@ -1369,45 +1404,53 @@ fn validate_code_source_snapshot(
             .find(|asset| asset.role == manifest_role)
             .ok_or_else(|| fail("generation lacks its pinned immutable manifest"))?;
         if pinned_manifest.mode != ImmutableAssetModeV1::PinnedExisting
-            || pinned_manifest.sha256 != evidence.manifest_sha256
+            || pinned_manifest.sha256.as_str() != inventory.manifest_sha256
         {
-            return Err(fail(
-                "pinned immutable manifest disagrees with source evidence",
-            ));
+            return Err(fail("pinned immutable manifest disagrees with inventory"));
         }
         accounted_manifests.insert(manifest_role);
 
-        let old_selection = old_selections.get(&evidence.project_id).copied();
-        let new_selection = new_selections.get(&evidence.project_id).copied();
-        let selection_matches =
-            |selection: &bbox_code_source_store::MigrationEffectiveSourceSelectionV1| {
-                selection.published_scope == evidence.published_scope
-                    && selection.generation_id == evidence.generation_id.as_str()
-                    && selection.selector == evidence.selector
-            };
         let project = catalog
             .projects
             .get(&evidence.project_id)
             .ok_or_else(|| fail("code-source project is absent from catalog"))?;
         match evidence.disposition {
             MigrationCodeSourceDispositionV1::SurvivingActive => {
-                let old_activation = old_activation.as_ref().ok_or_else(|| {
-                    fail("surviving active generation lacks exact old activation")
-                })?;
-                if !old_selection.is_some_and(selection_matches)
-                    || !new_selection.is_some_and(selection_matches)
-                    || project.scope != ProjectScope::Published(evidence.published_scope.clone())
+                let activation_plan = planned_activations
+                    .get(&evidence.project_id)
+                    .filter(|activation| {
+                        activation.disposition == MigrationCodeSourceDispositionV1::SurvivingActive
+                    })
+                    .ok_or_else(|| fail("active generation lacks surviving activation"))?;
+                let old_activation = inventory_activations[&evidence.project_id];
+                if old_activation.record.generation_id != evidence.generation_id.as_str()
+                    || project.scope != ProjectScope::Published(inventory.published_scope.clone())
                 {
-                    return Err(fail(
-                        "surviving active selection or catalog scope disagrees",
-                    ));
+                    return Err(fail("active generation and activation join disagree"));
                 }
+                let selection_matches =
+                    |selection: &&bbox_code_source_store::MigrationEffectiveSourceSelectionV1| {
+                        selection.published_scope == inventory.published_scope
+                            && selection.generation_id == evidence.generation_id.as_str()
+                            && selection.selector == old_activation.record.selector
+                    };
+                if old_effective.is_some()
+                    && !old_selections
+                        .get(&evidence.project_id)
+                        .is_some_and(selection_matches)
+                    || !new_selections
+                        .get(&evidence.project_id)
+                        .is_some_and(selection_matches)
+                {
+                    return Err(fail("active effective selection rewrites source evidence"));
+                }
+                let _ = activation_plan;
                 let activation_bytes = post_images
-                    .get(&activation_role)
+                    .get(&ParticipantRoleV1::Activation {
+                        project_id: evidence.project_id.clone(),
+                    })
                     .and_then(Option::as_deref)
-                    .ok_or_else(|| {
-                        fail("surviving active generation lacks activation post-image")
-                    })?;
+                    .ok_or_else(|| fail("surviving activation post-image is absent"))?;
                 let activation = decode_activation_v2_for_migration(activation_bytes)
                     .map_err(|error| fail(error.to_string()))?;
                 let stored_bytes = post_images
@@ -1418,7 +1461,7 @@ fn validate_code_source_snapshot(
                     .map_err(|error| fail(error.to_string()))?;
                 let expected_activation =
                     bbox_code_source_store::ActivationRecordV2::from_v1_for_migration(
-                        (*old_activation).clone(),
+                        old_activation.record.clone(),
                         &expected_stored,
                     )
                     .map_err(|error| fail(error.to_string()))?;
@@ -1430,20 +1473,23 @@ fn validate_code_source_snapshot(
                         "surviving activation and stored post-images rewrite source evidence",
                     ));
                 }
-                accounted_roles.insert(activation_role);
-                accounted_old_selections.insert(evidence.project_id.clone());
+                accounted_roles.insert(ParticipantRoleV1::Activation {
+                    project_id: evidence.project_id.clone(),
+                });
+                if old_effective.is_some() {
+                    accounted_old_selections.insert(evidence.project_id.clone());
+                }
                 accounted_new_selections.insert(evidence.project_id.clone());
             }
             MigrationCodeSourceDispositionV1::SurvivingRetained => {
-                if old_activation.is_some()
-                    || old_selection.is_some()
-                    || new_selection.is_some()
-                    || post_images.contains_key(&activation_role)
-                    || project.scope != ProjectScope::Published(evidence.published_scope.clone())
+                if inventory_activations.contains_key(&evidence.project_id)
+                    && inventory_activations[&evidence.project_id]
+                        .record
+                        .generation_id
+                        == evidence.generation_id.as_str()
+                    || project.scope != ProjectScope::Published(inventory.published_scope.clone())
                 {
-                    return Err(fail(
-                        "retained generation is unexpectedly active or selected",
-                    ));
+                    return Err(fail("retained generation is active or has the wrong scope"));
                 }
                 let stored_bytes = post_images
                     .get(&stored_role)
@@ -1456,45 +1502,64 @@ fn validate_code_source_snapshot(
                 }
             }
             MigrationCodeSourceDispositionV1::QuarantinedCollision => {
-                let old_activation = old_activation
-                    .as_ref()
-                    .ok_or_else(|| fail("quarantined generation lacks exact old activation"))?;
-                if !old_selection.is_some_and(selection_matches)
-                    || new_selection.is_some()
-                    || post_images.get(&activation_role) != Some(&None)
-                    || post_images.get(&stored_role) != Some(&None)
-                    || project.scope != ProjectScope::LegacyLocal
-                {
-                    return Err(fail(
-                        "quarantined generation remains selected, active, or stored",
-                    ));
+                if project.scope != ProjectScope::LegacyLocal {
+                    return Err(fail("quarantined generation remains published"));
                 }
-                let retirement_role = ParticipantRoleV1::CollisionRetirement {
-                    project_id: evidence.project_id.clone(),
-                };
-                let retirement_bytes = post_images
-                    .get(&retirement_role)
+                let stored_bytes = post_images
+                    .get(&stored_role)
                     .and_then(Option::as_deref)
-                    .ok_or_else(|| fail("quarantined generation lacks retirement post-image"))?;
-                let retirement =
-                    decode_collision_retirement_pending_for_migration(retirement_bytes)
-                        .map_err(|error| fail(error.to_string()))?;
-                if retirement.project_id != evidence.project_id
-                    || retirement.former_scope != evidence.published_scope
-                    || retirement.generation_id != evidence.generation_id.as_str()
-                    || retirement.selector != evidence.selector
-                    || retirement.snapshot_id != old_activation.snapshot_id
-                    || retirement.manifest_sha256 != evidence.manifest_sha256.as_str()
-                    || retirement.inventory_hash != inventory_sha256.as_str()
-                    || retirement.plan_hash != plan_hash.as_str()
-                {
-                    return Err(fail(
-                        "collision retirement does not bind the exact deleted source state",
-                    ));
+                    .ok_or_else(|| fail("quarantined generation metadata must be retained"))?;
+                let stored = decode_stored_generation_v2_for_migration(stored_bytes)
+                    .map_err(|error| fail(error.to_string()))?;
+                if stored != expected_stored {
+                    return Err(fail("quarantined metadata rewrites source evidence"));
                 }
-                accounted_roles.insert(activation_role);
-                accounted_roles.insert(retirement_role);
-                accounted_old_selections.insert(evidence.project_id.clone());
+                if let Some(old_activation) = inventory_activations.get(&evidence.project_id)
+                    && old_activation.record.generation_id == evidence.generation_id.as_str()
+                {
+                    let activation_plan = planned_activations
+                        .get(&evidence.project_id)
+                        .filter(|activation| {
+                            activation.disposition
+                                == MigrationCodeSourceDispositionV1::QuarantinedCollision
+                        })
+                        .ok_or_else(|| fail("collision activation lacks quarantine disposition"))?;
+                    let _ = activation_plan;
+                    let activation_role = ParticipantRoleV1::Activation {
+                        project_id: evidence.project_id.clone(),
+                    };
+                    if post_images.get(&activation_role) != Some(&None)
+                        || new_selections.contains_key(&evidence.project_id)
+                    {
+                        return Err(fail("quarantined activation remains active or selected"));
+                    }
+                    let retirement_role = ParticipantRoleV1::CollisionRetirement {
+                        project_id: evidence.project_id.clone(),
+                    };
+                    let retirement_bytes = post_images
+                        .get(&retirement_role)
+                        .and_then(Option::as_deref)
+                        .ok_or_else(|| fail("quarantined activation lacks retirement record"))?;
+                    let retirement =
+                        decode_collision_retirement_pending_for_migration(retirement_bytes)
+                            .map_err(|error| fail(error.to_string()))?;
+                    if retirement.project_id != evidence.project_id
+                        || retirement.former_scope != inventory.published_scope
+                        || retirement.generation_id != evidence.generation_id.as_str()
+                        || retirement.selector != old_activation.record.selector
+                        || retirement.snapshot_id != old_activation.record.snapshot_id
+                        || retirement.manifest_sha256 != inventory.record.descriptor.manifest_sha256
+                        || retirement.inventory_hash != inventory_sha256.as_str()
+                        || retirement.plan_hash != plan_hash.as_str()
+                    {
+                        return Err(fail("collision retirement rewrites source evidence"));
+                    }
+                    accounted_roles.insert(activation_role);
+                    accounted_roles.insert(retirement_role);
+                    if old_effective.is_some() {
+                        accounted_old_selections.insert(evidence.project_id.clone());
+                    }
+                }
             }
         }
     }
@@ -1600,9 +1665,14 @@ fn validate_new_side_cross_roles(
             .projects
             .get(project_id)
             .ok_or_else(|| fail("stored generation project is absent from the catalog"))?;
+        let collision_retained =
+            post_images.contains_key(&ParticipantRoleV1::CollisionRetirement {
+                project_id: project_id.clone(),
+            });
         if record.generation_id != generation_id.as_str()
             || &record.published_scope != published_scope
-            || project.scope != ProjectScope::Published(published_scope.clone())
+            || !(project.scope == ProjectScope::Published(published_scope.clone())
+                || collision_retained && project.scope == ProjectScope::LegacyLocal)
         {
             return Err(fail(
                 "stored generation role, record, and catalog scope disagree",
@@ -1694,23 +1764,30 @@ fn validate_new_side_cross_roles(
                         published_scope: retirement.former_scope.clone(),
                         generation_id: generation_id.clone(),
                     })?
-                    .is_some()
+                    .is_none()
                     || effective_by_project.contains_key(project_id)
                 {
                     return Err(fail(
-                        "collision retirement role, catalog, hashes, or source removal disagree",
+                        "collision retirement role, catalog, hashes, or retained source disagree",
                     ));
                 }
                 let manifest_role = ImmutableAssetRoleV1::CollectedGenerationManifest {
                     published_scope: retirement.former_scope.clone(),
-                    generation_id,
+                    generation_id: generation_id.clone(),
                 };
                 let manifest = immutable_for(&manifest_role)?;
+                let stored = stored_generations
+                    .get(&(
+                        project_id.clone(),
+                        retirement.former_scope.clone(),
+                        generation_id,
+                    ))
+                    .ok_or_else(|| fail("collision retirement lacks retained metadata"))?;
                 if manifest.mode != ImmutableAssetModeV1::PinnedExisting
-                    || manifest.sha256 != manifest_hash
+                    || stored.descriptor.manifest_sha256 != manifest_hash.as_str()
                 {
                     return Err(fail(
-                        "collision retirement lacks its exact pinned collected manifest",
+                        "collision retirement lacks exact retained manifest evidence",
                     ));
                 }
             }
@@ -1903,7 +1980,7 @@ pub(crate) struct MigrationPlanDraftV1 {
     pub(crate) transaction_id: ProjectCatalogTransactionId,
     pub(crate) plan_hash: Sha256Hex,
     pub(crate) source_store_sha256: Sha256Hex,
-    pub(crate) publisher_ref_source_sha256: Sha256Hex,
+    pub(crate) publisher_ref_source: MigrationPublisherSourceDraftV1,
     pub(crate) inventory_sha256: Sha256Hex,
     pub(crate) expected_legacy_catalog_sha256: Sha256Hex,
     pub(crate) catalog: CatalogSnapshotV2,
@@ -1956,6 +2033,23 @@ pub(crate) fn validate_migration_plan(
         &draft.publisher_dispositions,
         "migration plan",
     )?;
+    let publisher_source_evidence = match &draft.publisher_ref_source {
+        MigrationPublisherSourceDraftV1::Missing => {
+            if !draft.publisher_pins.is_empty() || !draft.publisher_dispositions.is_empty() {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_invalid_publisher_evidence",
+                    "missing publisher source cannot have typed publisher rows",
+                ));
+            }
+            MigrationPublisherSourceEvidenceV1::missing()
+        }
+        MigrationPublisherSourceDraftV1::Present(bytes) => {
+            validate_publisher_source_binding(bytes, &draft.publisher_pins, "migration plan")?;
+            MigrationPublisherSourceEvidenceV1::Present {
+                sha256: sha256(bytes),
+            }
+        }
+    };
     validate_catalog_attachments(&draft.catalog, &draft.attachments).map_err(contract_error)?;
     if draft.catalog.epoch != 1
         || draft.attachments.epoch != 1
@@ -2078,10 +2172,7 @@ pub(crate) fn validate_migration_plan(
             immutable_asset_bytes.insert(role, bytes);
         }
     }
-    for mandatory in [
-        ImmutableAssetRoleV1::LegacyProjectStoreBackup,
-        ImmutableAssetRoleV1::LegacyPublisherRefBackup,
-    ] {
+    for mandatory in [ImmutableAssetRoleV1::LegacyProjectStoreBackup] {
         if !immutable_assets_by_role.contains_key(&mandatory) {
             return Err(ProjectCatalogStoreError::new(
                 "error.project_catalog_invalid_migration_plan",
@@ -2093,29 +2184,47 @@ pub(crate) fn validate_migration_plan(
         .get(&ImmutableAssetRoleV1::LegacyProjectStoreBackup)
         .map(|(_, hash)| hash)
         != Some(&draft.source_store_sha256)
-        || immutable_assets_by_role
-            .get(&ImmutableAssetRoleV1::LegacyPublisherRefBackup)
-            .map(|(_, hash)| hash)
-            != Some(&draft.publisher_ref_source_sha256)
     {
         return Err(ProjectCatalogStoreError::new(
             "error.project_catalog_invalid_migration_plan",
             "migration source backups do not match their inventoried source hashes",
         ));
     }
-    let publisher_source_bytes = immutable_asset_bytes
-        .get(&ImmutableAssetRoleV1::LegacyPublisherRefBackup)
-        .ok_or_else(|| {
-            ProjectCatalogStoreError::new(
-                "error.project_catalog_invalid_migration_plan",
-                "migration plan lacks exact legacy publisher source bytes",
-            )
-        })?;
-    validate_publisher_source_binding(
-        publisher_source_bytes,
-        &draft.publisher_pins,
-        "migration plan",
-    )?;
+    match (&draft.publisher_ref_source, &publisher_source_evidence) {
+        (
+            MigrationPublisherSourceDraftV1::Missing,
+            MigrationPublisherSourceEvidenceV1::Missing { .. },
+        ) => {
+            if immutable_assets_by_role
+                .contains_key(&ImmutableAssetRoleV1::LegacyPublisherRefBackup)
+            {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_invalid_migration_plan",
+                    "missing publisher source must not fabricate a backup",
+                ));
+            }
+        }
+        (
+            MigrationPublisherSourceDraftV1::Present(expected_bytes),
+            MigrationPublisherSourceEvidenceV1::Present { sha256: expected },
+        ) => {
+            let asset_hash = immutable_assets_by_role
+                .get(&ImmutableAssetRoleV1::LegacyPublisherRefBackup)
+                .map(|(_, hash)| hash);
+            let backup_bytes =
+                immutable_asset_bytes.get(&ImmutableAssetRoleV1::LegacyPublisherRefBackup);
+            if asset_hash != Some(expected)
+                || backup_bytes != Some(expected_bytes)
+                || sha256(expected_bytes) != *expected
+            {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_invalid_migration_plan",
+                    "publisher source backup does not match exact present source bytes",
+                ));
+            }
+        }
+        _ => unreachable!("publisher source draft and evidence are built together"),
+    }
 
     let actions = draft
         .checkout_identity_actions
@@ -2174,6 +2283,21 @@ pub(crate) fn validate_migration_plan(
             })
         })
         .collect::<ProjectCatalogStoreResult<Vec<_>>>()?;
+    if Sha256Hex::parse(
+        draft
+            .code_source_snapshot
+            .legacy_inventory
+            .canonical_sha256
+            .clone(),
+    )
+    .map_err(contract_error)?
+        != draft.inventory_sha256
+    {
+        return Err(ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_migration_plan",
+            "migration inventory hash does not bind the owner-enumerated source row set",
+        ));
+    }
     validate_code_source_snapshot(
         &draft.code_source_snapshot,
         &draft.catalog,
@@ -2200,7 +2324,7 @@ pub(crate) fn validate_migration_plan(
         transaction_id: draft.transaction_id.clone(),
         plan_hash: draft.plan_hash.clone(),
         source_store_sha256: draft.source_store_sha256.clone(),
-        publisher_ref_source_sha256: draft.publisher_ref_source_sha256.clone(),
+        publisher_ref_source: publisher_source_evidence.clone(),
         inventory_sha256: draft.inventory_sha256.clone(),
         publisher_pins: draft.publisher_pins.clone(),
         publisher_dispositions: draft.publisher_dispositions.clone(),
@@ -2249,7 +2373,7 @@ pub(crate) fn validate_migration_plan(
         state: TransactionStateV1::Prepared,
         outcome: None,
         plan_hash: Some(draft.plan_hash),
-        publisher_ref_source_sha256: Some(draft.publisher_ref_source_sha256),
+        publisher_ref_source: Some(publisher_source_evidence),
         publisher_pins: draft.publisher_pins,
         publisher_dispositions: draft.publisher_dispositions,
         old_epoch: 0,
@@ -2440,69 +2564,13 @@ impl ProjectCatalogTransactionOwner {
                 format!("code-source inventory changed after capture: {detail}"),
             )
         };
-        let effective = self.io.read_regular_nofollow(
-            &registry.code_source_paths.anchor(),
-            ParticipantRoleV1::EffectiveSourceManifest.max_bytes(),
-        )?;
-        if effective != snapshot.effective_manifest_old {
-            return Err(stale("effective source manifest bytes differ"));
-        }
-        if let Some(bytes) = effective.as_deref() {
-            decode_migration_effective_source_manifest_v1(bytes)
-                .map_err(|error| stale(error.to_string()))?;
-        }
-        for evidence in &snapshot.generations {
-            let activation_path = registry.code_source_paths.activation(&evidence.project_id);
-            let activation = self.io.read_regular_nofollow(
-                &activation_path,
-                ParticipantRoleV1::Activation {
-                    project_id: evidence.project_id.clone(),
-                }
-                .max_bytes(),
-            )?;
-            if activation != evidence.old_activation {
-                return Err(stale("activation bytes differ"));
-            }
-            if let Some(bytes) = activation.as_deref() {
-                decode_activation_v1_for_migration(bytes)
-                    .map_err(|error| stale(error.to_string()))?;
-            }
-            let metadata_path = registry
-                .code_source_paths
-                .generation_metadata(&evidence.published_scope, evidence.generation_id.as_str())
-                .map_err(|error| stale(error.to_string()))?;
-            let metadata = self.io.read_regular_nofollow(
-                &metadata_path,
-                ParticipantRoleV1::StoredGenerationMetadata {
-                    project_id: evidence.project_id.clone(),
-                    published_scope: evidence.published_scope.clone(),
-                    generation_id: evidence.generation_id.clone(),
-                }
-                .max_bytes(),
-            )?;
-            if metadata.as_deref() != Some(evidence.old_stored_metadata.as_slice()) {
-                return Err(stale("stored generation metadata bytes differ"));
-            }
-            decode_stored_generation_v1_for_migration(&evidence.old_stored_metadata)
-                .map_err(|error| stale(error.to_string()))?;
-            let manifest_path = registry
-                .code_source_paths
-                .generation_manifest(&evidence.published_scope, evidence.generation_id.as_str())
-                .map_err(|error| stale(error.to_string()))?;
-            let manifest = self
-                .io
-                .read_regular_nofollow(&manifest_path, MAX_CODE_SOURCE_COLLECTED_MANIFEST_BYTES)?;
-            if manifest.as_deref() != Some(evidence.manifest_bytes.as_slice()) {
-                return Err(stale("collected generation manifest bytes differ"));
-            }
-            verify_generation_manifest_for_migration(
-                &evidence.manifest_bytes,
-                &evidence.descriptor,
-                &evidence.producer_id,
-                evidence.generation_id.as_str(),
-                &StoreLimits::default(),
-            )
-            .map_err(|error| stale(error.to_string()))?;
+        let current = enumerate_legacy_migration_inventory_locked(
+            &registry.code_source_paths,
+            &StoreLimits::default(),
+        )
+        .map_err(|error| stale(error.to_string()))?;
+        if current.canonical_sha256 != snapshot.legacy_inventory.canonical_sha256 {
+            return Err(stale("canonical legacy source row set differs"));
         }
         Ok(())
     }
@@ -2649,26 +2717,17 @@ impl ProjectCatalogTransactionOwner {
             ));
         };
         let state = self.read_strict_pair_locked()?;
-        let effective_bytes = self
-            .io
-            .read_regular_nofollow(
-                &registry.code_source_paths.anchor(),
-                MAX_CODE_SOURCE_EFFECTIVE_MANIFEST_BYTES,
-            )?
-            .ok_or_else(|| {
-                ProjectCatalogStoreError::new(
-                    "error.project_catalog_migration_incomplete",
-                    "current effective source manifest is missing",
-                )
-            })?;
-        let effective =
-            decode_migration_effective_source_manifest_v1(&effective_bytes).map_err(|error| {
-                ProjectCatalogStoreError::new(
-                    "error.project_catalog_migration_incomplete",
-                    error.to_string(),
-                )
-            })?;
-        for selection in &effective.selections {
+        let current = enumerate_current_migration_inventory_locked(
+            &registry.code_source_paths,
+            &StoreLimits::default(),
+        )
+        .map_err(|error| {
+            ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_incomplete",
+                error.to_string(),
+            )
+        })?;
+        for selection in &current.effective_manifest.selections {
             let project = state
                 .catalog
                 .projects
@@ -2685,118 +2744,96 @@ impl ProjectCatalogTransactionOwner {
                     "current source selection and catalog scope disagree",
                 ));
             }
-            let activation_bytes = self
+        }
+        for participant in &journal.participants {
+            let ParticipantRoleV1::CollisionRetirement { project_id } = &participant.role else {
+                continue;
+            };
+            let activation_participant = journal
+                .participants
+                .iter()
+                .find(|candidate| {
+                    candidate.role
+                        == (ParticipantRoleV1::Activation {
+                            project_id: project_id.clone(),
+                        })
+                })
+                .ok_or_else(|| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_migration_incomplete",
+                        "historical collision lacks activation evidence",
+                    )
+                })?;
+            let ExpectedImageV1::Present {
+                sha256: expected,
+                artifact_name,
+            } = &activation_participant.old
+            else {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_migration_incomplete",
+                    "historical collision activation evidence is absent",
+                ));
+            };
+            let old_activation_bytes = self
                 .io
                 .read_regular_nofollow(
-                    &registry.code_source_paths.activation(&selection.project_id),
+                    &self.paths.backup_dir.join(artifact_name.as_str()),
                     MAX_CODE_SOURCE_ACTIVATION_BYTES,
                 )?
                 .ok_or_else(|| {
                     ProjectCatalogStoreError::new(
                         "error.project_catalog_migration_incomplete",
-                        "current source selection lacks activation",
+                        "historical collision activation backup is missing",
                     )
                 })?;
-            let activation =
-                decode_activation_v2_for_migration(&activation_bytes).map_err(|error| {
-                    ProjectCatalogStoreError::new(
-                        "error.project_catalog_migration_incomplete",
-                        error.to_string(),
-                    )
-                })?;
-            if activation.project_id != selection.project_id
-                || activation.published_scope != selection.published_scope
-                || activation.generation_id != selection.generation_id
-                || activation.selector != selection.selector
-            {
+            if sha256(&old_activation_bytes) != *expected {
                 return Err(ProjectCatalogStoreError::new(
                     "error.project_catalog_migration_incomplete",
-                    "current activation and effective source selection disagree",
+                    "historical collision activation backup hash disagrees",
                 ));
             }
-            let metadata_path = registry
-                .code_source_paths
-                .generation_metadata(&selection.published_scope, &selection.generation_id)
+            let old_activation = decode_activation_v1_for_migration(&old_activation_bytes)
                 .map_err(|error| {
                     ProjectCatalogStoreError::new(
                         "error.project_catalog_migration_incomplete",
                         error.to_string(),
                     )
                 })?;
-            let stored_bytes = self
-                .io
-                .read_regular_nofollow(&metadata_path, MAX_CODE_SOURCE_GENERATION_METADATA_BYTES)?
-                .ok_or_else(|| {
-                    ProjectCatalogStoreError::new(
-                        "error.project_catalog_migration_incomplete",
-                        "current source selection lacks stored generation metadata",
-                    )
-                })?;
-            let stored =
-                decode_stored_generation_v2_for_migration(&stored_bytes).map_err(|error| {
-                    ProjectCatalogStoreError::new(
-                        "error.project_catalog_migration_incomplete",
-                        error.to_string(),
-                    )
-                })?;
-            activation
-                .validate_against_generation(&stored)
-                .map_err(|error| {
-                    ProjectCatalogStoreError::new(
-                        "error.project_catalog_migration_incomplete",
-                        error.to_string(),
-                    )
-                })?;
-            let manifest_path = registry
-                .code_source_paths
-                .generation_manifest(&selection.published_scope, &selection.generation_id)
-                .map_err(|error| {
-                    ProjectCatalogStoreError::new(
-                        "error.project_catalog_migration_incomplete",
-                        error.to_string(),
-                    )
-                })?;
-            let manifest = self
-                .io
-                .read_regular_nofollow(&manifest_path, MAX_CODE_SOURCE_COLLECTED_MANIFEST_BYTES)?
-                .ok_or_else(|| {
-                    ProjectCatalogStoreError::new(
-                        "error.project_catalog_migration_incomplete",
-                        "current source selection lacks collected manifest",
-                    )
-                })?;
-            verify_generation_manifest_for_migration(
-                &manifest,
-                &stored.descriptor,
-                &stored.producer_id,
-                &stored.generation_id,
-                &StoreLimits::default(),
-            )
-            .map_err(|error| {
-                ProjectCatalogStoreError::new(
+            if current.activations.iter().any(|row| {
+                row.project_id == *project_id
+                    && row.record.selector == old_activation.selector
+                    && row.record.generation_id == old_activation.generation_id
+            }) {
+                return Err(ProjectCatalogStoreError::new(
                     "error.project_catalog_migration_incomplete",
-                    error.to_string(),
-                )
-            })?;
-        }
-        let selected_projects = effective
-            .selections
-            .iter()
-            .map(|selection| &selection.project_id)
-            .collect::<BTreeSet<_>>();
-        for project_id in state.catalog.projects.keys() {
-            if !selected_projects.contains(project_id)
-                && self
-                    .io
-                    .read_regular_nofollow(
-                        &registry.code_source_paths.activation(project_id),
-                        MAX_CODE_SOURCE_ACTIVATION_BYTES,
-                    )?
-                    .is_some()
+                    "historical collision source became active again without a successor",
+                ));
+            }
+            if let Some(pending) = current
+                .collision_pending
+                .iter()
+                .find(|row| row.project_id == *project_id)
+                && (pending.record.selector != old_activation.selector
+                    || pending.record.snapshot_id != old_activation.snapshot_id
+                    || pending.record.generation_id != old_activation.generation_id)
             {
                 return Err(ProjectCatalogStoreError::new(
                     "error.project_catalog_migration_incomplete",
-                    "current activation is absent from the effective source manifest",
+                    "current collision pending rewrites historical retirement evidence",
+                ));
+            }
+            if let Some(retirement) = current
+                .retirements
+                .iter()
+                .find(|row| row.record.selector == old_activation.selector)
+                && (retirement.record.project_id != old_activation.project_id
+                    || retirement.record.snapshot_id != old_activation.snapshot_id
+                    || retirement.record.generation_id.as_deref()
+                        != Some(old_activation.generation_id.as_str()))
+            {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_migration_incomplete",
+                    "retirement successor rewrites historical collision evidence",
                 ));
             }
         }
@@ -2805,37 +2842,55 @@ impl ProjectCatalogTransactionOwner {
         let publisher_backup = journal
             .immutable_assets
             .iter()
-            .find(|asset| asset.role == ImmutableAssetRoleV1::LegacyPublisherRefBackup)
-            .ok_or_else(|| {
-                ProjectCatalogStoreError::new(
-                    "error.project_catalog_migration_incomplete",
-                    "retained migration marker lacks publisher source evidence",
-                )
-            })?;
-        let publisher_source = self
-            .io
-            .read_regular_nofollow(
-                &registry
-                    .immutable_target(&publisher_backup.role, &publisher_backup.validated_name),
-                MAX_LEGACY_PUBLISHER_REF_SOURCE_BYTES,
-            )?
-            .ok_or_else(|| {
-                ProjectCatalogStoreError::new(
-                    "error.project_catalog_migration_incomplete",
-                    "retained publisher source backup is missing",
-                )
-            })?;
-        validate_publisher_source_binding(
-            &publisher_source,
-            &journal.publisher_pins,
-            "retained migration source",
-        )
-        .map_err(|error| {
+            .find(|asset| asset.role == ImmutableAssetRoleV1::LegacyPublisherRefBackup);
+        match journal.publisher_ref_source.as_ref().ok_or_else(|| {
             ProjectCatalogStoreError::new(
                 "error.project_catalog_migration_incomplete",
-                error.to_string(),
+                "migration journal lacks publisher source presence evidence",
             )
-        })?;
+        })? {
+            MigrationPublisherSourceEvidenceV1::Missing { .. } if publisher_backup.is_none() => {}
+            MigrationPublisherSourceEvidenceV1::Present { sha256: expected } => {
+                let publisher_backup = publisher_backup.ok_or_else(|| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_migration_incomplete",
+                        "present publisher source lacks retained backup",
+                    )
+                })?;
+                let publisher_source = self
+                    .io
+                    .read_regular_nofollow(
+                        &registry.immutable_target(
+                            &publisher_backup.role,
+                            &publisher_backup.validated_name,
+                        ),
+                        MAX_LEGACY_PUBLISHER_REF_SOURCE_BYTES,
+                    )?
+                    .ok_or_else(|| {
+                        ProjectCatalogStoreError::new(
+                            "error.project_catalog_migration_incomplete",
+                            "retained publisher source backup is missing",
+                        )
+                    })?;
+                if sha256(&publisher_source) != *expected {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_migration_incomplete",
+                        "retained publisher source backup hash disagrees",
+                    ));
+                }
+                validate_publisher_source_binding(
+                    &publisher_source,
+                    &journal.publisher_pins,
+                    "retained migration source",
+                )?;
+            }
+            MigrationPublisherSourceEvidenceV1::Missing { .. } => {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_migration_incomplete",
+                    "missing publisher source has a fabricated backup",
+                ));
+            }
+        }
         for pin in &journal.publisher_pins {
             let project = state.catalog.projects.get(&pin.project_id).ok_or_else(|| {
                 ProjectCatalogStoreError::new(
@@ -2942,20 +2997,18 @@ impl ProjectCatalogTransactionOwner {
         }
         self.verify_expected_pair(&journal, ExpectedSide::Old)?;
         self.verify_journal_pair_invariants(&journal, ExpectedSide::Old)?;
-        self.verify_immutable_assets(&journal)?;
         for participant in &journal.participants {
-            for (root, image) in [
-                (&self.paths.backup_dir, &participant.old),
-                (&self.paths.stage_dir, &participant.new),
-            ] {
-                if image.sha256().is_some()
-                    && !self.artifact_available(root, image, participant.role.max_bytes())?
-                {
-                    return Err(ProjectCatalogStoreError::new(
-                        "error.project_catalog_recovery_incomplete",
-                        "terminal rollback lacks its complete retained participant evidence",
-                    ));
-                }
+            if participant.old.sha256().is_some()
+                && !self.artifact_available(
+                    &self.paths.backup_dir,
+                    &participant.old,
+                    participant.role.max_bytes(),
+                )?
+            {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_recovery_incomplete",
+                    "terminal rollback lacks its retained old participant evidence",
+                ));
             }
         }
         let ParticipantRegistry::Migration(registry) = &self.registry else {
@@ -3144,8 +3197,8 @@ impl ProjectCatalogTransactionOwner {
                                     )
                             )
                             || journal.plan_hash.as_ref() != Some(&marker.plan_hash)
-                            || journal.publisher_ref_source_sha256.as_ref()
-                                != Some(&marker.publisher_ref_source_sha256)
+                            || journal.publisher_ref_source.as_ref()
+                                != Some(&marker.publisher_ref_source)
                             || journal.publisher_pins != marker.publisher_pins
                             || journal.publisher_dispositions != marker.publisher_dispositions
                             || journal.new_epoch != marker.migration_epoch
@@ -3245,7 +3298,7 @@ impl ProjectCatalogTransactionOwner {
             state: TransactionStateV1::Prepared,
             outcome: None,
             plan_hash: None,
-            publisher_ref_source_sha256: None,
+            publisher_ref_source: None,
             publisher_pins: Vec::new(),
             publisher_dispositions: Vec::new(),
             old_epoch: old.map_or(0, |state| state.epoch),
@@ -3355,50 +3408,40 @@ impl ProjectCatalogTransactionOwner {
         // The complete live inventory is revalidated before this transaction
         // creates even a staging directory. A stale plan therefore has no
         // filesystem side effects and cannot poison a corrected attempt.
-        let expected_publisher_source = plan
-            .journal
-            .publisher_ref_source_sha256
-            .as_ref()
-            .ok_or_else(|| {
+        let expected_publisher_source =
+            plan.journal.publisher_ref_source.as_ref().ok_or_else(|| {
                 ProjectCatalogStoreError::new(
                     "error.project_catalog_invalid_migration_plan",
-                    "validated migration plan lacks its publisher source hash",
+                    "validated migration plan lacks its publisher source evidence",
                 )
             })?;
-        let publisher_source = self
-            .io
-            .read_regular_nofollow(
-                &registry.legacy_publisher_ref_source,
-                MAX_LEGACY_PUBLISHER_REF_SOURCE_BYTES,
-            )?
-            .ok_or_else(|| {
-                ProjectCatalogStoreError::new(
-                    "error.project_catalog_migration_inventory_stale",
-                    "legacy publisher source disappeared after inventory",
-                )
-            })?;
+        let publisher_source = self.io.read_regular_nofollow(
+            &registry.legacy_publisher_ref_source,
+            MAX_LEGACY_PUBLISHER_REF_SOURCE_BYTES,
+        )?;
         let planned_publisher_source = plan
             .immutable_asset_bytes
-            .get(&ImmutableAssetRoleV1::LegacyPublisherRefBackup)
-            .ok_or_else(|| {
-                ProjectCatalogStoreError::new(
-                    "error.project_catalog_invalid_migration_plan",
-                    "validated migration plan lacks exact publisher source bytes",
-                )
-            })?;
-        if sha256(&publisher_source) != *expected_publisher_source
-            || &publisher_source != planned_publisher_source
-        {
-            return Err(ProjectCatalogStoreError::new(
-                "error.project_catalog_migration_inventory_stale",
-                "legacy publisher source changed after inventory",
-            ));
+            .get(&ImmutableAssetRoleV1::LegacyPublisherRefBackup);
+        match (expected_publisher_source, publisher_source.as_deref()) {
+            (MigrationPublisherSourceEvidenceV1::Missing { .. }, None)
+                if planned_publisher_source.is_none() => {}
+            (MigrationPublisherSourceEvidenceV1::Present { sha256: expected }, Some(bytes))
+                if sha256(bytes) == *expected
+                    && planned_publisher_source.is_some_and(|planned| planned == bytes) =>
+            {
+                validate_publisher_source_binding(
+                    bytes,
+                    &plan.journal.publisher_pins,
+                    "live migration source",
+                )?;
+            }
+            _ => {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_migration_inventory_stale",
+                    "legacy publisher source presence or bytes changed after inventory",
+                ));
+            }
         }
-        validate_publisher_source_binding(
-            &publisher_source,
-            &plan.journal.publisher_pins,
-            "live migration source",
-        )?;
         self.verify_live_code_source_snapshot(&plan.code_source_snapshot)?;
         let mut old_images = std::collections::BTreeMap::new();
         for participant in &plan.journal.participants {
@@ -3718,11 +3761,10 @@ impl ProjectCatalogTransactionOwner {
                 "migration recovery requires the complete code-owned participant registry",
             ));
         }
-        self.install_immutable_assets(&journal)?;
-        self.verify_immutable_assets(&journal)?;
-
         match (journal.state, journal.outcome) {
             (TransactionStateV1::Committed, Some(TransactionOutcomeV1::Committed)) => {
+                self.install_immutable_assets(&journal)?;
+                self.verify_immutable_assets(&journal)?;
                 if journal.kind == TransactionKindV1::V1Migration {
                     self.verify_current_migration_state(&journal).map(|_| ())
                 } else {
@@ -3736,64 +3778,26 @@ impl ProjectCatalogTransactionOwner {
             }
             (TransactionStateV1::Prepared, None) => {
                 let checkout_locks = self.acquire_checkout_action_locks(&journal)?;
-                if journal.kind == TransactionKindV1::V1Migration {
-                    let attachment_participant = journal
-                        .participants
-                        .iter()
-                        .find(|participant| participant.role == ParticipantRoleV1::Attachments)
-                        .ok_or_else(|| {
-                            ProjectCatalogStoreError::new(
-                                "error.project_catalog_invalid_journal",
-                                "migration journal lacks attachment evidence",
-                            )
-                        })?;
-                    let ExpectedImageV1::Present {
-                        sha256: expected,
-                        artifact_name,
-                    } = &attachment_participant.new
-                    else {
-                        return Err(ProjectCatalogStoreError::new(
-                            "error.project_catalog_invalid_journal",
-                            "migration attachment post-image is absent",
-                        ));
-                    };
-                    let attachment_bytes = self
-                        .io
-                        .read_regular_nofollow(
-                            &self.paths.stage_dir.join(artifact_name.as_str()),
-                            MAX_PROJECT_CATALOG_BYTES,
-                        )?
-                        .ok_or_else(|| {
-                            ProjectCatalogStoreError::new(
-                                "error.project_catalog_recovery_incomplete",
-                                "migration attachment stage is missing",
-                            )
-                        })?;
-                    if sha256(&attachment_bytes) != *expected {
-                        return Err(ProjectCatalogStoreError::new(
-                            "error.project_catalog_recovery_incomplete",
-                            "migration attachment stage hash disagrees",
-                        ));
-                    }
-                    let attachments =
-                        decode_attachment_snapshot(&attachment_bytes).map_err(contract_error)?;
-                    self.verify_nonaction_checkout_bindings_locked(
-                        &attachments,
-                        &journal,
-                        &checkout_locks,
-                    )?;
-                }
+                let forward_bindings_available = journal.kind != TransactionKindV1::V1Migration
+                    || self
+                        .migration_forward_bindings_available(&journal, &checkout_locks)
+                        .unwrap_or(false);
                 let checkout_state =
                     self.classify_checkout_action_recovery(&journal, &checkout_locks)?;
-                if checkout_state == CheckoutActionRecoveryState::Compatible {
+                if forward_bindings_available
+                    && checkout_state == CheckoutActionRecoveryState::Compatible
+                {
                     self.execute_monotonic_checkout_actions_locked(&journal, &checkout_locks)?;
                 }
                 let decision = self.classify_recovery(
                     &journal,
-                    checkout_state == CheckoutActionRecoveryState::ConflictingValid,
+                    !forward_bindings_available
+                        || checkout_state == CheckoutActionRecoveryState::ConflictingValid,
                 )?;
                 match decision {
                     RecoveryDecision::Forward => {
+                        self.install_immutable_assets(&journal)?;
+                        self.verify_immutable_assets(&journal)?;
                         for participant in &journal.participants {
                             self.io.checkpoint(FaultPoint::RecoveryParticipantInstall)?;
                             self.install_new_image(participant)?;
@@ -3832,6 +3836,43 @@ impl ProjectCatalogTransactionOwner {
                 "journal state and outcome disagree",
             )),
         }
+    }
+
+    fn migration_forward_bindings_available(
+        &self,
+        journal: &ProjectCatalogTransactionJournalV1,
+        checkout_locks: &[CatalogDirectoryLockGuard],
+    ) -> ProjectCatalogStoreResult<bool> {
+        let Some(attachment_participant) = journal
+            .participants
+            .iter()
+            .find(|participant| participant.role == ParticipantRoleV1::Attachments)
+        else {
+            return Ok(false);
+        };
+        let ExpectedImageV1::Present {
+            sha256: expected,
+            artifact_name,
+        } = &attachment_participant.new
+        else {
+            return Ok(false);
+        };
+        let Some(attachment_bytes) = self.io.read_regular_nofollow(
+            &self.paths.stage_dir.join(artifact_name.as_str()),
+            MAX_PROJECT_CATALOG_BYTES,
+        )?
+        else {
+            return Ok(false);
+        };
+        if sha256(&attachment_bytes) != *expected {
+            return Ok(false);
+        }
+        let Ok(attachments) = decode_attachment_snapshot(&attachment_bytes) else {
+            return Ok(false);
+        };
+        Ok(self
+            .verify_nonaction_checkout_bindings_locked(&attachments, journal, checkout_locks)
+            .is_ok())
     }
 
     fn classify_recovery(
@@ -4145,25 +4186,38 @@ impl ProjectCatalogTransactionOwner {
                 })?;
             immutable_asset_bytes.insert(asset.role.clone(), bytes);
         }
-        let publisher_source = immutable_asset_bytes
-            .get(&ImmutableAssetRoleV1::LegacyPublisherRefBackup)
-            .ok_or_else(|| {
-                ProjectCatalogStoreError::new(
+        match journal.publisher_ref_source.as_ref() {
+            Some(MigrationPublisherSourceEvidenceV1::Missing { .. })
+                if !immutable_asset_bytes
+                    .contains_key(&ImmutableAssetRoleV1::LegacyPublisherRefBackup) => {}
+            Some(MigrationPublisherSourceEvidenceV1::Present { sha256: expected }) => {
+                let publisher_source = immutable_asset_bytes
+                    .get(&ImmutableAssetRoleV1::LegacyPublisherRefBackup)
+                    .ok_or_else(|| {
+                        ProjectCatalogStoreError::new(
+                            "error.project_catalog_recovery_incomplete",
+                            "present publisher source backup is missing during verification",
+                        )
+                    })?;
+                if sha256(publisher_source) != *expected {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_recovery_incomplete",
+                        "present publisher source backup hash disagrees during verification",
+                    ));
+                }
+                validate_publisher_source_binding(
+                    publisher_source,
+                    &journal.publisher_pins,
+                    "retained migration source",
+                )?;
+            }
+            _ => {
+                return Err(ProjectCatalogStoreError::new(
                     "error.project_catalog_recovery_incomplete",
-                    "legacy publisher source backup is missing during verification",
-                )
-            })?;
-        validate_publisher_source_binding(
-            publisher_source,
-            &journal.publisher_pins,
-            "retained migration source",
-        )
-        .map_err(|error| {
-            ProjectCatalogStoreError::new(
-                "error.project_catalog_recovery_incomplete",
-                error.to_string(),
-            )
-        })?;
+                    "publisher source presence evidence is inconsistent",
+                ));
+            }
+        }
         validate_new_side_cross_roles(
             &catalog,
             &attachments,
@@ -4318,11 +4372,11 @@ impl ProjectCatalogTransactionOwner {
             )
             .map_err(|error| fail(error.to_string()))?;
             let selection_matches =
-                |selection: &&bbox_code_source_store::MigrationEffectiveSourceSelectionV1| {
+                |selection: &&bbox_code_source_store::MigrationEffectiveSourceSelectionV1,
+                 selector: &str| {
                     &selection.published_scope == published_scope
                         && selection.generation_id == generation_id.as_str()
-                        && selection.selector
-                            == source_selector(project_id.as_str(), generation_id.as_str())
+                        && selection.selector == selector
                 };
             let old_selection = old_selections.get(project_id);
             let new_selection = new_selections.get(project_id);
@@ -4341,18 +4395,25 @@ impl ProjectCatalogTransactionOwner {
                     if new_stored != expected_stored {
                         return Err(fail("surviving stored generation rewrites old evidence"));
                     }
-                    match activation_participant {
-                        Some(activation_participant)
+                    let matching_activation = activation_participant
+                        .map(|activation_participant| {
+                            let bytes = read_old(activation_participant)?
+                                .ok_or_else(|| fail("activation lacks exact old bytes"))?;
+                            let activation = decode_activation_v1_for_migration(&bytes)
+                                .map_err(|error| fail(error.to_string()))?;
+                            Ok::<_, ProjectCatalogStoreError>((activation_participant, activation))
+                        })
+                        .transpose()?
+                        .filter(|(_, activation)| {
+                            activation.generation_id == generation_id.as_str()
+                        });
+                    match matching_activation {
+                        Some((activation_participant, old_activation))
                             if matches!(
                                 &activation_participant.new,
                                 ExpectedImageV1::Present { .. }
                             ) =>
                         {
-                            let old_activation_bytes = read_old(activation_participant)?
-                                .ok_or_else(|| fail("active generation lacks old activation"))?;
-                            let old_activation =
-                                decode_activation_v1_for_migration(&old_activation_bytes)
-                                    .map_err(|error| fail(error.to_string()))?;
                             let expected_activation =
                                 bbox_code_source_store::ActivationRecordV2::from_v1_for_migration(
                                     old_activation,
@@ -4367,69 +4428,110 @@ impl ProjectCatalogTransactionOwner {
                                 decode_activation_v2_for_migration(new_activation_bytes)
                                     .map_err(|error| fail(error.to_string()))?;
                             if new_activation != expected_activation
-                                || !old_selection.is_some_and(selection_matches)
-                                || !new_selection.is_some_and(selection_matches)
+                                || old_effective.is_some()
+                                    && !old_selection.is_some_and(|selection| {
+                                        selection_matches(selection, &expected_activation.selector)
+                                    })
+                                || !new_selection.is_some_and(|selection| {
+                                    selection_matches(selection, &expected_activation.selector)
+                                })
                             {
                                 return Err(fail(
                                     "active generation transition rewrites source evidence",
                                 ));
                             }
                             accounted_activations.insert(activation_role);
-                            accounted_old_selections.insert(project_id.clone());
+                            if old_effective.is_some() {
+                                accounted_old_selections.insert(project_id.clone());
+                            }
                             accounted_new_selections.insert(project_id.clone());
                         }
+                        Some((activation_participant, old_activation))
+                            if matches!(
+                                &activation_participant.new,
+                                ExpectedImageV1::Absent {}
+                            ) =>
+                        {
+                            if old_effective.is_some()
+                                && !old_selection.is_some_and(|selection| {
+                                    selection_matches(selection, &old_activation.selector)
+                                })
+                                || new_selection.is_some()
+                            {
+                                return Err(fail(
+                                    "quarantined generation remains active or selected",
+                                ));
+                            }
+                            let retirement_role = ParticipantRoleV1::CollisionRetirement {
+                                project_id: project_id.clone(),
+                            };
+                            let retirement_bytes = post_images
+                                .get(&retirement_role)
+                                .and_then(Option::as_deref)
+                                .ok_or_else(|| {
+                                    fail("quarantined generation lacks retirement record")
+                                })?;
+                            let retirement =
+                                decode_collision_retirement_pending_for_migration(retirement_bytes)
+                                    .map_err(|error| fail(error.to_string()))?;
+                            if &retirement.project_id != project_id
+                                || &retirement.former_scope != published_scope
+                                || retirement.generation_id != generation_id.as_str()
+                                || retirement.selector != old_activation.selector
+                                || retirement.snapshot_id != old_activation.snapshot_id
+                                || retirement.manifest_sha256
+                                    != old_stored.descriptor.manifest_sha256
+                                || retirement.inventory_hash != marker.inventory_sha256.as_str()
+                                || retirement.plan_hash != marker.plan_hash.as_str()
+                            {
+                                return Err(fail(
+                                    "collision retirement rewrites exact old source evidence",
+                                ));
+                            }
+                            accounted_activations.insert(activation_role);
+                            accounted_retirements.insert(retirement_role);
+                            if old_effective.is_some() {
+                                accounted_old_selections.insert(project_id.clone());
+                            }
+                        }
                         None => {
-                            if old_selection.is_some() || new_selection.is_some() {
+                            let selected_here = old_selection.is_some_and(|selection| {
+                                selection.generation_id == generation_id.as_str()
+                            }) || new_selection.is_some_and(|selection| {
+                                selection.generation_id == generation_id.as_str()
+                            });
+                            if selected_here {
                                 return Err(fail("retained generation is unexpectedly selected"));
                             }
                         }
-                        Some(_) => {
-                            return Err(fail(
-                                "surviving stored generation has a deleted activation",
-                            ));
-                        }
+                        Some(_) => return Err(fail("activation transition shape is invalid")),
                     }
                 }
                 ExpectedImageV1::Absent {} => {
-                    let activation_participant = activation_participant
-                        .ok_or_else(|| fail("quarantined generation lacks activation removal"))?;
-                    let old_activation_bytes = read_old(activation_participant)?
-                        .ok_or_else(|| fail("quarantined generation lacks old activation"))?;
-                    let old_activation = decode_activation_v1_for_migration(&old_activation_bytes)
-                        .map_err(|error| fail(error.to_string()))?;
-                    if !matches!(&activation_participant.new, ExpectedImageV1::Absent {})
-                        || !old_selection.is_some_and(selection_matches)
-                        || new_selection.is_some()
-                    {
-                        return Err(fail("quarantined generation remains active or selected"));
-                    }
-                    let retirement_role = ParticipantRoleV1::CollisionRetirement {
-                        project_id: project_id.clone(),
-                    };
-                    let retirement_bytes = post_images
-                        .get(&retirement_role)
-                        .and_then(Option::as_deref)
-                        .ok_or_else(|| fail("quarantined generation lacks retirement record"))?;
-                    let retirement =
-                        decode_collision_retirement_pending_for_migration(retirement_bytes)
-                            .map_err(|error| fail(error.to_string()))?;
-                    if &retirement.project_id != project_id
-                        || &retirement.former_scope != published_scope
-                        || retirement.generation_id != generation_id.as_str()
-                        || retirement.selector
-                            != source_selector(project_id.as_str(), generation_id.as_str())
-                        || retirement.snapshot_id != old_activation.snapshot_id
-                        || retirement.manifest_sha256 != manifest_asset.sha256.as_str()
-                        || retirement.inventory_hash != marker.inventory_sha256.as_str()
-                        || retirement.plan_hash != marker.plan_hash.as_str()
+                    let matches_activation = activation_participant
+                        .map(|activation_participant| {
+                            let bytes = read_old(activation_participant)?
+                                .ok_or_else(|| fail("activation lacks exact old bytes"))?;
+                            let activation = decode_activation_v1_for_migration(&bytes)
+                                .map_err(|error| fail(error.to_string()))?;
+                            Ok::<_, ProjectCatalogStoreError>(
+                                activation.generation_id == generation_id.as_str(),
+                            )
+                        })
+                        .transpose()?
+                        .unwrap_or(false);
+                    if matches_activation
+                        || old_selection.is_some_and(|selection| {
+                            selection.generation_id == generation_id.as_str()
+                        })
+                        || new_selection.is_some_and(|selection| {
+                            selection.generation_id == generation_id.as_str()
+                        })
                     {
                         return Err(fail(
-                            "collision retirement rewrites exact old source evidence",
+                            "migration deletes active, selected, or quarantined generation metadata",
                         ));
                     }
-                    accounted_activations.insert(activation_role);
-                    accounted_retirements.insert(retirement_role);
-                    accounted_old_selections.insert(project_id.clone());
                 }
             }
         }
@@ -5100,6 +5202,10 @@ fn sha256(bytes: &[u8]) -> Sha256Hex {
     Sha256Hex(hex::encode(Sha256::digest(bytes)))
 }
 
+fn publisher_source_absence_sha256() -> Sha256Hex {
+    sha256(b"bbox-project-catalog-publisher-source-absent-v1")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 struct ValidatedBasename(String);
@@ -5416,7 +5522,7 @@ struct ProjectCatalogTransactionJournalV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     plan_hash: Option<Sha256Hex>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    publisher_ref_source_sha256: Option<Sha256Hex>,
+    publisher_ref_source: Option<MigrationPublisherSourceEvidenceV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     publisher_pins: Vec<PublisherPinEvidenceV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -5516,7 +5622,7 @@ impl ProjectCatalogTransactionJournalV1 {
                 });
                 if roles != required
                     || self.plan_hash.is_some()
-                    || self.publisher_ref_source_sha256.is_some()
+                    || self.publisher_ref_source.is_some()
                     || !self.publisher_pins.is_empty()
                     || !self.publisher_dispositions.is_empty()
                     || !self.immutable_assets.is_empty()
@@ -5578,10 +5684,13 @@ impl ProjectCatalogTransactionJournalV1 {
                     self.participants
                         .iter()
                         .all(|participant| match &participant.role {
-                            ParticipantRoleV1::StoredGenerationMetadata { project_id, .. } => {
-                                matches!(&participant.new, ExpectedImageV1::Present { .. })
-                                    || (matches!(&participant.old, ExpectedImageV1::Present { .. })
-                                        && collision_projects.contains(project_id))
+                            ParticipantRoleV1::StoredGenerationMetadata { .. } => {
+                                matches!(&participant.old, ExpectedImageV1::Present { .. })
+                                    && matches!(
+                                        &participant.new,
+                                        ExpectedImageV1::Present { .. }
+                                            | ExpectedImageV1::Absent {}
+                                    )
                             }
                             ParticipantRoleV1::Activation { project_id } => {
                                 matches!(&participant.new, ExpectedImageV1::Present { .. })
@@ -5613,7 +5722,10 @@ impl ProjectCatalogTransactionJournalV1 {
                                                 ..
                                             } if stored_project == project_id
                                         ) && matches!(&stored.old, ExpectedImageV1::Present { .. })
-                                            && matches!(&stored.new, ExpectedImageV1::Absent {})
+                                            && matches!(
+                                                &stored.new,
+                                                ExpectedImageV1::Present { .. }
+                                            )
                                     })
                             }
                             ParticipantRoleV1::AcceptedPublicationPointer { .. } => {
@@ -5631,7 +5743,7 @@ impl ProjectCatalogTransactionJournalV1 {
                     .map(|action| action.observation_id.as_str())
                     .collect::<BTreeSet<_>>();
                 if self.plan_hash.is_none()
-                    || self.publisher_ref_source_sha256.is_none()
+                    || self.publisher_ref_source.is_none()
                     || self.old_epoch != 0
                     || self.new_epoch != 1
                     || mandatory.iter().any(|role| !roles.contains(role))
@@ -5640,11 +5752,20 @@ impl ProjectCatalogTransactionJournalV1 {
                     })
                     || asset_roles.len() != self.immutable_assets.len()
                     || !asset_roles.contains(&ImmutableAssetRoleV1::LegacyProjectStoreBackup)
-                    || !asset_roles.contains(&ImmutableAssetRoleV1::LegacyPublisherRefBackup)
                     || source_backup.map(|asset| &asset.sha256)
                         != catalog.and_then(|participant| participant.old.sha256())
-                    || publisher_backup.map(|asset| &asset.sha256)
-                        != self.publisher_ref_source_sha256.as_ref()
+                    || match self.publisher_ref_source.as_ref() {
+                        Some(MigrationPublisherSourceEvidenceV1::Missing { absence_sha256 }) => {
+                            absence_sha256 != &publisher_source_absence_sha256()
+                                || publisher_backup.is_some()
+                                || !self.publisher_pins.is_empty()
+                                || !self.publisher_dispositions.is_empty()
+                        }
+                        Some(MigrationPublisherSourceEvidenceV1::Present { sha256 }) => {
+                            publisher_backup.map(|asset| &asset.sha256) != Some(sha256)
+                        }
+                        None => true,
+                    }
                     || !role_shapes_are_valid
                     || !catalog.is_some_and(|participant| {
                         matches!(&participant.old, ExpectedImageV1::Present { .. })
@@ -5682,6 +5803,10 @@ impl ProjectCatalogTransactionJournalV1 {
                     &self.publisher_dispositions,
                     "journal",
                 )?;
+                self.publisher_ref_source
+                    .as_ref()
+                    .expect("migration publisher source presence was checked")
+                    .validate()?;
             }
         }
         Ok(())
@@ -5695,7 +5820,7 @@ struct ProjectCatalogMigrationMarkerV1 {
     transaction_id: ProjectCatalogTransactionId,
     plan_hash: Sha256Hex,
     source_store_sha256: Sha256Hex,
-    publisher_ref_source_sha256: Sha256Hex,
+    publisher_ref_source: MigrationPublisherSourceEvidenceV1,
     inventory_sha256: Sha256Hex,
     publisher_pins: Vec<PublisherPinEvidenceV1>,
     publisher_dispositions: Vec<PublisherDispositionEvidenceV1>,
@@ -5743,10 +5868,12 @@ impl ProjectCatalogMigrationMarkerV1 {
             .participants
             .iter()
             .all(|participant| match &participant.role {
-                ParticipantRoleV1::StoredGenerationMetadata { project_id, .. } => {
-                    matches!(&participant.new, ExpectedImageV1::Present { .. })
-                        || (matches!(&participant.old, ExpectedImageV1::Present { .. })
-                            && collision_projects.contains(project_id))
+                ParticipantRoleV1::StoredGenerationMetadata { .. } => {
+                    matches!(&participant.old, ExpectedImageV1::Present { .. })
+                        && matches!(
+                            &participant.new,
+                            ExpectedImageV1::Present { .. } | ExpectedImageV1::Absent {}
+                        )
                 }
                 ParticipantRoleV1::Activation { project_id } => {
                     matches!(&participant.new, ExpectedImageV1::Present { .. })
@@ -5771,7 +5898,7 @@ impl ProjectCatalogMigrationMarkerV1 {
                                     ..
                                 } if stored_project == project_id
                             ) && matches!(&stored.old, ExpectedImageV1::Present { .. })
-                                && matches!(&stored.new, ExpectedImageV1::Absent {})
+                                && matches!(&stored.new, ExpectedImageV1::Present { .. })
                         })
                 }
                 ParticipantRoleV1::AcceptedPublicationPointer { .. } => {
@@ -5826,7 +5953,6 @@ impl ProjectCatalogMigrationMarkerV1 {
             .collect::<BTreeSet<_>>();
         if asset_roles.len() != self.immutable_assets.len()
             || !asset_roles.contains(&ImmutableAssetRoleV1::LegacyProjectStoreBackup)
-            || !asset_roles.contains(&ImmutableAssetRoleV1::LegacyPublisherRefBackup)
             || self.immutable_assets.iter().any(|evidence| {
                 match immutable_target_name(&self.transaction_id, &evidence.role, &evidence.sha256)
                 {
@@ -5857,12 +5983,21 @@ impl ProjectCatalogMigrationMarkerV1 {
         let publisher_backup = self
             .immutable_assets
             .iter()
-            .find(|asset| asset.role == ImmutableAssetRoleV1::LegacyPublisherRefBackup)
-            .expect("mandatory publisher source backup role was checked");
-        if publisher_backup.sha256 != self.publisher_ref_source_sha256 {
+            .find(|asset| asset.role == ImmutableAssetRoleV1::LegacyPublisherRefBackup);
+        if match &self.publisher_ref_source {
+            MigrationPublisherSourceEvidenceV1::Missing { absence_sha256 } => {
+                absence_sha256 != &publisher_source_absence_sha256()
+                    || publisher_backup.is_some()
+                    || !self.publisher_pins.is_empty()
+                    || !self.publisher_dispositions.is_empty()
+            }
+            MigrationPublisherSourceEvidenceV1::Present { sha256 } => {
+                publisher_backup.map(|asset| &asset.sha256) != Some(sha256)
+            }
+        } {
             return Err(ProjectCatalogStoreError::new(
                 "error.project_catalog_migration_incomplete",
-                "migration marker publisher source hash disagrees with its retained backup",
+                "migration marker publisher source evidence disagrees with its backup state",
             ));
         }
         let catalog_backup = self
@@ -6806,6 +6941,13 @@ mod tests {
 
     use super::*;
 
+    fn historical_selector(project_id: &str, generation_id: &str) -> String {
+        format!(
+            "{}:m0123456789abcdef",
+            bbox_code_source::source_selector(project_id, generation_id)
+        )
+    }
+
     #[derive(Debug)]
     struct TracingIo {
         real: RealCatalogStoreIo,
@@ -7162,8 +7304,6 @@ mod tests {
         let root = path.parent().unwrap();
         let transaction_id = ProjectCatalogTransactionId::mint();
         let publisher_source = root.join("publisher-refs.json");
-        let publisher_bytes = b"{\"version\":1,\"refs\":[]}\n";
-        fs::write(&publisher_source, publisher_bytes).unwrap();
         let mut registry =
             MigrationParticipantRegistry::new(path, root.join("code-source"), publisher_source)
                 .unwrap();
@@ -7229,12 +7369,18 @@ mod tests {
                 .unwrap()
                 .into_state(),
         );
+        let legacy_inventory = enumerate_legacy_migration_inventory_locked(
+            &registry.code_source_paths,
+            &StoreLimits::default(),
+        )
+        .unwrap();
+        let inventory_sha256 = Sha256Hex::parse(legacy_inventory.canonical_sha256.clone()).unwrap();
         let draft = MigrationPlanDraftV1 {
             transaction_id,
             plan_hash: Sha256Hex::digest(b"migration fault plan"),
             source_store_sha256: Sha256Hex::digest(legacy_bytes),
-            publisher_ref_source_sha256: Sha256Hex::digest(publisher_bytes),
-            inventory_sha256: Sha256Hex::digest(b"migration fault inventory"),
+            publisher_ref_source: MigrationPublisherSourceDraftV1::Missing,
+            inventory_sha256,
             expected_legacy_catalog_sha256: Sha256Hex::digest(legacy_bytes),
             catalog,
             attachments,
@@ -7243,18 +7389,13 @@ mod tests {
                 None,
                 Some(effective_bytes),
             )],
-            immutable_assets: vec![
-                MigrationImmutableAssetDraftV1::new(
-                    ImmutableAssetRoleV1::LegacyProjectStoreBackup,
-                    legacy_bytes.to_vec(),
-                ),
-                MigrationImmutableAssetDraftV1::new(
-                    ImmutableAssetRoleV1::LegacyPublisherRefBackup,
-                    publisher_bytes.to_vec(),
-                ),
-            ],
+            immutable_assets: vec![MigrationImmutableAssetDraftV1::new(
+                ImmutableAssetRoleV1::LegacyProjectStoreBackup,
+                legacy_bytes.to_vec(),
+            )],
             code_source_snapshot: MigrationCodeSourceSnapshotDraftV1 {
-                effective_manifest_old: None,
+                legacy_inventory,
+                activations: Vec::new(),
                 generations: Vec::new(),
             },
             publisher_pins: Vec::new(),
@@ -7395,14 +7536,14 @@ mod tests {
         }))
         .unwrap();
         fs::write(&registry.legacy_publisher_ref_source, &publisher_bytes).unwrap();
-        draft.publisher_ref_source_sha256 = Sha256Hex::digest(&publisher_bytes);
-        let publisher_backup = draft
+        draft.publisher_ref_source =
+            MigrationPublisherSourceDraftV1::Present(publisher_bytes.clone());
+        draft
             .immutable_assets
-            .iter_mut()
-            .find(|asset| asset.role == ImmutableAssetRoleV1::LegacyPublisherRefBackup)
-            .unwrap();
-        publisher_backup.source =
-            MigrationImmutableAssetSourceV1::InstallableBytes(publisher_bytes);
+            .push(MigrationImmutableAssetDraftV1::new(
+                ImmutableAssetRoleV1::LegacyPublisherRefBackup,
+                publisher_bytes,
+            ));
         draft.publisher_pins.push(PublisherPinEvidenceV1 {
             observation_id: "publisher-observation-1".into(),
             project_id: project_id.clone(),
@@ -7450,8 +7591,7 @@ mod tests {
         let producer_id = "collision-producer";
         let generation_id =
             Sha256Hex::parse(bbox_code_source::generation_id(producer_id, &descriptor)).unwrap();
-        let selector =
-            bbox_code_source::source_selector(project_id.as_str(), generation_id.as_str());
+        let selector = historical_selector(project_id.as_str(), generation_id.as_str());
         let manifest_bytes = Vec::new();
         let manifest_sha256 = Sha256Hex::digest(&manifest_bytes);
         draft.catalog.projects.insert(
@@ -7497,30 +7637,6 @@ mod tests {
         let stored_bytes = serde_json::to_vec_pretty(&old_stored).unwrap();
         decode_activation_v1_for_migration(&activation_bytes).unwrap();
         decode_stored_generation_v1_for_migration(&stored_bytes).unwrap();
-        let old_effective = bbox_code_source_store::encode_migration_effective_source_manifest_v1(
-            &MigrationEffectiveSourceManifestV1 {
-                version: 1,
-                selections: vec![
-                    bbox_code_source_store::MigrationEffectiveSourceSelectionV1 {
-                        project_id: project_id.clone(),
-                        published_scope: former_scope.clone(),
-                        generation_id: generation_id.to_string(),
-                        selector: selector.clone(),
-                    },
-                ],
-            },
-        )
-        .unwrap();
-        let effective_target = registry.code_source_paths.anchor();
-        fs::create_dir_all(effective_target.parent().unwrap()).unwrap();
-        fs::write(&effective_target, &old_effective).unwrap();
-        let effective_participant = draft
-            .participants
-            .iter_mut()
-            .find(|participant| participant.role == ParticipantRoleV1::EffectiveSourceManifest)
-            .unwrap();
-        effective_participant.expected_old_sha256 = Some(Sha256Hex::digest(&old_effective));
-        draft.code_source_snapshot.effective_manifest_old = Some(old_effective);
         let activation_target = registry.code_source_paths.activation(&project_id);
         fs::create_dir_all(activation_target.parent().unwrap()).unwrap();
         fs::write(&activation_target, &activation_bytes).unwrap();
@@ -7542,19 +7658,43 @@ mod tests {
             .unwrap();
         fs::create_dir_all(stored_target.parent().unwrap()).unwrap();
         fs::write(&stored_target, &stored_bytes).unwrap();
+        let new_stored = bbox_code_source_store::StoredGenerationV2::from_v1_for_migration(
+            old_stored,
+            former_scope.clone(),
+        )
+        .unwrap();
         draft.participants.push(MigrationParticipantDraftV1::new(
             stored_role,
             Some(Sha256Hex::digest(&stored_bytes)),
-            None,
+            Some(
+                bbox_code_source_store::encode_stored_generation_v2_for_migration(&new_stored)
+                    .unwrap(),
+            ),
         ));
+        let manifest_role = ImmutableAssetRoleV1::CollectedGenerationManifest {
+            published_scope: former_scope.clone(),
+            generation_id: generation_id.clone(),
+        };
+        let manifest_name =
+            immutable_target_name(&draft.transaction_id, &manifest_role, &manifest_sha256).unwrap();
+        let manifest_target = registry.immutable_target(&manifest_role, &manifest_name);
+        fs::create_dir_all(manifest_target.parent().unwrap()).unwrap();
+        fs::write(&manifest_target, &manifest_bytes).unwrap();
+        let legacy_inventory = enumerate_legacy_migration_inventory_locked(
+            &registry.code_source_paths,
+            &StoreLimits::default(),
+        )
+        .unwrap();
+        draft.inventory_sha256 =
+            Sha256Hex::parse(legacy_inventory.canonical_sha256.clone()).unwrap();
         let retirement = bbox_code_source_store::CollisionRetirementPendingV1 {
             version: 1,
             project_id: project_id.clone(),
             former_scope: former_scope.clone(),
             generation_id: generation_id.to_string(),
-            selector: selector.clone(),
-            snapshot_id: activation.snapshot_id.clone(),
-            manifest_sha256: manifest_sha256.to_string(),
+            selector,
+            snapshot_id: activation.snapshot_id,
+            manifest_sha256: descriptor.manifest_sha256.clone(),
             inventory_hash: draft.inventory_sha256.to_string(),
             plan_hash: draft.plan_hash.to_string(),
         };
@@ -7568,15 +7708,6 @@ mod tests {
             None,
             Some(retirement_bytes),
         ));
-        let manifest_role = ImmutableAssetRoleV1::CollectedGenerationManifest {
-            published_scope: former_scope.clone(),
-            generation_id: generation_id.clone(),
-        };
-        let manifest_name =
-            immutable_target_name(&draft.transaction_id, &manifest_role, &manifest_sha256).unwrap();
-        let manifest_target = registry.immutable_target(&manifest_role, &manifest_name);
-        fs::create_dir_all(manifest_target.parent().unwrap()).unwrap();
-        fs::write(&manifest_target, &manifest_bytes).unwrap();
         draft
             .immutable_assets
             .push(MigrationImmutableAssetDraftV1::pinned_existing(
@@ -7585,21 +7716,22 @@ mod tests {
             ));
         draft
             .code_source_snapshot
+            .activations
+            .push(MigrationCodeSourceActivationDraftV1 {
+                observation_id: "collision-activation-observation-1".into(),
+                project_id: project_id.clone(),
+                disposition: MigrationCodeSourceDispositionV1::QuarantinedCollision,
+            });
+        draft
+            .code_source_snapshot
             .generations
             .push(MigrationCodeSourceGenerationDraftV1 {
                 observation_id: "collision-generation-observation-1".into(),
                 project_id,
-                published_scope: former_scope,
                 generation_id,
-                selector,
-                producer_id: producer_id.into(),
-                descriptor,
-                manifest_sha256: Sha256Hex::digest(&manifest_bytes),
-                manifest_bytes: manifest_bytes.clone(),
-                old_activation: Some(activation_bytes),
-                old_stored_metadata: stored_bytes,
                 disposition: MigrationCodeSourceDispositionV1::QuarantinedCollision,
             });
+        draft.code_source_snapshot.legacy_inventory = legacy_inventory;
         (manifest_role, manifest_target, manifest_bytes)
     }
 
@@ -7638,8 +7770,6 @@ mod tests {
         let producer_id = "retained-producer";
         let generation_id =
             Sha256Hex::parse(bbox_code_source::generation_id(producer_id, &descriptor)).unwrap();
-        let selector =
-            bbox_code_source::source_selector(project_id.as_str(), generation_id.as_str());
         let old_stored = bbox_code_source_store::StoredGeneration {
             version: 1,
             generation_id: generation_id.to_string(),
@@ -7698,17 +7828,37 @@ mod tests {
             .push(MigrationCodeSourceGenerationDraftV1 {
                 observation_id: "retained-generation-observation-1".into(),
                 project_id,
-                published_scope: scope,
                 generation_id,
-                selector,
-                producer_id: producer_id.into(),
-                descriptor,
-                manifest_sha256,
-                manifest_bytes,
-                old_activation: None,
-                old_stored_metadata: old_stored_bytes,
                 disposition: MigrationCodeSourceDispositionV1::SurvivingRetained,
             });
+        let legacy_inventory = enumerate_legacy_migration_inventory_locked(
+            &registry.code_source_paths,
+            &StoreLimits::default(),
+        )
+        .unwrap();
+        draft.inventory_sha256 =
+            Sha256Hex::parse(legacy_inventory.canonical_sha256.clone()).unwrap();
+        draft.code_source_snapshot.legacy_inventory = legacy_inventory;
+        for participant in &mut draft.participants {
+            if !matches!(
+                participant.role,
+                ParticipantRoleV1::CollisionRetirement { .. }
+            ) {
+                continue;
+            }
+            let bytes = participant
+                .post_image
+                .as_deref()
+                .expect("collision retirement has a post-image");
+            let mut retirement = decode_collision_retirement_pending_for_migration(bytes).unwrap();
+            retirement.inventory_hash = draft.inventory_sha256.to_string();
+            participant.post_image = Some(
+                bbox_code_source_store::encode_collision_retirement_pending_for_migration(
+                    &retirement,
+                )
+                .unwrap(),
+            );
+        }
     }
 
     fn extended_migration_fault_fixture() -> (
@@ -7769,7 +7919,7 @@ mod tests {
         };
         let producer_id = "migration-producer";
         let generation_id = bbox_code_source::generation_id(producer_id, &descriptor);
-        let selector = bbox_code_source::source_selector(project_id.as_str(), &generation_id);
+        let selector = historical_selector(project_id.as_str(), &generation_id);
         let manifest_bytes = Vec::new();
         let manifest_sha256 = Sha256Hex::digest(&manifest_bytes);
         let old_generation = bbox_code_source_store::StoredGeneration {
@@ -7849,15 +7999,12 @@ mod tests {
         let effective_bytes =
             bbox_code_source_store::encode_migration_effective_source_manifest_v1(&effective)
                 .unwrap();
-        let effective_target = registry.code_source_paths.anchor();
-        fs::create_dir_all(effective_target.parent().unwrap()).unwrap();
-        fs::write(&effective_target, &effective_bytes).unwrap();
         let effective_participant = draft
             .participants
             .iter_mut()
             .find(|participant| participant.role == ParticipantRoleV1::EffectiveSourceManifest)
             .unwrap();
-        effective_participant.expected_old_sha256 = Some(Sha256Hex::digest(&effective_bytes));
+        effective_participant.expected_old_sha256 = None;
         effective_participant.post_image = Some(effective_bytes.clone());
         let activation_target = registry.code_source_paths.activation(&project_id);
         fs::create_dir_all(activation_target.parent().unwrap()).unwrap();
@@ -7896,20 +8043,24 @@ mod tests {
                 manifest_role,
                 manifest_sha256.clone(),
             ));
+        let legacy_inventory = enumerate_legacy_migration_inventory_locked(
+            &registry.code_source_paths,
+            &StoreLimits::default(),
+        )
+        .unwrap();
+        draft.inventory_sha256 =
+            Sha256Hex::parse(legacy_inventory.canonical_sha256.clone()).unwrap();
         draft.code_source_snapshot = MigrationCodeSourceSnapshotDraftV1 {
-            effective_manifest_old: Some(effective_bytes),
+            legacy_inventory,
+            activations: vec![MigrationCodeSourceActivationDraftV1 {
+                observation_id: "active-activation-observation-1".into(),
+                project_id: project_id.clone(),
+                disposition: MigrationCodeSourceDispositionV1::SurvivingActive,
+            }],
             generations: vec![MigrationCodeSourceGenerationDraftV1 {
                 observation_id: "active-generation-observation-1".into(),
                 project_id,
-                published_scope: scope,
                 generation_id,
-                selector,
-                producer_id: producer_id.into(),
-                descriptor,
-                manifest_sha256,
-                manifest_bytes,
-                old_activation: Some(old_activation_bytes),
-                old_stored_metadata: old_stored_bytes,
                 disposition: MigrationCodeSourceDispositionV1::SurvivingActive,
             }],
         };
@@ -7930,6 +8081,19 @@ mod tests {
             activation_migration_draft(&path, legacy_bytes);
         let plan = validate_migration_plan(&path, registry, draft).unwrap();
         (directory, path, plan, activation_role, stored_role)
+    }
+
+    #[test]
+    fn migration_plan_rejects_an_omitted_owner_enumerated_generation() {
+        let (_directory, path) = projects_path();
+        let legacy_bytes = b"{\"version\":1,\"projects\":[]}\n";
+        fs::write(&path, legacy_bytes).unwrap();
+        let (registry, mut draft, _, _) = activation_migration_draft(&path, legacy_bytes);
+        draft.code_source_snapshot.generations.clear();
+
+        let error = validate_migration_plan(&path, registry, draft).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_invalid_migration_plan");
+        assert_no_migration_outputs(&path);
     }
 
     #[test]
@@ -8335,7 +8499,8 @@ mod tests {
         assert_no_migration_outputs(&path);
 
         let (registry, mut draft, _) = basic_migration_draft(&path, legacy_bytes);
-        draft.publisher_ref_source_sha256 = Sha256Hex::digest(b"different publisher source");
+        draft.publisher_ref_source =
+            MigrationPublisherSourceDraftV1::Present(b"different publisher source".to_vec());
         assert!(validate_migration_plan(&path, registry, draft).is_err());
         assert_no_migration_outputs(&path);
 
@@ -8989,6 +9154,50 @@ mod tests {
     }
 
     #[test]
+    fn missing_attachment_stage_forces_exact_rollback_across_a_second_crash() {
+        let (_directory, path, plan, _, legacy_bytes) = migration_fault_fixture();
+        let registry = plan.registry.clone();
+        let initial = Arc::new(TracingIo::failing_points([FaultPoint::ParticipantInstall]));
+        assert!(transact_migration_with_io(&path, plan, initial).is_err());
+
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        let journal: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
+            &fs::read(&paths.journal).unwrap(),
+            MAX_JOURNAL_BYTES,
+            "transaction journal",
+        )
+        .unwrap();
+        let attachment_stage = journal
+            .participants
+            .iter()
+            .find(|participant| participant.role == ParticipantRoleV1::Attachments)
+            .and_then(|participant| match &participant.new {
+                ExpectedImageV1::Present { artifact_name, .. } => {
+                    Some(paths.stage_dir.join(artifact_name.as_str()))
+                }
+                ExpectedImageV1::Absent {} => None,
+            })
+            .unwrap();
+        fs::remove_file(attachment_stage).unwrap();
+
+        let second_crash = Arc::new(TracingIo::failing_points([
+            FaultPoint::RecoveryParticipantRestore,
+        ]));
+        assert!(recover_migration_with_io(&path, registry.clone(), second_crash).is_err());
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
+        assert!(!paths.attachments.exists());
+        let recovered: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
+            &fs::read(paths.journal).unwrap(),
+            MAX_JOURNAL_BYTES,
+            "transaction journal",
+        )
+        .unwrap();
+        assert_eq!(recovered.outcome, Some(TransactionOutcomeV1::RolledBack));
+    }
+
+    #[test]
     fn rollback_recovery_fault_matrix_deletes_only_the_exact_new_image() {
         let (_trace_directory, successful_path) = projects_path();
         let recording = Arc::new(TracingIo::recording());
@@ -9061,7 +9270,9 @@ mod tests {
         journal.kind = TransactionKindV1::V1Migration;
         journal.plan_hash = Some(sha256(b"synthetic migration plan"));
         let publisher_hash = sha256(b"legacy publisher refs");
-        journal.publisher_ref_source_sha256 = Some(publisher_hash.clone());
+        journal.publisher_ref_source = Some(MigrationPublisherSourceEvidenceV1::Present {
+            sha256: publisher_hash.clone(),
+        });
         let catalog = journal
             .participants
             .iter_mut()
@@ -9175,15 +9386,17 @@ mod tests {
             evidence.role == ParticipantRoleV1::EffectiveSourceManifest
                 && matches!(evidence.new, ExpectedImageV1::Present { .. })
         }));
-        assert_eq!(marker.immutable_assets.len(), 2);
+        assert_eq!(marker.immutable_assets.len(), 1);
         assert_eq!(
-            marker.publisher_ref_source_sha256,
-            Sha256Hex::digest(b"{\"version\":1,\"refs\":[]}\n")
+            marker.publisher_ref_source,
+            MigrationPublisherSourceEvidenceV1::missing()
         );
-        assert!(marker.immutable_assets.iter().any(|asset| {
-            asset.role == ImmutableAssetRoleV1::LegacyPublisherRefBackup
-                && asset.sha256 == marker.publisher_ref_source_sha256
-        }));
+        assert!(
+            !marker
+                .immutable_assets
+                .iter()
+                .any(|asset| asset.role == ImmutableAssetRoleV1::LegacyPublisherRefBackup)
+        );
         let root = path.parent().unwrap();
         assert_eq!(
             fs::read_to_string(root.join("checkout/.bbox/local/checkout-id")).unwrap(),
@@ -9222,7 +9435,7 @@ mod tests {
         };
         let producer_id = "later-producer";
         let generation_id = bbox_code_source::generation_id(producer_id, &descriptor);
-        let selector = bbox_code_source::source_selector(project_id.as_str(), &generation_id);
+        let selector = historical_selector(project_id.as_str(), &generation_id);
         let stored = bbox_code_source_store::StoredGenerationV2 {
             version: 2,
             generation_id: generation_id.clone(),
@@ -9404,7 +9617,9 @@ mod tests {
             transaction_id: transaction_id.clone(),
             plan_hash: Sha256Hex::digest(b"plan"),
             source_store_sha256: source_hash,
-            publisher_ref_source_sha256: Sha256Hex::digest(b"publisher refs"),
+            publisher_ref_source: MigrationPublisherSourceEvidenceV1::Present {
+                sha256: Sha256Hex::digest(b"publisher refs"),
+            },
             inventory_sha256: Sha256Hex::digest(b"inventory"),
             publisher_pins: Vec::new(),
             publisher_dispositions: Vec::new(),
@@ -9442,7 +9657,9 @@ mod tests {
             state: TransactionStateV1::Prepared,
             outcome: None,
             plan_hash: Some(Sha256Hex::digest(b"plan")),
-            publisher_ref_source_sha256: Some(Sha256Hex::digest(b"publisher refs")),
+            publisher_ref_source: Some(MigrationPublisherSourceEvidenceV1::Present {
+                sha256: Sha256Hex::digest(b"publisher refs"),
+            }),
             publisher_pins: Vec::new(),
             publisher_dispositions: Vec::new(),
             old_epoch: 0,
