@@ -1545,7 +1545,7 @@ fn spawn_retirement(
                                 project_id,
                                 generation_id,
                             } => {
-                                if let Err(error) = repair_collision_generation_state(
+                                if let Err(error) = repair_and_complete_collision_retirement(
                                     &store,
                                     project_id,
                                     generation_id,
@@ -1587,11 +1587,9 @@ fn spawn_retirement(
                                 store.complete_retirement(&record.selector)
                             }
                             RetirementCompletion::Collision {
-                                project_id,
-                                generation_id,
-                            } => {
-                                store.complete_collision_retirement(project_id, generation_id)
-                            }
+                                project_id: _,
+                                generation_id: _,
+                            } => Ok(()),
                         };
                         if let Err(error) = completion_result {
                             tracing::warn!(%error, "completing code-source retirement record failed");
@@ -1628,14 +1626,14 @@ enum RetirementCompletion {
     },
 }
 
-fn repair_collision_generation_state(
+fn repair_and_complete_collision_retirement(
     store: &CodeSourceStore,
     project_id: &ProjectId,
     generation_id: &str,
 ) -> Result<()> {
     store
-        .repair_collision_generation_state(project_id, generation_id)
-        .context("repairing collision retirement generation state")
+        .repair_and_complete_collision_retirement(project_id, generation_id)
+        .context("repairing and completing collision retirement")
 }
 
 fn spawn_selectorless_collision_retirement(
@@ -1646,9 +1644,11 @@ fn spawn_selectorless_collision_retirement(
         .name("blackbox-code-source-collision-retirement".to_string())
         .spawn(move || {
             let store = state.code_sources.store();
-            if let Err(error) =
-                repair_collision_generation_state(&store, &work.project_id, &work.generation_id)
-            {
+            if let Err(error) = repair_and_complete_collision_retirement(
+                &store,
+                &work.project_id,
+                &work.generation_id,
+            ) {
                 let _ = store.record_health_failure(
                     work.project_id.as_str(),
                     "retirement_failed",
@@ -1659,22 +1659,6 @@ fn spawn_selectorless_collision_retirement(
                     generation_id = %work.generation_id,
                     %error,
                     "selectorless collision retirement generation repair failed"
-                );
-                return;
-            }
-            if let Err(error) =
-                store.complete_collision_retirement(&work.project_id, &work.generation_id)
-            {
-                let _ = store.record_health_failure(
-                    work.project_id.as_str(),
-                    "retirement_failed",
-                    &error.to_string(),
-                );
-                tracing::warn!(
-                    project_id = %work.project_id,
-                    generation_id = %work.generation_id,
-                    %error,
-                    "completing selectorless collision retirement failed"
                 );
                 return;
             }
@@ -1867,8 +1851,45 @@ mod tests {
         let store = CodeSourceStore::open(&root, StoreLimits::default()).unwrap();
         let paths = CodeSourceStorePaths::new(root).unwrap();
         let project_id = ProjectId::parse("startup-collision").unwrap();
-        let exact_generation_id = "a".repeat(64);
-        let retained_generation_id = "b".repeat(64);
+        let scope = PublishedScope::try_new("startup-repo", ".").unwrap();
+        let exact_descriptor = empty_generation_descriptor(scope.clone(), &"a".repeat(40));
+        let retained_descriptor = empty_generation_descriptor(scope.clone(), &"b".repeat(40));
+        let exact_generation_id = compute_generation_id("startup-exact-host", &exact_descriptor);
+        let retained_generation_id =
+            compute_generation_id("startup-retained-host", &retained_descriptor);
+        for (generation_id, producer_id, descriptor) in [
+            (
+                &exact_generation_id,
+                "startup-exact-host",
+                exact_descriptor.clone(),
+            ),
+            (
+                &retained_generation_id,
+                "startup-retained-host",
+                retained_descriptor.clone(),
+            ),
+        ] {
+            let metadata_path = paths.generation_metadata(&scope, generation_id).unwrap();
+            fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+            fs::write(
+                metadata_path,
+                encode_stored_generation_v2_for_migration(&StoredGenerationV2 {
+                    version: 2,
+                    generation_id: generation_id.clone(),
+                    producer_id: producer_id.to_string(),
+                    ordinal: 1,
+                    descriptor,
+                    published_scope: scope.clone(),
+                    state: GenerationState::Ready,
+                    diagnostic: None,
+                    created_unix_secs: 1,
+                    materialized_doc_count: None,
+                    entity_inventory_sha256: None,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        }
         let exact_selector = format!(
             "{}:m0123456789abcdef",
             source_selector(project_id.as_str(), &exact_generation_id)
@@ -1881,12 +1902,12 @@ mod tests {
                     exact_generation_id.clone(),
                     CollisionRetirementEntryV1 {
                         state: CollisionRetirementLifecycleStateV1::Pending,
-                        former_scope: PublishedScope::try_new("startup-repo", ".").unwrap(),
+                        former_scope: scope.clone(),
                         selector_evidence: CollisionRetirementSelectorEvidenceV1::ExactMaterialized(
                             exact_selector.clone(),
                         ),
                         snapshot_id: format!("collected-{}", "c".repeat(32)),
-                        manifest_sha256: "d".repeat(64),
+                        manifest_sha256: exact_descriptor.manifest_sha256,
                         inventory_hash: "e".repeat(64),
                         plan_hash: "f".repeat(64),
                     },
@@ -1895,10 +1916,10 @@ mod tests {
                     retained_generation_id.clone(),
                     CollisionRetirementEntryV1 {
                         state: CollisionRetirementLifecycleStateV1::Pending,
-                        former_scope: PublishedScope::try_new("startup-repo", ".").unwrap(),
+                        former_scope: scope,
                         selector_evidence: CollisionRetirementSelectorEvidenceV1::NoDurableSelector,
                         snapshot_id: format!("collected-{}", "c".repeat(32)),
-                        manifest_sha256: "1".repeat(64),
+                        manifest_sha256: retained_descriptor.manifest_sha256,
                         inventory_hash: "2".repeat(64),
                         plan_hash: "f".repeat(64),
                     },
@@ -1916,17 +1937,17 @@ mod tests {
         let first_recovery = collision_retirement_tasks_for_recovery(&store).unwrap();
 
         assert_eq!(first_recovery.len(), 2);
-        assert!(matches!(
-            &first_recovery[0],
+        assert!(first_recovery.iter().any(|task| matches!(
+            task,
             CollisionRetirementRecoveryTask::Exact { work, selector }
                 if work.generation_id == exact_generation_id && selector == &exact_selector
-        ));
-        assert!(matches!(
-            &first_recovery[1],
+        )));
+        assert!(first_recovery.iter().any(|task| matches!(
+            task,
             CollisionRetirementRecoveryTask::Selectorless { work }
                 if work.generation_id == retained_generation_id
                     && work.exact_selector().is_none()
-        ));
+        )));
         let queued =
             decode_collision_retirement_pending_for_migration(&fs::read(&lifecycle_path).unwrap())
                 .unwrap();
@@ -1938,7 +1959,7 @@ mod tests {
         );
 
         store
-            .complete_collision_retirement(&project_id, &retained_generation_id)
+            .repair_and_complete_collision_retirement(&project_id, &retained_generation_id)
             .unwrap();
         let restarted = collision_retirement_tasks_for_recovery(&store).unwrap();
         assert_eq!(restarted.len(), 1);
@@ -1949,7 +1970,7 @@ mod tests {
         ));
 
         store
-            .complete_collision_retirement(&project_id, &exact_generation_id)
+            .repair_and_complete_collision_retirement(&project_id, &exact_generation_id)
             .unwrap();
         assert!(
             collision_retirement_tasks_for_recovery(&store)
@@ -2000,7 +2021,7 @@ mod tests {
     }
 
     #[test]
-    fn collision_generation_repair_failure_preserves_work_and_retries_for_both_targets() {
+    fn collision_terminal_transition_failure_preserves_work_and_retries_for_both_targets() {
         for (project_name, producer_id, exact_selector) in [
             ("repair-exact", "repair-host-exact", true),
             ("repair-retained", "repair-host-retained", false),
@@ -2051,7 +2072,8 @@ mod tests {
             );
 
             assert!(
-                repair_collision_generation_state(&store, &project_id, &generation_id).is_err()
+                repair_and_complete_collision_retirement(&store, &project_id, &generation_id)
+                    .is_err()
             );
             let queued = decode_collision_retirement_pending_for_migration(
                 &fs::read(&lifecycle_path).unwrap(),
@@ -2083,10 +2105,7 @@ mod tests {
                 encode_stored_generation_v2_for_migration(&stored).unwrap(),
             )
             .unwrap();
-            repair_collision_generation_state(&store, &project_id, &generation_id).unwrap();
-            store
-                .complete_collision_retirement(&project_id, &generation_id)
-                .unwrap();
+            repair_and_complete_collision_retirement(&store, &project_id, &generation_id).unwrap();
 
             assert_eq!(
                 decode_stored_generation_v2_for_migration(&fs::read(metadata_path).unwrap())

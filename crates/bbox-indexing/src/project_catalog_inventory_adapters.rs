@@ -2512,19 +2512,18 @@ mod tests {
             .to_string(),
             "error.project_catalog_inventory_adapter_source: active_descriptor_committed_scope_mismatch"
         );
-        assert_eq!(
-            observe_code_sources(&snapshot, &BTreeMap::new(), &BTreeSet::new())
-                .unwrap_err()
-                .to_string(),
-            "error.project_catalog_inventory_adapter_source: collision_lifecycle_owner_generation_set_mismatch"
-        );
         let capture = observe_code_sources(
             &snapshot,
             &BTreeMap::new(),
             &BTreeSet::from([project_id.clone()]),
         )
         .unwrap();
-        let quarantined = &capture.sources[0].observation.quarantine[0];
+        let quarantined = capture.sources[0]
+            .observation
+            .quarantine
+            .iter()
+            .find(|generation| generation.generation_id == active_generation_id)
+            .unwrap();
         assert_eq!(quarantined.generation_id, active_generation_id);
         assert!(matches!(
             quarantined.descriptor,
@@ -2553,22 +2552,28 @@ mod tests {
                     .row_observation_ids
                     .contains(&quarantined.observation_id)
         }));
-        let bound = capture.sources[0]
+        let active_generation_sources = capture.sources[0]
             .source_evidence
             .iter()
             .filter(|source| {
                 matches!(
-                    source.source_kind,
-                    MutableInventorySourceKindV1::CodeSourceGenerationMetadata
-                        | MutableInventorySourceKindV1::CodeSourceGenerationManifest
+                    &source.source_locator,
+                    MutableInventorySourceLocatorV1::CodeSourceGenerationMetadata {
+                        generation_id,
+                        ..
+                    } | MutableInventorySourceLocatorV1::CodeSourceGenerationManifest {
+                        generation_id,
+                        ..
+                    } if generation_id == &active_generation_id
                 )
             })
-            .all(|source| {
-                source
-                    .row_observation_ids
-                    .contains(&quarantined.observation_id)
-            });
-        assert!(bound);
+            .collect::<Vec<_>>();
+        assert_eq!(active_generation_sources.len(), 2);
+        assert!(active_generation_sources.iter().all(|source| {
+            source
+                .row_observation_ids
+                .contains(&quarantined.observation_id)
+        }));
         let retained = capture.sources[0]
             .observation
             .quarantine
@@ -2624,10 +2629,14 @@ mod tests {
             &BTreeSet::new(),
         )
         .unwrap();
+        let active_quarantine = capture.sources[0]
+            .observation
+            .quarantine
+            .iter()
+            .find(|generation| generation.generation_id == active_generation_id)
+            .unwrap();
         assert!(matches!(
-            capture.sources[0].observation.quarantine[0]
-                .collision_lifecycle
-                .selector_evidence,
+            active_quarantine.collision_lifecycle.selector_evidence,
             DurableSelectorEvidenceV1::ExactMaterialized { .. }
         ));
 

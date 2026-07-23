@@ -3961,19 +3961,23 @@ impl CodeSourceStore {
         Ok(records)
     }
 
-    pub fn repair_collision_generation_state(
+    pub fn repair_and_complete_collision_retirement(
         &self,
         project_id: &ProjectId,
         generation_id: &str,
     ) -> Result<()> {
         validate_sha256(generation_id)?;
         let _guard = self.lock_mutation()?;
-        let lifecycle = self
+        let mut lifecycle = self
             .collision_lifecycle_for_project_locked(project_id)?
             .ok_or_else(|| anyhow!("collision retirement lifecycle is missing"))?;
-        let entry = lifecycle.entry(generation_id)?;
+        let previous = lifecycle.clone();
+        let entry = lifecycle
+            .entries
+            .get(generation_id)
+            .ok_or_else(|| anyhow!("collision retirement generation is absent"))?;
         if entry.state != CollisionRetirementLifecycleStateV1::Queued {
-            bail!("collision retirement generation repair requires queued lifecycle state");
+            bail!("collision retirement terminal transition requires queued lifecycle state");
         }
         let work_path = self
             .paths
@@ -3998,68 +4002,40 @@ impl CodeSourceStore {
         let metadata_path = self
             .paths
             .generation_metadata(&entry.former_scope, generation_id)?;
-        let mut stored = read_mixed_stored_generation(&metadata_path)?;
-        if stored.generation_id() != generation_id
-            || stored.descriptor().scope != entry.former_scope
+        let mut stored = match read_mixed_stored_generation(&metadata_path)? {
+            MixedStoredGeneration::LegacyV1(_) => {
+                bail!("collision retirement refuses legacy generation metadata")
+            }
+            MixedStoredGeneration::CurrentV2(record) => record,
+        };
+        if stored.generation_id != generation_id
+            || stored.published_scope != entry.former_scope
+            || stored.descriptor.scope != entry.former_scope
         {
             bail!("collision retirement generation metadata disagrees with lifecycle evidence");
         }
-        match &mut stored {
-            MixedStoredGeneration::LegacyV1(record) => {
-                record.state = GenerationState::Superseded;
-                record.diagnostic = None;
-            }
-            MixedStoredGeneration::CurrentV2(record) => {
-                record.state = GenerationState::Superseded;
-                record.diagnostic = None;
-            }
-        }
+        stored.state = GenerationState::Superseded;
+        stored.diagnostic = None;
+        let stored = MixedStoredGeneration::CurrentV2(stored);
         self.save_mixed_generation_locked(&stored)?;
-        self.update_desired_if_same_mixed(&stored)
-    }
+        self.update_desired_if_same_mixed(&stored)?;
+        if stored.state() != GenerationState::Superseded {
+            bail!("collision retirement generation did not reach superseded state");
+        }
 
-    pub fn complete_collision_retirement(
-        &self,
-        project_id: &ProjectId,
-        generation_id: &str,
-    ) -> Result<()> {
-        validate_sha256(generation_id)?;
-        let _guard = self.lock_mutation()?;
-        let Some(mut lifecycle) = self.collision_lifecycle_for_project_locked(project_id)? else {
-            bail!("collision retirement lifecycle is missing");
-        };
-        let previous = lifecycle.clone();
         let entry = lifecycle
             .entries
             .get_mut(generation_id)
             .ok_or_else(|| anyhow!("collision retirement generation is absent"))?;
-        let work_path = self
-            .paths
-            .collision_retirement_work(project_id, generation_id)?;
-        let work = read_collision_retirement_work_nofollow(&work_path)?;
-        if work.as_ref().is_some_and(|work| !work.matches_entry(entry)) {
-            bail!("collision retirement work row rewrites lifecycle evidence");
-        }
-        match entry.state {
-            CollisionRetirementLifecycleStateV1::Pending => {
-                bail!("collision retirement cannot complete before work publication");
-            }
-            CollisionRetirementLifecycleStateV1::Queued => {
-                if work.is_none() {
-                    bail!("queued collision retirement work row is missing");
-                }
-                entry.state = CollisionRetirementLifecycleStateV1::Completed;
-                lifecycle.validate_transition_from(&previous)?;
-                atomic_write_json(
-                    &self
-                        .paths
-                        .collision_retirement_pending(&lifecycle.project_id),
-                    &lifecycle,
-                )?;
-                remove_file_if_exists(&work_path)
-            }
-            CollisionRetirementLifecycleStateV1::Completed => remove_file_if_exists(&work_path),
-        }
+        entry.state = CollisionRetirementLifecycleStateV1::Completed;
+        lifecycle.validate_transition_from(&previous)?;
+        atomic_write_json(
+            &self
+                .paths
+                .collision_retirement_pending(&lifecycle.project_id),
+            &lifecycle,
+        )?;
+        remove_file_if_exists(&work_path)
     }
 
     fn collision_lifecycle_for_project_locked(
@@ -6671,16 +6647,77 @@ mod tests {
         }
     }
 
-    fn retirement_for_lifecycle(lifecycle: &CollisionRetirementLifecycleV1) -> RetirementRecord {
-        let generation_id = "a".repeat(64);
-        let entry = lifecycle.entry(&generation_id).unwrap();
-        RetirementRecord {
+    fn collision_terminal_fixture(
+        store: &CodeSourceStore,
+    ) -> (CollisionRetirementLifecycleV1, String, String) {
+        let descriptor = descriptor(&[]);
+        let scope = descriptor.scope.clone();
+        let project_id = ProjectId::parse("project-terminal").unwrap();
+        let records = ["host-exact", "host-retained"]
+            .into_iter()
+            .map(|producer_id| {
+                let generation_id = generation_id(producer_id, &descriptor);
+                let record = StoredGenerationV2 {
+                    version: MIGRATION_STORE_VERSION,
+                    generation_id: generation_id.clone(),
+                    producer_id: producer_id.to_string(),
+                    ordinal: 1,
+                    descriptor: descriptor.clone(),
+                    published_scope: scope.clone(),
+                    state: GenerationState::Ready,
+                    diagnostic: Some("pending collision retirement".to_string()),
+                    created_unix_secs: 1,
+                    materialized_doc_count: None,
+                    entity_inventory_sha256: None,
+                };
+                let metadata_path = store
+                    .paths
+                    .generation_metadata(&scope, &generation_id)
+                    .unwrap();
+                fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+                fs::write(
+                    metadata_path,
+                    encode_stored_generation_v2_for_migration(&record).unwrap(),
+                )
+                .unwrap();
+                (generation_id, record)
+            })
+            .collect::<Vec<_>>();
+        let exact_generation_id = records[0].0.clone();
+        let retained_generation_id = records[1].0.clone();
+        let lifecycle = CollisionRetirementLifecycleV1 {
             version: STORE_VERSION,
-            project_id: lifecycle.project_id.to_string(),
-            selector: entry.exact_selector().unwrap().to_string(),
-            snapshot_id: entry.snapshot_id.clone(),
-            generation_id: Some(generation_id),
-        }
+            project_id: project_id.clone(),
+            entries: BTreeMap::from([
+                (
+                    exact_generation_id.clone(),
+                    CollisionRetirementEntryV1 {
+                        state: CollisionRetirementLifecycleStateV1::Pending,
+                        former_scope: scope.clone(),
+                        selector_evidence: CollisionRetirementSelectorEvidenceV1::ExactMaterialized(
+                            materialized_selector(project_id.as_str(), &exact_generation_id),
+                        ),
+                        snapshot_id: format!("collected-{}", "e".repeat(32)),
+                        manifest_sha256: descriptor.manifest_sha256.clone(),
+                        inventory_hash: "c".repeat(64),
+                        plan_hash: "d".repeat(64),
+                    },
+                ),
+                (
+                    retained_generation_id.clone(),
+                    CollisionRetirementEntryV1 {
+                        state: CollisionRetirementLifecycleStateV1::Pending,
+                        former_scope: scope,
+                        selector_evidence: CollisionRetirementSelectorEvidenceV1::NoDurableSelector,
+                        snapshot_id: format!("collected-{}", "f".repeat(32)),
+                        manifest_sha256: descriptor.manifest_sha256,
+                        inventory_hash: "2".repeat(64),
+                        plan_hash: "d".repeat(64),
+                    },
+                ),
+            ]),
+        };
+        (lifecycle, exact_generation_id, retained_generation_id)
     }
 
     fn write_collision_lifecycle(
@@ -6739,23 +6776,27 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let store = open_store(&root);
-        let mut lifecycle = collision_lifecycle_fixture();
-        lifecycle.entries.remove(&"a".repeat(64));
+        let (mut lifecycle, exact_generation_id, retained_generation_id) =
+            collision_terminal_fixture(&store);
+        lifecycle.entries.remove(&exact_generation_id);
         write_collision_lifecycle(&store, &lifecycle);
 
         store.reconcile_collision_retirements().unwrap();
 
         let work = store.collision_retirement_work_records().unwrap();
         assert_eq!(work.len(), 1);
-        assert_eq!(work[0].generation_id, "b".repeat(64));
+        assert_eq!(work[0].generation_id, retained_generation_id);
         assert!(work[0].exact_selector().is_none());
         assert!(store.retirement_records().unwrap().is_empty());
         store
-            .complete_collision_retirement(&lifecycle.project_id, &"b".repeat(64))
+            .repair_and_complete_collision_retirement(
+                &lifecycle.project_id,
+                &retained_generation_id,
+            )
             .unwrap();
         assert_eq!(
             read_collision_lifecycle(&store, &lifecycle.project_id)
-                .entry(&"b".repeat(64))
+                .entry(&retained_generation_id)
                 .unwrap()
                 .state,
             CollisionRetirementLifecycleStateV1::Completed
@@ -6767,25 +6808,29 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let store = open_store(&root);
-        let lifecycle = collision_lifecycle_fixture();
+        let (lifecycle, exact_generation_id, retained_generation_id) =
+            collision_terminal_fixture(&store);
         write_collision_lifecycle(&store, &lifecycle);
         store.reconcile_collision_retirements().unwrap();
 
         store
-            .complete_collision_retirement(&lifecycle.project_id, &"b".repeat(64))
+            .repair_and_complete_collision_retirement(
+                &lifecycle.project_id,
+                &retained_generation_id,
+            )
             .unwrap();
         let partial = read_collision_lifecycle(&store, &lifecycle.project_id);
         assert_eq!(
-            partial.entry(&"a".repeat(64)).unwrap().state,
+            partial.entry(&exact_generation_id).unwrap().state,
             CollisionRetirementLifecycleStateV1::Queued
         );
         assert_eq!(
-            partial.entry(&"b".repeat(64)).unwrap().state,
+            partial.entry(&retained_generation_id).unwrap().state,
             CollisionRetirementLifecycleStateV1::Completed
         );
         assert_eq!(store.collision_retirement_work_records().unwrap().len(), 1);
         store
-            .complete_collision_retirement(&lifecycle.project_id, &"a".repeat(64))
+            .repair_and_complete_collision_retirement(&lifecycle.project_id, &exact_generation_id)
             .unwrap();
 
         let completed = read_collision_lifecycle(&store, &lifecycle.project_id);
@@ -6800,6 +6845,110 @@ mod tests {
                 .collision_retirement_work_records()
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn collision_terminal_transition_refuses_intervening_metadata_and_legacy_then_retries() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = open_store(&root);
+        let (mut lifecycle, exact_generation_id, retained_generation_id) =
+            collision_terminal_fixture(&store);
+        lifecycle.entries.remove(&exact_generation_id);
+        write_collision_lifecycle(&store, &lifecycle);
+        store.reconcile_collision_retirements().unwrap();
+
+        let entry = lifecycle.entry(&retained_generation_id).unwrap();
+        let metadata_path = store
+            .paths
+            .generation_metadata(&entry.former_scope, &retained_generation_id)
+            .unwrap();
+        let expected =
+            decode_stored_generation_v2_for_migration(&fs::read(&metadata_path).unwrap()).unwrap();
+        let mut intervening = expected.clone();
+        intervening.producer_id = "host-intervening".to_string();
+        intervening.generation_id =
+            generation_id(&intervening.producer_id, &intervening.descriptor);
+        fs::write(
+            &metadata_path,
+            encode_stored_generation_v2_for_migration(&intervening).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            store
+                .repair_and_complete_collision_retirement(
+                    &lifecycle.project_id,
+                    &retained_generation_id,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("metadata disagrees")
+        );
+        assert_eq!(
+            read_collision_lifecycle(&store, &lifecycle.project_id)
+                .entry(&retained_generation_id)
+                .unwrap()
+                .state,
+            CollisionRetirementLifecycleStateV1::Queued
+        );
+        assert_eq!(store.collision_retirement_work_records().unwrap().len(), 1);
+
+        let legacy = StoredGeneration {
+            version: STORE_VERSION,
+            generation_id: expected.generation_id.clone(),
+            producer_id: expected.producer_id.clone(),
+            ordinal: expected.ordinal,
+            descriptor: expected.descriptor.clone(),
+            state: GenerationState::Ready,
+            diagnostic: expected.diagnostic.clone(),
+            created_unix_secs: expected.created_unix_secs,
+            materialized_doc_count: expected.materialized_doc_count,
+            entity_inventory_sha256: expected.entity_inventory_sha256.clone(),
+        };
+        fs::write(&metadata_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+        assert!(
+            store
+                .repair_and_complete_collision_retirement(
+                    &lifecycle.project_id,
+                    &retained_generation_id,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("refuses legacy generation metadata")
+        );
+        assert_eq!(
+            read_collision_lifecycle(&store, &lifecycle.project_id)
+                .entry(&retained_generation_id)
+                .unwrap()
+                .state,
+            CollisionRetirementLifecycleStateV1::Queued
+        );
+
+        fs::write(
+            &metadata_path,
+            encode_stored_generation_v2_for_migration(&expected).unwrap(),
+        )
+        .unwrap();
+        store
+            .repair_and_complete_collision_retirement(
+                &lifecycle.project_id,
+                &retained_generation_id,
+            )
+            .unwrap();
+        assert_eq!(
+            decode_stored_generation_v2_for_migration(&fs::read(&metadata_path).unwrap())
+                .unwrap()
+                .state,
+            GenerationState::Superseded
+        );
+        assert_eq!(
+            read_collision_lifecycle(&store, &lifecycle.project_id)
+                .entry(&retained_generation_id)
+                .unwrap()
+                .state,
+            CollisionRetirementLifecycleStateV1::Completed
         );
     }
 
@@ -6911,7 +7060,6 @@ mod tests {
         let root = directory.path().canonicalize().unwrap();
         let store = open_store(&root);
         let lifecycle = collision_lifecycle_fixture();
-        let queue = retirement_for_lifecycle(&lifecycle);
         let lifecycle_directory = store.root().join("collision-retirements");
         fs::create_dir_all(&lifecycle_directory).unwrap();
         fs::write(
@@ -6935,7 +7083,7 @@ mod tests {
             vec![b'x'; MAX_COLLISION_RETIREMENT_RECORD_BYTES + 1],
         )
         .unwrap();
-        assert!(store.enqueue_retirement(&queue).is_err());
+        assert!(store.reconcile_collision_retirements().is_err());
     }
 
     #[cfg(unix)]
@@ -6947,7 +7095,6 @@ mod tests {
         let root = directory.path().canonicalize().unwrap();
         let store = open_store(&root);
         let lifecycle = collision_lifecycle_fixture();
-        let queue = retirement_for_lifecycle(&lifecycle);
         let lifecycle_directory = store.root().join("collision-retirements");
         fs::create_dir_all(&lifecycle_directory).unwrap();
         let target = store.root().join("outside-lifecycle.json");
@@ -6958,7 +7105,7 @@ mod tests {
         .unwrap();
         symlink(&target, lifecycle_directory.join("project-a.json")).unwrap();
 
-        assert!(store.enqueue_retirement(&queue).is_err());
+        assert!(store.reconcile_collision_retirements().is_err());
     }
 
     #[test]
@@ -7523,9 +7670,9 @@ mod tests {
         limits.unreferenced_blob_grace_hours = 0;
         let store = CodeSourceStore::open(root.join("code-sources"), limits).unwrap();
         let collision_directory = store.root().join("collision-retirements");
-        assert!(!collision_directory.exists());
+        assert!(collision_directory.is_dir());
         assert_eq!(store.gc_blobs().unwrap().reclaimed_blobs, 0);
-        assert!(!collision_directory.exists());
+        assert!(collision_directory.is_dir());
 
         let orphan_bytes = b"orphan";
         let orphan_hash = sha256_hex(orphan_bytes);

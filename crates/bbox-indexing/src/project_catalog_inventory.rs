@@ -1730,6 +1730,16 @@ impl ProjectCatalogMigrationReportV1 {
                 .map(|row| row.resolution_id.as_str()),
             "required resolution",
         )?;
+        validate_unique_by(
+            self.namespace_conflicts
+                .iter()
+                .chain(&self.scope_conflicts)
+                .chain(&self.alias_conflicts)
+                .chain(&self.activation_conflicts)
+                .chain(&self.publisher_binding_conflicts)
+                .map(|row| row.conflict_id.as_str()),
+            "report conflict",
+        )?;
         for row in &self.checkout_identity_actions {
             validate_checkout_id(&row.planned_checkout_id)?;
         }
@@ -2421,21 +2431,6 @@ impl ValidatedQuarantineBindingsV1 {
     pub fn generation_owners(&self) -> &BTreeMap<Sha256ValueV1, ProjectId> {
         &self.generation_owners
     }
-
-    #[cfg(test)]
-    pub(crate) fn from_parts_for_test(
-        plan_hash: Sha256ValueV1,
-        transaction_id: ProjectCatalogTransactionId,
-        generation_owners: BTreeMap<Sha256ValueV1, ProjectId>,
-        bindings: BTreeSet<(ProjectId, Sha256ValueV1)>,
-    ) -> Self {
-        Self {
-            plan_hash,
-            transaction_id,
-            generation_owners,
-            bindings,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2834,8 +2829,54 @@ pub fn validate_supported_resolution(
         .map(|row| (row.resolution_id.as_str(), row))
         .collect::<BTreeMap<_, _>>();
     let mut satisfied = BTreeSet::new();
+    let mut expected_quarantines = BTreeMap::new();
+    let canonical_scope_conflicts = projects
+        .iter()
+        .flat_map(|project_id| {
+            observed_scopes_for_project(inventory, project_id)
+                .into_iter()
+                .map(move |scope| (scope, project_id.clone()))
+        })
+        .fold(
+            BTreeMap::<PublishedScope, BTreeSet<ProjectId>>::new(),
+            |mut conflicts, (scope, project_id)| {
+                conflicts.entry(scope).or_default().insert(project_id);
+                conflicts
+            },
+        )
+        .into_iter()
+        .filter(|(_, candidates)| candidates.len() > 1)
+        .collect::<BTreeMap<_, _>>();
+    let selected_scope_owners = resolution
+        .selected_scope_owners
+        .iter()
+        .map(|row| (row.scope.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    if selected_scope_owners.len() != resolution.selected_scope_owners.len()
+        || selected_scope_owners.len() != canonical_scope_conflicts.len()
+        || selected_scope_owners.keys().collect::<BTreeSet<_>>()
+            != canonical_scope_conflicts.keys().collect::<BTreeSet<_>>()
+    {
+        return Err(ProjectCatalogInventoryError::new(
+            "error.project_catalog_inventory_incomplete_scope_conflicts",
+            "scope-owner dispositions do not equal every inventoried duplicate scope",
+        ));
+    }
+    let resolved_scopes = post_image
+        .resolved_project_scopes
+        .iter()
+        .map(|row| (row.project_id.clone(), row.published_scope.as_ref()))
+        .collect::<BTreeMap<_, _>>();
 
     for row in &resolution.selected_scope_owners {
+        let canonical_candidates = &canonical_scope_conflicts[&row.scope];
+        let canonical_resolution_id =
+            canonical_scope_resolution_id(&row.scope, canonical_candidates)?;
+        if row.resolution_id != canonical_resolution_id {
+            return Err(invalid(
+                "scope-owner disposition does not use its canonical conflict id",
+            ));
+        }
         require_resolution_kind(
             &requirements,
             &mut satisfied,
@@ -2853,13 +2894,62 @@ pub fn validate_supported_resolution(
         let mut selected = row
             .losing_project_ids
             .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        selected.insert(row.owner_project_id.clone());
+        if &selected != canonical_candidates {
+            return Err(invalid(
+                "scope-owner resolution does not cover exact inventoried candidates",
+            ));
+        }
+        let canonical_candidate_ids = canonical_candidates
+            .iter()
             .map(ToString::to_string)
             .collect::<BTreeSet<_>>();
-        selected.insert(row.owner_project_id.to_string());
-        if selected != requirement.candidate_record_ids {
+        if requirement.candidate_record_ids != canonical_candidate_ids
+            || !report.scope_conflicts.iter().any(|conflict| {
+                conflict.conflict_id == row.resolution_id
+                    && conflict.affected_record_ids == canonical_candidate_ids
+                    && conflict.diagnostic_code == "duplicate_published_scope"
+            })
+        {
             return Err(invalid(
-                "scope-owner resolution does not cover exact candidates",
+                "scope-owner requirement and conflict do not match the inventoried candidates",
             ));
+        }
+        if resolved_scopes.get(&row.owner_project_id) != Some(&Some(&row.scope))
+            || row
+                .losing_project_ids
+                .iter()
+                .any(|project_id| resolved_scopes.get(project_id) == Some(&Some(&row.scope)))
+        {
+            return Err(invalid(
+                "scope-owner disposition is not reflected exactly in the post-image",
+            ));
+        }
+        for source in &inventory.code_sources {
+            for generation in &source.generations {
+                let ImmutableCollectedDescriptorV1::Valid {
+                    published_scope, ..
+                } = &generation.descriptor
+                else {
+                    continue;
+                };
+                if published_scope == &row.scope
+                    && row.losing_project_ids.contains(&generation.project_id)
+                    && expected_quarantines
+                        .insert(
+                            (
+                                generation.project_id.clone(),
+                                generation.generation_id.clone(),
+                            ),
+                            generation.observation_id.clone(),
+                        )
+                        .is_some()
+                {
+                    return Err(duplicate("canonical quarantine candidate"));
+                }
+            }
         }
         for alias in &row.owned_aliases {
             let alias_owners = inventory
@@ -2883,6 +2973,38 @@ pub fn validate_supported_resolution(
                 return Err(unknown("selected alias conflict"));
             }
         }
+    }
+    let scope_resolution_ids = resolution
+        .selected_scope_owners
+        .iter()
+        .map(|row| row.resolution_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let reported_scope_conflict_ids = report
+        .scope_conflicts
+        .iter()
+        .map(|row| row.conflict_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let required_scope_resolution_ids = report
+        .required_resolutions
+        .iter()
+        .filter(|row| row.kind == RequiredResolutionKindV1::ScopeOwner)
+        .map(|row| row.resolution_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let canonical_scope_resolution_ids = canonical_scope_conflicts
+        .iter()
+        .map(|(scope, candidates)| canonical_scope_resolution_id(scope, candidates))
+        .collect::<InventoryResult<BTreeSet<_>>>()?;
+    if reported_scope_conflict_ids != required_scope_resolution_ids
+        || scope_resolution_ids != required_scope_resolution_ids
+        || scope_resolution_ids
+            != canonical_scope_resolution_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+    {
+        return Err(invalid(
+            "scope conflicts, requirements, and dispositions are not exact",
+        ));
     }
 
     let report_groups = report
@@ -3018,6 +3140,27 @@ pub fn validate_supported_resolution(
         ));
     }
 
+    let actual_quarantines = resolution
+        .quarantine_collected
+        .iter()
+        .map(|row| {
+            (
+                (row.project_id.clone(), row.generation_id.clone()),
+                row.resolution_id.as_str(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if actual_quarantines.keys().cloned().collect::<BTreeSet<_>>()
+        != expected_quarantines
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    {
+        return Err(ProjectCatalogInventoryError::new(
+            "error.project_catalog_inventory_unsupported_quarantine",
+            "quarantine dispositions do not equal the losing inventoried generations",
+        ));
+    }
     for row in &resolution.quarantine_collected {
         require_resolution_kind(
             &requirements,
@@ -3025,15 +3168,20 @@ pub fn validate_supported_resolution(
             &row.resolution_id,
             RequiredResolutionKindV1::QuarantineCollected,
         )?;
-        let generation_exists = inventory.code_sources.iter().any(|source| {
-            source.project_id == row.project_id
-                && source.generations.iter().any(|generation| {
-                    generation.project_id == row.project_id
-                        && generation.generation_id == row.generation_id
-                })
-        });
-        if !generation_exists {
-            return Err(unknown("collected generation selected for quarantine"));
+        let candidate_record_ids = BTreeSet::from([expected_quarantines
+            .get(&(row.project_id.clone(), row.generation_id.clone()))
+            .ok_or_else(|| unknown("canonical quarantine candidate"))?
+            .clone()]);
+        let requirement = requirements[row.resolution_id.as_str()];
+        if requirement.candidate_record_ids != candidate_record_ids
+            || !report.activation_conflicts.iter().any(|conflict| {
+                conflict.conflict_id == row.resolution_id
+                    && conflict.affected_record_ids == candidate_record_ids
+            })
+        {
+            return Err(invalid(
+                "quarantine requirement and conflict do not match its inventoried generation",
+            ));
         }
         if !post_image.quarantined_collected.iter().any(|candidate| {
             candidate.project_id == row.project_id && candidate.generation_id == row.generation_id
@@ -3042,6 +3190,29 @@ pub fn validate_supported_resolution(
                 "selected quarantine is absent from post-image input",
             ));
         }
+    }
+    let quarantine_resolution_ids = resolution
+        .quarantine_collected
+        .iter()
+        .map(|row| row.resolution_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let reported_activation_conflict_ids = report
+        .activation_conflicts
+        .iter()
+        .map(|row| row.conflict_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let required_quarantine_resolution_ids = report
+        .required_resolutions
+        .iter()
+        .filter(|row| row.kind == RequiredResolutionKindV1::QuarantineCollected)
+        .map(|row| row.resolution_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if reported_activation_conflict_ids != required_quarantine_resolution_ids
+        || quarantine_resolution_ids != required_quarantine_resolution_ids
+    {
+        return Err(invalid(
+            "activation conflicts, quarantine requirements, and dispositions are not exact",
+        ));
     }
     for quarantined in &post_image.quarantined_collected {
         let resolved = resolution.quarantine_collected.iter().any(|row| {
@@ -3496,11 +3667,32 @@ pub fn digest_publisher_full_ref(full_ref: &str) -> InventoryResult<Sha256ValueV
     ))
 }
 
+fn canonical_scope_resolution_id(
+    scope: &PublishedScope,
+    candidates: &BTreeSet<ProjectId>,
+) -> InventoryResult<String> {
+    let bytes = serde_json::to_vec(&(scope, candidates)).map_err(|error| {
+        ProjectCatalogInventoryError::new(
+            "error.project_catalog_inventory_encode",
+            error.to_string(),
+        )
+    })?;
+    let digest = domain_hash(b"blackbox.project-catalog.scope-conflict.v1\0", &bytes);
+    Ok(format!("scope_conflict_{}", &digest.as_str()[..32]))
+}
+
 fn observed_scopes_for_project(
     inventory: &V1ProjectCatalogInventory,
     project_id: &ProjectId,
 ) -> BTreeSet<PublishedScope> {
     let mut scopes = BTreeSet::new();
+    for project in &inventory.legacy_projects {
+        if project.record.project_id == project_id.as_str()
+            && let Some(scope) = &project.committed_scope
+        {
+            scopes.insert(scope.clone());
+        }
+    }
     for source in &inventory.code_sources {
         if source.project_id != *project_id {
             continue;
@@ -4837,7 +5029,7 @@ fn limit(kind: impl Into<String>) -> ProjectCatalogInventoryError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn project_id(value: &str) -> ProjectId {
@@ -5008,7 +5200,7 @@ mod tests {
             "version": 1,
             "refs": [{
                 "scope": {
-                    "repo_id": "repo_family",
+                    "repo_id": "acme_repo",
                     "bbox_root_relpath": "services/alpha"
                 },
                 "branch_ref": "refs/heads/main"
@@ -5530,6 +5722,436 @@ mod tests {
         }
     }
 
+    pub(crate) fn validated_quarantine_bindings_fixture(
+        transaction_id: ProjectCatalogTransactionId,
+        generation_owners: BTreeMap<Sha256ValueV1, ProjectId>,
+        bindings: BTreeSet<(ProjectId, Sha256ValueV1)>,
+    ) -> ValidatedQuarantineBindingsV1 {
+        let mut inventory = fixture_inventory();
+        inventory.code_sources.clear();
+        inventory.code_source_generation_count = generation_owners.len() as u64;
+        inventory.code_source_generation_set_sha256 = hash("authority_generation_set");
+
+        let bindings_by_project = bindings.iter().fold(
+            BTreeMap::<ProjectId, BTreeSet<Sha256ValueV1>>::new(),
+            |mut by_project, (project_id, generation_id)| {
+                assert_eq!(generation_owners.get(generation_id), Some(project_id));
+                by_project
+                    .entry(project_id.clone())
+                    .or_default()
+                    .insert(generation_id.clone());
+                by_project
+            },
+        );
+        let generations_by_project = generation_owners.iter().fold(
+            BTreeMap::<ProjectId, Vec<Sha256ValueV1>>::new(),
+            |mut by_project, (generation_id, project_id)| {
+                by_project
+                    .entry(project_id.clone())
+                    .or_default()
+                    .push(generation_id.clone());
+                by_project
+            },
+        );
+        let mut bound_scopes = BTreeMap::new();
+        let mut winner_projects = BTreeMap::new();
+        for (index, project_id) in bindings_by_project.keys().enumerate() {
+            bound_scopes.insert(
+                project_id.clone(),
+                PublishedScope::try_new("authority-fixture", format!("collision-{index}")).unwrap(),
+            );
+            winner_projects.insert(
+                project_id.clone(),
+                ProjectId::parse(format!("authority-winner-{index}")).unwrap(),
+            );
+        }
+
+        let mut generation_observations = BTreeMap::new();
+        for (project_index, (project_id, generation_ids)) in
+            generations_by_project.iter().enumerate()
+        {
+            if !inventory
+                .legacy_projects
+                .iter()
+                .any(|row| row.record.project_id == project_id.as_str())
+            {
+                let mut project = legacy_project(
+                    &format!("authority_legacy_{project_index}"),
+                    project_id.as_str(),
+                    &format!("/authority/{project_index}"),
+                    &format!("authority_probe_{project_index}"),
+                );
+                project.committed_scope = bound_scopes.get(project_id).cloned();
+                inventory.legacy_projects.push(project);
+            }
+            let generations = generation_ids
+                .iter()
+                .enumerate()
+                .map(|(generation_index, generation_id)| {
+                    let observation_id =
+                        format!("authority_generation_{project_index}_{generation_index}");
+                    generation_observations.insert(
+                        (project_id.clone(), generation_id.clone()),
+                        observation_id.clone(),
+                    );
+                    let published_scope =
+                        if bindings.contains(&(project_id.clone(), generation_id.clone())) {
+                            bound_scopes[project_id].clone()
+                        } else {
+                            PublishedScope::try_new(
+                                "authority-fixture",
+                                format!("retained-{project_index}-{generation_index}"),
+                            )
+                            .unwrap()
+                        };
+                    CollectedGenerationObservationV1 {
+                        observation_id,
+                        project_id: project_id.clone(),
+                        role: CollectedGenerationRoleV1::Retained,
+                        generation_id: generation_id.to_string(),
+                        activation_scope: None,
+                        descriptor: ImmutableCollectedDescriptorV1::Valid {
+                            descriptor_hash: hash(&format!(
+                                "authority_descriptor_{project_index}_{generation_index}"
+                            )),
+                            published_scope,
+                        },
+                        manifest: ImmutableArtifactObservationV1::Valid {
+                            content_hash: hash(&format!(
+                                "authority_manifest_{project_index}_{generation_index}"
+                            )),
+                        },
+                        selector_evidence: DurableSelectorEvidenceV1::NoDurableSelector,
+                        checkout_missing: false,
+                        planned_metadata_v2_hash: hash(&format!(
+                            "authority_metadata_{project_index}_{generation_index}"
+                        )),
+                    }
+                })
+                .collect::<Vec<_>>();
+            inventory.code_sources.push(CodeSourceObservationV1 {
+                observation_id: format!("authority_source_{project_index}"),
+                project_id: project_id.clone(),
+                generations,
+                quarantine: Vec::new(),
+                effective_manifest_hash: hash(&format!("authority_effective_{project_index}")),
+                planned_activation_v2_hash: None,
+            });
+        }
+        for (index, (loser, winner)) in winner_projects.iter().enumerate() {
+            let mut project = legacy_project(
+                &format!("authority_winner_legacy_{index}"),
+                winner.as_str(),
+                &format!("/authority/winner/{index}"),
+                &format!("authority_winner_probe_{index}"),
+            );
+            project.committed_scope = Some(bound_scopes[loser].clone());
+            inventory.legacy_projects.push(project);
+        }
+
+        let evidence = |source_id: String,
+                        source_kind: MutableInventorySourceKindV1,
+                        source_locator: MutableInventorySourceLocatorV1,
+                        row_observation_ids: BTreeSet<String>,
+                        content_hash: Sha256ValueV1| {
+            MutableInventorySourceEvidenceV1 {
+                row_set_sha256: mutable_source_row_set_hash(&row_observation_ids),
+                source_id,
+                source_kind,
+                source_locator,
+                state: InventorySourceStateV1::Present {
+                    fingerprint: hash("authority_source_fingerprint"),
+                    content_hash,
+                    byte_len: 1,
+                },
+                row_observation_ids,
+            }
+        };
+        let legacy_rows = inventory
+            .legacy_projects
+            .iter()
+            .map(|row| row.observation_id.clone())
+            .collect::<BTreeSet<_>>();
+        let publisher_rows = inventory
+            .publisher_pins
+            .iter()
+            .map(|row| row.observation_id.clone())
+            .collect::<BTreeSet<_>>();
+        let code_source_rows = inventory
+            .code_sources
+            .iter()
+            .map(|row| row.observation_id.clone())
+            .collect::<BTreeSet<_>>();
+        let generation_rows = inventory
+            .code_sources
+            .iter()
+            .flat_map(|source| {
+                source
+                    .generations
+                    .iter()
+                    .map(|generation| generation.observation_id.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        let mut mutable_source_evidence = vec![
+            evidence(
+                "authority_legacy_store".to_string(),
+                MutableInventorySourceKindV1::LegacyProjectStore,
+                MutableInventorySourceLocatorV1::LegacyProjectStore,
+                legacy_rows,
+                inventory.source_store_hash.clone(),
+            ),
+            evidence(
+                "authority_publisher_store".to_string(),
+                MutableInventorySourceKindV1::PublisherRefStore,
+                MutableInventorySourceLocatorV1::PublisherRefStore,
+                publisher_rows,
+                inventory.publisher_ref_source_hash.clone(),
+            ),
+            evidence(
+                "authority_effective_manifest".to_string(),
+                MutableInventorySourceKindV1::EffectiveSourceManifest,
+                MutableInventorySourceLocatorV1::CodeSourceAnchor,
+                code_source_rows
+                    .iter()
+                    .cloned()
+                    .chain(generation_rows.iter().cloned())
+                    .collect(),
+                hash("authority_effective_manifest"),
+            ),
+        ];
+        for (index, source) in inventory.code_sources.iter().enumerate() {
+            mutable_source_evidence.push(evidence(
+                format!("authority_activation_{index}"),
+                MutableInventorySourceKindV1::CodeSourceActivation,
+                MutableInventorySourceLocatorV1::CodeSourceActivation {
+                    project_id: source.project_id.clone(),
+                },
+                BTreeSet::from([source.observation_id.clone()]),
+                hash(&format!("authority_activation_{index}")),
+            ));
+            for (generation_index, generation) in source.generations.iter().enumerate() {
+                let ImmutableCollectedDescriptorV1::Valid {
+                    published_scope, ..
+                } = &generation.descriptor
+                else {
+                    unreachable!();
+                };
+                let scope_hash =
+                    Sha256ValueV1::parse(bbox_code_source::scope_hash(published_scope)).unwrap();
+                for (kind, suffix) in [
+                    (
+                        MutableInventorySourceKindV1::CodeSourceGenerationMetadata,
+                        "metadata",
+                    ),
+                    (
+                        MutableInventorySourceKindV1::CodeSourceGenerationManifest,
+                        "manifest",
+                    ),
+                ] {
+                    let locator = match kind {
+                        MutableInventorySourceKindV1::CodeSourceGenerationMetadata => {
+                            MutableInventorySourceLocatorV1::CodeSourceGenerationMetadata {
+                                scope_hash: scope_hash.clone(),
+                                generation_id: generation.generation_id.clone(),
+                            }
+                        }
+                        MutableInventorySourceKindV1::CodeSourceGenerationManifest => {
+                            MutableInventorySourceLocatorV1::CodeSourceGenerationManifest {
+                                scope_hash: scope_hash.clone(),
+                                generation_id: generation.generation_id.clone(),
+                            }
+                        }
+                        _ => unreachable!(),
+                    };
+                    mutable_source_evidence.push(evidence(
+                        format!("authority_{suffix}_{index}_{generation_index}"),
+                        kind,
+                        locator,
+                        BTreeSet::from([generation.observation_id.clone()]),
+                        hash(&format!("authority_{suffix}_{index}_{generation_index}")),
+                    ));
+                }
+            }
+        }
+        for (index, project) in inventory.legacy_projects.iter().enumerate() {
+            let authority = project.committed_authority.as_ref().unwrap();
+            mutable_source_evidence.push(evidence(
+                format!("authority_probe_source_{index}"),
+                MutableInventorySourceKindV1::CommittedAuthorityProbe,
+                MutableInventorySourceLocatorV1::CommittedProjectConfig {
+                    project_id: ProjectId::parse(project.record.project_id.clone()).unwrap(),
+                    commit_oid: format!("{:040x}", index + 1),
+                    repo_relative_path: format!("project-{index}/.bbox/config.toml"),
+                },
+                BTreeSet::from([authority.observation_id.clone()]),
+                hash(&format!("authority_probe_source_{index}")),
+            ));
+        }
+        for (index, checkout) in inventory.checkouts.iter().enumerate() {
+            for (kind, suffix) in [
+                (MutableInventorySourceKindV1::CheckoutRoot, "root"),
+                (MutableInventorySourceKindV1::CheckoutMarker, "marker"),
+            ] {
+                let locator = match kind {
+                    MutableInventorySourceKindV1::CheckoutRoot => {
+                        MutableInventorySourceLocatorV1::CheckoutRoot {
+                            canonical_root_digest: checkout.canonical_root_digest.clone(),
+                        }
+                    }
+                    MutableInventorySourceKindV1::CheckoutMarker => {
+                        MutableInventorySourceLocatorV1::CheckoutMarker {
+                            canonical_root_digest: checkout.canonical_root_digest.clone(),
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                mutable_source_evidence.push(evidence(
+                    format!("authority_checkout_{suffix}_{index}"),
+                    kind,
+                    locator,
+                    BTreeSet::from([checkout.observation_id.clone()]),
+                    hash(&format!("authority_checkout_{suffix}_{index}")),
+                ));
+            }
+        }
+        inventory.mutable_source_evidence = mutable_source_evidence;
+        inventory.validate().unwrap();
+
+        let mut resolution =
+            ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
+        let mut post_image = fixture_post_image(&inventory);
+        post_image.transaction_id = transaction_id;
+        for project_id in generations_by_project.keys() {
+            post_image
+                .resolved_project_scopes
+                .push(ResolvedProjectScopeInputV1 {
+                    project_id: project_id.clone(),
+                    published_scope: None,
+                    created_at: "2026-01-02T03:04:05Z".to_string(),
+                });
+            if let Some(winner) = winner_projects.get(project_id) {
+                post_image
+                    .resolved_project_scopes
+                    .push(ResolvedProjectScopeInputV1 {
+                        project_id: winner.clone(),
+                        published_scope: Some(bound_scopes[project_id].clone()),
+                        created_at: "2026-01-02T03:04:05Z".to_string(),
+                    });
+                let candidates = BTreeSet::from([winner.clone(), project_id.clone()]);
+                resolution.selected_scope_owners.push(SelectedScopeOwnerV1 {
+                    resolution_id: canonical_scope_resolution_id(
+                        &bound_scopes[project_id],
+                        &candidates,
+                    )
+                    .unwrap(),
+                    scope: bound_scopes[project_id].clone(),
+                    owner_project_id: winner.clone(),
+                    losing_project_ids: BTreeSet::from([project_id.clone()]),
+                    owned_aliases: BTreeSet::new(),
+                });
+            }
+        }
+        let existing_history_identities = post_image
+            .repo_history_groups
+            .iter()
+            .map(|group| {
+                (
+                    group.group_id.clone(),
+                    PlannedRepoHistoryIdentityV1 {
+                        planned_history_id: group.planned_history_id.clone(),
+                        planned_primary_namespace: group.planned_primary_namespace.clone(),
+                        planned_compatibility_namespaces: group
+                            .planned_compatibility_namespaces
+                            .clone(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let history_group_ids =
+            deterministic_repo_history_group_ids(&inventory, &post_image.resolved_project_scopes)
+                .unwrap();
+        let planned_history_identities = history_group_ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, group_id)| {
+                let identity = existing_history_identities
+                    .get(&group_id)
+                    .cloned()
+                    .unwrap_or_else(|| PlannedRepoHistoryIdentityV1 {
+                        planned_history_id: RepoHistoryId::parse(format!("rh_{:032x}", index + 16))
+                            .unwrap(),
+                        planned_primary_namespace: CommitNamespace::parse(format!(
+                            "authority_namespace_{index}"
+                        ))
+                        .unwrap(),
+                        planned_compatibility_namespaces: BTreeSet::new(),
+                    });
+                (group_id, identity)
+            })
+            .collect::<BTreeMap<_, _>>();
+        post_image.repo_history_groups = build_deterministic_repo_history_groups(
+            &inventory,
+            &post_image.resolved_project_scopes,
+            &planned_history_identities,
+        )
+        .unwrap();
+        for (index, (project_id, generation_id)) in bindings.iter().enumerate() {
+            resolution.quarantine_collected.push(QuarantineCollectedV1 {
+                resolution_id: format!("authority_quarantine_{index}"),
+                project_id: project_id.clone(),
+                generation_id: generation_id.to_string(),
+            });
+            post_image
+                .quarantined_collected
+                .push(QuarantinePostImageInputV1 {
+                    project_id: project_id.clone(),
+                    generation_id: generation_id.to_string(),
+                });
+        }
+        let mut report = fixture_report(&inventory, &resolution, &post_image);
+        for row in &resolution.selected_scope_owners {
+            let candidate_record_ids = BTreeSet::from([
+                row.owner_project_id.to_string(),
+                row.losing_project_ids.iter().next().unwrap().to_string(),
+            ]);
+            report.scope_conflicts.push(ConflictReportV1 {
+                conflict_id: row.resolution_id.clone(),
+                affected_record_ids: candidate_record_ids.clone(),
+                diagnostic_code: "duplicate_published_scope".to_string(),
+            });
+            report.required_resolutions.push(RequiredResolutionV1 {
+                resolution_id: row.resolution_id.clone(),
+                kind: RequiredResolutionKindV1::ScopeOwner,
+                candidate_record_ids,
+            });
+        }
+        for row in &resolution.quarantine_collected {
+            let candidate_record_ids = BTreeSet::from([generation_observations[&(
+                row.project_id.clone(),
+                Sha256ValueV1::parse(row.generation_id.clone()).unwrap(),
+            )]
+                .clone()]);
+            report.activation_conflicts.push(ConflictReportV1 {
+                conflict_id: row.resolution_id.clone(),
+                affected_record_ids: candidate_record_ids.clone(),
+                diagnostic_code: "authority_generation_quarantine".to_string(),
+            });
+            report.required_resolutions.push(RequiredResolutionV1 {
+                resolution_id: row.resolution_id.clone(),
+                kind: RequiredResolutionKindV1::QuarantineCollected,
+                candidate_record_ids,
+            });
+        }
+        if !report.required_resolutions.is_empty() {
+            report.status = ProjectCatalogMigrationStatusV1::ResolutionRequired;
+        }
+        let authority =
+            validated_quarantine_bindings(&inventory, &report, &resolution, &post_image).unwrap();
+        assert_eq!(authority.generation_owners(), &generation_owners);
+        assert_eq!(authority.bindings(), &bindings);
+        authority
+    }
+
     #[test]
     fn inventory_hash_is_independent_of_adapter_enumeration_order() {
         let inventory = fixture_inventory();
@@ -5578,8 +6200,12 @@ mod tests {
     #[test]
     fn missing_active_descriptor_is_a_non_overridable_refusal() {
         let mut inventory = fixture_inventory();
-        inventory.code_sources[0].generations[0].descriptor =
-            ImmutableCollectedDescriptorV1::Missing;
+        let source = &mut inventory.code_sources[0];
+        source.generations[0].role = CollectedGenerationRoleV1::Retained;
+        source.generations[0].activation_scope = None;
+        source.generations[0].selector_evidence = DurableSelectorEvidenceV1::NoDurableSelector;
+        source.generations[0].descriptor = ImmutableCollectedDescriptorV1::Missing;
+        source.planned_activation_v2_hash = None;
         inventory.validate().unwrap();
         assert_eq!(
             inventory.hard_refusals(),
@@ -5939,14 +6565,31 @@ mod tests {
     #[test]
     fn quarantine_bindings_cannot_be_laundered_with_coordinated_post_image_and_hash_changes() {
         let inventory = fixture_inventory();
-        let resolution =
+        let clean_resolution =
             ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
         let post_image = fixture_post_image(&inventory);
-        let report = fixture_report(&inventory, &resolution, &post_image);
+        let report = fixture_report(&inventory, &clean_resolution, &post_image);
         let authority =
-            validated_quarantine_bindings(&inventory, &report, &resolution, &post_image).unwrap();
+            validated_quarantine_bindings(&inventory, &report, &clean_resolution, &post_image)
+                .unwrap();
         assert!(authority.bindings().is_empty());
 
+        let scope_resolution_id = "resolve_scope_alpha".to_string();
+        let quarantine_resolution_id = "quarantine_generation_alpha".to_string();
+        let mut resolution =
+            ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
+        resolution.selected_scope_owners.push(SelectedScopeOwnerV1 {
+            resolution_id: scope_resolution_id.clone(),
+            scope: scope("services/alpha"),
+            owner_project_id: project_id("alpha"),
+            losing_project_ids: BTreeSet::from([project_id("beta")]),
+            owned_aliases: BTreeSet::new(),
+        });
+        resolution.quarantine_collected.push(QuarantineCollectedV1 {
+            resolution_id: quarantine_resolution_id.clone(),
+            project_id: project_id("alpha"),
+            generation_id: "e".repeat(64),
+        });
         let mut laundered_post_image = post_image;
         laundered_post_image
             .quarantined_collected
@@ -5954,15 +6597,75 @@ mod tests {
                 project_id: project_id("alpha"),
                 generation_id: "e".repeat(64),
             });
-        let laundered_report = fixture_report(&inventory, &resolution, &laundered_post_image);
-        assert!(
+        let mut laundered_report = fixture_report(&inventory, &resolution, &laundered_post_image);
+        laundered_report.status = ProjectCatalogMigrationStatusV1::ResolutionRequired;
+        laundered_report.scope_conflicts = vec![ConflictReportV1 {
+            conflict_id: scope_resolution_id.clone(),
+            affected_record_ids: BTreeSet::from([
+                project_id("alpha").to_string(),
+                project_id("beta").to_string(),
+            ]),
+            diagnostic_code: "collected_scope_owner_conflict".to_string(),
+        }];
+        laundered_report.activation_conflicts = vec![ConflictReportV1 {
+            conflict_id: quarantine_resolution_id.clone(),
+            affected_record_ids: BTreeSet::from(["generation_alpha".to_string()]),
+            diagnostic_code: "collected_generation_quarantine".to_string(),
+        }];
+        laundered_report.required_resolutions = vec![
+            RequiredResolutionV1 {
+                resolution_id: scope_resolution_id,
+                kind: RequiredResolutionKindV1::ScopeOwner,
+                candidate_record_ids: BTreeSet::from([
+                    project_id("alpha").to_string(),
+                    project_id("beta").to_string(),
+                ]),
+            },
+            RequiredResolutionV1 {
+                resolution_id: quarantine_resolution_id,
+                kind: RequiredResolutionKindV1::QuarantineCollected,
+                candidate_record_ids: BTreeSet::from(["generation_alpha".to_string()]),
+            },
+        ];
+        assert_eq!(
             validated_quarantine_bindings(
                 &inventory,
                 &laundered_report,
                 &resolution,
                 &laundered_post_image,
             )
-            .is_err()
+            .unwrap_err()
+            .code(),
+            "error.project_catalog_inventory_incomplete_scope_conflicts"
+        );
+    }
+
+    #[test]
+    fn duplicate_scope_conflict_cannot_be_suppressed_with_coordinated_post_image_and_hash() {
+        let mut inventory = fixture_inventory();
+        inventory
+            .legacy_projects
+            .iter_mut()
+            .find(|project| project.record.project_id == "beta")
+            .unwrap()
+            .committed_scope = Some(scope("services/alpha"));
+        inventory.validate().unwrap();
+        let resolution =
+            ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
+        let mut post_image = fixture_post_image(&inventory);
+        post_image
+            .resolved_project_scopes
+            .iter_mut()
+            .find(|project| project.project_id == project_id("beta"))
+            .unwrap()
+            .published_scope = None;
+        let report = fixture_report(&inventory, &resolution, &post_image);
+
+        assert_eq!(
+            validate_supported_resolution(&inventory, &report, &resolution, &post_image)
+                .unwrap_err()
+                .code(),
+            "error.project_catalog_inventory_incomplete_scope_conflicts"
         );
     }
 
