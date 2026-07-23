@@ -47,16 +47,17 @@ use crate::project_catalog_inventory::{
     ConflictReportV1, DeterministicPostImageInputV1, DeterministicRepoHistoryGroupV1,
     InventorySourceStateV1, LegacyPathBindingPostImageInputV1, LegacyPathBindingReportV1,
     LegacyPathBindingStatusV1, LegacyPathRelationshipV1, MAX_PROJECT_CATALOG_REPORT_BYTES,
-    MAX_PROJECT_CATALOG_RESOLUTION_BYTES, MigrationRefusalReportV1, MissingPathReportV1,
-    MutableInventorySourceKindV1, PlannedRepoHistoryIdentityV1, PredictedAssetV1,
-    PredictedPostImageHashesV1, ProjectCatalogMigrationPlanKindV1, ProjectCatalogMigrationReportV1,
-    ProjectCatalogMigrationResolutionV1, ProjectCatalogMigrationStatusV1,
-    ProjectMigrationReportRowV1, PublicationPayloadHashesV1, PublisherBindingDispositionV1,
-    PublisherBindingReportStatusV1, PublisherBindingReportV1, QuarantinePostImageInputV1,
-    RequiredResolutionKindV1, RequiredResolutionV1, ResolvedProjectScopeInputV1,
-    SensitiveLocalPathReportV1, SensitiveLocalPathRowV1, Sha256ValueV1, V1ProjectCatalogInventory,
-    build_deterministic_repo_history_groups, canonical_plan_hash, canonical_scope_conflicts,
-    canonical_scope_resolution_id, decode_migration_report_v1, decode_migration_resolution_v1,
+    MAX_PROJECT_CATALOG_RESOLUTION_BYTES, MigrationRefusalOriginV1, MigrationRefusalReportV1,
+    MissingPathReportV1, MutableInventorySourceKindV1, PlannedRepoHistoryIdentityV1,
+    PredictedAssetV1, PredictedPostImageHashesV1, ProjectCatalogMigrationPlanKindV1,
+    ProjectCatalogMigrationReportV1, ProjectCatalogMigrationResolutionV1,
+    ProjectCatalogMigrationStatusV1, ProjectMigrationReportRowV1, PublicationPayloadHashesV1,
+    PublisherBindingDispositionV1, PublisherBindingReportStatusV1, PublisherBindingReportV1,
+    QuarantinePostImageInputV1, RequiredResolutionKindV1, RequiredResolutionV1,
+    ResolvedProjectScopeInputV1, SensitiveLocalPathReportV1, SensitiveLocalPathRowV1,
+    Sha256ValueV1, V1ProjectCatalogInventory, build_deterministic_repo_history_groups,
+    canonical_plan_hash, canonical_scope_conflicts, canonical_scope_resolution_id,
+    decode_migration_report_v1, decode_migration_resolution_v1,
     deterministic_repo_history_group_ids, deterministic_repo_history_group_memberships,
     digest_path, digest_published_scope, digest_publisher_full_ref, encode_migration_report_v1,
     encode_migration_resolution_v1, project_authority_scope, validated_quarantine_bindings,
@@ -972,7 +973,6 @@ struct MigrationBasePostImagesV1 {
     sensitive_report: SensitiveLocalPathReportV1,
     missing_paths: Vec<MissingPathReportV1>,
     unscoped_legacy_counts: BTreeMap<crate::project_catalog_inventory::LegacyPathStoreKindV1, u64>,
-    refusal_count: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -990,14 +990,20 @@ struct ClassifiedLegacyPathsV1 {
     report_rows: Vec<LegacyPathBindingReportV1>,
     sensitive_report: SensitiveLocalPathReportV1,
     unscoped_counts: BTreeMap<crate::project_catalog_inventory::LegacyPathStoreKindV1, u64>,
-    refusal_count: u64,
+    refusals: Vec<MigrationRefusalReportV1>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum LateMigrationDomainRefusalV1 {
-    ConflictingPublishedAuthorities,
-    MultipleBaseAttachments,
-    MissingBaseAttachment,
+    ConflictingPublishedAuthorities {
+        affected_record_ids: BTreeSet<String>,
+    },
+    MultipleBaseAttachments {
+        affected_record_ids: BTreeSet<String>,
+    },
+    MissingBaseAttachment {
+        affected_record_ids: BTreeSet<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -1060,18 +1066,65 @@ pub(crate) struct MigrationSemanticAssessmentV1 {
     retained_attachment_ids: BTreeSet<AttachmentId>,
     required_resolutions: Vec<RequiredResolutionV1>,
     unresolved_resolution_ids: BTreeSet<String>,
-    refusal_count: u64,
+    refusals: Vec<MigrationRefusalReportV1>,
 }
 
 impl MigrationSemanticAssessmentV1 {
     fn status(&self) -> ProjectCatalogMigrationStatusV1 {
-        if self.refusal_count != 0 {
+        if !self.refusals.is_empty() {
             ProjectCatalogMigrationStatusV1::Refused
         } else if !self.unresolved_resolution_ids.is_empty() {
             ProjectCatalogMigrationStatusV1::ResolutionRequired
         } else {
             ProjectCatalogMigrationStatusV1::Clean
         }
+    }
+}
+
+fn migration_refusal(
+    origin: MigrationRefusalOriginV1,
+    diagnostic_code: impl Into<String>,
+    affected_record_ids: impl IntoIterator<Item = String>,
+) -> MigrationRefusalReportV1 {
+    MigrationRefusalReportV1 {
+        origin,
+        diagnostic_code: diagnostic_code.into(),
+        affected_record_ids: affected_record_ids.into_iter().collect(),
+    }
+}
+
+fn semantic_refusal(
+    diagnostic_code: impl Into<String>,
+    affected_record_ids: impl IntoIterator<Item = String>,
+) -> MigrationRefusalReportV1 {
+    migration_refusal(
+        MigrationRefusalOriginV1::Semantic,
+        diagnostic_code,
+        affected_record_ids,
+    )
+}
+
+fn canonicalize_refusals(refusals: &mut Vec<MigrationRefusalReportV1>) {
+    refusals.sort_by(|left, right| {
+        left.origin
+            .cmp(&right.origin)
+            .then_with(|| left.diagnostic_code.cmp(&right.diagnostic_code))
+            .then_with(|| left.affected_record_ids.cmp(&right.affected_record_ids))
+    });
+    refusals.dedup();
+}
+
+fn late_domain_refusal_row(refusal: LateMigrationDomainRefusalV1) -> MigrationRefusalReportV1 {
+    match refusal {
+        LateMigrationDomainRefusalV1::ConflictingPublishedAuthorities {
+            affected_record_ids,
+        } => semantic_refusal("conflicting_published_authorities", affected_record_ids),
+        LateMigrationDomainRefusalV1::MultipleBaseAttachments {
+            affected_record_ids,
+        } => semantic_refusal("multiple_base_attachments", affected_record_ids),
+        LateMigrationDomainRefusalV1::MissingBaseAttachment {
+            affected_record_ids,
+        } => semantic_refusal("missing_base_attachment", affected_record_ids),
     }
 }
 
@@ -1094,7 +1147,17 @@ fn assess_migration_semantics(
         ));
     }
 
-    let mut refusal_count = u64::try_from(inventory.hard_refusals().len()).unwrap_or(u64::MAX);
+    let mut refusals = inventory
+        .hard_refusals()
+        .into_iter()
+        .map(|row| {
+            migration_refusal(
+                MigrationRefusalOriginV1::Inventory,
+                row.diagnostic_code,
+                [row.record_id],
+            )
+        })
+        .collect::<Vec<_>>();
     let mut resolved_project_scopes = Vec::with_capacity(inventory.legacy_projects.len());
     for project in &inventory.legacy_projects {
         let project_id = ProjectId::parse(project.record.project_id.clone())
@@ -1102,7 +1165,10 @@ fn assess_migration_semantics(
         let published_scope = match project_authority_scope(inventory, &project_id) {
             Ok(scope) => scope.cloned(),
             Err(_) => {
-                refusal_count = refusal_count.saturating_add(1);
+                refusals.push(semantic_refusal(
+                    "project_authority_ambiguous",
+                    [project.observation_id.clone()],
+                ));
                 None
             }
         };
@@ -1114,13 +1180,7 @@ fn assess_migration_semantics(
     }
     resolved_project_scopes.sort_by(|left, right| left.project_id.cmp(&right.project_id));
 
-    let scope_projects = match canonical_scope_conflicts(inventory) {
-        Ok(conflicts) => conflicts,
-        Err(_) => {
-            refusal_count = refusal_count.saturating_add(1);
-            BTreeMap::new()
-        }
-    };
+    let scope_projects = canonical_scope_conflicts(inventory).map_err(inventory_error)?;
     let selected_owners = resolution
         .selected_scope_owners
         .iter()
@@ -1258,7 +1318,10 @@ fn assess_migration_semantics(
             // V1 has no free-standing alias-owner disposition. An alias may
             // only ride on the exact duplicate-scope owner selection that
             // already names it; otherwise it is a non-overridable conflict.
-            refusal_count = refusal_count.saturating_add(1);
+            refusals.push(semantic_refusal(
+                "independent_alias_conflict",
+                candidates.iter().map(ToString::to_string),
+            ));
         }
     }
     if resolved_alias_owners
@@ -1588,7 +1651,10 @@ fn assess_migration_semantics(
                 | crate::project_catalog_inventory::CheckoutMarkerStateV1::Unreadable { .. }
                 | crate::project_catalog_inventory::CheckoutMarkerStateV1::Symlinked
         ) {
-            refusal_count = refusal_count.saturating_add(1);
+            refusals.push(semantic_refusal(
+                "unsafe_checkout_marker",
+                [checkout.observation_id.clone()],
+            ));
         }
     }
     for namespace in &inventory.legacy_commit_namespaces {
@@ -1604,7 +1670,10 @@ fn assess_migration_semantics(
             Attribution::Unclaimed => false,
         };
         if !supported {
-            refusal_count = refusal_count.saturating_add(1);
+            refusals.push(semantic_refusal(
+                "unsupported_legacy_namespace",
+                [namespace.observation_id.clone()],
+            ));
         }
     }
     namespace_conflicts.sort_by(|left, right| left.conflict_id.cmp(&right.conflict_id));
@@ -1615,6 +1684,7 @@ fn assess_migration_semantics(
         .sort_by(|left, right| left.pin_observation_id.cmp(&right.pin_observation_id));
     publisher_binding_conflicts.sort_by(|left, right| left.conflict_id.cmp(&right.conflict_id));
     required_resolutions.sort_by(|left, right| left.resolution_id.cmp(&right.resolution_id));
+    canonicalize_refusals(&mut refusals);
     Ok(MigrationSemanticAssessmentV1 {
         resolved_project_scopes,
         namespace_conflicts,
@@ -1626,7 +1696,7 @@ fn assess_migration_semantics(
         retained_attachment_ids,
         required_resolutions,
         unresolved_resolution_ids,
-        refusal_count,
+        refusals,
     })
 }
 
@@ -1827,7 +1897,7 @@ fn classify_legacy_paths(
     let mut report_rows = Vec::new();
     let mut sensitive_rows = Vec::new();
     let mut unscoped_counts = BTreeMap::new();
-    let mut refusal_count = 0_u64;
+    let mut refusals = Vec::new();
     for observed in &inventory.legacy_path_observations {
         let literal = runtime
             .legacy_selectors
@@ -1842,7 +1912,10 @@ fn classify_legacy_paths(
                 )
             });
         if selector_is_unsafe {
-            refusal_count = refusal_count.saturating_add(1);
+            refusals.push(semantic_refusal(
+                "unsafe_legacy_selector",
+                [observed.observation_id.clone()],
+            ));
             let planned_binding_id = identities
                 .legacy_path_binding_ids
                 .get(&observed.observation_id)
@@ -1910,7 +1983,13 @@ fn classify_legacy_paths(
                     if project.path_status
                         == crate::project_catalog_inventory::LegacyProjectPathStatusV1::Missing =>
                 {
-                    refusal_count = refusal_count.saturating_add(1);
+                    refusals.push(semantic_refusal(
+                        "legacy_selector_targets_missing_project",
+                        [
+                            observed.observation_id.clone(),
+                            project.observation_id.clone(),
+                        ],
+                    ));
                     (
                         LegacyPathRelationshipV1::MissingProject,
                         LegacyPathBindingStatusV1::Refused,
@@ -1926,7 +2005,13 @@ fn classify_legacy_paths(
                                 .get(&project.observation_id)
                                 .expect("matched legacy project path") =>
                 {
-                    refusal_count = refusal_count.saturating_add(1);
+                    refusals.push(semantic_refusal(
+                        "project_selector_is_not_exact_root",
+                        [
+                            observed.observation_id.clone(),
+                            project.observation_id.clone(),
+                        ],
+                    ));
                     (
                         LegacyPathRelationshipV1::UnsafeSelector,
                         LegacyPathBindingStatusV1::Refused,
@@ -1951,7 +2036,15 @@ fn classify_legacy_paths(
                     )
                 }
                 (Some(_), _) => {
-                    refusal_count = refusal_count.saturating_add(1);
+                    refusals.push(semantic_refusal(
+                        "ambiguous_legacy_selector",
+                        std::iter::once(observed.observation_id.clone()).chain(
+                            matching_projects
+                                .iter()
+                                .take(deepest_tied)
+                                .map(|(project, _)| project.observation_id.clone()),
+                        ),
+                    ));
                     (
                         LegacyPathRelationshipV1::Ambiguous,
                         LegacyPathBindingStatusV1::Refused,
@@ -1990,12 +2083,13 @@ fn classify_legacy_paths(
     report_rows.sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
     let sensitive_report = SensitiveLocalPathReportV1::from_runtime_rows(inventory, sensitive_rows)
         .map_err(inventory_error)?;
+    canonicalize_refusals(&mut refusals);
     Ok(ClassifiedLegacyPathsV1 {
         paths,
         report_rows,
         sensitive_report,
         unscoped_counts,
-        refusal_count,
+        refusals,
     })
 }
 
@@ -2061,8 +2155,13 @@ fn build_base_post_images(
             }
             0 => RepoHistoryAuthority::LegacyNamespace(group.planned_primary_namespace.clone()),
             _ => {
+                let affected_record_ids = std::iter::once(group.group_id.clone())
+                    .chain(group.project_ids.iter().map(ToString::to_string))
+                    .collect();
                 return Err(MigrationBasePostImagesFailureV1::Refused(
-                    LateMigrationDomainRefusalV1::ConflictingPublishedAuthorities,
+                    LateMigrationDomainRefusalV1::ConflictingPublishedAuthorities {
+                        affected_record_ids,
+                    },
                 ));
             }
         };
@@ -2317,8 +2416,22 @@ fn build_base_post_images(
             .ok_or_else(|| planner_error("legacy project runtime binding is missing"))?;
         let kind = if &project_dir == legacy_project_path {
             if !base_attachment_projects.insert(observed.project_id.clone()) {
+                let affected_record_ids = inventory
+                    .attachment_candidates
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.project_id == observed.project_id
+                            && assessment
+                                .retained_attachment_ids
+                                .contains(&candidate.attachment_id)
+                    })
+                    .map(|candidate| candidate.observation_id.clone())
+                    .chain(std::iter::once(legacy_project.observation_id.clone()))
+                    .collect();
                 return Err(MigrationBasePostImagesFailureV1::Refused(
-                    LateMigrationDomainRefusalV1::MultipleBaseAttachments,
+                    LateMigrationDomainRefusalV1::MultipleBaseAttachments {
+                        affected_record_ids,
+                    },
                 ));
             }
             AttachmentKind::Base
@@ -2383,8 +2496,24 @@ fn build_base_post_images(
             })
             .count();
         if base_count != 1 {
+            let affected_record_ids = std::iter::once(project.observation_id.clone())
+                .chain(
+                    inventory
+                        .attachment_candidates
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.project_id == project_id
+                                && assessment
+                                    .retained_attachment_ids
+                                    .contains(&candidate.attachment_id)
+                        })
+                        .map(|candidate| candidate.observation_id.clone()),
+                )
+                .collect();
             return Err(MigrationBasePostImagesFailureV1::Refused(
-                LateMigrationDomainRefusalV1::MissingBaseAttachment,
+                LateMigrationDomainRefusalV1::MissingBaseAttachment {
+                    affected_record_ids,
+                },
             ));
         }
     }
@@ -2471,7 +2600,6 @@ fn build_base_post_images(
         sensitive_report: classified_legacy_paths.sensitive_report.clone(),
         missing_paths,
         unscoped_legacy_counts: classified_legacy_paths.unscoped_counts.clone(),
-        refusal_count: classified_legacy_paths.refusal_count,
     })
 }
 
@@ -3221,24 +3349,7 @@ fn build_migration_report(
             })
         })
         .collect::<Result<Vec<_>, ProjectCatalogMigrationError>>()?;
-    let inventory_refusals = inventory.hard_refusals();
-    let mut refusals = inventory_refusals
-        .iter()
-        .map(|row| MigrationRefusalReportV1 {
-            record_id: row.record_id.clone(),
-            diagnostic_code: row.diagnostic_code.clone(),
-        })
-        .collect::<Vec<_>>();
-    let semantic_refusal_count = assessment
-        .refusal_count
-        .saturating_sub(u64::try_from(refusals.len()).unwrap_or(u64::MAX));
-    for index in 0..semantic_refusal_count {
-        refusals.push(MigrationRefusalReportV1 {
-            record_id: format!("semantic-refusal-{index:016x}"),
-            diagnostic_code: "semantic_migration_refusal".to_string(),
-        });
-    }
-    refusals.sort_by(|left, right| left.record_id.cmp(&right.record_id));
+    let refusals = assessment.refusals.clone();
     let report = ProjectCatalogMigrationReportV1 {
         version: 1,
         transaction_id: identities.transaction_id.clone(),
@@ -3709,9 +3820,10 @@ fn prepare_closed_migration(
         prior_report.as_ref(),
     )?;
     let classified_legacy_paths = classify_legacy_paths(inventory, &runtime, &identities)?;
-    assessment.refusal_count = assessment
-        .refusal_count
-        .saturating_add(classified_legacy_paths.refusal_count);
+    assessment
+        .refusals
+        .extend(classified_legacy_paths.refusals.clone());
+    canonicalize_refusals(&mut assessment.refusals);
     if assessment.status() != ProjectCatalogMigrationStatusV1::Clean {
         return prepare_assessment_only_with_rows(
             inventory,
@@ -3736,8 +3848,9 @@ fn prepare_closed_migration(
         &classified_legacy_paths,
     ) {
         Ok(base) => base,
-        Err(MigrationBasePostImagesFailureV1::Refused(_)) => {
-            assessment.refusal_count = assessment.refusal_count.saturating_add(1);
+        Err(MigrationBasePostImagesFailureV1::Refused(refusal)) => {
+            assessment.refusals.push(late_domain_refusal_row(refusal));
+            canonicalize_refusals(&mut assessment.refusals);
             return prepare_assessment_only_with_rows(
                 inventory,
                 &runtime,
@@ -3753,21 +3866,6 @@ fn prepare_closed_migration(
         }
         Err(MigrationBasePostImagesFailureV1::Error(error)) => return Err(error),
     };
-    if base.refusal_count != 0 {
-        assessment.refusal_count = assessment.refusal_count.saturating_add(base.refusal_count);
-        return prepare_assessment_only_with_rows(
-            inventory,
-            &runtime,
-            &resolution_bytes,
-            &assessment,
-            &identities,
-            include_sensitive_paths,
-            base.legacy_binding_report,
-            base.missing_paths,
-            base.unscoped_legacy_counts,
-            base.sensitive_report,
-        );
-    }
     let publisher = prepare_publisher_plan(inventory, &runtime, &assessment, &resolution)?;
     let catalog_bytes = encode_catalog_snapshot(&base.catalog)
         .map_err(|_| planner_error("catalog post-image cannot be encoded"))?;
@@ -3950,7 +4048,6 @@ fn prepare_closed_migration(
         &report,
         &report_bytes,
         &resolution_bytes,
-        assessment.refusal_count,
         &immutable_predictions,
         Some(identity_projections.marker_hash.clone()),
         sensitive_review.as_ref(),
@@ -3985,9 +4082,8 @@ fn prepare_assessment_only(
 ) -> Result<PreparedClosedMigrationV1, ProjectCatalogMigrationError> {
     let classified = classify_legacy_paths(inventory, runtime, identities)?;
     let mut assessment = assessment.clone();
-    assessment.refusal_count = assessment
-        .refusal_count
-        .saturating_add(classified.refusal_count);
+    assessment.refusals.extend(classified.refusals);
+    canonicalize_refusals(&mut assessment.refusals);
     prepare_assessment_only_with_rows(
         inventory,
         runtime,
@@ -4049,7 +4145,6 @@ fn prepare_assessment_only_with_rows(
         &report,
         &report_bytes,
         resolution_bytes,
-        assessment.refusal_count,
         &report.predicted_immutable_asset_hashes,
         None,
         sensitive_review.as_ref(),
@@ -4326,7 +4421,6 @@ fn preflight_receipt(
     report: &ProjectCatalogMigrationReportV1,
     report_bytes: &[u8],
     resolution_bytes: &[u8],
-    _refusal_count: u64,
     immutable_predictions: &BTreeMap<String, Sha256ValueV1>,
     predicted_marker_hash: Option<Sha256ValueV1>,
     sensitive: Option<&PreparedSensitiveReviewV1>,
@@ -4631,6 +4725,8 @@ fn validate_prepared_preflight(
                 && report.plan_kind == ProjectCatalogMigrationPlanKindV1::Executable)
         || prepared.receipt.required_resolution_count
             != u64::try_from(report.required_resolutions.len()).unwrap_or(u64::MAX)
+        || prepared.receipt.refusal_count
+            != u64::try_from(report.refusals.len()).unwrap_or(u64::MAX)
         || prepared.receipt.checkout_action_count
             != u64::try_from(report.checkout_identity_actions.len()).unwrap_or(u64::MAX)
     {
@@ -5365,7 +5461,14 @@ mod tests {
             assessment.status(),
             ProjectCatalogMigrationStatusV1::Refused
         );
-        assert_eq!(assessment.refusal_count, 1);
+        assert_eq!(assessment.refusals.len(), 1);
+        assert_eq!(
+            assessment.refusals[0],
+            semantic_refusal(
+                "unsafe_checkout_marker",
+                [inventory.checkouts[0].observation_id.clone()],
+            )
+        );
     }
 
     #[test]
@@ -5419,10 +5522,14 @@ mod tests {
         assert!(matches!(
             refusal,
             MigrationBasePostImagesFailureV1::Refused(
-                LateMigrationDomainRefusalV1::MissingBaseAttachment
+                LateMigrationDomainRefusalV1::MissingBaseAttachment { .. }
             )
         ));
-        assessment.refusal_count = assessment.refusal_count.saturating_add(1);
+        let MigrationBasePostImagesFailureV1::Refused(refusal) = refusal else {
+            unreachable!("matched refusal")
+        };
+        assessment.refusals.push(late_domain_refusal_row(refusal));
+        canonicalize_refusals(&mut assessment.refusals);
         let prepared = prepare_assessment_only(
             &inventory,
             &runtime,
@@ -5514,7 +5621,10 @@ mod tests {
         assert_eq!(base.legacy_binding_report, contained.report_rows);
 
         let mut refused_assessment = assessment.clone();
-        refused_assessment.refusal_count = 1;
+        refused_assessment.refusals.push(semantic_refusal(
+            "test_semantic_refusal",
+            ["legacy_alpha".to_string()],
+        ));
         let prepared = prepare_assessment_only(
             &inventory,
             &runtime,
@@ -5566,7 +5676,7 @@ mod tests {
             missing.report_rows[0].relationship,
             LegacyPathRelationshipV1::MissingProject
         );
-        assert_eq!(missing.refusal_count, 1);
+        assert_eq!(missing.refusals.len(), 1);
 
         runtime.legacy_project_paths.insert(
             "legacy_beta".to_string(),
@@ -5577,7 +5687,7 @@ mod tests {
             ambiguous.report_rows[0].relationship,
             LegacyPathRelationshipV1::Ambiguous
         );
-        assert_eq!(ambiguous.refusal_count, 1);
+        assert_eq!(ambiguous.refusals.len(), 1);
 
         runtime.legacy_selectors.insert(
             "legacy_path_alpha".to_string(),
@@ -5588,6 +5698,6 @@ mod tests {
             unsafe_selector.report_rows[0].relationship,
             LegacyPathRelationshipV1::UnsafeSelector
         );
-        assert_eq!(unsafe_selector.refusal_count, 1);
+        assert_eq!(unsafe_selector.refusals.len(), 1);
     }
 }
