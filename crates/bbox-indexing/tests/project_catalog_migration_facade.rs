@@ -15,7 +15,9 @@ use bbox_code_source_store::{
 };
 use bbox_config::config::{self, Config, LoadOptions};
 use bbox_corpus_core::identity::PublishedScope;
-use bbox_corpus_core::project_catalog::ProjectId;
+use bbox_corpus_core::project_catalog::{
+    AttachmentKind, AttachmentStatus, ProjectId, decode_attachment_snapshot,
+};
 use bbox_corpus_index::index::TranscriptIndex;
 use bbox_edge_sidecar::manifest::ManifestIndex;
 use bbox_indexing::project_catalog_inventory::{
@@ -653,6 +655,51 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
     assert_eq!(verified.receipt(), &applied.receipt.verification);
     assert_eq!(verified.compatibility().records().len(), 2);
     assert_eq!(verified.compatibility().omitted_catalog_count(), 1);
+    for (project_id, checkout, repo_id, registered_at) in [
+        (
+            &fixture.winner_project,
+            &fixture.winner_checkout,
+            "neutral-repository",
+            "2026-01-02T03:04:05Z",
+        ),
+        (
+            &fixture.collision_winner_project,
+            &fixture.collision_winner_checkout,
+            "neutral-collision",
+            "2026-01-02T03:04:06Z",
+        ),
+    ] {
+        let record = verified
+            .compatibility()
+            .records()
+            .iter()
+            .find(|record| record.project_id == project_id.as_str())
+            .unwrap();
+        assert_eq!(record.canonical_path, checkout.to_str().unwrap());
+        assert_eq!(record.repo_id.as_deref(), Some(repo_id));
+        assert_eq!(record.registered_at, registered_at);
+        assert!(record.is_git_repo);
+        assert!(record.languages.is_empty());
+        assert!(record.aliases.is_empty());
+    }
+    let attachment_snapshot = decode_attachment_snapshot(
+        &fs::read(rehearsal_root.join("state/project-attachments.json")).unwrap(),
+    )
+    .unwrap();
+    for project_id in [&fixture.winner_project, &fixture.collision_winner_project] {
+        assert_eq!(
+            attachment_snapshot
+                .attachments
+                .values()
+                .filter(|attachment| {
+                    attachment.project_id == *project_id
+                        && attachment.kind == AttachmentKind::Base
+                        && attachment.status == AttachmentStatus::Attached
+                })
+                .count(),
+            1
+        );
+    }
 
     let code_source_paths =
         CodeSourceStorePaths::new(rehearsal_root.join("state/code-sources")).unwrap();

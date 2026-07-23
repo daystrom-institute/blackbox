@@ -1799,6 +1799,43 @@ fn classify_legacy_paths(
             .get(&observed.observation_id)
             .ok_or_else(|| planner_error("legacy selector runtime binding is missing"))?;
         let literal_path = Path::new(literal);
+        let selector_is_unsafe = !literal_path.is_absolute()
+            || literal_path.components().any(|component| {
+                matches!(
+                    component,
+                    Component::CurDir | Component::ParentDir | Component::Prefix(_)
+                )
+            });
+        if selector_is_unsafe {
+            refusal_count = refusal_count.saturating_add(1);
+            let planned_binding_id = identities
+                .legacy_path_binding_ids
+                .get(&observed.observation_id)
+                .ok_or_else(|| planner_error("legacy path binding identity is missing"))?
+                .clone();
+            paths.push(ClassifiedLegacyPathV1 {
+                observation_id: observed.observation_id.clone(),
+                planned_binding_id: planned_binding_id.clone(),
+                literal_selector: literal.clone(),
+                relationship: LegacyPathRelationshipV1::UnsafeSelector,
+                mapped_project_id: None,
+            });
+            report_rows.push(LegacyPathBindingReportV1 {
+                observation_id: observed.observation_id.clone(),
+                planned_binding_id,
+                store_kind: observed.store_kind,
+                relationship: LegacyPathRelationshipV1::UnsafeSelector,
+                status: LegacyPathBindingStatusV1::Refused,
+                path_digest: digest_path(literal),
+            });
+            sensitive_rows.push(SensitiveLocalPathRowV1 {
+                observation_id: observed.observation_id.clone(),
+                store_kind: observed.store_kind,
+                stable_row_id: observed.stable_row_id.clone(),
+                literal_selector: literal.clone(),
+            });
+            continue;
+        }
         let mut matching_projects = inventory
             .legacy_projects
             .iter()
@@ -1841,6 +1878,22 @@ fn classify_legacy_paths(
                     refusal_count = refusal_count.saturating_add(1);
                     (
                         LegacyPathRelationshipV1::MissingProject,
+                        LegacyPathBindingStatusV1::Refused,
+                        None,
+                    )
+                }
+                (Some((project, _)), 1)
+                    if observed.selector_kind
+                        == crate::project_catalog_inventory::LegacySelectorKindV1::Project
+                        && literal_path
+                            != runtime
+                                .legacy_project_paths
+                                .get(&project.observation_id)
+                                .expect("matched legacy project path") =>
+                {
+                    refusal_count = refusal_count.saturating_add(1);
+                    (
+                        LegacyPathRelationshipV1::UnsafeSelector,
                         LegacyPathBindingStatusV1::Refused,
                         None,
                     )
@@ -2184,7 +2237,6 @@ fn build_base_post_images(
         .collect::<Result<BTreeMap<_, _>, ProjectCatalogMigrationError>>()?;
 
     let mut post_image_attachments = Vec::new();
-    let mut attachments_by_project = BTreeMap::<ProjectId, Vec<AttachmentId>>::new();
     let mut base_attachment_projects = BTreeSet::new();
     let mut attachment_snapshot_rows = BTreeMap::new();
     for observed in inventory.attachment_candidates.iter().filter(|row| {
@@ -2200,7 +2252,11 @@ fn build_base_post_images(
             .to_str()
             .ok_or_else(|| planner_error("attachment checkout runtime path is not utf8"))?
             .to_string();
-        let project_dir = checkout_root.join(&observed.base_relpath);
+        let project_dir = if observed.base_relpath == "." {
+            checkout_root.clone()
+        } else {
+            checkout_root.join(&observed.base_relpath)
+        };
         let checkout_project_dir = project_dir
             .to_str()
             .ok_or_else(|| planner_error("attachment project runtime path is not utf8"))?
@@ -2234,10 +2290,6 @@ fn build_base_post_images(
         } else {
             AttachmentKind::Worktree
         };
-        let project_attachments = attachments_by_project
-            .entry(observed.project_id.clone())
-            .or_default();
-        project_attachments.push(observed.attachment_id.clone());
         let has_history = project_history_ids.contains_key(&observed.project_id);
         attachment_snapshot_rows.insert(
             observed.attachment_id.clone(),
@@ -2276,8 +2328,21 @@ fn build_base_post_images(
             attached_at,
         });
     }
-    for (project_id, attachment_ids) in &attachments_by_project {
-        if !attachment_ids.is_empty() && !base_attachment_projects.contains(project_id) {
+    for project in &inventory.legacy_projects {
+        if project.path_status
+            != crate::project_catalog_inventory::LegacyProjectPathStatusV1::Present
+        {
+            continue;
+        }
+        let project_id = ProjectId::parse(project.record.project_id.clone())
+            .map_err(|_| planner_error("legacy project id is invalid"))?;
+        let base_count = attachment_snapshot_rows
+            .values()
+            .filter(|attachment| {
+                attachment.project_id == project_id && attachment.kind == AttachmentKind::Base
+            })
+            .count();
+        if base_count != 1 {
             return Err(MigrationBasePostImagesFailureV1::Refused(
                 LateMigrationDomainRefusalV1::MissingBaseAttachment,
             ));
@@ -3449,7 +3514,13 @@ impl ClosedMigrationIntegrationV1 for CurrentClosedMigrationIntegrationV1 {
                 mutation_disposition,
             )
         })?;
-        let verified = verify_installed(layout)?;
+        let verified = verify_installed(layout).map_err(|error| {
+            ProjectCatalogMigrationError::new(
+                error.code,
+                "installed migration verification failed after commit",
+                ProjectCatalogMigrationMutationDispositionV1::RecoveredToCommittedState,
+            )
+        })?;
         if verified.receipt.predicted_marker_hash != predicted_marker_hash {
             return Err(ProjectCatalogMigrationError::new(
                 "error.project_catalog_migration_artifact_identity",
@@ -3486,6 +3557,7 @@ fn prepare_closed_migration(
     include_sensitive_paths: bool,
 ) -> Result<PreparedClosedMigrationV1, ProjectCatalogMigrationError> {
     let checkout_roots = discover_checkout_roots(layout)?;
+    validate_rehearsal_runtime_authorities(layout, &checkout_roots)?;
     let prior_report = existing_report
         .map(decode_migration_report_v1)
         .transpose()
@@ -3493,6 +3565,7 @@ fn prepare_closed_migration(
     let candidate_keys =
         ProjectCatalogMigrationInventoryFacadeV1::discover_attachment_candidate_keys(
             ProjectCatalogAttachmentCandidateDiscoveryRequestV1 {
+                rehearsal_root: layout.rehearsal_root.clone(),
                 legacy_project_store_path: layout.projects_path.clone(),
                 checkout_roots: checkout_roots.clone(),
             },
@@ -3504,12 +3577,14 @@ fn prepare_closed_migration(
         ProjectCatalogMigrationInventoryFacadeV1::discover_provenance_owner_sources(
             layout.projects_path.clone(),
             layout.provenance_notes_ref.clone(),
+            layout.rehearsal_root.clone(),
         )
         .map_err(adapter_error)?;
     let publisher_ref_store =
         PublisherRefStore::migration_source(layout.publisher_refs_path.clone());
     let captured = ProjectCatalogMigrationInventoryFacadeV1::capture(
         ProjectCatalogMigrationInventoryRequestV1 {
+            rehearsal_root: layout.rehearsal_root.clone(),
             legacy_project_store_path: layout.projects_path.clone(),
             publisher_ref_store: &publisher_ref_store,
             code_source_store_root: layout.code_source_root.clone(),
@@ -4672,6 +4747,69 @@ fn validate_rehearsal_separation(
     Ok(())
 }
 
+fn validate_rehearsal_runtime_authorities(
+    layout: &ProjectCatalogMigrationResolvedLayoutV1,
+    checkout_roots: &[PathBuf],
+) -> Result<(), ProjectCatalogMigrationError> {
+    let Some(root) = layout.rehearsal_root.as_ref() else {
+        return Ok(());
+    };
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|_| unsafe_layout("rehearsal root must be canonicalizable"))?;
+    let require_contained = |path: &Path| -> Result<PathBuf, ProjectCatalogMigrationError> {
+        if !path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    Component::CurDir | Component::ParentDir | Component::Prefix(_)
+                )
+            })
+        {
+            return Err(unsafe_layout(
+                "runtime migration authority is not a normalized absolute path",
+            ));
+        }
+        let canonical = path
+            .canonicalize()
+            .map_err(|_| unsafe_layout("runtime migration authority is not canonicalizable"))?;
+        if canonical != path || !canonical.starts_with(&canonical_root) {
+            return Err(unsafe_layout(
+                "runtime migration authority escapes the rehearsal root",
+            ));
+        }
+        Ok(canonical)
+    };
+    for checkout in checkout_roots {
+        require_contained(checkout)?;
+    }
+    let metadata = match std::fs::symlink_metadata(&layout.projects_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(unsafe_layout("legacy catalog cannot be inspected")),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(unsafe_layout("legacy catalog must be a no-follow file"));
+    }
+    let bytes = std::fs::read(&layout.projects_path)
+        .map_err(|_| unsafe_layout("legacy catalog cannot be read"))?;
+    if bytes.len() > MAX_PROJECT_CATALOG_BYTES {
+        return Err(unsafe_layout("legacy catalog exceeds its size limit"));
+    }
+    let legacy = decode_legacy_project_store(&bytes)
+        .map_err(|_| unsafe_layout("legacy catalog is invalid"))?;
+    for project in legacy.projects {
+        let project_root = require_contained(Path::new(&project.canonical_path))?;
+        if let Some(git_root) = bbox_corpus_core::git::git_root_for_path(&project_root) {
+            require_contained(&git_root)?;
+        }
+        if let Some(common_dir) = bbox_corpus_core::git::git_common_dir(&project_root) {
+            require_contained(&common_dir)?;
+        }
+    }
+    Ok(())
+}
+
 fn canonicalize_existing_ancestor(path: &Path) -> Result<PathBuf, ProjectCatalogMigrationError> {
     let mut cursor = path;
     let mut suffix = Vec::new();
@@ -4992,6 +5130,43 @@ mod tests {
                 .all_paths()
                 .into_iter()
                 .all(|path| path.starts_with(&rehearsal))
+        );
+    }
+
+    #[test]
+    fn rehearsal_runtime_authority_cannot_escape_declared_root() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let config = test_config(&root);
+        let rehearsal = root.join("rehearsal");
+        let outside = root.join("outside");
+        fs::create_dir_all(rehearsal.join("state")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(
+            rehearsal.join("state/projects.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "projects": [{
+                    "project_id": "outside-project",
+                    "repo_id": null,
+                    "canonical_path": outside,
+                    "registered_at": "2026-01-02T03:04:05Z",
+                    "is_git_repo": false,
+                    "languages": [],
+                    "aliases": []
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let layout =
+            ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(&rehearsal, &config)
+                .unwrap();
+        assert_eq!(
+            validate_rehearsal_runtime_authorities(&layout, &[])
+                .unwrap_err()
+                .code,
+            "error.project_catalog_migration_unsafe_layout"
         );
     }
 
@@ -5337,5 +5512,16 @@ mod tests {
             LegacyPathRelationshipV1::Ambiguous
         );
         assert_eq!(ambiguous.refusal_count, 1);
+
+        runtime.legacy_selectors.insert(
+            "legacy_path_alpha".to_string(),
+            "/workspace/acme/services/alpha/../beta".to_string(),
+        );
+        let unsafe_selector = classify_legacy_paths(&inventory, &runtime, &identities).unwrap();
+        assert_eq!(
+            unsafe_selector.report_rows[0].relationship,
+            LegacyPathRelationshipV1::UnsafeSelector
+        );
+        assert_eq!(unsafe_selector.refusal_count, 1);
     }
 }
