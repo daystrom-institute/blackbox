@@ -3385,14 +3385,6 @@ enum MigrationAttemptFailureV1 {
     Classify(ProjectCatalogStoreError),
 }
 
-impl MigrationAttemptFailureV1 {
-    fn into_error(self) -> ProjectCatalogStoreError {
-        match self {
-            Self::NoDurableMutation(error) | Self::Classify(error) => error,
-        }
-    }
-}
-
 fn transact_migration_attempt_with_io(
     projects_path: &Path,
     plan: ValidatedMigrationPlanV1,
