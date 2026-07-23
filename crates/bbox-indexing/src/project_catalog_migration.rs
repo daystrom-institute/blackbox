@@ -4827,16 +4827,23 @@ mod tests {
             &resolution,
             &post_image,
         );
+        let retained_attachment_ids = post_image
+            .attachments
+            .iter()
+            .map(|row| row.attachment_id.clone())
+            .collect::<BTreeSet<_>>();
 
         let first = build_persisted_identity_plan(
             &inventory,
             &post_image.resolved_project_scopes,
+            &retained_attachment_ids,
             Some(&report),
         )
         .unwrap();
         let second = build_persisted_identity_plan(
             &inventory,
             &post_image.resolved_project_scopes,
+            &retained_attachment_ids,
             Some(&report),
         )
         .unwrap();
