@@ -410,12 +410,14 @@ pub fn read_verified_committed_file_bytes_bounded(
             .sessions
             .lock()
             .map_err(|_| anyhow::anyhow!("verified Git object session lock was poisoned"))?;
+        let mut raw_entry_count = 0_usize;
         let object = sessions
             .resolve_path(
                 &commit.root_tree_oid,
                 repo_rel,
                 max_bytes,
                 std::time::Instant::now() + GIT_OUTPUT_TIMEOUT,
+                &mut raw_entry_count,
             )?
             .context("committed file is missing from the verified object database")?;
         if object.object_type != "blob" {
@@ -726,6 +728,9 @@ const GIT_COMMIT_OBJECT_LIMIT: usize = 16 * 1024 * 1024;
 const GIT_PATH_TRAVERSAL_LIMIT: usize = 64 * 1024 * 1024;
 
 #[cfg(unix)]
+const MAX_VERIFIED_RAW_TREE_ENTRIES: usize = 200_000;
+
+#[cfg(unix)]
 fn parse_commit_tree_oid(commit: &[u8], object_id_hex_len: usize) -> Result<String> {
     let first_line = commit
         .split(|byte| *byte == b'\n')
@@ -794,6 +799,7 @@ impl VerifiedObjectSessions {
         repo_rel: &str,
         max_object_bytes: usize,
         deadline: std::time::Instant,
+        raw_entry_count: &mut usize,
     ) -> Result<Option<CatObject>> {
         let mut tree_oid = root_tree_oid.to_string();
         let mut traversal_bytes = 0_usize;
@@ -811,20 +817,35 @@ impl VerifiedObjectSessions {
             traversal_bytes = traversal_bytes
                 .checked_add(tree.bytes.len())
                 .context("committed path traversal byte count overflowed")?;
-            let entry = parse_raw_tree_entries(&tree.bytes, root_tree_oid.len())?
-                .into_iter()
-                .find(|entry| entry.name == component.as_bytes());
-            let Some(entry) = entry else {
+            prescan_raw_tree_entries(
+                &tree.bytes,
+                root_tree_oid.len(),
+                raw_entry_count,
+                MAX_VERIFIED_RAW_TREE_ENTRIES,
+            )?;
+            let mut matched = None;
+            for entry in RawTreeEntryIter::new(&tree.bytes, root_tree_oid.len()) {
+                let entry = entry?;
+                if entry.name == component.as_bytes() {
+                    matched = Some((entry.mode, entry.object_id));
+                    break;
+                }
+            }
+            let Some((mode, raw_object_id)) = matched else {
                 return Ok(None);
             };
             if components.peek().is_some() {
-                if !matches!(entry.mode.as_slice(), b"40000" | b"040000") {
+                if !matches!(mode, b"40000" | b"040000") {
                     anyhow::bail!("committed path traverses through a non-directory entry");
                 }
-                tree_oid = entry.object_id;
+                tree_oid = hex::encode(raw_object_id);
                 continue;
             }
-            return self.read_object_before(&entry.object_id, max_object_bytes, deadline);
+            return self.read_object_before(
+                &hex::encode(raw_object_id),
+                max_object_bytes,
+                deadline,
+            );
         }
         anyhow::bail!("committed path has no components")
     }
@@ -1267,8 +1288,9 @@ pub fn list_committed_dir_result_with_alternate(
 ///
 /// Reads raw tree objects through the verified session and rejects aggregate
 /// overflow, non-regular entries, non-UTF-8 or non-confined paths, duplicates,
-/// and over-count listings. Returned paths are sorted independently of object
-/// order.
+/// over-count listings, and over-cap raw entry graphs. Raw entries are
+/// pre-scanned as borrowed slices before any per-entry path or object-id
+/// allocation. Returned paths are sorted independently of object order.
 pub fn list_verified_committed_dir_bounded(
     commit: &VerifiedCommit,
     dir_rel: &str,
@@ -1288,10 +1310,17 @@ pub fn list_verified_committed_dir_bounded(
 }
 
 #[cfg(unix)]
-struct RawTreeEntry {
-    mode: Vec<u8>,
-    name: Vec<u8>,
-    object_id: String,
+struct BorrowedRawTreeEntry<'a> {
+    mode: &'a [u8],
+    name: &'a [u8],
+    object_id: &'a [u8],
+}
+
+#[cfg(unix)]
+struct RawTreeEntryIter<'a> {
+    tree: &'a [u8],
+    cursor: usize,
+    object_id_bytes: usize,
 }
 
 #[cfg(unix)]
@@ -1300,16 +1329,20 @@ struct VerifiedListingBudget {
     retained_bytes: usize,
     max_trees: usize,
     tree_count: usize,
+    raw_entry_count: usize,
 }
 
 #[cfg(unix)]
 impl VerifiedListingBudget {
-    fn new(max_bytes: usize, max_entries: usize) -> Self {
+    fn new(max_bytes: usize, max_entries: usize, raw_entry_count: usize) -> Self {
         Self {
             max_bytes,
             retained_bytes: 0,
-            max_trees: max_entries.saturating_add(1).min(200_000),
+            max_trees: max_entries
+                .saturating_add(1)
+                .min(MAX_VERIFIED_RAW_TREE_ENTRIES),
             tree_count: 0,
+            raw_entry_count,
         }
     }
 
@@ -1338,6 +1371,15 @@ impl VerifiedListingBudget {
         self.tree_count += 1;
         Ok(())
     }
+
+    fn prescan_tree(&mut self, tree: &[u8], object_id_hex_len: usize) -> Result<()> {
+        prescan_raw_tree_entries(
+            tree,
+            object_id_hex_len,
+            &mut self.raw_entry_count,
+            MAX_VERIFIED_RAW_TREE_ENTRIES,
+        )
+    }
 }
 
 #[cfg(unix)]
@@ -1353,11 +1395,13 @@ fn list_verified_committed_dir_bounded_unix(
         .lock()
         .map_err(|_| anyhow::anyhow!("verified Git object session lock was poisoned"))?;
     let listing_deadline = std::time::Instant::now() + GIT_OUTPUT_TIMEOUT;
+    let mut raw_entry_count = 0_usize;
     let Some(root_tree) = sessions.resolve_path(
         &commit.root_tree_oid,
         dir_rel,
         max_listing_bytes,
         listing_deadline,
+        &mut raw_entry_count,
     )?
     else {
         return Ok(Vec::new());
@@ -1366,7 +1410,7 @@ fn list_verified_committed_dir_bounded_unix(
         anyhow::bail!("committed directory does not resolve to a tree");
     }
 
-    let mut budget = VerifiedListingBudget::new(max_listing_bytes, max_entries);
+    let mut budget = VerifiedListingBudget::new(max_listing_bytes, max_entries, raw_entry_count);
     budget.charge_tree()?;
     budget.charge_bytes(root_tree.bytes.len())?;
     budget.charge_bytes(
@@ -1380,9 +1424,10 @@ fn list_verified_committed_dir_bounded_unix(
     let mut files = std::collections::BTreeSet::new();
     let mut trees = vec![(root_path, root_tree.bytes)];
     while let Some((tree_path, tree_bytes)) = trees.pop() {
-        let entries = parse_raw_tree_entries(&tree_bytes, commit.object_id_hex_len)?;
-        for entry in entries {
-            let name = std::str::from_utf8(&entry.name)
+        budget.prescan_tree(&tree_bytes, commit.object_id_hex_len)?;
+        for entry in RawTreeEntryIter::new(&tree_bytes, commit.object_id_hex_len) {
+            let entry = entry?;
+            let name = std::str::from_utf8(entry.name)
                 .context("committed tree contains a non-UTF-8 path component")?;
             let full_path_len = tree_path
                 .len()
@@ -1399,12 +1444,13 @@ fn list_verified_committed_dir_bounded_unix(
             full_path.push('/');
             full_path.push_str(name);
             validate_repository_relative_git_path(&full_path, "committed tree path")?;
-            match entry.mode.as_slice() {
+            match entry.mode {
                 b"40000" | b"040000" => {
                     budget.charge_tree()?;
+                    let object_id = hex::encode(entry.object_id);
                     let subtree = sessions
                         .read_object_before(
-                            &entry.object_id,
+                            &object_id,
                             budget.remaining_bytes()?,
                             listing_deadline,
                         )?
@@ -1419,8 +1465,9 @@ fn list_verified_committed_dir_bounded_unix(
                     if files.len() >= max_entries {
                         anyhow::bail!("committed directory listing exceeds its entry limit");
                     }
+                    let object_id = hex::encode(entry.object_id);
                     let (object_type, _) = sessions
-                        .read_info_before(&entry.object_id, listing_deadline)?
+                        .read_info_before(&object_id, listing_deadline)?
                         .context("committed regular-file entry references a missing object")?;
                     if object_type != "blob" {
                         anyhow::bail!(
@@ -1442,46 +1489,92 @@ fn list_verified_committed_dir_bounded_unix(
 }
 
 #[cfg(unix)]
-fn parse_raw_tree_entries(tree: &[u8], object_id_hex_len: usize) -> Result<Vec<RawTreeEntry>> {
-    let object_id_bytes = object_id_hex_len / 2;
-    let mut entries = Vec::new();
+impl<'a> RawTreeEntryIter<'a> {
+    fn new(tree: &'a [u8], object_id_hex_len: usize) -> Self {
+        Self {
+            tree,
+            cursor: 0,
+            object_id_bytes: object_id_hex_len / 2,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl<'a> Iterator for RawTreeEntryIter<'a> {
+    type Item = Result<BorrowedRawTreeEntry<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor >= self.tree.len() {
+            return None;
+        }
+        let tree = self.tree;
+        let cursor = self.cursor;
+        let object_id_bytes = self.object_id_bytes;
+        let result = (|| {
+            let mode_end = tree[cursor..]
+                .iter()
+                .position(|byte| *byte == b' ')
+                .map(|offset| cursor + offset)
+                .context("committed tree entry has no mode delimiter")?;
+            let name_start = mode_end + 1;
+            let name_end = tree[name_start..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .map(|offset| name_start + offset)
+                .context("committed tree entry has no name delimiter")?;
+            let object_start = name_end + 1;
+            let object_end = object_start
+                .checked_add(object_id_bytes)
+                .context("committed tree object id offset overflowed")?;
+            if object_end > tree.len() {
+                anyhow::bail!("committed tree entry has a truncated object id");
+            }
+            let mode = &tree[cursor..mode_end];
+            let name = &tree[name_start..name_end];
+            if name.is_empty() || name.contains(&b'/') {
+                anyhow::bail!("committed tree entry name is malformed");
+            }
+            Ok((
+                BorrowedRawTreeEntry {
+                    mode,
+                    name,
+                    object_id: &tree[object_start..object_end],
+                },
+                object_end,
+            ))
+        })();
+        match result {
+            Ok((entry, object_end)) => {
+                self.cursor = object_end;
+                Some(Ok(entry))
+            }
+            Err(error) => {
+                self.cursor = self.tree.len();
+                Some(Err(error))
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn prescan_raw_tree_entries(
+    tree: &[u8],
+    object_id_hex_len: usize,
+    raw_entry_count: &mut usize,
+    max_raw_entries: usize,
+) -> Result<()> {
     let mut names = std::collections::BTreeSet::new();
-    let mut cursor = 0_usize;
-    while cursor < tree.len() {
-        let mode_end = tree[cursor..]
-            .iter()
-            .position(|byte| *byte == b' ')
-            .map(|offset| cursor + offset)
-            .context("committed tree entry has no mode delimiter")?;
-        let mode = tree[cursor..mode_end].to_vec();
-        let name_start = mode_end + 1;
-        let name_end = tree[name_start..]
-            .iter()
-            .position(|byte| *byte == 0)
-            .map(|offset| name_start + offset)
-            .context("committed tree entry has no name delimiter")?;
-        let object_start = name_end + 1;
-        let object_end = object_start
-            .checked_add(object_id_bytes)
-            .context("committed tree object id offset overflowed")?;
-        if object_end > tree.len() {
-            anyhow::bail!("committed tree entry has a truncated object id");
+    for entry in RawTreeEntryIter::new(tree, object_id_hex_len) {
+        let entry = entry?;
+        if *raw_entry_count >= max_raw_entries {
+            anyhow::bail!("committed tree traversal exceeds its raw entry limit");
         }
-        let name = &tree[name_start..name_end];
-        if name.is_empty() || name.contains(&b'/') {
-            anyhow::bail!("committed tree entry name is malformed");
-        }
-        if !names.insert(name) {
+        *raw_entry_count += 1;
+        if !names.insert(entry.name) {
             anyhow::bail!("committed tree contains a duplicate entry name");
         }
-        entries.push(RawTreeEntry {
-            mode,
-            name: name.to_vec(),
-            object_id: hex::encode(&tree[object_start..object_end]),
-        });
-        cursor = object_end;
     }
-    Ok(entries)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2892,6 +2985,26 @@ mod tests {
         let error =
             list_verified_committed_dir_bounded(&verified, "scope", 8, 1024 * 1024).unwrap_err();
         assert!(error.to_string().contains("tree count limit"));
+    }
+
+    #[test]
+    fn raw_tree_prescan_rejects_single_tree_over_cap_before_next_insertion() {
+        let object_id = "11".repeat(20);
+        let mut tree = Vec::new();
+        for index in 0..9 {
+            tree.extend(raw_tree_entry(
+                "100644",
+                &format!("entry-{index}.json"),
+                &object_id,
+            ));
+        }
+        let mut raw_entry_count = 0_usize;
+        let error = prescan_raw_tree_entries(&tree, 40, &mut raw_entry_count, 8).unwrap_err();
+        assert!(error.to_string().contains("raw entry limit"));
+        assert_eq!(
+            raw_entry_count, 8,
+            "the over-cap entry must be rejected before duplicate-set insertion"
+        );
     }
 
     fn ls_tree_record(mode: &str, object_type: &str, path: &[u8]) -> Vec<u8> {
