@@ -105,8 +105,8 @@ recomputation and therefore cannot be promoted into attachment authority.
 the Phase 0 head:
 
 - no tracked file was deleted;
-- the number of `#[tool]` declarations under `src/tools` increased from 202 to
-  203; and
+- `git grep -n -F '#[tool(' <ref> -- 'src/tools/*.rs' | wc -l` counts 172
+  declarations at `254cabf0` and 173 at Phase 0 head `73f093fb`; and
 - the current full suite, workspace clippy, concurrency lint, exact-SHA cluster
   verification, stable-signed isolated boot, HTTP probes, and MCP initialize
   are green.
@@ -157,6 +157,8 @@ Add validated newtypes:
 ```text
 ProjectId
 RepoHistoryId
+RepoHistoryGenerationId
+RepoHistoryQuarantineGenerationId
 RecordedRepoAuthority
 RepoBootstrapHint
 CommitNamespace
@@ -178,9 +180,13 @@ characters, except `.` and `..`. New ids are `p_` plus 32 lowercase
 hexadecimal characters generated from operating-system randomness. Minting
 checks catalog membership and retries a bounded number of times.
 
-`RepoHistoryId` and `AttachmentId` use distinct code-owned prefixes so logs and
-diagnostics cannot confuse them with project ids. Their values are still opaque
-and never encode a path, alias, scope, repository URL, token, or Git ref.
+`RepoHistoryId`, `RepoHistoryGenerationId`,
+`RepoHistoryQuarantineGenerationId`, and `AttachmentId` use distinct
+code-owned prefixes so logs and diagnostics cannot confuse them with project
+ids or with one another. Their values are still opaque and never encode a
+path, alias, scope, repository URL, token, or Git ref. The two generation ids
+are content-addressed by the Phase 3 materializer under the governing
+domain-separated contracts; Phase 1 only validates and preserves them.
 
 `RecordedRepoAuthority`, `RepoBootstrapHint`, and `CommitNamespace` are
 different types even when legacy bytes happen to match. No caller may infer
@@ -232,6 +238,16 @@ random project-bound commit namespace and may refresh local history through a
 validated Git-history attachment. That authority cannot publish, satisfy a
 producer grant, identify another project, or claim cross-host sameness.
 Non-Git `LegacyLocal` projects create no commit history.
+
+`RepoHistoryRecord.materialization` is exactly `NotBuilt` or
+`Ready { generation_id: RepoHistoryGenerationId }`.
+`AmbiguousNamespaceRecord.materialization` is exactly `NotBuilt` or
+`Ready { generation_id: RepoHistoryQuarantineGenerationId }`. Phase 1
+migration post-images always write both forms as `NotBuilt`: the importer
+inventories namespace ownership and complete commit/vector commitments but
+does not copy commit-document bodies or create history assets. Phase 3 is the
+sole creation owner and advances these fields through the regular catalog
+transaction only after strict generation verification.
 
 `ScopeMigrationRecord` is the path-free logical audit and compatibility bridge
 defined by governing section 7.2. It lives inside the catalog snapshot, keyed
@@ -316,7 +332,9 @@ Pure `validate` functions reject the complete snapshot when any of these hold:
 - map key and embedded id disagree;
 - duplicate project id, published scope, accepted alias, repository authority,
   repo-history id, or active commit namespace;
-- an accepted alias collides with a project id or another accepted alias;
+- an accepted or nominated alias violates the governing 1–96-byte alias
+  contract, or an accepted alias collides with a project id or another
+  accepted alias;
 - a project references a missing repo-history record;
 - a scope-migration key and embedded id disagree, references a missing project,
   has equal old/new scope, branches or breaks continuity in a project's
@@ -326,12 +344,16 @@ Pure `validate` functions reject the complete snapshot when any of these hold:
 - a project's current scope disagrees with the final transition in its chain;
 - a recorded repo-history authority disagrees with a published project using
   that record;
+- a `Ready` repo-history or ambiguous-namespace record carries the wrong
+  generation-id type or a generation id that fails its strict parser;
 - a primary namespace also appears as incompatible or ambiguous ownership;
 - an ambiguous namespace is accepted for ordinary commit resolution;
 - an attachment references a missing project;
 - attachment and catalog published scopes disagree;
 - active `(project_id, checkout_id, project_root_relpath)` uniqueness is
   violated;
+- two active attachments for different projects share one
+  `(checkout_id, project_root_relpath)`;
 - a mapped legacy path binding references a missing project, has a malformed
   absolute historical path, or disagrees with its embedded id/status;
 - a scope-migration proof references a missing migration record or attachment,
@@ -378,8 +400,9 @@ Tests cover every accepted and rejected character class, bounded mint retry,
 serde rejection bypass attempts, deterministic ordering, every uniqueness
 rule, dangling references, scope disagreement, monorepo attachment uniqueness,
 detached capability refusal, local-project history authority isolation,
-promotion-compatible namespace preservation, legacy fixture decoding, and
-compatibility joins.
+promotion-compatible namespace preservation, typed history-generation id
+separation, `NotBuilt`/`Ready` round trips and malformed-ready refusal, legacy
+fixture decoding, and compatibility joins.
 
 Run:
 
@@ -630,6 +653,139 @@ of the complete participant registry and is the only public entry point that
 may execute or verify a migration transaction. P1-D must not expose individual
 participant internals or reconstruct the registry in the CLI.
 
+The public executable surface is
+`project_catalog_migration::ProjectCatalogMigrationFacadeV1` with exactly
+three operations:
+
+```text
+preflight(ProjectCatalogMigrationPreflightRequestV1)
+    -> ProjectCatalogMigrationPreflightResultV1
+apply_rehearsal(ProjectCatalogMigrationApplyRequestV1)
+    -> ProjectCatalogMigrationApplyResultV1
+verify(ProjectCatalogMigrationVerifyRequestV1)
+    -> ProjectCatalogMigrationVerifyResultV1
+```
+
+Requests carry non-serializable, already-resolved typed layouts plus explicit
+report, resolution, and optional sensitive-report artifact paths. They never
+carry caller-decoded reports, caller-built observation rows, participant
+drafts, or a boolean claiming that a path is safe. The facade itself:
+
+- opens every owner store and captures every owner lane;
+- decodes, validates, and writes the bounded persisted artifacts;
+- constructs deterministic report and post-image inputs;
+- owns the complete `MigrationParticipantRegistry`;
+- is the only caller of `validate_migration_plan`, `transact_migration`, and
+  `ProjectCatalogStore::open_existing_after_migration`; and
+- returns path-redacted receipts while retaining any compatibility paths only
+  in a non-serializable host-local projection.
+
+The lower inventory capture facade becomes crate-private. Inventory runtime
+bindings, owner snapshots, participant roles and drafts, the registry,
+validated plans, and migration-aware store open remain crate-private. A
+consumer outside `bbox-indexing` can complete preflight, rehearsal apply, and
+fresh verification without importing any of them.
+
+The one public `ProjectCatalogMigrationError` preserves stable underlying
+inventory, adapter, store, and lock error codes where they are already
+specific. Facade-only codes cover unsafe or overlapping layout, bounded
+artifact I/O, noncanonical or stale artifact identity, missing owner adapter,
+compatibility join failure, and installed-state mismatch. Its public message is
+control-free, bounded to 512 bytes, and contains no source path or private row
+value. Apply errors also carry one typed mutation disposition:
+`NoDurableMutation`, `RecoveredToOldState`, `RecoveredToCommittedState`, or
+`RetryExactPlanRequired`. The CLI never classifies errors by matching strings.
+
+`Clean`, `ResolutionRequired`, and `Refused` are successful preflight domain
+results. The result states the status and bounded counts; P1-D maps those typed
+statuses to its documented exit policy. Apply accepts only `Clean`.
+
+### 6.1.1 Resolved source and rehearsal layouts
+
+`ProjectCatalogMigrationResolvedLayoutV1` is an opaque, validated,
+non-serializable path bundle. Its constructors are:
+
+```text
+from_config(config, { projects_path?, state_dir? })
+from_rehearsal_root(root, config)
+```
+
+The bundle contains the exact projects path, code-source root,
+publisher-reference source, index and vector roots, edge manifests, Git and
+checkout inputs, knowledge/gap/coordination stores, artifact and provenance
+roots, accepted-publication paths, every transaction/backup/stage/marker/GC
+root, and the exact configured `StoreLimits`. The shared
+config-to-`StoreLimits` conversion lives in `bbox-indexing` and is used by both
+daemon startup and this facade; neither side carries a private duplicate.
+Any current owner location that is still derived privately at open time
+(including vectors, edge manifests, Git metadata, and the provenance-notes
+ref) becomes an explicit resolved config/layout field first. Migration never
+calls `dirs::*`, guesses a ref, or opens a create-on-read default to discover
+an owner.
+
+An explicit `--state-dir` re-roots the complete conventional source bundle,
+including publisher refs at `<state-dir>/bro/publisher-refs.json`. An explicit
+`--projects-path` overrides only the projects member and wins when both are
+present. With neither override, every resolved config path is retained,
+including publisher refs under the configured `bro_home`. P1-D only chooses
+one constructor; it never derives individual participant paths.
+
+`from_rehearsal_root` derives one fixed relative layout under the supplied
+root: state-owned stores live under `state/`, publisher refs under
+`state/bro/`, and checkout replicas under `checkouts/`. Paths already derived
+from the projects path, including attachments, accepted publications,
+journal, stage, backups, marker, and locks, retain their code-owned sibling
+layout below `state/`. The exact relative path table is one code-owned constant
+tested against daemon path resolution; it is not repeated in the CLI.
+
+The facade never copies configured live state. A rehearsal root is an
+operator- or test-prepared isolated v1 bundle, and preflight must be rerun
+against that copy before apply. A report captured from configured live paths
+is diagnostic only during Phase 1 and cannot authorize an isolated apply.
+Apply receives both the isolated layout and the protected configured layout.
+It canonicalizes every existing parent, opens sources and artifacts no-follow,
+rejects symlinks and non-regular files, and proves that every mutable source,
+participant, checkout root, immutable asset, backup, stage, marker, lock, and
+GC root is contained by the rehearsal root and disjoint from every protected
+live path and source authority. Canonical ancestor, descendant, inode-alias,
+and symlink-alias overlap all refuse. The same planner, registry builder,
+transaction owner, recovery, and verifier run in rehearsal and Phase 6; only
+the validated layout differs.
+
+### 6.1.2 Facade artifacts and result algebra
+
+Preflight always receives an explicit resolution path. If that path is absent,
+the facade atomically creates the canonical
+`ProjectCatalogMigrationResolutionV1::empty(inventory_hash)` after inventory
+capture. If it exists, the facade bounded-no-follow reads and strictly decodes
+it. A present zero-byte file is invalid. This gives conflict-free migrations a
+real persisted resolution artifact without asking P1-D to synthesize one.
+After an operator edits a resolution, preflight is rerun and writes a new
+report bound to those exact resolution bytes.
+
+The report records the resolution artifact SHA-256. Preflight atomically writes
+the report itself through a descriptor-bound no-follow parent, owner-only temp
+file, file fsync, rename, and directory fsync. Apply bounded-no-follow reads the
+report and mandatory resolution itself. It validates decoded semantics and
+also binds the exact report and resolution byte hashes into the transaction
+journal, migration marker, apply receipt, and verification receipt. It never
+reruns preflight, remints an identity, normalizes an artifact behind the
+operator's back, or substitutes regenerated bytes. Reapplying a completed plan
+requires the same exact artifact hashes.
+
+The serializable redacted receipts include version, domain status or outcome,
+transaction id, inventory and plan hashes, exact report and resolution hashes,
+expected and observed catalog/attachment/participant/immutable-asset hashes,
+epoch, bounded role counts, backup hashes, checkout-action count, publisher
+pin count, quarantine-root count, attached-project count, and omitted-catalog
+count. Apply outcome is `Applied` or `AlreadyApplied`.
+
+`ProjectCatalogMigrationVerifyResultV1` itself is not serializable. It exposes
+the serializable redacted `MigrationVerificationReceiptV1` used by P1-D and a
+separate host-local compatibility projection used by tests. The compatibility
+projection contains paths and therefore can neither enter the CLI envelope nor
+be written by the default report path.
+
 ### 6.2 Stable v1 inventory
 
 Preflight acquires the shared lifetime lock and `projects.json.lock` while
@@ -648,6 +804,9 @@ their role locks. It then builds one canonical
   ref, candidate attachment ids, resolved commit, resolved scope, and
   observation ids;
 - project ids and project-scoped refs found in Tantivy and vector metadata;
+- every materialized commit namespace with a complete streamed commit-document
+  count and canonical ordered commitment, plus the matching vector-key count
+  and commitment, without embedding document bodies in inventory/report;
 - edge workspace manifests and active selectors;
 - Git metadata, every materialized commit namespace, and every legacy
   per-project `last_ingested_sha` cursor;
@@ -664,6 +823,64 @@ Inventory adapters return typed observations. They do not mutate stores,
 refresh indexes, infer authority from origin URLs, or dump private content into
 the report. Reports use generic record ids, hashes, counts, and bounded
 diagnostics. Public fixtures use only neutral synthetic names.
+
+The facade, not its caller, opens and snapshots the required owners. The ten
+`ImmutableInventoryLaneKindV1` lanes are a closed completeness set:
+
+- Tantivy and vector owners enumerate every durable project-scoped entity ref;
+- the edge-manifest owner supplies workspaces and active selectors;
+- checkout/Git adapters supply canonical checkout identity, exact Git common
+  directory and first-commit evidence, materialized namespaces, resolved refs,
+  and legacy cursors;
+- the legacy project owner and checkout evidence produce attachment candidates
+  and already-materialized aliases;
+- artifact and provenance owners enumerate exact project-scoped targets;
+- the coordination-store owners enumerated by the closed
+  `LegacyPathStoreKindV1` set enumerate every durable legacy path selector; and
+- repository grouping and legacy namespace clusters are derived only from the
+  preceding exact owner evidence.
+
+`LegacyPathStoreKindV1` names actual owning surfaces, not entry subtypes:
+
+```text
+Knowledge | Gap | Thread | Note | Pin | Roadmap | Packet | Task | Proposal
+| SlackBinding | Whiteboard | Artifact | Provenance | TranscriptEdge
+```
+
+Decision and memory are knowledge entry kinds and remain visible in the stable
+row id/evidence, not fictional physical stores. There is no `Goal` owner. A new
+owner surface cannot be silently folded into an existing kind; adding one
+requires a versioned inventory change and parity update.
+
+Every owner adapter captures under that owner's read/role lock, returns a
+bounded immutable snapshot with source fingerprint and row-set commitment, and
+releases the lock before cross-owner planning. Composite lanes additionally
+contain a canonical nonempty `OwnerSubsourceEvidenceV1` list with owner kind,
+stable source id, typed present/missing/corrupt state, byte/count bounds,
+content fingerprint, and row-set commitment for every constituent store. The
+lane aggregate is derived from that exact list. One aggregate lane hash can
+never stand in for proof that each owner was visited.
+
+Missing or corrupt owners return typed subsource/lane evidence and make the
+report `Refused`; they never collapse into an empty complete lane. Apply
+recaptures all lanes through the same owner APIs and requires the same
+subsource list, fingerprints, and row commitments before plan validation.
+Where an owner crate lacks a read-only, no-create strict snapshot API, P1-C
+adds it to that owner; neither the facade nor P1-D parses the owner's private
+files ad hoc. Root-only wire schemas move to a dependency-safe leaf before the
+adapter is added. The hard-coded `owner_lane_unsupported` placeholder is a
+fail-closed staging state, not an acceptable P1-C result.
+
+The Tantivy/vector owner snapshots also produce
+`LegacyCommitNamespaceInventoryV1` for every exact commit namespace. Each row
+binds source schema/fingerprint, complete commit-document count and canonical
+ordered row commitment, vector-key count and commitment, and the later proved,
+ambiguous, or unclaimed attribution. The marker and verification receipt
+retain these commitments as Phase 3 readiness evidence. Phase 1 does not copy
+commit-document bodies, create `RepoHistoryGeneration`, or add history assets
+to the migration participant registry. Phase 3's reviewed pre-replacement
+materializer is the sole owner of those immutable generations and must
+reproduce the Phase 1 commitments before replacing an index.
 
 Literal legacy selectors are migration inputs, not canonical inventory or
 default report fields.
@@ -713,6 +930,7 @@ predicted post-image:
 
 - one migration transaction id;
 - one repository-history id for each surviving history group;
+- one attachment id for each retained attachment candidate;
 - one legacy-path binding id for each retained ledger row;
 - one local commit namespace for each history group that requires local
   authority and has no inventoried materialized namespace; and
@@ -722,11 +940,13 @@ predicted post-image:
 The catalog post-image uses the exact transaction id in
 `CatalogOriginV2::MigratedV1`. Reported repository-history groups carry their
 planned history id, primary namespace, and compatibility namespaces. Reported
-legacy-path binding rows carry their planned binding id. Apply never remints or
-substitutes any of these values. A `LegacyLocal` project with no inventoried
-history evidence receives no repository-history record; when such evidence
-requires a local-authority history and supplies no materialized namespace,
-preflight uses the persisted planned local namespace.
+attachment rows carry their planned attachment id. Reported legacy-path
+binding rows carry their planned binding id. Apply never remints or substitutes
+any of these values. The adapter cannot derive an opaque attachment id from a
+path, digest, observation order, or checkout id. A `LegacyLocal` project with
+no inventoried history evidence receives no repository-history record; when
+such evidence requires a local-authority history and supplies no materialized
+namespace, preflight uses the persisted planned local namespace.
 
 Migrated `CorpusProject.created_at` and every corresponding
 `CheckoutAttachment.attached_at` preserve that legacy project's exact
@@ -765,6 +985,7 @@ version
 transaction_id
 inventory_hash
 plan_hash
+resolution_artifact_hash
 source_store_hash
 publisher_ref_source_hash
 generated_at
@@ -796,10 +1017,21 @@ resolution shape. `refused` means the inventory is corrupt, incomplete, or
 contains a conflict no resolution schema may override.
 
 Preflight writes no project, checkout marker, attachment, activation, index,
-vector, edge, knowledge, gap, or coordination state. Writing an explicit report
-path is the only mutation and uses no-follow atomic replacement. Apply always
-requires that exact persisted report, even for an empty or conflict-free
-inventory.
+vector, edge, knowledge, gap, or coordination state. Writing the explicit
+report and, only when absent, the explicit resolution path are its only default
+mutations and use no-follow atomic replacement. Apply always requires those
+exact persisted artifact bytes, even for an empty or conflict-free inventory.
+
+An explicitly requested sensitive review artifact is a separate third
+possible preflight write. Its typed path must differ from report, resolution,
+source, and every owner path. It contains
+`local_paths_included: true`, a fixed warning, digest-paired legacy selector
+rows, and digest-paired attachment/checkout rows. It is built only from the
+opaque runtime bindings after complete one-to-one validation, created below a
+no-follow owner-only directory, and atomically replaced at mode `0600`.
+Preflight returns only its hash and row counts. No serializable default result,
+canonical inventory, public fixture, or committed artifact contains its path
+or literals.
 
 ### 6.5 Resolution file
 
@@ -816,6 +1048,21 @@ quarantine_collected
 publisher_binding_dispositions
 operator_notes
 ```
+
+Preflight and apply both receive the resolution artifact path. On the first
+preflight only, absence means "create and use the canonical empty resolution
+for this freshly captured inventory"; it never means "no resolution artifact".
+Once present, the file must be a nonempty strict v1 document. Apply refuses a
+missing or zero-byte file and never synthesizes an empty resolution.
+
+A resolution whose inventory hash is stale is never rewritten or
+automatically carried forward. The operator retains or moves that local
+artifact for comparison, selects a new absent resolution path, reruns
+preflight to create the canonical empty document for the new inventory, and
+re-enters only dispositions that the new report still names with the same
+typed candidates. Preflight emits bounded old/new inventory hashes and stable
+resolution ids to support that review, but no disposition crosses inventories
+without explicit operator authorship.
 
 Unknown resolution keys, unknown record ids, stale inventory hashes, duplicate
 dispositions, incomplete dispositions, and attempts to remint/reassign a
@@ -1022,11 +1269,14 @@ The engine:
     marker, before committing the journal; and
 12. reopens and validates every v2 participant and pinned asset before success.
 
-The marker contains the transaction id, plan hash, source and inventory hashes,
-all participant post-image hashes, G1 asset hashes, quarantine pins, epoch, and
-retained backup hashes. The engine is idempotent for the same completed marker
-and plan. Different source bytes, planned checkout id, resolution, or predicted
-hashes refuse. Pair-installed but marker-absent state recovers only through its
+The marker contains the transaction id, plan hash, exact report and resolution
+artifact hashes, source and inventory hashes, all participant post-image
+hashes, G1 asset hashes, collision quarantine pins, complete legacy
+commit-namespace document/vector commitments for the later history
+materializer, epoch, and retained backup hashes. The engine is idempotent only
+for the same completed marker, plan, and exact artifacts. Different source
+bytes, report bytes, resolution bytes, planned checkout id, or predicted hashes
+refuse. Pair-installed but marker-absent state recovers only through its
 prepared journal; without one it fails
 `error.project_catalog_migration_incomplete`.
 
@@ -1037,17 +1287,68 @@ Phase 6 later activates for the configured path. Rehearsal redirects every
 participant, legacy source, checkout fixture, and GC root to isolated copies;
 it changes destination, not transaction semantics.
 
+Facade verification is a fresh reopen, never an inspection of the in-memory
+apply result. `verify` derives the fixed layout from the rehearsal root,
+bounded-no-follow reads only enough journal and attachment evidence to recover
+the observation-id-to-checkout-root registry, requires a unique root-contained
+mapping, rebuilds the complete registry, and then invokes migration-aware
+strict open. Provisional bytes grant no authority: success requires the
+subsequent marker, journal, pair, participant, asset, and source verification
+to authenticate them exactly.
+
+The verifier checks:
+
+- the strict catalog and attachment pair and epoch;
+- a committed terminal journal and matching migration marker;
+- transaction, plan, inventory, report, and resolution identities;
+- every expected and observed mutable participant hash;
+- every immutable G1 asset and accepted-publication pointer;
+- publisher backups and retained rollback backup hashes;
+- checkout markers and their exact planned ids;
+- effective source manifest, scope-bearing activation and retained metadata,
+  collision retirement state, and every pending GC root; and
+- predicted versus installed catalog, attachment, participant, and asset
+  hashes.
+
+Its receipt distinguishes `Committed` from `AlreadyApplied`. Any ambiguous
+journal-to-checkout correlation, missing registry role, incomplete recovery
+set, or installed mismatch fails closed; P1-D never reopens internals to
+manufacture a verification result.
+
 ### 6.8 Migration tests
 
 Fixture and property tests cover:
 
 - empty v1 store;
+- an external-consumer integration test completing preflight, rehearsal apply,
+  idempotent reapply, and fresh verify through only the three public facade
+  operations;
+- all ten owner lanes as complete, missing, corrupt, reordered, and changed
+  snapshots, proving the staging `owner_lane_unsupported` path is gone;
+- every composite lane with one omitted, duplicated, changed, missing, or
+  corrupt owner subsource, proving an aggregate lane hash cannot launder
+  incomplete capture;
+- complete per-namespace commit-document and vector-key commitments for
+  proved, ambiguous, and unclaimed legacy namespaces, including refusal on a
+  changed/omitted row and proof that Phase 1 created no history-generation
+  asset;
+- exact report/resolution byte binding, noncanonical or zero-byte artifact
+  refusal, no-follow atomic writes, and same-plan/different-bytes refusal;
+- every rehearsal/live canonical ancestor, descendant, inode-alias, and
+  symlink-alias overlap, plus proof that facade rehearsal never copies state;
 - separately invoked preflight and apply reproducing identical post-image
   hashes for repository-history records, legacy-path binding rows, and a
   `LegacyLocal` project whose inventoried history requires a planned local
   namespace;
 - Git, non-Git, monorepo, shallow, missing, and moved projects;
 - duplicate ids, scopes, aliases, and weak namespaces;
+- planned random attachment ids reproduced across separate preflight/apply,
+  plus refusal of path-derived, order-derived, reminted, or missing ids;
+- cross-project duplicate active `(checkout_id, project_root_relpath)`
+  candidates represented as attachment conflicts and excluded before install;
+- well-formed legacy aliases preserved exactly and invalid length,
+  whitespace, separator, percent, or control-character aliases hard-refused
+  with only a digest in the default report;
 - same-repo and false-same-repo evidence;
 - active and retained collected generations;
 - complete generation history beyond reduced row and aggregate-byte limits,
@@ -1105,25 +1406,41 @@ Fixture and property tests cover:
 - complete mapped/unscoped classification from typed literal observations
   without a second live-store read.
 
+Compatibility fixtures obtain their path-bearing rows only from the facade's
+host-local verification projection. For every attached migrated v1 project
+they compare exact project id, canonical path, Git/non-Git classification,
+languages, accepted aliases, and registration timestamp through the existing
+cross-validated `ProjectRecord::from_catalog_attachment` join. Exactly one
+attached base row is allowed per migrated legacy project. Zero attached rows
+means remote/missing and increments the explicit omitted-catalog count; more
+than one refuses. Nominated aliases never resolve. The serializable receipt is
+scanned to prove none of these paths escaped.
+
 The final report test scans all string fields for known fixture tokens that
 represent credentials or private identifiers and fails if any leak.
 
 ### 6.9 P1-C gate
 
 - run targeted migration and transaction nextest suites;
-- run `blackbox project-catalog migrate --preflight --report <path>` on a
-  neutral v1 fixture containing a markerless checkout, a publisher pin, and a
-  collected collision;
-- run `--apply --report <path>` into an isolated rehearsal root;
+- from an integration test compiled as an external `bbox-indexing` consumer,
+  run facade preflight on an operator-prepared neutral v1 rehearsal fixture
+  containing a markerless checkout, a publisher pin, and a collected
+  collision;
+- run facade rehearsal apply with the exact report/resolution artifacts, then
+  run a separately opened facade verify;
 - verify predicted and installed hashes match;
 - verify the exact planned checkout marker, G1 pointer, effective manifest,
   scope-bearing activation/retained metadata, retirement record, and marker
   hashes;
-- rerun apply and prove idempotence;
-- prove apply refuses the configured live path;
+- rerun facade apply and prove `AlreadyApplied` with exact artifact identity;
+- prove every configured-live overlap refuses and the live bundle is
+  byte-unchanged;
 - run the stable-signed bridge bootsmoke against fresh v1 state;
 - confirm the live bridge state is unchanged by rehearsal; and
 - commit and push P1-C, then cluster-verify that exact pushed ref.
+
+The `blackbox` executable does not exist until P1-D. P1-C never claims a CLI
+gate; P1-D repeats this exact facade rehearsal through the thin executable.
 
 ## 7. Milestone P1-D: offline CLI, compatibility proof, and later-phase handoff
 
@@ -1135,28 +1452,42 @@ entry. Use the root package's existing `clap` dependency.
 Commands:
 
 ```text
-blackbox project-catalog migrate --preflight --report <path>
-blackbox project-catalog migrate --apply --report <path> --rehearsal-root <path>
+blackbox project-catalog migrate --preflight --report <path> --resolution <path>
+blackbox project-catalog migrate --apply --report <path> --resolution <path> --rehearsal-root <path>
 blackbox project-catalog verify --root <path>
 ```
 
 Common options include explicit projects path, state dir, report, and
-resolution. Both preflight and apply accept `--resolution`; preflight binds it
-into the report, and apply requires the exact report/resolution pair and refuses
-unless the report is clean. Preflight alone accepts the sensitive opt-in
-`--include-local-paths` flag. Defaults use the same config loader as the daemon,
-but help and version remain side-effect-free.
-`--preflight` is read-only except for an explicit report. `--apply` refuses
-without an exclusive lifetime lock and an isolated rehearsal root in Phase 1.
-The exact `blackbox` name is final: the package and library already own it,
-while `blackboxd` remains daemon-only.
+resolution. Both preflight and apply require `--resolution`; first preflight
+may create the canonical empty artifact at that explicit path, while apply
+requires the existing exact report/resolution pair and refuses unless the
+report is clean. Preflight alone accepts
+`--include-local-paths <sensitive-report-path>`. Defaults use the same config
+loader as the daemon, but help and version remain side-effect-free.
+`--preflight` is read-only except for the explicit report, first-use
+resolution, and optional sensitive report. `--apply` refuses without an
+exclusive lifetime lock and an isolated rehearsal root in Phase 1. The exact
+`blackbox` name is final: the package and library already own it, while
+`blackboxd` remains daemon-only.
 
 `--root` and `--rehearsal-root` both name the rehearsal state root, never a
 `projects.json` file. The facade derives participant paths from that root.
-Explicit `--projects-path` wins over `--state-dir`; otherwise an explicit
-`--state-dir` derives the projects path; otherwise both come from the shared
-config loader. The CLI reports the resolved source and destination roles
-without echoing private local paths in default JSON.
+An explicit `--state-dir` re-roots the complete conventional bundle; an
+explicit `--projects-path` then overrides its projects member and therefore
+wins when both are present. With no state override, non-project members remain
+the exact shared-config paths. The CLI reports the resolved source and
+destination roles without echoing private local paths in default JSON.
+
+After parsing, the executable performs only:
+
+```text
+shared config load -> one typed layout constructor -> one facade operation
+    -> redacted receipt envelope
+```
+
+It never opens an owner store, decodes a report or resolution, constructs an
+observation or participant, maps a checkout action, computes a post-image, or
+reopens migration state.
 
 Update the binary inventory, getting-started and operations documentation,
 release packaging, and Nix app definitions so the CLI is installed
@@ -1173,8 +1504,10 @@ configuration or stores.
 
 ### 7.2 Compatibility proof
 
-Build a test-only joined compatibility registry from migrated catalog and
-attachments. Compare it with the v1 registry for every fixture:
+Use the facade verification result's non-serializable host-local compatibility
+projection. It is built from a fully cross-validated migrated catalog and
+attachment pair through `ProjectRecord::from_catalog_attachment`; P1-D does not
+join the stores itself. Compare it with the v1 registry for every fixture:
 
 - same attached project ids;
 - same canonical paths;
@@ -1187,7 +1520,8 @@ attachments. Compare it with the v1 registry for every fixture:
 
 This is the contract Phase 2 must use when it replaces `ProjectRegistry` in the
 isolated v2 runtime path. It is not wired into configured daemon state during
-Phase 1.
+Phase 1. The serializable verification receipt exposes only attached and
+omitted counts, never compatibility paths.
 
 ### 7.3 Later-phase readiness artifact
 

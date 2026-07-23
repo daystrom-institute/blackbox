@@ -173,6 +173,8 @@ RecordedRepoAuthority(String)
 RepoBootstrapHint(String)
 CommitNamespace(String)
 RepoHistoryId(String)
+RepoHistoryGenerationId(String)
+RepoHistoryQuarantineGenerationId(String)
 ScopeMigrationId(String)
 
 CorpusProject {
@@ -194,6 +196,9 @@ RepoHistoryRecord {
     authority: RepoHistoryAuthority,
     primary_namespace: CommitNamespace,
     compatibility_namespaces: Vec<CommitNamespace>,
+    materialization:
+        NotBuilt
+      | Ready { generation_id: RepoHistoryGenerationId },
 }
 
 RepoHistoryAuthority =
@@ -205,6 +210,9 @@ AmbiguousNamespaceRecord {
     namespace: CommitNamespace,
     candidate_repo_history_ids: Vec<RepoHistoryId>,
     status: Quarantined,
+    materialization:
+        NotBuilt
+      | Ready { generation_id: RepoHistoryQuarantineGenerationId },
 }
 
 CatalogOriginV2 =
@@ -231,6 +239,16 @@ migration marker with the same transaction id. The complete plan hash remains
 in the marker and journal, avoiding a hash cycle through the catalog
 post-image. Marker loss is therefore distinguishable from a store that was
 born at v2.
+
+Phase 1 migration writes history and ambiguous-namespace materialization as
+typed `NotBuilt`; it does not read commit-document bodies or create history
+generations. Phase 3's pre-replacement materializer is the sole owner that
+creates immutable history/quarantine generations and advances those catalog
+fields to `Ready` through the regular catalog transaction. A fresh v2 history
+may remain `NotBuilt` until its first successful build. At the Phase 6 cut,
+however, startup refuses when the migration inventory proved materialized
+legacy commit documents for a catalog or ambiguous namespace whose field is
+still `NotBuilt` or whose named generation fails strict verification.
 
 `ProjectId::parse` accepts the already-persisted legacy ids plus new ids under
 one bounded, path-safe contract: 1 through 96 ASCII alphanumeric, `_`, `-`, or
@@ -300,8 +318,15 @@ ownership without changing the old entity ref, then retires the quarantine only
 after coverage is complete. Until that proof, ambiguity remains fail-closed.
 
 The catalog enforces uniqueness of `ProjectId`, `PublishedScope`, and accepted
-operator alias. A `LegacyLocal` record has no wire identity and cannot be used
-for a producer grant or remote publisher.
+operator alias. Accepted and nominated aliases are 1 through 96 UTF-8 bytes,
+trim-equal, not `.` or `..`, contain no whitespace, control character, `/`,
+`\`, or `%`, and cannot collide with an exact catalog id. Migration accepts
+every well-formed materialized v1 alias as an operator alias. An invalid
+legacy alias hard-refuses preflight with its project id, a redacted alias
+digest, and the exact bridge-compatible remove-or-rename instruction; neither
+resolution nor migration silently drops, rewrites, or accepts unsafe selector
+authority. A `LegacyLocal` record has no wire identity and cannot be used for
+a producer grant or remote publisher.
 
 ### 5.2 Authoritative host-local attachments
 
@@ -338,9 +363,15 @@ AttachmentSnapshotV1 {
 
 One checkout may carry multiple monorepo attachments. The key is
 `attachment_id`; active uniqueness is `(project_id, checkout_id,
-project_root_relpath)`. Paths are canonicalized and are host-local routing
-data, never serialized into catalog records, code documents, entity refs,
-collector descriptors, or durable response stamps.
+project_root_relpath)`. In addition, no two active attachments for different
+projects may share the same `(checkout_id, project_root_relpath)`: that would
+make the exact/deepest path resolver permanently equal-depth ambiguous. Attach
+and register refuse the shape. Migration represents the duplicate as an
+attachment conflict and requires exclusion of every losing candidate; it does
+not install an "accepted ambiguity." Distinct monorepo projects remain valid
+because their root-relative paths differ. Paths are canonicalized and are
+host-local routing data, never serialized into catalog records, code
+documents, entity refs, collector descriptors, or durable response stamps.
 
 Capabilities include local code source, Git history, blame, repo knowledge,
 repo mutation, render output, provenance note I/O, and artifact watching. A
@@ -477,9 +508,17 @@ Version-1 import is an explicit offline operation, not a side effect of first
 v2 daemon startup. Add these non-daemon command modes:
 
 ```text
-blackbox project-catalog migrate --preflight [--report <path>]
-blackbox project-catalog migrate --apply [--resolution <path>]
+blackbox project-catalog migrate --preflight --report <path> --resolution <path>
+blackbox project-catalog migrate --apply --report <path> --resolution <path> --rehearsal-root <path>
+blackbox project-catalog verify --root <path>
 ```
+
+The executable is a thin caller of the one public `bbox-indexing` migration
+facade specified by the active phase implementation document. That facade owns
+owner-lane capture, deterministic planning, exact artifact decoding, complete
+participant-registry construction, transaction apply, fresh verification, and
+the host-local compatibility projection. No CLI or later consumer may
+reconstruct those internals.
 
 Preflight takes a shared/read lock, reads live v1 state, writes no project
 state, and emits a complete machine-readable report plus its v1 inventory hash.
@@ -489,11 +528,17 @@ Phase 0 first ships a v1-store-compatible daemon that holds a shared
 `project-catalog-migration.lock` for its entire process lifetime. All project
 store writers in that bridge release honor the same lock. Apply requires the
 exclusive lifetime lock, so runbook ordering is enforced rather than trusted;
-it cannot race any compatible daemon write. It also requires the same
-inventory hash, reruns preflight after acquiring exclusivity, performs the
-journaled transaction, and emits the resulting catalog epoch. The final v2
-daemon holds the lifetime lock too. A v2 daemon that sees v1 bytes fails closed
-with the exact preflight/apply command; it never attempts an implicit import.
+it cannot race any compatible daemon write. After acquiring exclusivity it
+recaptures the typed inventory and host-local runtime bindings through the
+same owner locks, then requires the same inventory hash, plan hash, report
+artifact hash, and resolution artifact hash as the persisted clean preflight.
+It never reruns preflight, remints a planned identity, or substitutes a newly
+generated artifact. A staleness refusal sends the operator back to an explicit
+preflight invocation; only that invocation may create a new plan. Apply then
+performs the journaled transaction and emits the resulting catalog epoch. The
+final v2 daemon holds the lifetime lock too. A v2 daemon that sees v1 bytes
+fails closed with the exact preflight/apply command; it never attempts an
+implicit import.
 
 Before import, take a read-only inventory of:
 
@@ -503,6 +548,9 @@ Before import, take a read-only inventory of:
 - every `PublisherRefStore` pin, its exact source bytes, full ref, current
   unique publisher candidates, resolved commit, and scope proof;
 - Tantivy/vector project ids and entity refs;
+- every materialized commit namespace with its complete commit-document count
+  and canonical ordered commitment plus the matching vector-key count and
+  commitment, without embedding document bodies;
 - edge manifests and workspace selectors;
 - Git metadata and legacy commit namespaces;
 - artifacts and provenance targets;
@@ -579,15 +627,18 @@ The importer refuses the whole cutover when it finds:
 - an attachment whose validated scope belongs to another catalog project; or
 - a malformed id or commit namespace that cannot round-trip safely.
 
-It does not merge or pick a winner. The optional resolution file is a
-versioned, operator-authored mapping bound to the preflight inventory hash. For
+It does not merge or pick a winner. The required resolution artifact is a
+versioned, operator-authored mapping bound to the preflight inventory hash.
+First preflight may atomically create the canonical empty artifact at the
+explicit resolution path; apply never synthesizes or substitutes it. For
 duplicate scope claims it selects the one old id that owns the published scope;
 the other ids remain `LegacyLocal` with all their state and an explicit
 collision diagnostic. It does not rewrite or redirect their entity refs. For
 an id/path collision it may exclude the conflicting attachment, but may not
 remint or reassign the preserved id. Unresolvable conflicts keep apply blocked.
 The operator reruns preflight with the mapping and must obtain a clean report
-before apply.
+before apply. Exact report and resolution byte hashes enter the journal,
+marker, apply receipt, and fresh verification receipt.
 
 A losing duplicate-scope id with active or retained collected state requires an
 explicit `quarantine_collected` disposition in the resolution file. For an
@@ -689,16 +740,20 @@ retained until the catalog, attachments, index materialization,
 accepted-publication state, and durable-store backfills have passed the final
 parity and rollback closeout gate. The migration marker is a staged mutable
 participant, not an after-commit receipt. It names the transaction id and plan
-hash, complete inventory, every mutable post-image, every immutable G1 and
-quarantine asset, retained backups, and schema epoch. Startup runs migration
-recovery before opening any participant. A v2 catalog with neither a valid
-marker nor a recoverable prepared journal fails with
+hash, exact report and resolution artifact hashes, complete inventory, every
+mutable post-image, every immutable G1 and quarantine asset, retained backups,
+and schema epoch. Startup runs migration recovery before opening any
+participant. A v2 catalog with neither a valid marker nor a recoverable
+prepared journal fails with
 `error.project_catalog_migration_incomplete`; it never infers completion from
 valid catalog bytes alone. External storage GC excludes all prepared-journal,
 marker, stage, backup, G1, and quarantine roots.
 
 Phase 1 through Phase 5 run this exact protocol only against isolated copied
-state. The supported live rollout occurs in Phase 6: deploy the v1-compatible
+state. The facade does not copy live state: an operator or hermetic test
+prepares the isolated v1 bundle, then reruns preflight against that bundle so
+path digests and post-images bind the destination it will mutate. The supported
+live rollout occurs in Phase 6: deploy the v1-compatible
 bridge under the normal shared-service approval process, run preflight, resolve
 every refusal, stop that daemon, run apply while holding the exclusive lifetime
 lock, then start the complete v2 runtime. Tests cover a live bridge preventing
@@ -930,8 +985,11 @@ new catalog list/get response is the canonical complete inventory.
 Before attachment relocation stops rewriting state, inventory every store that
 currently treats a canonical path as logical project identity. Add a stable
 `project_id` field and dual-read old rows for a bounded schema epoch. The
-logical backfill includes knowledge, gaps, threads, notes, pins, roadmap,
-packets, Slack bindings, project-scoped artifacts, proposals, and whiteboards.
+logical backfill covers exactly the versioned `LegacyPathStoreKindV1` owner set
+defined by the active phase plan: knowledge, gaps, threads, notes, pins,
+roadmap, packets, tasks, proposals, Slack bindings, whiteboards, artifacts,
+provenance, and transcript edges. Decision and memory remain knowledge entry
+kinds; no Goal store exists.
 
 Do not blanket-convert execution targets. Team `project_dir`, poller and cron
 working directories, workflow ambient cwd, render output locations, and
@@ -1156,10 +1214,31 @@ project it chooses the persisted effective source:
 - `unavailable`: preserve the last-good committed view or omit a project with
   an explicit health state, never purge it as an empty local root.
 
-Full rebuild inventories every active collected generation before replacing
-the index. A missing or quarantined blob aborts the replacement and preserves
-the complete last-good index. Incremental purge keys by project id, source
-kind, generation, and relative document identity, not canonical path.
+Before replacing the index, full rebuild inventories both code and history
+sources:
+
+- every active collected code generation;
+- every `RepoHistoryGeneration` referenced by a catalog history record, active
+  or retained overlay, or pinned read view; and
+- every `RepoHistoryQuarantineGeneration` that owns an ambiguous or otherwise
+  unclaimed materialized commit namespace.
+
+The rebuild rematerializes commit documents and their vector inputs from those
+immutable history generations; it never assumes that a checkout can reingest
+them. It verifies each generation's complete document count, canonical
+document-set commitment, content hashes, and namespace ownership before the
+destructive replacement boundary. A missing/corrupt code or history source,
+an incomplete quarantine inventory, or an unowned materialized namespace
+aborts the replacement and preserves the complete last-good lexical and vector
+views. Derived commit vectors may be recomputed from the authenticated
+generation content, but the rebuild cannot commit a lexical-only history
+generation if its selected vector view was promised.
+
+Incremental purge keys code by project id, source kind, generation, and
+relative document identity, not canonical path. Commit/history purge keys by
+repo-history or quarantine generation and requires the reference/GC rule in
+section 11; one project detach or code purge never removes shared or stale
+commit history.
 
 Seed code selectors, vector selectors, edge registered-project sets, search
 filter validation, and `CodeReadView` from the catalog. A request pins one
@@ -1225,6 +1304,51 @@ Commit documents and their vectors are eligible for tombstone/GC only after no
 catalog project, active or retained overlay, pinned read view, or in-flight
 history build references the repo-history generation. Vector tombstoning is
 driven by the repo-history generation, never by one project's code selector.
+
+Phase 3's pre-replacement history materializer, reused by the Phase 6
+path-free-rebuild subcommand, is the sole creation owner for
+`RepoHistoryGeneration` and `RepoHistoryQuarantineGeneration`. Phase 1 import
+only records namespace ownership/ambiguity and the complete legacy index
+inventory needed to prove what the later materializer must find.
+
+Every history generation is a complete, self-contained snapshot, never a
+cursor delta. It stores the exact commit documents and vector inputs for its
+namespace, a canonical ordered document-set commitment and count, content
+hashes, source schema/hash evidence, and its typed owner. Generation ids are
+content-addressed SHA-256 values over a versioned domain separator, namespace,
+typed owner/disposition, and canonical generation bytes. Repeating
+materialization is therefore idempotent and cannot remint identity.
+
+Before any destructive schema replacement, the materializer inventories old
+Tantivy commit documents by exact namespace and proves that the observed
+namespace/count/commitment set equals the migration inventory. For a proved
+history owner it creates the immutable `RepoHistoryGeneration`, verifies it,
+then advances that `RepoHistoryRecord.materialization` from `NotBuilt` to
+`Ready { generation_id }` through the regular catalog transaction. For an
+ambiguous namespace it creates and verifies
+`RepoHistoryQuarantineGeneration { disposition: Ambiguous {
+candidate_repo_history_ids } }` and advances the matching
+`AmbiguousNamespaceRecord` the same way. A namespace with no proved or
+ambiguous catalog owner is never dropped: it receives
+`Unclaimed { inventory_diagnostic }` and is named in the rebuild manifest,
+without becoming ordinary catalog or query authority.
+
+`RepoHistoryRebuildManifestV1` is the durable crash/recovery and GC surface.
+Its prepared state binds the source index fingerprint and complete namespace
+inventory, catalog epoch, every owned and quarantine generation id, and the
+planned target lexical/vector generations. Its committed state additionally
+binds the verified replacement views and resulting catalog epoch. Prepared and
+committed manifests pin all named history generations; recovery resumes or
+rolls back before any v2 route binds. A namespace that cannot be attributed or
+whose complete old document set cannot be proved keeps rebuild refused and the
+last-good index intact.
+
+No ordinary query resolves an unclaimed generation, while an ambiguous query
+returns the existing typed ambiguity diagnostic. Owned, ambiguous, and
+unclaimed generations remain rebuild sources and GC roots until explicit
+namespace resolution or an operator-acknowledged history-retire action proves
+that no catalog, compatibility ref, overlay, read view, durable entity ref, or
+prepared/committed rebuild manifest needs them.
 
 Compatibility namespaces from section 5.1 remain queryable through the
 repo-history record. They are retired only by an explicit namespace migration
@@ -1404,8 +1528,8 @@ returns `provisional_overlay_unavailable`. `all` serves published plus every
 valid peer, omits unavailable peers, and lists them in structured
 `degraded.overlays`. Health reports accepted-publication integrity,
 publisher-advance availability, and per-checkout overlay-baseline availability
-separately. No live publisher blocks advance and alternate-object assistance,
-not accepted published reads.
+separately. A missing live publisher blocks advance and alternate-object
+assistance, not accepted published reads.
 
 ### 13.2 Publisher binding
 
@@ -1547,12 +1671,17 @@ state; it does not apply v2 bytes to configured operator state.
 2. Remove path and Git access from collected staging.
 3. Iterate catalog projects for full/incremental rebuild, purge, selectors,
    vectors, edge registration, and read views.
-4. Split repo-owned commit generations and project current-file edges into
-   reference-counted matching optional overlays.
+4. Before the first replacement, materialize complete immutable
+   repo-history and ambiguous/unclaimed quarantine generations from the legacy
+   index; then split repo-owned commit generations and project current-file
+   edges into reference-counted matching optional overlays.
 5. Add source URI and boundary display rendering.
 
 Exit gate: a remote-only fixture activates, rebuilds, searches, and exposes
-graph data under `DenyCheckoutAccess`; new docs contain no host path.
+graph data under `DenyCheckoutAccess`; new docs contain no host path. An
+attachment-less stale history and every ambiguous/unclaimed namespace survive
+replacement from complete immutable generations, and the committed rebuild
+manifest reproduces their exact catalog/quarantine links.
 
 ### Phase 4: catalog-based collector and state transitions
 
@@ -1589,10 +1718,17 @@ checkout open is lease-counted and remote-only projects degrade per capability.
    backfills, new-index rebuild, quarantine handling, and exact post-image
    verification against a final copied inventory.
 4. Through the shared-service approval runbook, stop the bridge and apply to
-   configured state under the exclusive lifetime lock.
+   configured state under the exclusive lifetime lock. If apply reports stale
+   inventory after the bridge stops, leave it stopped, run an explicit new
+   preflight, resolve/review the new exact artifacts, and invoke apply again;
+   apply never replans inside the exclusive mutation call.
 5. Before any v2 route binds, run the offline durable-store backfills and
    path-free index rebuild against the applied catalog, preserving active
-   collected generations, then require the complete startup validation gate.
+   collected generations and materializing the complete owned/ambiguous/
+   unclaimed history generations. Require a committed
+   `RepoHistoryRebuildManifestV1` matching the resulting catalog epoch and
+   strict verification of every named generation before the complete startup
+   validation gate passes.
 6. Start the v2 daemon and run the catalog-only, cutback, and adapter live
    checks.
 7. Retain the version-1 backup and compatibility reader until a later explicit
@@ -1601,6 +1737,14 @@ checkout open is lease-counted and remote-only projects degrade per capability.
 Exit gate: the daemon can start with an empty attachment store and serve all
 catalog-only collected code; the remaining nonzero checkout operations match
 the explicit adapter table.
+
+The Phase 6 implementation document must define the durable-backfill and
+path-free-rebuild operations as additional versioned
+`blackbox project-catalog` subcommands using the same v1 result envelope,
+exclusive-lock, exact-root, preflight/apply, and receipt conventions. They are
+not daemon flags, ad hoc scripts, MCP tools, or direct library entry points.
+That document receives its own clean plan review before either subcommand is
+implemented.
 
 ## 16. Concurrency, recovery, and security invariants
 
@@ -1643,9 +1787,11 @@ the explicit adapter table.
   verified published generation remains readable.
 - GC pins active read views, active/retained code generations, the selected Git
   overlay, in-flight rebuild inventories, prepared migration journals,
-  committed migration markers, G1 assets, quarantined generations, and
-  migration backups. General storage sweeps exclude transaction stage and
-  backup roots.
+  committed migration markers, G1 assets, collision-quarantined code
+  generations, every owned/ambiguous/unclaimed history generation named by a
+  catalog record or prepared/committed `RepoHistoryRebuildManifestV1`, and
+  migration backups. General storage sweeps exclude transaction stage,
+  history-rebuild stage, and backup roots.
 
 ## 17. Verification matrix
 
@@ -1807,6 +1953,13 @@ the explicit adapter table.
 - Divergent legacy monorepo cursor SHAs seed no consolidated cursor. One full
   reachable-history walk publishes the initial repo-history generation before
   its new cursor is recorded.
+- Full index replacement with an attachment-less project rematerializes the
+  complete stale commit-document and vector set from its authenticated
+  `RepoHistoryGeneration` without a checkout lease.
+- Ambiguous and unclaimed legacy namespaces survive replacement through
+  complete quarantine generations; a missing row, corrupt manifest, or
+  unverifiable count aborts before replacing the last-good lexical/vector
+  views.
 - Retiring one monorepo project cannot tombstone shared commit documents or
   vectors while another project/overlay/read view references the repo-history
   generation.

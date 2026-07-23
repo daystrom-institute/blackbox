@@ -374,13 +374,15 @@ until a later entry explicitly supersedes it.
 - Status: accepted after independent plan re-review
 - Decision: Preflight plans and persists every strong-random value embedded in
   a predicted migration post-image. This includes repository-history ids,
-  legacy-path binding ids, local commit namespaces required by inventoried
-  local history, checkout ids, and the migration transaction id. Apply reuses
-  the exact planned values and never remints them. A `LegacyLocal` project
-  without inventoried history evidence receives no repository-history record.
+  attachment ids, legacy-path binding ids, local commit namespaces required by
+  inventoried local history, checkout ids, and the migration transaction id.
+  Apply reuses the exact planned values and never remints them. A
+  `LegacyLocal` project without inventoried history evidence receives no
+  repository-history record.
 - Evidence:
-  - Repository-history and legacy-path maps use opaque random ids as canonical
-    keys, and a local-authority history may require a random namespace.
+  - Repository-history, attachment, and legacy-path maps use opaque random ids
+    as canonical keys, and a local-authority history may require a random
+    namespace.
   - A later apply cannot reconstruct a predicted hash if it remints any value
     contained in the hashed snapshot.
   - Deriving authority-bearing ids from paths, aliases, or weak namespaces
@@ -491,10 +493,12 @@ until a later entry explicitly supersedes it.
 - Status: accepted after independent plan re-review
 - Decision: `verify --root` and apply's `--rehearsal-root` name a rehearsal
   state root, from which the migration facade derives participant paths.
-  Explicit `--projects-path` wins over `--state-dir`; otherwise explicit
-  `--state-dir` derives the projects path, then shared configuration supplies
-  defaults. Preflight and apply both accept `--resolution`; apply consumes the
-  exact clean report/resolution pair.
+  Explicit `--state-dir` re-roots the complete conventional source bundle;
+  explicit `--projects-path` then overrides its projects member and wins when
+  both are present; otherwise shared configuration supplies every path.
+  Preflight and apply both require an explicit resolution artifact path;
+  first preflight may create the canonical empty artifact, and apply consumes
+  the exact clean report/resolution pair.
 - Evidence:
   - Treating `--root` as a file on one command and a state root on another
     would make rehearsal verification ambiguous.
@@ -583,3 +587,85 @@ until a later entry explicitly supersedes it.
 - Revisit only if: the owner store adopts an equally complete bounded
   generation-indexed lifecycle with the same immutable evidence and monotonic
   transition guarantees.
+
+## D-025: One facade owns migration authority end to end
+
+- Date: 2026-07-23
+- Phase: durable project catalog, migration facade repair
+- Status: accepted after independent plan re-review
+- Decision: `bbox-indexing` exposes exactly one executable migration facade
+  with typed preflight, rehearsal-apply, and fresh-verify operations. The
+  facade opens every inventory owner, constructs every deterministic
+  post-image and participant, owns the complete registry, invokes the
+  transaction owner, and returns a redacted receipt plus a separate
+  non-serializable compatibility projection. Inventory captures, runtime path
+  bindings, owner snapshots, participant drafts, registries, and
+  migration-aware store open remain crate-private.
+- Evidence:
+  - The implemented inventory-only facade deliberately fails while auxiliary
+    owner lanes are unconnected.
+  - The validated transaction seams are crate-private, but without a higher
+    owner a CLI would have to reconstruct their authority joins and path
+    registry.
+  - Compatibility paths are required for parity tests but are forbidden in
+    default report and CLI JSON.
+- Rationale: One closed authority owner prevents the offline CLI and later
+  runtime adapters from assembling subtly different migrations, while the
+  split receipt/projection keeps private paths out of serializable output.
+- Revisit only if: a replacement crate provides one equally closed,
+  independently verified migration authority surface without exposing
+  participant assembly to callers.
+
+## D-026: Rehearsal is preflighted in place and binds exact artifacts
+
+- Date: 2026-07-23
+- Phase: durable project catalog, rehearsal and artifact identity
+- Status: accepted after independent plan re-review
+- Decision: The Phase-1 facade never copies configured live state. An operator
+  or hermetic test prepares a complete isolated v1 bundle and reruns preflight
+  against it before rehearsal apply. First preflight may create a canonical
+  empty resolution at the explicit resolution path; apply always requires the
+  existing report and resolution. Their exact byte hashes are recorded in the
+  journal, marker, apply receipt, and verification receipt.
+- Evidence:
+  - Canonical inventory includes path digests and host-local bindings, so a
+    report captured against live roots cannot safely authorize silently
+    rebased checkout and participant paths.
+  - Having preflight copy state would violate its read-only owner-store
+    contract and introduce an unbounded filesystem copier into the authority
+    path.
+  - Semantic plan hashing alone cannot prove that apply consumed the exact
+    operator-reviewed files when insignificant JSON byte differences exist.
+- Rationale: In-place isolated preflight makes destination identity explicit,
+  preserves no-copy safety, and gives recovery an auditable binding to the
+  exact reviewed artifacts.
+- Revisit only if: a reviewed snapshot/export format can rebase every
+  path-bearing authority while preserving the same inventory and post-image
+  proofs, or persisted artifacts adopt a stricter canonical-byte format with
+  equivalent exact identity.
+
+## D-027: Full rebuild preserves history from immutable generations
+
+- Date: 2026-07-23
+- Phase: path-free index and Git history
+- Status: accepted after independent plan re-review
+- Decision: A full index replacement rematerializes stale, compatibility, and
+  active commit documents from referenced immutable
+  `RepoHistoryGeneration`s. Ambiguous or unclaimed legacy commit namespaces
+  live in immutable `RepoHistoryQuarantineGeneration`s with complete ordered
+  document commitments and remain rebuild/GC roots until explicit resolution
+  or acknowledged retirement. A checkout is never the only rebuild source for
+  retained history.
+- Evidence:
+  - Full replacement deletes the old index before local Git reingestion would
+    run.
+  - An attachment-less project cannot rewalk Git, while ambiguous namespaces
+    are intentionally forbidden from selecting an arbitrary repository.
+  - The governing design promises that imported commit refs remain queryable
+    and that ordinary project GC does not delete quarantined history.
+- Rationale: Immutable history generations make the durability promise
+  executable and let rebuild fail before replacement when its complete source
+  set cannot be proved.
+- Revisit only if: a different durable history store supplies the same
+  complete-count/hash proof, namespace quarantine, reference tracking, and
+  checkout-independent rematerialization.
