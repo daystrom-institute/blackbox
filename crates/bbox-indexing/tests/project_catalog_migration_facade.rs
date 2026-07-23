@@ -627,6 +627,15 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
     assert_eq!(verified.receipt(), &applied.receipt.verification);
     assert_eq!(verified.compatibility().records().len(), 3);
     assert_eq!(verified.compatibility().omitted_catalog_count(), 0);
+    let executable_report = decode_migration_report_v1(&fs::read(&report_path).unwrap()).unwrap();
+    let loser_repo_id = executable_report
+        .repo_history_groups
+        .iter()
+        .find(|group| group.project_ids.contains(&fixture.loser_project))
+        .unwrap()
+        .planned_primary_namespace
+        .as_str()
+        .to_string();
     for (project_id, checkout, repo_id, registered_at) in [
         (
             &fixture.winner_project,
@@ -643,7 +652,7 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
         (
             &fixture.loser_project,
             &fixture.loser_checkout,
-            None,
+            Some(loser_repo_id.as_str()),
             "2026-01-02T03:04:07Z",
         ),
     ] {
@@ -685,7 +694,6 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
 
     let code_source_paths =
         CodeSourceStorePaths::new(rehearsal_root.join("state/code-sources")).unwrap();
-    let executable_report = decode_migration_report_v1(&fs::read(&report_path).unwrap()).unwrap();
     for (project_id, checkout) in [
         (&fixture.winner_project, &fixture.winner_checkout),
         (
