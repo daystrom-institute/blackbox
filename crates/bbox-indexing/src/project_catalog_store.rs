@@ -85,7 +85,7 @@ const MAX_LEGACY_PUBLISHER_REF_SOURCE_BYTES: usize = MAX_PROJECT_CATALOG_BYTES;
 pub type ProjectCatalogStoreResult<T> = Result<T, ProjectCatalogStoreError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MigrationTransactionFailureDispositionV1 {
+pub(crate) enum MigrationMutationDispositionV1 {
     NoDurableMutation,
     RecoveredToOldState,
     RecoveredToCommittedState,
@@ -95,7 +95,19 @@ pub(crate) enum MigrationTransactionFailureDispositionV1 {
 #[derive(Debug, Clone)]
 pub(crate) struct MigrationTransactionFailureV1 {
     pub(crate) error: ProjectCatalogStoreError,
-    pub(crate) disposition: MigrationTransactionFailureDispositionV1,
+    pub(crate) disposition: MigrationMutationDispositionV1,
+}
+
+#[derive(Debug)]
+pub(crate) struct MigrationStoreOpenV1 {
+    pub(crate) store: ProjectCatalogStore,
+    pub(crate) disposition: MigrationMutationDispositionV1,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MigrationStoreOpenFailureV1 {
+    pub(crate) error: ProjectCatalogStoreError,
+    pub(crate) disposition: MigrationMutationDispositionV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,18 +354,86 @@ impl ProjectCatalogStore {
         projects_path: PathBuf,
         registry: MigrationParticipantRegistry,
     ) -> ProjectCatalogStoreResult<Self> {
-        let registry = registry.validate()?;
+        Self::open_existing_after_migration_classified(projects_path, registry)
+            .map(|opened| opened.store)
+            .map_err(|failure| failure.error)
+    }
+
+    pub(crate) fn open_existing_after_migration_classified(
+        projects_path: PathBuf,
+        registry: MigrationParticipantRegistry,
+    ) -> Result<MigrationStoreOpenV1, MigrationStoreOpenFailureV1> {
+        let registry = registry.validate().map_err(open_pre_entry_failure)?;
         if registry.catalog_path != projects_path {
-            return Err(ProjectCatalogStoreError::new(
+            return Err(open_pre_entry_failure(ProjectCatalogStoreError::new(
                 "error.project_catalog_invalid_migration_registry",
                 "migration registry is bound to a different project catalog path",
-            ));
+            )));
         }
-        Self::open_existing_with_registry_and_io(
+        Self::open_existing_after_migration_classified_with_io(
             projects_path,
             ParticipantRegistry::Migration(Arc::new(registry)),
             Arc::new(RealCatalogStoreIo),
         )
+    }
+
+    fn open_existing_after_migration_classified_with_io(
+        projects_path: PathBuf,
+        registry: ParticipantRegistry,
+        io: Arc<dyn CatalogStoreIo>,
+    ) -> Result<MigrationStoreOpenV1, MigrationStoreOpenFailureV1> {
+        let paths = ProjectCatalogPaths::derive(&projects_path).map_err(open_pre_entry_failure)?;
+        let lifetime_lock = Arc::new(
+            ProjectCatalogMigrationLock::acquire_shared(&paths.catalog)
+                .map_err(|error| io_error("acquire lifetime lock for", &paths.catalog, error))
+                .map_err(open_pre_entry_failure)?,
+        );
+        let owner = ProjectCatalogTransactionOwner {
+            paths,
+            registry,
+            io,
+        };
+        let _mutation_lock = owner
+            .io
+            .acquire_mutation_lock(&owner.paths.catalog)
+            .map_err(open_pre_entry_failure)?;
+        let _auxiliary_locks = owner
+            .acquire_auxiliary_locks()
+            .map_err(open_pre_entry_failure)?;
+        let before = owner
+            .read_journal_locked()
+            .map_err(open_recovery_uncertain_failure)?;
+        owner
+            .recover_locked()
+            .map_err(open_recovery_uncertain_failure)?;
+        let disposition = match before {
+            None => MigrationMutationDispositionV1::NoDurableMutation,
+            Some(_) => {
+                let after = owner
+                    .read_journal_locked()
+                    .map_err(open_recovery_uncertain_failure)?;
+                recovered_journal_disposition(after.as_ref()).ok_or_else(|| {
+                    open_recovery_uncertain_failure(ProjectCatalogStoreError::new(
+                        "error.project_catalog_recovery_incomplete",
+                        "migration recovery did not reach a terminal journal outcome",
+                    ))
+                })?
+            }
+        };
+        let current = Arc::new(
+            owner
+                .read_strict_pair_locked()
+                .map_err(|error| MigrationStoreOpenFailureV1 { error, disposition })?,
+        );
+        drop(_mutation_lock);
+        Ok(MigrationStoreOpenV1 {
+            store: Self {
+                owner,
+                current: RwLock::new(PublishedStoreState::Ready(current)),
+                _lifetime_lock: lifetime_lock,
+            },
+            disposition,
+        })
     }
 
     /// Returns path-redacted committed migration evidence after a fresh
@@ -474,6 +554,38 @@ impl ProjectCatalogStore {
         drop(exclusive);
 
         Self::open_existing_with_io(projects_path, io)
+    }
+}
+
+fn open_pre_entry_failure(error: ProjectCatalogStoreError) -> MigrationStoreOpenFailureV1 {
+    MigrationStoreOpenFailureV1 {
+        error,
+        disposition: MigrationMutationDispositionV1::NoDurableMutation,
+    }
+}
+
+fn open_recovery_uncertain_failure(error: ProjectCatalogStoreError) -> MigrationStoreOpenFailureV1 {
+    MigrationStoreOpenFailureV1 {
+        error,
+        disposition: MigrationMutationDispositionV1::RetryExactPlanRequired,
+    }
+}
+
+fn recovered_journal_disposition(
+    journal: Option<&ProjectCatalogTransactionJournalV1>,
+) -> Option<MigrationMutationDispositionV1> {
+    match journal.map(|journal| (&journal.kind, &journal.state, &journal.outcome)) {
+        Some((
+            TransactionKindV1::V1Migration,
+            TransactionStateV1::Committed,
+            Some(TransactionOutcomeV1::Committed),
+        )) => Some(MigrationMutationDispositionV1::RecoveredToCommittedState),
+        Some((
+            TransactionKindV1::V1Migration,
+            TransactionStateV1::Committed,
+            Some(TransactionOutcomeV1::RolledBack),
+        )) => Some(MigrationMutationDispositionV1::RecoveredToOldState),
+        _ => None,
     }
 }
 
@@ -3370,7 +3482,7 @@ fn transact_migration_classified_with_io(
         Err(MigrationAttemptFailureV1::NoDurableMutation(error)) => {
             Err(MigrationTransactionFailureV1 {
                 error,
-                disposition: MigrationTransactionFailureDispositionV1::NoDurableMutation,
+                disposition: MigrationMutationDispositionV1::NoDurableMutation,
             })
         }
         Err(MigrationAttemptFailureV1::Classify(error)) => {
@@ -3445,13 +3557,13 @@ fn classify_migration_failure(
     projects_path: &Path,
     plan: &ValidatedMigrationPlanV1,
     io: Arc<dyn CatalogStoreIo>,
-) -> MigrationTransactionFailureDispositionV1 {
+) -> MigrationMutationDispositionV1 {
     let Ok(paths) = ProjectCatalogPaths::derive(projects_path) else {
-        return MigrationTransactionFailureDispositionV1::NoDurableMutation;
+        return MigrationMutationDispositionV1::NoDurableMutation;
     };
     let Ok(Some(_exclusive)) = ProjectCatalogMigrationLock::try_acquire_exclusive(&paths.catalog)
     else {
-        return MigrationTransactionFailureDispositionV1::RetryExactPlanRequired;
+        return MigrationMutationDispositionV1::RetryExactPlanRequired;
     };
     let owner = ProjectCatalogTransactionOwner {
         paths,
@@ -3459,13 +3571,13 @@ fn classify_migration_failure(
         io,
     };
     let Ok(_mutation_lock) = owner.io.acquire_mutation_lock(&owner.paths.catalog) else {
-        return MigrationTransactionFailureDispositionV1::RetryExactPlanRequired;
+        return MigrationMutationDispositionV1::RetryExactPlanRequired;
     };
     let Ok(_auxiliary_locks) = owner.acquire_auxiliary_locks() else {
-        return MigrationTransactionFailureDispositionV1::RetryExactPlanRequired;
+        return MigrationMutationDispositionV1::RetryExactPlanRequired;
     };
     if owner.recover_locked().is_err() {
-        return MigrationTransactionFailureDispositionV1::RetryExactPlanRequired;
+        return MigrationMutationDispositionV1::RetryExactPlanRequired;
     }
     match owner.read_journal_locked() {
         Ok(Some(journal))
@@ -3474,18 +3586,18 @@ fn classify_migration_failure(
         {
             match (journal.state, journal.outcome) {
                 (TransactionStateV1::Committed, Some(TransactionOutcomeV1::Committed)) => {
-                    MigrationTransactionFailureDispositionV1::RecoveredToCommittedState
+                    MigrationMutationDispositionV1::RecoveredToCommittedState
                 }
                 (TransactionStateV1::Committed, Some(TransactionOutcomeV1::RolledBack)) => {
-                    MigrationTransactionFailureDispositionV1::RecoveredToOldState
+                    MigrationMutationDispositionV1::RecoveredToOldState
                 }
-                _ => MigrationTransactionFailureDispositionV1::RetryExactPlanRequired,
+                _ => MigrationMutationDispositionV1::RetryExactPlanRequired,
             }
         }
         Ok(None) if !migration_plan_artifacts_exist_locked(&owner, plan) => {
-            MigrationTransactionFailureDispositionV1::NoDurableMutation
+            MigrationMutationDispositionV1::NoDurableMutation
         }
-        _ => MigrationTransactionFailureDispositionV1::RetryExactPlanRequired,
+        _ => MigrationMutationDispositionV1::RetryExactPlanRequired,
     }
 }
 
@@ -13212,7 +13324,7 @@ mod tests {
         let failure = transact_migration_classified(&path, stale).unwrap_err();
         assert_eq!(
             failure.disposition,
-            MigrationTransactionFailureDispositionV1::NoDurableMutation
+            MigrationMutationDispositionV1::NoDurableMutation
         );
         assert_eq!(
             failure.error.code(),
@@ -13244,7 +13356,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             failure.disposition,
-            MigrationTransactionFailureDispositionV1::RecoveredToCommittedState
+            MigrationMutationDispositionV1::RecoveredToCommittedState
         );
         let journal: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
             &fs::read(ProjectCatalogPaths::derive(&path).unwrap().journal).unwrap(),
@@ -13288,7 +13400,7 @@ mod tests {
                 .unwrap_err();
         assert_eq!(
             failure.disposition,
-            MigrationTransactionFailureDispositionV1::RecoveredToOldState
+            MigrationMutationDispositionV1::RecoveredToOldState
         );
         assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
         assert_eq!(fs::read(publisher_source).unwrap(), b"new publisher source");
@@ -13321,7 +13433,151 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             failure.disposition,
-            MigrationTransactionFailureDispositionV1::RetryExactPlanRequired
+            MigrationMutationDispositionV1::RetryExactPlanRequired
+        );
+    }
+
+    #[test]
+    fn classified_open_reports_no_mutation_before_recovery_entry() {
+        let (_directory, path, plan, _, _) = migration_fault_fixture();
+        let other_path = path.with_file_name("other-projects.json");
+
+        let failure = ProjectCatalogStore::open_existing_after_migration_classified(
+            other_path,
+            plan.registry,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            failure.disposition,
+            MigrationMutationDispositionV1::NoDurableMutation
+        );
+        assert_eq!(
+            failure.error.code(),
+            "error.project_catalog_invalid_migration_registry"
+        );
+    }
+
+    #[test]
+    fn classified_open_reports_prepared_forward_recovery() {
+        let (_trace_directory, trace_path, trace_plan, _, _) = migration_fault_fixture();
+        let recording = Arc::new(TracingIo::recording());
+        transact_migration_with_io(&trace_path, trace_plan, recording.clone()).unwrap();
+        let fail_after_prepared = recording
+            .trace()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, point)| {
+                (*point == FaultPoint::PreparedJournalWrite).then_some(index)
+            })
+            .nth(1)
+            .unwrap();
+
+        let (_directory, path, plan, _, _) = migration_fault_fixture();
+        let registry = plan.registry.clone();
+        assert!(
+            transact_migration_with_io(
+                &path,
+                plan,
+                Arc::new(TracingIo::failing_at(fail_after_prepared)),
+            )
+            .is_err()
+        );
+
+        let opened = ProjectCatalogStore::open_existing_after_migration_classified_with_io(
+            path,
+            ParticipantRegistry::Migration(Arc::new(registry)),
+            Arc::new(RealCatalogStoreIo),
+        )
+        .unwrap();
+
+        assert_eq!(
+            opened.disposition,
+            MigrationMutationDispositionV1::RecoveredToCommittedState
+        );
+        assert_eq!(opened.store.snapshot().unwrap().epoch, 1);
+    }
+
+    #[test]
+    fn classified_open_reports_prepared_rollback_recovery() {
+        let (_trace_directory, trace_path, trace_plan, _, _) = migration_fault_fixture();
+        let recording = Arc::new(TracingIo::recording());
+        transact_migration_with_io(&trace_path, trace_plan, recording.clone()).unwrap();
+        let fail_after_prepared = recording
+            .trace()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, point)| {
+                (*point == FaultPoint::PreparedJournalWrite).then_some(index)
+            })
+            .nth(1)
+            .unwrap();
+
+        let (_directory, path, plan, _, legacy_bytes) = migration_fault_fixture();
+        let registry = plan.registry.clone();
+        let publisher_source = registry.legacy_publisher_ref_source.clone();
+        assert!(
+            transact_migration_with_io(
+                &path,
+                plan,
+                Arc::new(TracingIo::failing_at(fail_after_prepared)),
+            )
+            .is_err()
+        );
+        fs::write(&publisher_source, b"new publisher source").unwrap();
+
+        let failure = ProjectCatalogStore::open_existing_after_migration_classified_with_io(
+            path.clone(),
+            ParticipantRegistry::Migration(Arc::new(registry)),
+            Arc::new(RealCatalogStoreIo),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            failure.disposition,
+            MigrationMutationDispositionV1::RecoveredToOldState
+        );
+        assert_eq!(fs::read(path).unwrap(), legacy_bytes);
+    }
+
+    #[test]
+    fn classified_open_reports_uncertain_recovery_as_retry_required() {
+        let (_trace_directory, trace_path, trace_plan, _, _) = migration_fault_fixture();
+        let recording = Arc::new(TracingIo::recording());
+        transact_migration_with_io(&trace_path, trace_plan, recording.clone()).unwrap();
+        let fail_after_prepared = recording
+            .trace()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, point)| {
+                (*point == FaultPoint::PreparedJournalWrite).then_some(index)
+            })
+            .nth(1)
+            .unwrap();
+
+        let (_directory, path, plan, _, _) = migration_fault_fixture();
+        let registry = plan.registry.clone();
+        assert!(
+            transact_migration_with_io(
+                &path,
+                plan,
+                Arc::new(TracingIo::failing_at(fail_after_prepared)),
+            )
+            .is_err()
+        );
+
+        let failure = ProjectCatalogStore::open_existing_after_migration_classified_with_io(
+            path,
+            ParticipantRegistry::Migration(Arc::new(registry)),
+            Arc::new(TracingIo::failing_points([
+                FaultPoint::RecoveryParticipantInstall,
+            ])),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            failure.disposition,
+            MigrationMutationDispositionV1::RetryExactPlanRequired
         );
     }
 

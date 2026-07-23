@@ -73,9 +73,9 @@ use crate::project_catalog_store::{
     MigrationCheckoutRegistryBootstrapV1, MigrationCodeSourceActivationDraftV1,
     MigrationCodeSourceDispositionV1, MigrationCodeSourceGenerationDraftV1,
     MigrationCodeSourceSnapshotDraftV1, MigrationImmutableAssetDraftV1,
-    MigrationLegacyProjectSourceDraftV1, MigrationParticipantDraftV1, MigrationParticipantRegistry,
-    MigrationPlanDraftV1, MigrationPublisherSourceDraftV1,
-    MigrationTransactionFailureDispositionV1, ParticipantRoleV1, ProjectCatalogStore,
+    MigrationLegacyProjectSourceDraftV1, MigrationMutationDispositionV1,
+    MigrationParticipantDraftV1, MigrationParticipantRegistry, MigrationPlanDraftV1,
+    MigrationPublisherSourceDraftV1, ParticipantRoleV1, ProjectCatalogStore,
     PublisherDispositionEvidenceV1, PublisherPinEvidenceV1, Sha256Hex, ValidatedMigrationPlanV1,
     bootstrap_migration_checkout_registry, transact_migration_classified, validate_migration_plan,
 };
@@ -131,6 +131,16 @@ impl ProjectCatalogMigrationError {
             message,
             ProjectCatalogMigrationMutationDispositionV1::NoDurableMutation,
         )
+    }
+
+    fn with_mutation_disposition(
+        self,
+        mutation_disposition: ProjectCatalogMigrationMutationDispositionV1,
+    ) -> Self {
+        Self {
+            mutation_disposition,
+            ..self
+        }
     }
 }
 
@@ -670,6 +680,7 @@ impl ProjectCatalogCompatibilityProjectionV1 {
 pub struct ProjectCatalogMigrationVerifyResultV1 {
     receipt: MigrationVerificationReceiptV1,
     compatibility: ProjectCatalogCompatibilityProjectionV1,
+    mutation_disposition: ProjectCatalogMigrationMutationDispositionV1,
 }
 
 impl ProjectCatalogMigrationVerifyResultV1 {
@@ -3672,24 +3683,10 @@ impl ClosedMigrationIntegrationV1 for CurrentClosedMigrationIntegrationV1 {
             )
         })?;
         transact_migration_classified(&layout.projects_path, plan).map_err(|failure| {
-            let mutation_disposition = match failure.disposition {
-                MigrationTransactionFailureDispositionV1::NoDurableMutation => {
-                    ProjectCatalogMigrationMutationDispositionV1::NoDurableMutation
-                }
-                MigrationTransactionFailureDispositionV1::RecoveredToOldState => {
-                    ProjectCatalogMigrationMutationDispositionV1::RecoveredToOldState
-                }
-                MigrationTransactionFailureDispositionV1::RecoveredToCommittedState => {
-                    ProjectCatalogMigrationMutationDispositionV1::RecoveredToCommittedState
-                }
-                MigrationTransactionFailureDispositionV1::RetryExactPlanRequired => {
-                    ProjectCatalogMigrationMutationDispositionV1::RetryExactPlanRequired
-                }
-            };
             ProjectCatalogMigrationError::new(
                 failure.error.code(),
                 "migration transaction failed after exact-plan validation",
-                mutation_disposition,
+                facade_mutation_disposition(failure.disposition),
             )
         })?;
         let verified = verify_installed(layout).map_err(|error| {
@@ -4563,9 +4560,10 @@ fn verify_exact_installed_review(
                 || receipt.expected_immutable_asset_hashes
                     != report.predicted_immutable_asset_hashes
             {
-                return Err(ProjectCatalogMigrationError::no_mutation(
+                return Err(ProjectCatalogMigrationError::new(
                     "error.project_catalog_migration_artifact_identity",
                     "installed migration belongs to a different reviewed artifact set",
+                    result.mutation_disposition,
                 ));
             }
             Ok(Some(result))
@@ -4608,50 +4606,69 @@ fn verify_installed_optional(
         } => retained_checkout_roots,
     };
     let registry = build_registry(layout, &retained_checkout_roots)?;
-    let store =
-        ProjectCatalogStore::open_existing_after_migration(layout.projects_path.clone(), registry)
-            .map_err(store_validation_error)?;
+    let opened = ProjectCatalogStore::open_existing_after_migration_classified(
+        layout.projects_path.clone(),
+        registry,
+    )
+    .map_err(|failure| {
+        ProjectCatalogMigrationError::new(
+            failure.error.code(),
+            "migration store recovery or open failed",
+            facade_mutation_disposition(failure.disposition),
+        )
+    })?;
+    let mutation_disposition = facade_mutation_disposition(opened.disposition);
+    let store = opened.store;
     let identity = store
         .migration_artifact_identity()
-        .map_err(store_validation_error)?;
-    let state = store.snapshot().map_err(store_validation_error)?;
-    let compatibility = build_compatibility_projection(&state)?;
-    let projections = identity_projections(&identity)?;
-    let receipt = MigrationVerificationReceiptV1 {
-        version: FACADE_VERSION_V1,
-        transaction_id: identity.transaction_id,
-        inventory_hash: Sha256ValueV1::parse(identity.inventory_sha256.to_string())
+        .map_err(|error| store_error_with_disposition(error, mutation_disposition))?;
+    let state = store
+        .snapshot()
+        .map_err(|error| store_error_with_disposition(error, mutation_disposition))?;
+    let compatibility = build_compatibility_projection(&state)
+        .map_err(|error| error.with_mutation_disposition(mutation_disposition))?;
+    let projections = identity_projections(&identity)
+        .map_err(|error| error.with_mutation_disposition(mutation_disposition))?;
+    let receipt = (|| {
+        Ok::<_, ProjectCatalogMigrationError>(MigrationVerificationReceiptV1 {
+            version: FACADE_VERSION_V1,
+            transaction_id: identity.transaction_id,
+            inventory_hash: Sha256ValueV1::parse(identity.inventory_sha256.to_string())
+                .map_err(inventory_error)?,
+            plan_hash: Sha256ValueV1::parse(identity.plan_hash.to_string())
+                .map_err(inventory_error)?,
+            report_artifact_hash: Sha256ValueV1::parse(identity.report_artifact_sha256.to_string())
+                .map_err(inventory_error)?,
+            resolution_artifact_hash: Sha256ValueV1::parse(
+                identity.resolution_artifact_sha256.to_string(),
+            )
             .map_err(inventory_error)?,
-        plan_hash: Sha256ValueV1::parse(identity.plan_hash.to_string()).map_err(inventory_error)?,
-        report_artifact_hash: Sha256ValueV1::parse(identity.report_artifact_sha256.to_string())
-            .map_err(inventory_error)?,
-        resolution_artifact_hash: Sha256ValueV1::parse(
-            identity.resolution_artifact_sha256.to_string(),
-        )
-        .map_err(inventory_error)?,
-        expected_catalog_hash: projections.catalog_hash.clone(),
-        observed_catalog_hash: Sha256ValueV1::parse(state.catalog_sha256().to_string())
-            .map_err(inventory_error)?,
-        expected_attachment_hash: projections.attachment_hash.clone(),
-        observed_attachment_hash: Sha256ValueV1::parse(state.attachments_sha256().to_string())
-            .map_err(inventory_error)?,
-        expected_participant_hashes: projections.participant_hashes.clone(),
-        observed_participant_hashes: projections.participant_hashes,
-        expected_immutable_asset_hashes: projections.immutable_hashes.clone(),
-        observed_immutable_asset_hashes: projections.immutable_hashes,
-        predicted_marker_hash: projections.marker_hash,
-        observed_marker_hash: projections.observed_marker_hash,
-        backup_hashes: projections.backup_hashes,
-        epoch: identity.epoch,
-        checkout_action_count: identity.checkout_action_count,
-        publisher_pin_count: identity.publisher_pin_count,
-        quarantine_root_count: identity.quarantine_root_count,
-        attached_project_count: u64::try_from(compatibility.records.len()).unwrap_or(u64::MAX),
-        omitted_catalog_count: compatibility.omitted_catalog_count,
-    };
+            expected_catalog_hash: projections.catalog_hash.clone(),
+            observed_catalog_hash: Sha256ValueV1::parse(state.catalog_sha256().to_string())
+                .map_err(inventory_error)?,
+            expected_attachment_hash: projections.attachment_hash.clone(),
+            observed_attachment_hash: Sha256ValueV1::parse(state.attachments_sha256().to_string())
+                .map_err(inventory_error)?,
+            expected_participant_hashes: projections.participant_hashes.clone(),
+            observed_participant_hashes: projections.participant_hashes,
+            expected_immutable_asset_hashes: projections.immutable_hashes.clone(),
+            observed_immutable_asset_hashes: projections.immutable_hashes,
+            predicted_marker_hash: projections.marker_hash,
+            observed_marker_hash: projections.observed_marker_hash,
+            backup_hashes: projections.backup_hashes,
+            epoch: identity.epoch,
+            checkout_action_count: identity.checkout_action_count,
+            publisher_pin_count: identity.publisher_pin_count,
+            quarantine_root_count: identity.quarantine_root_count,
+            attached_project_count: u64::try_from(compatibility.records.len()).unwrap_or(u64::MAX),
+            omitted_catalog_count: compatibility.omitted_catalog_count,
+        })
+    })()
+    .map_err(|error| error.with_mutation_disposition(mutation_disposition))?;
     Ok(Some(ProjectCatalogMigrationVerifyResultV1 {
         receipt,
         compatibility,
+        mutation_disposition,
     }))
 }
 
@@ -4668,6 +4685,36 @@ fn store_validation_error(
     error: crate::project_catalog_store::ProjectCatalogStoreError,
 ) -> ProjectCatalogMigrationError {
     ProjectCatalogMigrationError::no_mutation(error.code(), "migration store contract failed")
+}
+
+fn store_error_with_disposition(
+    error: crate::project_catalog_store::ProjectCatalogStoreError,
+    mutation_disposition: ProjectCatalogMigrationMutationDispositionV1,
+) -> ProjectCatalogMigrationError {
+    ProjectCatalogMigrationError::new(
+        error.code(),
+        "migration store contract failed after classified recovery",
+        mutation_disposition,
+    )
+}
+
+fn facade_mutation_disposition(
+    disposition: MigrationMutationDispositionV1,
+) -> ProjectCatalogMigrationMutationDispositionV1 {
+    match disposition {
+        MigrationMutationDispositionV1::NoDurableMutation => {
+            ProjectCatalogMigrationMutationDispositionV1::NoDurableMutation
+        }
+        MigrationMutationDispositionV1::RecoveredToOldState => {
+            ProjectCatalogMigrationMutationDispositionV1::RecoveredToOldState
+        }
+        MigrationMutationDispositionV1::RecoveredToCommittedState => {
+            ProjectCatalogMigrationMutationDispositionV1::RecoveredToCommittedState
+        }
+        MigrationMutationDispositionV1::RetryExactPlanRequired => {
+            ProjectCatalogMigrationMutationDispositionV1::RetryExactPlanRequired
+        }
+    }
 }
 
 fn validate_prepared_preflight(
@@ -4781,9 +4828,10 @@ fn validate_verify_result(
         || result.receipt.attached_project_count
             != u64::try_from(result.compatibility.records.len()).unwrap_or(u64::MAX)
     {
-        return Err(ProjectCatalogMigrationError::no_mutation(
+        return Err(ProjectCatalogMigrationError::new(
             "error.project_catalog_migration_invalid_verify_output",
             "closed verification returned inconsistent installed state",
+            result.mutation_disposition,
         ));
     }
     Ok(())
@@ -5691,6 +5739,95 @@ mod tests {
             LegacyPathRelationshipV1::UnsafeSelector
         );
         assert_eq!(unsafe_selector.refusals.len(), 1);
+    }
+
+    fn verification_validation_fixture() -> (
+        ProjectCatalogMigrationReportV1,
+        Vec<u8>,
+        Vec<u8>,
+        MigrationVerificationReceiptV1,
+    ) {
+        let inventory = crate::project_catalog_inventory::tests::fixture_inventory();
+        let resolution =
+            ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
+        let post_image = crate::project_catalog_inventory::tests::fixture_post_image(&inventory);
+        let report = crate::project_catalog_inventory::tests::fixture_report(
+            &inventory,
+            &resolution,
+            &post_image,
+        );
+        let report_bytes = encode_migration_report_v1(&report, &inventory).unwrap();
+        let resolution_bytes = encode_migration_resolution_v1(&resolution).unwrap();
+        let marker_hash = Sha256ValueV1::digest(b"marker");
+        let receipt = MigrationVerificationReceiptV1 {
+            version: FACADE_VERSION_V1,
+            transaction_id: report.transaction_id.clone(),
+            inventory_hash: report.inventory_hash.clone(),
+            plan_hash: report.plan_hash.clone(),
+            report_artifact_hash: Sha256ValueV1::digest(&report_bytes),
+            resolution_artifact_hash: Sha256ValueV1::digest(&resolution_bytes),
+            expected_catalog_hash: report.predicted_catalog_hash.clone(),
+            observed_catalog_hash: report.predicted_catalog_hash.clone(),
+            expected_attachment_hash: report.predicted_attachment_hash.clone(),
+            observed_attachment_hash: report.predicted_attachment_hash.clone(),
+            expected_participant_hashes: report.predicted_participant_hashes.clone(),
+            observed_participant_hashes: report.predicted_participant_hashes.clone(),
+            expected_immutable_asset_hashes: report.predicted_immutable_asset_hashes.clone(),
+            observed_immutable_asset_hashes: report.predicted_immutable_asset_hashes.clone(),
+            predicted_marker_hash: marker_hash.clone(),
+            observed_marker_hash: marker_hash,
+            backup_hashes: BTreeMap::new(),
+            epoch: 1,
+            checkout_action_count: 0,
+            publisher_pin_count: 0,
+            quarantine_root_count: 0,
+            attached_project_count: 0,
+            omitted_catalog_count: 0,
+        };
+        (report, report_bytes, resolution_bytes, receipt)
+    }
+
+    #[test]
+    fn post_open_verify_mismatch_inherits_recovery_disposition() {
+        let (_, _, _, mut receipt) = verification_validation_fixture();
+        receipt.version = 0;
+        let result = ProjectCatalogMigrationVerifyResultV1 {
+            receipt,
+            compatibility: ProjectCatalogCompatibilityProjectionV1 {
+                records: Vec::new(),
+                omitted_catalog_count: 0,
+            },
+            mutation_disposition: ProjectCatalogMigrationMutationDispositionV1::RecoveredToOldState,
+        };
+
+        let error = validate_verify_result(&result).unwrap_err();
+
+        assert_eq!(
+            error.mutation_disposition,
+            ProjectCatalogMigrationMutationDispositionV1::RecoveredToOldState
+        );
+    }
+
+    #[test]
+    fn post_commit_apply_mismatch_reports_committed_disposition() {
+        let (report, report_bytes, resolution_bytes, mut verification) =
+            verification_validation_fixture();
+        verification.version = 0;
+        let result = ProjectCatalogMigrationApplyResultV1 {
+            receipt: ProjectCatalogMigrationApplyReceiptV1 {
+                version: FACADE_VERSION_V1,
+                outcome: ProjectCatalogMigrationApplyOutcomeV1::Applied,
+                verification,
+            },
+        };
+
+        let error =
+            validate_apply_result(&result, &report_bytes, &report, &resolution_bytes).unwrap_err();
+
+        assert_eq!(
+            error.mutation_disposition,
+            ProjectCatalogMigrationMutationDispositionV1::RecoveredToCommittedState
+        );
     }
 
     #[cfg(unix)]
