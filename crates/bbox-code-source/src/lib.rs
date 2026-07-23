@@ -71,6 +71,9 @@ pub struct ManifestEntry {
 impl ManifestEntry {
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_relative_path(&self.relative_path)?;
+        if self.relative_path.split('/').any(is_skipped_component) {
+            return Err(ContractError::UnsupportedPath(self.relative_path.clone()));
+        }
         validate_sha256(&self.content_sha256)?;
         let max_bytes = max_bytes_for_path(Path::new(&self.relative_path))
             .ok_or_else(|| ContractError::UnsupportedPath(self.relative_path.clone()))?;
@@ -584,6 +587,20 @@ mod tests {
         ));
         assert!(entry("a.rs", 'A', 1).validate().is_err());
         assert!(entry("a.bin", 'a', 1).validate().is_err());
+        for path in [
+            ".bbox/knowledge/x.json",
+            ".github/workflows/ci.yml",
+            "target/cache.json",
+            "src/.generated/value.rs",
+        ] {
+            assert!(
+                matches!(
+                    entry(path, 'a', 1).validate(),
+                    Err(ContractError::UnsupportedPath(rejected)) if rejected == path
+                ),
+                "server-side manifest validation accepted skipped path {path}"
+            );
+        }
         assert!(
             entry("a.rs", 'a', MAX_TEXT_FILE_BYTES + 1)
                 .validate()

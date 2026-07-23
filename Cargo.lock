@@ -1278,6 +1278,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bro-apply-patch",
+ "chrono",
  "fs2",
  "globset",
  "ignore",

@@ -787,6 +787,25 @@ struct CloseoutKnowledgeManifest {
     files: Vec<CloseoutKnowledgeFile>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CloseoutTransactionOrderKey {
+    unix_seconds: i64,
+    nanoseconds: u32,
+    transaction_id: String,
+}
+
+fn closeout_transaction_order_key(
+    created_at: &str,
+    transaction_id: &str,
+) -> anyhow::Result<CloseoutTransactionOrderKey> {
+    let timestamp = chrono::DateTime::parse_from_rfc3339(created_at)?;
+    Ok(CloseoutTransactionOrderKey {
+        unix_seconds: timestamp.timestamp(),
+        nanoseconds: timestamp.timestamp_subsec_nanos(),
+        transaction_id: transaction_id.to_string(),
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct CloseoutKnowledgeFile {
     relative_path: String,
@@ -968,18 +987,29 @@ fn verify_knowledge_transaction_closeout(req: &CloseoutRequest, candidate_tree: 
                 ),
             );
         }
-        manifests.push(manifest);
+        let order_key =
+            match closeout_transaction_order_key(&manifest.created_at, &manifest.transaction_id) {
+                Ok(order_key) => order_key,
+                Err(err) => {
+                    return knowledge_closeout_blocked(
+                        req,
+                        format!(
+                            "{} has invalid knowledge transaction ordering metadata: {err}",
+                            path.display()
+                        ),
+                    );
+                }
+            };
+        manifests.push((order_key, manifest));
     }
     if manifests.is_empty() {
         return HookRun::None;
     }
-    manifests.sort_by(|left, right| {
-        (&left.created_at, &left.transaction_id).cmp(&(&right.created_at, &right.transaction_id))
-    });
+    manifests.sort_by(|(left, _), (right, _)| left.cmp(right));
 
     let manifest_count = manifests.len();
     let mut expected = BTreeMap::<String, Option<String>>::new();
-    for manifest in manifests {
+    for (_, manifest) in manifests {
         for file in manifest.files {
             if file.relative_path.is_empty()
                 || !is_safe_pathspec(&file.relative_path)
@@ -2701,6 +2731,21 @@ mod tests {
     use super::*;
     use crate::tool::ToolCx;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn closeout_transaction_order_parses_variable_width_rfc3339_fractions() {
+        let whole = closeout_transaction_order_key(
+            "2026-07-21T12:00:05Z",
+            "20260721T120005.000000000Z-1-0",
+        )
+        .unwrap();
+        let fractional = closeout_transaction_order_key(
+            "2026-07-21T12:00:05.500000Z",
+            "20260721T120005.500000000Z-1-1",
+        )
+        .unwrap();
+        assert!(whole < fractional);
+    }
 
     /// Process-env serialization lock for tests that mutate `BRO_FLEET_*`
     /// env vars. `std::env::set_var` is process-global; two parallel

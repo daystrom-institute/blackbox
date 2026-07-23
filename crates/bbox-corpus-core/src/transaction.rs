@@ -76,6 +76,29 @@ pub struct RepoTransactionFile {
 pub type KnowledgeTransactionManifest = RepoTransactionManifest;
 pub type KnowledgeTransactionFile = RepoTransactionFile;
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CompletedTransactionOrderKey {
+    unix_seconds: i64,
+    nanoseconds: u32,
+    transaction_id: String,
+}
+
+/// Parse the durable manifest timestamp before ordering completed transactions.
+/// RFC3339's variable-width fractional seconds are not lexicographically sortable.
+pub fn completed_transaction_order_key(
+    created_at: &str,
+    transaction_id: &str,
+) -> Result<CompletedTransactionOrderKey> {
+    validate_transaction_id(transaction_id)?;
+    let timestamp = chrono::DateTime::parse_from_rfc3339(created_at)
+        .with_context(|| format!("invalid transaction created_at {created_at:?}"))?;
+    Ok(CompletedTransactionOrderKey {
+        unix_seconds: timestamp.timestamp(),
+        nanoseconds: timestamp.timestamp_subsec_nanos(),
+        transaction_id: transaction_id.to_string(),
+    })
+}
+
 /// True while a daemon repo-file transaction owns this checkout.
 pub fn has_pending_transaction(checkout_dir: &Path) -> bool {
     pending_path(checkout_dir).is_file()
@@ -530,13 +553,13 @@ fn compact_completed_manifests(root: &Path) -> Result<()> {
         )
         .with_context(|| format!("parsing {}", path.display()))?;
         validate_manifest(&manifest, &manifest.transaction_id)?;
-        manifests.push(manifest);
+        let order_key =
+            completed_transaction_order_key(&manifest.created_at, &manifest.transaction_id)?;
+        manifests.push((order_key, manifest));
     }
-    manifests.sort_by(|left, right| {
-        (&left.created_at, &left.transaction_id).cmp(&(&right.created_at, &right.transaction_id))
-    });
+    manifests.sort_by(|(left, _), (right, _)| left.cmp(right));
     let mut latest = BTreeMap::new();
-    for manifest in manifests {
+    for (_, manifest) in manifests {
         for file in manifest.files {
             latest.insert(file.relative_path.clone(), file);
         }
@@ -979,7 +1002,7 @@ mod tests {
                 version: TRANSACTION_VERSION,
                 kind: TRANSACTION_KIND.to_string(),
                 transaction_id: transaction_id.clone(),
-                created_at: format!("2026-07-22T00:00:{index:02}Z"),
+                created_at: format!("2026-07-22T00:{:02}:{:02}Z", index / 60, index % 60),
                 files: vec![RepoTransactionFile {
                     relative_path: format!(".bbox/knowledge/{index}.json"),
                     old_ref: None,
@@ -1085,6 +1108,21 @@ mod tests {
         assert!(validate_transaction_id(".").is_err());
         assert!(validate_transaction_id("..").is_err());
         assert!(validate_transaction_id("valid-id_1.2").is_ok());
+    }
+
+    #[test]
+    fn completed_transaction_order_parses_variable_width_rfc3339_fractions() {
+        let whole = completed_transaction_order_key(
+            "2026-07-21T12:00:05Z",
+            "20260721T120005.000000000Z-1-0",
+        )
+        .unwrap();
+        let fractional = completed_transaction_order_key(
+            "2026-07-21T12:00:05.500000Z",
+            "20260721T120005.500000000Z-1-1",
+        )
+        .unwrap();
+        assert!(whole < fractional);
     }
 
     #[cfg(unix)]
