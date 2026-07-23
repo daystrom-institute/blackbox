@@ -4611,7 +4611,13 @@ fn verify_installed_optional(
         bootstrap_registry,
         &checkout_bindings,
     )
-    .map_err(store_validation_error)?;
+    .map_err(|failure| {
+        ProjectCatalogMigrationError::new(
+            failure.error.code(),
+            "migration checkout registry bootstrap failed",
+            facade_mutation_disposition(failure.disposition),
+        )
+    })?;
     let retained_checkout_roots = match bootstrap {
         MigrationCheckoutRegistryBootstrapV1::FreshLegacyNotInstalled => return Ok(None),
         MigrationCheckoutRegistryBootstrapV1::Ready {

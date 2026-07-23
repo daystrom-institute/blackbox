@@ -110,6 +110,12 @@ pub(crate) struct MigrationStoreOpenFailureV1 {
     pub(crate) disposition: MigrationMutationDispositionV1,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct MigrationBootstrapFailureV1 {
+    pub(crate) error: ProjectCatalogStoreError,
+    pub(crate) disposition: MigrationMutationDispositionV1,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectCatalogStoreError {
     code: &'static str,
@@ -571,6 +577,24 @@ fn open_recovery_uncertain_failure(error: ProjectCatalogStoreError) -> Migration
     }
 }
 
+fn bootstrap_retry_failure(error: ProjectCatalogStoreError) -> MigrationBootstrapFailureV1 {
+    bootstrap_journal_failure(
+        error,
+        MigrationMutationDispositionV1::RetryExactPlanRequired,
+    )
+}
+
+fn bootstrap_pre_entry_failure(error: ProjectCatalogStoreError) -> MigrationBootstrapFailureV1 {
+    bootstrap_journal_failure(error, MigrationMutationDispositionV1::NoDurableMutation)
+}
+
+fn bootstrap_journal_failure(
+    error: ProjectCatalogStoreError,
+    disposition: MigrationMutationDispositionV1,
+) -> MigrationBootstrapFailureV1 {
+    MigrationBootstrapFailureV1 { error, disposition }
+}
+
 fn recovered_journal_disposition(
     journal: Option<&ProjectCatalogTransactionJournalV1>,
 ) -> Option<MigrationMutationDispositionV1> {
@@ -715,6 +739,7 @@ pub(crate) struct MigrationParticipantRegistry {
     code_source_limits: StoreLimits,
 }
 
+#[derive(Debug)]
 pub(crate) enum MigrationCheckoutRegistryBootstrapV1 {
     FreshLegacyNotInstalled,
     Ready {
@@ -933,53 +958,69 @@ pub(crate) fn bootstrap_migration_checkout_registry(
     projects_path: &Path,
     registry_without_checkouts: MigrationParticipantRegistry,
     discovered_checkout_roots: &BTreeMap<String, PathBuf>,
-) -> ProjectCatalogStoreResult<MigrationCheckoutRegistryBootstrapV1> {
-    let registry_without_checkouts = registry_without_checkouts.validate()?;
+) -> Result<MigrationCheckoutRegistryBootstrapV1, MigrationBootstrapFailureV1> {
+    let registry_without_checkouts = registry_without_checkouts
+        .validate()
+        .map_err(bootstrap_pre_entry_failure)?;
     if registry_without_checkouts.catalog_path != projects_path
         || !registry_without_checkouts
             .checkout_identity_markers
             .is_empty()
     {
-        return Err(ProjectCatalogStoreError::new(
+        return Err(bootstrap_pre_entry_failure(ProjectCatalogStoreError::new(
             "error.project_catalog_invalid_migration_registry",
             "migration bootstrap requires the matching checkout-empty registry",
-        ));
+        )));
     }
-    let paths = ProjectCatalogPaths::derive(projects_path)?;
+    let paths = ProjectCatalogPaths::derive(projects_path).map_err(bootstrap_pre_entry_failure)?;
     let _lifetime_lock = ProjectCatalogMigrationLock::acquire_shared(&paths.catalog)
-        .map_err(|error| io_error("acquire lifetime lock for", &paths.catalog, error))?;
+        .map_err(|error| io_error("acquire lifetime lock for", &paths.catalog, error))
+        .map_err(bootstrap_pre_entry_failure)?;
     let owner = ProjectCatalogTransactionOwner {
         paths,
         registry: ParticipantRegistry::Migration(Arc::new(registry_without_checkouts)),
         io: Arc::new(RealCatalogStoreIo),
     };
-    let _mutation_lock = owner.io.acquire_mutation_lock(&owner.paths.catalog)?;
-    let _auxiliary_locks = owner.acquire_auxiliary_locks()?;
-    let Some(journal) = owner.read_journal_locked()? else {
+    let _mutation_lock = owner
+        .io
+        .acquire_mutation_lock(&owner.paths.catalog)
+        .map_err(bootstrap_pre_entry_failure)?;
+    let _auxiliary_locks = owner
+        .acquire_auxiliary_locks()
+        .map_err(bootstrap_pre_entry_failure)?;
+    let Some(journal) = owner
+        .read_journal_locked()
+        .map_err(bootstrap_retry_failure)?
+    else {
         let catalog_bytes = owner
             .io
-            .read_regular_nofollow(&owner.paths.catalog, MAX_PROJECT_CATALOG_BYTES)?;
+            .read_regular_nofollow(&owner.paths.catalog, MAX_PROJECT_CATALOG_BYTES)
+            .map_err(bootstrap_retry_failure)?;
         if catalog_bytes
             .as_deref()
             .is_some_and(|bytes| decode_legacy_project_store(bytes).is_err())
             || owner
                 .io
-                .read_regular_nofollow(&owner.paths.attachments, MAX_PROJECT_CATALOG_BYTES)?
+                .read_regular_nofollow(&owner.paths.attachments, MAX_PROJECT_CATALOG_BYTES)
+                .map_err(bootstrap_retry_failure)?
                 .is_some()
             || owner
                 .io
-                .read_regular_nofollow(&owner.paths.migration_marker, MAX_MARKER_BYTES)?
+                .read_regular_nofollow(&owner.paths.migration_marker, MAX_MARKER_BYTES)
+                .map_err(bootstrap_retry_failure)?
                 .is_some()
-            || path_exists_nofollow(&owner.paths.stage_dir)?
-            || path_exists_nofollow(&owner.paths.backup_dir)?
+            || path_exists_nofollow(&owner.paths.stage_dir).map_err(bootstrap_retry_failure)?
+            || path_exists_nofollow(&owner.paths.backup_dir).map_err(bootstrap_retry_failure)?
         {
-            return Err(ProjectCatalogStoreError::new(
+            return Err(bootstrap_retry_failure(ProjectCatalogStoreError::new(
                 "error.project_catalog_migration_incomplete",
                 "journal-free migration bootstrap found partial or v2 migration state",
-            ));
+            )));
         }
         return Ok(MigrationCheckoutRegistryBootstrapV1::FreshLegacyNotInstalled);
     };
+    let journal_disposition = recovered_journal_disposition(Some(&journal))
+        .unwrap_or(MigrationMutationDispositionV1::RetryExactPlanRequired);
     if journal.kind != TransactionKindV1::V1Migration
         || matches!(
             (journal.state, journal.outcome),
@@ -989,9 +1030,12 @@ pub(crate) fn bootstrap_migration_checkout_registry(
             )
         )
     {
-        return Err(ProjectCatalogStoreError::new(
-            "error.project_catalog_migration_incomplete",
-            "migration registry bootstrap requires a recoverable or committed migration",
+        return Err(bootstrap_journal_failure(
+            ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_incomplete",
+                "migration registry bootstrap requires a recoverable or committed migration",
+            ),
+            journal_disposition,
         ));
     }
     let attachment_participant = journal
@@ -1003,20 +1047,25 @@ pub(crate) fn bootstrap_migration_checkout_registry(
                 "error.project_catalog_migration_incomplete",
                 "migration registry bootstrap lacks attachment evidence",
             )
-        })?;
+        })
+        .map_err(|error| bootstrap_journal_failure(error, journal_disposition))?;
     let ExpectedImageV1::Present {
         sha256: expected_hash,
         artifact_name,
     } = &attachment_participant.new
     else {
-        return Err(ProjectCatalogStoreError::new(
-            "error.project_catalog_migration_incomplete",
-            "migration registry bootstrap requires an attachment post-image",
+        return Err(bootstrap_journal_failure(
+            ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_incomplete",
+                "migration registry bootstrap requires an attachment post-image",
+            ),
+            journal_disposition,
         ));
     };
     let installed = owner
         .io
-        .read_regular_nofollow(&owner.paths.attachments, MAX_PROJECT_CATALOG_BYTES)?;
+        .read_regular_nofollow(&owner.paths.attachments, MAX_PROJECT_CATALOG_BYTES)
+        .map_err(|error| bootstrap_journal_failure(error, journal_disposition))?;
     let attachment_bytes = match installed {
         Some(bytes) if sha256(&bytes) == *expected_hash => bytes,
         _ => {
@@ -1025,31 +1074,41 @@ pub(crate) fn bootstrap_migration_checkout_registry(
                 .read_regular_nofollow(
                     &owner.paths.stage_dir.join(artifact_name.as_str()),
                     MAX_PROJECT_CATALOG_BYTES,
-                )?
+                )
+                .map_err(|error| bootstrap_journal_failure(error, journal_disposition))?
                 .ok_or_else(|| {
                     ProjectCatalogStoreError::new(
                         "error.project_catalog_migration_incomplete",
                         "migration registry bootstrap cannot find the attachment post-image",
                     )
-                })?;
+                })
+                .map_err(|error| bootstrap_journal_failure(error, journal_disposition))?;
             if sha256(&staged) != *expected_hash {
-                return Err(ProjectCatalogStoreError::new(
-                    "error.project_catalog_migration_incomplete",
-                    "migration registry bootstrap attachment hash disagrees with the journal",
+                return Err(bootstrap_journal_failure(
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_migration_incomplete",
+                        "migration registry bootstrap attachment hash disagrees with the journal",
+                    ),
+                    journal_disposition,
                 ));
             }
             staged
         }
     };
-    let attachments = decode_attachment_snapshot(&attachment_bytes).map_err(contract_error)?;
+    let attachments = decode_attachment_snapshot(&attachment_bytes)
+        .map_err(contract_error)
+        .map_err(|error| bootstrap_journal_failure(error, journal_disposition))?;
     let discovered_by_root = discovered_checkout_roots
         .iter()
         .map(|(observation_id, root)| (root.clone(), observation_id.clone()))
         .collect::<BTreeMap<_, _>>();
     if discovered_by_root.len() != discovered_checkout_roots.len() {
-        return Err(ProjectCatalogStoreError::new(
-            "error.project_catalog_invalid_migration_registry",
-            "migration registry bootstrap discovered duplicate checkout roots",
+        return Err(bootstrap_journal_failure(
+            ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_migration_registry",
+                "migration registry bootstrap discovered duplicate checkout roots",
+            ),
+            journal_disposition,
         ));
     }
     let mut retained_checkout_roots = BTreeMap::new();
@@ -1057,25 +1116,34 @@ pub(crate) fn bootstrap_migration_checkout_registry(
     for attachment in attachments.attachments.values() {
         let root = PathBuf::from(&attachment.checkout_dir);
         if !safe_absolute_path(&root) {
-            return Err(ProjectCatalogStoreError::new(
-                "error.project_catalog_invalid_migration_registry",
-                "migration attachment post-image contains an unsafe checkout root",
+            return Err(bootstrap_journal_failure(
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_invalid_migration_registry",
+                    "migration attachment post-image contains an unsafe checkout root",
+                ),
+                journal_disposition,
             ));
         }
-        let observation_id = discovered_by_root.get(&root).ok_or_else(|| {
-            ProjectCatalogStoreError::new(
-                "error.project_catalog_invalid_migration_registry",
-                "migration attachment root is absent from strict checkout discovery",
-            )
-        })?;
+        let observation_id = discovered_by_root
+            .get(&root)
+            .ok_or_else(|| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_invalid_migration_registry",
+                    "migration attachment root is absent from strict checkout discovery",
+                )
+            })
+            .map_err(|error| bootstrap_journal_failure(error, journal_disposition))?;
         retained_checkout_roots.insert(observation_id.clone(), root.clone());
         if let Some(existing) =
             roots_by_checkout_id.insert(attachment.checkout_id.clone(), root.clone())
             && existing != root
         {
-            return Err(ProjectCatalogStoreError::new(
-                "error.project_catalog_invalid_migration_registry",
-                "migration attachment checkout id identifies multiple roots",
+            return Err(bootstrap_journal_failure(
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_invalid_migration_registry",
+                    "migration attachment checkout id identifies multiple roots",
+                ),
+                journal_disposition,
             ));
         }
     }
@@ -1087,13 +1155,17 @@ pub(crate) fn bootstrap_migration_checkout_registry(
                     "error.project_catalog_invalid_migration_registry",
                     "migration action observation is absent from strict checkout discovery",
                 )
-            })?;
+            })
+            .map_err(|error| bootstrap_journal_failure(error, journal_disposition))?;
         if roots_by_checkout_id.get(&action.planned_id) != Some(root)
             || retained_checkout_roots.get(&action.observation_id) != Some(root)
         {
-            return Err(ProjectCatalogStoreError::new(
-                "error.project_catalog_invalid_migration_registry",
-                "migration action observation disagrees with the attachment post-image",
+            return Err(bootstrap_journal_failure(
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_invalid_migration_registry",
+                    "migration action observation disagrees with the attachment post-image",
+                ),
+                journal_disposition,
             ));
         }
     }
@@ -3594,9 +3666,10 @@ fn classify_migration_failure(
                 _ => MigrationMutationDispositionV1::RetryExactPlanRequired,
             }
         }
-        Ok(None) if !migration_plan_artifacts_exist_locked(&owner, plan) => {
-            MigrationMutationDispositionV1::NoDurableMutation
-        }
+        Ok(None) => match migration_plan_artifacts_exist_locked(&owner, plan) {
+            Ok(false) => MigrationMutationDispositionV1::NoDurableMutation,
+            Ok(true) | Err(_) => MigrationMutationDispositionV1::RetryExactPlanRequired,
+        },
         _ => MigrationMutationDispositionV1::RetryExactPlanRequired,
     }
 }
@@ -3604,9 +3677,9 @@ fn classify_migration_failure(
 fn migration_plan_artifacts_exist_locked(
     owner: &ProjectCatalogTransactionOwner,
     plan: &ValidatedMigrationPlanV1,
-) -> bool {
+) -> ProjectCatalogStoreResult<bool> {
     let ParticipantRegistry::Migration(registry) = &owner.registry else {
-        return true;
+        return Ok(true);
     };
     for participant in &plan.journal.participants {
         for (root, image) in [
@@ -3621,12 +3694,10 @@ fn migration_plan_artifacts_exist_locked(
                 .read_regular_nofollow(
                     &root.join(artifact_name.as_str()),
                     participant.role.max_bytes(),
-                )
-                .ok()
-                .flatten()
+                )?
                 .is_some()
             {
-                return true;
+                return Ok(true);
             }
         }
     }
@@ -3634,23 +3705,21 @@ fn migration_plan_artifacts_exist_locked(
         let target = registry.immutable_target(&asset.role, &asset.validated_name);
         if owner
             .io
-            .read_regular_nofollow(&target, asset.role.max_bytes())
-            .ok()
-            .flatten()
+            .read_regular_nofollow(&target, asset.role.max_bytes())?
             .is_some()
         {
-            return true;
+            return Ok(true);
         }
     }
-    plan.journal
-        .monotonic_checkout_identity_actions
-        .iter()
-        .any(|action| {
-            registry
-                .checkout_identity_target(&action.observation_id)
-                .and_then(|target| owner.io.read_regular_nofollow(&target, 128).ok().flatten())
-                .is_some()
-        })
+    for action in &plan.journal.monotonic_checkout_identity_actions {
+        let Some(target) = registry.checkout_identity_target(&action.observation_id) else {
+            continue;
+        };
+        if owner.io.read_regular_nofollow(&target, 128)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -8843,6 +8912,7 @@ mod tests {
         real: RealCatalogStoreIo,
         fail_at: Option<usize>,
         fail_points: BTreeSet<FaultPoint>,
+        fail_read_paths: BTreeSet<PathBuf>,
         seen: AtomicUsize,
         points: Mutex<Vec<FaultPoint>>,
         mutation_lock_paths: Mutex<Vec<PathBuf>>,
@@ -8854,6 +8924,7 @@ mod tests {
                 real: RealCatalogStoreIo,
                 fail_at: None,
                 fail_points: BTreeSet::new(),
+                fail_read_paths: BTreeSet::new(),
                 seen: AtomicUsize::new(0),
                 points: Mutex::new(Vec::new()),
                 mutation_lock_paths: Mutex::new(Vec::new()),
@@ -8865,6 +8936,7 @@ mod tests {
                 real: RealCatalogStoreIo,
                 fail_at: Some(index),
                 fail_points: BTreeSet::new(),
+                fail_read_paths: BTreeSet::new(),
                 seen: AtomicUsize::new(0),
                 points: Mutex::new(Vec::new()),
                 mutation_lock_paths: Mutex::new(Vec::new()),
@@ -8876,6 +8948,7 @@ mod tests {
                 real: RealCatalogStoreIo,
                 fail_at: None,
                 fail_points: points.into_iter().collect(),
+                fail_read_paths: BTreeSet::new(),
                 seen: AtomicUsize::new(0),
                 points: Mutex::new(Vec::new()),
                 mutation_lock_paths: Mutex::new(Vec::new()),
@@ -8890,6 +8963,19 @@ mod tests {
                 real: RealCatalogStoreIo,
                 fail_at: Some(index),
                 fail_points: points.into_iter().collect(),
+                fail_read_paths: BTreeSet::new(),
+                seen: AtomicUsize::new(0),
+                points: Mutex::new(Vec::new()),
+                mutation_lock_paths: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing_reads(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+            Self {
+                real: RealCatalogStoreIo,
+                fail_at: None,
+                fail_points: BTreeSet::new(),
+                fail_read_paths: paths.into_iter().collect(),
                 seen: AtomicUsize::new(0),
                 points: Mutex::new(Vec::new()),
                 mutation_lock_paths: Mutex::new(Vec::new()),
@@ -8922,6 +9008,12 @@ mod tests {
             path: &Path,
             max_bytes: usize,
         ) -> ProjectCatalogStoreResult<Option<Vec<u8>>> {
+            if self.fail_read_paths.contains(path) {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_injected_fault",
+                    "injected artifact read failure",
+                ));
+            }
             self.real.read_regular_nofollow(path, max_bytes)
         }
 
@@ -13577,6 +13669,102 @@ mod tests {
 
         assert_eq!(
             failure.disposition,
+            MigrationMutationDispositionV1::RetryExactPlanRequired
+        );
+    }
+
+    #[test]
+    fn bootstrap_failure_preserves_terminal_rollback_disposition() {
+        let (_trace_directory, trace_path, trace_plan, _, _) = migration_fault_fixture();
+        let recording = Arc::new(TracingIo::recording());
+        transact_migration_with_io(&trace_path, trace_plan, recording.clone()).unwrap();
+        let fail_after_prepared = recording
+            .trace()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, point)| {
+                (*point == FaultPoint::PreparedJournalWrite).then_some(index)
+            })
+            .nth(1)
+            .unwrap();
+
+        let (_directory, path, plan, _, _) = migration_fault_fixture();
+        let retry = plan.clone();
+        let mut bootstrap_registry = plan.registry.clone();
+        bootstrap_registry.checkout_identity_markers.clear();
+        let publisher_source = plan.registry.legacy_publisher_ref_source.clone();
+        assert!(
+            transact_migration_with_io(
+                &path,
+                plan,
+                Arc::new(TracingIo::failing_at(fail_after_prepared)),
+            )
+            .is_err()
+        );
+        fs::write(&publisher_source, b"new publisher source").unwrap();
+        let failure =
+            transact_migration_classified_with_io(&path, retry, Arc::new(RealCatalogStoreIo))
+                .unwrap_err();
+        assert_eq!(
+            failure.disposition,
+            MigrationMutationDispositionV1::RecoveredToOldState
+        );
+
+        let bootstrap_failure =
+            bootstrap_migration_checkout_registry(&path, bootstrap_registry, &BTreeMap::new())
+                .unwrap_err();
+
+        assert_eq!(
+            bootstrap_failure.disposition,
+            MigrationMutationDispositionV1::RecoveredToOldState
+        );
+    }
+
+    #[test]
+    fn bootstrap_failure_preserves_terminal_committed_disposition() {
+        let (_directory, path, plan, _, _) = migration_fault_fixture();
+        let mut bootstrap_registry = plan.registry.clone();
+        bootstrap_registry.checkout_identity_markers.clear();
+        transact_migration(&path, plan).unwrap();
+
+        let bootstrap_failure =
+            bootstrap_migration_checkout_registry(&path, bootstrap_registry, &BTreeMap::new())
+                .unwrap_err();
+
+        assert_eq!(
+            bootstrap_failure.disposition,
+            MigrationMutationDispositionV1::RecoveredToCommittedState
+        );
+        assert_eq!(
+            bootstrap_failure.error.code(),
+            "error.project_catalog_invalid_migration_registry"
+        );
+    }
+
+    #[test]
+    fn artifact_read_failure_cannot_classify_as_no_mutation() {
+        let (_directory, path, plan, _, _) = migration_fault_fixture();
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        let unreadable_artifact = plan
+            .journal
+            .participants
+            .iter()
+            .find_map(|participant| match &participant.new {
+                ExpectedImageV1::Present { artifact_name, .. } => {
+                    Some(paths.stage_dir.join(artifact_name.as_str()))
+                }
+                ExpectedImageV1::Absent => None,
+            })
+            .unwrap();
+
+        let disposition = classify_migration_failure(
+            &path,
+            &plan,
+            Arc::new(TracingIo::failing_reads([unreadable_artifact])),
+        );
+
+        assert_eq!(
+            disposition,
             MigrationMutationDispositionV1::RetryExactPlanRequired
         );
     }
