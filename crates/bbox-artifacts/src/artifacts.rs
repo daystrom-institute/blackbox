@@ -173,6 +173,119 @@ pub struct ArtifactCatalog {
     root: PathBuf,
 }
 
+/// Capture durable artifact targets and legacy project-path selectors without
+/// opening or creating an [`ArtifactCatalog`].
+pub fn capture_project_catalog_owner_snapshot(
+    root: &Path,
+    limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
+) -> std::result::Result<
+    bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotError,
+> {
+    use bbox_corpus_core::project_catalog_snapshot::{
+        LegacyProjectSelectorKindV1, OwnerSnapshotRowV1, OwnerSnapshotStateV1,
+        build_owner_snapshot, capture_stable_regular_tree_nofollow, corrupt_owner_snapshot,
+        finalize_owner_snapshot, missing_owner_snapshot, owner_subsource, sha256_hex,
+        stable_subsource_id,
+    };
+
+    match std::fs::symlink_metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return missing_owner_snapshot("artifact", "artifact:root", limits);
+        }
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        _ => {
+            return corrupt_owner_snapshot(
+                "artifact",
+                "artifact:root",
+                "owner_tree_unsafe",
+                limits,
+            );
+        }
+    }
+    let captures =
+        match capture_stable_regular_tree_nofollow(root, "artifact", limits, |relative| {
+            relative.file_name().and_then(|name| name.to_str()) == Some("metadata.json")
+                || relative
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".metadata.json"))
+        }) {
+            Ok(captures) => captures,
+            Err(error) => {
+                return corrupt_owner_snapshot("artifact", "artifact:root", error.code, limits);
+            }
+        };
+    if captures.is_empty() {
+        let state = OwnerSnapshotStateV1::Present {
+            content_sha256: sha256_hex(b""),
+            byte_len: 0,
+        };
+        return build_owner_snapshot(
+            "artifact",
+            vec![owner_subsource("artifact:root", state, &[])],
+            Vec::new(),
+            limits,
+        );
+    }
+    let mut rows = Vec::new();
+    let mut subsources = Vec::new();
+    for (relative, captured) in captures {
+        let subsource_id = stable_subsource_id("artifact", &relative);
+        let Some(bytes) = captured.bytes else {
+            return corrupt_owner_snapshot(
+                "artifact",
+                &subsource_id,
+                "owner_source_unreadable",
+                limits,
+            );
+        };
+        let metadata: ArtifactMetadata = match serde_json::from_slice(&bytes) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                return corrupt_owner_snapshot(
+                    "artifact",
+                    &subsource_id,
+                    "owner_source_invalid",
+                    limits,
+                );
+            }
+        };
+        let mut subsource_rows = Vec::new();
+        if let Some(project_id) = metadata
+            .project_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|project_id| !project_id.is_empty())
+        {
+            subsource_rows.push(OwnerSnapshotRowV1::inventory_target(
+                format!("{subsource_id}:target"),
+                project_id,
+                sha256_hex(&bytes),
+            ));
+        }
+        if let Some(project_path) = metadata
+            .project_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|project_path| !project_path.is_empty())
+        {
+            subsource_rows.push(OwnerSnapshotRowV1::legacy_selector(
+                format!("{subsource_id}:legacy-path"),
+                LegacyProjectSelectorKindV1::Project,
+                project_path,
+            ));
+        }
+        subsources.push(owner_subsource(
+            subsource_id,
+            captured.state,
+            &subsource_rows,
+        ));
+        rows.extend(subsource_rows);
+    }
+    finalize_owner_snapshot("artifact", "artifact:root", subsources, rows, limits)
+}
+
 impl ArtifactCatalog {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
@@ -2272,5 +2385,69 @@ mod tests {
         for path in result.paths {
             assert!(!std::path::Path::new(&path).exists());
         }
+    }
+
+    #[test]
+    fn migration_snapshot_captures_targets_and_legacy_paths_without_creating_root() {
+        use bbox_corpus_core::project_catalog_snapshot::{
+            OwnerSnapshotLimitsV1, OwnerSnapshotRowValueV1, OwnerSnapshotStateV1,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("artifacts");
+        let missing =
+            capture_project_catalog_owner_snapshot(&root, OwnerSnapshotLimitsV1::default())
+                .unwrap();
+        assert!(matches!(
+            missing.state,
+            OwnerSnapshotStateV1::Missing { .. }
+        ));
+        assert!(!root.exists());
+
+        let metadata_dir = root
+            .join("projects")
+            .join("project1")
+            .join("local")
+            .join("agent")
+            .join("owner-test");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        let metadata = ArtifactMetadata {
+            kind: ArtifactKind::Agent,
+            name: "owner-test".into(),
+            version: "1".into(),
+            source: "fixture".into(),
+            installed_at: "2026-01-01T00:00:00Z".into(),
+            content_sha256: Some("a".repeat(64)),
+            project_id: Some("project1".into()),
+            project_path: Some("/repo/legacy".into()),
+            local: true,
+            supersedes: None,
+            supersedes_chain: Vec::new(),
+            superseded_by: None,
+            active: true,
+            install_warnings: Vec::new(),
+        };
+        std::fs::write(
+            metadata_dir.join("metadata.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let snapshot =
+            capture_project_catalog_owner_snapshot(&root, OwnerSnapshotLimitsV1::default())
+                .unwrap();
+        assert_eq!(snapshot.row_count, 2);
+        assert!(snapshot.rows.iter().any(|row| matches!(
+            &row.value,
+            OwnerSnapshotRowValueV1::InventoryTarget { project_id, .. }
+                if project_id == "project1"
+        )));
+        assert!(snapshot.rows.iter().any(|row| matches!(
+            &row.value,
+            OwnerSnapshotRowValueV1::LegacyProjectSelector {
+                literal_selector,
+                ..
+            } if literal_selector == "/repo/legacy"
+        )));
     }
 }

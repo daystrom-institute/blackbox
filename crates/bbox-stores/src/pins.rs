@@ -96,6 +96,37 @@ impl PinStore {
     }
 }
 
+/// Capture pin rows that retain the legacy literal project selector.
+pub fn capture_project_catalog_owner_snapshot(
+    store_path: &Path,
+    limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
+) -> std::result::Result<
+    bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotError,
+> {
+    use bbox_corpus_core::project_catalog_snapshot::{
+        LegacyProjectSelectorKindV1, OwnerSnapshotRowV1, capture_json_owner,
+    };
+
+    capture_json_owner(store_path, "pin", "pin:central-json", limits, |bytes| {
+        let store: PinStore = serde_json::from_slice(bytes).map_err(|_| ())?;
+        Ok(store
+            .pins
+            .into_iter()
+            .filter_map(|pin| {
+                let selector = pin.project?.trim().to_string();
+                (!selector.is_empty()).then(|| {
+                    OwnerSnapshotRowV1::legacy_selector(
+                        pin.id,
+                        LegacyProjectSelectorKindV1::Project,
+                        selector,
+                    )
+                })
+            })
+            .collect())
+    })
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AmbientPinQuery<'a> {
     pub project: Option<&'a str>,

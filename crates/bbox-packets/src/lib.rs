@@ -230,6 +230,100 @@ pub struct Packets {
     generation: AtomicU64,
 }
 
+/// Capture packet rows that retain the legacy literal project selector.
+///
+/// The migration reader does not call [`Packets::open`], so a missing packet
+/// directory remains missing instead of being created as an empty store.
+pub fn capture_project_catalog_owner_snapshot(
+    packets_dir: &Path,
+    limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
+) -> std::result::Result<
+    bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotError,
+> {
+    use bbox_corpus_core::project_catalog_snapshot::{
+        LegacyProjectSelectorKindV1, OwnerSnapshotRowV1, OwnerSnapshotStateV1,
+        build_owner_snapshot, capture_stable_regular_tree_nofollow, corrupt_owner_snapshot,
+        finalize_owner_snapshot, missing_owner_snapshot, owner_subsource, sha256_hex,
+        stable_subsource_id,
+    };
+
+    match std::fs::symlink_metadata(packets_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return missing_owner_snapshot("packet", "packet:root", limits);
+        }
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        _ => return corrupt_owner_snapshot("packet", "packet:root", "owner_tree_unsafe", limits),
+    }
+    let captures =
+        match capture_stable_regular_tree_nofollow(packets_dir, "packet", limits, |relative| {
+            relative
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("json")
+        }) {
+            Ok(captures) => captures,
+            Err(error) => {
+                return corrupt_owner_snapshot("packet", "packet:root", error.code, limits);
+            }
+        };
+    if captures.is_empty() {
+        let state = OwnerSnapshotStateV1::Present {
+            content_sha256: sha256_hex(b""),
+            byte_len: 0,
+        };
+        return build_owner_snapshot(
+            "packet",
+            vec![owner_subsource("packet:root", state, &[])],
+            Vec::new(),
+            limits,
+        );
+    }
+    let mut rows = Vec::new();
+    let mut subsources = Vec::new();
+    for (relative, captured) in captures {
+        let subsource_id = stable_subsource_id("packet", &relative);
+        let Some(bytes) = captured.bytes else {
+            return corrupt_owner_snapshot(
+                "packet",
+                &subsource_id,
+                "owner_source_unreadable",
+                limits,
+            );
+        };
+        let packet: Packet = match serde_json::from_slice(&bytes) {
+            Ok(packet) => packet,
+            Err(_) => {
+                return corrupt_owner_snapshot(
+                    "packet",
+                    &subsource_id,
+                    "owner_source_invalid",
+                    limits,
+                );
+            }
+        };
+        let subsource_rows = packet
+            .project
+            .map(|project| project.trim().to_string())
+            .filter(|project| !project.is_empty())
+            .map(|project| {
+                vec![OwnerSnapshotRowV1::legacy_selector(
+                    packet.id,
+                    LegacyProjectSelectorKindV1::Project,
+                    project,
+                )]
+            })
+            .unwrap_or_default();
+        subsources.push(owner_subsource(
+            subsource_id,
+            captured.state,
+            &subsource_rows,
+        ));
+        rows.extend(subsource_rows);
+    }
+    finalize_owner_snapshot("packet", "packet:root", subsources, rows, limits)
+}
+
 impl Packets {
     pub fn open(packets_dir: &Path) -> Result<Self> {
         let actual_dir = packets_dir.to_path_buf();

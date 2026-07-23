@@ -1115,6 +1115,45 @@ impl KnowledgeStore {
     }
 }
 
+/// Capture central knowledge rows that still carry a literal project
+/// selector. This never opens or creates the mutable [`Knowledge`] store and
+/// never follows a source-file symlink.
+pub fn capture_project_catalog_owner_snapshot(
+    store_path: &Path,
+    limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
+) -> std::result::Result<
+    bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotError,
+> {
+    use bbox_corpus_core::project_catalog_snapshot::{
+        LegacyProjectSelectorKindV1, OwnerSnapshotRowV1, capture_json_owner,
+    };
+
+    capture_json_owner(
+        store_path,
+        "knowledge",
+        "knowledge:central-json",
+        limits,
+        |bytes| {
+            let store: KnowledgeStore = serde_json::from_slice(bytes).map_err(|_| ())?;
+            Ok(store
+                .entries
+                .into_iter()
+                .filter_map(|entry| {
+                    let selector = entry.project?.trim().to_string();
+                    (!selector.is_empty()).then(|| {
+                        OwnerSnapshotRowV1::legacy_selector(
+                            entry.id,
+                            LegacyProjectSelectorKindV1::Project,
+                            selector,
+                        )
+                    })
+                })
+                .collect())
+        },
+    )
+}
+
 impl StoreSnapshot for Knowledge {
     type Snapshot = KnowledgeStore;
 

@@ -67,6 +67,43 @@ struct StoreData {
     bindings: HashMap<String, ChannelBinding>,
 }
 
+/// Capture channel bindings that retain the legacy project directory.
+pub fn capture_project_catalog_owner_snapshot(
+    store_dir: &Path,
+    limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
+) -> std::result::Result<
+    bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotError,
+> {
+    use bbox_corpus_core::project_catalog_snapshot::{
+        LegacyProjectSelectorKindV1, OwnerSnapshotRowV1, capture_json_owner,
+    };
+
+    capture_json_owner(
+        &store_dir.join(STORE_FILE),
+        "slack_binding",
+        "slack_binding:channel-json",
+        limits,
+        |bytes| {
+            let store: StoreData = serde_json::from_slice(bytes).map_err(|_| ())?;
+            Ok(store
+                .bindings
+                .into_values()
+                .filter_map(|binding| {
+                    let selector = binding.project_dir.trim().to_string();
+                    (!selector.is_empty()).then(|| {
+                        OwnerSnapshotRowV1::legacy_selector(
+                            format!("{}:{}", binding.team_id, binding.channel_id),
+                            LegacyProjectSelectorKindV1::Project,
+                            selector,
+                        )
+                    })
+                })
+                .collect())
+        },
+    )
+}
+
 #[derive(Debug)]
 pub struct SlackChannelBindings {
     path: PathBuf,
@@ -348,5 +385,43 @@ mod tests {
             .unwrap();
         assert_eq!(store.lookup("T01", "C01").unwrap().project_dir, "/repo/a");
         assert_eq!(store.lookup("T02", "C01").unwrap().project_dir, "/repo/b");
+    }
+
+    #[test]
+    fn migration_snapshot_is_read_only_and_canonical() {
+        use bbox_corpus_core::project_catalog_snapshot::{
+            OwnerSnapshotLimitsV1, OwnerSnapshotRowValueV1, OwnerSnapshotStateV1,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing =
+            capture_project_catalog_owner_snapshot(dir.path(), OwnerSnapshotLimitsV1::default())
+                .unwrap();
+        assert!(matches!(
+            missing.state,
+            OwnerSnapshotStateV1::Missing { .. }
+        ));
+        assert!(!dir.path().join(STORE_FILE).exists());
+
+        let store = SlackChannelBindings::open(dir.path()).unwrap();
+        store
+            .bind(sample("T01", "C01", "alpha", "/repo/a"))
+            .unwrap();
+        store.bind(sample("T02", "C02", "beta", "/repo/b")).unwrap();
+        let first =
+            capture_project_catalog_owner_snapshot(dir.path(), OwnerSnapshotLimitsV1::default())
+                .unwrap();
+        let second =
+            capture_project_catalog_owner_snapshot(dir.path(), OwnerSnapshotLimitsV1::default())
+                .unwrap();
+        assert_eq!(first.canonical_sha256, second.canonical_sha256);
+        assert_eq!(first.row_count, 2);
+        assert!(first.rows.iter().any(|row| matches!(
+            &row.value,
+            OwnerSnapshotRowValueV1::LegacyProjectSelector {
+                literal_selector,
+                ..
+            } if literal_selector == "/repo/a"
+        )));
     }
 }

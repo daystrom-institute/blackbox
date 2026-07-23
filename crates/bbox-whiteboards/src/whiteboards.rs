@@ -669,6 +669,103 @@ pub struct WhiteboardRegistry {
     storage_dir: RwLock<Option<PathBuf>>,
 }
 
+/// Capture persisted boards that retain a legacy literal project selector.
+/// This does not initialize a [`WhiteboardRegistry`] or create its directory.
+pub fn capture_project_catalog_owner_snapshot(
+    storage_dir: &std::path::Path,
+    limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
+) -> std::result::Result<
+    bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotError,
+> {
+    use bbox_corpus_core::project_catalog_snapshot::{
+        LegacyProjectSelectorKindV1, OwnerSnapshotRowV1, OwnerSnapshotStateV1,
+        build_owner_snapshot, capture_stable_regular_tree_nofollow, corrupt_owner_snapshot,
+        finalize_owner_snapshot, missing_owner_snapshot, owner_subsource, sha256_hex,
+        stable_subsource_id,
+    };
+
+    match std::fs::symlink_metadata(storage_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return missing_owner_snapshot("whiteboard", "whiteboard:root", limits);
+        }
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        _ => {
+            return corrupt_owner_snapshot(
+                "whiteboard",
+                "whiteboard:root",
+                "owner_tree_unsafe",
+                limits,
+            );
+        }
+    }
+    let captures =
+        match capture_stable_regular_tree_nofollow(storage_dir, "whiteboard", limits, |relative| {
+            relative
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("json")
+        }) {
+            Ok(captures) => captures,
+            Err(error) => {
+                return corrupt_owner_snapshot("whiteboard", "whiteboard:root", error.code, limits);
+            }
+        };
+    if captures.is_empty() {
+        let state = OwnerSnapshotStateV1::Present {
+            content_sha256: sha256_hex(b""),
+            byte_len: 0,
+        };
+        return build_owner_snapshot(
+            "whiteboard",
+            vec![owner_subsource("whiteboard:root", state, &[])],
+            Vec::new(),
+            limits,
+        );
+    }
+    let mut rows = Vec::new();
+    let mut subsources = Vec::new();
+    for (relative, captured) in captures {
+        let subsource_id = stable_subsource_id("whiteboard", &relative);
+        let Some(bytes) = captured.bytes else {
+            return corrupt_owner_snapshot(
+                "whiteboard",
+                &subsource_id,
+                "owner_source_unreadable",
+                limits,
+            );
+        };
+        let board: Board = match serde_json::from_slice(&bytes) {
+            Ok(board) => board,
+            Err(_) => {
+                return corrupt_owner_snapshot(
+                    "whiteboard",
+                    &subsource_id,
+                    "owner_source_invalid",
+                    limits,
+                );
+            }
+        };
+        let selector = board.project.trim().to_string();
+        let subsource_rows = (!selector.is_empty())
+            .then(|| {
+                vec![OwnerSnapshotRowV1::legacy_selector(
+                    board.id,
+                    LegacyProjectSelectorKindV1::Project,
+                    selector,
+                )]
+            })
+            .unwrap_or_default();
+        subsources.push(owner_subsource(
+            subsource_id,
+            captured.state,
+            &subsource_rows,
+        ));
+        rows.extend(subsource_rows);
+    }
+    finalize_owner_snapshot("whiteboard", "whiteboard:root", subsources, rows, limits)
+}
+
 pub type SharedRegistry = Arc<WhiteboardRegistry>;
 
 impl WhiteboardRegistry {

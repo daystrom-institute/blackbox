@@ -251,6 +251,43 @@ impl RoadmapStore {
     }
 }
 
+/// Capture roadmap rows that retain the legacy literal project selector.
+pub fn capture_project_catalog_owner_snapshot(
+    store_path: &Path,
+    limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
+) -> std::result::Result<
+    bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotError,
+> {
+    use bbox_corpus_core::project_catalog_snapshot::{
+        LegacyProjectSelectorKindV1, OwnerSnapshotRowV1, capture_json_owner,
+    };
+
+    capture_json_owner(
+        store_path,
+        "roadmap",
+        "roadmap:central-json",
+        limits,
+        |bytes| {
+            let store: RoadmapStore = serde_json::from_slice(bytes).map_err(|_| ())?;
+            Ok(store
+                .items
+                .into_iter()
+                .filter_map(|item| {
+                    let selector = item.project?.trim().to_string();
+                    (!selector.is_empty()).then(|| {
+                        OwnerSnapshotRowV1::legacy_selector(
+                            item.id,
+                            LegacyProjectSelectorKindV1::Project,
+                            selector,
+                        )
+                    })
+                })
+                .collect())
+        },
+    )
+}
+
 // ── Roadmap ─────────────────────────────────────────────────────────
 
 pub struct Roadmap {

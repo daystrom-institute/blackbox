@@ -767,6 +767,38 @@ impl GapStoreData {
     }
 }
 
+/// Capture central gap rows that still carry a literal project selector.
+/// Missing and malformed stores are returned as typed source states.
+pub fn capture_project_catalog_owner_snapshot(
+    store_path: &Path,
+    limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
+) -> std::result::Result<
+    bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotError,
+> {
+    use bbox_corpus_core::project_catalog_snapshot::{
+        LegacyProjectSelectorKindV1, OwnerSnapshotRowV1, capture_json_owner,
+    };
+
+    capture_json_owner(store_path, "gap", "gap:central-json", limits, |bytes| {
+        let store: GapStoreData = serde_json::from_slice(bytes).map_err(|_| ())?;
+        Ok(store
+            .gaps
+            .into_iter()
+            .filter_map(|gap| {
+                let selector = gap.project?.trim().to_string();
+                (!selector.is_empty()).then(|| {
+                    OwnerSnapshotRowV1::legacy_selector(
+                        gap.id,
+                        LegacyProjectSelectorKindV1::Project,
+                        selector,
+                    )
+                })
+            })
+            .collect())
+    })
+}
+
 pub struct GapStore {
     store_path: PathBuf,
     data: GapStoreData,
