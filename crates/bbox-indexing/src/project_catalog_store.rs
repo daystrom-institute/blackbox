@@ -3023,31 +3023,14 @@ impl ProjectCatalogTransactionOwner {
             let ParticipantRoleV1::CollisionRetirement { project_id } = &participant.role else {
                 continue;
             };
-            let lifecycle = current
-                .collision_pending
-                .iter()
-                .find(|row| row.project_id == *project_id)
-                .ok_or_else(|| {
-                    ProjectCatalogStoreError::new(
-                        "error.project_catalog_migration_incomplete",
-                        "historical collision lacks its durable lifecycle record",
-                    )
-                })?;
-            let activation_participant = journal
-                .participants
-                .iter()
-                .find(|candidate| {
-                    candidate.role
-                        == (ParticipantRoleV1::Activation {
-                            project_id: project_id.clone(),
-                        })
-                })
-                .ok_or_else(|| {
-                    ProjectCatalogStoreError::new(
-                        "error.project_catalog_migration_incomplete",
-                        "historical collision lacks activation evidence",
-                    )
-                })?;
+            let Some(activation_participant) = journal.participants.iter().find(|candidate| {
+                candidate.role
+                    == (ParticipantRoleV1::Activation {
+                        project_id: project_id.clone(),
+                    })
+            }) else {
+                continue;
+            };
             let ExpectedImageV1::Present { artifact_name, .. } = &activation_participant.old else {
                 return Err(ProjectCatalogStoreError::new(
                     "error.project_catalog_migration_incomplete",
@@ -3143,6 +3126,16 @@ impl ProjectCatalogTransactionOwner {
             let ParticipantRoleV1::CollisionRetirement { project_id } = &participant.role else {
                 continue;
             };
+            let lifecycle = current
+                .collision_pending
+                .iter()
+                .find(|row| row.project_id == *project_id)
+                .ok_or_else(|| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_migration_incomplete",
+                        "historical collision lacks its durable lifecycle record",
+                    )
+                })?;
             let activation_participant = journal.participants.iter().find(|candidate| {
                 candidate.role
                     == (ParticipantRoleV1::Activation {

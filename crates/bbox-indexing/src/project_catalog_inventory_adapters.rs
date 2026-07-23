@@ -2296,11 +2296,11 @@ mod tests {
             file_count: 1,
             logical_bytes: content.len() as u64,
         };
-        let generation_id = generation_id("host-a", &descriptor);
+        let active_generation_id = generation_id("host-a", &descriptor);
         let descriptor_manifest_sha256 = descriptor.manifest_sha256.clone();
         let stored = StoredGeneration {
             version: 1,
-            generation_id: generation_id.clone(),
+            generation_id: active_generation_id.clone(),
             producer_id: "host-a".to_string(),
             ordinal: 1,
             descriptor: descriptor.clone(),
@@ -2315,11 +2315,15 @@ mod tests {
         serde_json::to_writer(&mut manifest, &entries[0]).unwrap();
         manifest.push(b'\n');
         write(
-            &paths.generation_metadata(&scope, &generation_id).unwrap(),
+            &paths
+                .generation_metadata(&scope, &active_generation_id)
+                .unwrap(),
             &metadata,
         );
         write(
-            &paths.generation_manifest(&scope, &generation_id).unwrap(),
+            &paths
+                .generation_manifest(&scope, &active_generation_id)
+                .unwrap(),
             &manifest,
         );
         let retained_generation_id = generation_id("host-retained", &descriptor);
@@ -2349,14 +2353,14 @@ mod tests {
         );
         let selector = format!(
             "{}:m0123456789abcdef",
-            source_selector(project_id.as_str(), &generation_id)
+            source_selector(project_id.as_str(), &active_generation_id)
         );
         write(
             &paths.activation(&project_id),
             &serde_json::to_vec(&ActivationRecord {
                 version: 1,
                 project_id: project_id.to_string(),
-                generation_id: generation_id.clone(),
+                generation_id: active_generation_id.clone(),
                 selector: selector.clone(),
                 snapshot_id: format!("collected-{}", "e".repeat(32)),
                 document_count: 1,
@@ -2375,7 +2379,7 @@ mod tests {
                 selections: vec![MigrationEffectiveSourceSelectionV1 {
                     project_id: project_id.clone(),
                     published_scope: scope.clone(),
-                    generation_id: generation_id.clone(),
+                    generation_id: active_generation_id.clone(),
                     selector: selector.clone(),
                 }],
             })
@@ -2386,7 +2390,7 @@ mod tests {
             state: CollisionRetirementLifecycleStateV1::Pending,
             project_id: project_id.clone(),
             former_scope: scope.clone(),
-            generation_id: generation_id.clone(),
+            generation_id: active_generation_id.clone(),
             selector_evidence: CollisionRetirementSelectorEvidenceV1::ExactMaterialized(selector),
             snapshot_id: format!("collected-{}", "e".repeat(32)),
             manifest_sha256: descriptor_manifest_sha256,
@@ -2417,7 +2421,7 @@ mod tests {
         )
         .unwrap();
         let quarantined = &capture.sources[0].observation.quarantine[0];
-        assert_eq!(quarantined.generation_id, generation_id);
+        assert_eq!(quarantined.generation_id, active_generation_id);
         assert!(matches!(
             quarantined.descriptor,
             ImmutableCollectedDescriptorV1::Valid { .. }
@@ -2499,7 +2503,9 @@ mod tests {
         let mut retained_origin = stored.clone();
         retained_origin.state = GenerationState::Superseded;
         write(
-            &paths.generation_metadata(&scope, &generation_id).unwrap(),
+            &paths
+                .generation_metadata(&scope, &active_generation_id)
+                .unwrap(),
             &serde_json::to_vec(&retained_origin).unwrap(),
         );
         collision.project_id = retained_project_id.clone();
