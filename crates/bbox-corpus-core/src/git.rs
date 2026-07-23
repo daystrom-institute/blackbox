@@ -23,12 +23,14 @@ pub struct GitCommit {
 }
 
 /// A full object id verified to name a commit in one exact repository/object
-/// environment. The repository root and explicit alternate object directory
-/// are captured once so every subsequent tree/blob read uses the same
-/// authority inputs without resolving a movable ref again.
+/// environment. The exact worktree root, canonical Git directory, and explicit
+/// alternate object directory are captured once so every subsequent tree/blob
+/// read uses the same authority inputs without repository rediscovery or a
+/// movable ref.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedCommit {
     repository_root: PathBuf,
+    git_dir: PathBuf,
     oid: String,
     alternate_objects: Option<PathBuf>,
     object_id_hex_len: usize,
@@ -312,13 +314,15 @@ pub fn verify_commit_oid_with_alternate(
     {
         anyhow::bail!("exact commit must be a full lowercase hexadecimal object id");
     }
-    let repository_root = root
-        .canonicalize()
-        .with_context(|| format!("canonicalizing exact-read repository {}", root.display()))?;
-    let repository_objects = resolve_hardened_git_objects_dir(&repository_root)?;
+    let repository = resolve_hardened_worktree_root(root, "exact-read repository")?;
+    let repository_objects =
+        resolve_hardened_git_objects_dir(&repository.git_dir, &repository.root)?;
     reject_repository_configured_alternates(&repository_objects)?;
     let alternate_objects = alternate_root
-        .map(resolve_hardened_git_objects_dir)
+        .map(|root| {
+            let alternate = resolve_hardened_worktree_root(root, "explicit alternate repository")?;
+            resolve_hardened_git_objects_dir(&alternate.git_dir, &alternate.root)
+        })
         .transpose()?;
     if let Some(alternate_objects) = alternate_objects.as_deref() {
         reject_repository_configured_alternates(alternate_objects)?;
@@ -326,13 +330,13 @@ pub fn verify_commit_oid_with_alternate(
 
     let mut format_command = Command::new("git");
     format_command
-        .arg("-C")
-        .arg(&repository_root)
+        .arg("--git-dir")
+        .arg(&repository.git_dir)
         .args(["rev-parse", "--show-object-format=storage"]);
     configure_exact_read_environment(&mut format_command, alternate_objects.as_deref())?;
     let format_output = run_bounded_with_timeout_and_stdout_limit(
         format_command,
-        &repository_root,
+        &repository.root,
         "reading repository object format",
         GIT_OUTPUT_TIMEOUT,
         Some(32),
@@ -340,7 +344,7 @@ pub fn verify_commit_oid_with_alternate(
     .context("running git to read repository object format")?;
     ensure_exact_git_success(
         &format_output,
-        &repository_root,
+        &repository.root,
         "reading repository object format",
     )?;
     if format_output.stdout_overflowed {
@@ -360,13 +364,13 @@ pub fn verify_commit_oid_with_alternate(
 
     let mut type_command = Command::new("git");
     type_command
-        .arg("-C")
-        .arg(&repository_root)
+        .arg("--git-dir")
+        .arg(&repository.git_dir)
         .args(["cat-file", "-t", oid]);
     configure_exact_read_environment(&mut type_command, alternate_objects.as_deref())?;
     let type_output = run_bounded_with_timeout_and_stdout_limit(
         type_command,
-        &repository_root,
+        &repository.root,
         "verifying exact commit object",
         GIT_OUTPUT_TIMEOUT,
         Some(32),
@@ -374,7 +378,7 @@ pub fn verify_commit_oid_with_alternate(
     .context("running git to verify exact commit object")?;
     ensure_exact_git_success(
         &type_output,
-        &repository_root,
+        &repository.root,
         "verifying exact commit object",
     )?;
     if type_output.stdout_overflowed {
@@ -385,7 +389,8 @@ pub fn verify_commit_oid_with_alternate(
     }
 
     Ok(VerifiedCommit {
-        repository_root,
+        repository_root: repository.root,
+        git_dir: repository.git_dir,
         oid: oid.to_string(),
         alternate_objects,
         object_id_hex_len,
@@ -406,8 +411,8 @@ pub fn read_verified_committed_file_bytes_bounded(
     let spec = format!("{}:{}", commit.oid, repo_rel);
     let mut command = Command::new("git");
     command
-        .arg("-C")
-        .arg(&commit.repository_root)
+        .arg("--git-dir")
+        .arg(&commit.git_dir)
         .args(["cat-file", "blob", &spec]);
     configure_exact_read_environment(&mut command, commit.alternate_objects.as_deref())?;
     let output = run_bounded_with_timeout_and_stdout_limit(
@@ -434,12 +439,68 @@ pub fn read_verified_committed_file_bytes_bounded(
     Ok(output.stdout)
 }
 
-fn resolve_hardened_git_objects_dir(root: &Path) -> Result<PathBuf> {
-    let root = root
+struct HardenedWorktreeRoot {
+    root: PathBuf,
+    git_dir: PathBuf,
+}
+
+fn resolve_hardened_worktree_root(caller_root: &Path, label: &str) -> Result<HardenedWorktreeRoot> {
+    let caller_root = caller_root
         .canonicalize()
-        .with_context(|| format!("canonicalizing alternate repository {}", root.display()))?;
+        .with_context(|| format!("canonicalizing {label} {}", caller_root.display()))?;
+    let discovered_root = run_hardened_repository_path_query(
+        &caller_root,
+        &["rev-parse", "--show-toplevel"],
+        "resolving exact worktree root",
+    )?;
+    if discovered_root != caller_root {
+        anyhow::bail!("{label} must be the exact worktree root, not a nested repository path");
+    }
+    let git_dir = run_hardened_repository_path_query(
+        &caller_root,
+        &["rev-parse", "--absolute-git-dir"],
+        "resolving exact worktree git directory",
+    )?;
+    Ok(HardenedWorktreeRoot {
+        root: caller_root,
+        git_dir,
+    })
+}
+
+fn run_hardened_repository_path_query(
+    caller_root: &Path,
+    args: &[&str],
+    action: &'static str,
+) -> Result<PathBuf> {
     let mut command = Command::new("git");
-    command.arg("-C").arg(&root).args([
+    command.arg("-C").arg(caller_root).args(args);
+    configure_exact_read_environment(&mut command, None)?;
+    let output = run_bounded_with_timeout_and_stdout_limit(
+        command,
+        caller_root,
+        action,
+        GIT_OUTPUT_TIMEOUT,
+        Some(16 * 1024),
+    )
+    .with_context(|| format!("running git while {action}"))?;
+    ensure_exact_git_success(&output, caller_root, action)?;
+    if output.stdout_overflowed {
+        anyhow::bail!("{action} output exceeded its byte limit");
+    }
+    let raw = std::str::from_utf8(&output.stdout)
+        .with_context(|| format!("{action} output is not UTF-8"))?
+        .trim();
+    if raw.is_empty() || raw.contains('\n') || raw.contains('\r') {
+        anyhow::bail!("{action} output is malformed");
+    }
+    PathBuf::from(raw)
+        .canonicalize()
+        .with_context(|| format!("canonicalizing path returned while {action}: {raw}"))
+}
+
+fn resolve_hardened_git_objects_dir(git_dir: &Path, diagnostic_root: &Path) -> Result<PathBuf> {
+    let mut command = Command::new("git");
+    command.arg("--git-dir").arg(git_dir).args([
         "rev-parse",
         "--path-format=absolute",
         "--git-path",
@@ -448,29 +509,29 @@ fn resolve_hardened_git_objects_dir(root: &Path) -> Result<PathBuf> {
     configure_exact_read_environment(&mut command, None)?;
     let output = run_bounded_with_timeout_and_stdout_limit(
         command,
-        &root,
-        "resolving explicit alternate object directory",
+        diagnostic_root,
+        "resolving captured repository object directory",
         GIT_OUTPUT_TIMEOUT,
         Some(16 * 1024),
     )
-    .context("running git to resolve explicit alternate object directory")?;
+    .context("running git to resolve captured repository object directory")?;
     ensure_exact_git_success(
         &output,
-        &root,
-        "resolving explicit alternate object directory",
+        diagnostic_root,
+        "resolving captured repository object directory",
     )?;
     if output.stdout_overflowed {
-        anyhow::bail!("alternate object directory output exceeded its byte limit");
+        anyhow::bail!("captured repository object directory output exceeded its byte limit");
     }
     let raw = std::str::from_utf8(&output.stdout)
-        .context("alternate object directory is not UTF-8")?
+        .context("captured repository object directory is not UTF-8")?
         .trim();
     if raw.is_empty() || raw.contains('\n') || raw.contains('\r') {
-        anyhow::bail!("alternate object directory output is malformed");
+        anyhow::bail!("captured repository object directory output is malformed");
     }
     PathBuf::from(raw)
         .canonicalize()
-        .with_context(|| format!("canonicalizing alternate object directory {raw}"))
+        .with_context(|| format!("canonicalizing captured repository object directory {raw}"))
 }
 
 fn reject_repository_configured_alternates(objects: &Path) -> Result<()> {
@@ -550,7 +611,7 @@ pub fn list_verified_committed_dir_bounded(
 ) -> Result<Vec<String>> {
     validate_repository_relative_git_path(dir_rel, "committed directory")?;
     let mut command = Command::new("git");
-    command.arg("-C").arg(&commit.repository_root).args([
+    command.arg("--git-dir").arg(&commit.git_dir).args([
         "--literal-pathspecs",
         "ls-tree",
         "-r",
@@ -1921,6 +1982,94 @@ mod tests {
         fs::write(info.join("alternates"), b"/untrusted/object/store\n").unwrap();
 
         assert!(verify_commit_oid_with_alternate(&root, &oid, None).is_err());
+    }
+
+    #[test]
+    fn exact_commit_verification_rejects_nested_primary_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        init_repo(&root);
+        write(&root, "nested/entry", "one");
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-q", "-m", "one"]);
+        let oid = resolve_commit(&root, "HEAD").unwrap();
+        let nested = root.join("nested").canonicalize().unwrap();
+
+        assert!(
+            verify_commit_oid_with_alternate(&nested, &oid, None)
+                .unwrap_err()
+                .to_string()
+                .contains("exact worktree root")
+        );
+    }
+
+    #[test]
+    fn exact_commit_verification_rejects_nested_explicit_alternate_root() {
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary = primary_dir.path().canonicalize().unwrap();
+        init_repo(&primary);
+        write(&primary, "entry", "primary");
+        run_git(&primary, &["add", "."]);
+        run_git(&primary, &["commit", "-q", "-m", "primary"]);
+        let oid = resolve_commit(&primary, "HEAD").unwrap();
+
+        let alternate_dir = tempfile::tempdir().unwrap();
+        let alternate = alternate_dir.path().canonicalize().unwrap();
+        init_repo(&alternate);
+        write(&alternate, "nested/entry", "alternate");
+        run_git(&alternate, &["add", "."]);
+        run_git(&alternate, &["commit", "-q", "-m", "alternate"]);
+        let nested_alternate = alternate.join("nested").canonicalize().unwrap();
+
+        assert!(
+            verify_commit_oid_with_alternate(&primary, &oid, Some(&nested_alternate))
+                .unwrap_err()
+                .to_string()
+                .contains("exact worktree root")
+        );
+    }
+
+    #[test]
+    fn verified_commit_uses_captured_linked_worktree_gitdir() {
+        let base_dir = tempfile::tempdir().unwrap();
+        let base = base_dir.path().canonicalize().unwrap();
+        init_repo(&base);
+        write(&base, ".bbox/knowledge/entry.json", "worktree");
+        run_git(&base, &["add", "."]);
+        run_git(&base, &["commit", "-q", "-m", "base"]);
+
+        let worktree_parent = tempfile::tempdir().unwrap();
+        let worktree = worktree_parent.path().join("linked");
+        run_git(
+            &base,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "verified-worktree",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        let worktree = worktree.canonicalize().unwrap();
+        let oid = resolve_commit(&worktree, "HEAD").unwrap();
+        let verified = verify_commit_oid_with_alternate(&worktree, &oid, None).unwrap();
+        assert!(verified.git_dir.is_dir());
+
+        fs::rename(worktree.join(".git"), worktree.join(".git.detached")).unwrap();
+        assert_eq!(
+            list_verified_committed_dir_bounded(&verified, ".bbox/knowledge", 10, 4096).unwrap(),
+            vec![".bbox/knowledge/entry.json".to_string()]
+        );
+        assert_eq!(
+            read_verified_committed_file_bytes_bounded(
+                &verified,
+                ".bbox/knowledge/entry.json",
+                64,
+            )
+            .unwrap(),
+            b"worktree"
+        );
     }
 
     #[test]
