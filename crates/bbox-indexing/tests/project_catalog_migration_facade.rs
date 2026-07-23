@@ -649,7 +649,9 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
             .repo_history_groups
             .iter()
             .find(|group| group.project_ids.contains(project_id))
-            .map(|group| group.planned_primary_namespace.as_str());
+            .expect("legacy project has reviewed history group")
+            .planned_primary_namespace
+            .as_str();
         let record = verified
             .compatibility()
             .records()
@@ -657,7 +659,7 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
             .find(|record| record.project_id == project_id.as_str())
             .unwrap();
         assert_eq!(record.canonical_path, checkout.to_str().unwrap());
-        assert_eq!(record.repo_id.as_deref(), planned_repo_id);
+        assert_eq!(record.repo_id.as_deref(), Some(planned_repo_id));
         assert_eq!(record.registered_at, registered_at);
         assert!(record.is_git_repo);
         assert!(record.languages.is_empty());
