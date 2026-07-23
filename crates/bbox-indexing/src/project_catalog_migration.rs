@@ -3429,7 +3429,7 @@ fn prepare_closed_migration(
             legacy_project_store_path: layout.projects_path.clone(),
             publisher_ref_store: &publisher_ref_store,
             code_source_store_root: layout.code_source_root.clone(),
-            code_source_store_limits: layout.store_limits,
+            code_source_store_limits: layout.store_limits.clone(),
             checkout_roots,
             owner_paths: owner_inventory_paths(layout),
             owner_limits: ProjectCatalogOwnerInventoryLimitsV1::default(),
