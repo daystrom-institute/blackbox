@@ -4261,9 +4261,13 @@ impl CodeSourceStore {
         }
         let collision_lifecycle = self.collision_retirement_pending_records_for_gc()?;
         for record in &collision_lifecycle {
-            if record.state != CollisionRetirementLifecycleStateV1::Completed {
-                authority_scopes.insert(record.former_scope.clone());
-            }
+            authority_scopes.extend(
+                record
+                    .entries
+                    .values()
+                    .filter(|entry| entry.state != CollisionRetirementLifecycleStateV1::Completed)
+                    .map(|entry| entry.former_scope.clone()),
+            );
         }
 
         let has_current_rows = generations
@@ -4319,7 +4323,11 @@ impl CodeSourceStore {
             "collision retirement lifecycle",
             |project_id, bytes, record| {
                 commitment.add(&project_id, &bytes)?;
-                if record.state != CollisionRetirementLifecycleStateV1::Completed {
+                if record
+                    .entries
+                    .values()
+                    .any(|entry| entry.state != CollisionRetirementLifecycleStateV1::Completed)
+                {
                     records.push(record);
                 }
                 Ok(())
@@ -7280,20 +7288,34 @@ mod tests {
         let pending = CollisionRetirementLifecycleV1 {
             version: STORE_VERSION,
             project_id: project_id.clone(),
-            entries: BTreeMap::from([(
-                generation_id,
-                CollisionRetirementEntryV1 {
-                    state: CollisionRetirementLifecycleStateV1::Pending,
-                    former_scope: descriptor.scope,
-                    selector_evidence: CollisionRetirementSelectorEvidenceV1::ExactMaterialized(
-                        selector,
-                    ),
-                    snapshot_id: format!("collected-{}", "e".repeat(32)),
-                    manifest_sha256: descriptor.manifest_sha256,
-                    inventory_hash: "c".repeat(64),
-                    plan_hash: "d".repeat(64),
-                },
-            )]),
+            entries: BTreeMap::from([
+                (
+                    generation_id.clone(),
+                    CollisionRetirementEntryV1 {
+                        state: CollisionRetirementLifecycleStateV1::Pending,
+                        former_scope: descriptor.scope.clone(),
+                        selector_evidence: CollisionRetirementSelectorEvidenceV1::ExactMaterialized(
+                            selector,
+                        ),
+                        snapshot_id: format!("collected-{}", "e".repeat(32)),
+                        manifest_sha256: descriptor.manifest_sha256.clone(),
+                        inventory_hash: "c".repeat(64),
+                        plan_hash: "d".repeat(64),
+                    },
+                ),
+                (
+                    "f".repeat(64),
+                    CollisionRetirementEntryV1 {
+                        state: CollisionRetirementLifecycleStateV1::Completed,
+                        former_scope: descriptor.scope,
+                        selector_evidence: CollisionRetirementSelectorEvidenceV1::NoDurableSelector,
+                        snapshot_id: format!("collected-{}", "f".repeat(32)),
+                        manifest_sha256: "1".repeat(64),
+                        inventory_hash: "2".repeat(64),
+                        plan_hash: "d".repeat(64),
+                    },
+                ),
+            ]),
         };
         let pending_path = store.paths.collision_retirement_pending(&project_id);
         atomic_write(
@@ -7304,9 +7326,17 @@ mod tests {
 
         assert_eq!(store.gc_blobs().unwrap().reclaimed_blobs, 0);
         assert!(store.blob_path(&hash).is_file());
-        fs::remove_file(&pending_path).unwrap();
+        let mut completed = pending;
+        completed.entries.get_mut(&generation_id).unwrap().state =
+            CollisionRetirementLifecycleStateV1::Completed;
+        atomic_write(
+            &pending_path,
+            &encode_collision_retirement_pending_for_migration(&completed).unwrap(),
+        )
+        .unwrap();
         assert_eq!(store.gc_blobs().unwrap().reclaimed_blobs, 1);
         assert!(!store.blob_path(&hash).exists());
+        assert!(pending_path.is_file());
     }
 
     #[test]
