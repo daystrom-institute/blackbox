@@ -14,9 +14,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use bbox_code_source::{
-    GenerationState, source_selector, validate_collected_materialization_selector,
-};
+use bbox_code_source::{GenerationState, validate_collected_materialization_selector};
 use bbox_code_source_store::{
     ActivationRecord, ActivationRecordV2, CodeSourceStore, CollisionRetirementLifecycleStateV1,
     MigrationLegacyAnchorEvidenceV1, MigrationLegacyGenerationEvidenceV1,
@@ -893,6 +891,7 @@ fn observe_code_sources(
     missing_checkout_projects: &BTreeSet<ProjectId>,
 ) -> AdapterResult<CodeSourceInventoryCaptureV1> {
     let generations_by_id = snapshot
+        .owner
         .inventory
         .generations
         .iter()
@@ -1000,6 +999,7 @@ fn observe_code_sources(
         owner_by_generation.insert(generation.generation_id.clone(), candidates[0].clone());
     }
     let collision_by_generation = snapshot
+        .owner
         .inventory
         .collision_pending
         .iter()
@@ -1034,6 +1034,7 @@ fn observe_code_sources(
     for (project_id, mut generation_rows) in grouped {
         generation_rows.sort_by(|left, right| left.generation_id.cmp(&right.generation_id));
         let activation = snapshot
+            .owner
             .inventory
             .activations
             .iter()
@@ -2088,7 +2089,7 @@ mod tests {
 
     use bbox_code_source::{
         GenerationDescriptor, ManifestEntry, SCHEMA_VERSION, WALKER_POLICY_VERSION,
-        dirty_fingerprint, generation_id, manifest_sha256,
+        dirty_fingerprint, generation_id, manifest_sha256, source_selector,
     };
     use bbox_code_source_store::{
         CodeSourceStorePaths, CollisionRetirementLifecycleV1, StoredGeneration,

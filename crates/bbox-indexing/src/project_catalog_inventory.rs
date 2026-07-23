@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use bbox_code_source_store::MAX_SNAPSHOT_ID_BYTES;
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::language::Language;
 use bbox_corpus_core::project_catalog::{
@@ -4369,7 +4370,7 @@ fn validate_collision_lifecycle(
     }
     validate_bounded_text(
         &lifecycle.snapshot_id,
-        MAX_STABLE_ID_BYTES,
+        MAX_SNAPSHOT_ID_BYTES,
         "collision lifecycle snapshot id",
     )
 }
