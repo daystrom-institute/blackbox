@@ -1638,11 +1638,11 @@ struct ImmutableInventoryLanesV1 {
     legacy_namespace_clusters: ImmutableLaneCaptureV1<LegacyNamespaceClusterObservationV1>,
 }
 
-pub struct ProjectCatalogMigrationInventoryRequestV1<'a> {
-    pub legacy_project_store_path: PathBuf,
-    pub publisher_ref_store: &'a PublisherRefStore,
-    pub code_source_store: &'a CodeSourceStore,
-    pub checkout_roots: Vec<PathBuf>,
+pub(crate) struct ProjectCatalogMigrationInventoryRequestV1<'a> {
+    pub(crate) legacy_project_store_path: PathBuf,
+    pub(crate) publisher_ref_store: &'a PublisherRefStore,
+    pub(crate) code_source_store: &'a CodeSourceStore,
+    pub(crate) checkout_roots: Vec<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -1768,19 +1768,19 @@ fn validate_authorized_path_bindings(
 }
 
 #[derive(Debug, Clone)]
-pub struct ProjectCatalogMigrationInventoryResultV1 {
-    pub inventory: V1ProjectCatalogInventory,
+pub(crate) struct ProjectCatalogMigrationInventoryResultV1 {
+    pub(crate) inventory: V1ProjectCatalogInventory,
     /// Host-local authorities are retained outside canonical inventory JSON.
     _runtime_bindings: InventoryRuntimeBindingsV1,
-    pub code_source_canonical_sha256: Sha256ValueV1,
-    pub code_source_generation_count: u64,
-    pub code_source_generation_set_sha256: Sha256ValueV1,
+    pub(crate) code_source_canonical_sha256: Sha256ValueV1,
+    pub(crate) code_source_generation_count: u64,
+    pub(crate) code_source_generation_set_sha256: Sha256ValueV1,
 }
 
-pub struct ProjectCatalogMigrationInventoryFacadeV1;
+pub(crate) struct ProjectCatalogMigrationInventoryFacadeV1;
 
 impl ProjectCatalogMigrationInventoryFacadeV1 {
-    pub fn capture(
+    pub(crate) fn capture(
         request: ProjectCatalogMigrationInventoryRequestV1<'_>,
     ) -> Result<ProjectCatalogMigrationInventoryResultV1, InventoryAdapterError> {
         let legacy_project_store_path =

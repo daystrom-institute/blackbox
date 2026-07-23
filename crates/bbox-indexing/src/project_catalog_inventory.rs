@@ -1598,6 +1598,7 @@ pub struct ProjectCatalogMigrationReportV1 {
     pub transaction_id: ProjectCatalogTransactionId,
     pub inventory_hash: Sha256ValueV1,
     pub plan_hash: Sha256ValueV1,
+    pub resolution_artifact_hash: Sha256ValueV1,
     pub source_store_hash: Sha256ValueV1,
     pub publisher_ref_source_hash: Sha256ValueV1,
     pub generated_at: String,
@@ -5657,6 +5658,9 @@ pub(crate) mod tests {
             transaction_id: post_image.transaction_id.clone(),
             inventory_hash: inventory.inventory_hash().unwrap(),
             plan_hash: canonical_plan_hash(inventory, resolution, post_image).unwrap(),
+            resolution_artifact_hash: Sha256ValueV1::digest(
+                &encode_migration_resolution_v1(resolution).unwrap(),
+            ),
             source_store_hash: inventory.source_store_hash.clone(),
             publisher_ref_source_hash: inventory.publisher_ref_source_hash.clone(),
             generated_at: "2026-01-02T03:04:05Z".to_string(),
