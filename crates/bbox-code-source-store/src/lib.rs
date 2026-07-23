@@ -5597,6 +5597,65 @@ mod tests {
     }
 
     #[test]
+    fn current_retention_discards_a_lower_rank_before_inspecting_its_evidence_bytes() {
+        let make_record = |producer_id: &str, ordinal| {
+            let descriptor = descriptor(&[]);
+            let mut legacy = stored_generation_v1(producer_id, descriptor.clone());
+            legacy.ordinal = ordinal;
+            legacy.state = GenerationState::Superseded;
+            StoredGenerationV2::from_v1_for_migration(legacy, descriptor.scope).unwrap()
+        };
+        let winner_record = make_record("host-retained-winner", 2);
+        let winner_generation_id = winner_record.generation_id.clone();
+        let winner = CurrentRetentionCandidate {
+            ordinal: 2,
+            generation_id: winner_generation_id.clone(),
+            evidence: CurrentRetentionEvidence::CurrentV2(CurrentGenerationRowSummary {
+                published_scope: winner_record.published_scope.clone(),
+                generation_id: winner_generation_id.clone(),
+                generation_path: PathBuf::new(),
+                metadata_bytes: vec![0; 7],
+                metadata_sha256: "a".repeat(64),
+                record: winner_record,
+                manifest_len: 0,
+                manifest_sha256: "b".repeat(64),
+            }),
+        };
+        let mut candidates = vec![winner];
+        let mut materialized_count = 1;
+        let mut materialized_bytes = 7;
+        let discarded_record = make_record("host-discarded-overflow", 1);
+        let discarded = CurrentRetentionCandidate {
+            ordinal: 1,
+            generation_id: discarded_record.generation_id.clone(),
+            evidence: CurrentRetentionEvidence::CurrentV2(CurrentGenerationRowSummary {
+                published_scope: discarded_record.published_scope.clone(),
+                generation_id: discarded_record.generation_id.clone(),
+                generation_path: PathBuf::new(),
+                metadata_bytes: vec![0],
+                metadata_sha256: "c".repeat(64),
+                record: discarded_record,
+                manifest_len: usize::MAX,
+                manifest_sha256: "d".repeat(64),
+            }),
+        };
+
+        insert_current_retention_candidate(
+            &mut candidates,
+            discarded,
+            1,
+            &mut materialized_count,
+            &mut materialized_bytes,
+        )
+        .unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].generation_id, winner_generation_id);
+        assert_eq!(materialized_count, 1);
+        assert_eq!(materialized_bytes, 7);
+    }
+
+    #[test]
     fn current_inventory_refuses_a_protected_row_before_materializing_over_limit_bytes() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap().join("source");
@@ -6708,7 +6767,7 @@ mod tests {
                 version: STORE_VERSION,
                 project_id: "project-a".into(),
                 generation_id: "a".repeat(64),
-                selector: "selector-a".into(),
+                selector: materialized_selector("project-a", &"a".repeat(64)),
                 snapshot_id: "snapshot-a".into(),
                 document_count: 1,
                 entity_inventory_sha256: "b".repeat(64),
@@ -7108,6 +7167,9 @@ mod tests {
             )
             .unwrap();
         let ready = store.finalize_upload("host-a", &upload.upload_id).unwrap();
+        store
+            .record_materialization(&descriptor.scope, &ready.generation_id, 1, "c".repeat(64))
+            .unwrap();
         store
             .save_activation(&ActivationRecord {
                 version: STORE_VERSION,
