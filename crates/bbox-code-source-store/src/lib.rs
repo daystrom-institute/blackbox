@@ -1663,30 +1663,45 @@ fn insert_current_retention_candidate(
     if retained_generations == 0 {
         return Ok(());
     }
-    *materialized_count = materialized_count
-        .checked_add(candidate.materialized())
-        .ok_or_else(|| anyhow!("current retained generation count overflowed"))?;
-    *materialized_bytes = materialized_bytes
-        .checked_add(candidate.evidence_bytes()?)
-        .ok_or_else(|| anyhow!("current retained generation byte count overflowed"))?;
-    candidates.push(candidate);
-    candidates.sort_by(|left, right| {
-        right
-            .ordinal
-            .cmp(&left.ordinal)
-            .then_with(|| left.generation_id.cmp(&right.generation_id))
-    });
-    if candidates.len() > retained_generations {
+
+    let position = candidates
+        .binary_search_by(|existing| {
+            candidate
+                .ordinal
+                .cmp(&existing.ordinal)
+                .then_with(|| existing.generation_id.cmp(&candidate.generation_id))
+        })
+        .unwrap_or_else(|position| position);
+    if position >= retained_generations {
+        return Ok(());
+    }
+
+    let (removed_count, removed_bytes) = if candidates.len() == retained_generations {
         let removed = candidates
+            .last()
+            .expect("full current retained candidate set has a worst row");
+        (removed.materialized(), removed.evidence_bytes()?)
+    } else {
+        (0, 0)
+    };
+    let candidate_bytes = candidate.evidence_bytes()?;
+    let next_count = (*materialized_count)
+        .checked_sub(removed_count)
+        .and_then(|count| count.checked_add(candidate.materialized()))
+        .ok_or_else(|| anyhow!("current retained generation count overflowed"))?;
+    let next_bytes = (*materialized_bytes)
+        .checked_sub(removed_bytes)
+        .and_then(|bytes| bytes.checked_add(candidate_bytes))
+        .ok_or_else(|| anyhow!("current retained generation byte count overflowed"))?;
+
+    candidates.insert(position, candidate);
+    if candidates.len() > retained_generations {
+        candidates
             .pop()
             .expect("oversized current retained candidate set has a worst row");
-        *materialized_count = materialized_count
-            .checked_sub(removed.materialized())
-            .ok_or_else(|| anyhow!("current retained generation count underflowed"))?;
-        *materialized_bytes = materialized_bytes
-            .checked_sub(removed.evidence_bytes()?)
-            .ok_or_else(|| anyhow!("current retained generation byte count underflowed"))?;
     }
+    *materialized_count = next_count;
+    *materialized_bytes = next_bytes;
     Ok(())
 }
 
@@ -5489,6 +5504,96 @@ mod tests {
             .unwrap();
 
         assert!(inventory.generations.is_empty());
+    }
+
+    #[test]
+    fn current_inventory_does_not_charge_a_discarded_superseded_candidate() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("source");
+        let paths = CodeSourceStorePaths::new(root).unwrap();
+        fs::create_dir_all(paths.root()).unwrap();
+        let effective =
+            encode_migration_effective_source_manifest_v1(&MigrationEffectiveSourceManifestV1 {
+                version: 1,
+                selections: Vec::new(),
+            })
+            .unwrap();
+        fs::write(paths.anchor(), &effective).unwrap();
+
+        let small_descriptor = descriptor(&[]);
+        let mut small = stored_generation_v1("host-retained-small", small_descriptor.clone());
+        small.ordinal = 2;
+        small.state = GenerationState::Superseded;
+        let small =
+            StoredGenerationV2::from_v1_for_migration(small, small_descriptor.scope.clone())
+                .unwrap();
+        let large_entries = (0..128)
+            .map(|index| ManifestEntry {
+                relative_path: format!("src/file-{index:04}.rs"),
+                content_sha256: "a".repeat(64),
+                size: 1,
+            })
+            .collect::<Vec<_>>();
+        let large_descriptor = descriptor(&large_entries);
+        let mut large = (0..1_024)
+            .find_map(|index| {
+                let candidate = stored_generation_v1(
+                    &format!("host-discarded-large-{index}"),
+                    large_descriptor.clone(),
+                );
+                (candidate.generation_id > small.generation_id).then_some(candidate)
+            })
+            .expect("a lexically later discarded generation id");
+        large.ordinal = 1;
+        large.state = GenerationState::Superseded;
+        let large =
+            StoredGenerationV2::from_v1_for_migration(large, large_descriptor.scope.clone())
+                .unwrap();
+        let small_metadata = encode_stored_generation_v2_for_migration(&small).unwrap();
+        let small_manifest = manifest_bytes(&[]);
+        let large_metadata = encode_stored_generation_v2_for_migration(&large).unwrap();
+        let large_manifest = manifest_bytes(&large_entries);
+        for (record, metadata, manifest) in [
+            (&small, &small_metadata, &small_manifest),
+            (&large, &large_metadata, &large_manifest),
+        ] {
+            let metadata_path = paths
+                .generation_metadata(&record.published_scope, &record.generation_id)
+                .unwrap();
+            fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+            fs::write(metadata_path, metadata).unwrap();
+            fs::write(
+                paths
+                    .generation_manifest(&record.published_scope, &record.generation_id)
+                    .unwrap(),
+                manifest,
+            )
+            .unwrap();
+        }
+        let survivor_bytes = effective
+            .len()
+            .checked_add(small_metadata.len())
+            .and_then(|bytes| bytes.checked_add(small_manifest.len()))
+            .unwrap();
+        assert!(large_manifest.len() > survivor_bytes);
+        let limits = StoreLimits {
+            retained_generations: 1,
+            max_migration_survivor_rows: 1,
+            max_migration_survivor_bytes: survivor_bytes,
+            ..StoreLimits::default()
+        };
+        let guard = paths.lock_migration_inventory().unwrap();
+
+        let inventory = guard
+            .snapshot_current_v2_for_scopes(
+                &limits,
+                &BTreeSet::from([small.published_scope.clone()]),
+                &BTreeSet::new(),
+            )
+            .unwrap();
+
+        assert_eq!(inventory.generations.len(), 1);
+        assert_eq!(inventory.generations[0].generation_id, small.generation_id);
     }
 
     #[test]
