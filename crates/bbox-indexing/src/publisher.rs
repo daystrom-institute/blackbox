@@ -23,6 +23,7 @@
 //! inventory, so the daemon supplies `bbox_config::read_repo_id_inputs` and this
 //! stays unit-testable with a fake resolver.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -69,12 +70,14 @@ pub enum PublisherResolution {
 /// scope may move or be re-registered; the symbolic branch ref remains the
 /// definition of published truth until an explicit repin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublisherRefRow {
     pub scope: PublishedScope,
     pub branch_ref: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PublisherRefData {
     version: u32,
     #[serde(default)]
@@ -90,6 +93,71 @@ impl Default for PublisherRefData {
     }
 }
 
+fn validate_full_publisher_ref(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 1024
+        || value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control() || byte == b' ')
+        || value.contains('\\')
+        || value.contains("..")
+        || value.contains("@{")
+        || value
+            .bytes()
+            .any(|byte| matches!(byte, b'~' | b'^' | b':' | b'?' | b'*' | b'['))
+        || value.ends_with('/')
+        || value.ends_with('.')
+    {
+        anyhow::bail!("invalid full publisher ref");
+    }
+    let Some(branch) = value.strip_prefix("refs/heads/") else {
+        anyhow::bail!("publisher ref is not a full branch ref");
+    };
+    if branch.is_empty()
+        || branch.starts_with('-')
+        || branch.split('/').any(|component| {
+            component.is_empty()
+                || component.starts_with('.')
+                || component.ends_with('.')
+                || component.ends_with(".lock")
+        })
+    {
+        anyhow::bail!("invalid full publisher branch ref");
+    }
+    Ok(())
+}
+
+fn validate_publisher_ref_data(data: &PublisherRefData) -> Result<()> {
+    if data.version != 1 {
+        anyhow::bail!("unsupported publisher ref source version");
+    }
+    let mut scopes = BTreeSet::new();
+    let mut prior_scope = None;
+    for row in &data.refs {
+        row.scope.validate()?;
+        validate_full_publisher_ref(&row.branch_ref)?;
+        if !scopes.insert(row.scope.clone())
+            || prior_scope.is_some_and(|prior: &PublishedScope| prior >= &row.scope)
+        {
+            anyhow::bail!("publisher ref rows are duplicated or not strictly sorted");
+        }
+        prior_scope = Some(&row.scope);
+    }
+    Ok(())
+}
+
+/// Strict migration decoder for the exact v1 publisher-ref source bytes.
+///
+/// The legacy v1 format defaults an omitted `refs` field to an empty set.
+/// Unknown fields, unsupported versions, invalid full refs, duplicate scopes,
+/// and non-canonical row order fail closed.
+pub(crate) fn decode_publisher_ref_source_v1(bytes: &[u8]) -> Result<Vec<PublisherRefRow>> {
+    let data: PublisherRefData =
+        serde_json::from_slice(bytes).context("parsing publisher ref source v1")?;
+    validate_publisher_ref_data(&data)?;
+    Ok(data.refs)
+}
+
 /// Durable host state for symbolic publisher refs.
 pub struct PublisherRefStore {
     path: PathBuf,
@@ -100,9 +168,13 @@ impl PublisherRefStore {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let data = if path.exists() {
-            let raw = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?
+            let raw =
+                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            let data: PublisherRefData = serde_json::from_slice(&raw)
+                .with_context(|| format!("parsing {}", path.display()))?;
+            validate_publisher_ref_data(&data)
+                .with_context(|| format!("validating {}", path.display()))?;
+            data
         } else {
             PublisherRefData::default()
         };
@@ -188,6 +260,7 @@ impl PublisherRefStore {
     }
 
     fn replace_data(&mut self, next: PublisherRefData) -> Result<()> {
+        validate_publisher_ref_data(&next)?;
         atomic_write_json_locked(&self.path, &next)?;
         self.data = next;
         Ok(())
@@ -416,6 +489,34 @@ mod tests {
         let error = PublisherRefStore::open(&path).err().unwrap();
 
         assert!(error.to_string().contains("parsing"));
+    }
+
+    #[test]
+    fn migration_publisher_ref_decoder_is_strict_and_preserves_v1_default() {
+        assert!(
+            decode_publisher_ref_source_v1(br#"{"version":1}"#)
+                .unwrap()
+                .is_empty()
+        );
+        let scope = PublishedScope::try_new("fam", ".").unwrap();
+        let valid = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "refs": [{
+                "scope": scope,
+                "branch_ref": "refs/heads/main",
+            }],
+        }))
+        .unwrap();
+        assert_eq!(decode_publisher_ref_source_v1(&valid).unwrap().len(), 1);
+
+        for invalid in [
+            br#"{"version":2,"refs":[]}"#.as_slice(),
+            br#"{"version":1,"refs":[],"extra":true}"#.as_slice(),
+            br#"{"version":1,"refs":[{"scope":{"repo_id":"fam","bbox_root_relpath":"."},"branch_ref":"main"}]}"#.as_slice(),
+            br#"{"version":1,"refs":[{"scope":{"repo_id":"fam","bbox_root_relpath":"."},"branch_ref":"refs/heads/main"},{"scope":{"repo_id":"fam","bbox_root_relpath":"."},"branch_ref":"refs/heads/other"}]}"#.as_slice(),
+        ] {
+            assert!(decode_publisher_ref_source_v1(invalid).is_err());
+        }
     }
 
     #[test]
