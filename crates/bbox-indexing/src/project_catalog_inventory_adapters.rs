@@ -651,6 +651,7 @@ fn observe_committed_authority_probe(
 struct LegacyProjectProbeInputV1 {
     pub project_id: ProjectId,
     pub authorized_canonical_path: AuthorizedInventoryPath,
+    pub repository_root: Option<AuthorizedInventoryPath>,
     pub committed_config: Option<CommittedConfigSourceV1>,
 }
 
@@ -675,29 +676,29 @@ fn derive_legacy_project_probes(
             let project_id = ProjectId::parse(record.project_id.clone())
                 .map_err(|_| invalid_source("legacy_project_id_invalid"))?;
             let project_root = AuthorizedInventoryPath::new(&record.canonical_path)?;
-            let committed_config = if record.is_git_repo
+            let repository_root = if record.is_git_repo
                 && matches!(
                     inspect_path(project_root.as_path()),
                     InspectedPath::Directory
                 ) {
                 bbox_corpus_core::git::git_root_for_path(project_root.as_path())
-                    .and_then(|root| {
-                        bbox_corpus_core::git::current_head(&root)
-                            .map(|commit_oid| (root, commit_oid))
-                    })
-                    .map(|(root, commit_oid)| {
-                        Ok(CommittedConfigSourceV1 {
-                            repository_root: AuthorizedInventoryPath::new(root)?,
-                            commit_oid,
-                        })
-                    })
+                    .map(AuthorizedInventoryPath::new)
                     .transpose()?
             } else {
                 None
             };
+            let committed_config = repository_root.as_ref().and_then(|root| {
+                bbox_corpus_core::git::current_head(root.as_path()).map(|commit_oid| {
+                    CommittedConfigSourceV1 {
+                        repository_root: root.clone(),
+                        commit_oid,
+                    }
+                })
+            });
             Ok(LegacyProjectProbeInputV1 {
                 project_id,
                 authorized_canonical_path: project_root,
+                repository_root,
                 committed_config,
             })
         })
@@ -2031,10 +2032,10 @@ impl ProjectCatalogMigrationInventoryFacadeV1 {
                 derive_legacy_project_probes(&legacy_source)?
                     .into_iter()
                     .filter_map(|probe| {
-                        probe.committed_config.map(|source| {
+                        probe.repository_root.map(|repository_root| {
                             Ok(ProjectCatalogProvenanceOwnerSourceV1 {
                                 project_id: probe.project_id,
-                                repository_root: source.repository_root.as_path().to_path_buf(),
+                                repository_root: repository_root.as_path().to_path_buf(),
                                 notes_ref: notes_ref.clone(),
                             })
                         })
@@ -5090,5 +5091,47 @@ mod tests {
             error.code(),
             "error.project_catalog_inventory_adapter_input"
         );
+    }
+
+    #[test]
+    fn provenance_discovery_includes_an_unborn_git_repository() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let repository = root.join("unborn");
+        fs::create_dir_all(&repository).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let projects = root.join("projects.json");
+        write(
+            &projects,
+            &serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "projects": [{
+                    "project_id": "unborn-project",
+                    "canonical_path": repository,
+                    "registered_at": "2026-01-01T00:00:00Z",
+                    "is_git_repo": true
+                }]
+            }))
+            .unwrap(),
+        );
+
+        let sources = ProjectCatalogMigrationInventoryFacadeV1::discover_provenance_owner_sources(
+            projects,
+            "refs/notes/blackbox".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].project_id.as_str(), "unborn-project");
+        assert_eq!(sources[0].repository_root, repository);
+        assert_eq!(sources[0].notes_ref, "refs/notes/blackbox");
     }
 }

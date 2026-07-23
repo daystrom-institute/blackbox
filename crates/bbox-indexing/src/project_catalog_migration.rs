@@ -69,13 +69,14 @@ use crate::project_catalog_inventory_adapters::{
 use crate::project_catalog_migration_lock::project_catalog_migration_lock_path;
 use crate::project_catalog_store::{
     ImmutableAssetRoleV1, MigrationCheckoutIdentityActionDraftV1,
-    MigrationCodeSourceActivationDraftV1, MigrationCodeSourceDispositionV1,
-    MigrationCodeSourceGenerationDraftV1, MigrationCodeSourceSnapshotDraftV1,
-    MigrationImmutableAssetDraftV1, MigrationLegacyProjectSourceDraftV1,
-    MigrationParticipantDraftV1, MigrationParticipantRegistry, MigrationPlanDraftV1,
-    MigrationPublisherSourceDraftV1, MigrationTransactionFailureDispositionV1, ParticipantRoleV1,
-    ProjectCatalogStore, PublisherDispositionEvidenceV1, PublisherPinEvidenceV1, Sha256Hex,
-    ValidatedMigrationPlanV1, transact_migration_classified, validate_migration_plan,
+    MigrationCheckoutRegistryBootstrapV1, MigrationCodeSourceActivationDraftV1,
+    MigrationCodeSourceDispositionV1, MigrationCodeSourceGenerationDraftV1,
+    MigrationCodeSourceSnapshotDraftV1, MigrationImmutableAssetDraftV1,
+    MigrationLegacyProjectSourceDraftV1, MigrationParticipantDraftV1, MigrationParticipantRegistry,
+    MigrationPlanDraftV1, MigrationPublisherSourceDraftV1,
+    MigrationTransactionFailureDispositionV1, ParticipantRoleV1, ProjectCatalogStore,
+    PublisherDispositionEvidenceV1, PublisherPinEvidenceV1, Sha256Hex, ValidatedMigrationPlanV1,
+    bootstrap_migration_checkout_registry, transact_migration_classified, validate_migration_plan,
 };
 use crate::publisher::PublisherRefStore;
 
@@ -583,6 +584,7 @@ pub struct ProjectCatalogMigrationPreflightReceiptV1 {
     pub predicted_attachment_hash: Sha256ValueV1,
     pub predicted_participant_hashes: BTreeMap<String, Sha256ValueV1>,
     pub predicted_immutable_asset_hashes: BTreeMap<String, Sha256ValueV1>,
+    pub predicted_marker_hash: Option<Sha256ValueV1>,
     pub required_resolution_count: u64,
     pub refusal_count: u64,
     pub checkout_action_count: u64,
@@ -621,6 +623,8 @@ pub struct MigrationVerificationReceiptV1 {
     pub observed_participant_hashes: BTreeMap<String, Sha256ValueV1>,
     pub expected_immutable_asset_hashes: BTreeMap<String, Sha256ValueV1>,
     pub observed_immutable_asset_hashes: BTreeMap<String, Sha256ValueV1>,
+    pub predicted_marker_hash: Sha256ValueV1,
+    pub observed_marker_hash: Sha256ValueV1,
     pub backup_hashes: BTreeMap<String, Sha256ValueV1>,
     pub epoch: u64,
     pub checkout_action_count: u64,
@@ -3362,6 +3366,17 @@ impl ClosedMigrationIntegrationV1 for CurrentClosedMigrationIntegrationV1 {
                 "recaptured executable plan does not match exact reviewed artifacts",
             ));
         }
+        let predicted_marker_hash = prepared
+            .preflight
+            .receipt
+            .predicted_marker_hash
+            .clone()
+            .ok_or_else(|| {
+                ProjectCatalogMigrationError::no_mutation(
+                    "error.project_catalog_migration_artifact_identity",
+                    "recaptured executable plan lacks its marker prediction",
+                )
+            })?;
         let plan = prepared.plan.ok_or_else(|| {
             ProjectCatalogMigrationError::no_mutation(
                 "error.project_catalog_migration_report_not_clean",
@@ -3390,6 +3405,13 @@ impl ClosedMigrationIntegrationV1 for CurrentClosedMigrationIntegrationV1 {
             )
         })?;
         let verified = verify_installed(layout)?;
+        if verified.receipt.predicted_marker_hash != predicted_marker_hash {
+            return Err(ProjectCatalogMigrationError::new(
+                "error.project_catalog_migration_artifact_identity",
+                "installed marker disagrees with the recaptured executable plan",
+                ProjectCatalogMigrationMutationDispositionV1::RecoveredToCommittedState,
+            ));
+        }
         Ok(ProjectCatalogMigrationApplyResultV1 {
             receipt: ProjectCatalogMigrationApplyReceiptV1 {
                 version: FACADE_VERSION_V1,
@@ -3650,7 +3672,30 @@ fn prepare_closed_migration(
     let quarantine_authority =
         validated_quarantine_bindings(inventory, &report, &resolution, &post_image)
             .map_err(inventory_error)?;
-    let registry = build_registry(layout, &runtime.checkout_paths)?;
+    let retained_checkout_observation_ids = inventory
+        .attachment_candidates
+        .iter()
+        .filter(|candidate| {
+            assessment
+                .retained_attachment_ids
+                .contains(&candidate.attachment_id)
+        })
+        .map(|candidate| candidate.checkout_observation_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let retained_checkout_paths = runtime
+        .checkout_paths
+        .iter()
+        .filter(|(observation_id, _)| {
+            retained_checkout_observation_ids.contains(observation_id.as_str())
+        })
+        .map(|(observation_id, path)| (observation_id.clone(), path.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if retained_checkout_paths.len() != retained_checkout_observation_ids.len() {
+        return Err(planner_error(
+            "retained attachment checkout runtime bindings are incomplete",
+        ));
+    }
+    let registry = build_registry(layout, &retained_checkout_paths)?;
     let draft = MigrationPlanDraftV1 {
         transaction_id: identities.transaction_id.clone(),
         plan_hash: store_sha256(plan_hash.as_str())?,
@@ -3683,7 +3728,7 @@ fn prepare_closed_migration(
     };
     let plan = validate_migration_plan(&layout.projects_path, registry, draft)
         .map_err(store_validation_error)?;
-    validate_planned_identity(
+    let identity_projections = validate_planned_identity(
         &plan,
         &report_bytes,
         &resolution_bytes,
@@ -3702,6 +3747,7 @@ fn prepare_closed_migration(
         &resolution_bytes,
         assessment.refusal_count,
         &immutable_predictions,
+        Some(identity_projections.marker_hash.clone()),
         sensitive_review.as_ref(),
         u64::try_from(
             base.attachments
@@ -3798,6 +3844,7 @@ fn prepare_assessment_only_with_rows(
         resolution_bytes,
         assessment.refusal_count,
         &report.predicted_immutable_asset_hashes,
+        None,
         sensitive_review.as_ref(),
         0,
         u64::try_from(inventory.legacy_projects.len()).unwrap_or(u64::MAX),
@@ -4074,6 +4121,7 @@ fn preflight_receipt(
     resolution_bytes: &[u8],
     refusal_count: u64,
     immutable_predictions: &BTreeMap<String, Sha256ValueV1>,
+    predicted_marker_hash: Option<Sha256ValueV1>,
     sensitive: Option<&PreparedSensitiveReviewV1>,
     attached_project_count: u64,
     catalog_project_count: u64,
@@ -4095,6 +4143,7 @@ fn preflight_receipt(
         predicted_attachment_hash: report.predicted_attachment_hash.clone(),
         predicted_participant_hashes: report.predicted_participant_hashes.clone(),
         predicted_immutable_asset_hashes: report.predicted_immutable_asset_hashes.clone(),
+        predicted_marker_hash,
         required_resolution_count: u64::try_from(report.required_resolutions.len())
             .unwrap_or(u64::MAX),
         refusal_count,
@@ -4119,9 +4168,14 @@ fn validate_planned_identity(
     resolution_bytes: &[u8],
     report: &ProjectCatalogMigrationReportV1,
     immutable_predictions: &BTreeMap<String, Sha256ValueV1>,
-) -> Result<(), ProjectCatalogMigrationError> {
+) -> Result<IdentityProjectionsV1, ProjectCatalogMigrationError> {
     let identity = plan.artifact_identity();
     let projections = identity_projections(&identity)?;
+    let marker_bytes = read_artifact_required(
+        &layout.migration_marker_path,
+        MAX_PROJECT_CATALOG_REPORT_BYTES,
+        "migration marker",
+    )?;
     if identity.transaction_id != report.transaction_id
         || identity.plan_hash.as_str() != report.plan_hash.as_str()
         || identity.inventory_sha256.as_str() != report.inventory_hash.as_str()
@@ -4139,7 +4193,7 @@ fn validate_planned_identity(
             "validated transaction plan disagrees with reviewed predictions",
         ));
     }
-    Ok(())
+    Ok(projections)
 }
 
 struct IdentityProjectionsV1 {
@@ -4147,6 +4201,8 @@ struct IdentityProjectionsV1 {
     attachment_hash: Sha256ValueV1,
     participant_hashes: BTreeMap<String, Sha256ValueV1>,
     immutable_hashes: BTreeMap<String, Sha256ValueV1>,
+    marker_hash: Sha256ValueV1,
+    observed_marker_hash: Sha256ValueV1,
     backup_hashes: BTreeMap<String, Sha256ValueV1>,
 }
 
@@ -4155,6 +4211,7 @@ fn identity_projections(
 ) -> Result<IdentityProjectionsV1, ProjectCatalogMigrationError> {
     let mut catalog_hash = None;
     let mut attachment_hash = None;
+    let mut marker_hash = None;
     let mut participants = BTreeMap::new();
     let mut backups = BTreeMap::new();
     for participant in &identity.participants {
@@ -4172,7 +4229,7 @@ fn identity_projections(
         match participant.role {
             ParticipantRoleV1::Catalog => catalog_hash = Some(hash),
             ParticipantRoleV1::Attachments => attachment_hash = Some(hash),
-            ParticipantRoleV1::MigrationMarker => {}
+            ParticipantRoleV1::MigrationMarker => marker_hash = Some(hash),
             _ => {
                 participants.insert(token, hash);
             }
@@ -4194,6 +4251,9 @@ fn identity_projections(
             .ok_or_else(|| planner_error("attachment identity is missing"))?,
         participant_hashes: participants,
         immutable_hashes,
+        marker_hash: marker_hash.ok_or_else(|| planner_error("marker identity is missing"))?,
+        observed_marker_hash: Sha256ValueV1::parse(identity.observed_marker_sha256.to_string())
+            .map_err(inventory_error)?,
         backup_hashes: backups,
     })
 }
@@ -4204,8 +4264,8 @@ fn verify_exact_installed_review(
     report: &ProjectCatalogMigrationReportV1,
     resolution_bytes: &[u8],
 ) -> Result<Option<ProjectCatalogMigrationVerifyResultV1>, ProjectCatalogMigrationError> {
-    match verify_installed(layout) {
-        Ok(result) => {
+    match verify_installed_optional(layout)? {
+        Some(result) => {
             let receipt = &result.receipt;
             if receipt.transaction_id != report.transaction_id
                 || receipt.plan_hash != report.plan_hash
@@ -4225,21 +4285,44 @@ fn verify_exact_installed_review(
             }
             Ok(Some(result))
         }
-        Err(error) if error.code == "error.project_catalog_invalid_snapshot" => Ok(None),
-        Err(error) => Err(error),
+        None => Ok(None),
     }
 }
 
 fn verify_installed(
     layout: &ProjectCatalogMigrationResolvedLayoutV1,
 ) -> Result<ProjectCatalogMigrationVerifyResultV1, ProjectCatalogMigrationError> {
+    verify_installed_optional(layout)?.ok_or_else(|| {
+        ProjectCatalogMigrationError::no_mutation(
+            "error.project_catalog_invalid_snapshot",
+            "migration verification requires installed v2 state",
+        )
+    })
+}
+
+fn verify_installed_optional(
+    layout: &ProjectCatalogMigrationResolvedLayoutV1,
+) -> Result<Option<ProjectCatalogMigrationVerifyResultV1>, ProjectCatalogMigrationError> {
     let checkout_roots = discover_checkout_roots(layout)?;
     let checkout_bindings =
         ProjectCatalogMigrationInventoryFacadeV1::discover_checkout_observation_bindings(
             checkout_roots,
         )
         .map_err(adapter_error)?;
-    let registry = build_registry(layout, &checkout_bindings)?;
+    let bootstrap_registry = build_registry(layout, &BTreeMap::new())?;
+    let bootstrap = bootstrap_migration_checkout_registry(
+        &layout.projects_path,
+        bootstrap_registry,
+        &checkout_bindings,
+    )
+    .map_err(store_validation_error)?;
+    let retained_checkout_roots = match bootstrap {
+        MigrationCheckoutRegistryBootstrapV1::FreshLegacyNotInstalled => return Ok(None),
+        MigrationCheckoutRegistryBootstrapV1::Ready {
+            retained_checkout_roots,
+        } => retained_checkout_roots,
+    };
+    let registry = build_registry(layout, &retained_checkout_roots)?;
     let store =
         ProjectCatalogStore::open_existing_after_migration(layout.projects_path.clone(), registry)
             .map_err(store_validation_error)?;
@@ -4271,6 +4354,8 @@ fn verify_installed(
         observed_participant_hashes: projections.participant_hashes,
         expected_immutable_asset_hashes: projections.immutable_hashes.clone(),
         observed_immutable_asset_hashes: projections.immutable_hashes,
+        predicted_marker_hash: projections.marker_hash,
+        observed_marker_hash: projections.observed_marker_hash,
         backup_hashes: projections.backup_hashes,
         epoch: identity.epoch,
         checkout_action_count: identity.checkout_action_count,
@@ -4279,10 +4364,10 @@ fn verify_installed(
         attached_project_count: u64::try_from(compatibility.records.len()).unwrap_or(u64::MAX),
         omitted_catalog_count: compatibility.omitted_catalog_count,
     };
-    Ok(ProjectCatalogMigrationVerifyResultV1 {
+    Ok(Some(ProjectCatalogMigrationVerifyResultV1 {
         receipt,
         compatibility,
-    })
+    }))
 }
 
 fn adapter_error(
@@ -4339,6 +4424,9 @@ fn validate_prepared_preflight(
         || prepared.receipt.predicted_participant_hashes != report.predicted_participant_hashes
         || prepared.receipt.predicted_immutable_asset_hashes
             != report.predicted_immutable_asset_hashes
+        || prepared.receipt.predicted_marker_hash.is_some()
+            != (report.status == ProjectCatalogMigrationStatusV1::Clean
+                && report.plan_kind == ProjectCatalogMigrationPlanKindV1::Executable)
         || prepared.receipt.required_resolution_count
             != u64::try_from(report.required_resolutions.len()).unwrap_or(u64::MAX)
         || prepared.receipt.checkout_action_count
@@ -4419,6 +4507,7 @@ fn verification_receipt_observations_match(receipt: &MigrationVerificationReceip
         && receipt.expected_attachment_hash == receipt.observed_attachment_hash
         && receipt.expected_participant_hashes == receipt.observed_participant_hashes
         && receipt.expected_immutable_asset_hashes == receipt.observed_immutable_asset_hashes
+        && receipt.predicted_marker_hash == receipt.observed_marker_hash
 }
 
 fn validate_artifact_set(
