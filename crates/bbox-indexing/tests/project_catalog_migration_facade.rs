@@ -24,8 +24,9 @@ use bbox_indexing::project_catalog_inventory::{
 use bbox_indexing::project_catalog_migration::{
     ProjectCatalogMigrationApplyOutcomeV1, ProjectCatalogMigrationApplyRequestV1,
     ProjectCatalogMigrationFacadeV1, ProjectCatalogMigrationLayoutOverridesV1,
-    ProjectCatalogMigrationPreflightRequestV1, ProjectCatalogMigrationResolvedLayoutV1,
-    ProjectCatalogMigrationVerifyRequestV1, project_catalog_migration_store_limits,
+    ProjectCatalogMigrationMutationDispositionV1, ProjectCatalogMigrationPreflightRequestV1,
+    ProjectCatalogMigrationResolvedLayoutV1, ProjectCatalogMigrationVerifyRequestV1,
+    project_catalog_migration_store_limits,
 };
 use bbox_indexing::publisher::PublisherRefStore;
 use sha2::{Digest, Sha256};
@@ -34,6 +35,17 @@ use tempfile::tempdir;
 fn write(path: &Path, bytes: &[u8]) {
     fs::create_dir_all(path.parent().expect("fixture path has a parent")).unwrap();
     fs::write(path, bytes).unwrap();
+}
+
+fn assert_public_value_is_path_redacted(value: &impl serde::Serialize, fixture_root: &Path) {
+    let serialized = serde_json::to_string(value).unwrap();
+    let fixture_root = fixture_root.to_string_lossy();
+    for private_token in [fixture_root.as_ref(), "winner-checkout", "loser-checkout"] {
+        assert!(
+            !serialized.contains(private_token),
+            "public value leaked fixture token {private_token:?}: {serialized}"
+        );
+    }
 }
 
 fn git(root: &Path, args: &[&str]) -> String {
@@ -300,6 +312,15 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
     let review = rehearsal_root.join("review");
     let report_path = review.join("report.json");
     let resolution_path = review.join("resolution.json");
+    let public_error =
+        ProjectCatalogMigrationFacadeV1::preflight(ProjectCatalogMigrationPreflightRequestV1 {
+            layout: rehearsal.clone(),
+            report_path: rehearsal_root.join("state/projects.json"),
+            resolution_path: resolution_path.clone(),
+            sensitive_report_path: None,
+        })
+        .unwrap_err();
+    assert_public_value_is_path_redacted(&public_error, &rehearsal_root);
 
     let assessment =
         ProjectCatalogMigrationFacadeV1::preflight(ProjectCatalogMigrationPreflightRequestV1 {
@@ -366,11 +387,43 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
         preflight.receipt.status,
         ProjectCatalogMigrationStatusV1::Clean
     );
+    assert_public_value_is_path_redacted(&preflight.receipt, &rehearsal_root);
     assert_eq!(preflight.receipt.checkout_action_count, 1);
     assert_eq!(preflight.receipt.publisher_pin_count, 1);
     assert_eq!(preflight.receipt.quarantine_root_count, 1);
     assert_eq!(preflight.receipt.attached_project_count, 1);
     assert_eq!(preflight.receipt.omitted_catalog_count, 1);
+
+    let reviewed_report_bytes = fs::read(&report_path).unwrap();
+    let mut tampered_report: serde_json::Value =
+        serde_json::from_slice(&reviewed_report_bytes).unwrap();
+    let first_asset_hash = tampered_report["predicted_immutable_asset_hashes"]
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+        .next()
+        .unwrap();
+    *first_asset_hash = serde_json::Value::String("0".repeat(64));
+    fs::write(&report_path, serde_json::to_vec(&tampered_report).unwrap()).unwrap();
+    let tampered_error =
+        ProjectCatalogMigrationFacadeV1::apply_rehearsal(ProjectCatalogMigrationApplyRequestV1 {
+            rehearsal_layout: rehearsal.clone(),
+            protected_layout: protected.clone(),
+            report_path: report_path.clone(),
+            resolution_path: resolution_path.clone(),
+        })
+        .unwrap_err();
+    assert_eq!(
+        tampered_error.mutation_disposition,
+        ProjectCatalogMigrationMutationDispositionV1::NoDurableMutation
+    );
+    assert_public_value_is_path_redacted(&tampered_error, &rehearsal_root);
+    assert!(
+        !rehearsal_root
+            .join("state/project-catalog-migration.json")
+            .exists()
+    );
+    fs::write(&report_path, reviewed_report_bytes).unwrap();
 
     let applied =
         ProjectCatalogMigrationFacadeV1::apply_rehearsal(ProjectCatalogMigrationApplyRequestV1 {
@@ -384,6 +437,7 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
         applied.receipt.outcome,
         ProjectCatalogMigrationApplyOutcomeV1::Applied
     );
+    assert_public_value_is_path_redacted(&applied.receipt, &rehearsal_root);
     assert_eq!(
         applied.receipt.verification.expected_catalog_hash,
         preflight.receipt.predicted_catalog_hash
@@ -410,6 +464,7 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
             rehearsal_layout: rehearsal.clone(),
         })
         .unwrap();
+    assert_public_value_is_path_redacted(verified.receipt(), &rehearsal_root);
     assert_eq!(verified.receipt(), &applied.receipt.verification);
     assert_eq!(verified.compatibility().records().len(), 1);
     assert_eq!(verified.compatibility().omitted_catalog_count(), 1);
