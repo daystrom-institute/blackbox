@@ -6783,6 +6783,7 @@ pub(crate) mod tests {
         }
         if !report.required_resolutions.is_empty() {
             report.status = ProjectCatalogMigrationStatusV1::ResolutionRequired;
+            report.plan_kind = ProjectCatalogMigrationPlanKindV1::AssessmentOnly;
         }
         let authority =
             validated_quarantine_bindings(&inventory, &report, &resolution, &post_image).unwrap();
