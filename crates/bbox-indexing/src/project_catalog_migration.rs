@@ -959,7 +959,6 @@ struct MigrationRuntimeBindingsViewV1 {
     legacy_project_paths: BTreeMap<String, PathBuf>,
     checkout_paths: BTreeMap<String, PathBuf>,
     checkout_repositories: BTreeMap<String, StableGitRepository>,
-    git_common_directories: BTreeMap<String, PathBuf>,
     legacy_selectors: BTreeMap<String, String>,
 }
 
@@ -1129,6 +1128,7 @@ fn late_domain_refusal_row(refusal: LateMigrationDomainRefusalV1) -> MigrationRe
 }
 
 impl MigrationPersistedIdentityPlanV1 {
+    #[cfg(test)]
     fn transaction_id(&self) -> &ProjectCatalogTransactionId {
         &self.transaction_id
     }
@@ -3790,11 +3790,6 @@ fn prepare_closed_migration(
             .checkout_repositories()
             .map(|(id, repository)| (id.to_string(), repository.clone()))
             .collect(),
-        git_common_directories: captured
-            .runtime_bindings()
-            .git_common_directories()
-            .map(|(id, path)| (id.to_string(), path.to_path_buf()))
-            .collect(),
         legacy_selectors: captured
             .runtime_bindings()
             .legacy_selectors()
@@ -4047,7 +4042,6 @@ fn prepare_closed_migration(
         &report,
         &report_bytes,
         &resolution_bytes,
-        &immutable_predictions,
         Some(identity_projections.marker_hash.clone()),
         sensitive_review.as_ref(),
         u64::try_from(
@@ -4071,6 +4065,7 @@ fn prepare_closed_migration(
     })
 }
 
+#[cfg(test)]
 fn prepare_assessment_only(
     inventory: &V1ProjectCatalogInventory,
     runtime: &MigrationRuntimeBindingsViewV1,
@@ -4144,7 +4139,6 @@ fn prepare_assessment_only_with_rows(
         &report,
         &report_bytes,
         resolution_bytes,
-        &report.predicted_immutable_asset_hashes,
         None,
         sensitive_review.as_ref(),
         0,
@@ -4417,7 +4411,6 @@ fn preflight_receipt(
     report: &ProjectCatalogMigrationReportV1,
     report_bytes: &[u8],
     resolution_bytes: &[u8],
-    immutable_predictions: &BTreeMap<String, Sha256ValueV1>,
     predicted_marker_hash: Option<Sha256ValueV1>,
     sensitive: Option<&PreparedSensitiveReviewV1>,
     attached_project_count: u64,
@@ -5490,7 +5483,6 @@ mod tests {
                 PathBuf::from("/workspace/acme"),
             )]),
             checkout_repositories: BTreeMap::new(),
-            git_common_directories: BTreeMap::new(),
             legacy_selectors: BTreeMap::from([(
                 "legacy_path_alpha".to_string(),
                 "/workspace/acme/alpha/src/Example.java".to_string(),
@@ -5588,7 +5580,6 @@ mod tests {
                 PathBuf::from("/workspace/acme"),
             )]),
             checkout_repositories: BTreeMap::new(),
-            git_common_directories: BTreeMap::new(),
             legacy_selectors: BTreeMap::from([(
                 "legacy_path_alpha".to_string(),
                 "/workspace/acme/services/alpha/src/Example.java".to_string(),
@@ -5755,7 +5746,6 @@ mod tests {
                 attachment.checkout_observation_id.clone(),
                 repository,
             )]),
-            git_common_directories: BTreeMap::new(),
             legacy_selectors: BTreeMap::new(),
         };
         prepare_publisher_generation(

@@ -1905,22 +1905,10 @@ impl InventoryRuntimeBindingsV1 {
         self.legacy_project_store_was_missing
     }
 
-    pub(crate) fn legacy_project_path(&self, observation_id: &str) -> Option<&Path> {
-        self.legacy_project_paths
-            .get(observation_id)
-            .map(AuthorizedInventoryPath::as_path)
-    }
-
     pub(crate) fn legacy_project_paths(&self) -> impl Iterator<Item = (&str, &Path)> {
         self.legacy_project_paths
             .iter()
             .map(|(id, path)| (id.as_str(), path.as_path()))
-    }
-
-    pub(crate) fn checkout_path(&self, observation_id: &str) -> Option<&Path> {
-        self.checkout_paths
-            .get(observation_id)
-            .map(AuthorizedInventoryPath::as_path)
     }
 
     pub(crate) fn checkout_paths(&self) -> impl Iterator<Item = (&str, &Path)> {
@@ -1935,24 +1923,6 @@ impl InventoryRuntimeBindingsV1 {
         self.checkout_repositories
             .iter()
             .map(|(id, repository)| (id.as_str(), repository))
-    }
-
-    pub(crate) fn git_common_directory(&self, observation_id: &str) -> Option<&Path> {
-        self.git_common_directories
-            .get(observation_id)
-            .map(AuthorizedInventoryPath::as_path)
-    }
-
-    pub(crate) fn git_common_directories(&self) -> impl Iterator<Item = (&str, &Path)> {
-        self.git_common_directories
-            .iter()
-            .map(|(id, path)| (id.as_str(), path.as_path()))
-    }
-
-    pub(crate) fn legacy_selector(&self, observation_id: &str) -> Option<&str> {
-        self.legacy_selectors
-            .get(observation_id)
-            .map(|binding| binding.literal.as_str())
     }
 
     pub(crate) fn legacy_selectors(&self) -> impl Iterator<Item = (&str, &str)> {
@@ -2062,8 +2032,6 @@ pub(crate) struct ProjectCatalogMigrationInventoryResultV1 {
     pub(crate) code_source_owner_inventory: MigrationLegacyInventoryV1,
     pub(crate) publisher_ref_source_was_missing: bool,
     pub(crate) code_source_canonical_sha256: Sha256ValueV1,
-    pub(crate) code_source_generation_count: u64,
-    pub(crate) code_source_generation_set_sha256: Sha256ValueV1,
 }
 
 impl ProjectCatalogMigrationInventoryResultV1 {
@@ -2474,8 +2442,6 @@ fn capture_inventory_locked(
     runtime_bindings.validate_pairing(&inventory)?;
     Ok(ProjectCatalogMigrationInventoryResultV1 {
         code_source_canonical_sha256,
-        code_source_generation_count: code_snapshot.owner.inventory.generation_count,
-        code_source_generation_set_sha256,
         code_source_owner_inventory,
         publisher_ref_source_was_missing: publisher_source.was_missing,
         inventory,
