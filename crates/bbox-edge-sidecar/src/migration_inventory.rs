@@ -121,7 +121,7 @@ fn capture_locked(
         Ok(None) => return missing_snapshot(),
         Err(code) => return corrupt_snapshot(code),
     };
-    let index: ManifestIndex = match serde_json::from_slice(&index_bytes) {
+    let index: ManifestIndex = match serde_json::from_slice::<ManifestIndex>(&index_bytes) {
         Ok(index) if index.version == MANIFEST_VERSION => index,
         _ => return corrupt_snapshot("edge_manifest_index_decode_failed"),
     };
@@ -151,14 +151,16 @@ fn capture_locked(
                 Ok(None) => return corrupt_snapshot("edge_workspace_manifest_missing"),
                 Err(code) => return corrupt_snapshot(code),
             };
-        let manifest: WorkspaceManifest = match serde_json::from_slice(&manifest_bytes) {
-            Ok(manifest)
-                if manifest.version == MANIFEST_VERSION && manifest.project_id == project_id =>
-            {
-                manifest
-            }
-            _ => return corrupt_snapshot("edge_workspace_manifest_decode_failed"),
-        };
+        let manifest: WorkspaceManifest =
+            match serde_json::from_slice::<WorkspaceManifest>(&manifest_bytes) {
+                Ok(manifest)
+                    if manifest.version == MANIFEST_VERSION
+                        && manifest.project_id == project_id =>
+                {
+                    manifest
+                }
+                _ => return corrupt_snapshot("edge_workspace_manifest_decode_failed"),
+            };
         if !optional_token(&manifest.repo_id)
             || !optional_token(&manifest.active_snapshot_id)
             || !optional_token(&manifest.active_dirty_overlay_id)

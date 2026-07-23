@@ -755,6 +755,7 @@ name = "bbox-slack"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bbox-corpus-core",
  "parking_lot",
  "serde",
  "serde_json",
@@ -863,6 +864,7 @@ dependencies = [
  "bincode",
  "chrono",
  "dirs",
+ "hex",
  "ordered-float",
  "parking_lot",
  "serde",
@@ -890,6 +892,7 @@ name = "bbox-whiteboards"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bbox-corpus-core",
  "chrono",
  "parking_lot",
  "serde",
