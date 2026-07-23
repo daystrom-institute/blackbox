@@ -656,7 +656,7 @@ pub fn encode_migration_effective_source_manifest_v1(
 pub fn decode_migration_effective_source_manifest_v1(
     bytes: &[u8],
 ) -> Result<MigrationEffectiveSourceManifestV1> {
-    let manifest = decode_bounded_json(
+    let manifest: MigrationEffectiveSourceManifestV1 = decode_bounded_json(
         bytes,
         MAX_MIGRATION_RECORD_BYTES,
         "migration effective-source manifest",
