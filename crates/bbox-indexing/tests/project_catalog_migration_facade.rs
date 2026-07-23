@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use bbox_code_source::{
     GenerationDescriptor, GenerationState, ManifestEntry, SCHEMA_VERSION, WALKER_POLICY_VERSION,
@@ -16,6 +16,8 @@ use bbox_code_source_store::{
 use bbox_config::config::{self, Config, LoadOptions};
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_catalog::ProjectId;
+use bbox_corpus_index::index::TranscriptIndex;
+use bbox_edge_sidecar::manifest::ManifestIndex;
 use bbox_indexing::project_catalog_inventory::{
     ExcludedAttachmentV1, ProjectCatalogMigrationStatusV1, QuarantineCollectedV1,
     RequiredResolutionKindV1, SelectedScopeOwnerV1, decode_migration_report_v1,
@@ -29,6 +31,7 @@ use bbox_indexing::project_catalog_migration::{
     project_catalog_migration_store_limits,
 };
 use bbox_indexing::publisher::PublisherRefStore;
+use bbox_vectors::VectorStore;
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
@@ -40,7 +43,12 @@ fn write(path: &Path, bytes: &[u8]) {
 fn assert_public_value_is_path_redacted(value: &impl serde::Serialize, fixture_root: &Path) {
     let serialized = serde_json::to_string(value).unwrap();
     let fixture_root = fixture_root.to_string_lossy();
-    for private_token in [fixture_root.as_ref(), "winner-checkout", "loser-checkout"] {
+    for private_token in [
+        fixture_root.as_ref(),
+        "winner-checkout",
+        "collision-winner-checkout",
+        "loser-checkout",
+    ] {
         assert!(
             !serialized.contains(private_token),
             "public value leaked fixture token {private_token:?}: {serialized}"
@@ -66,6 +74,92 @@ fn git(root: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+fn initialize_empty_provenance_ref(root: &Path, config: &Config) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("mktree")
+        .env("GIT_AUTHOR_NAME", "Migration Fixture")
+        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Migration Fixture")
+        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git mktree failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let empty_tree = String::from_utf8(output.stdout).unwrap();
+    let notes_commit = git(
+        root,
+        &[
+            "commit-tree",
+            empty_tree.trim(),
+            "-m",
+            "initialize empty provenance notes",
+        ],
+    );
+    let notes_ref = format!("refs/notes/{}", config.provenance.git_notes_namespace);
+    git(root, &["update-ref", &notes_ref, &notes_commit]);
+}
+
+fn initialize_empty_owner_state(root: &Path) {
+    let state = root.join("state");
+    let index_path = state.join("index");
+    let index = TranscriptIndex::open_or_create(
+        &index_path,
+        Vec::new(),
+        None,
+        state.join("projects.json"),
+        state.join("blackbox-knowledge.json"),
+        state.join("blackbox-threads.json"),
+        state.join("blackbox-roadmap.json"),
+    )
+    .unwrap();
+    drop(index);
+    write(&index_path.join("_meta.json"), b"{}");
+
+    VectorStore::open(state.join("vectors")).unwrap();
+    ManifestIndex::new()
+        .write_atomic(&state.join("edges"))
+        .unwrap();
+    fs::create_dir_all(state.join("git_meta")).unwrap();
+
+    for (name, body) in [
+        ("blackbox-knowledge.json", r#"{"version":1,"entries":[]}"#),
+        ("blackbox-gaps.json", r#"{"version":1,"gaps":[]}"#),
+        ("blackbox-threads.json", r#"{"version":1,"threads":[]}"#),
+        ("blackbox-notes.json", r#"{"version":1,"notes":[]}"#),
+        ("blackbox-pins.json", r#"{"version":1,"pins":[]}"#),
+        (
+            "blackbox-roadmap.json",
+            r#"{"version":1,"items":[],"edges":[]}"#,
+        ),
+    ] {
+        write(&state.join(name), body.as_bytes());
+    }
+
+    for directory in [
+        state.join("packets"),
+        state.join("artifacts"),
+        state.join("bro/badgey/proposals"),
+        state.join("bro/whiteboards"),
+    ] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    write(&state.join("bro/tasks.json"), b"[]");
+    write(
+        &state.join("bro/slack-channel-bindings.json"),
+        br#"{"bindings":{}}"#,
+    );
+    write(
+        &state.join("bro/slack-proposal-links.json"),
+        br#"{"order":[],"links":{},"by_proposal":{}}"#,
+    );
 }
 
 fn config(root: &Path) -> Config {
@@ -228,9 +322,16 @@ fn prepare_rehearsal(root: &Path, config: &Config) -> RehearsalFixture {
         "git clone failed: {}",
         String::from_utf8_lossy(&clone.stderr)
     );
+    for checkout in [
+        &winner_checkout,
+        &collision_winner_checkout,
+        &loser_checkout,
+    ] {
+        initialize_empty_provenance_ref(checkout, config);
+    }
 
     let state = root.join("state");
-    fs::create_dir_all(state.join("bro")).unwrap();
+    initialize_empty_owner_state(root);
     let winner_project = ProjectId::parse("neutral-winner").unwrap();
     let collision_winner_project = ProjectId::parse("neutral-collision-winner").unwrap();
     let loser_project = ProjectId::parse("neutral-loser").unwrap();
@@ -745,6 +846,7 @@ fn absent_legacy_catalog_is_fresh_for_first_apply_but_public_verify_fails_closed
     let config = config(&root);
     let rehearsal_root = root.join("empty-rehearsal");
     fs::create_dir_all(&rehearsal_root).unwrap();
+    initialize_empty_owner_state(&rehearsal_root);
     let rehearsal =
         ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(&rehearsal_root, &config)
             .unwrap();

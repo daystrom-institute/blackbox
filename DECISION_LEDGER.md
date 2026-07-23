@@ -672,7 +672,7 @@ until a later entry explicitly supersedes it.
 
 ## D-028: Migration reports distinguish executable plans from assessments
 
-- Date: 2026-07-23
+- Date: 2026-07-22
 - Phase: durable project catalog, migration facade
 - Status: accepted during facade integration repair
 - Decision: Every migration report carries `plan_kind` as either `executable`
