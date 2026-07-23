@@ -2015,6 +2015,35 @@ impl ProjectCatalogMigrationInventoryResultV1 {
 pub(crate) struct ProjectCatalogMigrationInventoryFacadeV1;
 
 impl ProjectCatalogMigrationInventoryFacadeV1 {
+    pub(crate) fn discover_provenance_owner_sources(
+        legacy_project_store_path: PathBuf,
+        notes_ref: String,
+    ) -> Result<Vec<ProjectCatalogProvenanceOwnerSourceV1>, InventoryAdapterError> {
+        let legacy_project_store_path = AuthorizedInventoryPath::new(&legacy_project_store_path)?;
+        let projects_path = legacy_project_store_path.as_path().to_path_buf();
+        crate::project_catalog_store::capture_migration_preflight_with(
+            &projects_path,
+            |error| invalid_source(error.to_string()),
+            || {
+                let legacy_source = accept_missing_legacy_projects_source(
+                    capture_legacy_projects_source(&legacy_project_store_path)?,
+                )?;
+                derive_legacy_project_probes(&legacy_source)?
+                    .into_iter()
+                    .filter_map(|probe| {
+                        probe.committed_config.map(|source| {
+                            Ok(ProjectCatalogProvenanceOwnerSourceV1 {
+                                project_id: probe.project_id,
+                                repository_root: source.repository_root.as_path().to_path_buf(),
+                                notes_ref: notes_ref.clone(),
+                            })
+                        })
+                    })
+                    .collect()
+            },
+        )
+    }
+
     pub(crate) fn discover_checkout_observation_bindings(
         checkout_roots: Vec<PathBuf>,
     ) -> Result<BTreeMap<String, PathBuf>, InventoryAdapterError> {
