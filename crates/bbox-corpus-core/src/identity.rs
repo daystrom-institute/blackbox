@@ -20,15 +20,14 @@
 //!   random, minted once, so a replacement checkout at the same path never
 //!   inherits a removed checkout's state (see [`ensure_checkout_id`]).
 
-use std::io::{self, Read};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use fs2::FileExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::git;
+use crate::json_store::NofollowDirectory;
 
 /// Result of minting a durable `repo_id` at first eject/init.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,6 +331,7 @@ pub fn bbox_root_relpath(git_root: &Path, project_root: &Path) -> Option<String>
 }
 
 const CHECKOUT_ID_RELPATH: &str = "checkout-id";
+pub const CHECKOUT_LOCAL_GITIGNORE_BYTES: &[u8] = b"*\n!.gitignore\n";
 
 /// Ensure a durable, reuse-safe `checkout_id` for the checkout rooted at
 /// `checkout_dir`, persisting it in `.bbox/local/checkout-id` (gitignored).
@@ -355,42 +355,32 @@ const CHECKOUT_ID_RELPATH: &str = "checkout-id";
 #[allow(clippy::disallowed_methods)]
 pub fn ensure_checkout_id(checkout_dir: &Path) -> Result<String> {
     let local_dir = checkout_dir.join(".bbox").join("local");
-    let marker = local_dir.join(CHECKOUT_ID_RELPATH);
-    reject_checkout_identity_symlinks(checkout_dir)?;
-
-    // Fast path: already minted.
-    if let Some(existing) = read_checkout_id(&marker)? {
-        return Ok(existing);
-    }
-
-    std::fs::create_dir_all(&local_dir)
-        .with_context(|| format!("creating {}", local_dir.display()))?;
-    reject_checkout_identity_symlinks(checkout_dir)?;
-
-    let local_lock = std::fs::File::open(&local_dir)
-        .with_context(|| format!("opening checkout identity lane {}", local_dir.display()))?;
-    local_lock
-        .lock_exclusive()
+    let lane = NofollowDirectory::open_or_create(&local_dir).with_context(|| {
+        format!(
+            "refusing checkout identity path through symlink or unsafe component {}",
+            local_dir.display()
+        )
+    })?;
+    lane.lock_exclusive()
         .with_context(|| format!("locking checkout identity lane {}", local_dir.display()))?;
-    ensure_local_gitignore(&local_dir)?;
-    reject_checkout_identity_symlinks(checkout_dir)?;
+    ensure_local_gitignore(&lane)?;
 
     // Recheck after taking the lock. Another process may have completed the
     // marker between the unlocked fast path and lane acquisition.
-    if let Some(existing) = read_checkout_id(&marker)? {
+    if let Some(existing) = read_checkout_id_from_lane(&lane).with_context(|| {
+        format!(
+            "refusing checkout identity path through symlink or non-regular marker in {}",
+            local_dir.display()
+        )
+    })? {
+        lane.ensure_still_current()?;
         return Ok(existing);
     }
 
     let candidate = random_hex();
-    crate::json_store::atomic_write_bytes_from_dir_locked(
-        &marker,
-        &local_dir,
-        candidate.as_bytes(),
-    )
-    .with_context(|| format!("writing {}", marker.display()))?;
-    local_lock
-        .sync_all()
-        .with_context(|| format!("fsync checkout identity lane {}", local_dir.display()))?;
+    lane.atomic_replace(CHECKOUT_ID_RELPATH, candidate.as_bytes())
+        .with_context(|| format!("writing checkout identity in {}", local_dir.display()))?;
+    lane.ensure_still_current()?;
     Ok(candidate)
 }
 
@@ -398,25 +388,37 @@ pub fn ensure_checkout_id(checkout_dir: &Path) -> Result<String> {
 // Host-local marker read; see `ensure_checkout_id`.
 #[allow(clippy::disallowed_methods)]
 pub fn read_checkout_id(marker: &Path) -> Result<Option<String>> {
-    match std::fs::symlink_metadata(marker) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            anyhow::bail!("refusing symlinked checkout-id marker {}", marker.display());
-        }
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("inspecting {}", marker.display())),
-    }
-    match std::fs::File::open(marker) {
-        Ok(mut f) => {
-            let mut buf = String::new();
-            f.read_to_string(&mut buf)
-                .with_context(|| format!("reading {}", marker.display()))?;
-            let trimmed = buf.trim();
-            Ok(is_checkout_id(trimmed).then(|| trimmed.to_string()))
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("reading {}", marker.display())),
-    }
+    let parent = marker
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("checkout-id marker has no parent"))?;
+    let name = marker
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("checkout-id marker has an invalid filename"))?;
+    let Some(lane) = NofollowDirectory::open_existing(parent).with_context(|| {
+        format!(
+            "refusing checkout identity path through symlink or unsafe component {}",
+            parent.display()
+        )
+    })?
+    else {
+        return Ok(None);
+    };
+    read_checkout_id_named(&lane, name)
+}
+
+fn read_checkout_id_from_lane(lane: &NofollowDirectory) -> Result<Option<String>> {
+    read_checkout_id_named(lane, CHECKOUT_ID_RELPATH)
+}
+
+fn read_checkout_id_named(lane: &NofollowDirectory, name: &str) -> Result<Option<String>> {
+    let Some(bytes) = lane.read_regular(name, 128, "checkout-id marker")? else {
+        return Ok(None);
+    };
+    let value = std::str::from_utf8(&bytes)
+        .context("decoding checkout-id marker")?
+        .trim();
+    Ok(is_checkout_id(value).then(|| value.to_string()))
 }
 
 /// Keep `.bbox/local/` ignored so the checkout-id marker (and the other
@@ -424,44 +426,16 @@ pub fn read_checkout_id(marker: &Path) -> Result<Option<String>> {
 /// write failure aborts identity creation rather than writing through an
 /// untrusted path. Mirrors `knowledge.rs` and `bbox_project_init`.
 #[allow(clippy::disallowed_methods)] // host-local sidecar; see `ensure_checkout_id`
-fn ensure_local_gitignore(local_dir: &Path) -> Result<()> {
-    let gitignore = local_dir.join(".gitignore");
-    if std::fs::symlink_metadata(&gitignore).is_ok_and(|metadata| metadata.file_type().is_symlink())
+fn ensure_local_gitignore(lane: &NofollowDirectory) -> Result<()> {
+    if lane
+        .read_regular(".gitignore", 64 * 1024, "checkout-local gitignore")?
+        .as_deref()
+        == Some(CHECKOUT_LOCAL_GITIGNORE_BYTES)
     {
-        anyhow::bail!(
-            "refusing symlinked checkout-local gitignore {}",
-            gitignore.display()
-        );
+        return Ok(());
     }
-    if !gitignore.exists() {
-        std::fs::write(&gitignore, "*\n!.gitignore\n")
-            .with_context(|| format!("writing {}", gitignore.display()))?;
-    }
-    Ok(())
-}
-
-fn reject_checkout_identity_symlinks(checkout_dir: &Path) -> Result<()> {
-    let bbox_dir = checkout_dir.join(".bbox");
-    let local_dir = bbox_dir.join("local");
-    let marker = local_dir.join(CHECKOUT_ID_RELPATH);
-    for path in [&bbox_dir, &local_dir, &marker] {
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                anyhow::bail!(
-                    "refusing checkout identity path through symlink {}",
-                    path.display()
-                );
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("inspecting checkout identity path {}", path.display())
-                });
-            }
-        }
-    }
-    Ok(())
+    lane.atomic_replace(".gitignore", CHECKOUT_LOCAL_GITIGNORE_BYTES)
+        .context("repairing checkout-local gitignore")
 }
 
 /// 32 lowercase-hex characters (128 bits) of strong OS randomness, via the
@@ -687,6 +661,54 @@ mod tests {
     }
 
     #[test]
+    fn existing_checkout_id_repairs_a_missing_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let id = ensure_checkout_id(&root).unwrap();
+        let gitignore = root.join(".bbox").join("local").join(".gitignore");
+        std::fs::remove_file(&gitignore).unwrap();
+
+        assert_eq!(ensure_checkout_id(&root).unwrap(), id);
+        assert_eq!(
+            std::fs::read(&gitignore).unwrap(),
+            CHECKOUT_LOCAL_GITIGNORE_BYTES
+        );
+    }
+
+    #[test]
+    fn existing_checkout_id_repairs_a_noncanonical_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let id = ensure_checkout_id(&root).unwrap();
+        let gitignore = root.join(".bbox").join("local").join(".gitignore");
+        std::fs::write(&gitignore, b"# does not ignore checkout-id\n").unwrap();
+
+        assert_eq!(ensure_checkout_id(&root).unwrap(), id);
+        assert_eq!(
+            std::fs::read(&gitignore).unwrap(),
+            CHECKOUT_LOCAL_GITIGNORE_BYTES
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkout_id_reader_rejects_fifo_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let marker = root.join(".bbox").join("local").join("checkout-id");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        let fifo = CString::new(marker.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        let started = std::time::Instant::now();
+        assert!(read_checkout_id(&marker).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
     fn checkout_id_fresh_after_marker_removed() {
         // A replacement checkout at the same path (marker gone) mints a FRESH
         // id — the reuse-safety invariant.
@@ -730,6 +752,22 @@ mod tests {
         let error = ensure_checkout_id(&root).unwrap_err();
         assert!(error.to_string().contains("through symlink"));
         assert!(!outside.path().join("checkout-id").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkout_id_rejects_symlinked_checkout_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let checkout = root.join("checkout");
+        symlink(outside.path(), &checkout).unwrap();
+
+        let error = ensure_checkout_id(&checkout).unwrap_err();
+        assert!(error.to_string().contains("through symlink"));
+        assert!(!outside.path().join(".bbox/local/checkout-id").exists());
     }
 
     #[cfg(unix)]

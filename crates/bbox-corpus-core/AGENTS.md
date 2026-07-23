@@ -34,6 +34,13 @@ below bbox-indexing (ingest passes, sidecars) can call them.
   the gate: the clone's durable `repo_id` must still uniquely match a
   registered base project. Lane tooling owns marker creation; arbitrary
   unmarked clones remain write-isolated.
+- The canonical JSON store lock is a stable, no-follow inode. Never truncate
+  or replace `<store>.json.lock`: bridge writers and strict catalog
+  transactions must contend on that exact advisory lock.
+- Host-local lanes that can be reached through mutable checkout paths use
+  `NofollowDirectory`: open or create every component without following links,
+  hold and lock the directory descriptor, perform leaf I/O relative to that
+  descriptor, then verify the path still names the held inode before publish.
 
 ## Rerank math (search/rerank.rs)
 

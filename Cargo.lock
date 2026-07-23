@@ -416,6 +416,7 @@ dependencies = [
  "chrono",
  "fs2",
  "hex",
+ "libc",
  "schemars 1.2.1",
  "serde",
  "serde_json",

@@ -38,3 +38,30 @@
 - Sync REPLACES the record's alias set with the declared set: the committed
   config is authoritative. Host-local operator aliases would need a separate
   field; don't overload this one.
+
+## Durable project catalog transactions are paired
+
+- `projects.json` and `project-attachments.json` are one logical value. Every
+  strict mutation installs and validates complete post-images at one matching
+  nonzero epoch. No caller may write one participant directly.
+- Lock order is the process-lifetime migration lock, then the canonical
+  `projects.json.lock`, then code-owned auxiliary store locks in deterministic
+  path order. The lifetime lock prevents bridge/offline overlap; the short
+  locks serialize bridge writes, strict reads, recovery, and transactions.
+  Code-source and accepted-publication writers must share the same anchor
+  store locks used by the migration participant registry.
+- Recovery is journal-driven and fail-closed. It may complete the whole new
+  participant set or restore the whole old set only when every required byte
+  image is installed or available in a verified code-owned artifact. Never
+  synthesize missing bytes, accept a mixed set, or recover only the catalog
+  subset of a migration journal.
+- Strict store reads reject symlinks, non-regular files, oversized input,
+  legacy v1 bytes, half-pairs, mismatched epochs, and invalid cross-store
+  references. A fresh v2 origin forbids a migration marker; a migrated origin
+  requires the committed marker for its exact transaction.
+- Migration checkout-ID actions share the `.bbox/local` directory lock with
+  `ensure_checkout_id`. The owner holds a component-no-follow directory
+  descriptor and performs marker and gitignore I/O relative to that exact
+  inode. Missing or empty markers may be atomically filled, and any different
+  or unsafe marker refuses the migration. A successfully installed ID is
+  monotonic and is not rolled back with catalog participants.

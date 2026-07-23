@@ -7,5 +7,6 @@ pub mod checkout_access_v1;
 pub mod checkout_registry;
 pub mod index;
 pub mod project_catalog_migration_lock;
+pub mod project_catalog_store;
 pub mod projects;
 pub mod publisher;

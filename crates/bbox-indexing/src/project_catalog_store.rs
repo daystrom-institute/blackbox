@@ -1,0 +1,5926 @@
+//! Strict paired persistence for the durable project catalog and host-local
+//! attachment snapshot.
+//!
+//! The catalog and attachment files are one logical value. Every mutation is
+//! journaled, installs both post-images, and publishes in-memory state only
+//! after the installed pair has been read back and cross-validated.
+
+use std::collections::BTreeSet;
+use std::fmt;
+#[cfg(any(test, not(unix)))]
+use std::fs;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use bbox_code_source_store::CodeSourceStorePaths;
+use bbox_corpus_core::identity::CHECKOUT_LOCAL_GITIGNORE_BYTES;
+use bbox_corpus_core::identity::PublishedScope;
+use bbox_corpus_core::json_store::{
+    NofollowDirectory, StoreLockGuard, acquire_store_lock_nofollow, canonical_store_lock_path,
+};
+use bbox_corpus_core::project_catalog::{
+    AttachmentSnapshotV1, CatalogOriginV2, CatalogSnapshotV2, MAX_PROJECT_CATALOG_BYTES,
+    MAX_PROJECT_CATALOG_ENTRIES, ProjectCatalogTransactionId, ProjectId,
+    decode_attachment_snapshot, decode_catalog_snapshot, decode_legacy_project_store,
+    encode_attachment_snapshot, encode_catalog_snapshot, validate_catalog_attachments,
+};
+use parking_lot::RwLock;
+use serde::{Deserialize, Deserializer, Serialize, de};
+use sha2::{Digest, Sha256};
+
+use crate::project_catalog_migration_lock::{
+    ProjectCatalogMigrationLock, project_catalog_migration_lock_path,
+};
+
+const JOURNAL_VERSION: u32 = 1;
+const MIGRATION_MARKER_VERSION: u32 = 1;
+const MAX_MIGRATION_PARTICIPANTS: usize = MAX_PROJECT_CATALOG_ENTRIES * 4 + 4;
+const MAX_MIGRATION_IMMUTABLE_ASSETS: usize = MAX_PROJECT_CATALOG_ENTRIES * 2 + 2;
+const MAX_MIGRATION_CHECKOUT_ACTIONS: usize = MAX_PROJECT_CATALOG_ENTRIES;
+const MAX_JOURNAL_BYTES: usize = 512 * 1024 * 1024;
+const MAX_MARKER_BYTES: usize = 512 * 1024 * 1024;
+
+pub type ProjectCatalogStoreResult<T> = Result<T, ProjectCatalogStoreError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCatalogStoreError {
+    code: &'static str,
+    detail: String,
+}
+
+impl ProjectCatalogStoreError {
+    fn new(code: &'static str, detail: impl Into<String>) -> Self {
+        let detail = detail
+            .into()
+            .chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .take(512)
+            .collect();
+        Self { code, detail }
+    }
+
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+}
+
+impl fmt::Display for ProjectCatalogStoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.detail)
+    }
+}
+
+impl std::error::Error for ProjectCatalogStoreError {}
+
+fn io_error(operation: &str, path: &Path, error: impl fmt::Display) -> ProjectCatalogStoreError {
+    ProjectCatalogStoreError::new(
+        "error.project_catalog_io",
+        format!("{operation} {} failed: {error}", path.display()),
+    )
+}
+
+fn contract_error(error: impl fmt::Display) -> ProjectCatalogStoreError {
+    ProjectCatalogStoreError::new("error.project_catalog_invalid_snapshot", error.to_string())
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectCatalogState {
+    catalog: Arc<CatalogSnapshotV2>,
+    attachments: Arc<AttachmentSnapshotV1>,
+    epoch: u64,
+    catalog_sha256: Sha256Hex,
+    attachments_sha256: Sha256Hex,
+}
+
+impl ProjectCatalogState {
+    pub fn catalog(&self) -> &Arc<CatalogSnapshotV2> {
+        &self.catalog
+    }
+
+    pub fn attachments(&self) -> &Arc<AttachmentSnapshotV1> {
+        &self.attachments
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub fn catalog_sha256(&self) -> &str {
+        self.catalog_sha256.as_str()
+    }
+
+    pub fn attachments_sha256(&self) -> &str {
+        self.attachments_sha256.as_str()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCatalogCommit {
+    pub epoch: u64,
+    pub catalog_sha256: String,
+    pub attachments_sha256: String,
+}
+
+pub struct ProjectCatalogStore {
+    owner: ProjectCatalogTransactionOwner,
+    current: RwLock<PublishedStoreState>,
+    _lifetime_lock: Arc<ProjectCatalogMigrationLock>,
+}
+
+#[derive(Debug, Clone)]
+enum PublishedStoreState {
+    Ready(Arc<ProjectCatalogState>),
+    Poisoned(ProjectCatalogStoreError),
+}
+
+impl fmt::Debug for ProjectCatalogStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.current.read();
+        let epoch = match &*state {
+            PublishedStoreState::Ready(state) => Some(state.epoch),
+            PublishedStoreState::Poisoned(_) => None,
+        };
+        formatter
+            .debug_struct("ProjectCatalogStore")
+            .field("catalog_path", &self.owner.paths.catalog)
+            .field("epoch", &epoch)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProjectCatalogStore {
+    /// Open an already initialized strict v2 pair.
+    ///
+    /// Two missing snapshots are not interpreted as an empty store here.
+    pub fn open_existing(projects_path: impl Into<PathBuf>) -> ProjectCatalogStoreResult<Self> {
+        Self::open_existing_with_io(projects_path.into(), Arc::new(RealCatalogStoreIo))
+    }
+
+    /// Initialize an explicitly new store at epoch one.
+    ///
+    /// Initialization requires exclusive process-lifetime authority and
+    /// rejects any pre-existing catalog or attachment image.
+    pub fn initialize_empty(projects_path: impl Into<PathBuf>) -> ProjectCatalogStoreResult<Self> {
+        Self::initialize_empty_with_io(projects_path.into(), Arc::new(RealCatalogStoreIo))
+    }
+
+    pub fn snapshot(&self) -> ProjectCatalogStoreResult<Arc<ProjectCatalogState>> {
+        match &*self.current.read() {
+            PublishedStoreState::Ready(state) => Ok(state.clone()),
+            PublishedStoreState::Poisoned(error) => Err(error.clone()),
+        }
+    }
+
+    /// Mutate a complete catalog and attachment post-image under epoch CAS.
+    ///
+    /// The closure runs on private clones before the mutation lock is held.
+    /// It cannot change versions, epochs, or catalog origin.
+    pub fn transact(
+        &self,
+        expected_epoch: u64,
+        build: impl FnOnce(
+            &mut CatalogSnapshotV2,
+            &mut AttachmentSnapshotV1,
+        ) -> ProjectCatalogStoreResult<()>,
+    ) -> ProjectCatalogStoreResult<ProjectCatalogCommit> {
+        let base = self.snapshot()?;
+        if base.epoch != expected_epoch {
+            return Err(stale_epoch(expected_epoch, base.epoch));
+        }
+
+        let mut catalog = (*base.catalog).clone();
+        let mut attachments = (*base.attachments).clone();
+        let invariant_version = (catalog.version, attachments.version);
+        let invariant_epoch = (catalog.epoch, attachments.epoch);
+        let invariant_origin = catalog.origin.clone();
+        build(&mut catalog, &mut attachments)?;
+        if (catalog.version, attachments.version) != invariant_version
+            || (catalog.epoch, attachments.epoch) != invariant_epoch
+            || catalog.origin != invariant_origin
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_owner_field_mutation",
+                "transaction closure changed owner-controlled fields",
+            ));
+        }
+        let new_epoch = expected_epoch.checked_add(1).ok_or_else(|| {
+            ProjectCatalogStoreError::new(
+                "error.project_catalog_epoch_overflow",
+                "catalog epoch cannot be incremented",
+            )
+        })?;
+        catalog.epoch = new_epoch;
+        attachments.epoch = new_epoch;
+        let candidate = PreparedPair::new(catalog, attachments)?;
+
+        let _mutation_lock = self
+            .owner
+            .io
+            .acquire_mutation_lock(&self.owner.paths.catalog)?;
+        let _auxiliary_locks = self.owner.acquire_auxiliary_locks()?;
+        let locked_result = (|| {
+            self.owner.recover_locked().map_err(|error| (error, None))?;
+            let installed = self
+                .owner
+                .read_strict_pair_locked()
+                .map_err(|error| (error, None))?;
+            if installed.epoch != expected_epoch
+                || installed.catalog_sha256 != base.catalog_sha256
+                || installed.attachments_sha256 != base.attachments_sha256
+            {
+                return Err((
+                    stale_epoch(expected_epoch, installed.epoch),
+                    Some(installed),
+                ));
+            }
+            self.owner
+                .commit_regular_pair_locked(Some(&installed), &candidate)
+                .map_err(|error| (error, None))?;
+            Ok(())
+        })();
+        if let Err((error, known_state)) = locked_result {
+            if let Some(state) = known_state {
+                *self.current.write() = PublishedStoreState::Ready(Arc::new(state));
+            } else {
+                self.reconcile_after_error_locked(&error);
+            }
+            return Err(error);
+        }
+        let committed = Arc::new(candidate.into_state());
+        let result = ProjectCatalogCommit {
+            epoch: committed.epoch,
+            catalog_sha256: committed.catalog_sha256.to_string(),
+            attachments_sha256: committed.attachments_sha256.to_string(),
+        };
+        *self.current.write() = PublishedStoreState::Ready(committed);
+        Ok(result)
+    }
+
+    fn reconcile_after_error_locked(&self, transaction_error: &ProjectCatalogStoreError) {
+        let reconciled = self
+            .owner
+            .recover_locked()
+            .and_then(|()| self.owner.read_strict_pair_locked());
+        *self.current.write() = match reconciled {
+            Ok(state) => PublishedStoreState::Ready(Arc::new(state)),
+            Err(recovery_error) => PublishedStoreState::Poisoned(ProjectCatalogStoreError::new(
+                "error.project_catalog_store_poisoned",
+                format!(
+                    "transaction failed with {}; reconciliation failed with {}",
+                    transaction_error.code(),
+                    recovery_error.code()
+                ),
+            )),
+        };
+    }
+
+    fn open_existing_with_io(
+        projects_path: PathBuf,
+        io: Arc<dyn CatalogStoreIo>,
+    ) -> ProjectCatalogStoreResult<Self> {
+        Self::open_existing_with_registry_and_io(projects_path, ParticipantRegistry::Regular, io)
+    }
+
+    #[allow(dead_code)] // P1-B seam consumed by P1-C runtime startup.
+    pub(crate) fn open_existing_after_migration(
+        projects_path: PathBuf,
+        registry: MigrationParticipantRegistry,
+    ) -> ProjectCatalogStoreResult<Self> {
+        let registry = registry.validate()?;
+        if registry.catalog_path != projects_path {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_migration_registry",
+                "migration registry is bound to a different project catalog path",
+            ));
+        }
+        Self::open_existing_with_registry_and_io(
+            projects_path,
+            ParticipantRegistry::Migration(Arc::new(registry)),
+            Arc::new(RealCatalogStoreIo),
+        )
+    }
+
+    fn open_existing_with_registry_and_io(
+        projects_path: PathBuf,
+        registry: ParticipantRegistry,
+        io: Arc<dyn CatalogStoreIo>,
+    ) -> ProjectCatalogStoreResult<Self> {
+        let paths = ProjectCatalogPaths::derive(&projects_path)?;
+        let lifetime_lock = Arc::new(
+            ProjectCatalogMigrationLock::acquire_shared(&paths.catalog)
+                .map_err(|error| io_error("acquire lifetime lock for", &paths.catalog, error))?,
+        );
+        let owner = ProjectCatalogTransactionOwner {
+            paths,
+            registry,
+            io,
+        };
+        let _mutation_lock = owner.io.acquire_mutation_lock(&owner.paths.catalog)?;
+        let _auxiliary_locks = owner.acquire_auxiliary_locks()?;
+        owner.recover_locked()?;
+        let current = Arc::new(owner.read_strict_pair_locked()?);
+        drop(_mutation_lock);
+        Ok(Self {
+            owner,
+            current: RwLock::new(PublishedStoreState::Ready(current)),
+            _lifetime_lock: lifetime_lock,
+        })
+    }
+
+    fn initialize_empty_with_io(
+        projects_path: PathBuf,
+        io: Arc<dyn CatalogStoreIo>,
+    ) -> ProjectCatalogStoreResult<Self> {
+        let paths = ProjectCatalogPaths::derive(&projects_path)?;
+        let exclusive = ProjectCatalogMigrationLock::try_acquire_exclusive(&paths.catalog)
+            .map_err(|error| io_error("acquire lifetime lock for", &paths.catalog, error))?
+            .ok_or_else(|| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_lifetime_lock_busy",
+                    "a compatible daemon or preflight still holds the lifetime lock",
+                )
+            })?;
+        let owner = ProjectCatalogTransactionOwner {
+            paths: paths.clone(),
+            registry: ParticipantRegistry::Regular,
+            io: io.clone(),
+        };
+        let _mutation_lock = owner.io.acquire_mutation_lock(&owner.paths.catalog)?;
+        owner.recover_locked()?;
+        match (
+            owner
+                .io
+                .read_regular_nofollow(&paths.catalog, MAX_PROJECT_CATALOG_BYTES)?,
+            owner
+                .io
+                .read_regular_nofollow(&paths.attachments, MAX_PROJECT_CATALOG_BYTES)?,
+            owner
+                .io
+                .read_regular_nofollow(&paths.migration_marker, MAX_MARKER_BYTES)?,
+        ) {
+            (None, None, None) => {}
+            _ => {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_already_initialized",
+                    "new-store initialization found existing strict state",
+                ));
+            }
+        }
+        let empty = PreparedPair::new(
+            CatalogSnapshotV2::empty(1).map_err(contract_error)?,
+            AttachmentSnapshotV1::empty(1).map_err(contract_error)?,
+        )?;
+        owner.commit_regular_pair_locked(None, &empty)?;
+        drop(_mutation_lock);
+        drop(exclusive);
+
+        Self::open_existing_with_io(projects_path, io)
+    }
+}
+
+fn stale_epoch(expected: u64, actual: u64) -> ProjectCatalogStoreError {
+    ProjectCatalogStoreError::new(
+        "error.project_catalog_stale_epoch",
+        format!("expected epoch {expected}, found {actual}"),
+    )
+}
+
+#[derive(Debug, Clone)]
+struct ProjectCatalogPaths {
+    catalog: PathBuf,
+    attachments: PathBuf,
+    journal: PathBuf,
+    migration_marker: PathBuf,
+    stage_dir: PathBuf,
+    backup_dir: PathBuf,
+    mutation_lock: PathBuf,
+    lifetime_lock: PathBuf,
+}
+
+impl ProjectCatalogPaths {
+    fn derive(projects_path: &Path) -> ProjectCatalogStoreResult<Self> {
+        if !projects_path.is_absolute() {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_unsafe_path",
+                "configured projects path must be absolute",
+            ));
+        }
+        let parent = projects_path.parent().ok_or_else(|| {
+            ProjectCatalogStoreError::new(
+                "error.project_catalog_unsafe_path",
+                "configured projects path has no parent",
+            )
+        })?;
+        let basename = projects_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| valid_basename(name))
+            .ok_or_else(|| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_unsafe_path",
+                    "configured projects filename is unsafe",
+                )
+            })?;
+        let reserved = [
+            "project-attachments.json",
+            "project-catalog-transaction.json",
+            "project-catalog-migration.json",
+            "project-catalog-stage",
+            "project-catalog-backups",
+            "project-catalog-migration.lock",
+        ];
+        if reserved.contains(&basename) {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_path_collision",
+                "configured projects filename collides with a fixed sibling",
+            ));
+        }
+
+        let paths = Self {
+            catalog: projects_path.to_path_buf(),
+            attachments: parent.join("project-attachments.json"),
+            journal: parent.join("project-catalog-transaction.json"),
+            migration_marker: parent.join("project-catalog-migration.json"),
+            stage_dir: parent.join("project-catalog-stage"),
+            backup_dir: parent.join("project-catalog-backups"),
+            mutation_lock: canonical_store_lock_path(projects_path),
+            lifetime_lock: project_catalog_migration_lock_path(projects_path),
+        };
+        let unique = [
+            &paths.catalog,
+            &paths.attachments,
+            &paths.journal,
+            &paths.migration_marker,
+            &paths.stage_dir,
+            &paths.backup_dir,
+            &paths.mutation_lock,
+            &paths.lifetime_lock,
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        if unique.len() != 8 {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_path_collision",
+                "derived project catalog paths are not unique",
+            ));
+        }
+        Ok(paths)
+    }
+}
+
+fn valid_basename(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && !matches!(name, "." | "..")
+        && !name.contains(['/', '\\'])
+        && !name
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+}
+
+#[derive(Clone)]
+struct ProjectCatalogTransactionOwner {
+    paths: ProjectCatalogPaths,
+    registry: ParticipantRegistry,
+    io: Arc<dyn CatalogStoreIo>,
+}
+
+#[derive(Clone)]
+enum ParticipantRegistry {
+    Regular,
+    #[allow(dead_code)] // P1-B seam consumed by the P1-C apply engine.
+    Migration(Arc<MigrationParticipantRegistry>),
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // P1-B defines the closed registry before P1-C populates it.
+pub(crate) struct MigrationParticipantRegistry {
+    catalog_path: PathBuf,
+    code_source_paths: CodeSourceStorePaths,
+    catalog_immutable_root: PathBuf,
+    checkout_identity_markers: std::collections::BTreeMap<String, PathBuf>,
+}
+
+#[allow(dead_code)] // P1-B defines the closed registry before P1-C populates it.
+impl MigrationParticipantRegistry {
+    pub(crate) fn new(
+        projects_path: &Path,
+        code_source_root: PathBuf,
+    ) -> ProjectCatalogStoreResult<Self> {
+        let paths = ProjectCatalogPaths::derive(projects_path)?;
+        let code_source_paths = CodeSourceStorePaths::new(code_source_root).map_err(|error| {
+            ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_migration_registry",
+                error.to_string(),
+            )
+        })?;
+        Self {
+            catalog_path: paths.catalog,
+            code_source_paths,
+            catalog_immutable_root: paths.backup_dir.join("immutable"),
+            checkout_identity_markers: std::collections::BTreeMap::new(),
+        }
+        .validate()
+    }
+
+    pub(crate) fn register_checkout_identity(
+        &mut self,
+        observation_id: String,
+        checkout_root: PathBuf,
+    ) -> ProjectCatalogStoreResult<()> {
+        if observation_id.is_empty()
+            || observation_id.len() > 256
+            || observation_id.chars().any(char::is_control)
+            || !safe_absolute_path(&checkout_root)
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_migration_registry",
+                "checkout identity observation or root is invalid",
+            ));
+        }
+        let target = checkout_root
+            .join(".bbox")
+            .join("local")
+            .join("checkout-id");
+        if self
+            .checkout_identity_markers
+            .insert(observation_id, target)
+            .is_some()
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_migration_registry",
+                "checkout identity observation is duplicated",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate(self) -> ProjectCatalogStoreResult<Self> {
+        let paths = ProjectCatalogPaths::derive(&self.catalog_path)?;
+        let distinct_checkout_targets = self
+            .checkout_identity_markers
+            .values()
+            .collect::<BTreeSet<_>>();
+        let auxiliary_paths = self.auxiliary_store_paths();
+        let control_paths = vec![
+            paths.catalog.clone(),
+            paths.attachments.clone(),
+            paths.journal.clone(),
+            paths.migration_marker.clone(),
+            paths.stage_dir.clone(),
+            paths.backup_dir.clone(),
+            paths.mutation_lock.clone(),
+            paths.lifetime_lock.clone(),
+        ];
+        let mut lock_paths = Vec::new();
+        for path in &auxiliary_paths {
+            lock_paths.push(canonical_store_lock_path(path));
+        }
+        let mut all_fixed_paths = control_paths.clone();
+        all_fixed_paths.extend(auxiliary_paths.iter().cloned());
+        all_fixed_paths.extend(lock_paths);
+        let distinct_fixed_paths = all_fixed_paths.iter().collect::<BTreeSet<_>>();
+        let code_source_root = self.code_source_paths.root();
+        let root_collides = control_paths
+            .iter()
+            .any(|path| paths_overlap(path, code_source_root));
+        let checkout_collides = self.checkout_identity_markers.values().any(|target| {
+            control_paths.iter().any(|path| paths_overlap(path, target))
+                || paths_overlap(code_source_root, target)
+        });
+        if !safe_absolute_path(&self.catalog_path)
+            || !safe_absolute_path(self.code_source_paths.root())
+            || !safe_absolute_path(&self.catalog_immutable_root)
+            || self
+                .checkout_identity_markers
+                .values()
+                .any(|path| !safe_absolute_path(path))
+            || distinct_checkout_targets.len() != self.checkout_identity_markers.len()
+            || distinct_fixed_paths.len() != all_fixed_paths.len()
+            || root_collides
+            || checkout_collides
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_migration_registry",
+                "migration registry contains an unsafe, duplicated, or colliding control path",
+            ));
+        }
+        Ok(self)
+    }
+
+    fn participant_target(&self, role: &ParticipantRoleV1) -> Option<PathBuf> {
+        match role {
+            ParticipantRoleV1::EffectiveSourceManifest => Some(self.code_source_paths.anchor()),
+            ParticipantRoleV1::Activation { project_id } => {
+                Some(self.code_source_paths.activation(project_id))
+            }
+            ParticipantRoleV1::StoredGenerationMetadata {
+                published_scope,
+                generation_id,
+                ..
+            } => self
+                .code_source_paths
+                .generation_metadata(published_scope, generation_id.as_str())
+                .ok(),
+            ParticipantRoleV1::CollisionRetirement { project_id } => Some(
+                self.code_source_paths
+                    .collision_retirement_pending(project_id),
+            ),
+            ParticipantRoleV1::Catalog
+            | ParticipantRoleV1::Attachments
+            | ParticipantRoleV1::MigrationMarker => None,
+        }
+    }
+
+    fn immutable_target(
+        &self,
+        role: &ImmutableAssetRoleV1,
+        validated_name: &ValidatedBasename,
+    ) -> PathBuf {
+        match role {
+            ImmutableAssetRoleV1::LegacyProjectStoreBackup
+            | ImmutableAssetRoleV1::LegacyPublisherRefBackup => {
+                self.catalog_immutable_root.join(validated_name.as_str())
+            }
+        }
+    }
+
+    fn checkout_identity_target(&self, observation_id: &str) -> Option<PathBuf> {
+        self.checkout_identity_markers.get(observation_id).cloned()
+    }
+
+    fn auxiliary_store_paths(&self) -> Vec<PathBuf> {
+        let mut paths = vec![self.code_source_paths.anchor()];
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+fn safe_absolute_path(path: &Path) -> bool {
+    use std::path::Component;
+
+    path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(valid_basename)
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // P1-B transaction input consumed by P1-C.
+pub(crate) struct MigrationParticipantDraftV1 {
+    role: ParticipantRoleV1,
+    expected_old_sha256: Option<Sha256Hex>,
+    post_image: Option<Vec<u8>>,
+}
+
+#[allow(dead_code)] // P1-B transaction input consumed by P1-C.
+impl MigrationParticipantDraftV1 {
+    pub(crate) fn new(
+        role: ParticipantRoleV1,
+        expected_old_sha256: Option<Sha256Hex>,
+        post_image: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            role,
+            expected_old_sha256,
+            post_image,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // P1-B transaction input consumed by P1-C.
+pub(crate) struct MigrationImmutableAssetDraftV1 {
+    role: ImmutableAssetRoleV1,
+    bytes: Vec<u8>,
+}
+
+#[allow(dead_code)] // P1-B transaction input consumed by P1-C.
+impl MigrationImmutableAssetDraftV1 {
+    pub(crate) fn new(role: ImmutableAssetRoleV1, bytes: Vec<u8>) -> Self {
+        Self { role, bytes }
+    }
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // P1-B transaction input consumed by P1-C.
+pub(crate) struct MigrationCheckoutIdentityActionDraftV1 {
+    observation_id: String,
+    planned_id: String,
+}
+
+#[allow(dead_code)] // P1-B transaction input consumed by P1-C.
+impl MigrationCheckoutIdentityActionDraftV1 {
+    pub(crate) fn new(observation_id: String, planned_id: String) -> Self {
+        Self {
+            observation_id,
+            planned_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // P1-B transaction input consumed by P1-C.
+pub(crate) struct MigrationPlanDraftV1 {
+    pub(crate) transaction_id: ProjectCatalogTransactionId,
+    pub(crate) plan_hash: Sha256Hex,
+    pub(crate) source_store_sha256: Sha256Hex,
+    pub(crate) inventory_sha256: Sha256Hex,
+    pub(crate) expected_legacy_catalog_sha256: Sha256Hex,
+    pub(crate) catalog: CatalogSnapshotV2,
+    pub(crate) attachments: AttachmentSnapshotV1,
+    pub(crate) participants: Vec<MigrationParticipantDraftV1>,
+    pub(crate) immutable_assets: Vec<MigrationImmutableAssetDraftV1>,
+    pub(crate) checkout_identity_actions: Vec<MigrationCheckoutIdentityActionDraftV1>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // P1-B validated plan consumed by P1-C.
+pub(crate) struct ValidatedMigrationPlanV1 {
+    registry: MigrationParticipantRegistry,
+    journal: ProjectCatalogTransactionJournalV1,
+    post_images: std::collections::BTreeMap<ParticipantRoleV1, Option<Vec<u8>>>,
+    immutable_asset_bytes: std::collections::BTreeMap<ImmutableAssetRoleV1, Vec<u8>>,
+}
+
+#[allow(dead_code)] // P1-B validation seam consumed by P1-C.
+pub(crate) fn validate_migration_plan(
+    paths: &Path,
+    registry: MigrationParticipantRegistry,
+    draft: MigrationPlanDraftV1,
+) -> ProjectCatalogStoreResult<ValidatedMigrationPlanV1> {
+    let registry = registry.validate()?;
+    let _store_paths = ProjectCatalogPaths::derive(paths)?;
+    if draft.participants.len().saturating_add(3) > MAX_MIGRATION_PARTICIPANTS
+        || draft.immutable_assets.len() > MAX_MIGRATION_IMMUTABLE_ASSETS
+        || draft.checkout_identity_actions.len() > MAX_MIGRATION_CHECKOUT_ACTIONS
+    {
+        return Err(ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_migration_plan",
+            "migration plan exceeds its cardinality limit",
+        ));
+    }
+    if registry.catalog_path != _store_paths.catalog {
+        return Err(ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_migration_registry",
+            "migration registry is bound to a different project catalog path",
+        ));
+    }
+    validate_catalog_attachments(&draft.catalog, &draft.attachments).map_err(contract_error)?;
+    if draft.catalog.epoch != 1
+        || draft.attachments.epoch != 1
+        || draft.catalog.origin
+            != (CatalogOriginV2::MigratedV1 {
+                transaction_id: draft.transaction_id.clone(),
+            })
+    {
+        return Err(ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_migration_plan",
+            "migration post-images must start at epoch one with the exact transaction origin",
+        ));
+    }
+    if draft.source_store_sha256 != draft.expected_legacy_catalog_sha256 {
+        return Err(ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_migration_plan",
+            "legacy catalog old hash must equal the retained source backup hash",
+        ));
+    }
+
+    let catalog_bytes = encode_catalog_snapshot(&draft.catalog).map_err(contract_error)?;
+    let attachment_bytes =
+        encode_attachment_snapshot(&draft.attachments).map_err(contract_error)?;
+    let mut post_images = std::collections::BTreeMap::from([
+        (ParticipantRoleV1::Catalog, Some(catalog_bytes)),
+        (ParticipantRoleV1::Attachments, Some(attachment_bytes)),
+    ]);
+    let mut expected_old = std::collections::BTreeMap::from([
+        (
+            ParticipantRoleV1::Catalog,
+            Some(draft.expected_legacy_catalog_sha256.clone()),
+        ),
+        (ParticipantRoleV1::Attachments, None),
+    ]);
+    for participant in draft.participants {
+        if matches!(
+            participant.role,
+            ParticipantRoleV1::Catalog
+                | ParticipantRoleV1::Attachments
+                | ParticipantRoleV1::MigrationMarker
+        ) || post_images
+            .insert(participant.role.clone(), participant.post_image)
+            .is_some()
+            || expected_old
+                .insert(participant.role, participant.expected_old_sha256)
+                .is_some()
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_migration_plan",
+                "migration plan has a duplicate or owner-controlled participant role",
+            ));
+        }
+    }
+    if !post_images.contains_key(&ParticipantRoleV1::EffectiveSourceManifest) {
+        return Err(ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_migration_plan",
+            "migration plan lacks the complete effective source manifest",
+        ));
+    }
+    if post_images.iter().any(|(role, image)| {
+        image
+            .as_ref()
+            .is_some_and(|bytes| bytes.len() > role.max_bytes())
+    }) {
+        return Err(ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_migration_plan",
+            "migration mutable post-image exceeds its byte limit",
+        ));
+    }
+    for role in post_images.keys() {
+        if !matches!(
+            role,
+            ParticipantRoleV1::Catalog | ParticipantRoleV1::Attachments
+        ) && registry.participant_target(role).is_none()
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_migration_registry",
+                "migration plan role has no code-owned target",
+            ));
+        }
+    }
+
+    let mut immutable_asset_bytes = std::collections::BTreeMap::new();
+    for asset in draft.immutable_assets {
+        if asset.bytes.len() > MAX_PROJECT_CATALOG_BYTES
+            || immutable_asset_bytes
+                .insert(asset.role, asset.bytes)
+                .is_some()
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_migration_plan",
+                "migration immutable assets are oversized, duplicated, or unregistered",
+            ));
+        }
+    }
+    for mandatory in [
+        ImmutableAssetRoleV1::LegacyProjectStoreBackup,
+        ImmutableAssetRoleV1::LegacyPublisherRefBackup,
+    ] {
+        if !immutable_asset_bytes.contains_key(&mandatory) {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_migration_plan",
+                "migration plan lacks a mandatory immutable source backup",
+            ));
+        }
+    }
+
+    let actions = draft
+        .checkout_identity_actions
+        .into_iter()
+        .map(|action| CheckoutIdentityActionV1 {
+            observation_id: action.observation_id,
+            planned_id: action.planned_id,
+        })
+        .collect::<Vec<_>>();
+    let action_ids = actions
+        .iter()
+        .map(|action| action.observation_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if action_ids.len() != actions.len()
+        || actions.iter().any(|action| {
+            registry
+                .checkout_identity_target(&action.observation_id)
+                .is_none()
+        })
+    {
+        return Err(ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_migration_plan",
+            "migration checkout identity actions are duplicated or unregistered",
+        ));
+    }
+
+    let marker_participants = post_images
+        .iter()
+        .map(|(role, post_image)| {
+            build_transaction_participant(
+                &draft.transaction_id,
+                role.clone(),
+                expected_old.get(role).cloned().flatten(),
+                post_image,
+            )
+        })
+        .collect::<ProjectCatalogStoreResult<Vec<_>>>()?;
+    let participant_evidence = marker_participants
+        .iter()
+        .map(|participant| MigrationParticipantEvidenceV1 {
+            role: participant.role.clone(),
+            old: participant.old.clone(),
+            new: participant.new.clone(),
+        })
+        .collect::<Vec<_>>();
+    let immutable_evidence = immutable_asset_bytes
+        .iter()
+        .map(|(role, bytes)| {
+            let hash = sha256(bytes);
+            let validated_name = immutable_target_name(&draft.transaction_id, role, &hash)?;
+            Ok(MigrationImmutableAssetEvidenceV1 {
+                role: role.clone(),
+                sha256: hash,
+                validated_name,
+            })
+        })
+        .collect::<ProjectCatalogStoreResult<Vec<_>>>()?;
+    let marker = ProjectCatalogMigrationMarkerV1 {
+        version: MIGRATION_MARKER_VERSION,
+        transaction_id: draft.transaction_id.clone(),
+        plan_hash: draft.plan_hash.clone(),
+        source_store_sha256: draft.source_store_sha256,
+        inventory_sha256: draft.inventory_sha256,
+        participants: participant_evidence,
+        immutable_assets: immutable_evidence,
+        migration_epoch: 1,
+        committed_at: unix_timestamp()?,
+    };
+    marker.validate()?;
+    let marker_bytes = encode_bounded_json(&marker, MAX_MARKER_BYTES, "migration marker")?;
+    post_images.insert(ParticipantRoleV1::MigrationMarker, Some(marker_bytes));
+    expected_old.insert(ParticipantRoleV1::MigrationMarker, None);
+
+    let participants = post_images
+        .iter()
+        .map(|(role, post_image)| {
+            build_transaction_participant(
+                &draft.transaction_id,
+                role.clone(),
+                expected_old.get(role).cloned().flatten(),
+                post_image,
+            )
+        })
+        .collect::<ProjectCatalogStoreResult<Vec<_>>>()?;
+    let immutable_assets = immutable_asset_bytes
+        .iter()
+        .map(|(role, bytes)| {
+            let hash = sha256(bytes);
+            let validated_name = immutable_target_name(&draft.transaction_id, role, &hash)?;
+            Ok(ImmutableAssetV1 {
+                role: role.clone(),
+                sha256: hash.clone(),
+                validated_name,
+                stage_name: immutable_stage_name(&draft.transaction_id, role, &hash)?,
+            })
+        })
+        .collect::<ProjectCatalogStoreResult<Vec<_>>>()?;
+    let journal = ProjectCatalogTransactionJournalV1 {
+        version: JOURNAL_VERSION,
+        transaction_id: draft.transaction_id,
+        kind: TransactionKindV1::V1Migration,
+        state: TransactionStateV1::Prepared,
+        outcome: None,
+        plan_hash: Some(draft.plan_hash),
+        old_epoch: 0,
+        new_epoch: 1,
+        participants,
+        immutable_assets,
+        monotonic_checkout_identity_actions: actions,
+        created_at: unix_timestamp()?,
+        committed_at: None,
+    };
+    journal.validate()?;
+    let _ = encode_bounded_json(&journal, MAX_JOURNAL_BYTES, "transaction journal")?;
+
+    let mut derived_targets = BTreeSet::from([
+        _store_paths.catalog.clone(),
+        _store_paths.attachments.clone(),
+        _store_paths.migration_marker.clone(),
+        _store_paths.stage_dir.clone(),
+        _store_paths.backup_dir.clone(),
+        _store_paths.mutation_lock.clone(),
+        _store_paths.lifetime_lock.clone(),
+    ]);
+    for auxiliary in registry.auxiliary_store_paths() {
+        derived_targets.insert(canonical_store_lock_path(&auxiliary));
+    }
+    for role in post_images.keys() {
+        let target = match role {
+            ParticipantRoleV1::Catalog => _store_paths.catalog.clone(),
+            ParticipantRoleV1::Attachments => _store_paths.attachments.clone(),
+            ParticipantRoleV1::MigrationMarker => _store_paths.migration_marker.clone(),
+            role => registry.participant_target(role).ok_or_else(|| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_invalid_migration_registry",
+                    "migration participant lacks a code-derived target",
+                )
+            })?,
+        };
+        if !derived_targets.insert(target)
+            && !matches!(
+                role,
+                ParticipantRoleV1::Catalog
+                    | ParticipantRoleV1::Attachments
+                    | ParticipantRoleV1::MigrationMarker
+            )
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_migration_registry",
+                "migration participant targets collide",
+            ));
+        }
+    }
+    for asset in &journal.immutable_assets {
+        if !derived_targets.insert(registry.immutable_target(&asset.role, &asset.validated_name)) {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_migration_registry",
+                "migration immutable target collides with a mutable target",
+            ));
+        }
+    }
+    for action in &journal.monotonic_checkout_identity_actions {
+        let target = registry
+            .checkout_identity_target(&action.observation_id)
+            .expect("validated checkout identity target");
+        if !derived_targets.insert(target) {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_migration_registry",
+                "checkout identity target collides with another migration target",
+            ));
+        }
+    }
+    Ok(ValidatedMigrationPlanV1 {
+        registry,
+        journal,
+        post_images,
+        immutable_asset_bytes,
+    })
+}
+
+/// Capture a read-only migration preflight while excluding every compatible
+/// writer to the legacy project store.
+///
+/// The lock order is the shared process-lifetime migration lock followed by
+/// the canonical project-store mutation lock. P1-C owns the inventory shape,
+/// but must perform its complete live v1 capture through this seam.
+#[allow(dead_code)] // P1-B seam consumed by the P1-C preflight implementation.
+pub(crate) fn capture_migration_preflight<T>(
+    projects_path: &Path,
+    capture: impl FnOnce() -> ProjectCatalogStoreResult<T>,
+) -> ProjectCatalogStoreResult<T> {
+    let paths = ProjectCatalogPaths::derive(projects_path)?;
+    let _lifetime_lock = ProjectCatalogMigrationLock::acquire_shared(&paths.catalog)
+        .map_err(|error| io_error("acquire lifetime lock for", &paths.catalog, error))?;
+    let _mutation_lock = acquire_store_lock_nofollow(&paths.catalog)
+        .map_err(|error| io_error("acquire mutation lock for", &paths.catalog, error))?;
+    capture()
+}
+
+#[allow(dead_code)] // P1-B apply seam consumed by P1-C.
+pub(crate) fn transact_migration(
+    projects_path: &Path,
+    plan: ValidatedMigrationPlanV1,
+) -> ProjectCatalogStoreResult<ProjectCatalogCommit> {
+    transact_migration_with_io(projects_path, plan, Arc::new(RealCatalogStoreIo))
+}
+
+fn transact_migration_with_io(
+    projects_path: &Path,
+    plan: ValidatedMigrationPlanV1,
+    io: Arc<dyn CatalogStoreIo>,
+) -> ProjectCatalogStoreResult<ProjectCatalogCommit> {
+    let paths = ProjectCatalogPaths::derive(projects_path)?;
+    let _exclusive = ProjectCatalogMigrationLock::try_acquire_exclusive(&paths.catalog)
+        .map_err(|error| io_error("acquire lifetime lock for", &paths.catalog, error))?
+        .ok_or_else(|| {
+            ProjectCatalogStoreError::new(
+                "error.project_catalog_lifetime_lock_busy",
+                "a compatible daemon or preflight still holds the lifetime lock",
+            )
+        })?;
+    let owner = ProjectCatalogTransactionOwner {
+        paths,
+        registry: ParticipantRegistry::Migration(Arc::new(plan.registry.clone())),
+        io,
+    };
+    let _mutation_lock = owner.io.acquire_mutation_lock(&owner.paths.catalog)?;
+    let _auxiliary_locks = owner.acquire_auxiliary_locks()?;
+    if !owner.can_supersede_terminal_migration_rollback()? {
+        owner.recover_locked()?;
+    }
+    if let Some(commit) = owner.completed_migration_commit(&plan)? {
+        return Ok(commit);
+    }
+    owner.commit_migration_plan_locked(plan)
+}
+
+#[cfg(test)]
+fn recover_migration_with_io(
+    projects_path: &Path,
+    registry: MigrationParticipantRegistry,
+    io: Arc<dyn CatalogStoreIo>,
+) -> ProjectCatalogStoreResult<()> {
+    let paths = ProjectCatalogPaths::derive(projects_path)?;
+    let _exclusive = ProjectCatalogMigrationLock::try_acquire_exclusive(&paths.catalog)
+        .map_err(|error| io_error("acquire lifetime lock for", &paths.catalog, error))?
+        .ok_or_else(|| {
+            ProjectCatalogStoreError::new(
+                "error.project_catalog_lifetime_lock_busy",
+                "a compatible daemon or preflight still holds the lifetime lock",
+            )
+        })?;
+    let owner = ProjectCatalogTransactionOwner {
+        paths,
+        registry: ParticipantRegistry::Migration(Arc::new(registry)),
+        io,
+    };
+    let _mutation_lock = owner.io.acquire_mutation_lock(&owner.paths.catalog)?;
+    let _auxiliary_locks = owner.acquire_auxiliary_locks()?;
+    owner.recover_locked()
+}
+
+impl ProjectCatalogTransactionOwner {
+    fn acquire_auxiliary_locks(&self) -> ProjectCatalogStoreResult<Vec<StoreLockGuard>> {
+        let ParticipantRegistry::Migration(registry) = &self.registry else {
+            return Ok(Vec::new());
+        };
+        let mut guards = Vec::new();
+        for store_path in registry.auxiliary_store_paths() {
+            guards.push(self.io.acquire_mutation_lock(&store_path)?);
+        }
+        Ok(guards)
+    }
+
+    fn completed_migration_commit(
+        &self,
+        plan: &ValidatedMigrationPlanV1,
+    ) -> ProjectCatalogStoreResult<Option<ProjectCatalogCommit>> {
+        let Some(catalog_bytes) = self
+            .io
+            .read_regular_nofollow(&self.paths.catalog, MAX_PROJECT_CATALOG_BYTES)?
+        else {
+            return Ok(None);
+        };
+        if decode_legacy_project_store(&catalog_bytes).is_ok() {
+            return Ok(None);
+        }
+        let catalog = decode_catalog_snapshot(&catalog_bytes).map_err(contract_error)?;
+        let CatalogOriginV2::MigratedV1 { transaction_id } = &catalog.origin else {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_inventory_stale",
+                "migration target already contains an unrelated fresh v2 catalog",
+            ));
+        };
+        if transaction_id != &plan.journal.transaction_id {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_inventory_stale",
+                "migration target belongs to a different transaction",
+            ));
+        }
+        let marker_bytes = self
+            .io
+            .read_regular_nofollow(&self.paths.migration_marker, MAX_MARKER_BYTES)?
+            .ok_or_else(|| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_migration_incomplete",
+                    "completed migration catalog lacks its retained marker",
+                )
+            })?;
+        let marker: ProjectCatalogMigrationMarkerV1 =
+            decode_bounded_json(&marker_bytes, MAX_MARKER_BYTES, "migration marker")?;
+        marker.validate()?;
+        let planned_marker_bytes = plan
+            .post_images
+            .get(&ParticipantRoleV1::MigrationMarker)
+            .and_then(Option::as_deref)
+            .ok_or_else(|| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_invalid_migration_plan",
+                    "validated migration plan lacks its marker post-image",
+                )
+            })?;
+        let planned_marker_hash = plan
+            .journal
+            .participants
+            .iter()
+            .find(|participant| participant.role == ParticipantRoleV1::MigrationMarker)
+            .and_then(|participant| participant.new.sha256());
+        if marker.transaction_id != plan.journal.transaction_id
+            || Some(&marker.plan_hash) != plan.journal.plan_hash.as_ref()
+            || marker.migration_epoch != plan.journal.new_epoch
+            || marker_bytes != planned_marker_bytes
+            || planned_marker_hash != Some(&sha256(&marker_bytes))
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_incomplete",
+                "retained migration marker does not prove the requested plan",
+            ));
+        }
+        self.verify_immutable_assets(&plan.journal)?;
+        let state = self.read_strict_pair_locked()?;
+        Ok(Some(ProjectCatalogCommit {
+            epoch: state.epoch,
+            catalog_sha256: state.catalog_sha256.to_string(),
+            attachments_sha256: state.attachments_sha256.to_string(),
+        }))
+    }
+
+    fn can_supersede_terminal_migration_rollback(&self) -> ProjectCatalogStoreResult<bool> {
+        let Some(journal) = self.read_journal_locked()? else {
+            return Ok(false);
+        };
+        if journal.kind != TransactionKindV1::V1Migration
+            || journal.state != TransactionStateV1::Committed
+            || journal.outcome != Some(TransactionOutcomeV1::RolledBack)
+        {
+            return Ok(false);
+        }
+        let catalog = self
+            .io
+            .read_regular_nofollow(&self.paths.catalog, MAX_PROJECT_CATALOG_BYTES)?;
+        let attachments = self
+            .io
+            .read_regular_nofollow(&self.paths.attachments, MAX_PROJECT_CATALOG_BYTES)?;
+        let marker = self
+            .io
+            .read_regular_nofollow(&self.paths.migration_marker, MAX_MARKER_BYTES)?;
+        Ok(catalog
+            .as_deref()
+            .is_some_and(|bytes| decode_legacy_project_store(bytes).is_ok())
+            && attachments.is_none()
+            && marker.is_none())
+    }
+
+    fn read_strict_pair_locked(&self) -> ProjectCatalogStoreResult<ProjectCatalogState> {
+        let catalog_bytes = self
+            .io
+            .read_regular_nofollow(&self.paths.catalog, MAX_PROJECT_CATALOG_BYTES)?;
+        let attachment_bytes = self
+            .io
+            .read_regular_nofollow(&self.paths.attachments, MAX_PROJECT_CATALOG_BYTES)?;
+        let (catalog_bytes, attachment_bytes) = match (catalog_bytes, attachment_bytes) {
+            (None, None) => {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_not_initialized",
+                    "strict catalog and attachment snapshots are both missing",
+                ));
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_incomplete_pair",
+                    "exactly one strict project catalog snapshot is missing",
+                ));
+            }
+            (Some(catalog), Some(attachments)) => (catalog, attachments),
+        };
+
+        let catalog = match decode_catalog_snapshot(&catalog_bytes) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                if decode_legacy_project_store(&catalog_bytes).is_ok() {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_legacy_store_requires_migration",
+                        "projects.json contains the legacy v1 project store",
+                    ));
+                }
+                return Err(contract_error(error));
+            }
+        };
+        let attachments = decode_attachment_snapshot(&attachment_bytes).map_err(contract_error)?;
+        validate_catalog_attachments(&catalog, &attachments).map_err(contract_error)?;
+        if catalog.epoch == 0 {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_zero_epoch",
+                "strict project catalog snapshots have epoch zero",
+            ));
+        }
+        self.verify_origin_marker_locked(&catalog)?;
+
+        Ok(ProjectCatalogState {
+            epoch: catalog.epoch,
+            catalog: Arc::new(catalog),
+            attachments: Arc::new(attachments),
+            catalog_sha256: sha256(&catalog_bytes),
+            attachments_sha256: sha256(&attachment_bytes),
+        })
+    }
+
+    fn verify_origin_marker_locked(
+        &self,
+        catalog: &CatalogSnapshotV2,
+    ) -> ProjectCatalogStoreResult<()> {
+        let marker_bytes = self
+            .io
+            .read_regular_nofollow(&self.paths.migration_marker, MAX_MARKER_BYTES)?;
+        match (&catalog.origin, marker_bytes) {
+            (CatalogOriginV2::FreshV2 {}, None) => Ok(()),
+            (CatalogOriginV2::FreshV2 {}, Some(_)) => Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_incomplete",
+                "fresh v2 catalog unexpectedly has a migration marker",
+            )),
+            (CatalogOriginV2::MigratedV1 { transaction_id }, Some(bytes)) => {
+                let marker: ProjectCatalogMigrationMarkerV1 =
+                    decode_bounded_json(&bytes, MAX_MARKER_BYTES, "migration marker")?;
+                marker.validate()?;
+                if &marker.transaction_id != transaction_id {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_migration_incomplete",
+                        "migration marker transaction does not match catalog origin",
+                    ));
+                }
+                if let Some(journal_bytes) = self
+                    .io
+                    .read_regular_nofollow(&self.paths.journal, MAX_JOURNAL_BYTES)?
+                {
+                    let journal: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
+                        &journal_bytes,
+                        MAX_JOURNAL_BYTES,
+                        "transaction journal",
+                    )?;
+                    journal.validate()?;
+                    if journal.transaction_id == marker.transaction_id {
+                        let marker_hash = journal
+                            .participants
+                            .iter()
+                            .find(|participant| {
+                                participant.role == ParticipantRoleV1::MigrationMarker
+                            })
+                            .and_then(|participant| participant.new.sha256());
+                        let journal_participants = journal
+                            .participants
+                            .iter()
+                            .filter(|participant| {
+                                participant.role != ParticipantRoleV1::MigrationMarker
+                            })
+                            .map(|participant| MigrationParticipantEvidenceV1 {
+                                role: participant.role.clone(),
+                                old: participant.old.clone(),
+                                new: participant.new.clone(),
+                            })
+                            .collect::<Vec<_>>();
+                        let journal_immutable_assets = journal
+                            .immutable_assets
+                            .iter()
+                            .map(|asset| MigrationImmutableAssetEvidenceV1 {
+                                role: asset.role.clone(),
+                                sha256: asset.sha256.clone(),
+                                validated_name: asset.validated_name.clone(),
+                            })
+                            .collect::<Vec<_>>();
+                        if journal.kind != TransactionKindV1::V1Migration
+                            || !matches!(
+                                (journal.state, journal.outcome),
+                                (TransactionStateV1::Prepared, None)
+                                    | (
+                                        TransactionStateV1::Committed,
+                                        Some(TransactionOutcomeV1::Committed)
+                                    )
+                            )
+                            || journal.plan_hash.as_ref() != Some(&marker.plan_hash)
+                            || journal.new_epoch != marker.migration_epoch
+                            || marker_hash != Some(&sha256(&bytes))
+                            || journal_participants != marker.participants
+                            || journal_immutable_assets != marker.immutable_assets
+                        {
+                            return Err(ProjectCatalogStoreError::new(
+                                "error.project_catalog_migration_incomplete",
+                                "migration marker disagrees with its retained transaction journal",
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            }
+            (CatalogOriginV2::MigratedV1 { .. }, None) => Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_incomplete",
+                "migrated v2 catalog lacks its committed migration marker",
+            )),
+        }
+    }
+
+    fn commit_regular_pair_locked(
+        &self,
+        old: Option<&ProjectCatalogState>,
+        new: &PreparedPair,
+    ) -> ProjectCatalogStoreResult<()> {
+        let prior_journal = self.read_journal_locked()?;
+        self.io.create_private_dir_nofollow(&self.paths.stage_dir)?;
+        self.io
+            .create_private_dir_nofollow(&self.paths.backup_dir)?;
+
+        let transaction_id = ProjectCatalogTransactionId::mint();
+        let mut participants = Vec::with_capacity(2);
+        for (role, target, new_bytes, new_hash) in [
+            (
+                ParticipantRoleV1::Catalog,
+                &self.paths.catalog,
+                new.catalog_bytes.as_slice(),
+                &new.catalog_sha256,
+            ),
+            (
+                ParticipantRoleV1::Attachments,
+                &self.paths.attachments,
+                new.attachment_bytes.as_slice(),
+                &new.attachments_sha256,
+            ),
+        ] {
+            let old_image = match self
+                .io
+                .read_regular_nofollow(target, MAX_PROJECT_CATALOG_BYTES)?
+            {
+                Some(bytes) => {
+                    let hash = sha256(&bytes);
+                    let backup_name =
+                        artifact_name(&transaction_id, &role, &hash, ArtifactKind::Backup)?;
+                    let backup_path = self.paths.backup_dir.join(backup_name.as_str());
+                    self.write_artifact(
+                        &backup_path,
+                        &bytes,
+                        hash.clone(),
+                        FaultPoint::BackupWrite,
+                        FaultPoint::BackupFsync,
+                    )?;
+                    ExpectedImageV1::Present {
+                        sha256: hash,
+                        artifact_name: backup_name,
+                    }
+                }
+                None => ExpectedImageV1::Absent {},
+            };
+            let stage_name = artifact_name(&transaction_id, &role, new_hash, ArtifactKind::Stage)?;
+            let stage_path = self.paths.stage_dir.join(stage_name.as_str());
+            self.write_artifact(
+                &stage_path,
+                new_bytes,
+                new_hash.clone(),
+                FaultPoint::StageWrite,
+                FaultPoint::StageFsync,
+            )?;
+            participants.push(TransactionParticipantV1 {
+                role,
+                old: old_image,
+                new: ExpectedImageV1::Present {
+                    sha256: new_hash.clone(),
+                    artifact_name: stage_name,
+                },
+            });
+        }
+
+        let now = unix_timestamp()?;
+        let mut journal = ProjectCatalogTransactionJournalV1 {
+            version: JOURNAL_VERSION,
+            transaction_id,
+            kind: TransactionKindV1::RegularPair,
+            state: TransactionStateV1::Prepared,
+            outcome: None,
+            plan_hash: None,
+            old_epoch: old.map_or(0, |state| state.epoch),
+            new_epoch: new.catalog.epoch,
+            participants,
+            immutable_assets: Vec::new(),
+            monotonic_checkout_identity_actions: Vec::new(),
+            created_at: now,
+            committed_at: None,
+        };
+        journal.validate()?;
+        self.write_journal(&journal, FaultPoint::PreparedJournalWrite)?;
+        if let Some(prior) = prior_journal.as_ref() {
+            self.cleanup_obsolete_regular_evidence(prior)?;
+        }
+
+        for participant in &journal.participants {
+            self.io.checkpoint(FaultPoint::ParticipantInstall)?;
+            self.install_new_image(participant)?;
+            self.io.checkpoint(FaultPoint::ParticipantInstall)?;
+        }
+        self.io.checkpoint(FaultPoint::CompletePlanVerify)?;
+        self.verify_expected_pair(&journal, ExpectedSide::New)?;
+        let installed = self.read_strict_pair_locked()?;
+        if installed.epoch != journal.new_epoch
+            || installed.catalog_sha256 != new.catalog_sha256
+            || installed.attachments_sha256 != new.attachments_sha256
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_install_verification",
+                "installed pair does not match prepared post-images",
+            ));
+        }
+        self.io.checkpoint(FaultPoint::CompletePlanVerify)?;
+
+        journal.state = TransactionStateV1::Committed;
+        journal.outcome = Some(TransactionOutcomeV1::Committed);
+        journal.committed_at = Some(unix_timestamp()?);
+        journal.validate()?;
+        self.write_journal(&journal, FaultPoint::CommittedJournalWrite)?;
+        Ok(())
+    }
+
+    fn read_journal_locked(
+        &self,
+    ) -> ProjectCatalogStoreResult<Option<ProjectCatalogTransactionJournalV1>> {
+        let Some(bytes) = self
+            .io
+            .read_regular_nofollow(&self.paths.journal, MAX_JOURNAL_BYTES)?
+        else {
+            return Ok(None);
+        };
+        let journal: ProjectCatalogTransactionJournalV1 =
+            decode_bounded_json(&bytes, MAX_JOURNAL_BYTES, "transaction journal")?;
+        journal.validate()?;
+        Ok(Some(journal))
+    }
+
+    fn cleanup_obsolete_regular_evidence(
+        &self,
+        prior: &ProjectCatalogTransactionJournalV1,
+    ) -> ProjectCatalogStoreResult<()> {
+        prior.validate()?;
+        if prior.kind != TransactionKindV1::RegularPair
+            || prior.state != TransactionStateV1::Committed
+            || prior.outcome != Some(TransactionOutcomeV1::Committed)
+        {
+            return Ok(());
+        }
+        self.verify_expected_pair(prior, ExpectedSide::New)?;
+        for participant in &prior.participants {
+            for (root, image) in [
+                (&self.paths.backup_dir, &participant.old),
+                (&self.paths.stage_dir, &participant.new),
+            ] {
+                let ExpectedImageV1::Present {
+                    sha256,
+                    artifact_name,
+                } = image
+                else {
+                    continue;
+                };
+                self.io.checkpoint(FaultPoint::Cleanup)?;
+                self.io.remove_regular_exact(
+                    &root.join(artifact_name.as_str()),
+                    sha256,
+                    participant.role.max_bytes(),
+                )?;
+                self.io.checkpoint(FaultPoint::Cleanup)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)] // P1-B apply seam consumed by P1-C.
+    fn commit_migration_plan_locked(
+        &self,
+        plan: ValidatedMigrationPlanV1,
+    ) -> ProjectCatalogStoreResult<ProjectCatalogCommit> {
+        let ParticipantRegistry::Migration(registry) = &self.registry else {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_registry_required",
+                "migration transaction requires the complete registry",
+            ));
+        };
+
+        // The complete live inventory is revalidated before this transaction
+        // creates even a staging directory. A stale plan therefore has no
+        // filesystem side effects and cannot poison a corrected attempt.
+        let mut old_images = std::collections::BTreeMap::new();
+        for participant in &plan.journal.participants {
+            let target = self.target_for_role(&participant.role)?;
+            let actual = self
+                .io
+                .read_regular_nofollow(&target, participant.role.max_bytes())?;
+            let actual_hash = actual.as_ref().map(|bytes| sha256(bytes));
+            if actual_hash.as_ref() != participant.old.sha256() {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_migration_inventory_stale",
+                    "migration participant no longer matches its inventoried old image",
+                ));
+            }
+            match (plan.post_images.get(&participant.role), &participant.new) {
+                (
+                    Some(Some(bytes)),
+                    ExpectedImageV1::Present {
+                        sha256: expected_hash,
+                        ..
+                    },
+                ) if sha256(bytes) == *expected_hash => {}
+                (Some(None), ExpectedImageV1::Absent {}) => {}
+                _ => {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_invalid_migration_plan",
+                        "validated migration plan disagrees with its journal",
+                    ));
+                }
+            }
+            old_images.insert(participant.role.clone(), actual);
+        }
+        for asset in &plan.journal.immutable_assets {
+            let bytes = plan.immutable_asset_bytes.get(&asset.role).ok_or_else(|| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_invalid_migration_plan",
+                    "validated migration plan lacks journaled immutable bytes",
+                )
+            })?;
+            let target = registry.immutable_target(&asset.role, &asset.validated_name);
+            if sha256(bytes) != asset.sha256
+                || target.file_name().and_then(|name| name.to_str())
+                    != Some(asset.validated_name.as_str())
+            {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_invalid_migration_plan",
+                    "validated migration immutable bytes or target disagree with the journal",
+                ));
+            }
+            if let Some(existing) = self
+                .io
+                .read_regular_nofollow(&target, MAX_PROJECT_CATALOG_BYTES)?
+                && sha256(&existing) != asset.sha256
+            {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_artifact_collision",
+                    "immutable migration target has unexpected bytes",
+                ));
+            }
+        }
+        self.prevalidate_monotonic_checkout_actions(&plan.journal)?;
+
+        let checkout_locks = self.acquire_checkout_action_locks(&plan.journal)?;
+        self.prevalidate_monotonic_checkout_actions_locked(&plan.journal, &checkout_locks)?;
+        self.io.create_private_dir_nofollow(&self.paths.stage_dir)?;
+        self.io
+            .create_private_dir_nofollow(&self.paths.backup_dir)?;
+
+        for asset in &plan.journal.immutable_assets {
+            let bytes = plan
+                .immutable_asset_bytes
+                .get(&asset.role)
+                .expect("immutable plan bytes were revalidated");
+            self.write_artifact(
+                &self.paths.stage_dir.join(asset.stage_name.as_str()),
+                bytes,
+                asset.sha256.clone(),
+                FaultPoint::ImmutableAssetWrite,
+                FaultPoint::ImmutableAssetFsync,
+            )?;
+        }
+        self.install_immutable_assets(&plan.journal)?;
+
+        for participant in &plan.journal.participants {
+            let actual = old_images
+                .get(&participant.role)
+                .expect("all participants were revalidated");
+            if let (
+                Some(bytes),
+                ExpectedImageV1::Present {
+                    sha256,
+                    artifact_name,
+                },
+            ) = (actual.as_ref(), &participant.old)
+            {
+                self.write_artifact(
+                    &self.paths.backup_dir.join(artifact_name.as_str()),
+                    bytes,
+                    sha256.clone(),
+                    FaultPoint::BackupWrite,
+                    FaultPoint::BackupFsync,
+                )?;
+            }
+            match (plan.post_images.get(&participant.role), &participant.new) {
+                (
+                    Some(Some(bytes)),
+                    ExpectedImageV1::Present {
+                        sha256: expected_hash,
+                        artifact_name,
+                    },
+                ) if sha256(bytes) == *expected_hash => {
+                    self.write_artifact(
+                        &self.paths.stage_dir.join(artifact_name.as_str()),
+                        bytes,
+                        expected_hash.clone(),
+                        FaultPoint::StageWrite,
+                        FaultPoint::StageFsync,
+                    )?;
+                }
+                (Some(None), ExpectedImageV1::Absent {}) => {}
+                _ => {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_invalid_migration_plan",
+                        "validated migration plan disagrees with its journal",
+                    ));
+                }
+            }
+        }
+
+        let mut journal = plan.journal;
+        self.write_journal(&journal, FaultPoint::PreparedJournalWrite)?;
+        self.execute_monotonic_checkout_actions_locked(&journal, &checkout_locks)?;
+        for participant in &journal.participants {
+            self.io.checkpoint(FaultPoint::ParticipantInstall)?;
+            self.install_new_image(participant)?;
+            self.io.checkpoint(FaultPoint::ParticipantInstall)?;
+        }
+        self.io.checkpoint(FaultPoint::CompletePlanVerify)?;
+        self.verify_immutable_assets(&journal)?;
+        self.verify_expected_pair(&journal, ExpectedSide::New)?;
+        self.verify_journal_pair_invariants(&journal, ExpectedSide::New)?;
+        self.io.checkpoint(FaultPoint::CompletePlanVerify)?;
+
+        journal.state = TransactionStateV1::Committed;
+        journal.outcome = Some(TransactionOutcomeV1::Committed);
+        journal.committed_at = Some(unix_timestamp()?);
+        journal.validate()?;
+        self.write_journal(&journal, FaultPoint::CommittedJournalWrite)?;
+        let state = self.read_strict_pair_locked()?;
+        Ok(ProjectCatalogCommit {
+            epoch: state.epoch,
+            catalog_sha256: state.catalog_sha256.to_string(),
+            attachments_sha256: state.attachments_sha256.to_string(),
+        })
+    }
+
+    fn write_artifact(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        expected_hash: Sha256Hex,
+        write_point: FaultPoint,
+        fsync_point: FaultPoint,
+    ) -> ProjectCatalogStoreResult<()> {
+        if let Some(existing) = self.io.read_regular_nofollow(path, bytes.len())? {
+            if sha256(&existing) != expected_hash {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_artifact_collision",
+                    "content-addressed transaction artifact has unexpected bytes",
+                ));
+            }
+            self.io.checkpoint(fsync_point)?;
+            self.io.fsync_regular_nofollow(path)?;
+            self.io.checkpoint(fsync_point)?;
+            self.io.checkpoint(FaultPoint::DirectoryFsync)?;
+            self.io
+                .fsync_dir(path.parent().expect("derived artifact has parent"))?;
+            self.io.checkpoint(FaultPoint::DirectoryFsync)?;
+            return Ok(());
+        }
+        self.io.checkpoint(write_point)?;
+        self.io.write_new_nofollow(path, bytes)?;
+        self.io.checkpoint(write_point)?;
+        self.io.checkpoint(fsync_point)?;
+        self.io.fsync_regular_nofollow(path)?;
+        self.io.checkpoint(fsync_point)?;
+        self.io.checkpoint(FaultPoint::DirectoryFsync)?;
+        self.io
+            .fsync_dir(path.parent().expect("derived artifact has parent"))?;
+        self.io.checkpoint(FaultPoint::DirectoryFsync)?;
+        Ok(())
+    }
+
+    fn write_journal(
+        &self,
+        journal: &ProjectCatalogTransactionJournalV1,
+        point: FaultPoint,
+    ) -> ProjectCatalogStoreResult<()> {
+        let bytes = encode_bounded_json(journal, MAX_JOURNAL_BYTES, "transaction journal")?;
+        self.io.checkpoint(point)?;
+        self.io
+            .atomic_replace_sync_nofollow(&self.paths.journal, &bytes)?;
+        self.io.checkpoint(point)?;
+        self.io.checkpoint(FaultPoint::DirectoryFsync)?;
+        self.io.fsync_dir(
+            self.paths
+                .journal
+                .parent()
+                .expect("derived journal has parent"),
+        )?;
+        self.io.checkpoint(FaultPoint::DirectoryFsync)?;
+        Ok(())
+    }
+
+    fn recover_locked(&self) -> ProjectCatalogStoreResult<()> {
+        let Some(bytes) = self
+            .io
+            .read_regular_nofollow(&self.paths.journal, MAX_JOURNAL_BYTES)?
+        else {
+            return Ok(());
+        };
+        let mut journal: ProjectCatalogTransactionJournalV1 =
+            decode_bounded_json(&bytes, MAX_JOURNAL_BYTES, "transaction journal")?;
+        journal.validate()?;
+        if journal.kind == TransactionKindV1::V1Migration
+            && !matches!(self.registry, ParticipantRegistry::Migration(_))
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_registry_required",
+                "migration recovery requires the complete code-owned participant registry",
+            ));
+        }
+        self.install_immutable_assets(&journal)?;
+        self.verify_immutable_assets(&journal)?;
+
+        match (journal.state, journal.outcome) {
+            (TransactionStateV1::Committed, Some(TransactionOutcomeV1::Committed)) => {
+                self.verify_expected_pair(&journal, ExpectedSide::New)?;
+                self.verify_journal_pair_invariants(&journal, ExpectedSide::New)
+            }
+            (TransactionStateV1::Committed, Some(TransactionOutcomeV1::RolledBack)) => {
+                self.verify_expected_pair(&journal, ExpectedSide::Old)?;
+                self.verify_journal_pair_invariants(&journal, ExpectedSide::Old)
+            }
+            (TransactionStateV1::Prepared, None) => {
+                let checkout_locks = self.acquire_checkout_action_locks(&journal)?;
+                let checkout_state =
+                    self.classify_checkout_action_recovery(&journal, &checkout_locks)?;
+                if checkout_state == CheckoutActionRecoveryState::Compatible {
+                    self.execute_monotonic_checkout_actions_locked(&journal, &checkout_locks)?;
+                }
+                let decision = self.classify_recovery(
+                    &journal,
+                    checkout_state == CheckoutActionRecoveryState::ConflictingValid,
+                )?;
+                match decision {
+                    RecoveryDecision::Forward => {
+                        for participant in &journal.participants {
+                            self.io.checkpoint(FaultPoint::RecoveryParticipantInstall)?;
+                            self.install_new_image(participant)?;
+                            self.io.checkpoint(FaultPoint::RecoveryParticipantInstall)?;
+                        }
+                        self.verify_expected_pair(&journal, ExpectedSide::New)?;
+                        self.verify_journal_pair_invariants(&journal, ExpectedSide::New)?;
+                        journal.state = TransactionStateV1::Committed;
+                        journal.outcome = Some(TransactionOutcomeV1::Committed);
+                    }
+                    RecoveryDecision::Rollback => {
+                        for participant in &journal.participants {
+                            self.io.checkpoint(FaultPoint::RecoveryParticipantRestore)?;
+                            self.restore_old_image(participant)?;
+                            self.io.checkpoint(FaultPoint::RecoveryParticipantRestore)?;
+                        }
+                        self.verify_expected_pair(&journal, ExpectedSide::Old)?;
+                        self.verify_journal_pair_invariants(&journal, ExpectedSide::Old)?;
+                        journal.state = TransactionStateV1::Committed;
+                        journal.outcome = Some(TransactionOutcomeV1::RolledBack);
+                    }
+                    RecoveryDecision::Incomplete => {
+                        return Err(ProjectCatalogStoreError::new(
+                            "error.project_catalog_recovery_incomplete",
+                            "neither complete forward recovery nor complete rollback is possible",
+                        ));
+                    }
+                }
+                journal.committed_at = Some(unix_timestamp()?);
+                journal.validate()?;
+                self.write_journal(&journal, FaultPoint::CommittedJournalWrite)
+            }
+            _ => Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_journal",
+                "journal state and outcome disagree",
+            )),
+        }
+    }
+
+    fn classify_recovery(
+        &self,
+        journal: &ProjectCatalogTransactionJournalV1,
+        prefer_rollback: bool,
+    ) -> ProjectCatalogStoreResult<RecoveryDecision> {
+        let mut forward = true;
+        let mut rollback = true;
+        for participant in &journal.participants {
+            let target = self.target_for_role(&participant.role)?;
+            let observed = self
+                .io
+                .read_regular_nofollow(&target, participant.role.max_bytes())?
+                .map(|bytes| sha256(&bytes));
+            let old_hash = participant.old.sha256();
+            let new_hash = participant.new.sha256();
+            let target_is_new = observed.as_ref() == new_hash;
+            let forward_available = match &participant.new {
+                ExpectedImageV1::Absent {} => observed.is_none() || observed.as_ref() == old_hash,
+                image @ ExpectedImageV1::Present { .. } => {
+                    target_is_new
+                        || self.artifact_available(
+                            &self.paths.stage_dir,
+                            image,
+                            participant.role.max_bytes(),
+                        )?
+                }
+            };
+            forward &= forward_available;
+
+            let target_is_old = match old_hash {
+                Some(hash) => observed.as_ref() == Some(hash),
+                None => observed.is_none(),
+            };
+            let backup_available = match &participant.old {
+                ExpectedImageV1::Absent {} => observed.is_none() || observed.as_ref() == new_hash,
+                image @ ExpectedImageV1::Present { .. } => self.artifact_available(
+                    &self.paths.backup_dir,
+                    image,
+                    participant.role.max_bytes(),
+                )?,
+            };
+            rollback &= target_is_old || backup_available;
+
+            let explained = observed.is_none()
+                || observed.as_ref() == old_hash
+                || observed.as_ref() == new_hash;
+            if !explained {
+                return Ok(RecoveryDecision::Incomplete);
+            }
+        }
+        Ok(if prefer_rollback {
+            if rollback {
+                RecoveryDecision::Rollback
+            } else {
+                RecoveryDecision::Incomplete
+            }
+        } else if forward {
+            RecoveryDecision::Forward
+        } else if rollback {
+            RecoveryDecision::Rollback
+        } else {
+            RecoveryDecision::Incomplete
+        })
+    }
+
+    fn install_new_image(
+        &self,
+        participant: &TransactionParticipantV1,
+    ) -> ProjectCatalogStoreResult<()> {
+        let target = self.target_for_role(&participant.role)?;
+        let max_bytes = participant.role.max_bytes();
+        if let Some(parent) = target.parent() {
+            self.io.create_private_dir_nofollow(parent)?;
+        }
+        match &participant.new {
+            ExpectedImageV1::Absent {} => {
+                let Some(bytes) = self.io.read_regular_nofollow(&target, max_bytes)? else {
+                    return Ok(());
+                };
+                let old_hash = participant.old.sha256().ok_or_else(|| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_invalid_journal",
+                        "deletion participant has no old image hash",
+                    )
+                })?;
+                if sha256(&bytes) != *old_hash {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_recovery_incomplete",
+                        "deletion participant contains unexplained target bytes",
+                    ));
+                }
+                self.io.remove_regular_exact(&target, old_hash, max_bytes)?;
+                self.fsync_dir_checkpointed(
+                    target
+                        .parent()
+                        .expect("code-owned participant target has parent"),
+                )
+            }
+            ExpectedImageV1::Present {
+                sha256: expected_hash,
+                artifact_name,
+            } => {
+                if self
+                    .io
+                    .read_regular_nofollow(&target, max_bytes)?
+                    .is_some_and(|bytes| sha256(&bytes) == *expected_hash)
+                {
+                    return Ok(());
+                }
+                let stage = self.paths.stage_dir.join(artifact_name.as_str());
+                self.io
+                    .replace_from_stage_nofollow(&stage, &target, expected_hash, max_bytes)?;
+                self.fsync_dir_checkpointed(
+                    target
+                        .parent()
+                        .expect("code-owned participant target has parent"),
+                )
+            }
+        }
+    }
+
+    fn restore_old_image(
+        &self,
+        participant: &TransactionParticipantV1,
+    ) -> ProjectCatalogStoreResult<()> {
+        let target = self.target_for_role(&participant.role)?;
+        let max_bytes = participant.role.max_bytes();
+        if let Some(parent) = target.parent() {
+            self.io.create_private_dir_nofollow(parent)?;
+        }
+        match &participant.old {
+            ExpectedImageV1::Absent {} => {
+                if let Some(bytes) = self.io.read_regular_nofollow(&target, max_bytes)? {
+                    let new_hash = participant.new.sha256().ok_or_else(|| {
+                        ProjectCatalogStoreError::new(
+                            "error.project_catalog_invalid_journal",
+                            "regular participant lacks a new image hash",
+                        )
+                    })?;
+                    if sha256(&bytes) != *new_hash {
+                        return Err(ProjectCatalogStoreError::new(
+                            "error.project_catalog_recovery_incomplete",
+                            "rollback refused to remove unexplained target bytes",
+                        ));
+                    }
+                    self.io.checkpoint(FaultPoint::RecoveryParticipantDelete)?;
+                    self.io.remove_regular_exact(&target, new_hash, max_bytes)?;
+                    self.io.checkpoint(FaultPoint::RecoveryParticipantDelete)?;
+                    self.fsync_dir_checkpointed(
+                        target
+                            .parent()
+                            .expect("code-owned participant target has parent"),
+                    )?;
+                }
+                Ok(())
+            }
+            ExpectedImageV1::Present {
+                sha256: expected_hash,
+                artifact_name,
+            } => {
+                if self
+                    .io
+                    .read_regular_nofollow(&target, max_bytes)?
+                    .is_some_and(|bytes| sha256(&bytes) == *expected_hash)
+                {
+                    return Ok(());
+                }
+                let backup = self.paths.backup_dir.join(artifact_name.as_str());
+                self.io
+                    .replace_from_stage_nofollow(&backup, &target, expected_hash, max_bytes)?;
+                self.fsync_dir_checkpointed(
+                    target
+                        .parent()
+                        .expect("code-owned participant target has parent"),
+                )
+            }
+        }
+    }
+
+    fn verify_expected_pair(
+        &self,
+        journal: &ProjectCatalogTransactionJournalV1,
+        side: ExpectedSide,
+    ) -> ProjectCatalogStoreResult<()> {
+        for participant in &journal.participants {
+            let expected = match side {
+                ExpectedSide::Old => &participant.old,
+                ExpectedSide::New => &participant.new,
+            };
+            let target = self.target_for_role(&participant.role)?;
+            let observed = self
+                .io
+                .read_regular_nofollow(&target, participant.role.max_bytes())?
+                .map(|bytes| sha256(&bytes));
+            if observed.as_ref() != expected.sha256() {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_install_verification",
+                    "installed participant hash does not match journal",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_journal_pair_invariants(
+        &self,
+        journal: &ProjectCatalogTransactionJournalV1,
+        side: ExpectedSide,
+    ) -> ProjectCatalogStoreResult<()> {
+        let epoch = match side {
+            ExpectedSide::Old => journal.old_epoch,
+            ExpectedSide::New => journal.new_epoch,
+        };
+        if epoch == 0 {
+            let catalog = self
+                .io
+                .read_regular_nofollow(&self.paths.catalog, MAX_PROJECT_CATALOG_BYTES)?;
+            let attachments = self
+                .io
+                .read_regular_nofollow(&self.paths.attachments, MAX_PROJECT_CATALOG_BYTES)?;
+            match journal.kind {
+                TransactionKindV1::RegularPair if catalog.is_none() && attachments.is_none() => {
+                    return Ok(());
+                }
+                TransactionKindV1::V1Migration
+                    if side == ExpectedSide::Old
+                        && attachments.is_none()
+                        && catalog
+                            .as_deref()
+                            .is_some_and(|bytes| decode_legacy_project_store(bytes).is_ok()) =>
+                {
+                    return Ok(());
+                }
+                _ => {}
+            }
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_install_verification",
+                "epoch-zero journal state does not match its transaction kind",
+            ));
+        }
+        let installed = self.read_strict_pair_locked()?;
+        if installed.epoch != epoch {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_install_verification",
+                "installed pair epoch does not match journal",
+            ));
+        }
+        Ok(())
+    }
+
+    fn artifact_available(
+        &self,
+        root: &Path,
+        image: &ExpectedImageV1,
+        max_bytes: usize,
+    ) -> ProjectCatalogStoreResult<bool> {
+        let ExpectedImageV1::Present {
+            sha256: expected_hash,
+            artifact_name,
+        } = image
+        else {
+            return Ok(false);
+        };
+        Ok(self
+            .io
+            .read_regular_nofollow(&root.join(artifact_name.as_str()), max_bytes)?
+            .is_some_and(|bytes| sha256(&bytes) == *expected_hash))
+    }
+
+    fn verify_immutable_assets(
+        &self,
+        journal: &ProjectCatalogTransactionJournalV1,
+    ) -> ProjectCatalogStoreResult<()> {
+        if journal.immutable_assets.is_empty() {
+            return Ok(());
+        }
+        let ParticipantRegistry::Migration(registry) = &self.registry else {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_registry_required",
+                "immutable migration assets require the complete registry",
+            ));
+        };
+        for asset in &journal.immutable_assets {
+            self.io.checkpoint(FaultPoint::ImmutableAssetVerify)?;
+            let target = registry.immutable_target(&asset.role, &asset.validated_name);
+            if target.file_name().and_then(|name| name.to_str())
+                != Some(asset.validated_name.as_str())
+            {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_invalid_journal",
+                    "journaled immutable target name is not code-derived",
+                ));
+            }
+            let bytes = self
+                .io
+                .read_regular_nofollow(&target, MAX_PROJECT_CATALOG_BYTES)?
+                .ok_or_else(|| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_recovery_incomplete",
+                        "journaled immutable migration asset is missing",
+                    )
+                })?;
+            if sha256(&bytes) != asset.sha256 {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_recovery_incomplete",
+                    "journaled immutable migration asset has unexpected bytes",
+                ));
+            }
+            self.io.checkpoint(FaultPoint::ImmutableAssetVerify)?;
+        }
+        Ok(())
+    }
+
+    fn install_immutable_assets(
+        &self,
+        journal: &ProjectCatalogTransactionJournalV1,
+    ) -> ProjectCatalogStoreResult<()> {
+        if journal.immutable_assets.is_empty() {
+            return Ok(());
+        }
+        let ParticipantRegistry::Migration(registry) = &self.registry else {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_registry_required",
+                "immutable migration assets require the complete registry",
+            ));
+        };
+        for asset in &journal.immutable_assets {
+            let target = registry.immutable_target(&asset.role, &asset.validated_name);
+            if target.file_name().and_then(|name| name.to_str())
+                != Some(asset.validated_name.as_str())
+            {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_invalid_journal",
+                    "journaled immutable target name is not code-derived",
+                ));
+            }
+            let parent = target.parent().ok_or_else(|| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_unsafe_path",
+                    "immutable migration target has no parent",
+                )
+            })?;
+            self.io.create_private_dir_nofollow(parent)?;
+            if let Some(existing) = self
+                .io
+                .read_regular_nofollow(&target, MAX_PROJECT_CATALOG_BYTES)?
+            {
+                if sha256(&existing) != asset.sha256 {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_artifact_collision",
+                        "immutable migration target has unexpected bytes",
+                    ));
+                }
+                self.io.fsync_regular_nofollow(&target)?;
+                self.fsync_dir_checkpointed(parent)?;
+                continue;
+            }
+
+            let stage = self.paths.stage_dir.join(asset.stage_name.as_str());
+            let bytes = self
+                .io
+                .read_regular_nofollow(&stage, MAX_PROJECT_CATALOG_BYTES)?
+                .ok_or_else(|| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_recovery_incomplete",
+                        "journaled immutable stage is missing",
+                    )
+                })?;
+            if sha256(&bytes) != asset.sha256 {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_recovery_incomplete",
+                    "journaled immutable stage has unexpected bytes",
+                ));
+            }
+            self.io.checkpoint(FaultPoint::ImmutableAssetWrite)?;
+            match self.io.write_new_nofollow(&target, &bytes) {
+                Ok(()) => {}
+                Err(error) if error.code() == "error.project_catalog_already_exists" => {
+                    let installed = self
+                        .io
+                        .read_regular_nofollow(&target, MAX_PROJECT_CATALOG_BYTES)?
+                        .ok_or_else(|| {
+                            ProjectCatalogStoreError::new(
+                                "error.project_catalog_recovery_incomplete",
+                                "immutable target disappeared after create contention",
+                            )
+                        })?;
+                    if sha256(&installed) != asset.sha256 {
+                        return Err(ProjectCatalogStoreError::new(
+                            "error.project_catalog_artifact_collision",
+                            "immutable target changed during no-replace installation",
+                        ));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+            self.io.checkpoint(FaultPoint::ImmutableAssetWrite)?;
+            self.io.checkpoint(FaultPoint::ImmutableAssetFsync)?;
+            self.io.fsync_regular_nofollow(&target)?;
+            self.io.checkpoint(FaultPoint::ImmutableAssetFsync)?;
+            self.fsync_dir_checkpointed(parent)?;
+        }
+        Ok(())
+    }
+
+    fn fsync_dir_checkpointed(&self, path: &Path) -> ProjectCatalogStoreResult<()> {
+        self.io.checkpoint(FaultPoint::DirectoryFsync)?;
+        self.io.fsync_dir(path)?;
+        self.io.checkpoint(FaultPoint::DirectoryFsync)
+    }
+
+    fn prevalidate_monotonic_checkout_actions(
+        &self,
+        journal: &ProjectCatalogTransactionJournalV1,
+    ) -> ProjectCatalogStoreResult<()> {
+        if journal.monotonic_checkout_identity_actions.is_empty() {
+            return Ok(());
+        }
+        let ParticipantRegistry::Migration(registry) = &self.registry else {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_registry_required",
+                "checkout identity actions require the complete migration registry",
+            ));
+        };
+        for action in &journal.monotonic_checkout_identity_actions {
+            let target = registry
+                .checkout_identity_target(&action.observation_id)
+                .ok_or_else(|| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_invalid_migration_registry",
+                        "migration registry lacks a checkout identity target",
+                    )
+                })?;
+            let parent = target.parent().ok_or_else(|| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_unsafe_path",
+                    "checkout identity target has no parent",
+                )
+            })?;
+            let expected = format!("{}\n", action.planned_id);
+            match self.io.read_regular_nofollow(&target, 128)? {
+                None => {}
+                Some(bytes) if bytes.is_empty() || bytes == expected.as_bytes() => {}
+                Some(_) => {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_recovery_incomplete",
+                        "checkout identity marker disagrees with the journaled id",
+                    ));
+                }
+            }
+            let gitignore = parent.join(".gitignore");
+            let _ = self.io.read_regular_nofollow(&gitignore, 64 * 1024)?;
+        }
+        Ok(())
+    }
+
+    fn classify_checkout_action_recovery(
+        &self,
+        journal: &ProjectCatalogTransactionJournalV1,
+        locks: &[CatalogDirectoryLockGuard],
+    ) -> ProjectCatalogStoreResult<CheckoutActionRecoveryState> {
+        let ParticipantRegistry::Migration(registry) = &self.registry else {
+            if journal.monotonic_checkout_identity_actions.is_empty() {
+                return Ok(CheckoutActionRecoveryState::Compatible);
+            }
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_registry_required",
+                "checkout identity actions require the complete migration registry",
+            ));
+        };
+        let mut state = CheckoutActionRecoveryState::Compatible;
+        for action in &journal.monotonic_checkout_identity_actions {
+            let target = registry
+                .checkout_identity_target(&action.observation_id)
+                .ok_or_else(|| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_invalid_migration_registry",
+                        "migration registry lacks a checkout identity target",
+                    )
+                })?;
+            let lane = checkout_lock_for(&target, locks)?;
+            let expected = format!("{}\n", action.planned_id);
+            match lane.read_regular("checkout-id", 128)? {
+                None => {}
+                Some(bytes) if bytes.is_empty() || bytes == expected.as_bytes() => {}
+                Some(bytes) if valid_checkout_identity_bytes(&bytes) => {
+                    state = CheckoutActionRecoveryState::ConflictingValid;
+                }
+                Some(_) => {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_recovery_incomplete",
+                        "checkout identity marker is malformed during migration recovery",
+                    ));
+                }
+            }
+            lane.ensure_still_current()?;
+        }
+        Ok(state)
+    }
+
+    fn prevalidate_monotonic_checkout_actions_locked(
+        &self,
+        journal: &ProjectCatalogTransactionJournalV1,
+        locks: &[CatalogDirectoryLockGuard],
+    ) -> ProjectCatalogStoreResult<()> {
+        let ParticipantRegistry::Migration(registry) = &self.registry else {
+            if journal.monotonic_checkout_identity_actions.is_empty() {
+                return Ok(());
+            }
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_registry_required",
+                "checkout identity actions require the complete migration registry",
+            ));
+        };
+        for action in &journal.monotonic_checkout_identity_actions {
+            let target = registry
+                .checkout_identity_target(&action.observation_id)
+                .ok_or_else(|| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_invalid_migration_registry",
+                        "migration registry lacks a checkout identity target",
+                    )
+                })?;
+            let lane = checkout_lock_for(&target, locks)?;
+            let expected = format!("{}\n", action.planned_id);
+            match lane.read_regular("checkout-id", 128)? {
+                None => {}
+                Some(bytes) if bytes.is_empty() || bytes == expected.as_bytes() => {}
+                Some(_) => {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_recovery_incomplete",
+                        "checkout identity marker disagrees with the journaled id",
+                    ));
+                }
+            }
+            let _ = lane.read_regular(".gitignore", 64 * 1024)?;
+            lane.ensure_still_current()?;
+        }
+        Ok(())
+    }
+
+    fn acquire_checkout_action_locks(
+        &self,
+        journal: &ProjectCatalogTransactionJournalV1,
+    ) -> ProjectCatalogStoreResult<Vec<CatalogDirectoryLockGuard>> {
+        let ParticipantRegistry::Migration(registry) = &self.registry else {
+            if journal.monotonic_checkout_identity_actions.is_empty() {
+                return Ok(Vec::new());
+            }
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_registry_required",
+                "checkout identity actions require the complete migration registry",
+            ));
+        };
+        let mut parents = journal
+            .monotonic_checkout_identity_actions
+            .iter()
+            .map(|action| {
+                registry
+                    .checkout_identity_target(&action.observation_id)
+                    .and_then(|target| target.parent().map(Path::to_path_buf))
+                    .ok_or_else(|| {
+                        ProjectCatalogStoreError::new(
+                            "error.project_catalog_invalid_migration_registry",
+                            "migration registry lacks a checkout identity parent",
+                        )
+                    })
+            })
+            .collect::<ProjectCatalogStoreResult<Vec<_>>>()?;
+        parents.sort();
+        parents.dedup();
+        let mut guards = Vec::with_capacity(parents.len());
+        for parent in parents {
+            self.io.create_private_dir_nofollow(&parent)?;
+            guards.push(self.io.acquire_directory_lock_nofollow(&parent)?);
+        }
+        Ok(guards)
+    }
+
+    fn execute_monotonic_checkout_actions_locked(
+        &self,
+        journal: &ProjectCatalogTransactionJournalV1,
+        locks: &[CatalogDirectoryLockGuard],
+    ) -> ProjectCatalogStoreResult<()> {
+        if journal.monotonic_checkout_identity_actions.is_empty() {
+            return Ok(());
+        }
+        let ParticipantRegistry::Migration(registry) = &self.registry else {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_registry_required",
+                "checkout identity actions require the complete migration registry",
+            ));
+        };
+        for action in &journal.monotonic_checkout_identity_actions {
+            self.io
+                .checkpoint(FaultPoint::MonotonicCheckoutIdentityAction)?;
+            let target = registry
+                .checkout_identity_target(&action.observation_id)
+                .ok_or_else(|| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_invalid_migration_registry",
+                        "migration registry lacks a checkout identity target",
+                    )
+                })?;
+            let lane = checkout_lock_for(&target, locks)?;
+            self.ensure_checkout_local_gitignore(lane)?;
+            let expected = format!("{}\n", action.planned_id);
+            match lane.read_regular("checkout-id", 128)? {
+                None => {
+                    lane.atomic_replace("checkout-id", expected.as_bytes())?;
+                }
+                Some(bytes) if bytes.is_empty() => {
+                    lane.atomic_replace("checkout-id", expected.as_bytes())?;
+                }
+                Some(bytes) if bytes == expected.as_bytes() => {}
+                Some(_) => {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_recovery_incomplete",
+                        "checkout identity marker disagrees with the journaled id",
+                    ));
+                }
+            }
+            if lane.read_regular("checkout-id", 128)?.as_deref() != Some(expected.as_bytes()) {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_recovery_incomplete",
+                    "checkout identity marker changed during journaled installation",
+                ));
+            }
+            lane.ensure_still_current()?;
+            self.io
+                .checkpoint(FaultPoint::MonotonicCheckoutIdentityAction)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_checkout_local_gitignore(
+        &self,
+        lane: &CatalogDirectoryLockGuard,
+    ) -> ProjectCatalogStoreResult<()> {
+        if lane.read_regular(".gitignore", 64 * 1024)?.as_deref()
+            != Some(CHECKOUT_LOCAL_GITIGNORE_BYTES)
+        {
+            lane.atomic_replace(".gitignore", CHECKOUT_LOCAL_GITIGNORE_BYTES)?;
+        }
+        if lane.read_regular(".gitignore", 64 * 1024)?.as_deref()
+            != Some(CHECKOUT_LOCAL_GITIGNORE_BYTES)
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_recovery_incomplete",
+                "checkout-local gitignore changed during journaled installation",
+            ));
+        }
+        lane.sync_all()?;
+        lane.ensure_still_current()
+    }
+
+    fn target_for_role(&self, role: &ParticipantRoleV1) -> ProjectCatalogStoreResult<PathBuf> {
+        match role {
+            ParticipantRoleV1::Catalog => Ok(self.paths.catalog.clone()),
+            ParticipantRoleV1::Attachments => Ok(self.paths.attachments.clone()),
+            ParticipantRoleV1::MigrationMarker => match &self.registry {
+                ParticipantRegistry::Migration(_) => Ok(self.paths.migration_marker.clone()),
+                ParticipantRegistry::Regular => Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_migration_registry_required",
+                    "migration marker target requires the complete code-owned registry",
+                )),
+            },
+            role => match &self.registry {
+                ParticipantRegistry::Migration(registry) => {
+                    registry.participant_target(role).ok_or_else(|| {
+                        ProjectCatalogStoreError::new(
+                            "error.project_catalog_invalid_migration_registry",
+                            "migration registry lacks a journaled participant target",
+                        )
+                    })
+                }
+                ParticipantRegistry::Regular => Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_migration_registry_required",
+                    "migration participant target requires the complete code-owned registry",
+                )),
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PreparedPair {
+    catalog: CatalogSnapshotV2,
+    attachments: AttachmentSnapshotV1,
+    catalog_bytes: Vec<u8>,
+    attachment_bytes: Vec<u8>,
+    catalog_sha256: Sha256Hex,
+    attachments_sha256: Sha256Hex,
+}
+
+impl PreparedPair {
+    fn new(
+        catalog: CatalogSnapshotV2,
+        attachments: AttachmentSnapshotV1,
+    ) -> ProjectCatalogStoreResult<Self> {
+        validate_catalog_attachments(&catalog, &attachments).map_err(contract_error)?;
+        if catalog.epoch == 0 {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_zero_epoch",
+                "strict snapshots cannot be prepared with epoch zero",
+            ));
+        }
+        let catalog_bytes = encode_catalog_snapshot(&catalog).map_err(contract_error)?;
+        let attachment_bytes = encode_attachment_snapshot(&attachments).map_err(contract_error)?;
+        let catalog_sha256 = sha256(&catalog_bytes);
+        let attachments_sha256 = sha256(&attachment_bytes);
+        Ok(Self {
+            catalog,
+            attachments,
+            catalog_bytes,
+            attachment_bytes,
+            catalog_sha256,
+            attachments_sha256,
+        })
+    }
+
+    fn into_state(self) -> ProjectCatalogState {
+        ProjectCatalogState {
+            epoch: self.catalog.epoch,
+            catalog: Arc::new(self.catalog),
+            attachments: Arc::new(self.attachments),
+            catalog_sha256: self.catalog_sha256,
+            attachments_sha256: self.attachments_sha256,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub(crate) struct Sha256Hex(String);
+
+impl Sha256Hex {
+    pub(crate) fn parse(value: String) -> ProjectCatalogStoreResult<Self> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_hash",
+                "expected a lowercase SHA-256 value",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[allow(dead_code)] // P1-B constructor consumed by P1-C.
+    pub(crate) fn digest(bytes: &[u8]) -> Self {
+        sha256(bytes)
+    }
+}
+
+impl fmt::Display for Sha256Hex {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Sha256Hex {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(de::Error::custom)
+    }
+}
+
+fn sha256(bytes: &[u8]) -> Sha256Hex {
+    Sha256Hex(hex::encode(Sha256::digest(bytes)))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+struct ValidatedBasename(String);
+
+impl ValidatedBasename {
+    fn parse(value: String) -> ProjectCatalogStoreResult<Self> {
+        if !valid_basename(&value)
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_artifact_name",
+                "transaction artifact name is not a validated basename",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ValidatedBasename {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum ParticipantRoleV1 {
+    Catalog,
+    Attachments,
+    EffectiveSourceManifest,
+    Activation {
+        project_id: ProjectId,
+    },
+    StoredGenerationMetadata {
+        project_id: ProjectId,
+        published_scope: PublishedScope,
+        generation_id: Sha256Hex,
+    },
+    CollisionRetirement {
+        project_id: ProjectId,
+    },
+    MigrationMarker,
+}
+
+impl ParticipantRoleV1 {
+    fn artifact_token(&self) -> String {
+        match self {
+            Self::Catalog => "catalog".into(),
+            Self::Attachments => "attachments".into(),
+            _ => {
+                let encoded =
+                    serde_json::to_vec(self).expect("closed participant role must serialize");
+                format!("role-{}", &sha256(&encoded).as_str()[..24])
+            }
+        }
+    }
+
+    fn max_bytes(&self) -> usize {
+        match self {
+            Self::MigrationMarker => MAX_MARKER_BYTES,
+            _ => MAX_PROJECT_CATALOG_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ArtifactKind {
+    Backup,
+    Stage,
+}
+
+fn artifact_name(
+    transaction_id: &ProjectCatalogTransactionId,
+    role: &ParticipantRoleV1,
+    hash: &Sha256Hex,
+    kind: ArtifactKind,
+) -> ProjectCatalogStoreResult<ValidatedBasename> {
+    let suffix = match kind {
+        ArtifactKind::Backup => "bak",
+        ArtifactKind::Stage => "stage",
+    };
+    ValidatedBasename::parse(format!(
+        "{}.{}.{}.{}",
+        transaction_id,
+        role.artifact_token(),
+        hash,
+        suffix
+    ))
+}
+
+fn validate_expected_artifact_name(
+    transaction_id: &ProjectCatalogTransactionId,
+    role: &ParticipantRoleV1,
+    image: &ExpectedImageV1,
+    kind: ArtifactKind,
+) -> ProjectCatalogStoreResult<()> {
+    let ExpectedImageV1::Present {
+        sha256,
+        artifact_name: actual,
+    } = image
+    else {
+        return Ok(());
+    };
+    let expected = artifact_name(transaction_id, role, sha256, kind)?;
+    if actual != &expected {
+        return Err(ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_journal",
+            "transaction artifact name is not code-derived",
+        ));
+    }
+    Ok(())
+}
+
+fn build_transaction_participant(
+    transaction_id: &ProjectCatalogTransactionId,
+    role: ParticipantRoleV1,
+    old_hash: Option<Sha256Hex>,
+    post_image: &Option<Vec<u8>>,
+) -> ProjectCatalogStoreResult<TransactionParticipantV1> {
+    let old = match old_hash {
+        Some(hash) => ExpectedImageV1::Present {
+            artifact_name: artifact_name(transaction_id, &role, &hash, ArtifactKind::Backup)?,
+            sha256: hash,
+        },
+        None => ExpectedImageV1::Absent {},
+    };
+    let new = match post_image {
+        Some(bytes) => {
+            let hash = sha256(bytes);
+            ExpectedImageV1::Present {
+                artifact_name: artifact_name(transaction_id, &role, &hash, ArtifactKind::Stage)?,
+                sha256: hash,
+            }
+        }
+        None => ExpectedImageV1::Absent {},
+    };
+    Ok(TransactionParticipantV1 { role, old, new })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ExpectedImageV1 {
+    Absent {},
+    Present {
+        sha256: Sha256Hex,
+        artifact_name: ValidatedBasename,
+    },
+}
+
+impl ExpectedImageV1 {
+    fn sha256(&self) -> Option<&Sha256Hex> {
+        match self {
+            Self::Absent {} => None,
+            Self::Present { sha256, .. } => Some(sha256),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransactionParticipantV1 {
+    role: ParticipantRoleV1,
+    old: ExpectedImageV1,
+    new: ExpectedImageV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TransactionKindV1 {
+    RegularPair,
+    V1Migration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TransactionStateV1 {
+    Prepared,
+    Committed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TransactionOutcomeV1 {
+    Committed,
+    RolledBack,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum ImmutableAssetRoleV1 {
+    LegacyProjectStoreBackup,
+    LegacyPublisherRefBackup,
+}
+
+impl ImmutableAssetRoleV1 {
+    fn artifact_token(&self) -> String {
+        let encoded = serde_json::to_vec(self).expect("closed immutable role must serialize");
+        format!("immutable-role-{}", &sha256(&encoded).as_str()[..24])
+    }
+}
+
+fn immutable_target_name(
+    transaction_id: &ProjectCatalogTransactionId,
+    role: &ImmutableAssetRoleV1,
+    hash: &Sha256Hex,
+) -> ProjectCatalogStoreResult<ValidatedBasename> {
+    ValidatedBasename::parse(format!(
+        "{}.{}.{}.immutable",
+        transaction_id,
+        role.artifact_token(),
+        hash
+    ))
+}
+
+fn immutable_stage_name(
+    transaction_id: &ProjectCatalogTransactionId,
+    role: &ImmutableAssetRoleV1,
+    hash: &Sha256Hex,
+) -> ProjectCatalogStoreResult<ValidatedBasename> {
+    ValidatedBasename::parse(format!(
+        "{}.{}.{}.stage",
+        transaction_id,
+        role.artifact_token(),
+        hash
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImmutableAssetV1 {
+    role: ImmutableAssetRoleV1,
+    sha256: Sha256Hex,
+    validated_name: ValidatedBasename,
+    stage_name: ValidatedBasename,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckoutIdentityActionV1 {
+    observation_id: String,
+    planned_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectCatalogTransactionJournalV1 {
+    version: u32,
+    transaction_id: ProjectCatalogTransactionId,
+    kind: TransactionKindV1,
+    state: TransactionStateV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outcome: Option<TransactionOutcomeV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan_hash: Option<Sha256Hex>,
+    old_epoch: u64,
+    new_epoch: u64,
+    participants: Vec<TransactionParticipantV1>,
+    immutable_assets: Vec<ImmutableAssetV1>,
+    monotonic_checkout_identity_actions: Vec<CheckoutIdentityActionV1>,
+    created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    committed_at: Option<u64>,
+}
+
+impl ProjectCatalogTransactionJournalV1 {
+    fn validate(&self) -> ProjectCatalogStoreResult<()> {
+        if self.version != JOURNAL_VERSION
+            || self.old_epoch.checked_add(1) != Some(self.new_epoch)
+            || self.created_at == 0
+            || self.participants.len() > MAX_MIGRATION_PARTICIPANTS
+            || self.immutable_assets.len() > MAX_MIGRATION_IMMUTABLE_ASSETS
+            || self.monotonic_checkout_identity_actions.len() > MAX_MIGRATION_CHECKOUT_ACTIONS
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_journal",
+                "journal header is invalid",
+            ));
+        }
+        match (self.state, self.outcome, self.committed_at) {
+            (TransactionStateV1::Prepared, None, None)
+            | (TransactionStateV1::Committed, Some(_), Some(_)) => {}
+            _ => {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_invalid_journal",
+                    "journal state, outcome, and timestamps disagree",
+                ));
+            }
+        }
+        let roles = self
+            .participants
+            .iter()
+            .map(|participant| participant.role.clone())
+            .collect::<BTreeSet<_>>();
+        if roles.len() != self.participants.len() {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_journal",
+                "journal contains duplicate participant roles",
+            ));
+        }
+        for participant in &self.participants {
+            validate_expected_artifact_name(
+                &self.transaction_id,
+                &participant.role,
+                &participant.old,
+                ArtifactKind::Backup,
+            )?;
+            validate_expected_artifact_name(
+                &self.transaction_id,
+                &participant.role,
+                &participant.new,
+                ArtifactKind::Stage,
+            )?;
+        }
+        for asset in &self.immutable_assets {
+            let expected_target =
+                immutable_target_name(&self.transaction_id, &asset.role, &asset.sha256)?;
+            let expected_stage =
+                immutable_stage_name(&self.transaction_id, &asset.role, &asset.sha256)?;
+            if asset.validated_name != expected_target || asset.stage_name != expected_stage {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_invalid_journal",
+                    "journal immutable asset names are not code-derived",
+                ));
+            }
+        }
+        match self.kind {
+            TransactionKindV1::RegularPair => {
+                let required =
+                    BTreeSet::from([ParticipantRoleV1::Catalog, ParticipantRoleV1::Attachments]);
+                let old_images_match_epoch = self.participants.iter().all(|participant| {
+                    if self.old_epoch == 0 {
+                        matches!(&participant.old, ExpectedImageV1::Absent {})
+                    } else {
+                        matches!(&participant.old, ExpectedImageV1::Present { .. })
+                    }
+                });
+                if roles != required
+                    || self.plan_hash.is_some()
+                    || !self.immutable_assets.is_empty()
+                    || !self.monotonic_checkout_identity_actions.is_empty()
+                    || !old_images_match_epoch
+                    || self
+                        .participants
+                        .iter()
+                        .any(|participant| participant.new.sha256().is_none())
+                {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_invalid_journal",
+                        "regular transaction journal has an invalid participant set",
+                    ));
+                }
+            }
+            TransactionKindV1::V1Migration => {
+                let mandatory = [
+                    ParticipantRoleV1::Catalog,
+                    ParticipantRoleV1::Attachments,
+                    ParticipantRoleV1::EffectiveSourceManifest,
+                    ParticipantRoleV1::MigrationMarker,
+                ];
+                let asset_roles = self
+                    .immutable_assets
+                    .iter()
+                    .map(|asset| asset.role.clone())
+                    .collect::<BTreeSet<_>>();
+                let participant_for = |role: &ParticipantRoleV1| {
+                    self.participants
+                        .iter()
+                        .find(|participant| &participant.role == role)
+                };
+                let catalog = participant_for(&ParticipantRoleV1::Catalog);
+                let attachments = participant_for(&ParticipantRoleV1::Attachments);
+                let marker = participant_for(&ParticipantRoleV1::MigrationMarker);
+                let action_ids = self
+                    .monotonic_checkout_identity_actions
+                    .iter()
+                    .map(|action| action.observation_id.as_str())
+                    .collect::<BTreeSet<_>>();
+                if self.plan_hash.is_none()
+                    || self.old_epoch != 0
+                    || self.new_epoch != 1
+                    || mandatory.iter().any(|role| !roles.contains(role))
+                    || self.participants.iter().any(|participant| {
+                        mandatory.contains(&participant.role) && participant.new.sha256().is_none()
+                    })
+                    || asset_roles.len() != self.immutable_assets.len()
+                    || !asset_roles.contains(&ImmutableAssetRoleV1::LegacyProjectStoreBackup)
+                    || !asset_roles.contains(&ImmutableAssetRoleV1::LegacyPublisherRefBackup)
+                    || !catalog.is_some_and(|participant| {
+                        matches!(&participant.old, ExpectedImageV1::Present { .. })
+                            && matches!(&participant.new, ExpectedImageV1::Present { .. })
+                    })
+                    || !attachments.is_some_and(|participant| {
+                        matches!(&participant.old, ExpectedImageV1::Absent {})
+                            && matches!(&participant.new, ExpectedImageV1::Present { .. })
+                    })
+                    || !marker.is_some_and(|participant| {
+                        matches!(&participant.old, ExpectedImageV1::Absent {})
+                            && matches!(&participant.new, ExpectedImageV1::Present { .. })
+                    })
+                    || action_ids.len() != self.monotonic_checkout_identity_actions.len()
+                    || self
+                        .monotonic_checkout_identity_actions
+                        .iter()
+                        .any(|action| {
+                            action.observation_id.is_empty()
+                                || action.observation_id.len() > 256
+                                || action.observation_id.chars().any(char::is_control)
+                                || action.planned_id.len() != 32
+                                || !action.planned_id.bytes().all(|byte| {
+                                    byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
+                                })
+                        })
+                {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_invalid_journal",
+                        "migration journal lacks its closed participant or evidence set",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectCatalogMigrationMarkerV1 {
+    version: u32,
+    transaction_id: ProjectCatalogTransactionId,
+    plan_hash: Sha256Hex,
+    source_store_sha256: Sha256Hex,
+    inventory_sha256: Sha256Hex,
+    participants: Vec<MigrationParticipantEvidenceV1>,
+    immutable_assets: Vec<MigrationImmutableAssetEvidenceV1>,
+    migration_epoch: u64,
+    committed_at: u64,
+}
+
+impl ProjectCatalogMigrationMarkerV1 {
+    fn validate(&self) -> ProjectCatalogStoreResult<()> {
+        if self.version != MIGRATION_MARKER_VERSION
+            || self.migration_epoch != 1
+            || self.committed_at == 0
+            || self.participants.len() > MAX_MIGRATION_PARTICIPANTS
+            || self.immutable_assets.len() > MAX_MIGRATION_IMMUTABLE_ASSETS
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_incomplete",
+                "migration marker is invalid",
+            ));
+        }
+        let participant_roles = self
+            .participants
+            .iter()
+            .map(|evidence| evidence.role.clone())
+            .collect::<BTreeSet<_>>();
+        if participant_roles.len() != self.participants.len()
+            || !participant_roles.contains(&ParticipantRoleV1::Catalog)
+            || !participant_roles.contains(&ParticipantRoleV1::Attachments)
+            || !participant_roles.contains(&ParticipantRoleV1::EffectiveSourceManifest)
+            || participant_roles.contains(&ParticipantRoleV1::MigrationMarker)
+            || self.participants.iter().any(|evidence| {
+                validate_expected_artifact_name(
+                    &self.transaction_id,
+                    &evidence.role,
+                    &evidence.old,
+                    ArtifactKind::Backup,
+                )
+                .is_err()
+                    || validate_expected_artifact_name(
+                        &self.transaction_id,
+                        &evidence.role,
+                        &evidence.new,
+                        ArtifactKind::Stage,
+                    )
+                    .is_err()
+            })
+            || self.participants.iter().any(|evidence| {
+                matches!(
+                    evidence.role,
+                    ParticipantRoleV1::Catalog
+                        | ParticipantRoleV1::Attachments
+                        | ParticipantRoleV1::EffectiveSourceManifest
+                ) && evidence.new.sha256().is_none()
+            })
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_incomplete",
+                "migration marker participant evidence is incomplete or duplicated",
+            ));
+        }
+        let asset_roles = self
+            .immutable_assets
+            .iter()
+            .map(|evidence| evidence.role.clone())
+            .collect::<BTreeSet<_>>();
+        if asset_roles.len() != self.immutable_assets.len()
+            || !asset_roles.contains(&ImmutableAssetRoleV1::LegacyProjectStoreBackup)
+            || !asset_roles.contains(&ImmutableAssetRoleV1::LegacyPublisherRefBackup)
+            || self.immutable_assets.iter().any(|evidence| {
+                match immutable_target_name(&self.transaction_id, &evidence.role, &evidence.sha256)
+                {
+                    Ok(expected) => expected != evidence.validated_name,
+                    Err(_) => true,
+                }
+            })
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_incomplete",
+                "migration marker immutable evidence is incomplete or duplicated",
+            ));
+        }
+        let source_backup = self
+            .immutable_assets
+            .iter()
+            .find(|asset| asset.role == ImmutableAssetRoleV1::LegacyProjectStoreBackup)
+            .expect("mandatory source backup role was checked");
+        if source_backup.sha256 != self.source_store_sha256 {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_incomplete",
+                "migration marker source hash disagrees with its retained backup",
+            ));
+        }
+        let catalog_backup = self
+            .participants
+            .iter()
+            .find(|evidence| evidence.role == ParticipantRoleV1::Catalog)
+            .and_then(|evidence| evidence.old.sha256());
+        if catalog_backup != Some(&self.source_store_sha256) {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_incomplete",
+                "migration marker source hash disagrees with its mutable catalog backup",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MigrationParticipantEvidenceV1 {
+    role: ParticipantRoleV1,
+    old: ExpectedImageV1,
+    new: ExpectedImageV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MigrationImmutableAssetEvidenceV1 {
+    role: ImmutableAssetRoleV1,
+    sha256: Sha256Hex,
+    validated_name: ValidatedBasename,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpectedSide {
+    Old,
+    New,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryDecision {
+    Forward,
+    Rollback,
+    Incomplete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckoutActionRecoveryState {
+    Compatible,
+    ConflictingValid,
+}
+
+fn valid_checkout_identity_bytes(bytes: &[u8]) -> bool {
+    let Ok(value) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let value = value.trim();
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FaultPoint {
+    BackupWrite,
+    BackupFsync,
+    StageWrite,
+    StageFsync,
+    DirectoryFsync,
+    PreparedJournalWrite,
+    ParticipantInstall,
+    RecoveryParticipantInstall,
+    RecoveryParticipantRestore,
+    RecoveryParticipantDelete,
+    #[allow(dead_code)] // P1-B migration seam exercised once P1-C invokes it.
+    ImmutableAssetWrite,
+    #[allow(dead_code)] // P1-B migration seam exercised once P1-C invokes it.
+    ImmutableAssetFsync,
+    ImmutableAssetVerify,
+    MonotonicCheckoutIdentityAction,
+    Cleanup,
+    CompletePlanVerify,
+    CommittedJournalWrite,
+}
+
+struct CatalogDirectoryLockGuard {
+    path: PathBuf,
+    directory: NofollowDirectory,
+}
+
+impl CatalogDirectoryLockGuard {
+    fn read_regular(
+        &self,
+        name: &str,
+        max_bytes: usize,
+    ) -> ProjectCatalogStoreResult<Option<Vec<u8>>> {
+        self.directory
+            .read_regular(name, max_bytes, "checkout-local file")
+            .map_err(|error| io_error("read checkout-local file under", &self.path, error))
+    }
+
+    fn atomic_replace(&self, name: &str, bytes: &[u8]) -> ProjectCatalogStoreResult<()> {
+        self.directory
+            .atomic_replace(name, bytes)
+            .map_err(|error| io_error("replace checkout-local file under", &self.path, error))
+    }
+
+    fn sync_all(&self) -> ProjectCatalogStoreResult<()> {
+        self.directory
+            .sync_all()
+            .map_err(|error| io_error("fsync checkout-local directory", &self.path, error))
+    }
+
+    fn ensure_still_current(&self) -> ProjectCatalogStoreResult<()> {
+        self.directory
+            .ensure_still_current()
+            .map_err(|error| io_error("verify checkout-local directory", &self.path, error))
+    }
+}
+
+fn checkout_lock_for<'a>(
+    target: &Path,
+    locks: &'a [CatalogDirectoryLockGuard],
+) -> ProjectCatalogStoreResult<&'a CatalogDirectoryLockGuard> {
+    let parent = target.parent().ok_or_else(|| {
+        ProjectCatalogStoreError::new(
+            "error.project_catalog_unsafe_path",
+            "checkout identity target has no parent",
+        )
+    })?;
+    locks
+        .iter()
+        .find(|guard| guard.path == parent)
+        .ok_or_else(|| {
+            ProjectCatalogStoreError::new(
+                "error.project_catalog_recovery_incomplete",
+                "checkout identity directory lock is missing",
+            )
+        })
+}
+
+trait CatalogStoreIo: Send + Sync {
+    fn acquire_mutation_lock(
+        &self,
+        catalog_path: &Path,
+    ) -> ProjectCatalogStoreResult<StoreLockGuard>;
+    fn read_regular_nofollow(
+        &self,
+        path: &Path,
+        max_bytes: usize,
+    ) -> ProjectCatalogStoreResult<Option<Vec<u8>>>;
+    fn create_private_dir_nofollow(&self, path: &Path) -> ProjectCatalogStoreResult<()>;
+    fn acquire_directory_lock_nofollow(
+        &self,
+        path: &Path,
+    ) -> ProjectCatalogStoreResult<CatalogDirectoryLockGuard>;
+    fn write_new_nofollow(&self, path: &Path, bytes: &[u8]) -> ProjectCatalogStoreResult<()>;
+    fn fsync_regular_nofollow(&self, path: &Path) -> ProjectCatalogStoreResult<()>;
+    fn atomic_replace_sync_nofollow(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+    ) -> ProjectCatalogStoreResult<()>;
+    fn replace_from_stage_nofollow(
+        &self,
+        stage: &Path,
+        target: &Path,
+        expected_hash: &Sha256Hex,
+        max_bytes: usize,
+    ) -> ProjectCatalogStoreResult<()>;
+    fn remove_regular_exact(
+        &self,
+        path: &Path,
+        expected_hash: &Sha256Hex,
+        max_bytes: usize,
+    ) -> ProjectCatalogStoreResult<()>;
+    fn fsync_dir(&self, path: &Path) -> ProjectCatalogStoreResult<()>;
+    fn checkpoint(&self, _point: FaultPoint) -> ProjectCatalogStoreResult<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct RealCatalogStoreIo;
+
+impl RealCatalogStoreIo {
+    fn read_file(path: &Path, max_bytes: usize) -> ProjectCatalogStoreResult<Option<Vec<u8>>> {
+        #[cfg(unix)]
+        {
+            return Self::read_file_unix(path, max_bytes);
+        }
+        #[cfg(not(unix))]
+        {
+            let mut options = OpenOptions::new();
+            options.read(true);
+            let mut file = match options.open(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(io_error("open", path, error)),
+            };
+            if !file
+                .metadata()
+                .map_err(|error| io_error("inspect", path, error))?
+                .file_type()
+                .is_file()
+            {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_non_regular_file",
+                    format!("{} is not a regular file", path.display()),
+                ));
+            }
+            let limit = max_bytes.checked_add(1).ok_or_else(|| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_byte_limit",
+                    "read byte limit overflowed",
+                )
+            })?;
+            let mut bytes = Vec::new();
+            std::io::Read::by_ref(&mut file)
+                .take(limit as u64)
+                .read_to_end(&mut bytes)
+                .map_err(|error| io_error("read", path, error))?;
+            if bytes.len() > max_bytes {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_byte_limit",
+                    format!("{} exceeds its byte limit", path.display()),
+                ));
+            }
+            Ok(Some(bytes))
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn create_new_file(path: &Path) -> ProjectCatalogStoreResult<File> {
+        let mut options = OpenOptions::new();
+        options.create_new(true).read(true).write(true);
+        options.open(path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_already_exists",
+                    format!("{} already exists", path.display()),
+                )
+            } else {
+                io_error("create", path, error)
+            }
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn unique_temp_path(path: &Path) -> PathBuf {
+        let token = ProjectCatalogTransactionId::mint();
+        path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!(".project-catalog-replace-{token}.tmp"))
+    }
+
+    #[cfg(unix)]
+    fn open_directory_unix(path: &Path, create_missing: bool) -> ProjectCatalogStoreResult<File> {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::path::Component;
+
+        let mut directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(if path.is_absolute() { "/" } else { "." })
+            .map_err(|error| io_error("open directory root for", path, error))?;
+        for component in path.components() {
+            let name = match component {
+                Component::RootDir | Component::CurDir => continue,
+                Component::Normal(name) => name,
+                Component::Prefix(_) | Component::ParentDir => {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_unsafe_path",
+                        format!("{} has an unsafe directory component", path.display()),
+                    ));
+                }
+            };
+            let name = CString::new(name.as_bytes()).map_err(|_| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_unsafe_path",
+                    "directory component contains a NUL byte",
+                )
+            })?;
+            let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+            let mut descriptor =
+                unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+            if descriptor < 0
+                && create_missing
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)
+            {
+                let created = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
+                if created < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::EEXIST) {
+                        return Err(io_error("create directory component for", path, error));
+                    }
+                }
+                directory
+                    .sync_all()
+                    .map_err(|error| io_error("fsync created directory parent for", path, error))?;
+                descriptor = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+            }
+            if descriptor < 0 {
+                return Err(io_error(
+                    "open directory component for",
+                    path,
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            directory = unsafe { File::from_raw_fd(descriptor) };
+        }
+        Ok(directory)
+    }
+
+    #[cfg(unix)]
+    fn open_parent_unix(path: &Path) -> ProjectCatalogStoreResult<(File, std::ffi::CString)> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let parent = path.parent().ok_or_else(|| {
+            ProjectCatalogStoreError::new(
+                "error.project_catalog_unsafe_path",
+                format!("{} has no parent directory", path.display()),
+            )
+        })?;
+        let filename = path.file_name().ok_or_else(|| {
+            ProjectCatalogStoreError::new(
+                "error.project_catalog_unsafe_path",
+                format!("{} has no filename", path.display()),
+            )
+        })?;
+        let filename = std::ffi::CString::new(filename.as_bytes()).map_err(|_| {
+            ProjectCatalogStoreError::new(
+                "error.project_catalog_unsafe_path",
+                "filename contains a NUL byte",
+            )
+        })?;
+        Ok((Self::open_directory_unix(parent, false)?, filename))
+    }
+
+    #[cfg(unix)]
+    fn read_file_unix(path: &Path, max_bytes: usize) -> ProjectCatalogStoreResult<Option<Vec<u8>>> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let (parent, filename) = match Self::open_parent_unix(path) {
+            Ok(value) => value,
+            Err(error)
+                if !path.parent().is_some_and(Path::exists)
+                    && error.code() == "error.project_catalog_io" =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                filename.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(None);
+            }
+            return Err(io_error("open", path, error));
+        }
+        let mut file = unsafe { File::from_raw_fd(descriptor) };
+        if !file
+            .metadata()
+            .map_err(|error| io_error("inspect", path, error))?
+            .file_type()
+            .is_file()
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_non_regular_file",
+                format!("{} is not a regular file", path.display()),
+            ));
+        }
+        let limit = max_bytes.checked_add(1).ok_or_else(|| {
+            ProjectCatalogStoreError::new(
+                "error.project_catalog_byte_limit",
+                "read byte limit overflowed",
+            )
+        })?;
+        let mut bytes = Vec::new();
+        std::io::Read::by_ref(&mut file)
+            .take(limit as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| io_error("read", path, error))?;
+        if bytes.len() > max_bytes {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_byte_limit",
+                format!("{} exceeds its byte limit", path.display()),
+            ));
+        }
+        Ok(Some(bytes))
+    }
+
+    #[cfg(unix)]
+    fn write_new_file_unix(path: &Path, bytes: &[u8]) -> ProjectCatalogStoreResult<()> {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let (parent, filename) = Self::open_parent_unix(path)?;
+        let temp_name = CString::new(format!(
+            ".project-catalog-new-{}",
+            ProjectCatalogTransactionId::mint()
+        ))
+        .expect("code-owned temporary basename has no NUL");
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                temp_name.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io_error(
+                "create no-replace temporary file for",
+                path,
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let mut file = unsafe { File::from_raw_fd(descriptor) };
+        if let Err(error) = file
+            .write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| io_error("write and fsync no-replace image for", path, error))
+        {
+            drop(file);
+            unsafe {
+                libc::unlinkat(parent.as_raw_fd(), temp_name.as_ptr(), 0);
+            }
+            return Err(error);
+        }
+        drop(file);
+
+        let linked = unsafe {
+            libc::linkat(
+                parent.as_raw_fd(),
+                temp_name.as_ptr(),
+                parent.as_raw_fd(),
+                filename.as_ptr(),
+                0,
+            )
+        };
+        let link_error = (linked < 0).then(std::io::Error::last_os_error);
+        unsafe {
+            libc::unlinkat(parent.as_raw_fd(), temp_name.as_ptr(), 0);
+        }
+        match link_error {
+            None => Ok(()),
+            Some(error) if error.raw_os_error() == Some(libc::EEXIST) => {
+                Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_already_exists",
+                    format!("{} already exists", path.display()),
+                ))
+            }
+            Some(error) => Err(io_error("install no-replace image for", path, error)),
+        }
+    }
+
+    #[cfg(unix)]
+    fn atomic_replace_unix(path: &Path, bytes: &[u8]) -> ProjectCatalogStoreResult<()> {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let (parent, filename) = Self::open_parent_unix(path)?;
+        let temp_name = CString::new(format!(
+            ".project-catalog-replace-{}.tmp",
+            ProjectCatalogTransactionId::mint()
+        ))
+        .expect("code-owned temporary basename has no NUL");
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                temp_name.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io_error(
+                "create transaction temporary file for",
+                path,
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let mut file = unsafe { File::from_raw_fd(descriptor) };
+        if let Err(error) = file
+            .write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| io_error("write and fsync temporary file for", path, error))
+        {
+            unsafe {
+                libc::unlinkat(parent.as_raw_fd(), temp_name.as_ptr(), 0);
+            }
+            return Err(error);
+        }
+        drop(file);
+        let renamed = unsafe {
+            libc::renameat(
+                parent.as_raw_fd(),
+                temp_name.as_ptr(),
+                parent.as_raw_fd(),
+                filename.as_ptr(),
+            )
+        };
+        if renamed < 0 {
+            let error = io_error("replace", path, std::io::Error::last_os_error());
+            unsafe {
+                libc::unlinkat(parent.as_raw_fd(), temp_name.as_ptr(), 0);
+            }
+            return Err(error);
+        }
+        parent
+            .sync_all()
+            .map_err(|error| io_error("fsync directory for", path, error))
+    }
+}
+
+impl CatalogStoreIo for RealCatalogStoreIo {
+    fn acquire_mutation_lock(
+        &self,
+        catalog_path: &Path,
+    ) -> ProjectCatalogStoreResult<StoreLockGuard> {
+        acquire_store_lock_nofollow(catalog_path)
+            .map_err(|error| io_error("acquire mutation lock for", catalog_path, error))
+    }
+
+    fn read_regular_nofollow(
+        &self,
+        path: &Path,
+        max_bytes: usize,
+    ) -> ProjectCatalogStoreResult<Option<Vec<u8>>> {
+        Self::read_file(path, max_bytes)
+    }
+
+    fn create_private_dir_nofollow(&self, path: &Path) -> ProjectCatalogStoreResult<()> {
+        #[cfg(unix)]
+        {
+            Self::open_directory_unix(path, true)?;
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| io_error("create parent directory for", path, error))?;
+            }
+            match fs::create_dir(path) {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                            .map_err(|error| io_error("set permissions on", path, error))?;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(io_error("create directory", path, error)),
+            }
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|error| io_error("inspect directory", path, error))?;
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_non_regular_file",
+                    format!("{} is not a no-follow directory", path.display()),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    fn acquire_directory_lock_nofollow(
+        &self,
+        path: &Path,
+    ) -> ProjectCatalogStoreResult<CatalogDirectoryLockGuard> {
+        let directory = NofollowDirectory::open_existing(path)
+            .map_err(|error| io_error("open directory lock", path, error))?
+            .ok_or_else(|| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_recovery_incomplete",
+                    "checkout identity directory disappeared before lock acquisition",
+                )
+            })?;
+        directory
+            .lock_exclusive()
+            .map_err(|error| io_error("acquire directory lock", path, error))?;
+        Ok(CatalogDirectoryLockGuard {
+            path: path.to_path_buf(),
+            directory,
+        })
+    }
+
+    fn write_new_nofollow(&self, path: &Path, bytes: &[u8]) -> ProjectCatalogStoreResult<()> {
+        #[cfg(unix)]
+        {
+            return Self::write_new_file_unix(path, bytes);
+        }
+        #[cfg(not(unix))]
+        {
+            let temp = Self::unique_temp_path(path);
+            let mut file = Self::create_new_file(&temp)?;
+            if let Err(error) = file
+                .write_all(bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|error| io_error("write and fsync no-replace image for", path, error))
+            {
+                drop(file);
+                let _ = fs::remove_file(&temp);
+                return Err(error);
+            }
+            drop(file);
+            let result = fs::hard_link(&temp, path).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_already_exists",
+                        format!("{} already exists", path.display()),
+                    )
+                } else {
+                    io_error("install no-replace image for", path, error)
+                }
+            });
+            let _ = fs::remove_file(temp);
+            result
+        }
+    }
+
+    fn fsync_regular_nofollow(&self, path: &Path) -> ProjectCatalogStoreResult<()> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::{AsRawFd, FromRawFd};
+
+            let (parent, filename) = Self::open_parent_unix(path)?;
+            let descriptor = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    filename.as_ptr(),
+                    libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if descriptor < 0 {
+                return Err(io_error(
+                    "open for fsync",
+                    path,
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            let file = unsafe { File::from_raw_fd(descriptor) };
+            if !file
+                .metadata()
+                .map_err(|error| io_error("inspect for fsync", path, error))?
+                .file_type()
+                .is_file()
+            {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_non_regular_file",
+                    format!("{} is not a regular file", path.display()),
+                ));
+            }
+            return file
+                .sync_all()
+                .map_err(|error| io_error("fsync", path, error));
+        }
+        #[cfg(not(unix))]
+        {
+            let mut options = OpenOptions::new();
+            options.read(true);
+            let file = options
+                .open(path)
+                .map_err(|error| io_error("open for fsync", path, error))?;
+            if !file
+                .metadata()
+                .map_err(|error| io_error("inspect for fsync", path, error))?
+                .file_type()
+                .is_file()
+            {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_non_regular_file",
+                    format!("{} is not a regular file", path.display()),
+                ));
+            }
+            file.sync_all()
+                .map_err(|error| io_error("fsync", path, error))
+        }
+    }
+
+    fn atomic_replace_sync_nofollow(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+    ) -> ProjectCatalogStoreResult<()> {
+        #[cfg(unix)]
+        {
+            return Self::atomic_replace_unix(path, bytes);
+        }
+        #[cfg(not(unix))]
+        {
+            let temp = Self::unique_temp_path(path);
+            let mut file = Self::create_new_file(&temp)?;
+            if let Err(error) = file
+                .write_all(bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|error| io_error("write and fsync", &temp, error))
+            {
+                let _ = fs::remove_file(&temp);
+                return Err(error);
+            }
+            drop(file);
+            if let Err(error) =
+                fs::rename(&temp, path).map_err(|error| io_error("replace", path, error))
+            {
+                let _ = fs::remove_file(&temp);
+                return Err(error);
+            }
+            self.fsync_dir(path.parent().expect("derived path has parent"))
+        }
+    }
+
+    fn replace_from_stage_nofollow(
+        &self,
+        stage: &Path,
+        target: &Path,
+        expected_hash: &Sha256Hex,
+        max_bytes: usize,
+    ) -> ProjectCatalogStoreResult<()> {
+        let bytes = Self::read_file(stage, max_bytes)?.ok_or_else(|| {
+            ProjectCatalogStoreError::new(
+                "error.project_catalog_recovery_incomplete",
+                format!("required stage {} is missing", stage.display()),
+            )
+        })?;
+        if sha256(&bytes) != *expected_hash {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_recovery_incomplete",
+                format!("required stage {} has unexpected bytes", stage.display()),
+            ));
+        }
+        self.atomic_replace_sync_nofollow(target, &bytes)
+    }
+
+    fn remove_regular_exact(
+        &self,
+        path: &Path,
+        expected_hash: &Sha256Hex,
+        max_bytes: usize,
+    ) -> ProjectCatalogStoreResult<()> {
+        #[cfg(unix)]
+        {
+            use std::ffi::CString;
+            use std::os::fd::AsRawFd;
+
+            let (parent, filename) = Self::open_parent_unix(path)?;
+            let quarantine = CString::new(format!(
+                ".{}.{}.rollback",
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("project-catalog"),
+                ProjectCatalogTransactionId::mint()
+            ))
+            .expect("code-owned quarantine basename has no NUL");
+            let moved = unsafe {
+                libc::renameat(
+                    parent.as_raw_fd(),
+                    filename.as_ptr(),
+                    parent.as_raw_fd(),
+                    quarantine.as_ptr(),
+                )
+            };
+            if moved < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ENOENT) {
+                    return Ok(());
+                }
+                return Err(io_error("quarantine before removal", path, error));
+            }
+            let quarantine_path = path.parent().expect("derived path has parent").join(
+                quarantine
+                    .to_str()
+                    .expect("code-owned quarantine basename is UTF-8"),
+            );
+            let actual = Self::read_file(&quarantine_path, max_bytes)?.map(|bytes| sha256(&bytes));
+            if actual.as_ref() != Some(expected_hash) {
+                let restored = unsafe {
+                    libc::renameat(
+                        parent.as_raw_fd(),
+                        quarantine.as_ptr(),
+                        parent.as_raw_fd(),
+                        filename.as_ptr(),
+                    )
+                };
+                let detail = if restored == 0 {
+                    "unexpected participant was restored"
+                } else {
+                    "unexpected participant remains quarantined for inspection"
+                };
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_recovery_incomplete",
+                    detail,
+                ));
+            }
+            let removed = unsafe { libc::unlinkat(parent.as_raw_fd(), quarantine.as_ptr(), 0) };
+            if removed < 0 {
+                return Err(io_error(
+                    "remove verified rollback target",
+                    path,
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            return parent
+                .sync_all()
+                .map_err(|error| io_error("fsync directory for", path, error));
+        }
+        #[cfg(not(unix))]
+        {
+            let Some(bytes) = Self::read_file(path, max_bytes)? else {
+                return Ok(());
+            };
+            if sha256(&bytes) != *expected_hash {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_recovery_incomplete",
+                    "refused to remove participant with unexplained bytes",
+                ));
+            }
+            fs::remove_file(path).map_err(|error| io_error("remove", path, error))
+        }
+    }
+
+    fn fsync_dir(&self, path: &Path) -> ProjectCatalogStoreResult<()> {
+        #[cfg(unix)]
+        {
+            return Self::open_directory_unix(path, false)?
+                .sync_all()
+                .map_err(|error| io_error("fsync directory", path, error));
+        }
+        #[cfg(not(unix))]
+        {
+            let mut options = OpenOptions::new();
+            options.read(true);
+            let directory = options
+                .open(path)
+                .map_err(|error| io_error("open directory for fsync", path, error))?;
+            if !directory
+                .metadata()
+                .map_err(|error| io_error("inspect directory for fsync", path, error))?
+                .file_type()
+                .is_dir()
+            {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_non_regular_file",
+                    format!("{} is not a directory", path.display()),
+                ));
+            }
+            directory
+                .sync_all()
+                .map_err(|error| io_error("fsync directory", path, error))
+        }
+    }
+}
+
+fn encode_bounded_json<T: Serialize>(
+    value: &T,
+    max_bytes: usize,
+    label: &str,
+) -> ProjectCatalogStoreResult<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(value).map_err(|error| {
+        ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_journal",
+            format!("could not encode {label}: {error}"),
+        )
+    })?;
+    bytes.push(b'\n');
+    if bytes.len() > max_bytes {
+        return Err(ProjectCatalogStoreError::new(
+            "error.project_catalog_byte_limit",
+            format!("{label} exceeds its byte limit"),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn decode_bounded_json<T>(
+    bytes: &[u8],
+    max_bytes: usize,
+    label: &str,
+) -> ProjectCatalogStoreResult<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    if bytes.len() > max_bytes {
+        return Err(ProjectCatalogStoreError::new(
+            "error.project_catalog_byte_limit",
+            format!("{label} exceeds its byte limit"),
+        ));
+    }
+    serde_json::from_slice(bytes).map_err(|error| {
+        ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_journal",
+            format!("could not decode {label}: {error}"),
+        )
+    })
+}
+
+fn unix_timestamp() -> ProjectCatalogStoreResult<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().max(1))
+        .map_err(|error| {
+            ProjectCatalogStoreError::new(
+                "error.project_catalog_clock",
+                format!("system clock precedes Unix epoch: {error}"),
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Barrier, Mutex};
+    use std::time::Duration;
+
+    use bbox_corpus_core::identity::PublishedScope;
+    use bbox_corpus_core::project_catalog::{
+        ATTACHMENT_VERSION_V1, AttachmentCapabilities, AttachmentId, AttachmentKind,
+        AttachmentStatus, CATALOG_VERSION_V2, CheckoutAttachment, CorpusProject,
+        LegacyPathBindingId, LegacyPathBindingStatus, LegacyPathLedgerEntry, ProjectScope,
+        ScopeMigrationAttachmentProof, ScopeMigrationAuthorityProvenance, ScopeMigrationId,
+        ScopeMigrationKind, ScopeMigrationRecord,
+    };
+    use bbox_stores::store_persister::StorePersister;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct TracingIo {
+        real: RealCatalogStoreIo,
+        fail_at: Option<usize>,
+        fail_points: BTreeSet<FaultPoint>,
+        seen: AtomicUsize,
+        points: Mutex<Vec<FaultPoint>>,
+    }
+
+    impl TracingIo {
+        fn recording() -> Self {
+            Self {
+                real: RealCatalogStoreIo,
+                fail_at: None,
+                fail_points: BTreeSet::new(),
+                seen: AtomicUsize::new(0),
+                points: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing_at(index: usize) -> Self {
+            Self {
+                real: RealCatalogStoreIo,
+                fail_at: Some(index),
+                fail_points: BTreeSet::new(),
+                seen: AtomicUsize::new(0),
+                points: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing_points(points: impl IntoIterator<Item = FaultPoint>) -> Self {
+            Self {
+                real: RealCatalogStoreIo,
+                fail_at: None,
+                fail_points: points.into_iter().collect(),
+                seen: AtomicUsize::new(0),
+                points: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing_at_and_points(
+            index: usize,
+            points: impl IntoIterator<Item = FaultPoint>,
+        ) -> Self {
+            Self {
+                real: RealCatalogStoreIo,
+                fail_at: Some(index),
+                fail_points: points.into_iter().collect(),
+                seen: AtomicUsize::new(0),
+                points: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn trace(&self) -> Vec<FaultPoint> {
+            self.points.lock().unwrap().clone()
+        }
+    }
+
+    impl CatalogStoreIo for TracingIo {
+        fn acquire_mutation_lock(
+            &self,
+            catalog_path: &Path,
+        ) -> ProjectCatalogStoreResult<StoreLockGuard> {
+            self.real.acquire_mutation_lock(catalog_path)
+        }
+
+        fn read_regular_nofollow(
+            &self,
+            path: &Path,
+            max_bytes: usize,
+        ) -> ProjectCatalogStoreResult<Option<Vec<u8>>> {
+            self.real.read_regular_nofollow(path, max_bytes)
+        }
+
+        fn create_private_dir_nofollow(&self, path: &Path) -> ProjectCatalogStoreResult<()> {
+            self.real.create_private_dir_nofollow(path)
+        }
+
+        fn acquire_directory_lock_nofollow(
+            &self,
+            path: &Path,
+        ) -> ProjectCatalogStoreResult<CatalogDirectoryLockGuard> {
+            self.real.acquire_directory_lock_nofollow(path)
+        }
+
+        fn write_new_nofollow(&self, path: &Path, bytes: &[u8]) -> ProjectCatalogStoreResult<()> {
+            self.real.write_new_nofollow(path, bytes)
+        }
+
+        fn fsync_regular_nofollow(&self, path: &Path) -> ProjectCatalogStoreResult<()> {
+            self.real.fsync_regular_nofollow(path)
+        }
+
+        fn atomic_replace_sync_nofollow(
+            &self,
+            path: &Path,
+            bytes: &[u8],
+        ) -> ProjectCatalogStoreResult<()> {
+            self.real.atomic_replace_sync_nofollow(path, bytes)
+        }
+
+        fn replace_from_stage_nofollow(
+            &self,
+            stage: &Path,
+            target: &Path,
+            expected_hash: &Sha256Hex,
+            max_bytes: usize,
+        ) -> ProjectCatalogStoreResult<()> {
+            self.real
+                .replace_from_stage_nofollow(stage, target, expected_hash, max_bytes)
+        }
+
+        fn remove_regular_exact(
+            &self,
+            path: &Path,
+            expected_hash: &Sha256Hex,
+            max_bytes: usize,
+        ) -> ProjectCatalogStoreResult<()> {
+            self.real
+                .remove_regular_exact(path, expected_hash, max_bytes)
+        }
+
+        fn fsync_dir(&self, path: &Path) -> ProjectCatalogStoreResult<()> {
+            self.real.fsync_dir(path)
+        }
+
+        fn checkpoint(&self, point: FaultPoint) -> ProjectCatalogStoreResult<()> {
+            let index = self.seen.fetch_add(1, Ordering::SeqCst);
+            self.points.lock().unwrap().push(point);
+            if self.fail_at == Some(index) || self.fail_points.contains(&point) {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_injected_fault",
+                    format!("injected fault at checkpoint {index}: {point:?}"),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    fn projects_path() -> (tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("projects.json");
+        (directory, path)
+    }
+
+    fn assert_absent_pair(path: &Path) {
+        let paths = ProjectCatalogPaths::derive(path).unwrap();
+        assert!(!paths.catalog.exists());
+        assert!(!paths.attachments.exists());
+    }
+
+    fn assert_no_migration_outputs(path: &Path) {
+        let paths = ProjectCatalogPaths::derive(path).unwrap();
+        for output in [
+            paths.attachments,
+            paths.journal,
+            paths.migration_marker,
+            paths.stage_dir,
+            paths.backup_dir,
+            path.parent().unwrap().join("code-source"),
+            path.parent().unwrap().join("checkout"),
+        ] {
+            assert!(
+                !output.exists(),
+                "validation unexpectedly created {}",
+                output.display()
+            );
+        }
+    }
+
+    fn state_fingerprint(state: &ProjectCatalogState) -> (u64, String, String) {
+        (
+            state.epoch(),
+            state.catalog_sha256().to_owned(),
+            state.attachments_sha256().to_owned(),
+        )
+    }
+
+    fn assert_known_state_or_absent(path: &Path, allowed_states: &[(u64, String, String)]) {
+        match ProjectCatalogStore::open_existing(path.to_path_buf()) {
+            Ok(store) => {
+                let state = store.snapshot().unwrap();
+                let actual = state_fingerprint(&state);
+                assert!(
+                    allowed_states.contains(&actual),
+                    "unexpected recovered state {actual:?}"
+                );
+            }
+            Err(error) if error.code() == "error.project_catalog_not_initialized" => {
+                assert_absent_pair(path);
+            }
+            Err(error) => panic!("unexpected reopen error: {error}"),
+        }
+    }
+
+    fn assert_retained_journal_artifacts(path: &Path) {
+        let paths = ProjectCatalogPaths::derive(path).unwrap();
+        let Ok(bytes) = fs::read(&paths.journal) else {
+            return;
+        };
+        let journal: ProjectCatalogTransactionJournalV1 =
+            decode_bounded_json(&bytes, MAX_JOURNAL_BYTES, "transaction journal").unwrap();
+        journal.validate().unwrap();
+        assert_eq!(journal.state, TransactionStateV1::Committed);
+        for participant in &journal.participants {
+            for (root, image) in [
+                (&paths.backup_dir, &participant.old),
+                (&paths.stage_dir, &participant.new),
+            ] {
+                if let ExpectedImageV1::Present {
+                    sha256: expected,
+                    artifact_name,
+                } = image
+                {
+                    let bytes = fs::read(root.join(artifact_name.as_str())).unwrap();
+                    assert_eq!(sha256(&bytes), *expected);
+                }
+            }
+        }
+    }
+
+    fn corrupt_staged_role(path: &Path, role: ParticipantRoleV1) {
+        let paths = ProjectCatalogPaths::derive(path).unwrap();
+        let bytes = fs::read(&paths.journal).unwrap();
+        let journal: ProjectCatalogTransactionJournalV1 =
+            decode_bounded_json(&bytes, MAX_JOURNAL_BYTES, "transaction journal").unwrap();
+        let participant = journal
+            .participants
+            .iter()
+            .find(|participant| participant.role == role)
+            .unwrap();
+        let ExpectedImageV1::Present { artifact_name, .. } = &participant.new else {
+            panic!("selected role has no staged post-image");
+        };
+        fs::write(
+            paths.stage_dir.join(artifact_name.as_str()),
+            b"corrupt stage",
+        )
+        .unwrap();
+    }
+
+    fn add_promoted_fixture(
+        catalog: &mut CatalogSnapshotV2,
+        attachments: &mut AttachmentSnapshotV1,
+    ) -> ProjectCatalogStoreResult<()> {
+        let project_id = ProjectId::parse("example").map_err(contract_error)?;
+        let attachment_id =
+            AttachmentId::parse("att_11111111111111111111111111111111").map_err(contract_error)?;
+        let migration_id = ScopeMigrationId::parse("sm_22222222222222222222222222222222")
+            .map_err(contract_error)?;
+        let legacy_binding_id = LegacyPathBindingId::parse("lpb_33333333333333333333333333333333")
+            .map_err(contract_error)?;
+        let published_scope =
+            PublishedScope::try_new("repo-example", ".").map_err(contract_error)?;
+        let project = CorpusProject {
+            project_id: project_id.clone(),
+            scope: ProjectScope::Published(published_scope.clone()),
+            operator_aliases: BTreeSet::new(),
+            nominated_aliases: BTreeSet::new(),
+            display_name: "Example project".into(),
+            created_at: "2026-07-22T00:00:00Z".into(),
+            registered_at_compat: None,
+            repo_history: None,
+            languages: BTreeSet::new(),
+        };
+        catalog.projects.insert(project_id.clone(), project);
+        catalog.scope_migrations.insert(
+            migration_id.clone(),
+            ScopeMigrationRecord {
+                scope_migration_id: migration_id.clone(),
+                project_id: project_id.clone(),
+                catalog_epoch: 2,
+                authority_provenance: ScopeMigrationAuthorityProvenance::AttachmentProved,
+                operator_invocation: "bbox_project_promote".into(),
+                operator_reason: None,
+                old_scope: ProjectScope::LegacyLocal,
+                new_scope: ProjectScope::Published(published_scope.clone()),
+                kind: ScopeMigrationKind::Promotion,
+                migrated_at: "2026-07-22T00:00:00Z".into(),
+                code_bridge_generation: None,
+                publication_bridge_generation: None,
+                pending_capabilities: BTreeSet::new(),
+            },
+        );
+        attachments.attachments.insert(
+            attachment_id.clone(),
+            CheckoutAttachment {
+                attachment_id: attachment_id.clone(),
+                project_id: project_id.clone(),
+                checkout_id: "44444444444444444444444444444444".into(),
+                checkout_dir: "/tmp/example".into(),
+                checkout_project_dir: "/tmp/example".into(),
+                project_root_relpath: ".".into(),
+                kind: AttachmentKind::Base,
+                validated_scope: Some(published_scope.clone()),
+                computed_repo_hint: None,
+                branch_ref: None,
+                capabilities: AttachmentCapabilities {
+                    local_code_source: true,
+                    ..AttachmentCapabilities::default()
+                },
+                status: AttachmentStatus::Attached,
+                attached_at: "2026-07-22T00:00:00Z".into(),
+                detached_at: None,
+            },
+        );
+        attachments.scope_migration_proofs.insert(
+            migration_id.clone(),
+            ScopeMigrationAttachmentProof {
+                scope_migration_id: migration_id,
+                attachment_id,
+                checkout_id: "44444444444444444444444444444444".into(),
+                old_scope: ProjectScope::LegacyLocal,
+                new_scope: ProjectScope::Published(published_scope),
+                proved_at: "2026-07-22T00:00:00Z".into(),
+            },
+        );
+        attachments.legacy_path_bindings.insert(
+            legacy_binding_id.clone(),
+            LegacyPathLedgerEntry {
+                legacy_path_binding_id: legacy_binding_id,
+                historical_path: "/tmp/legacy-example".into(),
+                source_store: "synthetic".into(),
+                source_row_id: "row-1".into(),
+                inventory_epoch: 1,
+                status: LegacyPathBindingStatus::Unscoped {},
+            },
+        );
+        Ok(())
+    }
+
+    fn basic_migration_draft(
+        path: &Path,
+        legacy_bytes: &[u8],
+    ) -> (
+        MigrationParticipantRegistry,
+        MigrationPlanDraftV1,
+        (u64, String, String),
+    ) {
+        let root = path.parent().unwrap();
+        let transaction_id = ProjectCatalogTransactionId::mint();
+        let mut registry =
+            MigrationParticipantRegistry::new(path, root.join("code-source")).unwrap();
+        registry
+            .register_checkout_identity("checkout-observation-1".into(), root.join("checkout"))
+            .unwrap();
+        let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
+        catalog.origin = CatalogOriginV2::MigratedV1 {
+            transaction_id: transaction_id.clone(),
+        };
+        let attachments = AttachmentSnapshotV1::empty(1).unwrap();
+        let expected = state_fingerprint(
+            &PreparedPair::new(catalog.clone(), attachments.clone())
+                .unwrap()
+                .into_state(),
+        );
+        let draft = MigrationPlanDraftV1 {
+            transaction_id,
+            plan_hash: Sha256Hex::digest(b"migration fault plan"),
+            source_store_sha256: Sha256Hex::digest(legacy_bytes),
+            inventory_sha256: Sha256Hex::digest(b"migration fault inventory"),
+            expected_legacy_catalog_sha256: Sha256Hex::digest(legacy_bytes),
+            catalog,
+            attachments,
+            participants: vec![MigrationParticipantDraftV1::new(
+                ParticipantRoleV1::EffectiveSourceManifest,
+                None,
+                Some(b"effective manifest".to_vec()),
+            )],
+            immutable_assets: vec![
+                MigrationImmutableAssetDraftV1::new(
+                    ImmutableAssetRoleV1::LegacyProjectStoreBackup,
+                    legacy_bytes.to_vec(),
+                ),
+                MigrationImmutableAssetDraftV1::new(
+                    ImmutableAssetRoleV1::LegacyPublisherRefBackup,
+                    b"legacy publisher refs".to_vec(),
+                ),
+            ],
+            checkout_identity_actions: vec![MigrationCheckoutIdentityActionDraftV1::new(
+                "checkout-observation-1".into(),
+                "66666666666666666666666666666666".into(),
+            )],
+        };
+        (registry, draft, expected)
+    }
+
+    fn migration_fault_fixture() -> (
+        tempfile::TempDir,
+        PathBuf,
+        ValidatedMigrationPlanV1,
+        (u64, String, String),
+        Vec<u8>,
+    ) {
+        let (directory, path) = projects_path();
+        let legacy_bytes = b"{\"version\":1,\"projects\":[]}\n".to_vec();
+        fs::write(&path, &legacy_bytes).unwrap();
+        let (registry, draft, expected) = basic_migration_draft(&path, &legacy_bytes);
+        let plan = validate_migration_plan(&path, registry, draft).unwrap();
+        (directory, path, plan, expected, legacy_bytes)
+    }
+
+    #[test]
+    fn derives_fixed_siblings_from_an_arbitrary_catalog_filename() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let paths = ProjectCatalogPaths::derive(&root.join("custom-projects.json")).unwrap();
+
+        assert_eq!(paths.attachments, root.join("project-attachments.json"));
+        assert_eq!(paths.journal, root.join("project-catalog-transaction.json"));
+        assert_eq!(
+            paths.migration_marker,
+            root.join("project-catalog-migration.json")
+        );
+        assert_eq!(paths.stage_dir, root.join("project-catalog-stage"));
+        assert_eq!(paths.backup_dir, root.join("project-catalog-backups"));
+        assert_eq!(paths.mutation_lock, root.join("custom-projects.json.lock"));
+        assert!(ProjectCatalogPaths::derive(&root.join("project-attachments.json")).is_err());
+        assert!(ProjectCatalogPaths::derive(Path::new("projects.json")).is_err());
+    }
+
+    #[test]
+    fn initialize_and_transact_publish_only_verified_pairs() {
+        let (_directory, path) = projects_path();
+        let store = ProjectCatalogStore::initialize_empty(path.clone()).unwrap();
+        assert_eq!(store.snapshot().unwrap().epoch(), 1);
+        assert_eq!(
+            store.snapshot().unwrap().catalog().version,
+            CATALOG_VERSION_V2
+        );
+        assert_eq!(
+            store.snapshot().unwrap().attachments().version,
+            ATTACHMENT_VERSION_V1
+        );
+
+        let commit = store.transact(1, add_promoted_fixture).unwrap();
+        assert_eq!(commit.epoch, 2);
+        let reopened = ProjectCatalogStore::open_existing(path).unwrap();
+        assert_eq!(reopened.snapshot().unwrap().epoch(), 2);
+        assert_eq!(reopened.snapshot().unwrap().catalog().projects.len(), 1);
+        assert_eq!(
+            reopened
+                .snapshot()
+                .unwrap()
+                .attachments()
+                .scope_migration_proofs
+                .len(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .snapshot()
+                .unwrap()
+                .attachments()
+                .legacy_path_bindings
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn open_never_infers_an_empty_store_or_half_pair() {
+        let (_directory, path) = projects_path();
+        let error = ProjectCatalogStore::open_existing(path.clone()).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_not_initialized");
+
+        let catalog = CatalogSnapshotV2::empty(1).unwrap();
+        fs::write(&path, encode_catalog_snapshot(&catalog).unwrap()).unwrap();
+        let error = ProjectCatalogStore::open_existing(path).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_incomplete_pair");
+    }
+
+    #[test]
+    fn closure_cannot_change_owner_controlled_fields() {
+        let (_directory, path) = projects_path();
+        let store = ProjectCatalogStore::initialize_empty(path).unwrap();
+        let error = store
+            .transact(1, |catalog, _| {
+                catalog.epoch = 99;
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_owner_field_mutation");
+        assert_eq!(store.snapshot().unwrap().epoch(), 1);
+    }
+
+    #[test]
+    fn concurrent_stale_epoch_writers_have_exactly_one_winner() {
+        let (_directory, path) = projects_path();
+        let store = Arc::new(ProjectCatalogStore::initialize_empty(path).unwrap());
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                store.transact(1, |_, _| {
+                    barrier.wait();
+                    Ok(())
+                })
+            }));
+        }
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    result
+                        .as_ref()
+                        .is_err_and(|error| error.code() == "error.project_catalog_stale_epoch")
+                })
+                .count(),
+            1
+        );
+        assert_eq!(store.snapshot().unwrap().epoch(), 2);
+    }
+
+    #[test]
+    fn shared_bridge_lock_and_v2_owner_contend_on_the_same_inode() {
+        let (_directory, path) = projects_path();
+        let registry = Arc::new(RwLock::new(
+            crate::projects::ProjectRegistry::open(&path).unwrap(),
+        ));
+        let persister = StorePersister::spawn("catalog-lock-contention", registry, path.clone());
+        let guard = acquire_store_lock_nofollow(&path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = persister.flush_blocking();
+            sender.send(result).unwrap();
+        });
+        assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(guard);
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn migration_preflight_and_bridge_persister_contend_on_the_same_inode() {
+        let (_directory, path) = projects_path();
+        let (captured_sender, captured_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let capture_path = path.clone();
+        let capture = std::thread::spawn(move || {
+            capture_migration_preflight(&capture_path, || {
+                captured_sender.send(()).unwrap();
+                release_receiver.recv().unwrap();
+                Ok(())
+            })
+        });
+        captured_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        let registry = Arc::new(RwLock::new(
+            crate::projects::ProjectRegistry::open(&path).unwrap(),
+        ));
+        let persister = StorePersister::spawn("preflight-lock-contention", registry, path.clone());
+        let (persisted_sender, persisted_receiver) = std::sync::mpsc::channel();
+        let persist = std::thread::spawn(move || {
+            persisted_sender.send(persister.flush_blocking()).unwrap();
+        });
+        assert!(
+            persisted_receiver
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+
+        release_sender.send(()).unwrap();
+        capture.join().unwrap().unwrap();
+        persisted_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        persist.join().unwrap();
+    }
+
+    #[test]
+    fn migration_apply_contends_on_code_owned_auxiliary_store_locks() {
+        let (_directory, path, plan, _, _) = migration_fault_fixture();
+        let auxiliary_path = path
+            .parent()
+            .unwrap()
+            .join("code-source/effective-source-manifest.json");
+        let auxiliary_guard = acquire_store_lock_nofollow(&auxiliary_path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender.send(transact_migration(&path, plan)).unwrap();
+        });
+        assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+
+        drop(auxiliary_guard);
+        receiver
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn migration_registry_rejects_unsafe_roots_and_duplicate_checkout_targets() {
+        let (_directory, path) = projects_path();
+        let root = path.parent().unwrap();
+        assert!(
+            MigrationParticipantRegistry::new(&path, root.join("code-source/../escape"),).is_err()
+        );
+
+        let mut registry =
+            MigrationParticipantRegistry::new(&path, root.join("code-source")).unwrap();
+        registry
+            .register_checkout_identity("first".into(), root.join("checkout"))
+            .unwrap();
+        registry
+            .register_checkout_identity("second".into(), root.join("checkout"))
+            .unwrap();
+        assert!(registry.validate().is_err());
+    }
+
+    #[test]
+    fn catalog_and_auxiliary_lock_path_collisions_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        assert!(ProjectCatalogPaths::derive(&root.join("project-catalog-migration.lock")).is_err());
+        assert!(
+            MigrationParticipantRegistry::new(
+                &root.join("effective-source-manifest.toml"),
+                root.clone(),
+            )
+            .is_err()
+        );
+        assert!(
+            MigrationParticipantRegistry::new(
+                &root.join("projects.json"),
+                root.join("project-catalog-stage/code-source"),
+            )
+            .is_err()
+        );
+
+        let mut registry = MigrationParticipantRegistry::new(
+            &root.join("projects.json"),
+            root.join("code-source"),
+        )
+        .unwrap();
+        registry
+            .register_checkout_identity(
+                "nested-checkout".into(),
+                root.join("project-catalog-backups/checkout"),
+            )
+            .unwrap();
+        assert!(registry.validate().is_err());
+    }
+
+    #[test]
+    fn invalid_migration_images_and_source_binding_have_no_side_effects() {
+        let (directory, path) = projects_path();
+        let legacy_bytes = b"{\"version\":1,\"projects\":[]}\n";
+
+        let (registry, mut draft, _) = basic_migration_draft(&path, legacy_bytes);
+        draft.participants[0].post_image = Some(vec![b'x'; MAX_PROJECT_CATALOG_BYTES + 1]);
+        assert!(validate_migration_plan(&path, registry, draft).is_err());
+        assert_no_migration_outputs(&path);
+
+        let (registry, mut draft, _) = basic_migration_draft(&path, legacy_bytes);
+        draft.immutable_assets[0].bytes = vec![b'x'; MAX_PROJECT_CATALOG_BYTES + 1];
+        assert!(validate_migration_plan(&path, registry, draft).is_err());
+        assert_no_migration_outputs(&path);
+
+        let (registry, mut draft, _) = basic_migration_draft(&path, legacy_bytes);
+        draft.source_store_sha256 = Sha256Hex::digest(b"different source");
+        assert!(validate_migration_plan(&path, registry, draft).is_err());
+        assert_no_migration_outputs(&path);
+
+        let (registry, mut draft, _) = basic_migration_draft(&path, legacy_bytes);
+        draft.immutable_assets[0].bytes = b"different retained source".to_vec();
+        assert!(validate_migration_plan(&path, registry, draft).is_err());
+        assert_no_migration_outputs(&path);
+
+        drop(directory);
+    }
+
+    #[test]
+    fn migration_evidence_cardinality_and_encoded_size_bounds_are_compatible() {
+        let (_directory, path) = projects_path();
+        let legacy_bytes = b"{\"version\":1,\"projects\":[]}\n";
+        let (registry, mut draft, _) = basic_migration_draft(&path, legacy_bytes);
+        draft.participants = std::iter::repeat_with(|| {
+            MigrationParticipantDraftV1::new(ParticipantRoleV1::EffectiveSourceManifest, None, None)
+        })
+        .take(MAX_MIGRATION_PARTICIPANTS)
+        .collect();
+        let error = validate_migration_plan(&path, registry, draft).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_invalid_migration_plan");
+        assert_no_migration_outputs(&path);
+
+        let transaction_id = ProjectCatalogTransactionId::mint();
+        let project_id = ProjectId::parse("x".repeat(96)).unwrap();
+        let role = ParticipantRoleV1::StoredGenerationMetadata {
+            project_id,
+            published_scope: PublishedScope::try_new("r".repeat(128), ".").unwrap(),
+            generation_id: Sha256Hex::digest(b"generation"),
+        };
+        let image = Some(vec![b'x']);
+        let participant =
+            build_transaction_participant(&transaction_id, role, None, &image).unwrap();
+        let encoded_participant = serde_json::to_vec(&participant).unwrap().len();
+        let asset_role = ImmutableAssetRoleV1::LegacyProjectStoreBackup;
+        let asset_hash = Sha256Hex::digest(b"asset");
+        let encoded_asset = serde_json::to_vec(&ImmutableAssetV1 {
+            validated_name: immutable_target_name(&transaction_id, &asset_role, &asset_hash)
+                .unwrap(),
+            stage_name: immutable_stage_name(&transaction_id, &asset_role, &asset_hash).unwrap(),
+            role: asset_role,
+            sha256: asset_hash,
+        })
+        .unwrap()
+        .len();
+        let encoded_action = serde_json::to_vec(&CheckoutIdentityActionV1 {
+            observation_id: "o".repeat(256),
+            planned_id: "a".repeat(32),
+        })
+        .unwrap()
+        .len();
+        let conservative_max = encoded_participant
+            .saturating_mul(MAX_MIGRATION_PARTICIPANTS)
+            .saturating_add(encoded_asset.saturating_mul(MAX_MIGRATION_IMMUTABLE_ASSETS))
+            .saturating_add(encoded_action.saturating_mul(MAX_MIGRATION_CHECKOUT_ACTIONS))
+            .saturating_add(1024 * 1024);
+        assert!(conservative_max <= MAX_JOURNAL_BYTES);
+    }
+
+    #[test]
+    fn migration_replaces_only_an_empty_checkout_identity_marker() {
+        let (_directory, path, plan, _, _) = migration_fault_fixture();
+        let marker = path
+            .parent()
+            .unwrap()
+            .join("checkout/.bbox/local/checkout-id");
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&marker, b"").unwrap();
+
+        transact_migration(&path, plan).unwrap();
+        assert_eq!(
+            fs::read_to_string(marker).unwrap(),
+            "66666666666666666666666666666666\n"
+        );
+    }
+
+    #[test]
+    fn migration_refuses_a_different_checkout_identity_without_overwrite() {
+        let (_directory, path, plan, _, _) = migration_fault_fixture();
+        let marker = path
+            .parent()
+            .unwrap()
+            .join("checkout/.bbox/local/checkout-id");
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        let existing = b"77777777777777777777777777777777\n";
+        fs::write(&marker, existing).unwrap();
+
+        assert!(transact_migration(&path, plan).is_err());
+        assert_eq!(fs::read(marker).unwrap(), existing);
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        assert!(!paths.stage_dir.exists());
+        assert!(!paths.backup_dir.exists());
+        assert!(!paths.journal.exists());
+        assert!(!paths.attachments.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_refuses_a_symlinked_checkout_identity_without_overwrite() {
+        use std::os::unix::fs::symlink;
+
+        let (_directory, path, plan, _, _) = migration_fault_fixture();
+        let marker = path
+            .parent()
+            .unwrap()
+            .join("checkout/.bbox/local/checkout-id");
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        let outside = path.parent().unwrap().join("outside-checkout-id");
+        let existing = b"77777777777777777777777777777777\n";
+        fs::write(&outside, existing).unwrap();
+        symlink(&outside, &marker).unwrap();
+
+        assert!(transact_migration(&path, plan).is_err());
+        assert_eq!(fs::read(outside).unwrap(), existing);
+        assert!(
+            fs::symlink_metadata(marker)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        assert!(!paths.stage_dir.exists());
+        assert!(!paths.backup_dir.exists());
+        assert!(!paths.journal.exists());
+        assert!(!paths.attachments.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_open_rejects_a_fifo_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let (_directory, path) = projects_path();
+        let store = ProjectCatalogStore::initialize_empty(path.clone()).unwrap();
+        drop(store);
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        fs::remove_file(&paths.attachments).unwrap();
+        let fifo = CString::new(paths.attachments.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        let started = std::time::Instant::now();
+        let error = ProjectCatalogStore::open_existing(path).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_non_regular_file");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_open_refuses_symlinked_participant() {
+        use std::os::unix::fs::symlink;
+
+        let (_directory, path) = projects_path();
+        let store = ProjectCatalogStore::initialize_empty(path.clone()).unwrap();
+        drop(store);
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        let target = paths
+            .attachments
+            .parent()
+            .unwrap()
+            .join("attachment-target.json");
+        fs::rename(&paths.attachments, &target).unwrap();
+        symlink(&target, &paths.attachments).unwrap();
+
+        assert!(ProjectCatalogStore::open_existing(path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialization_refuses_symlinked_transaction_directory() {
+        use std::os::unix::fs::symlink;
+
+        let (_directory, path) = projects_path();
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        let redirected = path.parent().unwrap().join("redirected-stage");
+        fs::create_dir(&redirected).unwrap();
+        symlink(&redirected, &paths.stage_dir).unwrap();
+
+        let error = ProjectCatalogStore::initialize_empty(path).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_io");
+        assert!(fs::read_dir(&redirected).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn strict_journal_codec_rejects_duplicate_and_unknown_fields() {
+        let (_directory, path) = projects_path();
+        let store = ProjectCatalogStore::initialize_empty(path.clone()).unwrap();
+        drop(store);
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        let text = fs::read_to_string(paths.journal).unwrap();
+
+        let duplicate = format!("{{\"version\":1,{}", &text[1..]);
+        assert!(
+            decode_bounded_json::<ProjectCatalogTransactionJournalV1>(
+                duplicate.as_bytes(),
+                MAX_JOURNAL_BYTES,
+                "transaction journal"
+            )
+            .is_err()
+        );
+        let unknown = text.replacen('{', "{\"unknown\":true,", 1);
+        assert!(
+            decode_bounded_json::<ProjectCatalogTransactionJournalV1>(
+                unknown.as_bytes(),
+                MAX_JOURNAL_BYTES,
+                "transaction journal"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn journal_validation_enforces_epoch_images_and_unique_checkout_actions() {
+        let (_directory, path) = projects_path();
+        let store = ProjectCatalogStore::initialize_empty(path.clone()).unwrap();
+        drop(store);
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        let mut regular: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
+            &fs::read(paths.journal).unwrap(),
+            MAX_JOURNAL_BYTES,
+            "transaction journal",
+        )
+        .unwrap();
+        regular.old_epoch = 1;
+        regular.new_epoch = 2;
+        assert!(regular.validate().is_err());
+
+        let (_migration_directory, _, plan, _, _) = migration_fault_fixture();
+        let migration = plan.journal;
+        migration.validate().unwrap();
+
+        let mut wrong_epoch = migration.clone();
+        wrong_epoch.old_epoch = 1;
+        wrong_epoch.new_epoch = 2;
+        assert!(wrong_epoch.validate().is_err());
+
+        let mut missing_catalog_backup = migration.clone();
+        missing_catalog_backup
+            .participants
+            .iter_mut()
+            .find(|participant| participant.role == ParticipantRoleV1::Catalog)
+            .unwrap()
+            .old = ExpectedImageV1::Absent {};
+        assert!(missing_catalog_backup.validate().is_err());
+
+        let mut duplicate_action = migration;
+        duplicate_action
+            .monotonic_checkout_identity_actions
+            .push(duplicate_action.monotonic_checkout_identity_actions[0].clone());
+        assert!(duplicate_action.validate().is_err());
+    }
+
+    #[test]
+    fn empty_initialization_fault_matrix_reopens_to_one_coherent_state() {
+        let (_trace_directory, trace_path) = projects_path();
+        let recording = Arc::new(TracingIo::recording());
+        let store =
+            ProjectCatalogStore::initialize_empty_with_io(trace_path, recording.clone()).unwrap();
+        let initialized = state_fingerprint(&store.snapshot().unwrap());
+        drop(store);
+        let trace = recording.trace();
+        assert!(trace.contains(&FaultPoint::PreparedJournalWrite));
+        assert!(trace.contains(&FaultPoint::ParticipantInstall));
+        assert!(trace.contains(&FaultPoint::CommittedJournalWrite));
+
+        for index in 0..trace.len() {
+            let (_directory, path) = projects_path();
+            let failing = Arc::new(TracingIo::failing_at(index));
+            let _ = ProjectCatalogStore::initialize_empty_with_io(path.clone(), failing);
+            assert_known_state_or_absent(&path, std::slice::from_ref(&initialized));
+            assert_retained_journal_artifacts(&path);
+        }
+    }
+
+    #[test]
+    fn nonempty_pair_fault_matrix_never_reopens_a_mixed_epoch() {
+        let (_trace_directory, trace_path) = projects_path();
+        let trace_store = ProjectCatalogStore::initialize_empty(trace_path.clone()).unwrap();
+        let old = state_fingerprint(&trace_store.snapshot().unwrap());
+        drop(trace_store);
+        let recording = Arc::new(TracingIo::recording());
+        let trace_store =
+            ProjectCatalogStore::open_existing_with_io(trace_path, recording.clone()).unwrap();
+        trace_store.transact(1, add_promoted_fixture).unwrap();
+        let new = state_fingerprint(&trace_store.snapshot().unwrap());
+        drop(trace_store);
+        let trace = recording.trace();
+        assert!(trace.contains(&FaultPoint::BackupWrite));
+        assert!(trace.contains(&FaultPoint::BackupFsync));
+        assert!(trace.contains(&FaultPoint::StageWrite));
+        assert!(trace.contains(&FaultPoint::StageFsync));
+        assert!(trace.contains(&FaultPoint::Cleanup));
+        assert!(trace.contains(&FaultPoint::CompletePlanVerify));
+
+        for index in 0..trace.len() {
+            let (_directory, path) = projects_path();
+            let store = ProjectCatalogStore::initialize_empty(path.clone()).unwrap();
+            drop(store);
+            let failing = Arc::new(TracingIo::failing_at(index));
+            let store = ProjectCatalogStore::open_existing_with_io(path.clone(), failing).unwrap();
+            let _ = store.transact(1, add_promoted_fixture);
+            drop(store);
+            assert_known_state_or_absent(&path, &[old.clone(), new.clone()]);
+            assert_retained_journal_artifacts(&path);
+        }
+    }
+
+    #[test]
+    fn live_handle_reconciles_after_a_post_commit_fault() {
+        let (_trace_directory, trace_path) = projects_path();
+        let trace_store = ProjectCatalogStore::initialize_empty(trace_path.clone()).unwrap();
+        drop(trace_store);
+        let recording = Arc::new(TracingIo::recording());
+        let trace_store =
+            ProjectCatalogStore::open_existing_with_io(trace_path, recording.clone()).unwrap();
+        trace_store.transact(1, |_, _| Ok(())).unwrap();
+        drop(trace_store);
+        let fail_at = recording
+            .trace()
+            .iter()
+            .rposition(|point| *point == FaultPoint::CommittedJournalWrite)
+            .unwrap();
+
+        let (_directory, path) = projects_path();
+        let store = ProjectCatalogStore::initialize_empty(path.clone()).unwrap();
+        drop(store);
+        let failing = Arc::new(TracingIo::failing_at(fail_at));
+        let store = ProjectCatalogStore::open_existing_with_io(path, failing).unwrap();
+        let error = store.transact(1, |_, _| Ok(())).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_injected_fault");
+        assert_eq!(store.snapshot().unwrap().epoch(), 2);
+        assert_eq!(store.transact(2, |_, _| Ok(())).unwrap().epoch, 3);
+    }
+
+    #[test]
+    fn forward_recovery_fault_matrix_survives_a_second_crash() {
+        fn leave_prepared(path: &Path) {
+            let store = ProjectCatalogStore::initialize_empty(path.to_path_buf()).unwrap();
+            drop(store);
+            let failing = Arc::new(TracingIo::failing_points([
+                FaultPoint::ParticipantInstall,
+                FaultPoint::RecoveryParticipantInstall,
+            ]));
+            let store =
+                ProjectCatalogStore::open_existing_with_io(path.to_path_buf(), failing).unwrap();
+            assert!(store.transact(1, |_, _| Ok(())).is_err());
+            assert_eq!(
+                store.snapshot().unwrap_err().code(),
+                "error.project_catalog_store_poisoned"
+            );
+            drop(store);
+            let paths = ProjectCatalogPaths::derive(path).unwrap();
+            let journal: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
+                &fs::read(paths.journal).unwrap(),
+                MAX_JOURNAL_BYTES,
+                "transaction journal",
+            )
+            .unwrap();
+            assert_eq!(journal.state, TransactionStateV1::Prepared);
+        }
+
+        let (_reference_directory, reference_path) = projects_path();
+        let reference = ProjectCatalogStore::initialize_empty(reference_path).unwrap();
+        reference.transact(1, |_, _| Ok(())).unwrap();
+        let expected = state_fingerprint(&reference.snapshot().unwrap());
+        drop(reference);
+
+        let (_trace_directory, trace_path) = projects_path();
+        leave_prepared(&trace_path);
+        let recording = Arc::new(TracingIo::recording());
+        let recovered =
+            ProjectCatalogStore::open_existing_with_io(trace_path, recording.clone()).unwrap();
+        assert_eq!(state_fingerprint(&recovered.snapshot().unwrap()), expected);
+        drop(recovered);
+        let trace = recording.trace();
+        assert!(trace.contains(&FaultPoint::RecoveryParticipantInstall));
+
+        for index in 0..trace.len() {
+            let (_directory, path) = projects_path();
+            leave_prepared(&path);
+            let failing = Arc::new(TracingIo::failing_at(index));
+            let _ = ProjectCatalogStore::open_existing_with_io(path.clone(), failing);
+            assert_known_state_or_absent(&path, std::slice::from_ref(&expected));
+            assert_retained_journal_artifacts(&path);
+        }
+    }
+
+    #[test]
+    fn rollback_recovery_fault_matrix_deletes_only_the_exact_new_image() {
+        let (_trace_directory, successful_path) = projects_path();
+        let recording = Arc::new(TracingIo::recording());
+        let initialized =
+            ProjectCatalogStore::initialize_empty_with_io(successful_path, recording.clone())
+                .unwrap();
+        drop(initialized);
+        let install_points = recording
+            .trace()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, point)| {
+                (*point == FaultPoint::ParticipantInstall).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let fail_after_first_install = install_points[1];
+
+        fn leave_rollback_fixture(path: &Path, fail_after_first_install: usize) {
+            let failing = Arc::new(TracingIo::failing_at_and_points(
+                fail_after_first_install,
+                std::iter::empty(),
+            ));
+            assert!(
+                ProjectCatalogStore::initialize_empty_with_io(path.to_path_buf(), failing).is_err()
+            );
+            corrupt_staged_role(path, ParticipantRoleV1::Attachments);
+        }
+
+        let (_recovery_trace_directory, recovery_trace_path) = projects_path();
+        leave_rollback_fixture(&recovery_trace_path, fail_after_first_install);
+        let recovery_recording = Arc::new(TracingIo::recording());
+        let error = ProjectCatalogStore::open_existing_with_io(
+            recovery_trace_path,
+            recovery_recording.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_not_initialized");
+        let recovery_trace = recovery_recording.trace();
+        assert!(recovery_trace.contains(&FaultPoint::RecoveryParticipantRestore));
+        assert!(recovery_trace.contains(&FaultPoint::RecoveryParticipantDelete));
+
+        for index in 0..recovery_trace.len() {
+            let (_directory, path) = projects_path();
+            leave_rollback_fixture(&path, fail_after_first_install);
+            let failing = Arc::new(TracingIo::failing_at(index));
+            let _ = ProjectCatalogStore::open_existing_with_io(path.clone(), failing);
+            let error = ProjectCatalogStore::open_existing(path.clone()).unwrap_err();
+            assert_eq!(error.code(), "error.project_catalog_not_initialized");
+            assert_absent_pair(&path);
+            let paths = ProjectCatalogPaths::derive(&path).unwrap();
+            let journal: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
+                &fs::read(paths.journal).unwrap(),
+                MAX_JOURNAL_BYTES,
+                "transaction journal",
+            )
+            .unwrap();
+            assert_eq!(journal.outcome, Some(TransactionOutcomeV1::RolledBack));
+        }
+    }
+
+    #[test]
+    fn migration_journal_refuses_catalog_only_recovery_context() {
+        let (_directory, path) = projects_path();
+        let store = ProjectCatalogStore::initialize_empty(path.clone()).unwrap();
+        drop(store);
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        let bytes = fs::read(&paths.journal).unwrap();
+        let mut journal: ProjectCatalogTransactionJournalV1 =
+            decode_bounded_json(&bytes, MAX_JOURNAL_BYTES, "transaction journal").unwrap();
+        journal.kind = TransactionKindV1::V1Migration;
+        journal.plan_hash = Some(sha256(b"synthetic migration plan"));
+        let catalog = journal
+            .participants
+            .iter_mut()
+            .find(|participant| participant.role == ParticipantRoleV1::Catalog)
+            .unwrap();
+        let legacy_hash = sha256(b"synthetic legacy catalog");
+        catalog.old = ExpectedImageV1::Present {
+            artifact_name: artifact_name(
+                &journal.transaction_id,
+                &ParticipantRoleV1::Catalog,
+                &legacy_hash,
+                ArtifactKind::Backup,
+            )
+            .unwrap(),
+            sha256: legacy_hash,
+        };
+        for role in [
+            ParticipantRoleV1::EffectiveSourceManifest,
+            ParticipantRoleV1::MigrationMarker,
+        ] {
+            let hash = sha256(role.artifact_token().as_bytes());
+            journal.participants.push(TransactionParticipantV1 {
+                role: role.clone(),
+                old: ExpectedImageV1::Absent {},
+                new: ExpectedImageV1::Present {
+                    sha256: hash.clone(),
+                    artifact_name: artifact_name(
+                        &journal.transaction_id,
+                        &role,
+                        &hash,
+                        ArtifactKind::Stage,
+                    )
+                    .unwrap(),
+                },
+            });
+        }
+        journal.immutable_assets = [
+            (
+                ImmutableAssetRoleV1::LegacyProjectStoreBackup,
+                sha256(b"legacy project store"),
+            ),
+            (
+                ImmutableAssetRoleV1::LegacyPublisherRefBackup,
+                sha256(b"legacy publisher refs"),
+            ),
+        ]
+        .into_iter()
+        .map(|(role, hash)| ImmutableAssetV1 {
+            validated_name: immutable_target_name(&journal.transaction_id, &role, &hash).unwrap(),
+            stage_name: immutable_stage_name(&journal.transaction_id, &role, &hash).unwrap(),
+            role,
+            sha256: hash,
+        })
+        .collect();
+        fs::write(
+            &paths.journal,
+            encode_bounded_json(&journal, MAX_JOURNAL_BYTES, "transaction journal").unwrap(),
+        )
+        .unwrap();
+
+        let error = ProjectCatalogStore::open_existing(path).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_migration_registry_required"
+        );
+    }
+
+    #[test]
+    fn validated_migration_plan_uses_closed_roles_and_commits_every_participant() {
+        let (_directory, path) = projects_path();
+        let root = path.parent().unwrap();
+        let transaction_id = ProjectCatalogTransactionId::mint();
+        let project_id = ProjectId::parse("migration-example").unwrap();
+        let published_scope = PublishedScope::try_new("repo-migration", ".").unwrap();
+        let generation_id = Sha256Hex::digest(b"generation");
+        let legacy_bytes = b"{\"version\":1,\"projects\":[]}\n".to_vec();
+        fs::write(&path, &legacy_bytes).unwrap();
+
+        let mut registry =
+            MigrationParticipantRegistry::new(&path, root.join("code-source")).unwrap();
+        let retirement_target = root
+            .join("code-source/collision-retirements")
+            .join("migration-example.json");
+        registry
+            .register_checkout_identity("checkout-observation-1".into(), root.join("checkout"))
+            .unwrap();
+        fs::create_dir_all(retirement_target.parent().unwrap()).unwrap();
+        fs::write(&retirement_target, b"legacy activation").unwrap();
+
+        let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
+        catalog.origin = CatalogOriginV2::MigratedV1 {
+            transaction_id: transaction_id.clone(),
+        };
+        let attachments = AttachmentSnapshotV1::empty(1).unwrap();
+        let participants = vec![
+            MigrationParticipantDraftV1::new(
+                ParticipantRoleV1::EffectiveSourceManifest,
+                None,
+                Some(b"effective manifest".to_vec()),
+            ),
+            MigrationParticipantDraftV1::new(
+                ParticipantRoleV1::Activation {
+                    project_id: project_id.clone(),
+                },
+                None,
+                Some(b"activation v2".to_vec()),
+            ),
+            MigrationParticipantDraftV1::new(
+                ParticipantRoleV1::StoredGenerationMetadata {
+                    project_id: project_id.clone(),
+                    published_scope,
+                    generation_id: generation_id.clone(),
+                },
+                None,
+                Some(b"stored generation v2".to_vec()),
+            ),
+            MigrationParticipantDraftV1::new(
+                ParticipantRoleV1::CollisionRetirement {
+                    project_id: project_id.clone(),
+                },
+                Some(Sha256Hex::digest(b"legacy activation")),
+                None,
+            ),
+        ];
+        let draft = MigrationPlanDraftV1 {
+            transaction_id,
+            plan_hash: Sha256Hex::digest(b"migration plan"),
+            source_store_sha256: Sha256Hex::digest(&legacy_bytes),
+            inventory_sha256: Sha256Hex::digest(b"migration inventory"),
+            expected_legacy_catalog_sha256: Sha256Hex::digest(&legacy_bytes),
+            catalog,
+            attachments,
+            participants,
+            immutable_assets: vec![
+                MigrationImmutableAssetDraftV1::new(
+                    ImmutableAssetRoleV1::LegacyProjectStoreBackup,
+                    legacy_bytes,
+                ),
+                MigrationImmutableAssetDraftV1::new(
+                    ImmutableAssetRoleV1::LegacyPublisherRefBackup,
+                    b"legacy publisher refs".to_vec(),
+                ),
+            ],
+            checkout_identity_actions: vec![MigrationCheckoutIdentityActionDraftV1::new(
+                "checkout-observation-1".into(),
+                "55555555555555555555555555555555".into(),
+            )],
+        };
+        let plan = validate_migration_plan(&path, registry, draft).unwrap();
+        let retry_plan = plan.clone();
+        let retry_after_regular_commit = plan.clone();
+        let reopen_registry = plan.registry.clone();
+        let commit = transact_migration(&path, plan).unwrap();
+        assert_eq!(commit.epoch, 1);
+        let retried = transact_migration(&path, retry_plan).unwrap();
+        assert_eq!(retried, commit);
+
+        let reopened =
+            ProjectCatalogStore::open_existing_after_migration(path.clone(), reopen_registry)
+                .unwrap();
+        assert_eq!(reopened.snapshot().unwrap().epoch(), 1);
+        assert_eq!(reopened.transact(1, |_, _| Ok(())).unwrap().epoch, 2);
+        drop(reopened);
+        assert_eq!(
+            transact_migration(&path, retry_after_regular_commit)
+                .unwrap()
+                .epoch,
+            2
+        );
+        assert_eq!(
+            ProjectCatalogStore::open_existing(path.clone())
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .epoch(),
+            2
+        );
+
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        let catalog = decode_catalog_snapshot(&fs::read(paths.catalog).unwrap()).unwrap();
+        let attachments =
+            decode_attachment_snapshot(&fs::read(paths.attachments).unwrap()).unwrap();
+        validate_catalog_attachments(&catalog, &attachments).unwrap();
+        let marker: ProjectCatalogMigrationMarkerV1 = decode_bounded_json(
+            &fs::read(paths.migration_marker).unwrap(),
+            MAX_MARKER_BYTES,
+            "migration marker",
+        )
+        .unwrap();
+        marker.validate().unwrap();
+        let retirement_evidence = marker
+            .participants
+            .iter()
+            .find(|evidence| matches!(evidence.role, ParticipantRoleV1::CollisionRetirement { .. }))
+            .unwrap();
+        assert!(matches!(
+            retirement_evidence.old,
+            ExpectedImageV1::Present { .. }
+        ));
+        assert!(matches!(
+            retirement_evidence.new,
+            ExpectedImageV1::Absent {}
+        ));
+        assert!(!retirement_target.exists());
+        assert_eq!(
+            fs::read_to_string(root.join("checkout/.bbox/local/checkout-id")).unwrap(),
+            "55555555555555555555555555555555\n"
+        );
+        assert_eq!(
+            fs::read(root.join("checkout/.bbox/local/.gitignore")).unwrap(),
+            CHECKOUT_LOCAL_GITIGNORE_BYTES
+        );
+        assert_eq!(
+            bbox_corpus_core::identity::ensure_checkout_id(&root.join("checkout")).unwrap(),
+            "55555555555555555555555555555555"
+        );
+    }
+
+    #[test]
+    fn migration_marker_uses_its_role_cap_during_install_verify_and_rollback() {
+        let (_directory, path) = projects_path();
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        let registry =
+            MigrationParticipantRegistry::new(&path, path.parent().unwrap().join("code-source"))
+                .unwrap();
+        let owner = ProjectCatalogTransactionOwner {
+            paths: paths.clone(),
+            registry: ParticipantRegistry::Migration(Arc::new(registry)),
+            io: Arc::new(RealCatalogStoreIo),
+        };
+        fs::create_dir_all(&paths.stage_dir).unwrap();
+
+        let transaction_id = ProjectCatalogTransactionId::mint();
+        let source_hash = Sha256Hex::digest(b"legacy source");
+        let mut evidence = vec![
+            build_transaction_participant(
+                &transaction_id,
+                ParticipantRoleV1::Catalog,
+                Some(source_hash.clone()),
+                &Some(b"catalog".to_vec()),
+            )
+            .unwrap(),
+            build_transaction_participant(
+                &transaction_id,
+                ParticipantRoleV1::Attachments,
+                None,
+                &Some(b"attachments".to_vec()),
+            )
+            .unwrap(),
+            build_transaction_participant(
+                &transaction_id,
+                ParticipantRoleV1::EffectiveSourceManifest,
+                None,
+                &Some(b"manifest".to_vec()),
+            )
+            .unwrap(),
+        ]
+        .into_iter()
+        .map(|participant| MigrationParticipantEvidenceV1 {
+            role: participant.role,
+            old: participant.old,
+            new: participant.new,
+        })
+        .collect::<Vec<_>>();
+        let long_scope = PublishedScope::try_new(
+            "r".repeat(256),
+            std::iter::repeat_n("p".repeat(255), 15)
+                .collect::<Vec<_>>()
+                .join("/"),
+        )
+        .unwrap();
+        let project_id = ProjectId::parse("large-marker-project").unwrap();
+        for ordinal in 0_u32..2_500 {
+            let participant = build_transaction_participant(
+                &transaction_id,
+                ParticipantRoleV1::StoredGenerationMetadata {
+                    project_id: project_id.clone(),
+                    published_scope: long_scope.clone(),
+                    generation_id: Sha256Hex::digest(&ordinal.to_le_bytes()),
+                },
+                None,
+                &None,
+            )
+            .unwrap();
+            evidence.push(MigrationParticipantEvidenceV1 {
+                role: participant.role,
+                old: participant.old,
+                new: participant.new,
+            });
+        }
+        let immutable_assets = [
+            ImmutableAssetRoleV1::LegacyProjectStoreBackup,
+            ImmutableAssetRoleV1::LegacyPublisherRefBackup,
+        ]
+        .into_iter()
+        .map(|role| {
+            let hash = if role == ImmutableAssetRoleV1::LegacyProjectStoreBackup {
+                source_hash.clone()
+            } else {
+                Sha256Hex::digest(b"publisher refs")
+            };
+            MigrationImmutableAssetEvidenceV1 {
+                validated_name: immutable_target_name(&transaction_id, &role, &hash).unwrap(),
+                role,
+                sha256: hash,
+            }
+        })
+        .collect();
+        let marker = ProjectCatalogMigrationMarkerV1 {
+            version: MIGRATION_MARKER_VERSION,
+            transaction_id: transaction_id.clone(),
+            plan_hash: Sha256Hex::digest(b"plan"),
+            source_store_sha256: source_hash,
+            inventory_sha256: Sha256Hex::digest(b"inventory"),
+            participants: evidence,
+            immutable_assets,
+            migration_epoch: 1,
+            committed_at: 1,
+        };
+        marker.validate().unwrap();
+        let marker_bytes =
+            encode_bounded_json(&marker, MAX_MARKER_BYTES, "migration marker").unwrap();
+        assert!(marker_bytes.len() > MAX_PROJECT_CATALOG_BYTES);
+        assert!(marker_bytes.len() < MAX_MARKER_BYTES);
+
+        let marker_hash = sha256(&marker_bytes);
+        let stage_name = artifact_name(
+            &transaction_id,
+            &ParticipantRoleV1::MigrationMarker,
+            &marker_hash,
+            ArtifactKind::Stage,
+        )
+        .unwrap();
+        fs::write(paths.stage_dir.join(stage_name.as_str()), &marker_bytes).unwrap();
+        let participant = TransactionParticipantV1 {
+            role: ParticipantRoleV1::MigrationMarker,
+            old: ExpectedImageV1::Absent {},
+            new: ExpectedImageV1::Present {
+                sha256: marker_hash,
+                artifact_name: stage_name,
+            },
+        };
+        let journal = ProjectCatalogTransactionJournalV1 {
+            version: JOURNAL_VERSION,
+            transaction_id,
+            kind: TransactionKindV1::V1Migration,
+            state: TransactionStateV1::Prepared,
+            outcome: None,
+            plan_hash: Some(Sha256Hex::digest(b"plan")),
+            old_epoch: 0,
+            new_epoch: 1,
+            participants: vec![participant.clone()],
+            immutable_assets: Vec::new(),
+            monotonic_checkout_identity_actions: Vec::new(),
+            created_at: 1,
+            committed_at: None,
+        };
+
+        owner.install_new_image(&participant).unwrap();
+        owner
+            .verify_expected_pair(&journal, ExpectedSide::New)
+            .unwrap();
+        assert_eq!(
+            owner.classify_recovery(&journal, false).unwrap(),
+            RecoveryDecision::Forward
+        );
+        owner.restore_old_image(&participant).unwrap();
+        owner
+            .verify_expected_pair(&journal, ExpectedSide::Old)
+            .unwrap();
+    }
+
+    #[test]
+    fn stale_plan_writes_no_assets_and_a_corrected_plan_succeeds() {
+        let (_directory, path) = projects_path();
+        let original = b"{\"version\":1,\"projects\":[]}\n";
+        let changed = b"{\"version\":1,\"projects\":[],\"updated\":true}\n";
+        fs::write(&path, original).unwrap();
+        let (registry, draft, _) = basic_migration_draft(&path, original);
+        let stale = validate_migration_plan(&path, registry, draft).unwrap();
+
+        fs::write(&path, changed).unwrap();
+        let error = transact_migration(&path, stale).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_migration_inventory_stale"
+        );
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        assert!(!paths.stage_dir.exists());
+        assert!(!paths.backup_dir.exists());
+        assert!(!paths.journal.exists());
+        assert!(!paths.attachments.exists());
+        assert_eq!(fs::read(&path).unwrap(), changed);
+
+        let (registry, draft, _) = basic_migration_draft(&path, changed);
+        let corrected = validate_migration_plan(&path, registry, draft).unwrap();
+        assert_eq!(transact_migration(&path, corrected).unwrap().epoch, 1);
+    }
+
+    #[test]
+    fn same_plan_retry_resyncs_preexisting_artifacts() {
+        let (_directory, path, plan, _, _) = migration_fault_fixture();
+        let retry = plan.clone();
+        let failing = Arc::new(TracingIo::failing_points([FaultPoint::DirectoryFsync]));
+        let error = transact_migration_with_io(&path, plan, failing).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_injected_fault");
+
+        let recording = Arc::new(TracingIo::recording());
+        assert_eq!(
+            transact_migration_with_io(&path, retry, recording.clone())
+                .unwrap()
+                .epoch,
+            1
+        );
+        assert!(recording.trace().contains(&FaultPoint::BackupFsync));
+        assert!(recording.trace().contains(&FaultPoint::DirectoryFsync));
+    }
+
+    #[test]
+    fn migration_recovery_recreates_missing_participant_parents() {
+        let (_directory, path, plan, _, _) = migration_fault_fixture();
+        let registry = plan.registry.clone();
+        let failing = Arc::new(TracingIo::failing_points([FaultPoint::ParticipantInstall]));
+        let error = transact_migration_with_io(&path, plan, failing).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_injected_fault");
+
+        let code_source_root = path.parent().unwrap().join("code-source");
+        if code_source_root.exists() {
+            fs::remove_dir_all(&code_source_root).unwrap();
+        }
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        assert_eq!(
+            fs::read(code_source_root.join("effective-source-manifest.json")).unwrap(),
+            b"effective manifest"
+        );
+    }
+
+    #[test]
+    fn prepared_migration_rolls_back_around_a_new_valid_checkout_id() {
+        let (_trace_directory, trace_path, trace_plan, _, _) = migration_fault_fixture();
+        let recording = Arc::new(TracingIo::recording());
+        transact_migration_with_io(&trace_path, trace_plan, recording.clone()).unwrap();
+        let fail_after_prepared = recording
+            .trace()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, point)| {
+                (*point == FaultPoint::PreparedJournalWrite).then_some(index)
+            })
+            .nth(1)
+            .unwrap();
+
+        let (_directory, path, plan, _, legacy_bytes) = migration_fault_fixture();
+        let registry = plan.registry.clone();
+        let failing = Arc::new(TracingIo::failing_at(fail_after_prepared));
+        assert!(transact_migration_with_io(&path, plan, failing).is_err());
+        let checkout_id = path
+            .parent()
+            .unwrap()
+            .join("checkout/.bbox/local/checkout-id");
+        fs::write(&checkout_id, b"99999999999999999999999999999999\n").unwrap();
+
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
+        assert_eq!(
+            fs::read(&checkout_id).unwrap(),
+            b"99999999999999999999999999999999\n"
+        );
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        assert!(!paths.attachments.exists());
+        let journal: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
+            &fs::read(paths.journal).unwrap(),
+            MAX_JOURNAL_BYTES,
+            "transaction journal",
+        )
+        .unwrap();
+        assert_eq!(journal.state, TransactionStateV1::Committed);
+        assert_eq!(journal.outcome, Some(TransactionOutcomeV1::RolledBack));
+
+        fs::remove_file(&checkout_id).unwrap();
+        let changed = b"{\"version\":1,\"projects\":[],\"updated\":true}\n";
+        fs::write(&path, changed).unwrap();
+        let (registry, draft, _) = basic_migration_draft(&path, changed);
+        let corrected = validate_migration_plan(&path, registry, draft).unwrap();
+        assert_eq!(transact_migration(&path, corrected).unwrap().epoch, 1);
+    }
+
+    #[test]
+    fn committed_migration_does_not_reassert_a_replaced_checkout_id() {
+        let (_directory, path, plan, _, _) = migration_fault_fixture();
+        let registry = plan.registry.clone();
+        transact_migration(&path, plan).unwrap();
+        let checkout_id = path
+            .parent()
+            .unwrap()
+            .join("checkout/.bbox/local/checkout-id");
+        fs::write(&checkout_id, b"99999999999999999999999999999999\n").unwrap();
+
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        assert_eq!(
+            fs::read(checkout_id).unwrap(),
+            b"99999999999999999999999999999999\n"
+        );
+    }
+
+    #[test]
+    fn conflicting_checkout_id_never_forces_forward_without_rollback_evidence() {
+        let (_trace_directory, trace_path, trace_plan, _, _) = migration_fault_fixture();
+        let recording = Arc::new(TracingIo::recording());
+        transact_migration_with_io(&trace_path, trace_plan, recording.clone()).unwrap();
+        let fail_after_catalog_install = recording
+            .trace()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, point)| {
+                (*point == FaultPoint::ParticipantInstall).then_some(index)
+            })
+            .nth(1)
+            .unwrap();
+
+        let (_directory, path, plan, _, _legacy_bytes) = migration_fault_fixture();
+        let registry = plan.registry.clone();
+        let failing = Arc::new(TracingIo::failing_at(fail_after_catalog_install));
+        assert!(transact_migration_with_io(&path, plan, failing).is_err());
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        let journal: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
+            &fs::read(&paths.journal).unwrap(),
+            MAX_JOURNAL_BYTES,
+            "transaction journal",
+        )
+        .unwrap();
+        let catalog_backup = journal
+            .participants
+            .iter()
+            .find(|participant| participant.role == ParticipantRoleV1::Catalog)
+            .and_then(|participant| match &participant.old {
+                ExpectedImageV1::Present { artifact_name, .. } => {
+                    Some(paths.backup_dir.join(artifact_name.as_str()))
+                }
+                ExpectedImageV1::Absent {} => None,
+            })
+            .unwrap();
+        fs::remove_file(catalog_backup).unwrap();
+        let checkout_id = path
+            .parent()
+            .unwrap()
+            .join("checkout/.bbox/local/checkout-id");
+        fs::write(&checkout_id, b"99999999999999999999999999999999\n").unwrap();
+        let catalog_before_recovery = fs::read(&path).unwrap();
+
+        let error =
+            recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_recovery_incomplete");
+        assert_eq!(fs::read(&path).unwrap(), catalog_before_recovery);
+        assert!(!paths.attachments.exists());
+        assert_eq!(
+            fs::read(checkout_id).unwrap(),
+            b"99999999999999999999999999999999\n"
+        );
+    }
+
+    #[test]
+    fn migration_fault_matrix_preserves_exact_old_or_new_state() {
+        let (_trace_directory, trace_path, trace_plan, _, _) = migration_fault_fixture();
+        let recording = Arc::new(TracingIo::recording());
+        transact_migration_with_io(&trace_path, trace_plan, recording.clone()).unwrap();
+        let trace = recording.trace();
+        for required in [
+            FaultPoint::ImmutableAssetWrite,
+            FaultPoint::ImmutableAssetFsync,
+            FaultPoint::PreparedJournalWrite,
+            FaultPoint::MonotonicCheckoutIdentityAction,
+            FaultPoint::ParticipantInstall,
+            FaultPoint::ImmutableAssetVerify,
+            FaultPoint::CompletePlanVerify,
+            FaultPoint::CommittedJournalWrite,
+        ] {
+            assert!(
+                trace.contains(&required),
+                "missing migration point {required:?}"
+            );
+        }
+
+        for index in 0..trace.len() {
+            let (_directory, path, plan, expected_new, legacy_bytes) = migration_fault_fixture();
+            let registry = plan.registry.clone();
+            let failing = Arc::new(TracingIo::failing_at(index));
+            let _ = transact_migration_with_io(&path, plan, failing);
+            recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+            let paths = ProjectCatalogPaths::derive(&path).unwrap();
+            let catalog_bytes = fs::read(&paths.catalog).unwrap();
+            if decode_legacy_project_store(&catalog_bytes).is_ok() {
+                assert_eq!(catalog_bytes, legacy_bytes);
+                assert!(!paths.attachments.exists());
+            } else {
+                let catalog = decode_catalog_snapshot(&catalog_bytes).unwrap();
+                let attachment_bytes = fs::read(paths.attachments).unwrap();
+                let attachments = decode_attachment_snapshot(&attachment_bytes).unwrap();
+                validate_catalog_attachments(&catalog, &attachments).unwrap();
+                let actual = (
+                    catalog.epoch,
+                    sha256(&catalog_bytes).to_string(),
+                    sha256(&attachment_bytes).to_string(),
+                );
+                assert_eq!(actual, expected_new);
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_catalog_rejects_a_migration_marker() {
+        let (_directory, path) = projects_path();
+        let store = ProjectCatalogStore::initialize_empty(path.clone()).unwrap();
+        drop(store);
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        fs::write(paths.migration_marker, b"unexpected marker").unwrap();
+
+        let error = ProjectCatalogStore::open_existing(path).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_migration_incomplete");
+    }
+
+    #[test]
+    fn journal_and_snapshot_byte_caps_fail_closed() {
+        let (_directory, path) = projects_path();
+        let store = ProjectCatalogStore::initialize_empty(path.clone()).unwrap();
+        drop(store);
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        fs::write(&paths.journal, vec![b' '; MAX_JOURNAL_BYTES + 1]).unwrap();
+        let error = ProjectCatalogStore::open_existing(path).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_byte_limit");
+    }
+
+    #[test]
+    fn test_fixture_starts_with_matching_contract_versions() {
+        let catalog = CatalogSnapshotV2 {
+            version: CATALOG_VERSION_V2,
+            epoch: 1,
+            origin: CatalogOriginV2::FreshV2 {},
+            projects: BTreeMap::new(),
+            repo_histories: BTreeMap::new(),
+            ambiguous_namespaces: BTreeMap::new(),
+            scope_migrations: BTreeMap::new(),
+        };
+        let attachments = AttachmentSnapshotV1 {
+            version: ATTACHMENT_VERSION_V1,
+            epoch: 1,
+            attachments: BTreeMap::new(),
+            scope_migration_proofs: BTreeMap::new(),
+            legacy_path_bindings: BTreeMap::new(),
+        };
+        validate_catalog_attachments(&catalog, &attachments).unwrap();
+    }
+}

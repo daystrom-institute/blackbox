@@ -1,7 +1,8 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use bbox_corpus_core::json_store::open_lock_path_nofollow;
 use fs2::FileExt;
 
 const PROJECT_CATALOG_MIGRATION_LOCK_FILE: &str = "project-catalog-migration.lock";
@@ -57,25 +58,12 @@ pub fn project_catalog_migration_lock_path(projects_path: &Path) -> PathBuf {
 
 fn open_lock_file(projects_path: &Path) -> Result<(File, PathBuf)> {
     let lock_path = project_catalog_migration_lock_path(projects_path);
-    if let Some(parent) = lock_path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create project catalog migration lock directory {}",
-                parent.display()
-            )
-        })?;
-    }
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .with_context(|| {
-            format!(
-                "failed to open project catalog migration lock {}",
-                lock_path.display()
-            )
-        })?;
+    let file = open_lock_path_nofollow(&lock_path).with_context(|| {
+        format!(
+            "failed to open project catalog migration lock {}",
+            lock_path.display()
+        )
+    })?;
     Ok((file, lock_path))
 }
 
@@ -84,6 +72,7 @@ mod tests {
     use super::*;
     use bbox_stores::store_persister::StorePersister;
     use parking_lot::RwLock;
+    use std::fs;
     use std::sync::Arc;
 
     #[test]
@@ -149,5 +138,22 @@ mod tests {
             root.join(PROJECT_CATALOG_MIGRATION_LOCK_FILE)
         );
         drop(exclusive);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifetime_lock_refuses_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let projects_path = root.join("projects.json");
+        let lock_path = project_catalog_migration_lock_path(&projects_path);
+        let target = root.join("target");
+        fs::write(&target, b"do not follow").unwrap();
+        symlink(&target, &lock_path).unwrap();
+
+        assert!(ProjectCatalogMigrationLock::acquire_shared(&projects_path).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"do not follow");
     }
 }

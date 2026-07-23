@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -18,12 +18,15 @@ use bbox_code_source::{
 };
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_core::identity::PublishedScope;
+use bbox_corpus_core::json_store::{StoreLockGuard, acquire_store_lock_nofollow};
+use bbox_corpus_core::project_catalog::ProjectId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const STORE_VERSION: u32 = 1;
 const MISSING_PAGE_SIZE: usize = 1_000;
+const MAX_RETIREMENT_SELECTOR_BYTES: usize = 1_024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreLimits {
@@ -65,9 +68,96 @@ struct BlobIdentity {
     inode: u64,
 }
 
-pub struct CodeSourceStore {
+/// Side-effect-free authority for the code-source store's cross-crate paths.
+///
+/// Construction validates the root lexically. It does not create, open, or
+/// canonicalize any store path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeSourceStorePaths {
     root: PathBuf,
+}
+
+impl CodeSourceStorePaths {
+    pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
+        let root = root.into();
+        let root = if root.is_absolute() {
+            root
+        } else {
+            std::env::current_dir()
+                .context("resolving the code-source store root")?
+                .join(root)
+        };
+        validate_store_root(&root)?;
+        Ok(Self { root })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn anchor(&self) -> PathBuf {
+        self.root.join("effective-source-manifest.json")
+    }
+
+    pub fn activation(&self, project_id: &ProjectId) -> PathBuf {
+        self.root
+            .join("activations")
+            .join(format!("{project_id}.json"))
+    }
+
+    pub fn activation_for_str(&self, project_id: &str) -> Result<PathBuf> {
+        let project_id =
+            ProjectId::parse(project_id.to_string()).map_err(|error| anyhow!(error))?;
+        Ok(self.activation(&project_id))
+    }
+
+    pub fn generation_metadata(
+        &self,
+        scope: &PublishedScope,
+        generation_id: &str,
+    ) -> Result<PathBuf> {
+        scope.validate()?;
+        validate_sha256(generation_id)?;
+        Ok(self
+            .root
+            .join("scopes")
+            .join(scope_hash(scope))
+            .join("generations")
+            .join(generation_id)
+            .join("metadata.json"))
+    }
+
+    pub fn collision_retirement_pending(&self, project_id: &ProjectId) -> PathBuf {
+        self.root
+            .join("collision-retirements")
+            .join(format!("{project_id}.json"))
+    }
+
+    pub fn retirement_for_selector(&self, selector: &str) -> Result<PathBuf> {
+        validate_retirement_selector(selector)?;
+        Ok(self.retirement_for_validated_selector_hash(&sha256_hex(selector.as_bytes())))
+    }
+
+    pub fn retirement_for_selector_hash(&self, selector_hash: &str) -> Result<PathBuf> {
+        validate_sha256(selector_hash)?;
+        Ok(self.retirement_for_validated_selector_hash(selector_hash))
+    }
+
+    fn retirement_for_validated_selector_hash(&self, selector_hash: &str) -> PathBuf {
+        self.root
+            .join("retirements")
+            .join(format!("{selector_hash}.json"))
+    }
+}
+
+pub struct CodeSourceStore {
+    paths: CodeSourceStorePaths,
     shared: Arc<SharedStoreState>,
+}
+
+struct StoreMutationGuard<'a> {
+    _anchor: StoreLockGuard,
+    _in_process: MutexGuard<'a, ()>,
 }
 
 static STORE_REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<SharedStoreState>>>> = OnceLock::new();
@@ -155,8 +245,9 @@ pub struct RetirementRecord {
 
 impl CodeSourceStore {
     pub fn open(root: impl Into<PathBuf>, limits: StoreLimits) -> Result<Self> {
-        let mut root = root.into();
-        create_private_dir(&root)?;
+        let paths = CodeSourceStorePaths::new(root)?;
+        let _anchor = acquire_store_lock_nofollow(&paths.anchor())?;
+        create_private_dir(paths.root())?;
         for relative in [
             "blobs/sha256",
             "uploads",
@@ -167,18 +258,22 @@ impl CodeSourceStore {
             "health",
             "retirements",
         ] {
-            create_private_dir(&root.join(relative))?;
+            create_private_dir(&paths.root().join(relative))?;
         }
-        root = root
-            .canonicalize()
-            .with_context(|| format!("canonicalizing code-source store {}", root.display()))?;
+        let root = paths.root().canonicalize().with_context(|| {
+            format!(
+                "canonicalizing code-source store {}",
+                paths.root().display()
+            )
+        })?;
+        let paths = CodeSourceStorePaths::new(root)?;
         let mut registry = STORE_REGISTRY
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .map_err(|_| anyhow!("code-source store registry lock poisoned"))?;
         registry.retain(|_, state| state.strong_count() > 0);
         let shared = registry
-            .get(&root)
+            .get(paths.root())
             .and_then(Weak::upgrade)
             .unwrap_or_else(|| {
                 let shared = Arc::new(SharedStoreState {
@@ -188,14 +283,27 @@ impl CodeSourceStore {
                     #[cfg(test)]
                     blob_verifications: AtomicU64::new(0),
                 });
-                registry.insert(root.clone(), Arc::downgrade(&shared));
+                registry.insert(paths.root().to_path_buf(), Arc::downgrade(&shared));
                 shared
             });
-        Ok(Self { root, shared })
+        Ok(Self { paths, shared })
     }
 
     pub fn root(&self) -> &Path {
-        &self.root
+        self.paths.root()
+    }
+
+    fn lock_mutation(&self) -> Result<StoreMutationGuard<'_>> {
+        let in_process = self
+            .shared
+            .mutation
+            .lock()
+            .map_err(|_| anyhow!("code-source store lock poisoned"))?;
+        let anchor = acquire_store_lock_nofollow(&self.paths.anchor())?;
+        Ok(StoreMutationGuard {
+            _anchor: anchor,
+            _in_process: in_process,
+        })
     }
 
     pub fn update_limits(&self, limits: StoreLimits) -> Result<()> {
@@ -226,11 +334,7 @@ impl CodeSourceStore {
         if descriptor.logical_bytes > limits.max_manifest_logical_bytes {
             bail!("manifest logical bytes exceed configured limit");
         }
-        let _guard = self
-            .shared
-            .mutation
-            .lock()
-            .map_err(|_| anyhow!("code-source store lock poisoned"))?;
+        let _guard = self.lock_mutation()?;
         let producer_dir = self.upload_producer_dir(producer_id);
         create_private_dir(&producer_dir)?;
         let open = fs::read_dir(&producer_dir)?
@@ -302,11 +406,7 @@ impl CodeSourceStore {
             limits.max_manifest_files,
             limits.max_manifest_logical_bytes,
         )?;
-        let _guard = self
-            .shared
-            .mutation
-            .lock()
-            .map_err(|_| anyhow!("code-source store lock poisoned"))?;
+        let _guard = self.lock_mutation()?;
         let mut record = self.load_upload(producer_id, upload_id)?;
         if record.state != GenerationState::ReceivingManifest {
             bail!("upload is not receiving manifest pages");
@@ -374,11 +474,7 @@ impl CodeSourceStore {
         producer_id: &str,
         upload_id: &str,
     ) -> Result<MissingBlobsPage> {
-        let _guard = self
-            .shared
-            .mutation
-            .lock()
-            .map_err(|_| anyhow!("code-source store lock poisoned"))?;
+        let _guard = self.lock_mutation()?;
         let mut record = self.load_upload(producer_id, upload_id)?;
         if !matches!(
             record.state,
@@ -399,7 +495,7 @@ impl CodeSourceStore {
             limits.max_manifest_logical_bytes,
         )?;
         let generation = generation_id(producer_id, &record.descriptor);
-        let generation_dir = self.generation_dir(&record.descriptor.scope, &generation);
+        let generation_dir = self.generation_dir(&record.descriptor.scope, &generation)?;
         create_private_dir(&generation_dir)?;
         let manifest_path = generation_dir.join("manifest.jsonl");
         if manifest_path.is_file() {
@@ -451,11 +547,7 @@ impl CodeSourceStore {
         upload_id: &str,
         cursor: Option<&str>,
     ) -> Result<MissingBlobsPage> {
-        let _guard = self
-            .shared
-            .mutation
-            .lock()
-            .map_err(|_| anyhow!("code-source store lock poisoned"))?;
+        let _guard = self.lock_mutation()?;
         let mut record = self.load_upload(producer_id, upload_id)?;
         if record.state != GenerationState::MissingBlobs {
             bail!("missing-blob cursor is stale for upload state");
@@ -483,11 +575,7 @@ impl CodeSourceStore {
         mut reader: R,
     ) -> Result<u64> {
         validate_sha256(expected_hash)?;
-        let _guard = self
-            .shared
-            .mutation
-            .lock()
-            .map_err(|_| anyhow!("code-source store lock poisoned"))?;
+        let _guard = self.lock_mutation()?;
         let mut record = self.load_upload(producer_id, upload_id)?;
         let generation = record
             .generation_id
@@ -575,11 +663,7 @@ impl CodeSourceStore {
     }
 
     pub fn finalize_upload(&self, producer_id: &str, upload_id: &str) -> Result<StoredGeneration> {
-        let _guard = self
-            .shared
-            .mutation
-            .lock()
-            .map_err(|_| anyhow!("code-source store lock poisoned"))?;
+        let _guard = self.lock_mutation()?;
         let mut record = self.load_upload(producer_id, upload_id)?;
         let generation = record
             .generation_id
@@ -592,7 +676,7 @@ impl CodeSourceStore {
         }
         let mut stored = self.load_generation(&record.descriptor.scope, &generation)?;
         let desired_path = self
-            .root
+            .root()
             .join("desired")
             .join(format!("{}.json", scope_hash(&record.descriptor.scope)));
         let previous_desired = if desired_path.is_file() {
@@ -612,7 +696,7 @@ impl CodeSourceStore {
             GenerationState::Ready
         };
         stored.diagnostic = None;
-        self.save_generation(&stored)?;
+        self.save_generation_locked(&stored)?;
         record.state = stored.state;
         record.updated_unix_secs = now_unix_secs();
         self.save_upload(&record)?;
@@ -623,7 +707,7 @@ impl CodeSourceStore {
             {
                 previous.state = GenerationState::Superseded;
                 previous.diagnostic = None;
-                self.save_generation(&previous)?;
+                self.save_generation_locked(&previous)?;
             }
             atomic_write_json(&desired_path, &stored)?;
         }
@@ -669,7 +753,7 @@ impl CodeSourceStore {
         generation: &str,
     ) -> Result<GenerationStatus> {
         validate_sha256(generation)?;
-        for scope_entry in fs::read_dir(self.root.join("scopes"))? {
+        for scope_entry in fs::read_dir(self.root().join("scopes"))? {
             let scope_entry = scope_entry?;
             let metadata = scope_entry
                 .path()
@@ -696,7 +780,7 @@ impl CodeSourceStore {
 
     pub fn find_generation(&self, generation: &str) -> Result<StoredGeneration> {
         validate_sha256(generation)?;
-        for scope_entry in fs::read_dir(self.root.join("scopes"))? {
+        for scope_entry in fs::read_dir(self.root().join("scopes"))? {
             let metadata = scope_entry?
                 .path()
                 .join("generations")
@@ -714,14 +798,19 @@ impl CodeSourceStore {
         scope: &PublishedScope,
         generation: &str,
     ) -> Result<StoredGeneration> {
-        read_json(&self.generation_dir(scope, generation).join("metadata.json"))
+        read_json(&self.paths.generation_metadata(scope, generation)?)
     }
 
     pub fn save_generation(&self, generation: &StoredGeneration) -> Result<()> {
+        let _guard = self.lock_mutation()?;
+        self.save_generation_locked(generation)
+    }
+
+    fn save_generation_locked(&self, generation: &StoredGeneration) -> Result<()> {
         atomic_write_json(
             &self
-                .generation_dir(&generation.descriptor.scope, &generation.generation_id)
-                .join("metadata.json"),
+                .paths
+                .generation_metadata(&generation.descriptor.scope, &generation.generation_id)?,
             generation,
         )
     }
@@ -733,17 +822,13 @@ impl CodeSourceStore {
         state: GenerationState,
         diagnostic: Option<String>,
     ) -> Result<StoredGeneration> {
-        let _guard = self
-            .shared
-            .mutation
-            .lock()
-            .map_err(|_| anyhow!("code-source store lock poisoned"))?;
+        let _guard = self.lock_mutation()?;
         let mut stored = self.load_generation(scope, generation)?;
         stored.state = state;
         stored.diagnostic = diagnostic.map(|value| value.chars().take(512).collect());
-        self.save_generation(&stored)?;
+        self.save_generation_locked(&stored)?;
         let desired_path = self
-            .root
+            .root()
             .join("desired")
             .join(format!("{}.json", scope_hash(scope)));
         if desired_path.is_file() {
@@ -763,38 +848,33 @@ impl CodeSourceStore {
         entity_inventory_sha256: String,
     ) -> Result<StoredGeneration> {
         validate_sha256(&entity_inventory_sha256)?;
-        let _guard = self
-            .shared
-            .mutation
-            .lock()
-            .map_err(|_| anyhow!("code-source store lock poisoned"))?;
+        let _guard = self.lock_mutation()?;
         let mut stored = self.load_generation(scope, generation)?;
         stored.materialized_doc_count = Some(document_count);
         stored.entity_inventory_sha256 = Some(entity_inventory_sha256);
-        self.save_generation(&stored)?;
+        self.save_generation_locked(&stored)?;
         Ok(stored)
     }
 
     pub fn save_activation(&self, activation: &ActivationRecord) -> Result<()> {
+        let _guard = self.lock_mutation()?;
+        self.save_activation_locked(activation)
+    }
+
+    fn save_activation_locked(&self, activation: &ActivationRecord) -> Result<()> {
         validate_sha256(&activation.generation_id)?;
         validate_sha256(&activation.entity_inventory_sha256)?;
         if activation.version != STORE_VERSION || activation.project_id.trim().is_empty() {
             bail!("invalid activation record");
         }
         atomic_write_json(
-            &self
-                .root
-                .join("activations")
-                .join(format!("{}.json", activation.project_id)),
+            &self.paths.activation_for_str(&activation.project_id)?,
             activation,
         )
     }
 
     pub fn load_activation(&self, project_id: &str) -> Result<Option<ActivationRecord>> {
-        let path = self
-            .root
-            .join("activations")
-            .join(format!("{project_id}.json"));
+        let path = self.paths.activation_for_str(project_id)?;
         if !path.is_file() {
             return Ok(None);
         }
@@ -807,7 +887,7 @@ impl CodeSourceStore {
 
     pub fn activation_records(&self) -> Result<Vec<ActivationRecord>> {
         let mut records: Vec<ActivationRecord> = Vec::new();
-        for entry in fs::read_dir(self.root.join("activations"))? {
+        for entry in fs::read_dir(self.root().join("activations"))? {
             let entry = entry?;
             if entry.file_type()?.is_file() {
                 records.push(read_json(&entry.path())?);
@@ -818,29 +898,18 @@ impl CodeSourceStore {
     }
 
     pub fn mark_cutback_pending(&self, project_id: &str, diagnostic: &str) -> Result<()> {
-        let _guard = self
-            .shared
-            .mutation
-            .lock()
-            .map_err(|_| anyhow!("code-source store lock poisoned"))?;
+        let _guard = self.lock_mutation()?;
         let Some(mut record) = self.load_activation(project_id)? else {
             return Ok(());
         };
         record.cutback_pending = true;
         record.diagnostic = Some(diagnostic.chars().take(512).collect());
-        self.save_activation(&record)
+        self.save_activation_locked(&record)
     }
 
     pub fn clear_activation(&self, project_id: &str) -> Result<()> {
-        let _guard = self
-            .shared
-            .mutation
-            .lock()
-            .map_err(|_| anyhow!("code-source store lock poisoned"))?;
-        let path = self
-            .root
-            .join("activations")
-            .join(format!("{project_id}.json"));
+        let _guard = self.lock_mutation()?;
+        let path = self.paths.activation_for_str(project_id)?;
         match fs::remove_file(&path) {
             Ok(()) => sync_parent(&path),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -849,6 +918,16 @@ impl CodeSourceStore {
     }
 
     pub fn record_health_failure(
+        &self,
+        project_id: &str,
+        code: &str,
+        diagnostic: &str,
+    ) -> Result<()> {
+        let _guard = self.lock_mutation()?;
+        self.record_health_failure_locked(project_id, code, diagnostic)
+    }
+
+    fn record_health_failure_locked(
         &self,
         project_id: &str,
         code: &str,
@@ -865,6 +944,7 @@ impl CodeSourceStore {
     }
 
     pub fn clear_health_failure(&self, project_id: &str, code: &str) -> Result<()> {
+        let _guard = self.lock_mutation()?;
         let path = self.health_path(project_id, code);
         match fs::remove_file(&path) {
             Ok(()) => sync_parent(&path),
@@ -875,7 +955,7 @@ impl CodeSourceStore {
 
     pub fn health_records(&self) -> Result<Vec<CodeSourceHealthRecord>> {
         let mut records: Vec<CodeSourceHealthRecord> = Vec::new();
-        for entry in fs::read_dir(self.root.join("health"))? {
+        for entry in fs::read_dir(self.root().join("health"))? {
             let entry = entry?;
             if entry.file_type()?.is_file() {
                 records.push(read_json(&entry.path())?);
@@ -890,19 +970,22 @@ impl CodeSourceStore {
     }
 
     pub fn enqueue_retirement(&self, record: &RetirementRecord) -> Result<()> {
+        let _guard = self.lock_mutation()?;
         if record.version != STORE_VERSION
             || record.project_id.trim().is_empty()
-            || record.selector.trim().is_empty()
             || record.snapshot_id.trim().is_empty()
         {
             bail!("invalid code-source retirement record");
         }
-        atomic_write_json(&self.retirement_path(&record.selector), record)
+        atomic_write_json(
+            &self.paths.retirement_for_selector(&record.selector)?,
+            record,
+        )
     }
 
     pub fn retirement_records(&self) -> Result<Vec<RetirementRecord>> {
         let mut records = Vec::new();
-        for entry in fs::read_dir(self.root.join("retirements"))? {
+        for entry in fs::read_dir(self.root().join("retirements"))? {
             let entry = entry?;
             if entry.file_type()?.is_file() {
                 records.push(read_json(&entry.path())?);
@@ -912,7 +995,8 @@ impl CodeSourceStore {
     }
 
     pub fn complete_retirement(&self, selector: &str) -> Result<()> {
-        let path = self.retirement_path(selector);
+        let _guard = self.lock_mutation()?;
+        let path = self.paths.retirement_for_selector(selector)?;
         match fs::remove_file(&path) {
             Ok(()) => sync_parent(&path),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -978,14 +1062,14 @@ impl CodeSourceStore {
     ) -> Result<Vec<ManifestEntry>> {
         read_manifest_jsonl(
             &self
-                .generation_dir(scope, generation)
+                .generation_dir(scope, generation)?
                 .join("manifest.jsonl"),
         )
     }
 
     pub fn desired_generation(&self, scope: &PublishedScope) -> Result<Option<StoredGeneration>> {
         let path = self
-            .root
+            .root()
             .join("desired")
             .join(format!("{}.json", scope_hash(scope)));
         if !path.is_file() {
@@ -995,14 +1079,10 @@ impl CodeSourceStore {
     }
 
     pub fn expire_uploads(&self, max_idle_secs: u64) -> Result<u64> {
-        let _guard = self
-            .shared
-            .mutation
-            .lock()
-            .map_err(|_| anyhow!("code-source store lock poisoned"))?;
+        let _guard = self.lock_mutation()?;
         let cutoff = now_unix_secs().saturating_sub(max_idle_secs);
         let mut expired = 0_u64;
-        for producer in fs::read_dir(self.root.join("uploads"))? {
+        for producer in fs::read_dir(self.root().join("uploads"))? {
             let producer = producer?;
             if !producer.file_type()?.is_dir() {
                 continue;
@@ -1028,11 +1108,7 @@ impl CodeSourceStore {
     }
 
     pub fn scrub_retained(&self) -> Result<MaintenanceStats> {
-        let _guard = self
-            .shared
-            .mutation
-            .lock()
-            .map_err(|_| anyhow!("code-source store lock poisoned"))?;
+        let _guard = self.lock_mutation()?;
         let limits = self
             .shared
             .limits
@@ -1064,9 +1140,9 @@ impl CodeSourceStore {
                 generation.state = GenerationState::MissingBlobData;
                 generation.diagnostic =
                     Some("one or more retained source blobs failed verification".to_string());
-                self.save_generation(&generation)?;
+                self.save_generation_locked(&generation)?;
                 self.update_desired_if_same(&generation)?;
-                self.record_health_failure(
+                self.record_health_failure_locked(
                     &self
                         .activation_project_for_generation(&generation.generation_id)?
                         .unwrap_or_else(|| scope_hash(&generation.descriptor.scope)),
@@ -1080,11 +1156,7 @@ impl CodeSourceStore {
     }
 
     pub fn gc_blobs(&self) -> Result<MaintenanceStats> {
-        let _guard = self
-            .shared
-            .mutation
-            .lock()
-            .map_err(|_| anyhow!("code-source store lock poisoned"))?;
+        let _guard = self.lock_mutation()?;
         let limits = self
             .shared
             .limits
@@ -1106,7 +1178,7 @@ impl CodeSourceStore {
                 );
             }
         }
-        for producer in fs::read_dir(self.root.join("uploads"))? {
+        for producer in fs::read_dir(self.root().join("uploads"))? {
             let producer = producer?;
             if !producer.file_type()?.is_dir() {
                 continue;
@@ -1138,7 +1210,7 @@ impl CodeSourceStore {
             ))
             .unwrap_or(UNIX_EPOCH);
         let mut stats = MaintenanceStats::default();
-        for prefix in fs::read_dir(self.root.join("blobs/sha256"))? {
+        for prefix in fs::read_dir(self.root().join("blobs/sha256"))? {
             let prefix = prefix?;
             if !prefix.file_type()?.is_dir() {
                 continue;
@@ -1176,12 +1248,12 @@ impl CodeSourceStore {
     }
 
     pub fn blob_path(&self, hash: &str) -> PathBuf {
-        self.root.join("blobs/sha256").join(&hash[..2]).join(hash)
+        self.root().join("blobs/sha256").join(&hash[..2]).join(hash)
     }
 
     fn list_generations(&self) -> Result<Vec<StoredGeneration>> {
         let mut generations = Vec::new();
-        for scope in fs::read_dir(self.root.join("scopes"))? {
+        for scope in fs::read_dir(self.root().join("scopes"))? {
             let scope = scope?;
             if !scope.file_type()?.is_dir() {
                 continue;
@@ -1207,7 +1279,7 @@ impl CodeSourceStore {
         retained_generations: usize,
     ) -> Result<BTreeSet<String>> {
         let mut protected = BTreeSet::new();
-        for activation in fs::read_dir(self.root.join("activations"))? {
+        for activation in fs::read_dir(self.root().join("activations"))? {
             let activation = activation?;
             if activation.file_type()?.is_file() {
                 protected.insert(read_json::<ActivationRecord>(&activation.path())?.generation_id);
@@ -1245,7 +1317,7 @@ impl CodeSourceStore {
 
     fn update_desired_if_same(&self, generation: &StoredGeneration) -> Result<()> {
         let desired_path = self
-            .root
+            .root()
             .join("desired")
             .join(format!("{}.json", scope_hash(&generation.descriptor.scope)));
         if desired_path.is_file()
@@ -1263,19 +1335,13 @@ impl CodeSourceStore {
         hasher.update(project_id.as_bytes());
         hasher.update((code.len() as u64).to_be_bytes());
         hasher.update(code.as_bytes());
-        self.root
+        self.root()
             .join("health")
             .join(format!("{}.json", hex::encode(hasher.finalize())))
     }
 
-    fn retirement_path(&self, selector: &str) -> PathBuf {
-        self.root
-            .join("retirements")
-            .join(format!("{}.json", sha256_hex(selector.as_bytes())))
-    }
-
     fn activation_project_for_generation(&self, generation_id: &str) -> Result<Option<String>> {
-        for entry in fs::read_dir(self.root.join("activations"))? {
+        for entry in fs::read_dir(self.root().join("activations"))? {
             let entry = entry?;
             if !entry.file_type()?.is_file() {
                 continue;
@@ -1356,7 +1422,7 @@ impl CodeSourceStore {
 
     fn next_ordinal(&self, scope: &PublishedScope) -> Result<u64> {
         let path = self
-            .root
+            .root()
             .join("ordinals")
             .join(format!("{}.json", scope_hash(scope)));
         let current = if path.is_file() {
@@ -1372,19 +1438,19 @@ impl CodeSourceStore {
     }
 
     fn upload_producer_dir(&self, producer_id: &str) -> PathBuf {
-        self.root.join("uploads").join(producer_hash(producer_id))
+        self.root().join("uploads").join(producer_hash(producer_id))
     }
 
     fn upload_dir(&self, producer_id: &str, upload_id: &str) -> PathBuf {
         self.upload_producer_dir(producer_id).join(upload_id)
     }
 
-    fn generation_dir(&self, scope: &PublishedScope, generation: &str) -> PathBuf {
-        self.root
-            .join("scopes")
-            .join(scope_hash(scope))
-            .join("generations")
-            .join(generation)
+    fn generation_dir(&self, scope: &PublishedScope, generation: &str) -> Result<PathBuf> {
+        let metadata = self.paths.generation_metadata(scope, generation)?;
+        Ok(metadata
+            .parent()
+            .expect("generation metadata path has a parent")
+            .to_path_buf())
     }
 
     fn load_upload(&self, producer_id: &str, upload_id: &str) -> Result<UploadRecord> {
@@ -1417,6 +1483,30 @@ impl CodeSourceStore {
         }
         Ok(entries)
     }
+}
+
+fn validate_store_root(root: &Path) -> Result<()> {
+    use std::path::Component;
+
+    if !root.is_absolute()
+        || root.file_name().is_none()
+        || root
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        bail!("code-source store root must be an absolute normalized path");
+    }
+    Ok(())
+}
+
+fn validate_retirement_selector(selector: &str) -> Result<()> {
+    if selector.trim().is_empty()
+        || selector.len() > MAX_RETIREMENT_SELECTOR_BYTES
+        || selector.chars().any(char::is_control)
+    {
+        bail!("invalid code-source retirement selector");
+    }
+    Ok(())
 }
 
 fn producer_hash(producer_id: &str) -> String {
@@ -1660,6 +1750,78 @@ mod tests {
 
     fn open_store(root: &Path) -> CodeSourceStore {
         CodeSourceStore::open(root.join("code-sources"), StoreLimits::default()).unwrap()
+    }
+
+    #[test]
+    fn store_paths_derive_closed_layout_without_creating_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store_root = root.join("not-created");
+        let paths = CodeSourceStorePaths::new(store_root.clone()).unwrap();
+        let project_id = ProjectId::parse("project-a").unwrap();
+        let scope = PublishedScope::try_new("repo-family", "services/api").unwrap();
+        let generation_id = "a".repeat(64);
+        let selector = source_selector(project_id.as_str(), &generation_id);
+        let selector_hash = sha256_hex(selector.as_bytes());
+
+        assert_eq!(paths.root(), store_root);
+        assert_eq!(
+            paths.anchor(),
+            store_root.join("effective-source-manifest.json")
+        );
+        assert_eq!(
+            paths.activation(&project_id),
+            store_root.join("activations/project-a.json")
+        );
+        assert_eq!(
+            paths.activation_for_str("project-a").unwrap(),
+            paths.activation(&project_id)
+        );
+        assert_eq!(
+            paths.generation_metadata(&scope, &generation_id).unwrap(),
+            store_root
+                .join("scopes")
+                .join(scope_hash(&scope))
+                .join("generations")
+                .join(&generation_id)
+                .join("metadata.json")
+        );
+        assert_eq!(
+            paths.collision_retirement_pending(&project_id),
+            store_root.join("collision-retirements/project-a.json")
+        );
+        assert_eq!(
+            paths.retirement_for_selector(&selector).unwrap(),
+            store_root
+                .join("retirements")
+                .join(format!("{selector_hash}.json"))
+        );
+        assert_eq!(
+            paths.retirement_for_selector_hash(&selector_hash).unwrap(),
+            paths.retirement_for_selector(&selector).unwrap()
+        );
+        assert!(!store_root.exists());
+    }
+
+    #[test]
+    fn store_paths_reject_unsafe_roots_and_unvalidated_dynamic_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        assert!(CodeSourceStorePaths::new(root.join("nested/../escape")).is_err());
+
+        let paths = CodeSourceStorePaths::new(root.join("not-created")).unwrap();
+        let scope = PublishedScope::try_new("repo-family", ".").unwrap();
+        assert!(paths.activation_for_str("../escape").is_err());
+        assert!(paths.generation_metadata(&scope, &"A".repeat(64)).is_err());
+        assert!(paths.retirement_for_selector("").is_err());
+        assert!(paths.retirement_for_selector("local:\n").is_err());
+        assert!(
+            paths
+                .retirement_for_selector(&"x".repeat(MAX_RETIREMENT_SELECTOR_BYTES + 1))
+                .is_err()
+        );
+        assert!(paths.retirement_for_selector_hash(&"A".repeat(64)).is_err());
+        assert!(!paths.root().exists());
     }
 
     #[test]
@@ -2064,6 +2226,57 @@ mod tests {
         assert!(second.begin_upload("host-a", descriptor(&entries)).is_err());
         first.update_limits(StoreLimits::default()).unwrap();
         assert!(second.begin_upload("host-a", descriptor(&entries)).is_ok());
+    }
+
+    #[test]
+    fn activation_writer_contends_on_effective_source_manifest_anchor() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = open_store(&root);
+        let anchor =
+            acquire_store_lock_nofollow(&store.root().join("effective-source-manifest.json"))
+                .unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = store.save_activation(&ActivationRecord {
+                version: STORE_VERSION,
+                project_id: "project-a".into(),
+                generation_id: "a".repeat(64),
+                selector: "selector-a".into(),
+                snapshot_id: "snapshot-a".into(),
+                document_count: 1,
+                entity_inventory_sha256: "b".repeat(64),
+                current_chunk_targets: BTreeMap::new(),
+                activated_unix_secs: now_unix_secs(),
+                cutback_pending: false,
+                diagnostic: None,
+            });
+            done_tx.send(result).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(200)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(anchor);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+
+        let reopened = open_store(&root);
+        assert_eq!(
+            reopened
+                .load_activation("project-a")
+                .unwrap()
+                .unwrap()
+                .snapshot_id,
+            "snapshot-a"
+        );
     }
 
     #[test]
