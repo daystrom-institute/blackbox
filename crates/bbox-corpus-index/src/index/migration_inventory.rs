@@ -777,7 +777,7 @@ fn directory_has_symlink(path: &Path) -> bool {
     };
     entries
         .filter_map(Result::ok)
-        .any(|entry| entry.file_type().is_err_or(|kind| kind.is_symlink()))
+        .any(|entry| entry.file_type().map_or(true, |kind| kind.is_symlink()))
 }
 
 fn read_regular_bounded(path: &Path, max_bytes: u64) -> Result<Option<Vec<u8>>, &'static str> {
