@@ -38,6 +38,8 @@ pub enum ContractError {
     InvalidRelativePath(String),
     #[error("invalid sha256 digest")]
     InvalidDigest,
+    #[error("invalid collected materialization selector")]
+    InvalidCollectedMaterializationSelector,
     #[error("unsupported source path: {0}")]
     UnsupportedPath(String),
     #[error("source file {path} exceeds its {max_bytes}-byte cap")]
@@ -464,6 +466,27 @@ pub fn source_selector(project_id: &str, generation_id: &str) -> String {
     format!("collected:{project_id}:{generation_id}")
 }
 
+/// Validate the historical selector shape without deriving its materialization
+/// suffix from the current runtime version.
+pub fn validate_collected_materialization_selector(
+    project_id: &str,
+    generation_id: &str,
+    selector: &str,
+) -> Result<(), ContractError> {
+    let prefix = format!("{}:m", source_selector(project_id, generation_id));
+    let Some(suffix) = selector.strip_prefix(&prefix) else {
+        return Err(ContractError::InvalidCollectedMaterializationSelector);
+    };
+    if suffix.len() != 16
+        || !suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(ContractError::InvalidCollectedMaterializationSelector);
+    }
+    Ok(())
+}
+
 pub fn local_selector(project_id: &str) -> String {
     format!("local:{project_id}")
 }
@@ -520,6 +543,43 @@ mod tests {
             .unwrap();
         assert_eq!(generation_id("host-a", &descriptor).len(), 64);
         assert_eq!(source_entry_key("local:p", "src/lib.rs").len(), 64);
+        let generation = "a".repeat(64);
+        assert!(
+            validate_collected_materialization_selector(
+                "project-a",
+                &generation,
+                &format!(
+                    "{}:m0123456789abcdef",
+                    source_selector("project-a", &generation)
+                ),
+            )
+            .is_ok()
+        );
+        for invalid in [
+            source_selector("project-a", &generation),
+            format!(
+                "{}:m0123456789abcde",
+                source_selector("project-a", &generation)
+            ),
+            format!(
+                "{}:m0123456789abcdeF",
+                source_selector("project-a", &generation)
+            ),
+            format!(
+                "{}:m0123456789abcdeg",
+                source_selector("project-a", &generation)
+            ),
+            format!(
+                "{}:m0123456789abcdef",
+                source_selector("project-b", &generation)
+            ),
+        ] {
+            assert!(
+                validate_collected_materialization_selector("project-a", &generation, &invalid)
+                    .is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]

@@ -13,15 +13,16 @@ use anyhow::{Context, Result, anyhow, bail};
 use bbox_code_source::{
     BeginUploadResponse, DEFAULT_MAX_MANIFEST_FILES, DEFAULT_MAX_MANIFEST_LOGICAL_BYTES,
     GenerationDescriptor, GenerationState, GenerationStatus, MAX_MANIFEST_PAGE_ENTRIES,
-    ManifestEntry, MissingBlobsPage, generation_id, scope_hash, source_selector, validate_manifest,
-    validate_producer_id, validate_sha256,
+    ManifestEntry, MissingBlobsPage, generation_id, scope_hash,
+    validate_collected_materialization_selector, validate_manifest, validate_producer_id,
+    validate_sha256,
 };
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::json_store::{
     NofollowDirectory, StoreLockGuard, acquire_store_lock_nofollow,
 };
-use bbox_corpus_core::project_catalog::ProjectId;
+use bbox_corpus_core::project_catalog::{MAX_PROJECT_CATALOG_ENTRIES, ProjectId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -36,6 +37,11 @@ const MAX_CHUNK_TARGET_KEY_BYTES: usize = 4_096;
 const MAX_MIGRATION_RECORD_BYTES: usize = 512 * 1024 * 1024;
 const MAX_STORED_GENERATION_RECORD_BYTES: usize = 64 * 1024;
 const MAX_COLLISION_RETIREMENT_RECORD_BYTES: usize = 64 * 1024;
+const MAX_MIGRATION_INVENTORY_MANIFEST_BYTES: usize = 512 * 1024 * 1024;
+pub const MAX_MIGRATION_INVENTORY_ACTIVATIONS: usize = MAX_PROJECT_CATALOG_ENTRIES;
+pub const MAX_MIGRATION_INVENTORY_GENERATIONS: usize = MAX_PROJECT_CATALOG_ENTRIES;
+pub const MAX_MIGRATION_INVENTORY_COLLISION_RECORDS: usize = MAX_PROJECT_CATALOG_ENTRIES;
+pub const MAX_MIGRATION_INVENTORY_RETIREMENTS: usize = MAX_PROJECT_CATALOG_ENTRIES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreLimits {
@@ -84,6 +90,11 @@ struct BlobIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeSourceStorePaths {
     root: PathBuf,
+}
+
+pub struct MigrationCodeSourceInventoryGuard<'a> {
+    paths: &'a CodeSourceStorePaths,
+    _anchor: StoreLockGuard,
 }
 
 impl CodeSourceStorePaths {
@@ -172,6 +183,25 @@ impl CodeSourceStorePaths {
             .join("retirements")
             .join(format!("{selector_hash}.json"))
     }
+
+    /// Acquire the code-owned anchor lock for a coherent, side-effect-free
+    /// migration inventory snapshot.
+    pub fn lock_migration_inventory(&self) -> Result<MigrationCodeSourceInventoryGuard<'_>> {
+        Ok(MigrationCodeSourceInventoryGuard {
+            paths: self,
+            _anchor: acquire_store_lock_nofollow(&self.anchor())?,
+        })
+    }
+}
+
+impl MigrationCodeSourceInventoryGuard<'_> {
+    pub fn snapshot_legacy_v1(&self, limits: &StoreLimits) -> Result<MigrationLegacyInventoryV1> {
+        enumerate_legacy_migration_inventory_locked(self.paths, limits)
+    }
+
+    pub fn snapshot_current_v2(&self, limits: &StoreLimits) -> Result<MigrationCurrentInventoryV1> {
+        enumerate_current_migration_inventory_locked(self.paths, limits)
+    }
 }
 
 pub struct CodeSourceStore {
@@ -207,6 +237,7 @@ struct UploadRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoredGeneration {
     pub version: u32,
     pub generation_id: String,
@@ -223,6 +254,7 @@ pub struct StoredGeneration {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActivationRecord {
     pub version: u32,
     pub project_id: String,
@@ -355,9 +387,11 @@ impl ActivationRecordV2 {
         self.published_scope.validate()?;
         validate_sha256(&self.generation_id)?;
         validate_retirement_selector(&self.selector)?;
-        if self.selector != source_selector(self.project_id.as_str(), &self.generation_id) {
-            bail!("activation selector does not match project and generation");
-        }
+        validate_collected_materialization_selector(
+            self.project_id.as_str(),
+            &self.generation_id,
+            &self.selector,
+        )?;
         validate_migration_snapshot_id(&self.snapshot_id)?;
         validate_sha256(&self.entity_inventory_sha256)?;
         validate_optional_diagnostic(self.diagnostic.as_deref())?;
@@ -416,9 +450,11 @@ impl CollisionRetirementPendingV1 {
         self.former_scope.validate()?;
         validate_sha256(&self.generation_id)?;
         validate_retirement_selector(&self.selector)?;
-        if self.selector != source_selector(self.project_id.as_str(), &self.generation_id) {
-            bail!("collision retirement selector does not match project and generation");
-        }
+        validate_collected_materialization_selector(
+            self.project_id.as_str(),
+            &self.generation_id,
+            &self.selector,
+        )?;
         validate_migration_snapshot_id(&self.snapshot_id)?;
         validate_sha256(&self.manifest_sha256)?;
         validate_sha256(&self.inventory_hash)?;
@@ -448,12 +484,102 @@ pub struct MigrationEffectiveSourceSelectionV1 {
     pub selector: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationLegacyAnchorEvidenceV1 {
+    Missing,
+    Present { bytes: Vec<u8>, sha256: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct MigrationLegacyActivationEvidenceV1 {
+    pub project_id: ProjectId,
+    pub bytes: Vec<u8>,
+    pub sha256: String,
+    pub record: ActivationRecord,
+}
+
+#[derive(Debug, Clone)]
+pub struct MigrationLegacyGenerationEvidenceV1 {
+    pub published_scope: PublishedScope,
+    pub generation_id: String,
+    pub metadata_bytes: Vec<u8>,
+    pub metadata_sha256: String,
+    pub record: StoredGeneration,
+    pub manifest_bytes: Vec<u8>,
+    pub manifest_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MigrationLegacyCollisionEvidenceV1 {
+    pub project_id: ProjectId,
+    pub bytes: Vec<u8>,
+    pub sha256: String,
+    pub record: CollisionRetirementPendingV1,
+}
+
+#[derive(Debug, Clone)]
+pub struct MigrationLegacyInventoryV1 {
+    pub anchor: MigrationLegacyAnchorEvidenceV1,
+    pub activations: Vec<MigrationLegacyActivationEvidenceV1>,
+    pub generations: Vec<MigrationLegacyGenerationEvidenceV1>,
+    pub collision_pending: Vec<MigrationLegacyCollisionEvidenceV1>,
+    pub protected_generation_ids: BTreeSet<String>,
+    pub canonical_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MigrationCurrentActivationEvidenceV1 {
+    pub project_id: ProjectId,
+    pub bytes: Vec<u8>,
+    pub sha256: String,
+    pub record: ActivationRecordV2,
+}
+
+#[derive(Debug, Clone)]
+pub struct MigrationCurrentGenerationEvidenceV1 {
+    pub published_scope: PublishedScope,
+    pub generation_id: String,
+    pub metadata_bytes: Vec<u8>,
+    pub metadata_sha256: String,
+    pub record: StoredGenerationV2,
+    pub manifest_bytes: Vec<u8>,
+    pub manifest_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MigrationCurrentCollisionEvidenceV1 {
+    pub project_id: ProjectId,
+    pub bytes: Vec<u8>,
+    pub sha256: String,
+    pub record: CollisionRetirementPendingV1,
+}
+
+#[derive(Debug, Clone)]
+pub struct MigrationCurrentRetirementEvidenceV1 {
+    pub selector_sha256: String,
+    pub bytes: Vec<u8>,
+    pub sha256: String,
+    pub record: RetirementRecord,
+}
+
+#[derive(Debug, Clone)]
+pub struct MigrationCurrentInventoryV1 {
+    pub effective_manifest_bytes: Vec<u8>,
+    pub effective_manifest_sha256: String,
+    pub effective_manifest: MigrationEffectiveSourceManifestV1,
+    pub activations: Vec<MigrationCurrentActivationEvidenceV1>,
+    pub generations: Vec<MigrationCurrentGenerationEvidenceV1>,
+    pub collision_pending: Vec<MigrationCurrentCollisionEvidenceV1>,
+    pub retirements: Vec<MigrationCurrentRetirementEvidenceV1>,
+    pub canonical_sha256: String,
+}
+
 impl MigrationEffectiveSourceManifestV1 {
     pub fn validate(&self) -> Result<()> {
         if self.version != 1 {
             bail!("invalid migration effective-source manifest version");
         }
-        if self.selections.len() > DEFAULT_MAX_MANIFEST_FILES as usize {
+        if self.selections.len() > MAX_PROJECT_CATALOG_ENTRIES {
             bail!("migration effective-source manifest has too many selections");
         }
         let mut projects = BTreeSet::new();
@@ -464,8 +590,12 @@ impl MigrationEffectiveSourceManifestV1 {
             selection.published_scope.validate()?;
             validate_sha256(&selection.generation_id)?;
             validate_retirement_selector(&selection.selector)?;
-            if selection.selector
-                != source_selector(selection.project_id.as_str(), &selection.generation_id)
+            if validate_collected_materialization_selector(
+                selection.project_id.as_str(),
+                &selection.generation_id,
+                &selection.selector,
+            )
+            .is_err()
                 || !projects.insert(selection.project_id.clone())
                 || !selectors.insert(selection.selector.clone())
                 || prior_project
@@ -501,6 +631,537 @@ pub fn decode_migration_effective_source_manifest_v1(
     )?;
     manifest.validate()?;
     Ok(manifest)
+}
+
+/// Enumerate the complete legacy v1 source store without creating state.
+///
+/// The caller must hold the mutation lock for [`CodeSourceStorePaths::anchor`]
+/// for the full call. Every file is opened through a held nofollow directory.
+pub fn enumerate_legacy_migration_inventory_locked(
+    paths: &CodeSourceStorePaths,
+    limits: &StoreLimits,
+) -> Result<MigrationLegacyInventoryV1> {
+    let anchor_bytes = read_optional_regular_nofollow(
+        &paths.anchor(),
+        MAX_MIGRATION_RECORD_BYTES,
+        "legacy effective source anchor",
+    )?;
+    let mut total_encoded_bytes = anchor_bytes.as_ref().map_or(0, Vec::len);
+    let anchor = match anchor_bytes {
+        Some(bytes) => MigrationLegacyAnchorEvidenceV1::Present {
+            sha256: sha256_hex(&bytes),
+            bytes,
+        },
+        None => MigrationLegacyAnchorEvidenceV1::Missing,
+    };
+    let Some(_root) = NofollowDirectory::open_existing(paths.root())? else {
+        let mut inventory = MigrationLegacyInventoryV1 {
+            anchor,
+            activations: Vec::new(),
+            generations: Vec::new(),
+            collision_pending: Vec::new(),
+            protected_generation_ids: BTreeSet::new(),
+            canonical_sha256: String::new(),
+        };
+        inventory.canonical_sha256 = legacy_inventory_digest(&inventory);
+        return Ok(inventory);
+    };
+
+    let mut activations = Vec::new();
+    if let Some(directory) = NofollowDirectory::open_existing(&paths.root().join("activations"))? {
+        for name in sorted_regular_entry_names(
+            &paths.root().join("activations"),
+            MAX_MIGRATION_INVENTORY_ACTIVATIONS,
+            "legacy activation",
+        )? {
+            let project_name = name
+                .strip_suffix(".json")
+                .ok_or_else(|| anyhow!("legacy activation filename is not canonical"))?;
+            let project_id =
+                ProjectId::parse(project_name.to_string()).map_err(|error| anyhow!(error))?;
+            let bytes = directory
+                .read_regular(&name, MAX_MIGRATION_RECORD_BYTES, "legacy activation")?
+                .ok_or_else(|| anyhow!("legacy activation disappeared during enumeration"))?;
+            total_encoded_bytes = total_encoded_bytes
+                .checked_add(bytes.len())
+                .ok_or_else(|| anyhow!("legacy inventory byte count overflowed"))?;
+            if total_encoded_bytes > MAX_MIGRATION_INVENTORY_MANIFEST_BYTES {
+                bail!("legacy inventory exceeds its aggregate byte limit");
+            }
+            let record = decode_activation_v1_for_migration(&bytes)?;
+            if record.project_id != project_id.as_str() {
+                bail!("legacy activation path and record project disagree");
+            }
+            activations.push(MigrationLegacyActivationEvidenceV1 {
+                project_id,
+                sha256: sha256_hex(&bytes),
+                bytes,
+                record,
+            });
+        }
+    }
+
+    let mut generations = Vec::new();
+    let scopes_path = paths.root().join("scopes");
+    if NofollowDirectory::open_existing(&scopes_path)?.is_some() {
+        for scope_name in sorted_directory_entry_names(
+            &scopes_path,
+            MAX_MIGRATION_INVENTORY_GENERATIONS,
+            "legacy scope",
+        )? {
+            validate_sha256(&scope_name)?;
+            let scope_path = scopes_path.join(&scope_name);
+            let scope_entries = sorted_directory_entry_names(&scope_path, 1, "legacy scope")?;
+            if scope_entries.len() != 1 || scope_entries[0] != "generations" {
+                bail!("legacy scope directory has an incomplete or unexpected row set");
+            }
+            let generations_path = scope_path.join("generations");
+            let Some(_held_generations) = NofollowDirectory::open_existing(&generations_path)?
+            else {
+                continue;
+            };
+            for generation_id in sorted_directory_entry_names(
+                &generations_path,
+                MAX_MIGRATION_INVENTORY_GENERATIONS,
+                "legacy generation",
+            )? {
+                if generations.len() >= MAX_MIGRATION_INVENTORY_GENERATIONS {
+                    bail!("legacy generation inventory exceeds its row limit");
+                }
+                validate_sha256(&generation_id)?;
+                let generation_path = generations_path.join(&generation_id);
+                let directory = NofollowDirectory::open_existing(&generation_path)?
+                    .ok_or_else(|| anyhow!("legacy generation directory disappeared"))?;
+                let entries = sorted_regular_entry_names(&generation_path, 2, "legacy generation")?;
+                if entries.len() != 2
+                    || entries[0] != "manifest.jsonl"
+                    || entries[1] != "metadata.json"
+                {
+                    bail!("legacy generation directory has an incomplete or unexpected row set");
+                }
+                let metadata_bytes = directory
+                    .read_regular(
+                        "metadata.json",
+                        MAX_STORED_GENERATION_RECORD_BYTES,
+                        "legacy generation metadata",
+                    )?
+                    .ok_or_else(|| anyhow!("legacy generation metadata is missing"))?;
+                let record = decode_stored_generation_v1_for_migration(&metadata_bytes)?;
+                if record.generation_id != generation_id
+                    || scope_hash(&record.descriptor.scope) != scope_name
+                {
+                    bail!("legacy generation path and metadata disagree");
+                }
+                let manifest_bytes = directory
+                    .read_regular(
+                        "manifest.jsonl",
+                        MAX_MIGRATION_RECORD_BYTES,
+                        "legacy generation manifest",
+                    )?
+                    .ok_or_else(|| anyhow!("legacy generation manifest is missing"))?;
+                total_encoded_bytes = total_encoded_bytes
+                    .checked_add(metadata_bytes.len())
+                    .and_then(|total| total.checked_add(manifest_bytes.len()))
+                    .ok_or_else(|| anyhow!("legacy inventory byte count overflowed"))?;
+                if total_encoded_bytes > MAX_MIGRATION_INVENTORY_MANIFEST_BYTES {
+                    bail!("legacy inventory exceeds its aggregate byte limit");
+                }
+                verify_generation_manifest_for_migration(
+                    &manifest_bytes,
+                    &record.descriptor,
+                    &record.producer_id,
+                    &record.generation_id,
+                    limits,
+                )?;
+                generations.push(MigrationLegacyGenerationEvidenceV1 {
+                    published_scope: record.descriptor.scope.clone(),
+                    generation_id,
+                    metadata_sha256: sha256_hex(&metadata_bytes),
+                    metadata_bytes,
+                    manifest_sha256: sha256_hex(&manifest_bytes),
+                    manifest_bytes,
+                    record,
+                });
+                directory.ensure_still_current()?;
+            }
+        }
+    }
+    generations.sort_by(|left, right| {
+        left.published_scope
+            .cmp(&right.published_scope)
+            .then_with(|| left.generation_id.cmp(&right.generation_id))
+    });
+
+    let mut collision_pending = Vec::new();
+    let collision_path = paths.root().join("collision-retirements");
+    if let Some(directory) = NofollowDirectory::open_existing(&collision_path)? {
+        for name in sorted_regular_entry_names(
+            &collision_path,
+            MAX_MIGRATION_INVENTORY_COLLISION_RECORDS,
+            "legacy collision retirement",
+        )? {
+            let project_name = name
+                .strip_suffix(".json")
+                .ok_or_else(|| anyhow!("collision retirement filename is not canonical"))?;
+            let project_id =
+                ProjectId::parse(project_name.to_string()).map_err(|error| anyhow!(error))?;
+            let bytes = directory
+                .read_regular(
+                    &name,
+                    MAX_COLLISION_RETIREMENT_RECORD_BYTES,
+                    "legacy collision retirement",
+                )?
+                .ok_or_else(|| anyhow!("collision retirement disappeared"))?;
+            let record = decode_collision_retirement_pending_for_migration(&bytes)?;
+            total_encoded_bytes = total_encoded_bytes
+                .checked_add(bytes.len())
+                .ok_or_else(|| anyhow!("legacy inventory byte count overflowed"))?;
+            if total_encoded_bytes > MAX_MIGRATION_INVENTORY_MANIFEST_BYTES {
+                bail!("legacy inventory exceeds its aggregate byte limit");
+            }
+            if record.project_id != project_id {
+                bail!("collision retirement path and record project disagree");
+            }
+            collision_pending.push(MigrationLegacyCollisionEvidenceV1 {
+                project_id,
+                sha256: sha256_hex(&bytes),
+                bytes,
+                record,
+            });
+        }
+    }
+
+    let activation_records = activations
+        .iter()
+        .map(|row| row.record.clone())
+        .collect::<Vec<_>>();
+    let collision_records = collision_pending
+        .iter()
+        .map(|row| row.record.clone())
+        .collect::<Vec<_>>();
+    let generation_records = generations
+        .iter()
+        .map(|row| row.record.clone())
+        .collect::<Vec<_>>();
+    let protected_generation_ids = protected_generation_ids_from_records(
+        &generation_records,
+        &activation_records,
+        &collision_records,
+        limits.retained_generations,
+    )?;
+    if let MigrationLegacyAnchorEvidenceV1::Present { bytes, .. } = &anchor {
+        let effective = decode_migration_effective_source_manifest_v1(bytes)?;
+        let activations_by_project = activations
+            .iter()
+            .map(|row| (&row.project_id, &row.record))
+            .collect::<BTreeMap<_, _>>();
+        let generations_by_id = generations
+            .iter()
+            .map(|row| (row.generation_id.as_str(), row))
+            .collect::<BTreeMap<_, _>>();
+        if effective.selections.len() != activations.len() {
+            bail!("legacy effective source manifest and activation sets differ");
+        }
+        for selection in &effective.selections {
+            let activation = activations_by_project
+                .get(&selection.project_id)
+                .ok_or_else(|| anyhow!("legacy effective source selection lacks activation"))?;
+            let generation = generations_by_id
+                .get(selection.generation_id.as_str())
+                .ok_or_else(|| anyhow!("legacy effective source selection lacks generation"))?;
+            if activation.generation_id != selection.generation_id
+                || activation.selector != selection.selector
+                || generation.published_scope != selection.published_scope
+            {
+                bail!("legacy effective source selection rewrites activation evidence");
+            }
+        }
+    }
+    let mut inventory = MigrationLegacyInventoryV1 {
+        anchor,
+        activations,
+        generations,
+        collision_pending,
+        protected_generation_ids,
+        canonical_sha256: String::new(),
+    };
+    inventory.canonical_sha256 = legacy_inventory_digest(&inventory);
+    Ok(inventory)
+}
+
+/// Enumerate and validate the complete current v2 migration-owned source state.
+///
+/// The caller must hold the mutation lock for [`CodeSourceStorePaths::anchor`]
+/// for the full call. Valid later generations and selections are accepted.
+pub fn enumerate_current_migration_inventory_locked(
+    paths: &CodeSourceStorePaths,
+    limits: &StoreLimits,
+) -> Result<MigrationCurrentInventoryV1> {
+    let effective_manifest_bytes = read_optional_regular_nofollow(
+        &paths.anchor(),
+        MAX_MIGRATION_RECORD_BYTES,
+        "current effective source anchor",
+    )?
+    .ok_or_else(|| anyhow!("current effective source anchor is missing"))?;
+    let effective_manifest =
+        decode_migration_effective_source_manifest_v1(&effective_manifest_bytes)?;
+    let mut total_encoded_bytes = effective_manifest_bytes.len();
+
+    let activation_path = paths.root().join("activations");
+    let mut activations = Vec::new();
+    if let Some(directory) = NofollowDirectory::open_existing(&activation_path)? {
+        for name in sorted_regular_entry_names(
+            &activation_path,
+            MAX_MIGRATION_INVENTORY_ACTIVATIONS,
+            "current activation",
+        )? {
+            let project_name = name
+                .strip_suffix(".json")
+                .ok_or_else(|| anyhow!("current activation filename is not canonical"))?;
+            let project_id =
+                ProjectId::parse(project_name.to_string()).map_err(|error| anyhow!(error))?;
+            let bytes = directory
+                .read_regular(&name, MAX_MIGRATION_RECORD_BYTES, "current activation")?
+                .ok_or_else(|| anyhow!("current activation disappeared during enumeration"))?;
+            total_encoded_bytes = checked_inventory_bytes(total_encoded_bytes, bytes.len())?;
+            let record = decode_activation_v2_for_migration(&bytes)?;
+            if record.project_id != project_id {
+                bail!("current activation path and record project disagree");
+            }
+            activations.push(MigrationCurrentActivationEvidenceV1 {
+                project_id,
+                sha256: sha256_hex(&bytes),
+                bytes,
+                record,
+            });
+        }
+        directory.ensure_still_current()?;
+    }
+
+    let scopes_path = paths.root().join("scopes");
+    let mut generations = Vec::new();
+    if NofollowDirectory::open_existing(&scopes_path)?.is_some() {
+        for scope_name in sorted_directory_entry_names(
+            &scopes_path,
+            MAX_MIGRATION_INVENTORY_GENERATIONS,
+            "current scope",
+        )? {
+            validate_sha256(&scope_name)?;
+            let scope_path = scopes_path.join(&scope_name);
+            let scope_entries = sorted_directory_entry_names(&scope_path, 1, "current scope")?;
+            if scope_entries.len() != 1 || scope_entries[0] != "generations" {
+                bail!("current scope directory has an incomplete or unexpected row set");
+            }
+            let generations_path = scope_path.join("generations");
+            if NofollowDirectory::open_existing(&generations_path)?.is_none() {
+                continue;
+            }
+            for generation_id in sorted_directory_entry_names(
+                &generations_path,
+                MAX_MIGRATION_INVENTORY_GENERATIONS,
+                "current generation",
+            )? {
+                if generations.len() >= MAX_MIGRATION_INVENTORY_GENERATIONS {
+                    bail!("current generation inventory exceeds its row limit");
+                }
+                validate_sha256(&generation_id)?;
+                let generation_path = generations_path.join(&generation_id);
+                let directory = NofollowDirectory::open_existing(&generation_path)?
+                    .ok_or_else(|| anyhow!("current generation directory disappeared"))?;
+                let entries =
+                    sorted_regular_entry_names(&generation_path, 2, "current generation")?;
+                if entries.len() != 2
+                    || entries[0] != "manifest.jsonl"
+                    || entries[1] != "metadata.json"
+                {
+                    bail!("current generation directory has an incomplete or unexpected row set");
+                }
+                let metadata_bytes = directory
+                    .read_regular(
+                        "metadata.json",
+                        MAX_STORED_GENERATION_RECORD_BYTES,
+                        "current generation metadata",
+                    )?
+                    .ok_or_else(|| anyhow!("current generation metadata is missing"))?;
+                let record = decode_stored_generation_v2_for_migration(&metadata_bytes)?;
+                if record.generation_id != generation_id
+                    || scope_hash(&record.published_scope) != scope_name
+                {
+                    bail!("current generation path and metadata disagree");
+                }
+                let manifest_bytes = directory
+                    .read_regular(
+                        "manifest.jsonl",
+                        MAX_MIGRATION_RECORD_BYTES,
+                        "current generation manifest",
+                    )?
+                    .ok_or_else(|| anyhow!("current generation manifest is missing"))?;
+                total_encoded_bytes = checked_inventory_bytes(
+                    checked_inventory_bytes(total_encoded_bytes, metadata_bytes.len())?,
+                    manifest_bytes.len(),
+                )?;
+                verify_generation_manifest_for_migration(
+                    &manifest_bytes,
+                    &record.descriptor,
+                    &record.producer_id,
+                    &record.generation_id,
+                    limits,
+                )?;
+                generations.push(MigrationCurrentGenerationEvidenceV1 {
+                    published_scope: record.published_scope.clone(),
+                    generation_id,
+                    metadata_sha256: sha256_hex(&metadata_bytes),
+                    metadata_bytes,
+                    manifest_sha256: sha256_hex(&manifest_bytes),
+                    manifest_bytes,
+                    record,
+                });
+                directory.ensure_still_current()?;
+            }
+        }
+    }
+    generations.sort_by(|left, right| {
+        left.published_scope
+            .cmp(&right.published_scope)
+            .then_with(|| left.generation_id.cmp(&right.generation_id))
+    });
+    let generations_by_id = generations
+        .iter()
+        .map(|row| (row.generation_id.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
+    let scope_ordinals = generations
+        .iter()
+        .map(|row| (scope_hash(&row.published_scope), row.record.ordinal))
+        .collect::<BTreeSet<_>>();
+    if generations_by_id.len() != generations.len() || scope_ordinals.len() != generations.len() {
+        bail!("current generation inventory contains duplicate ids or scope ordinals");
+    }
+
+    let collision_path = paths.root().join("collision-retirements");
+    let mut collision_pending = Vec::new();
+    if let Some(directory) = NofollowDirectory::open_existing(&collision_path)? {
+        for name in sorted_regular_entry_names(
+            &collision_path,
+            MAX_MIGRATION_INVENTORY_COLLISION_RECORDS,
+            "current collision retirement",
+        )? {
+            let project_name = name
+                .strip_suffix(".json")
+                .ok_or_else(|| anyhow!("current collision filename is not canonical"))?;
+            let project_id =
+                ProjectId::parse(project_name.to_string()).map_err(|error| anyhow!(error))?;
+            let bytes = directory
+                .read_regular(
+                    &name,
+                    MAX_COLLISION_RETIREMENT_RECORD_BYTES,
+                    "current collision retirement",
+                )?
+                .ok_or_else(|| anyhow!("current collision retirement disappeared"))?;
+            total_encoded_bytes = checked_inventory_bytes(total_encoded_bytes, bytes.len())?;
+            let record = decode_collision_retirement_pending_for_migration(&bytes)?;
+            let generation = generations_by_id
+                .get(record.generation_id.as_str())
+                .ok_or_else(|| anyhow!("current collision retirement lacks generation metadata"))?;
+            if record.project_id != project_id
+                || record.former_scope != generation.published_scope
+                || record.manifest_sha256 != generation.record.descriptor.manifest_sha256
+            {
+                bail!("current collision retirement rewrites generation evidence");
+            }
+            collision_pending.push(MigrationCurrentCollisionEvidenceV1 {
+                project_id,
+                sha256: sha256_hex(&bytes),
+                bytes,
+                record,
+            });
+        }
+        directory.ensure_still_current()?;
+    }
+
+    let retirement_path = paths.root().join("retirements");
+    let mut retirements = Vec::new();
+    if let Some(directory) = NofollowDirectory::open_existing(&retirement_path)? {
+        for name in sorted_regular_entry_names(
+            &retirement_path,
+            MAX_MIGRATION_INVENTORY_RETIREMENTS,
+            "current retirement",
+        )? {
+            let selector_sha256 = name
+                .strip_suffix(".json")
+                .ok_or_else(|| anyhow!("current retirement filename is not canonical"))?
+                .to_string();
+            validate_sha256(&selector_sha256)?;
+            let bytes = directory
+                .read_regular(&name, MAX_MIGRATION_RECORD_BYTES, "current retirement")?
+                .ok_or_else(|| anyhow!("current retirement disappeared"))?;
+            total_encoded_bytes = checked_inventory_bytes(total_encoded_bytes, bytes.len())?;
+            let record: RetirementRecord =
+                decode_bounded_json(&bytes, MAX_MIGRATION_RECORD_BYTES, "current retirement")?;
+            validate_retirement_record(&record)?;
+            if sha256_hex(record.selector.as_bytes()) != selector_sha256 {
+                bail!("current retirement path and selector disagree");
+            }
+            retirements.push(MigrationCurrentRetirementEvidenceV1 {
+                selector_sha256,
+                sha256: sha256_hex(&bytes),
+                bytes,
+                record,
+            });
+        }
+        directory.ensure_still_current()?;
+    }
+
+    let activations_by_project = activations
+        .iter()
+        .map(|row| (&row.project_id, row))
+        .collect::<BTreeMap<_, _>>();
+    if activations_by_project.len() != activations.len()
+        || effective_manifest.selections.len() != activations.len()
+    {
+        bail!("current effective source and activation sets differ");
+    }
+    let selected_projects = effective_manifest
+        .selections
+        .iter()
+        .map(|selection| selection.project_id.clone())
+        .collect::<BTreeSet<_>>();
+    for selection in &effective_manifest.selections {
+        let activation = activations_by_project
+            .get(&selection.project_id)
+            .ok_or_else(|| anyhow!("current effective selection lacks activation"))?;
+        let generation = generations_by_id
+            .get(selection.generation_id.as_str())
+            .ok_or_else(|| anyhow!("current effective selection lacks generation"))?;
+        activation
+            .record
+            .validate_against_generation(&generation.record)?;
+        if activation.record.published_scope != selection.published_scope
+            || activation.record.generation_id != selection.generation_id
+            || activation.record.selector != selection.selector
+        {
+            bail!("current effective selection rewrites activation evidence");
+        }
+    }
+    for pending in &collision_pending {
+        if selected_projects.contains(&pending.project_id)
+            || activations_by_project.contains_key(&pending.project_id)
+        {
+            bail!("current collision retirement remains active or effective");
+        }
+    }
+
+    let mut inventory = MigrationCurrentInventoryV1 {
+        effective_manifest_sha256: sha256_hex(&effective_manifest_bytes),
+        effective_manifest_bytes,
+        effective_manifest,
+        activations,
+        generations,
+        collision_pending,
+        retirements,
+        canonical_sha256: String::new(),
+    };
+    inventory.canonical_sha256 = current_inventory_digest(&inventory);
+    Ok(inventory)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -633,6 +1294,7 @@ pub struct CodeSourceHealthRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RetirementRecord {
     pub version: u32,
     pub project_id: String,
@@ -1366,12 +2028,7 @@ impl CodeSourceStore {
 
     pub fn enqueue_retirement(&self, record: &RetirementRecord) -> Result<()> {
         let _guard = self.lock_mutation()?;
-        if record.version != STORE_VERSION
-            || record.project_id.trim().is_empty()
-            || record.snapshot_id.trim().is_empty()
-        {
-            bail!("invalid code-source retirement record");
-        }
+        validate_retirement_record(record)?;
         atomic_write_json(
             &self.paths.retirement_for_selector(&record.selector)?,
             record,
@@ -1671,55 +2328,19 @@ impl CodeSourceStore {
         generations: &[StoredGeneration],
         retained_generations: usize,
     ) -> Result<BTreeSet<String>> {
-        let mut protected = BTreeSet::new();
+        let mut activations = Vec::new();
         for activation in fs::read_dir(self.root().join("activations"))? {
             let activation = activation?;
             if activation.file_type()?.is_file() {
-                protected.insert(read_activation_v1(&activation.path())?.generation_id);
+                activations.push(read_activation_v1(&activation.path())?);
             }
         }
-        for pending in self.collision_retirement_pending_records_for_gc()? {
-            let Some(generation) = generations
-                .iter()
-                .find(|generation| generation.generation_id == pending.generation_id)
-            else {
-                bail!("collision retirement pending references missing generation metadata");
-            };
-            if pending.former_scope != generation.descriptor.scope
-                || pending.manifest_sha256 != generation.descriptor.manifest_sha256
-            {
-                bail!("collision retirement pending does not match generation metadata");
-            }
-            protected.insert(pending.generation_id);
-        }
-        let mut by_scope = BTreeMap::<String, Vec<&StoredGeneration>>::new();
-        for generation in generations {
-            if matches!(
-                generation.state,
-                GenerationState::MissingBlobs
-                    | GenerationState::Ready
-                    | GenerationState::StagingIndex
-                    | GenerationState::Active
-                    | GenerationState::MissingBlobData
-            ) {
-                protected.insert(generation.generation_id.clone());
-            }
-            by_scope
-                .entry(scope_hash(&generation.descriptor.scope))
-                .or_default()
-                .push(generation);
-        }
-        for scope_generations in by_scope.values_mut() {
-            scope_generations.sort_by_key(|generation| std::cmp::Reverse(generation.ordinal));
-            protected.extend(
-                scope_generations
-                    .iter()
-                    .filter(|generation| generation.state == GenerationState::Superseded)
-                    .take(retained_generations)
-                    .map(|generation| generation.generation_id.clone()),
-            );
-        }
-        Ok(protected)
+        protected_generation_ids_from_records(
+            generations,
+            &activations,
+            &self.collision_retirement_pending_records_for_gc()?,
+            retained_generations,
+        )
     }
 
     fn collision_retirement_pending_records_for_gc(
@@ -2023,9 +2644,14 @@ fn validate_activation_v1(record: &ActivationRecord) -> Result<()> {
     if record.version != STORE_VERSION {
         bail!("legacy code-source API refuses non-v1 activation record");
     }
-    ProjectId::parse(record.project_id.clone()).map_err(|error| anyhow!(error))?;
+    let project_id = ProjectId::parse(record.project_id.clone()).map_err(|error| anyhow!(error))?;
     validate_sha256(&record.generation_id)?;
     validate_retirement_selector(&record.selector)?;
+    validate_collected_materialization_selector(
+        project_id.as_str(),
+        &record.generation_id,
+        &record.selector,
+    )?;
     validate_snapshot_id(&record.snapshot_id)?;
     validate_sha256(&record.entity_inventory_sha256)?;
     validate_optional_diagnostic(record.diagnostic.as_deref())?;
@@ -2241,6 +2867,286 @@ fn quarantine_corrupt_blob(path: &Path) -> Result<()> {
     sync_parent(&quarantine)
 }
 
+fn read_optional_regular_nofollow(
+    path: &Path,
+    max_bytes: usize,
+    label: &str,
+) -> Result<Option<Vec<u8>>> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("{label} path has no parent"))?;
+    let Some(directory) = NofollowDirectory::open_existing(parent)? else {
+        return Ok(None);
+    };
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("{label} filename is not utf8"))?;
+    let bytes = directory.read_regular(name, max_bytes, label)?;
+    directory.ensure_still_current()?;
+    Ok(bytes)
+}
+
+fn sorted_regular_entry_names(path: &Path, max_rows: usize, label: &str) -> Result<Vec<String>> {
+    sorted_entry_names(path, max_rows, label, true)
+}
+
+fn sorted_directory_entry_names(path: &Path, max_rows: usize, label: &str) -> Result<Vec<String>> {
+    sorted_entry_names(path, max_rows, label, false)
+}
+
+fn sorted_entry_names(
+    path: &Path,
+    max_rows: usize,
+    label: &str,
+    regular: bool,
+) -> Result<Vec<String>> {
+    let Some(directory) = NofollowDirectory::open_existing(path)? else {
+        return Ok(Vec::new());
+    };
+    let mut names = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("{label} directory contains a non-utf8 entry"))?;
+        let file_type = entry.file_type()?;
+        let expected_type = if regular {
+            file_type.is_file() && !file_type.is_symlink()
+        } else {
+            file_type.is_dir() && !file_type.is_symlink()
+        };
+        if !expected_type {
+            bail!("{label} directory contains an unexpected entry type");
+        }
+        if names.len() >= max_rows {
+            bail!("{label} directory exceeds its row limit");
+        }
+        names.push(name);
+    }
+    names.sort();
+    directory.ensure_still_current()?;
+    Ok(names)
+}
+
+fn checked_inventory_bytes(current: usize, added: usize) -> Result<usize> {
+    let total = current
+        .checked_add(added)
+        .ok_or_else(|| anyhow!("migration inventory byte count overflowed"))?;
+    if total > MAX_MIGRATION_INVENTORY_MANIFEST_BYTES {
+        bail!("migration inventory exceeds its aggregate byte limit");
+    }
+    Ok(total)
+}
+
+fn validate_retirement_record(record: &RetirementRecord) -> Result<()> {
+    if record.version != STORE_VERSION {
+        bail!("invalid code-source retirement version");
+    }
+    let project_id = ProjectId::parse(record.project_id.clone()).map_err(|error| anyhow!(error))?;
+    validate_retirement_selector(&record.selector)?;
+    validate_migration_snapshot_id(&record.snapshot_id)?;
+    if let Some(generation_id) = &record.generation_id {
+        validate_sha256(generation_id)?;
+        validate_collected_materialization_selector(
+            project_id.as_str(),
+            generation_id,
+            &record.selector,
+        )?;
+    }
+    Ok(())
+}
+
+fn protected_generation_ids_from_records(
+    generations: &[StoredGeneration],
+    activations: &[ActivationRecord],
+    collision_pending: &[CollisionRetirementPendingV1],
+    retained_generations: usize,
+) -> Result<BTreeSet<String>> {
+    let mut generations_by_id = BTreeMap::new();
+    let mut ordinals_by_scope = BTreeSet::new();
+    let mut by_scope = BTreeMap::<String, Vec<&StoredGeneration>>::new();
+    for generation in generations {
+        validate_stored_generation_v1(generation)?;
+        let scope = scope_hash(&generation.descriptor.scope);
+        if generations_by_id
+            .insert(generation.generation_id.as_str(), generation)
+            .is_some()
+        {
+            bail!("generation inventory contains a duplicate generation id");
+        }
+        if !ordinals_by_scope.insert((scope.clone(), generation.ordinal)) {
+            bail!("generation inventory contains a duplicate scope ordinal");
+        }
+        by_scope.entry(scope).or_default().push(generation);
+    }
+
+    let mut protected = BTreeSet::new();
+    let mut activation_projects = BTreeSet::new();
+    for activation in activations {
+        validate_activation_v1(activation)?;
+        if !activation_projects.insert(activation.project_id.as_str()) {
+            bail!("activation inventory contains a duplicate project");
+        }
+        let generation = generations_by_id
+            .get(activation.generation_id.as_str())
+            .ok_or_else(|| anyhow!("activation references missing generation metadata"))?;
+        if Some(activation.document_count) != generation.materialized_doc_count
+            || Some(activation.entity_inventory_sha256.as_str())
+                != generation.entity_inventory_sha256.as_deref()
+        {
+            bail!("activation materialization evidence does not match generation metadata");
+        }
+        protected.insert(activation.generation_id.clone());
+    }
+    let mut pending_projects = BTreeSet::new();
+    for pending in collision_pending {
+        pending.validate()?;
+        if !pending_projects.insert(pending.project_id.clone()) {
+            bail!("collision retirement inventory contains a duplicate project");
+        }
+        let generation = generations_by_id
+            .get(pending.generation_id.as_str())
+            .ok_or_else(|| {
+                anyhow!("collision retirement pending references missing generation metadata")
+            })?;
+        if pending.former_scope != generation.descriptor.scope
+            || pending.manifest_sha256 != generation.descriptor.manifest_sha256
+        {
+            bail!("collision retirement pending does not match generation metadata");
+        }
+        protected.insert(pending.generation_id.clone());
+    }
+    for generation in generations {
+        if matches!(
+            generation.state,
+            GenerationState::MissingBlobs
+                | GenerationState::Ready
+                | GenerationState::StagingIndex
+                | GenerationState::Active
+                | GenerationState::MissingBlobData
+        ) {
+            protected.insert(generation.generation_id.clone());
+        }
+    }
+    for scope_generations in by_scope.values_mut() {
+        scope_generations.sort_by(|left, right| {
+            right
+                .ordinal
+                .cmp(&left.ordinal)
+                .then_with(|| left.generation_id.cmp(&right.generation_id))
+        });
+        protected.extend(
+            scope_generations
+                .iter()
+                .filter(|generation| generation.state == GenerationState::Superseded)
+                .take(retained_generations)
+                .map(|generation| generation.generation_id.clone()),
+        );
+    }
+    Ok(protected)
+}
+
+fn legacy_inventory_digest(inventory: &MigrationLegacyInventoryV1) -> String {
+    fn field(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+    fn text(hasher: &mut Sha256, value: &str) {
+        field(hasher, value.as_bytes());
+    }
+
+    let mut hasher = Sha256::new();
+    field(&mut hasher, b"bbox-code-source-legacy-inventory-v1");
+    match &inventory.anchor {
+        MigrationLegacyAnchorEvidenceV1::Missing => field(&mut hasher, b"anchor:missing"),
+        MigrationLegacyAnchorEvidenceV1::Present { sha256, .. } => {
+            field(&mut hasher, b"anchor:present");
+            text(&mut hasher, sha256);
+        }
+    }
+    field(
+        &mut hasher,
+        &(inventory.activations.len() as u64).to_be_bytes(),
+    );
+    for row in &inventory.activations {
+        field(&mut hasher, b"activation");
+        text(&mut hasher, row.project_id.as_str());
+        text(&mut hasher, &row.sha256);
+    }
+    field(
+        &mut hasher,
+        &(inventory.generations.len() as u64).to_be_bytes(),
+    );
+    for row in &inventory.generations {
+        field(&mut hasher, b"generation");
+        text(&mut hasher, row.published_scope.repo_id());
+        text(&mut hasher, row.published_scope.bbox_root_relpath());
+        text(&mut hasher, &row.generation_id);
+        text(&mut hasher, &row.metadata_sha256);
+        text(&mut hasher, &row.manifest_sha256);
+        text(&mut hasher, &row.record.descriptor.manifest_sha256);
+    }
+    field(
+        &mut hasher,
+        &(inventory.collision_pending.len() as u64).to_be_bytes(),
+    );
+    for row in &inventory.collision_pending {
+        field(&mut hasher, b"collision-pending");
+        text(&mut hasher, row.project_id.as_str());
+        text(&mut hasher, &row.sha256);
+    }
+    field(
+        &mut hasher,
+        &(inventory.protected_generation_ids.len() as u64).to_be_bytes(),
+    );
+    for generation_id in &inventory.protected_generation_ids {
+        field(&mut hasher, b"protected");
+        text(&mut hasher, generation_id);
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn current_inventory_digest(inventory: &MigrationCurrentInventoryV1) -> String {
+    fn field(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+    fn text(hasher: &mut Sha256, value: &str) {
+        field(hasher, value.as_bytes());
+    }
+
+    let mut hasher = Sha256::new();
+    field(&mut hasher, b"bbox-code-source-current-inventory-v2");
+    text(&mut hasher, &inventory.effective_manifest_sha256);
+    for row in &inventory.activations {
+        field(&mut hasher, b"activation");
+        text(&mut hasher, row.project_id.as_str());
+        text(&mut hasher, &row.sha256);
+    }
+    for row in &inventory.generations {
+        field(&mut hasher, b"generation");
+        text(&mut hasher, row.published_scope.repo_id());
+        text(&mut hasher, row.published_scope.bbox_root_relpath());
+        text(&mut hasher, &row.generation_id);
+        text(&mut hasher, &row.metadata_sha256);
+        text(&mut hasher, &row.manifest_sha256);
+    }
+    for row in &inventory.collision_pending {
+        field(&mut hasher, b"collision-pending");
+        text(&mut hasher, row.project_id.as_str());
+        text(&mut hasher, &row.sha256);
+    }
+    for row in &inventory.retirements {
+        field(&mut hasher, b"retirement");
+        text(&mut hasher, &row.selector_sha256);
+        text(&mut hasher, &row.sha256);
+    }
+    hex::encode(hasher.finalize())
+}
+
 struct HashWriter<'a>(&'a mut Sha256);
 
 impl Write for HashWriter<'_> {
@@ -2329,7 +3235,7 @@ fn tracing_rename_race(_error: &std::io::Error) {}
 mod tests {
     use super::*;
     use bbox_code_source::{
-        SCHEMA_VERSION, WALKER_POLICY_VERSION, dirty_fingerprint, manifest_sha256,
+        SCHEMA_VERSION, WALKER_POLICY_VERSION, dirty_fingerprint, manifest_sha256, source_selector,
     };
 
     fn descriptor(entries: &[ManifestEntry]) -> GenerationDescriptor {
@@ -2359,6 +3265,32 @@ mod tests {
         bytes
     }
 
+    fn materialized_selector(project_id: &str, generation_id: &str) -> String {
+        format!(
+            "{}:m0123456789abcdef",
+            source_selector(project_id, generation_id)
+        )
+    }
+
+    #[test]
+    fn legacy_inventory_accepts_a_missing_effective_anchor() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("source");
+        fs::create_dir_all(&root).unwrap();
+        let paths = CodeSourceStorePaths::new(root).unwrap();
+        let guard = paths.lock_migration_inventory().unwrap();
+
+        let inventory = guard.snapshot_legacy_v1(&StoreLimits::default()).unwrap();
+
+        assert!(matches!(
+            inventory.anchor,
+            MigrationLegacyAnchorEvidenceV1::Missing
+        ));
+        assert!(inventory.activations.is_empty());
+        assert!(inventory.generations.is_empty());
+        validate_sha256(&inventory.canonical_sha256).unwrap();
+    }
+
     fn stored_generation_v1(
         producer_id: &str,
         descriptor: GenerationDescriptor,
@@ -2382,7 +3314,7 @@ mod tests {
             version: STORE_VERSION,
             project_id: "project-a".into(),
             generation_id: generation_id.to_string(),
-            selector: source_selector("project-a", generation_id),
+            selector: materialized_selector("project-a", generation_id),
             snapshot_id: format!("collected-{}", "e".repeat(32)),
             document_count: 1,
             entity_inventory_sha256: "c".repeat(64),
@@ -2407,13 +3339,13 @@ mod tests {
                     project_id: project_a.clone(),
                     published_scope: scope.clone(),
                     generation_id: generation_a.clone(),
-                    selector: source_selector(project_a.as_str(), &generation_a),
+                    selector: materialized_selector(project_a.as_str(), &generation_a),
                 },
                 MigrationEffectiveSourceSelectionV1 {
                     project_id: project_b.clone(),
                     published_scope: scope.clone(),
                     generation_id: generation_b.clone(),
-                    selector: source_selector(project_b.as_str(), &generation_b),
+                    selector: materialized_selector(project_b.as_str(), &generation_b),
                 },
             ],
         };
@@ -2446,7 +3378,7 @@ mod tests {
         let project_id = ProjectId::parse("project-a").unwrap();
         let scope = PublishedScope::try_new("repo-family", "services/api").unwrap();
         let generation_id = "a".repeat(64);
-        let selector = source_selector(project_id.as_str(), &generation_id);
+        let selector = materialized_selector(project_id.as_str(), &generation_id);
         let selector_hash = sha256_hex(selector.as_bytes());
 
         assert_eq!(paths.root(), store_root);
@@ -2716,7 +3648,7 @@ mod tests {
             project_id: ProjectId::parse("project-a").unwrap(),
             former_scope: PublishedScope::try_new("repo-family", ".").unwrap(),
             generation_id: "a".repeat(64),
-            selector: source_selector("project-a", &"a".repeat(64)),
+            selector: materialized_selector("project-a", &"a".repeat(64)),
             snapshot_id: format!("collected-{}", "e".repeat(32)),
             manifest_sha256: "b".repeat(64),
             inventory_hash: "c".repeat(64),
@@ -3043,7 +3975,7 @@ mod tests {
                 version: STORE_VERSION,
                 project_id: "project-a".into(),
                 generation_id: ready.generation_id.clone(),
-                selector: source_selector("project-a", &ready.generation_id),
+                selector: materialized_selector("project-a", &ready.generation_id),
                 snapshot_id: "snapshot-a".into(),
                 document_count: 1,
                 entity_inventory_sha256: "c".repeat(64),
@@ -3247,7 +4179,7 @@ mod tests {
             .unwrap();
 
         let project_id = ProjectId::parse("project-a").unwrap();
-        let selector = source_selector(project_id.as_str(), &stored.generation_id);
+        let selector = materialized_selector(project_id.as_str(), &stored.generation_id);
         let pending = CollisionRetirementPendingV1 {
             version: STORE_VERSION,
             project_id: project_id.clone(),
@@ -3422,7 +4354,7 @@ mod tests {
                 version: STORE_VERSION,
                 project_id: "project-a".into(),
                 generation_id: ready.generation_id.clone(),
-                selector: source_selector("project-a", &ready.generation_id),
+                selector: materialized_selector("project-a", &ready.generation_id),
                 snapshot_id: "snapshot-a".into(),
                 document_count: 1,
                 entity_inventory_sha256: "c".repeat(64),
