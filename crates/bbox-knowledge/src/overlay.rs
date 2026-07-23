@@ -57,6 +57,31 @@ pub struct PublishedKnowledgeSnapshot {
     pub entries: BTreeMap<String, PublishedKnowledgeEntry>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishedKnowledgeSourceLimits {
+    pub max_entries: usize,
+    pub max_file_bytes: usize,
+    pub max_total_bytes: usize,
+    pub max_listing_bytes: usize,
+}
+
+impl Default for PublishedKnowledgeSourceLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: 100_000,
+            max_file_bytes: 2 * 1024 * 1024,
+            max_total_bytes: 128 * 1024 * 1024,
+            max_listing_bytes: 32 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedKnowledgeSourceFile {
+    pub repository_relative_filename: String,
+    pub source_bytes: Vec<u8>,
+}
+
 /// Immutable checkout bytes captured by the authority adapter.
 ///
 /// The overlay layer deliberately cannot reopen checkout paths. Production
@@ -382,6 +407,97 @@ pub fn load_published_snapshot_at_commit_unhydrated(
         publisher_commit: publisher_commit.to_string(),
         entries,
     })
+}
+
+/// Load exact committed knowledge JSON for an accepted-publication build.
+///
+/// This path does not hydrate recall telemetry or normalize records. It
+/// validates the committed lane and returns byte-exact, deterministically
+/// ordered source files for the transaction-owned publication builder.
+pub fn load_published_knowledge_sources_at_commit(
+    publisher_root: &Path,
+    publisher_commit: &str,
+    scope: &PublishedScope,
+    alternate_root: Option<&Path>,
+    limits: PublishedKnowledgeSourceLimits,
+) -> Result<Vec<PublishedKnowledgeSourceFile>> {
+    scope
+        .validate()
+        .context("invalid published knowledge scope")?;
+    let tree_dir = knowledge_tree_dir(scope);
+    let prefix = format!("{tree_dir}/");
+    let repo_paths = git::list_committed_dir_bounded_with_alternate(
+        publisher_root,
+        publisher_commit,
+        &tree_dir,
+        alternate_root,
+        limits.max_entries,
+        limits.max_listing_bytes,
+    )
+    .with_context(|| {
+        format!(
+            "listing bounded committed knowledge at {publisher_commit} in {}",
+            publisher_root.display()
+        )
+    })?;
+
+    let mut total_bytes = 0_usize;
+    let mut ids = BTreeSet::new();
+    let mut sources = Vec::with_capacity(repo_paths.len());
+    for repo_path in repo_paths {
+        let filename = repo_path.strip_prefix(&prefix).ok_or_else(|| {
+            anyhow::anyhow!("committed knowledge path is outside its published scope")
+        })?;
+        validate_snapshot_filename(filename, "published knowledge")?;
+        if filename.contains('/') {
+            anyhow::bail!("published knowledge source must be a flat JSON file");
+        }
+        let remaining = limits
+            .max_total_bytes
+            .checked_sub(total_bytes)
+            .ok_or_else(|| {
+                anyhow::anyhow!("published knowledge sources exceed their total byte limit")
+            })?;
+        let read_limit = limits.max_file_bytes.min(remaining);
+        let source_bytes = git::read_committed_file_bytes_bounded_with_alternate(
+            publisher_root,
+            publisher_commit,
+            &repo_path,
+            alternate_root,
+            read_limit,
+        )
+        .with_context(|| {
+            format!("reading bounded committed knowledge file {repo_path} at {publisher_commit}")
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "committed knowledge file disappeared from immutable commit {publisher_commit}"
+            )
+        })?;
+        total_bytes = total_bytes.checked_add(source_bytes.len()).ok_or_else(|| {
+            anyhow::anyhow!("published knowledge source total byte count overflowed")
+        })?;
+        if total_bytes > limits.max_total_bytes {
+            anyhow::bail!("published knowledge sources exceed their total byte limit");
+        }
+        let entry: KnowledgeEntry = serde_json::from_slice(&source_bytes)
+            .with_context(|| format!("parsing published knowledge source {repo_path}"))?;
+        let stem = Path::new(filename)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .context("published knowledge filename is not UTF-8")?;
+        if stem != entry.id {
+            anyhow::bail!("published knowledge filename and record id disagree");
+        }
+        if !ids.insert(entry.id) {
+            anyhow::bail!("published knowledge sources contain a duplicate record id");
+        }
+        sources.push(PublishedKnowledgeSourceFile {
+            repository_relative_filename: repo_path,
+            source_bytes,
+        });
+    }
+    Ok(sources)
 }
 
 /// Recompute one checkout overlay. Every failure becomes an invalid empty
@@ -1098,6 +1214,149 @@ mod tests {
         assert_eq!(
             snapshot_id(&stamp, &values(left_entry)).unwrap(),
             snapshot_id(&stamp, &values(right_entry)).unwrap()
+        );
+    }
+
+    #[test]
+    fn publication_source_loader_returns_exact_ordered_bytes_and_enforces_limits() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        run(&root, &["init", "-q", "-b", "main"]);
+        run(&root, &["config", "user.email", "test@example.com"]);
+        run(&root, &["config", "user.name", "Test"]);
+        let first = serde_json::to_vec_pretty(&entry("a", "first")).unwrap();
+        let mut second = serde_json::to_vec(&entry("z", "second")).unwrap();
+        second.push(b'\n');
+        let directory = root.join(".bbox/knowledge");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("z.json"), &second).unwrap();
+        std::fs::write(directory.join("a.json"), &first).unwrap();
+        run(&root, &["add", ".bbox/knowledge"]);
+        run(&root, &["commit", "-q", "-m", "seed"]);
+        let commit = git::resolve_commit(&root, "HEAD").unwrap();
+        let scope = PublishedScope::try_new("repo", ".").unwrap();
+
+        let sources = load_published_knowledge_sources_at_commit(
+            &root,
+            &commit,
+            &scope,
+            None,
+            PublishedKnowledgeSourceLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| source.repository_relative_filename.as_str())
+                .collect::<Vec<_>>(),
+            vec![".bbox/knowledge/a.json", ".bbox/knowledge/z.json",]
+        );
+        assert_eq!(sources[0].source_bytes, first);
+        assert_eq!(sources[1].source_bytes, second);
+
+        let defaults = PublishedKnowledgeSourceLimits::default();
+        for limits in [
+            PublishedKnowledgeSourceLimits {
+                max_entries: 1,
+                ..defaults
+            },
+            PublishedKnowledgeSourceLimits {
+                max_file_bytes: sources[0].source_bytes.len() - 1,
+                ..defaults
+            },
+            PublishedKnowledgeSourceLimits {
+                max_total_bytes: sources
+                    .iter()
+                    .map(|source| source.source_bytes.len())
+                    .sum::<usize>()
+                    - 1,
+                ..defaults
+            },
+            PublishedKnowledgeSourceLimits {
+                max_listing_bytes: 1,
+                ..defaults
+            },
+        ] {
+            assert!(
+                load_published_knowledge_sources_at_commit(&root, &commit, &scope, None, limits)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn publication_source_loader_rejects_non_flat_lane_members() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        run(&root, &["init", "-q", "-b", "main"]);
+        run(&root, &["config", "user.email", "test@example.com"]);
+        run(&root, &["config", "user.name", "Test"]);
+        let nested = root.join(".bbox/knowledge/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            nested.join("entry.json"),
+            serde_json::to_vec(&entry("entry", "nested")).unwrap(),
+        )
+        .unwrap();
+        run(&root, &["add", ".bbox/knowledge"]);
+        run(&root, &["commit", "-q", "-m", "nested"]);
+        let commit = git::resolve_commit(&root, "HEAD").unwrap();
+
+        assert!(
+            load_published_knowledge_sources_at_commit(
+                &root,
+                &commit,
+                &PublishedScope::try_new("repo", ".").unwrap(),
+                None,
+                PublishedKnowledgeSourceLimits::default(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn publication_source_loader_supports_alternate_commit_objects() {
+        let publisher_temp = tempfile::tempdir().unwrap();
+        let publisher = publisher_temp.path().canonicalize().unwrap();
+        run(&publisher, &["init", "-q", "-b", "main"]);
+        run(&publisher, &["config", "user.email", "test@example.com"]);
+        run(&publisher, &["config", "user.name", "Test"]);
+        write_entry(&publisher, &entry("first", "one"));
+        run(&publisher, &["add", ".bbox/knowledge"]);
+        run(&publisher, &["commit", "-q", "-m", "first"]);
+
+        let clone_temp = tempfile::tempdir().unwrap();
+        let checkout = clone_temp.path().join("checkout");
+        let output = std::process::Command::new("git")
+            .args([
+                "clone",
+                "--no-local",
+                "-q",
+                publisher.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let checkout = checkout.canonicalize().unwrap();
+
+        write_entry(&publisher, &entry("second", "two"));
+        run(&publisher, &["add", ".bbox/knowledge"]);
+        run(&publisher, &["commit", "-q", "-m", "second"]);
+        let commit = git::resolve_commit(&publisher, "HEAD").unwrap();
+        let sources = load_published_knowledge_sources_at_commit(
+            &checkout,
+            &commit,
+            &PublishedScope::try_new("repo", ".").unwrap(),
+            Some(&publisher),
+            PublishedKnowledgeSourceLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(sources.len(), 2);
+        assert_eq!(
+            sources[1].repository_relative_filename,
+            ".bbox/knowledge/second.json"
         );
     }
 }
