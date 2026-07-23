@@ -63,6 +63,7 @@ struct StableDirectory {
 }
 
 #[cfg(unix)]
+#[allow(dead_code)] // Retained handles keep the verified repository authority alive.
 struct StableRepositoryAuthority {
     root: PathBuf,
     git_dir: StableDirectory,
@@ -71,6 +72,7 @@ struct StableRepositoryAuthority {
 }
 
 #[cfg(unix)]
+#[allow(dead_code)] // Retained primary/alternate authorities prevent path rebinding.
 struct VerifiedGitAuthority {
     primary: StableRepositoryAuthority,
     alternate: Option<StableRepositoryAuthority>,
@@ -939,14 +941,6 @@ impl CatFileSession {
             }
         }
         anyhow::bail!("could not find a missing object id to initialize Git alternates")
-    }
-
-    fn read_object(&mut self, spec: &str, max_bytes: usize) -> Result<Option<CatObject>> {
-        self.read_object_before(
-            spec,
-            max_bytes,
-            std::time::Instant::now() + self.request_timeout,
-        )
     }
 
     fn read_object_before(
