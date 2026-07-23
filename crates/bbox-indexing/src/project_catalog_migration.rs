@@ -4600,20 +4600,30 @@ fn verify_installed(
 fn verify_installed_optional(
     layout: &ProjectCatalogMigrationResolvedLayoutV1,
 ) -> Result<Option<ProjectCatalogMigrationVerifyResultV1>, ProjectCatalogMigrationError> {
-    let bootstrap_registry = build_registry(layout, &BTreeMap::new())?;
     let bootstrap =
-        begin_migration_checkout_registry_bootstrap(&layout.projects_path, bootstrap_registry)
-            .map_err(|failure| {
-                ProjectCatalogMigrationError::new(
-                    failure.error.code(),
-                    "migration checkout registry bootstrap failed",
-                    facade_mutation_disposition(failure.disposition),
-                )
-            })?;
+        begin_migration_checkout_registry_bootstrap(&layout.projects_path).map_err(|failure| {
+            ProjectCatalogMigrationError::new(
+                failure.error.code(),
+                "migration checkout registry bootstrap failed",
+                facade_mutation_disposition(failure.disposition),
+            )
+        })?;
     let session = match bootstrap {
         MigrationCheckoutRegistryBootstrapV1::FreshLegacyNotInstalled => return Ok(None),
-        MigrationCheckoutRegistryBootstrapV1::RequiresCheckoutDiscovery(session) => session,
+        MigrationCheckoutRegistryBootstrapV1::RequiresRegistry(session) => session,
     };
+    let bootstrap_disposition = facade_mutation_disposition(session.disposition());
+    let bootstrap_registry = build_registry(layout, &BTreeMap::new())
+        .map_err(|error| error.with_mutation_disposition(bootstrap_disposition))?;
+    let session = session
+        .bind_registry(bootstrap_registry)
+        .map_err(|failure| {
+            ProjectCatalogMigrationError::new(
+                failure.error.code(),
+                "migration checkout registry binding failed",
+                facade_mutation_disposition(failure.disposition),
+            )
+        })?;
     let bootstrap_disposition = facade_mutation_disposition(session.disposition());
     let checkout_roots = discover_checkout_roots(layout)
         .map_err(|error| error.with_mutation_disposition(bootstrap_disposition))?;

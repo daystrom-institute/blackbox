@@ -741,10 +741,18 @@ pub(crate) struct MigrationParticipantRegistry {
 
 pub(crate) enum MigrationCheckoutRegistryBootstrapV1 {
     FreshLegacyNotInstalled,
-    RequiresCheckoutDiscovery(MigrationCheckoutRegistryBootstrapSessionV1),
+    RequiresRegistry(MigrationCheckoutRegistryBootstrapSessionV1),
 }
 
 pub(crate) struct MigrationCheckoutRegistryBootstrapSessionV1 {
+    owner: ProjectCatalogTransactionOwner,
+    journal: ProjectCatalogTransactionJournalV1,
+    disposition: MigrationMutationDispositionV1,
+    lifetime_lock: Arc<ProjectCatalogMigrationLock>,
+    mutation_lock: StoreLockGuard,
+}
+
+pub(crate) struct MigrationCheckoutRegistryBoundSessionV1 {
     owner: ProjectCatalogTransactionOwner,
     base_registry: MigrationParticipantRegistry,
     journal: ProjectCatalogTransactionJournalV1,
@@ -758,8 +766,8 @@ impl fmt::Debug for MigrationCheckoutRegistryBootstrapV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::FreshLegacyNotInstalled => formatter.write_str("FreshLegacyNotInstalled"),
-            Self::RequiresCheckoutDiscovery(session) => formatter
-                .debug_struct("RequiresCheckoutDiscovery")
+            Self::RequiresRegistry(session) => formatter
+                .debug_struct("RequiresRegistry")
                 .field("disposition", &session.disposition)
                 .finish_non_exhaustive(),
         }
@@ -975,51 +983,28 @@ impl MigrationParticipantRegistry {
 
 pub(crate) fn begin_migration_checkout_registry_bootstrap(
     projects_path: &Path,
-    registry_without_checkouts: MigrationParticipantRegistry,
 ) -> Result<MigrationCheckoutRegistryBootstrapV1, MigrationBootstrapFailureV1> {
-    begin_migration_checkout_registry_bootstrap_with_io(
-        projects_path,
-        registry_without_checkouts,
-        Arc::new(RealCatalogStoreIo),
-    )
+    begin_migration_checkout_registry_bootstrap_with_io(projects_path, Arc::new(RealCatalogStoreIo))
 }
 
 fn begin_migration_checkout_registry_bootstrap_with_io(
     projects_path: &Path,
-    registry_without_checkouts: MigrationParticipantRegistry,
     io: Arc<dyn CatalogStoreIo>,
 ) -> Result<MigrationCheckoutRegistryBootstrapV1, MigrationBootstrapFailureV1> {
-    let registry_without_checkouts = registry_without_checkouts
-        .validate()
-        .map_err(bootstrap_pre_entry_failure)?;
-    if registry_without_checkouts.catalog_path != projects_path
-        || !registry_without_checkouts
-            .checkout_identity_markers
-            .is_empty()
-    {
-        return Err(bootstrap_pre_entry_failure(ProjectCatalogStoreError::new(
-            "error.project_catalog_invalid_migration_registry",
-            "migration bootstrap requires the matching checkout-empty registry",
-        )));
-    }
     let paths = ProjectCatalogPaths::derive(projects_path).map_err(bootstrap_pre_entry_failure)?;
     let lifetime_lock = Arc::new(
         ProjectCatalogMigrationLock::acquire_shared(&paths.catalog)
             .map_err(|error| io_error("acquire lifetime lock for", &paths.catalog, error))
             .map_err(bootstrap_pre_entry_failure)?,
     );
-    let base_registry = registry_without_checkouts.clone();
     let owner = ProjectCatalogTransactionOwner {
         paths,
-        registry: ParticipantRegistry::Migration(Arc::new(registry_without_checkouts)),
+        registry: ParticipantRegistry::Regular,
         io,
     };
     let mutation_lock = owner
         .io
         .acquire_mutation_lock(&owner.paths.catalog)
-        .map_err(bootstrap_pre_entry_failure)?;
-    let auxiliary_locks = owner
-        .acquire_auxiliary_locks()
         .map_err(bootstrap_pre_entry_failure)?;
     let Some(journal) = owner
         .read_journal_locked()
@@ -1071,22 +1056,68 @@ fn begin_migration_checkout_registry_bootstrap_with_io(
             journal_disposition,
         ));
     }
-    return Ok(
-        MigrationCheckoutRegistryBootstrapV1::RequiresCheckoutDiscovery(
-            MigrationCheckoutRegistryBootstrapSessionV1 {
-                owner,
-                base_registry,
-                journal,
-                disposition: journal_disposition,
-                lifetime_lock,
-                mutation_lock,
-                auxiliary_locks,
-            },
-        ),
-    );
+    return Ok(MigrationCheckoutRegistryBootstrapV1::RequiresRegistry(
+        MigrationCheckoutRegistryBootstrapSessionV1 {
+            owner,
+            journal,
+            disposition: journal_disposition,
+            lifetime_lock,
+            mutation_lock,
+        },
+    ));
 }
 
 impl MigrationCheckoutRegistryBootstrapSessionV1 {
+    pub(crate) fn disposition(&self) -> MigrationMutationDispositionV1 {
+        self.disposition
+    }
+
+    pub(crate) fn bind_registry(
+        mut self,
+        registry_without_checkouts: MigrationParticipantRegistry,
+    ) -> Result<MigrationCheckoutRegistryBoundSessionV1, MigrationStoreOpenFailureV1> {
+        let registry_without_checkouts =
+            registry_without_checkouts
+                .validate()
+                .map_err(|error| MigrationStoreOpenFailureV1 {
+                    error,
+                    disposition: self.disposition,
+                })?;
+        if registry_without_checkouts.catalog_path != self.owner.paths.catalog
+            || !registry_without_checkouts
+                .checkout_identity_markers
+                .is_empty()
+        {
+            return Err(MigrationStoreOpenFailureV1 {
+                error: ProjectCatalogStoreError::new(
+                    "error.project_catalog_invalid_migration_registry",
+                    "migration bootstrap requires the matching checkout-empty registry",
+                ),
+                disposition: self.disposition,
+            });
+        }
+        let base_registry = registry_without_checkouts.clone();
+        self.owner.registry = ParticipantRegistry::Migration(Arc::new(registry_without_checkouts));
+        let auxiliary_locks =
+            self.owner
+                .acquire_auxiliary_locks()
+                .map_err(|error| MigrationStoreOpenFailureV1 {
+                    error,
+                    disposition: self.disposition,
+                })?;
+        Ok(MigrationCheckoutRegistryBoundSessionV1 {
+            owner: self.owner,
+            base_registry,
+            journal: self.journal,
+            disposition: self.disposition,
+            lifetime_lock: self.lifetime_lock,
+            mutation_lock: self.mutation_lock,
+            auxiliary_locks,
+        })
+    }
+}
+
+impl MigrationCheckoutRegistryBoundSessionV1 {
     pub(crate) fn disposition(&self) -> MigrationMutationDispositionV1 {
         self.disposition
     }
@@ -1260,18 +1291,25 @@ impl MigrationCheckoutRegistryBootstrapSessionV1 {
         self.owner.registry = ParticipantRegistry::Migration(Arc::new(registry));
         self.owner
             .recover_locked()
-            .map_err(open_recovery_uncertain_failure)?;
+            .map_err(|error| MigrationStoreOpenFailureV1 {
+                error,
+                disposition: self.disposition,
+            })?;
         let disposition = self
             .owner
             .read_journal_locked()
-            .map_err(open_recovery_uncertain_failure)?
+            .map_err(|error| MigrationStoreOpenFailureV1 {
+                error,
+                disposition: self.disposition,
+            })?
             .as_ref()
             .and_then(|journal| recovered_journal_disposition(Some(journal)))
-            .ok_or_else(|| {
-                open_recovery_uncertain_failure(ProjectCatalogStoreError::new(
+            .ok_or_else(|| MigrationStoreOpenFailureV1 {
+                error: ProjectCatalogStoreError::new(
                     "error.project_catalog_recovery_incomplete",
                     "migration bootstrap recovery did not reach a terminal journal outcome",
-                ))
+                ),
+                disposition: self.disposition,
             })?;
         let current = Arc::new(
             self.owner
@@ -13647,7 +13685,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             failure.disposition,
-            MigrationMutationDispositionV1::RetryExactPlanRequired
+            MigrationMutationDispositionV1::RecoveredToCommittedState
         );
     }
 
@@ -13812,8 +13850,6 @@ mod tests {
 
         let (_directory, path, plan, _, _) = migration_fault_fixture();
         let retry = plan.clone();
-        let mut bootstrap_registry = plan.registry.clone();
-        bootstrap_registry.checkout_identity_markers.clear();
         let publisher_source = plan.registry.legacy_publisher_ref_source.clone();
         assert!(
             transact_migration_with_io(
@@ -13832,8 +13868,7 @@ mod tests {
             MigrationMutationDispositionV1::RecoveredToOldState
         );
 
-        let bootstrap_failure =
-            begin_migration_checkout_registry_bootstrap(&path, bootstrap_registry).unwrap_err();
+        let bootstrap_failure = begin_migration_checkout_registry_bootstrap(&path).unwrap_err();
 
         assert_eq!(
             bootstrap_failure.disposition,
@@ -13848,12 +13883,11 @@ mod tests {
         bootstrap_registry.checkout_identity_markers.clear();
         transact_migration(&path, plan).unwrap();
 
-        let bootstrap =
-            begin_migration_checkout_registry_bootstrap(&path, bootstrap_registry).unwrap();
-        let MigrationCheckoutRegistryBootstrapV1::RequiresCheckoutDiscovery(session) = bootstrap
-        else {
-            panic!("committed migration requires checkout discovery")
+        let bootstrap = begin_migration_checkout_registry_bootstrap(&path).unwrap();
+        let MigrationCheckoutRegistryBootstrapV1::RequiresRegistry(session) = bootstrap else {
+            panic!("committed migration requires its participant registry")
         };
+        let session = session.bind_registry(bootstrap_registry).unwrap();
         let bootstrap_failure = session.finish_open(&BTreeMap::new()).unwrap_err();
 
         assert_eq!(
@@ -13892,18 +13926,17 @@ mod tests {
 
         let bootstrap = begin_migration_checkout_registry_bootstrap_with_io(
             &path,
-            bootstrap_registry,
             Arc::new(TracingIo::failing_reads([paths.migration_marker])),
         )
         .unwrap();
-        let MigrationCheckoutRegistryBootstrapV1::RequiresCheckoutDiscovery(session) = bootstrap
-        else {
-            panic!("committed migration requires checkout discovery")
+        let MigrationCheckoutRegistryBootstrapV1::RequiresRegistry(session) = bootstrap else {
+            panic!("committed migration requires its participant registry")
         };
         assert_eq!(
             session.disposition(),
             MigrationMutationDispositionV1::RecoveredToCommittedState
         );
+        let session = session.bind_registry(bootstrap_registry).unwrap();
 
         let failure = session.finish_open(&checkout_bindings).unwrap_err();
 
