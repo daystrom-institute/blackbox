@@ -458,7 +458,8 @@ pub fn encode_activation_v2_for_migration(record: &ActivationRecordV2) -> Result
 }
 
 pub fn decode_activation_v2_for_migration(bytes: &[u8]) -> Result<ActivationRecordV2> {
-    let record = decode_bounded_json(bytes, MAX_MIGRATION_RECORD_BYTES, "activation record v2")?;
+    let record: ActivationRecordV2 =
+        decode_bounded_json(bytes, MAX_MIGRATION_RECORD_BYTES, "activation record v2")?;
     record.validate()?;
     Ok(record)
 }
@@ -473,7 +474,7 @@ pub fn encode_stored_generation_v2_for_migration(record: &StoredGenerationV2) ->
 }
 
 pub fn decode_stored_generation_v2_for_migration(bytes: &[u8]) -> Result<StoredGenerationV2> {
-    let record = decode_bounded_json(
+    let record: StoredGenerationV2 = decode_bounded_json(
         bytes,
         MAX_STORED_GENERATION_RECORD_BYTES,
         "stored generation v2",
@@ -496,7 +497,7 @@ pub fn encode_collision_retirement_pending_for_migration(
 pub fn decode_collision_retirement_pending_for_migration(
     bytes: &[u8],
 ) -> Result<CollisionRetirementPendingV1> {
-    let record = decode_bounded_json(
+    let record: CollisionRetirementPendingV1 = decode_bounded_json(
         bytes,
         MAX_COLLISION_RETIREMENT_RECORD_BYTES,
         "collision retirement pending",
@@ -1993,7 +1994,18 @@ fn decode_manifest_jsonl_for_migration(
     max_manifest_files: u64,
 ) -> Result<Vec<ManifestEntry>> {
     let mut entries = Vec::new();
-    for (index, line) in bytes.split_terminator(|byte| *byte == b'\n').enumerate() {
+    let records = if bytes.last() == Some(&b'\n') {
+        &bytes[..bytes.len() - 1]
+    } else {
+        bytes
+    };
+    if records.is_empty() {
+        if bytes.is_empty() {
+            return Ok(entries);
+        }
+        bail!("generation manifest contains an empty record");
+    }
+    for (index, line) in records.split(|byte| *byte == b'\n').enumerate() {
         if line.iter().all(u8::is_ascii_whitespace) {
             bail!("generation manifest contains an empty record");
         }
@@ -2541,6 +2553,18 @@ mod tests {
         assert_eq!(evidence.raw_manifest_sha256, sha256_hex(&bytes));
         assert_eq!(evidence.file_count, 1);
         assert_eq!(evidence.logical_bytes, 3);
+        let mut terminal_empty_record = bytes.clone();
+        terminal_empty_record.push(b'\n');
+        assert!(
+            verify_generation_manifest_for_migration(
+                &terminal_empty_record,
+                &descriptor,
+                "host-a",
+                &generation,
+                &StoreLimits::default(),
+            )
+            .is_err()
+        );
         assert!(
             verify_generation_manifest_for_migration(
                 &bytes,
