@@ -75,8 +75,8 @@ use crate::project_catalog_store::{
     MigrationCodeSourceSnapshotDraftV1, MigrationImmutableAssetDraftV1,
     MigrationLegacyProjectSourceDraftV1, MigrationMutationDispositionV1,
     MigrationParticipantDraftV1, MigrationParticipantRegistry, MigrationPlanDraftV1,
-    MigrationPublisherSourceDraftV1, ParticipantRoleV1, ProjectCatalogStore,
-    PublisherDispositionEvidenceV1, PublisherPinEvidenceV1, Sha256Hex, ValidatedMigrationPlanV1,
+    MigrationPublisherSourceDraftV1, ParticipantRoleV1, PublisherDispositionEvidenceV1,
+    PublisherPinEvidenceV1, Sha256Hex, ValidatedMigrationPlanV1,
     begin_migration_checkout_registry_bootstrap, transact_migration_classified,
     validate_migration_plan,
 };
