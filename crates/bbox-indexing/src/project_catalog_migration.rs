@@ -58,8 +58,7 @@ use crate::project_catalog_inventory::{
     canonical_scope_resolution_id, decode_migration_report_v1, decode_migration_resolution_v1,
     deterministic_repo_history_group_ids, deterministic_repo_history_group_memberships,
     digest_path, digest_published_scope, digest_publisher_full_ref, encode_migration_report_v1,
-    encode_migration_resolution_v1, encode_sensitive_local_path_report_v1, project_authority_scope,
-    validated_quarantine_bindings,
+    encode_migration_resolution_v1, project_authority_scope, validated_quarantine_bindings,
 };
 use crate::project_catalog_inventory_adapters::{
     AttachmentCandidateIdentityPlanV1, AttachmentCandidateKeyV1,
@@ -1719,7 +1718,7 @@ fn build_persisted_identity_plan(
         .iter()
         .map(|attachment| {
             if let Some(prior_id) = prior_attachments.get(attachment.observation_id.as_str())
-                && *prior_id != &attachment.attachment_id
+                && *prior_id != attachment.attachment_id
             {
                 return Err(ProjectCatalogMigrationError::no_mutation(
                     "error.project_catalog_migration_identity_remint",
@@ -1856,7 +1855,7 @@ fn build_base_post_images(
                 .map(move |alias| (alias, selection.owner_project_id.clone()))
         })
         .collect::<BTreeMap<_, _>>();
-    let accepted_aliases = alias_candidates
+    let mut accepted_aliases = alias_candidates
         .into_iter()
         .filter_map(|(alias, owners)| {
             if owners.len() == 1 {
@@ -3502,9 +3501,10 @@ fn prepare_closed_migration(
         ));
     }
     let publisher = prepare_publisher_plan(inventory, &runtime, &assessment, &resolution)?;
-    let catalog_bytes = encode_catalog_snapshot(&base.catalog).map_err(inventory_error)?;
-    let attachment_bytes =
-        encode_attachment_snapshot(&base.attachments).map_err(inventory_error)?;
+    let catalog_bytes = encode_catalog_snapshot(&base.catalog)
+        .map_err(|_| planner_error("catalog post-image cannot be encoded"))?;
+    let attachment_bytes = encode_attachment_snapshot(&base.attachments)
+        .map_err(|_| planner_error("attachment post-image cannot be encoded"))?;
     let mut predicted = PredictedPostImageHashesV1 {
         catalog_hash: Sha256ValueV1::digest(&catalog_bytes),
         attachment_hash: Sha256ValueV1::digest(&attachment_bytes),
@@ -3593,7 +3593,7 @@ fn prepare_closed_migration(
         base.unscoped_legacy_counts.clone(),
         ProjectCatalogMigrationStatusV1::Clean,
     )?;
-    let report_bytes = encode_migration_report_v1(&report).map_err(inventory_error)?;
+    let report_bytes = encode_migration_report_v1(&report, inventory).map_err(inventory_error)?;
     let quarantine_authority =
         validated_quarantine_bindings(inventory, &report, &resolution, &post_image)
             .map_err(inventory_error)?;
@@ -3714,7 +3714,7 @@ fn prepare_assessment_only(
         unscoped,
         status,
     )?;
-    let report_bytes = encode_migration_report_v1(&report).map_err(inventory_error)?;
+    let report_bytes = encode_migration_report_v1(&report, inventory).map_err(inventory_error)?;
     let sensitive_review = prepare_sensitive_review(
         inventory,
         runtime,
@@ -3876,7 +3876,7 @@ fn build_registry(
         &layout.projects_path,
         layout.code_source_root.clone(),
         layout.publisher_refs_path.clone(),
-        layout.store_limits,
+        layout.store_limits.clone(),
     )
     .map_err(store_validation_error)?;
     for (observation_id, root) in checkout_bindings {
