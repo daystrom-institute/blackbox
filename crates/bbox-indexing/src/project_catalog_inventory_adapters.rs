@@ -1016,11 +1016,13 @@ fn observe_code_sources(
         ));
     }
     for collision in &snapshot.owner.inventory.collision_pending {
-        insert_generation_owner(
-            &mut owner_by_generation,
-            &collision.record.generation_id,
-            &collision.project_id,
-        )?;
+        for generation_id in collision.record.entries.keys() {
+            insert_generation_owner(
+                &mut owner_by_generation,
+                generation_id,
+                &collision.project_id,
+            )?;
+        }
     }
     let mut retained_owner_resolutions = Vec::new();
     let mut retained_owner_source_evidence = Vec::new();
@@ -1101,11 +1103,13 @@ fn observe_code_sources(
         .inventory
         .collision_pending
         .iter()
-        .map(|row| {
-            (
-                (row.project_id.clone(), row.record.generation_id.clone()),
-                row,
-            )
+        .flat_map(|row| {
+            row.record.entries.iter().map(|(generation_id, entry)| {
+                (
+                    (row.project_id.clone(), generation_id.clone()),
+                    (row, entry),
+                )
+            })
         })
         .collect::<BTreeMap<_, _>>();
     let ambiguous_generation_ids = retained_owner_resolutions
@@ -1195,21 +1199,9 @@ fn observe_code_sources(
                 present_bytes_state(&generation.manifest_bytes),
                 row_ids,
             ));
-            if let Some(collision) =
+            if let Some((collision, collision_entry)) =
                 collision_by_generation.get(&(project_id.clone(), generation.generation_id.clone()))
             {
-                evidence.push(source_evidence(
-                    &stable_observation_id_v1(
-                        "collision-lifecycle",
-                        &[project_id.as_str().as_bytes()],
-                    )?,
-                    MutableInventorySourceKindV1::CodeSourceCollisionLifecycle,
-                    MutableInventorySourceLocatorV1::CodeSourceCollisionLifecycle {
-                        project_id: project_id.clone(),
-                    },
-                    present_bytes_state(&collision.bytes),
-                    BTreeSet::from([observation_id.clone()]),
-                ));
                 quarantine.push(QuarantinedGenerationObservationV1 {
                     observation_id,
                     project_id: project_id.clone(),
@@ -1221,7 +1213,7 @@ fn observe_code_sources(
                     planned_metadata_v2_hash,
                     collision_lifecycle: CollisionLifecycleObservationV1 {
                         version: collision.record.version,
-                        state: match collision.record.state {
+                        state: match collision_entry.state {
                             CollisionRetirementLifecycleStateV1::Pending => {
                                 CollisionLifecycleStateObservationV1::Pending
                             }
@@ -1233,9 +1225,9 @@ fn observe_code_sources(
                             }
                         },
                         project_id: collision.record.project_id.clone(),
-                        former_scope: collision.record.former_scope.clone(),
-                        generation_id: collision.record.generation_id.clone(),
-                        selector_evidence: match &collision.record.selector_evidence {
+                        former_scope: collision_entry.former_scope.clone(),
+                        generation_id: generation.generation_id.clone(),
+                        selector_evidence: match &collision_entry.selector_evidence {
                             CollisionRetirementSelectorEvidenceV1::ExactMaterialized(selector) => {
                                 DurableSelectorEvidenceV1::ExactMaterialized {
                                     selector_hash: Sha256ValueV1::digest(selector.as_bytes()),
@@ -1245,16 +1237,16 @@ fn observe_code_sources(
                                 DurableSelectorEvidenceV1::NoDurableSelector
                             }
                         },
-                        snapshot_id: collision.record.snapshot_id.clone(),
+                        snapshot_id: collision_entry.snapshot_id.clone(),
                         manifest_sha256: Sha256ValueV1::parse(
-                            collision.record.manifest_sha256.clone(),
+                            collision_entry.manifest_sha256.clone(),
                         )
                         .map_err(|_| invalid_source("collision_manifest_hash_invalid"))?,
                         inventory_hash: Sha256ValueV1::parse(
-                            collision.record.inventory_hash.clone(),
+                            collision_entry.inventory_hash.clone(),
                         )
                         .map_err(|_| invalid_source("collision_inventory_hash_invalid"))?,
-                        plan_hash: Sha256ValueV1::parse(collision.record.plan_hash.clone())
+                        plan_hash: Sha256ValueV1::parse(collision_entry.plan_hash.clone())
                             .map_err(|_| invalid_source("collision_plan_hash_invalid"))?,
                     },
                 });
@@ -1301,6 +1293,30 @@ fn observe_code_sources(
                     planned_metadata_v2_hash,
                 });
             }
+        }
+        if !quarantine.is_empty() {
+            let collision = snapshot
+                .owner
+                .inventory
+                .collision_pending
+                .iter()
+                .find(|collision| collision.project_id == project_id)
+                .ok_or_else(|| invalid_source("collision_lifecycle_missing"))?;
+            evidence.push(source_evidence(
+                &stable_observation_id_v1(
+                    "collision-lifecycle",
+                    &[project_id.as_str().as_bytes()],
+                )?,
+                MutableInventorySourceKindV1::CodeSourceCollisionLifecycle,
+                MutableInventorySourceLocatorV1::CodeSourceCollisionLifecycle {
+                    project_id: project_id.clone(),
+                },
+                present_bytes_state(&collision.bytes),
+                quarantine
+                    .iter()
+                    .map(|generation| generation.observation_id.clone())
+                    .collect(),
+            ));
         }
         let planned_activation_v2_hash = match activation {
             Some(activation) if active_generation_id.is_some() => {
@@ -2226,8 +2242,8 @@ mod tests {
         dirty_fingerprint, generation_id, manifest_sha256, source_selector,
     };
     use bbox_code_source_store::{
-        CodeSourceStorePaths, CollisionRetirementLifecycleV1, MigrationEffectiveSourceManifestV1,
-        MigrationEffectiveSourceSelectionV1, StoredGeneration,
+        CodeSourceStorePaths, CollisionRetirementEntryV1, CollisionRetirementLifecycleV1,
+        MigrationEffectiveSourceManifestV1, MigrationEffectiveSourceSelectionV1, StoredGeneration,
         encode_collision_retirement_pending_for_migration,
         encode_migration_effective_source_manifest_v1,
     };
@@ -2426,15 +2442,21 @@ mod tests {
         );
         let mut collision = CollisionRetirementLifecycleV1 {
             version: 1,
-            state: CollisionRetirementLifecycleStateV1::Pending,
             project_id: project_id.clone(),
-            former_scope: scope.clone(),
-            generation_id: active_generation_id.clone(),
-            selector_evidence: CollisionRetirementSelectorEvidenceV1::ExactMaterialized(selector),
-            snapshot_id: format!("collected-{}", "e".repeat(32)),
-            manifest_sha256: descriptor_manifest_sha256,
-            inventory_hash: "d".repeat(64),
-            plan_hash: "f".repeat(64),
+            entries: BTreeMap::from([(
+                active_generation_id.clone(),
+                CollisionRetirementEntryV1 {
+                    state: CollisionRetirementLifecycleStateV1::Pending,
+                    former_scope: scope.clone(),
+                    selector_evidence: CollisionRetirementSelectorEvidenceV1::ExactMaterialized(
+                        selector,
+                    ),
+                    snapshot_id: format!("collected-{}", "e".repeat(32)),
+                    manifest_sha256: descriptor_manifest_sha256,
+                    inventory_hash: "d".repeat(64),
+                    plan_hash: "f".repeat(64),
+                },
+            )]),
         };
         write(
             &paths.collision_retirement_pending(&project_id),
@@ -2497,7 +2519,12 @@ mod tests {
             quarantined.collision_lifecycle.selector_evidence,
             DurableSelectorEvidenceV1::ExactMaterialized {
                 selector_hash: Sha256ValueV1::digest(
-                    collision.exact_selector().unwrap().as_bytes(),
+                    collision
+                        .entry(&active_generation_id)
+                        .unwrap()
+                        .exact_selector()
+                        .unwrap()
+                        .as_bytes(),
                 ),
             }
         );
@@ -2572,7 +2599,11 @@ mod tests {
             &serde_json::to_vec(&retained_origin).unwrap(),
         );
         collision.project_id = retained_project_id.clone();
-        collision.selector_evidence = CollisionRetirementSelectorEvidenceV1::NoDurableSelector;
+        collision
+            .entries
+            .get_mut(&active_generation_id)
+            .unwrap()
+            .selector_evidence = CollisionRetirementSelectorEvidenceV1::NoDurableSelector;
         write(
             &paths.collision_retirement_pending(&retained_project_id),
             &encode_collision_retirement_pending_for_migration(&collision).unwrap(),

@@ -1497,21 +1497,21 @@ fn validate_code_source_snapshot(
     }
 
     let mut collision_owner_scopes = BTreeMap::new();
-    for activation in planned_activations.values().filter(|activation| {
-        activation.disposition == MigrationCodeSourceDispositionV1::QuarantinedCollision
+    for generation in planned_generations.values().filter(|generation| {
+        generation.disposition == MigrationCodeSourceDispositionV1::QuarantinedCollision
     }) {
-        let inventory_activation = inventory_activations[&activation.project_id];
-        let generation = inventory_generations
-            .get(inventory_activation.record.generation_id.as_str())
-            .ok_or_else(|| fail("collision activation references an omitted generation"))?;
-        if collision_owner_scopes
-            .insert(
-                activation.project_id.clone(),
-                generation.published_scope.clone(),
-            )
-            .is_some()
-        {
-            return Err(fail("collision activation owner is duplicated"));
+        let inventory = inventory_generations[generation.generation_id.as_str()];
+        match collision_owner_scopes.get(&generation.project_id) {
+            Some(scope) if scope != &inventory.published_scope => {
+                return Err(fail("collision owner has conflicting published scopes"));
+            }
+            Some(_) => {}
+            None => {
+                collision_owner_scopes.insert(
+                    generation.project_id.clone(),
+                    inventory.published_scope.clone(),
+                );
+            }
         }
     }
     let mut collision_pending_projects = BTreeSet::new();
@@ -1520,9 +1520,6 @@ fn validate_code_source_snapshot(
         if !collision_pending_projects.insert(pending.project_id.clone()) {
             return Err(fail("legacy collision pending owner is duplicated"));
         }
-        let generation = inventory_generations
-            .get(pending.record.generation_id.as_str())
-            .ok_or_else(|| fail("legacy collision pending generation is omitted"))?;
         let retirement_role = ParticipantRoleV1::CollisionRetirement {
             project_id: pending.project_id.clone(),
         };
@@ -1533,66 +1530,67 @@ fn validate_code_source_snapshot(
                 "legacy collision pending bytes lack their exact participant pre-image",
             ));
         }
-        let planned = planned_generations
-            .get(pending.record.generation_id.as_str())
-            .filter(|planned| {
-                planned.project_id == pending.project_id
-                    && planned.disposition == MigrationCodeSourceDispositionV1::QuarantinedCollision
-            })
-            .ok_or_else(|| fail("legacy collision pending row is not exactly accounted"))?;
-        let _ = planned;
-        match &pending.record.selector_evidence {
-            CollisionRetirementSelectorEvidenceV1::ExactMaterialized(selector) => {
-                if !inventory_activations
-                    .get(&pending.project_id)
-                    .is_some_and(|activation| {
-                        activation.record.generation_id == pending.record.generation_id
-                            && activation.record.selector == *selector
-                            && activation.record.snapshot_id == pending.record.snapshot_id
-                    })
-                {
-                    return Err(fail(
-                        "legacy active collision rewrites its activation evidence",
-                    ));
+        for (generation_id, entry) in &pending.record.entries {
+            let generation = inventory_generations
+                .get(generation_id.as_str())
+                .ok_or_else(|| fail("legacy collision pending generation is omitted"))?;
+            planned_generations
+                .get(generation_id.as_str())
+                .filter(|planned| {
+                    planned.project_id == pending.project_id
+                        && planned.disposition
+                            == MigrationCodeSourceDispositionV1::QuarantinedCollision
+                })
+                .ok_or_else(|| fail("legacy collision pending entry is not exactly accounted"))?;
+            match &entry.selector_evidence {
+                CollisionRetirementSelectorEvidenceV1::ExactMaterialized(selector) => {
+                    if !inventory_activations
+                        .get(&pending.project_id)
+                        .is_some_and(|activation| {
+                            activation.record.generation_id == generation_id.as_str()
+                                && activation.record.selector == *selector
+                                && activation.record.snapshot_id == entry.snapshot_id
+                        })
+                    {
+                        return Err(fail(
+                            "legacy active collision rewrites its activation evidence",
+                        ));
+                    }
+                }
+                CollisionRetirementSelectorEvidenceV1::NoDurableSelector => {
+                    if inventory_activations
+                        .get(&pending.project_id)
+                        .is_some_and(|activation| {
+                            activation.record.generation_id == generation_id.as_str()
+                        })
+                        || generation.record.state == bbox_code_source::GenerationState::Active
+                    {
+                        return Err(fail(
+                            "legacy retained collision suppresses active selector authority",
+                        ));
+                    }
                 }
             }
-            CollisionRetirementSelectorEvidenceV1::NoDurableSelector => {
-                if inventory_activations
-                    .get(&pending.project_id)
-                    .is_some_and(|activation| {
-                        activation.record.generation_id == pending.record.generation_id
-                    })
-                    || generation.record.state == bbox_code_source::GenerationState::Active
-                {
-                    return Err(fail(
-                        "legacy retained collision suppresses active selector authority",
-                    ));
-                }
+            if generation.published_scope != entry.former_scope {
+                return Err(fail(
+                    "legacy collision pending scope and generation scope disagree",
+                ));
             }
-        }
-        if generation.published_scope != pending.record.former_scope {
-            return Err(fail(
-                "legacy collision pending scope and generation scope disagree",
-            ));
-        }
-        match collision_owner_scopes.get(&pending.project_id) {
-            Some(scope) if scope != &generation.published_scope => {
+            if collision_owner_scopes.get(&pending.project_id) != Some(&generation.published_scope)
+            {
                 return Err(fail("collision owner has conflicting published scopes"));
             }
-            Some(_) => {}
-            None => {
-                collision_owner_scopes.insert(
-                    pending.project_id.clone(),
-                    generation.published_scope.clone(),
-                );
-            }
+            accounted_collision_pending.insert((pending.project_id.clone(), generation_id.clone()));
         }
-        accounted_collision_pending.insert((
-            pending.project_id.clone(),
-            pending.record.generation_id.clone(),
-        ));
     }
-    if accounted_collision_pending.len() != snapshot.legacy_inventory.collision_pending.len() {
+    if accounted_collision_pending.len()
+        != snapshot
+            .legacy_inventory
+            .collision_pending
+            .iter()
+            .map(|row| row.record.entries.len())
+            .sum()
+    {
         return Err(fail(
             "legacy collision pending rows are not consumed exactly once",
         ));
@@ -1772,13 +1770,34 @@ fn validate_code_source_snapshot(
                 let retirement =
                     decode_collision_retirement_pending_for_migration(retirement_bytes)
                         .map_err(|error| fail(error.to_string()))?;
-                if retirement.state != CollisionRetirementLifecycleStateV1::Pending
-                    || retirement.project_id != evidence.project_id
-                    || retirement.former_scope != inventory.published_scope
-                    || retirement.generation_id != evidence.generation_id.as_str()
-                    || retirement.manifest_sha256 != inventory.record.descriptor.manifest_sha256
-                    || retirement.inventory_hash != inventory_sha256.as_str()
-                    || retirement.plan_hash != plan_hash.as_str()
+                let expected_generation_ids = snapshot
+                    .generations
+                    .iter()
+                    .filter(|generation| {
+                        generation.project_id == evidence.project_id
+                            && generation.disposition
+                                == MigrationCodeSourceDispositionV1::QuarantinedCollision
+                    })
+                    .map(|generation| generation.generation_id.to_string())
+                    .collect::<BTreeSet<_>>();
+                if retirement.project_id != evidence.project_id
+                    || retirement.entries.keys().cloned().collect::<BTreeSet<_>>()
+                        != expected_generation_ids
+                {
+                    return Err(fail(
+                        "collision retirement membership does not exactly cover the losing project",
+                    ));
+                }
+                let retirement_entry = retirement
+                    .entries
+                    .get(evidence.generation_id.as_str())
+                    .ok_or_else(|| fail("collision retirement generation entry is absent"))?;
+                if retirement_entry.state != CollisionRetirementLifecycleStateV1::Pending
+                    || retirement_entry.former_scope != inventory.published_scope
+                    || retirement_entry.manifest_sha256
+                        != inventory.record.descriptor.manifest_sha256
+                    || retirement_entry.inventory_hash != inventory_sha256.as_str()
+                    || retirement_entry.plan_hash != plan_hash.as_str()
                 {
                     return Err(fail("collision retirement rewrites source evidence"));
                 }
@@ -1801,8 +1820,9 @@ fn validate_code_source_snapshot(
                     {
                         return Err(fail("quarantined activation remains active or selected"));
                     }
-                    if retirement.exact_selector() != Some(old_activation.record.selector.as_str())
-                        || retirement.snapshot_id != old_activation.record.snapshot_id
+                    if retirement_entry.exact_selector()
+                        != Some(old_activation.record.selector.as_str())
+                        || retirement_entry.snapshot_id != old_activation.record.snapshot_id
                     {
                         return Err(fail(
                             "active collision retirement rewrites selector evidence",
@@ -1812,7 +1832,7 @@ fn validate_code_source_snapshot(
                     if old_effective.is_some() {
                         accounted_old_selections.insert(evidence.project_id.clone());
                     }
-                } else if retirement.selector_evidence
+                } else if retirement_entry.selector_evidence
                     != CollisionRetirementSelectorEvidenceV1::NoDurableSelector
                 {
                     return Err(fail(
@@ -1913,16 +1933,23 @@ fn validate_new_side_cross_roles(
             .ok_or_else(|| fail("collision retirement post-image is absent"))?;
         let retirement = decode_collision_retirement_pending_for_migration(bytes)
             .map_err(|error| fail(&error.to_string()))?;
-        if retirement.state != CollisionRetirementLifecycleStateV1::Pending
-            || retirement.project_id != *project_id
-            || collision_owner_scopes
-                .insert(project_id.clone(), retirement.former_scope)
-                .is_some()
-        {
+        let scopes = retirement
+            .entries
+            .values()
+            .map(|entry| entry.former_scope.clone())
+            .collect::<BTreeSet<_>>();
+        if retirement.project_id != *project_id || scopes.len() != 1 {
             return Err(fail(
                 "collision retirement role does not define one exact owner scope",
             ));
         }
+        collision_owner_scopes.insert(
+            project_id.clone(),
+            scopes
+                .into_iter()
+                .next()
+                .expect("non-empty lifecycle has one scope"),
+        );
     }
     let mut stored_generations = std::collections::BTreeMap::new();
     for (role, post_image) in post_images {
@@ -2026,57 +2053,71 @@ fn validate_new_side_cross_roles(
                     .projects
                     .get(project_id)
                     .ok_or_else(|| fail("collision retirement project is absent from catalog"))?;
-                let generation_id = Sha256Hex::parse(retirement.generation_id.clone())
-                    .map_err(|_| fail("collision retirement generation id is invalid"))?;
-                let manifest_hash = Sha256Hex::parse(retirement.manifest_sha256.clone())
-                    .map_err(|_| fail("collision retirement manifest hash is invalid"))?;
                 let activation_role = ParticipantRoleV1::Activation {
                     project_id: project_id.clone(),
                 };
-                let selector_authority_matches = match &retirement.selector_evidence {
-                    CollisionRetirementSelectorEvidenceV1::ExactMaterialized(_) => {
-                        post_images.get(&activation_role) == Some(&None)
-                    }
-                    CollisionRetirementSelectorEvidenceV1::NoDurableSelector => {
-                        !post_images.contains_key(&activation_role)
-                    }
+                let exact_entry_count = retirement
+                    .entries
+                    .values()
+                    .filter(|entry| {
+                        matches!(
+                            entry.selector_evidence,
+                            CollisionRetirementSelectorEvidenceV1::ExactMaterialized(_)
+                        )
+                    })
+                    .count();
+                let selector_authority_matches = match exact_entry_count {
+                    0 => !post_images.contains_key(&activation_role),
+                    1 => post_images.get(&activation_role) == Some(&None),
+                    _ => false,
                 };
-                if retirement.state != CollisionRetirementLifecycleStateV1::Pending
-                    || &retirement.project_id != project_id
+                if &retirement.project_id != project_id
                     || project.scope != ProjectScope::LegacyLocal
-                    || retirement.inventory_hash != inventory_sha256.as_str()
-                    || retirement.plan_hash != plan_hash.as_str()
                     || !selector_authority_matches
-                    || image_for(&ParticipantRoleV1::StoredGenerationMetadata {
-                        project_id: project_id.clone(),
-                        published_scope: retirement.former_scope.clone(),
-                        generation_id: generation_id.clone(),
-                    })?
-                    .is_none()
                     || effective_by_project.contains_key(project_id)
                 {
                     return Err(fail(
                         "collision retirement role, catalog, hashes, or retained source disagree",
                     ));
                 }
-                let manifest_role = ImmutableAssetRoleV1::CollectedGenerationManifest {
-                    published_scope: retirement.former_scope.clone(),
-                    generation_id: generation_id.clone(),
-                };
-                let manifest = immutable_for(&manifest_role)?;
-                let stored = stored_generations
-                    .get(&(
-                        project_id.clone(),
-                        retirement.former_scope.clone(),
-                        generation_id,
-                    ))
-                    .ok_or_else(|| fail("collision retirement lacks retained metadata"))?;
-                if manifest.mode != ImmutableAssetModeV1::PinnedExisting
-                    || stored.descriptor.manifest_sha256 != manifest_hash.as_str()
-                {
-                    return Err(fail(
-                        "collision retirement lacks exact retained manifest evidence",
-                    ));
+                for (generation_id, entry) in &retirement.entries {
+                    let generation_id = Sha256Hex::parse(generation_id.clone())
+                        .map_err(|_| fail("collision retirement generation id is invalid"))?;
+                    let manifest_hash = Sha256Hex::parse(entry.manifest_sha256.clone())
+                        .map_err(|_| fail("collision retirement manifest hash is invalid"))?;
+                    if entry.state != CollisionRetirementLifecycleStateV1::Pending
+                        || entry.inventory_hash != inventory_sha256.as_str()
+                        || entry.plan_hash != plan_hash.as_str()
+                        || image_for(&ParticipantRoleV1::StoredGenerationMetadata {
+                            project_id: project_id.clone(),
+                            published_scope: entry.former_scope.clone(),
+                            generation_id: generation_id.clone(),
+                        })?
+                        .is_none()
+                    {
+                        return Err(fail(
+                            "collision retirement entry rewrites migration evidence",
+                        ));
+                    }
+                    let manifest_role = ImmutableAssetRoleV1::CollectedGenerationManifest {
+                        published_scope: entry.former_scope.clone(),
+                        generation_id: generation_id.clone(),
+                    };
+                    let manifest = immutable_for(&manifest_role)?;
+                    let stored = stored_generations
+                        .get(&(
+                            project_id.clone(),
+                            entry.former_scope.clone(),
+                            generation_id,
+                        ))
+                        .ok_or_else(|| fail("collision retirement lacks retained metadata"))?;
+                    if manifest.mode != ImmutableAssetModeV1::PinnedExisting
+                        || stored.descriptor.manifest_sha256 != manifest_hash.as_str()
+                    {
+                        return Err(fail(
+                            "collision retirement lacks exact retained manifest evidence",
+                        ));
+                    }
                 }
             }
             ParticipantRoleV1::Catalog
@@ -2126,11 +2167,15 @@ fn validate_new_side_cross_roles(
                 else {
                     return false;
                 };
-                retirement.state == CollisionRetirementLifecycleStateV1::Pending
-                    && &retirement.project_id == project_id
-                    && &retirement.former_scope == published_scope
-                    && retirement.generation_id == generation_id.as_str()
-                    && retirement.manifest_sha256 == asset.sha256.as_str()
+                retirement.project_id == *project_id
+                    && retirement
+                        .entries
+                        .get(generation_id.as_str())
+                        .is_some_and(|entry| {
+                            entry.state == CollisionRetirementLifecycleStateV1::Pending
+                                && &entry.former_scope == published_scope
+                                && entry.manifest_sha256 == asset.sha256.as_str()
+                        })
             }) || post_images.iter().any(|(role, image)| {
                 matches!(
                     role,
@@ -3018,50 +3063,41 @@ impl ProjectCatalogTransactionOwner {
             ));
         };
         let state = self.read_strict_pair_locked()?;
-        let mut expected_retirement_selectors = BTreeSet::new();
+        let mut expected_collision_generations = BTreeSet::new();
         for participant in &journal.participants {
             let ParticipantRoleV1::CollisionRetirement { project_id } = &participant.role else {
                 continue;
             };
-            let Some(activation_participant) = journal.participants.iter().find(|candidate| {
-                candidate.role
-                    == (ParticipantRoleV1::Activation {
-                        project_id: project_id.clone(),
-                    })
-            }) else {
-                continue;
-            };
-            let ExpectedImageV1::Present { artifact_name, .. } = &activation_participant.old else {
+            let generation_ids = journal
+                .participants
+                .iter()
+                .filter_map(|candidate| match &candidate.role {
+                    ParticipantRoleV1::StoredGenerationMetadata {
+                        project_id: owner,
+                        generation_id,
+                        ..
+                    } if owner == project_id => Some(generation_id.to_string()),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            if generation_ids.is_empty() {
                 return Err(ProjectCatalogStoreError::new(
                     "error.project_catalog_migration_incomplete",
-                    "historical collision activation evidence is absent",
+                    "historical collision lacks generation participant evidence",
                 ));
-            };
-            let bytes = self
-                .io
-                .read_regular_nofollow(
-                    &self.paths.backup_dir.join(artifact_name.as_str()),
-                    MAX_CODE_SOURCE_ACTIVATION_BYTES,
-                )?
-                .ok_or_else(|| {
-                    ProjectCatalogStoreError::new(
-                        "error.project_catalog_migration_incomplete",
-                        "historical collision activation backup is missing",
-                    )
-                })?;
-            let activation = decode_activation_v1_for_migration(&bytes).map_err(|error| {
-                ProjectCatalogStoreError::new(
-                    "error.project_catalog_migration_incomplete",
-                    error.to_string(),
-                )
-            })?;
-            expected_retirement_selectors.insert(activation.selector);
+            }
+            expected_collision_generations.extend(
+                generation_ids
+                    .into_iter()
+                    .map(|generation_id| (project_id.clone(), generation_id)),
+            );
         }
         let current = enumerate_current_migration_inventory_for_scopes_locked(
             &registry.code_source_paths,
             &registry.code_source_limits,
             &published_catalog_scopes(&state.catalog),
-            &expected_retirement_selectors,
+            &BTreeSet::new(),
+            &expected_collision_generations,
         )
         .map_err(|error| {
             ProjectCatalogStoreError::new(
@@ -3136,14 +3172,51 @@ impl ProjectCatalogTransactionOwner {
                         "historical collision lacks its durable lifecycle record",
                     )
                 })?;
+            let expected_generation_ids = expected_collision_generations
+                .iter()
+                .filter(|(owner, _)| owner == project_id)
+                .map(|(_, generation_id)| generation_id.clone())
+                .collect::<BTreeSet<_>>();
+            if lifecycle
+                .record
+                .entries
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                != expected_generation_ids
+            {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_migration_incomplete",
+                    "historical collision lifecycle membership changed",
+                ));
+            }
             let activation_participant = journal.participants.iter().find(|candidate| {
                 candidate.role
                     == (ParticipantRoleV1::Activation {
                         project_id: project_id.clone(),
                     })
             });
-            let old_activation = match &lifecycle.record.selector_evidence {
-                CollisionRetirementSelectorEvidenceV1::ExactMaterialized(selector) => {
+            let exact_entries = lifecycle
+                .record
+                .entries
+                .iter()
+                .filter_map(|(generation_id, entry)| {
+                    entry
+                        .exact_selector()
+                        .map(|selector| (generation_id, entry, selector))
+                })
+                .collect::<Vec<_>>();
+            let old_activation = match exact_entries.as_slice() {
+                [] => {
+                    if activation_participant.is_some() {
+                        return Err(ProjectCatalogStoreError::new(
+                            "error.project_catalog_migration_incomplete",
+                            "retained historical collision acquired activation authority",
+                        ));
+                    }
+                    None
+                }
+                [(generation_id, entry, selector)] => {
                     let activation_participant = activation_participant.ok_or_else(|| {
                         ProjectCatalogStoreError::new(
                             "error.project_catalog_migration_incomplete",
@@ -3186,12 +3259,12 @@ impl ProjectCatalogTransactionOwner {
                             )
                         })?;
                     if old_activation.selector != *selector
-                        || old_activation.generation_id != lifecycle.record.generation_id
-                        || current.activations.iter().any(|row| {
-                            row.project_id == *project_id
-                                && row.record.selector == old_activation.selector
-                                && row.record.generation_id == old_activation.generation_id
-                        })
+                        || old_activation.generation_id != generation_id.as_str()
+                        || old_activation.snapshot_id != entry.snapshot_id
+                        || current
+                            .activations
+                            .iter()
+                            .any(|row| row.project_id == *project_id)
                     {
                         return Err(ProjectCatalogStoreError::new(
                             "error.project_catalog_migration_incomplete",
@@ -3200,134 +3273,116 @@ impl ProjectCatalogTransactionOwner {
                     }
                     Some(old_activation)
                 }
-                CollisionRetirementSelectorEvidenceV1::NoDurableSelector => {
-                    if activation_participant.is_some() {
-                        return Err(ProjectCatalogStoreError::new(
-                            "error.project_catalog_migration_incomplete",
-                            "retained historical collision acquired activation authority",
-                        ));
-                    }
-                    None
+                _ => {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_migration_incomplete",
+                        "historical collision has multiple active selector entries",
+                    ));
                 }
             };
-            let stored_participant = journal
-                .participants
-                .iter()
-                .find(|candidate| match &candidate.role {
-                    ParticipantRoleV1::StoredGenerationMetadata {
-                        project_id: owner,
-                        published_scope,
-                        generation_id,
-                    } if owner == project_id
-                        && published_scope == &lifecycle.record.former_scope
-                        && generation_id.as_str() == lifecycle.record.generation_id =>
-                    {
-                        true
-                    }
-                    _ => false,
-                })
-                .ok_or_else(|| {
-                    ProjectCatalogStoreError::new(
-                        "error.project_catalog_migration_incomplete",
-                        "historical collision lacks its scope-bearing generation evidence",
-                    )
-                })?;
-            let ParticipantRoleV1::StoredGenerationMetadata {
-                published_scope: former_scope,
-                ..
-            } = &stored_participant.role
-            else {
-                unreachable!("stored participant role was selected above");
-            };
-            let ExpectedImageV1::Present {
-                sha256: expected_stored,
-                artifact_name: stored_artifact_name,
-            } = &stored_participant.old
-            else {
-                return Err(ProjectCatalogStoreError::new(
-                    "error.project_catalog_migration_incomplete",
-                    "historical collision stored evidence is absent",
-                ));
-            };
-            let old_stored_bytes = self
-                .io
-                .read_regular_nofollow(
-                    &self.paths.backup_dir.join(stored_artifact_name.as_str()),
-                    MAX_CODE_SOURCE_GENERATION_METADATA_BYTES,
-                )?
-                .ok_or_else(|| {
-                    ProjectCatalogStoreError::new(
-                        "error.project_catalog_migration_incomplete",
-                        "historical collision stored backup is missing",
-                    )
-                })?;
-            if sha256(&old_stored_bytes) != *expected_stored {
-                return Err(ProjectCatalogStoreError::new(
-                    "error.project_catalog_migration_incomplete",
-                    "historical collision stored backup hash disagrees",
-                ));
-            }
-            let old_stored =
-                decode_stored_generation_v1_for_migration(&old_stored_bytes).map_err(|error| {
-                    ProjectCatalogStoreError::new(
-                        "error.project_catalog_migration_incomplete",
-                        error.to_string(),
-                    )
-                })?;
-            if old_stored.generation_id != lifecycle.record.generation_id
-                || &old_stored.descriptor.scope != former_scope
-            {
-                return Err(ProjectCatalogStoreError::new(
-                    "error.project_catalog_migration_incomplete",
-                    "historical collision stored backup rewrites generation evidence",
-                ));
-            }
-            let _manifest = journal
-                .immutable_assets
-                .iter()
-                .find(|asset| {
-                    asset.role
-                        == (ImmutableAssetRoleV1::CollectedGenerationManifest {
-                            published_scope: former_scope.clone(),
-                            generation_id: Sha256Hex::parse(lifecycle.record.generation_id.clone())
-                                .expect("validated activation generation id"),
-                        })
-                })
-                .ok_or_else(|| {
-                    ProjectCatalogStoreError::new(
-                        "error.project_catalog_migration_incomplete",
-                        "historical collision lacks its immutable manifest evidence",
-                    )
-                })?;
-            if old_activation.as_ref().is_some_and(|activation| {
-                lifecycle.record.exact_selector() != Some(activation.selector.as_str())
-                    || lifecycle.record.snapshot_id != activation.snapshot_id
-                    || lifecycle.record.generation_id != activation.generation_id
-            }) || &lifecycle.record.former_scope != former_scope
-                || lifecycle.record.manifest_sha256.as_str()
-                    != old_stored.descriptor.manifest_sha256.as_str()
-                || lifecycle.record.inventory_hash != marker.inventory_sha256.as_str()
-                || lifecycle.record.plan_hash != marker.plan_hash.as_str()
-            {
-                return Err(ProjectCatalogStoreError::new(
-                    "error.project_catalog_migration_incomplete",
-                    "current collision lifecycle rewrites historical retirement evidence",
-                ));
-            }
-            if let Some(old_activation) = &old_activation {
-                let queue = current
-                    .retirements
+            for (generation_id, entry) in &lifecycle.record.entries {
+                let stored_participant = journal
+                    .participants
                     .iter()
-                    .find(|row| row.record.selector == old_activation.selector);
-                if let Some(queue) = queue
-                    && (queue.record.project_id != old_activation.project_id
-                        || queue.record.snapshot_id != old_activation.snapshot_id
-                        || queue.record.generation_id.as_deref()
-                            != Some(old_activation.generation_id.as_str()))
+                    .find(|candidate| match &candidate.role {
+                        ParticipantRoleV1::StoredGenerationMetadata {
+                            project_id: owner,
+                            published_scope,
+                            generation_id: stored_generation_id,
+                        } => {
+                            owner == project_id
+                                && published_scope == &entry.former_scope
+                                && stored_generation_id.as_str() == generation_id
+                        }
+                        _ => false,
+                    })
+                    .ok_or_else(|| {
+                        ProjectCatalogStoreError::new(
+                            "error.project_catalog_migration_incomplete",
+                            "historical collision lacks its scope-bearing generation evidence",
+                        )
+                    })?;
+                let ExpectedImageV1::Present {
+                    sha256: expected_stored,
+                    artifact_name: stored_artifact_name,
+                } = &stored_participant.old
+                else {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_migration_incomplete",
+                        "historical collision stored evidence is absent",
+                    ));
+                };
+                let old_stored_bytes = self
+                    .io
+                    .read_regular_nofollow(
+                        &self.paths.backup_dir.join(stored_artifact_name.as_str()),
+                        MAX_CODE_SOURCE_GENERATION_METADATA_BYTES,
+                    )?
+                    .ok_or_else(|| {
+                        ProjectCatalogStoreError::new(
+                            "error.project_catalog_migration_incomplete",
+                            "historical collision stored backup is missing",
+                        )
+                    })?;
+                if sha256(&old_stored_bytes) != *expected_stored {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_migration_incomplete",
+                        "historical collision stored backup hash disagrees",
+                    ));
+                }
+                let old_stored = decode_stored_generation_v1_for_migration(&old_stored_bytes)
+                    .map_err(|error| {
+                        ProjectCatalogStoreError::new(
+                            "error.project_catalog_migration_incomplete",
+                            error.to_string(),
+                        )
+                    })?;
+                let generation_id_typed = Sha256Hex::parse(generation_id.clone())
+                    .expect("validated lifecycle generation id");
+                let _manifest = journal
+                    .immutable_assets
+                    .iter()
+                    .find(|asset| {
+                        asset.role
+                            == (ImmutableAssetRoleV1::CollectedGenerationManifest {
+                                published_scope: entry.former_scope.clone(),
+                                generation_id: generation_id_typed.clone(),
+                            })
+                    })
+                    .ok_or_else(|| {
+                        ProjectCatalogStoreError::new(
+                            "error.project_catalog_migration_incomplete",
+                            "historical collision lacks its immutable manifest evidence",
+                        )
+                    })?;
+                let is_active_entry = old_activation
+                    .as_ref()
+                    .is_some_and(|activation| activation.generation_id == generation_id.as_str());
+                if old_stored.generation_id != generation_id.as_str()
+                    || old_stored.descriptor.scope != entry.former_scope
+                    || old_stored.descriptor.manifest_sha256 != entry.manifest_sha256
+                    || entry.inventory_hash != marker.inventory_sha256.as_str()
+                    || entry.plan_hash != marker.plan_hash.as_str()
+                    || (is_active_entry && entry.exact_selector().is_none())
+                    || (!is_active_entry
+                        && entry.selector_evidence
+                            != CollisionRetirementSelectorEvidenceV1::NoDurableSelector)
+                    || (!is_active_entry
+                        && old_stored.state == bbox_code_source::GenerationState::Active)
                 {
                     return Err(ProjectCatalogStoreError::new(
                         "error.project_catalog_migration_incomplete",
-                        "subordinate retirement queue rewrites collision lifecycle evidence",
+                        "current collision lifecycle rewrites historical generation evidence",
+                    ));
+                }
+                let work = current.collision_work.iter().find(|work| {
+                    work.record.project_id == *project_id
+                        && work.record.generation_id == generation_id.as_str()
+                });
+                if entry.state == CollisionRetirementLifecycleStateV1::Queued && work.is_none() {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_migration_incomplete",
+                        "queued collision lifecycle entry lacks subordinate work",
                     ));
                 }
             }
@@ -5086,16 +5141,20 @@ impl ProjectCatalogTransactionOwner {
                             let retirement =
                                 decode_collision_retirement_pending_for_migration(retirement_bytes)
                                     .map_err(|error| fail(&error.to_string()))?;
+                            let retirement_entry =
+                                retirement.entries.get(generation_id.as_str()).ok_or_else(
+                                    || fail("quarantined generation lacks lifecycle entry"),
+                                )?;
                             if &retirement.project_id != project_id
-                                || &retirement.former_scope != published_scope
-                                || retirement.generation_id != generation_id.as_str()
-                                || retirement.exact_selector()
+                                || &retirement_entry.former_scope != published_scope
+                                || retirement_entry.exact_selector()
                                     != Some(old_activation.selector.as_str())
-                                || retirement.snapshot_id != old_activation.snapshot_id
-                                || retirement.manifest_sha256
+                                || retirement_entry.snapshot_id != old_activation.snapshot_id
+                                || retirement_entry.manifest_sha256
                                     != old_stored.descriptor.manifest_sha256
-                                || retirement.inventory_hash != marker.inventory_sha256.as_str()
-                                || retirement.plan_hash != marker.plan_hash.as_str()
+                                || retirement_entry.inventory_hash
+                                    != marker.inventory_sha256.as_str()
+                                || retirement_entry.plan_hash != marker.plan_hash.as_str()
                             {
                                 return Err(fail(
                                     "collision retirement rewrites exact old source evidence",
@@ -5125,16 +5184,19 @@ impl ProjectCatalogTransactionOwner {
                                     retirement_bytes,
                                 )
                                 .map_err(|error| fail(&error.to_string()))?;
-                                if retirement.generation_id == generation_id.as_str() {
+                                if let Some(retirement_entry) =
+                                    retirement.entries.get(generation_id.as_str())
+                                {
                                     if &retirement.project_id != project_id
-                                        || &retirement.former_scope != published_scope
-                                        || retirement.selector_evidence
+                                        || &retirement_entry.former_scope != published_scope
+                                        || retirement_entry.selector_evidence
                                             != CollisionRetirementSelectorEvidenceV1::NoDurableSelector
-                                        || retirement.manifest_sha256
+                                        || retirement_entry.manifest_sha256
                                             != old_stored.descriptor.manifest_sha256
-                                        || retirement.inventory_hash
+                                        || retirement_entry.inventory_hash
                                             != marker.inventory_sha256.as_str()
-                                        || retirement.plan_hash != marker.plan_hash.as_str()
+                                        || retirement_entry.plan_hash
+                                            != marker.plan_hash.as_str()
                                     {
                                         return Err(fail(
                                             "retained collision rewrites owner or immutable evidence",
@@ -8555,18 +8617,39 @@ mod tests {
             ));
         let legacy_retirement = bbox_code_source_store::CollisionRetirementLifecycleV1 {
             version: 1,
-            state: bbox_code_source_store::CollisionRetirementLifecycleStateV1::Pending,
             project_id: project_id.clone(),
-            former_scope: former_scope.clone(),
-            generation_id: generation_id.to_string(),
-            selector_evidence:
-                bbox_code_source_store::CollisionRetirementSelectorEvidenceV1::ExactMaterialized(
-                    selector.clone(),
+            entries: BTreeMap::from([
+                (
+                    generation_id.to_string(),
+                    bbox_code_source_store::CollisionRetirementEntryV1 {
+                        state:
+                            bbox_code_source_store::CollisionRetirementLifecycleStateV1::Pending,
+                        former_scope: former_scope.clone(),
+                        selector_evidence: bbox_code_source_store::
+                            CollisionRetirementSelectorEvidenceV1::ExactMaterialized(
+                                selector.clone(),
+                            ),
+                        snapshot_id: activation.snapshot_id.clone(),
+                        manifest_sha256: descriptor.manifest_sha256.clone(),
+                        inventory_hash: "0".repeat(64),
+                        plan_hash: draft.plan_hash.to_string(),
+                    },
                 ),
-            snapshot_id: activation.snapshot_id.clone(),
-            manifest_sha256: descriptor.manifest_sha256.clone(),
-            inventory_hash: "0".repeat(64),
-            plan_hash: draft.plan_hash.to_string(),
+                (
+                    retained_generation_id.to_string(),
+                    bbox_code_source_store::CollisionRetirementEntryV1 {
+                        state:
+                            bbox_code_source_store::CollisionRetirementLifecycleStateV1::Pending,
+                        former_scope: former_scope.clone(),
+                        selector_evidence: bbox_code_source_store::
+                            CollisionRetirementSelectorEvidenceV1::NoDurableSelector,
+                        snapshot_id: format!("collected-{}", "f".repeat(32)),
+                        manifest_sha256: descriptor.manifest_sha256.clone(),
+                        inventory_hash: "0".repeat(64),
+                        plan_hash: draft.plan_hash.to_string(),
+                    },
+                ),
+            ]),
         };
         let legacy_retirement_bytes =
             bbox_code_source_store::encode_collision_retirement_pending_for_migration(
@@ -8590,18 +8673,37 @@ mod tests {
             Sha256Hex::parse(legacy_inventory.canonical_sha256.clone()).unwrap();
         let retirement = bbox_code_source_store::CollisionRetirementLifecycleV1 {
             version: 1,
-            state: bbox_code_source_store::CollisionRetirementLifecycleStateV1::Pending,
             project_id: project_id.clone(),
-            former_scope: former_scope.clone(),
-            generation_id: generation_id.to_string(),
-            selector_evidence:
-                bbox_code_source_store::CollisionRetirementSelectorEvidenceV1::ExactMaterialized(
-                    selector,
+            entries: BTreeMap::from([
+                (
+                    generation_id.to_string(),
+                    bbox_code_source_store::CollisionRetirementEntryV1 {
+                        state:
+                            bbox_code_source_store::CollisionRetirementLifecycleStateV1::Pending,
+                        former_scope: former_scope.clone(),
+                        selector_evidence: bbox_code_source_store::
+                            CollisionRetirementSelectorEvidenceV1::ExactMaterialized(selector),
+                        snapshot_id: activation.snapshot_id,
+                        manifest_sha256: descriptor.manifest_sha256.clone(),
+                        inventory_hash: draft.inventory_sha256.to_string(),
+                        plan_hash: draft.plan_hash.to_string(),
+                    },
                 ),
-            snapshot_id: activation.snapshot_id,
-            manifest_sha256: descriptor.manifest_sha256.clone(),
-            inventory_hash: draft.inventory_sha256.to_string(),
-            plan_hash: draft.plan_hash.to_string(),
+                (
+                    retained_generation_id.to_string(),
+                    bbox_code_source_store::CollisionRetirementEntryV1 {
+                        state:
+                            bbox_code_source_store::CollisionRetirementLifecycleStateV1::Pending,
+                        former_scope: former_scope.clone(),
+                        selector_evidence: bbox_code_source_store::
+                            CollisionRetirementSelectorEvidenceV1::NoDurableSelector,
+                        snapshot_id: format!("collected-{}", "f".repeat(32)),
+                        manifest_sha256: descriptor.manifest_sha256.clone(),
+                        inventory_hash: draft.inventory_sha256.to_string(),
+                        plan_hash: draft.plan_hash.to_string(),
+                    },
+                ),
+            ]),
         };
         let retirement_bytes =
             bbox_code_source_store::encode_collision_retirement_pending_for_migration(&retirement)
@@ -8658,7 +8760,9 @@ mod tests {
                 .as_deref()
                 .expect("collision retirement has a post-image");
             let mut retirement = decode_collision_retirement_pending_for_migration(bytes).unwrap();
-            retirement.inventory_hash = draft.inventory_sha256.to_string();
+            for entry in retirement.entries.values_mut() {
+                entry.inventory_hash = draft.inventory_sha256.to_string();
+            }
             participant.post_image = Some(
                 bbox_code_source_store::encode_collision_retirement_pending_for_migration(
                     &retirement,
@@ -8801,7 +8905,9 @@ mod tests {
                 .as_deref()
                 .expect("collision retirement has a post-image");
             let mut retirement = decode_collision_retirement_pending_for_migration(bytes).unwrap();
-            retirement.inventory_hash = draft.inventory_sha256.to_string();
+            for entry in retirement.entries.values_mut() {
+                entry.inventory_hash = draft.inventory_sha256.to_string();
+            }
             participant.post_image = Some(
                 bbox_code_source_store::encode_collision_retirement_pending_for_migration(
                     &retirement,
@@ -9828,9 +9934,11 @@ mod tests {
         let lifecycle =
             decode_collision_retirement_pending_for_migration(&fs::read(lifecycle_path).unwrap())
                 .unwrap();
-        assert_eq!(
-            lifecycle.state,
-            CollisionRetirementLifecycleStateV1::Pending
+        assert!(
+            lifecycle
+                .entries
+                .values()
+                .all(|entry| entry.state == CollisionRetirementLifecycleStateV1::Pending)
         );
     }
 

@@ -766,8 +766,8 @@ impl V1ProjectCatalogInventory {
                 MutableInventorySourceKindV1::CodeSourceCollisionLifecycle,
                 self.code_sources
                     .iter()
-                    .map(|source| source.quarantine.len())
-                    .sum(),
+                    .filter(|source| !source.quarantine.is_empty())
+                    .count(),
             ),
             (
                 MutableInventorySourceKindV1::CommittedAuthorityProbe,
@@ -4251,7 +4251,13 @@ fn validate_mutable_source_row_coverage(
                 .iter()
                 .map(|row| (row.project_id.clone(), row.observation_id.as_str()))
         })
-        .collect::<BTreeMap<_, _>>();
+        .fold(
+            BTreeMap::<ProjectId, BTreeSet<&str>>::new(),
+            |mut rows, (project_id, observation_id)| {
+                rows.entry(project_id).or_default().insert(observation_id);
+                rows
+            },
+        );
     let checkout_row_by_digest = inventory
         .checkouts
         .iter()
@@ -4272,6 +4278,22 @@ fn validate_mutable_source_row_coverage(
                 .entry(source.source_kind)
                 .or_default()
                 .insert(observation_id);
+        }
+        if let MutableInventorySourceLocatorV1::CodeSourceCollisionLifecycle { project_id } =
+            &source.source_locator
+        {
+            let expected = quarantine_row_by_project
+                .get(project_id)
+                .ok_or_else(|| unknown("collision lifecycle project"))?
+                .iter()
+                .map(|row| (*row).to_string())
+                .collect::<BTreeSet<_>>();
+            if source.row_observation_ids != expected {
+                return Err(invalid(
+                    "collision lifecycle source does not bind its complete generation set",
+                ));
+            }
+            continue;
         }
         let expected_single_row = match &source.source_locator {
             MutableInventorySourceLocatorV1::CodeSourceActivation { project_id } => {
@@ -4296,9 +4318,7 @@ fn validate_mutable_source_row_coverage(
                     .then_some(*observation_id)
                 },
             ),
-            MutableInventorySourceLocatorV1::CodeSourceCollisionLifecycle { project_id } => {
-                quarantine_row_by_project.get(project_id).copied()
-            }
+            MutableInventorySourceLocatorV1::CodeSourceCollisionLifecycle { .. } => unreachable!(),
             MutableInventorySourceLocatorV1::CommittedProjectConfig { project_id, .. }
             | MutableInventorySourceLocatorV1::CommittedProjectConfigUnavailable { project_id } => {
                 authority_row_by_project.get(project_id).copied()

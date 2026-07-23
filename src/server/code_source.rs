@@ -16,9 +16,11 @@ use bbox_code_source::{
     ManifestPage, MissingBlobsPage, validate_producer_id, validate_scope,
 };
 use bbox_code_source_store::{
-    ActivationRecord, CodeSourceStore, RetirementRecord, StoreLimits, StoredGeneration,
+    ActivationRecord, CodeSourceStore, CollisionRetirementWorkV1, RetirementRecord, StoreLimits,
+    StoredGeneration,
 };
 use bbox_corpus_core::identity::PublishedScope;
+use bbox_corpus_core::project_catalog::ProjectId;
 use bbox_corpus_core::project_record::ProjectRecord;
 use bbox_indexing::checkout_access::{
     CheckoutAccessBroker, CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest,
@@ -731,16 +733,69 @@ pub(crate) fn resume_pending_activations(state: Arc<SharedState>) {
     match retirement_records_for_recovery(&store) {
         Ok(records) => {
             for record in records {
-                spawn_retirement(state.clone(), record, None);
+                spawn_retirement(state.clone(), record, None, RetirementCompletion::Ordinary);
             }
         }
         Err(error) => tracing::error!(%error, "loading code-source retirements failed"),
     }
+    match collision_retirement_tasks_for_recovery(&store) {
+        Ok(tasks) => {
+            for task in tasks {
+                match task {
+                    CollisionRetirementRecoveryTask::Exact { work, selector } => {
+                        let record = RetirementRecord {
+                            version: 1,
+                            project_id: work.project_id.to_string(),
+                            selector,
+                            snapshot_id: work.snapshot_id.clone(),
+                            generation_id: Some(work.generation_id.clone()),
+                        };
+                        let completion = RetirementCompletion::Collision {
+                            project_id: work.project_id,
+                            generation_id: work.generation_id,
+                        };
+                        spawn_retirement(state.clone(), record, None, completion);
+                    }
+                    CollisionRetirementRecoveryTask::Selectorless { work } => {
+                        spawn_selectorless_collision_retirement(state.clone(), work);
+                    }
+                }
+            }
+        }
+        Err(error) => tracing::error!(%error, "loading collision retirement work failed"),
+    }
 }
 
 fn retirement_records_for_recovery(store: &CodeSourceStore) -> Result<Vec<RetirementRecord>> {
-    store.reconcile_collision_retirements()?;
     store.retirement_records()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CollisionRetirementRecoveryTask {
+    Exact {
+        work: CollisionRetirementWorkV1,
+        selector: String,
+    },
+    Selectorless {
+        work: CollisionRetirementWorkV1,
+    },
+}
+
+fn collision_retirement_tasks_for_recovery(
+    store: &CodeSourceStore,
+) -> Result<Vec<CollisionRetirementRecoveryTask>> {
+    store.reconcile_collision_retirements()?;
+    store
+        .collision_retirement_work_records()?
+        .into_iter()
+        .map(|work| {
+            if let Some(selector) = work.exact_selector().map(str::to_string) {
+                Ok(CollisionRetirementRecoveryTask::Exact { work, selector })
+            } else {
+                Ok(CollisionRetirementRecoveryTask::Selectorless { work })
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn apply_source_transitions(state: Arc<SharedState>, transitions: SourceTransitions) {
@@ -1282,7 +1337,12 @@ fn schedule_previous_retirement(
         return Ok(());
     };
     state.code_sources.store().enqueue_retirement(&record)?;
-    spawn_retirement(state, record, Some(previous_view));
+    spawn_retirement(
+        state,
+        record,
+        Some(previous_view),
+        RetirementCompletion::Ordinary,
+    );
     Ok(())
 }
 
@@ -1300,7 +1360,7 @@ fn schedule_unactivated_retirement(
         generation_id,
     };
     state.code_sources.store().enqueue_retirement(&record)?;
-    spawn_retirement(state.clone(), record, None);
+    spawn_retirement(state.clone(), record, None, RetirementCompletion::Ordinary);
     Ok(())
 }
 
@@ -1350,6 +1410,7 @@ fn spawn_retirement(
     state: Arc<SharedState>,
     record: RetirementRecord,
     previous_view: Option<Arc<super::CodeReadView>>,
+    completion: RetirementCompletion,
 ) {
     if let Err(error) = std::thread::Builder::new()
         .name("blackbox-code-source-retirement".to_string())
@@ -1494,7 +1555,18 @@ fn spawn_retirement(
                             &record.project_id,
                             "retirement_failed",
                         );
-                        if let Err(error) = store.complete_retirement(&record.selector) {
+                        let completion_result = match &completion {
+                            RetirementCompletion::Ordinary => {
+                                store.complete_retirement(&record.selector)
+                            }
+                            RetirementCompletion::Collision {
+                                project_id,
+                                generation_id,
+                            } => {
+                                store.complete_collision_retirement(project_id, generation_id)
+                            }
+                        };
+                        if let Err(error) = completion_result {
                             tracing::warn!(%error, "completing code-source retirement record failed");
                         }
                         drop(retired);
@@ -1517,6 +1589,82 @@ fn spawn_retirement(
         })
     {
         tracing::error!(%error, "spawning code-source retirement thread failed");
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RetirementCompletion {
+    Ordinary,
+    Collision {
+        project_id: ProjectId,
+        generation_id: String,
+    },
+}
+
+fn spawn_selectorless_collision_retirement(
+    state: Arc<SharedState>,
+    work: CollisionRetirementWorkV1,
+) {
+    if let Err(error) = std::thread::Builder::new()
+        .name("blackbox-code-source-collision-retirement".to_string())
+        .spawn(move || {
+            let store = state.code_sources.store();
+            let generation_is_still_active = match store.load_activation(work.project_id.as_str()) {
+                Ok(activation) => activation
+                    .is_some_and(|activation| activation.generation_id == work.generation_id),
+                Err(error) => {
+                    let _ = store.record_health_failure(
+                        work.project_id.as_str(),
+                        "retirement_failed",
+                        &error.to_string(),
+                    );
+                    tracing::error!(%error, "selectorless retirement activation read failed");
+                    return;
+                }
+            };
+            if generation_is_still_active {
+                let error = anyhow!("selectorless collision retirement generation is active");
+                let _ = store.record_health_failure(
+                    work.project_id.as_str(),
+                    "retirement_failed",
+                    &error.to_string(),
+                );
+                tracing::error!(
+                    project_id = %work.project_id,
+                    generation_id = %work.generation_id,
+                    %error,
+                    "selectorless collision retirement refused"
+                );
+                return;
+            }
+            if let Ok(generation) = store.find_generation(&work.generation_id) {
+                let _ = store.mark_generation_state(
+                    &generation.descriptor.scope,
+                    &work.generation_id,
+                    GenerationState::Superseded,
+                    None,
+                );
+            }
+            if let Err(error) =
+                store.complete_collision_retirement(&work.project_id, &work.generation_id)
+            {
+                let _ = store.record_health_failure(
+                    work.project_id.as_str(),
+                    "retirement_failed",
+                    &error.to_string(),
+                );
+                tracing::warn!(
+                    project_id = %work.project_id,
+                    generation_id = %work.generation_id,
+                    %error,
+                    "completing selectorless collision retirement failed"
+                );
+                return;
+            }
+            let _ = store.clear_health_failure(work.project_id.as_str(), "retirement_failed");
+        })
+    {
+        tracing::error!(%error, "spawning selectorless collision retirement thread failed");
     }
 }
 
@@ -1662,12 +1810,14 @@ impl IntoResponse for HttpError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
 
     use bbox_code_source::source_selector;
     use bbox_code_source_store::{
-        CodeSourceStorePaths, CollisionRetirementLifecycleStateV1, CollisionRetirementLifecycleV1,
-        CollisionRetirementSelectorEvidenceV1, decode_collision_retirement_pending_for_migration,
+        CodeSourceStorePaths, CollisionRetirementEntryV1, CollisionRetirementLifecycleStateV1,
+        CollisionRetirementLifecycleV1, CollisionRetirementSelectorEvidenceV1,
+        decode_collision_retirement_pending_for_migration,
         encode_collision_retirement_pending_for_migration,
     };
     use bbox_corpus_core::project_catalog::ProjectId;
@@ -1675,27 +1825,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn startup_recovery_publishes_a_pending_collision_lifecycle() {
+    fn startup_recovery_distinguishes_exact_and_selectorless_collision_work() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap().join("code-source");
         let store = CodeSourceStore::open(&root, StoreLimits::default()).unwrap();
         let paths = CodeSourceStorePaths::new(root).unwrap();
         let project_id = ProjectId::parse("startup-collision").unwrap();
-        let generation_id = "a".repeat(64);
+        let exact_generation_id = "a".repeat(64);
+        let retained_generation_id = "b".repeat(64);
+        let exact_selector = format!(
+            "{}:m0123456789abcdef",
+            source_selector(project_id.as_str(), &exact_generation_id)
+        );
         let lifecycle = CollisionRetirementLifecycleV1 {
             version: 1,
-            state: CollisionRetirementLifecycleStateV1::Pending,
             project_id: project_id.clone(),
-            former_scope: PublishedScope::try_new("startup-repo", ".").unwrap(),
-            generation_id: generation_id.clone(),
-            selector_evidence: CollisionRetirementSelectorEvidenceV1::ExactMaterialized(format!(
-                "{}:m0123456789abcdef",
-                source_selector(project_id.as_str(), &generation_id)
-            )),
-            snapshot_id: format!("collected-{}", "b".repeat(32)),
-            manifest_sha256: "c".repeat(64),
-            inventory_hash: "d".repeat(64),
-            plan_hash: "e".repeat(64),
+            entries: BTreeMap::from([
+                (
+                    exact_generation_id.clone(),
+                    CollisionRetirementEntryV1 {
+                        state: CollisionRetirementLifecycleStateV1::Pending,
+                        former_scope: PublishedScope::try_new("startup-repo", ".").unwrap(),
+                        selector_evidence: CollisionRetirementSelectorEvidenceV1::ExactMaterialized(
+                            exact_selector.clone(),
+                        ),
+                        snapshot_id: format!("collected-{}", "c".repeat(32)),
+                        manifest_sha256: "d".repeat(64),
+                        inventory_hash: "e".repeat(64),
+                        plan_hash: "f".repeat(64),
+                    },
+                ),
+                (
+                    retained_generation_id.clone(),
+                    CollisionRetirementEntryV1 {
+                        state: CollisionRetirementLifecycleStateV1::Pending,
+                        former_scope: PublishedScope::try_new("startup-repo", ".").unwrap(),
+                        selector_evidence: CollisionRetirementSelectorEvidenceV1::NoDurableSelector,
+                        snapshot_id: format!("collected-{}", "c".repeat(32)),
+                        manifest_sha256: "1".repeat(64),
+                        inventory_hash: "2".repeat(64),
+                        plan_hash: "f".repeat(64),
+                    },
+                ),
+            ]),
         };
         let lifecycle_path = paths.collision_retirement_pending(&project_id);
         fs::create_dir_all(lifecycle_path.parent().unwrap()).unwrap();
@@ -1705,13 +1877,57 @@ mod tests {
         )
         .unwrap();
 
-        let records = retirement_records_for_recovery(&store).unwrap();
+        let first_recovery = collision_retirement_tasks_for_recovery(&store).unwrap();
 
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].selector, lifecycle.exact_selector().unwrap());
-        let repaired =
+        assert_eq!(first_recovery.len(), 2);
+        assert!(matches!(
+            &first_recovery[0],
+            CollisionRetirementRecoveryTask::Exact { work, selector }
+                if work.generation_id == exact_generation_id && selector == &exact_selector
+        ));
+        assert!(matches!(
+            &first_recovery[1],
+            CollisionRetirementRecoveryTask::Selectorless { work }
+                if work.generation_id == retained_generation_id
+                    && work.exact_selector().is_none()
+        ));
+        let queued =
             decode_collision_retirement_pending_for_migration(&fs::read(lifecycle_path).unwrap())
                 .unwrap();
-        assert_eq!(repaired.state, CollisionRetirementLifecycleStateV1::Queued);
+        assert!(
+            queued
+                .entries
+                .values()
+                .all(|entry| entry.state == CollisionRetirementLifecycleStateV1::Queued)
+        );
+
+        store
+            .complete_collision_retirement(&project_id, &retained_generation_id)
+            .unwrap();
+        let restarted = collision_retirement_tasks_for_recovery(&store).unwrap();
+        assert_eq!(restarted.len(), 1);
+        assert!(matches!(
+            &restarted[0],
+            CollisionRetirementRecoveryTask::Exact { work, selector }
+                if work.generation_id == exact_generation_id && selector == &exact_selector
+        ));
+
+        store
+            .complete_collision_retirement(&project_id, &exact_generation_id)
+            .unwrap();
+        assert!(
+            collision_retirement_tasks_for_recovery(&store)
+                .unwrap()
+                .is_empty()
+        );
+        let completed =
+            decode_collision_retirement_pending_for_migration(&fs::read(lifecycle_path).unwrap())
+                .unwrap();
+        assert!(
+            completed
+                .entries
+                .values()
+                .all(|entry| entry.state == CollisionRetirementLifecycleStateV1::Completed)
+        );
     }
 }
