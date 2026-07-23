@@ -38,6 +38,12 @@ const INVENTORY_HASH_DOMAIN: &[u8] = b"blackbox.project-catalog.inventory.v1\0";
 const PLAN_HASH_DOMAIN: &[u8] = b"blackbox.project-catalog.plan.v1\0";
 const PATH_DIGEST_DOMAIN: &[u8] = b"blackbox.project-catalog.legacy-path.v1\0";
 const GROUP_ID_DOMAIN: &[u8] = b"blackbox.project-catalog.repo-group.v1\0";
+const IMMUTABLE_OWNER_ROW_SET_DOMAIN: &[u8] =
+    b"blackbox.project-catalog.immutable-owner-row-set.v1\0";
+const IMMUTABLE_LANE_FINGERPRINT_DOMAIN: &[u8] =
+    b"blackbox.project-catalog.immutable-lane-fingerprint.v1\0";
+const IMMUTABLE_LANE_CONTENT_DOMAIN: &[u8] =
+    b"blackbox.project-catalog.immutable-lane-content.v1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectCatalogInventoryError {
@@ -408,6 +414,89 @@ pub struct ImmutableInventoryLaneEvidenceV1 {
     pub source_state: InventorySourceStateV1,
     pub completeness: ImmutableInventoryLaneCompletenessV1,
     pub row_count: u64,
+    pub owner_subsources: Vec<OwnerSubsourceEvidenceV1>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImmutableInventoryOwnerKindV1 {
+    Tantivy,
+    VectorMetadata,
+    EdgeManifest,
+    GitMetadata,
+    Checkout,
+    LegacyProjectStore,
+    Knowledge,
+    Gap,
+    Thread,
+    Note,
+    Pin,
+    Roadmap,
+    Packet,
+    Task,
+    Proposal,
+    SlackBinding,
+    Whiteboard,
+    Artifact,
+    Provenance,
+    TranscriptEdge,
+    DerivedRepoGrouping,
+    DerivedLegacyNamespaceClusters,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerSubsourceEvidenceV1 {
+    pub owner_kind: ImmutableInventoryOwnerKindV1,
+    pub source_id: String,
+    pub source_state: InventorySourceStateV1,
+    pub row_observation_ids: BTreeSet<String>,
+    pub row_set_sha256: Sha256ValueV1,
+}
+
+impl ImmutableInventoryLaneEvidenceV1 {
+    pub fn from_owner_subsources(
+        lane_kind: ImmutableInventoryLaneKindV1,
+        source_id: impl Into<String>,
+        row_count: u64,
+        mut owner_subsources: Vec<OwnerSubsourceEvidenceV1>,
+    ) -> InventoryResult<Self> {
+        owner_subsources.sort_by(|left, right| {
+            left.owner_kind
+                .cmp(&right.owner_kind)
+                .then_with(|| left.source_id.cmp(&right.source_id))
+        });
+        let completeness = lane_completeness(&owner_subsources);
+        let source_state = aggregate_lane_source_state(lane_kind, &owner_subsources)?;
+        let evidence = Self {
+            lane_kind,
+            source_id: source_id.into(),
+            source_state,
+            completeness,
+            row_count,
+            owner_subsources,
+        };
+        validate_immutable_lane_evidence(&evidence)?;
+        Ok(evidence)
+    }
+}
+
+impl OwnerSubsourceEvidenceV1 {
+    pub fn new(
+        owner_kind: ImmutableInventoryOwnerKindV1,
+        source_id: impl Into<String>,
+        source_state: InventorySourceStateV1,
+        row_observation_ids: BTreeSet<String>,
+    ) -> Self {
+        let row_set_sha256 = immutable_owner_row_set_hash(&row_observation_ids);
+        Self {
+            owner_kind,
+            source_id: source_id.into(),
+            source_state,
+            row_observation_ids,
+            row_set_sha256,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -521,16 +610,41 @@ pub struct MaterializedAliasObservationV1 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LegacyPathStoreKindV1 {
-    Thread,
-    Goal,
-    Task,
     Knowledge,
     Gap,
-    Decision,
-    Memory,
+    Thread,
+    Note,
+    Pin,
+    Roadmap,
+    Packet,
+    Task,
+    Proposal,
+    SlackBinding,
+    Whiteboard,
     Artifact,
     Provenance,
     TranscriptEdge,
+}
+
+impl LegacyPathStoreKindV1 {
+    fn all() -> BTreeSet<Self> {
+        BTreeSet::from([
+            Self::Knowledge,
+            Self::Gap,
+            Self::Thread,
+            Self::Note,
+            Self::Pin,
+            Self::Roadmap,
+            Self::Packet,
+            Self::Task,
+            Self::Proposal,
+            Self::SlackBinding,
+            Self::Whiteboard,
+            Self::Artifact,
+            Self::Provenance,
+            Self::TranscriptEdge,
+        ])
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -658,6 +772,30 @@ pub struct LegacyNamespaceClusterObservationV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LegacyCommitNamespaceAttributionV1 {
+    Proved {
+        project_ids: BTreeSet<ProjectId>,
+    },
+    Ambiguous {
+        candidate_project_ids: BTreeSet<ProjectId>,
+    },
+    Unclaimed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyCommitNamespaceInventoryV1 {
+    pub observation_id: String,
+    pub namespace: CommitNamespace,
+    pub commit_document_count: u64,
+    pub commit_document_set_sha256: Sha256ValueV1,
+    pub vector_key_count: u64,
+    pub vector_key_set_sha256: Sha256ValueV1,
+    pub attribution: LegacyCommitNamespaceAttributionV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct V1ProjectCatalogInventory {
     pub version: u32,
@@ -683,6 +821,7 @@ pub struct V1ProjectCatalogInventory {
     pub legacy_path_observations: Vec<LegacyPathObservationV1>,
     pub repo_grouping_proofs: Vec<RepoGroupingProofV1>,
     pub legacy_namespace_clusters: Vec<LegacyNamespaceClusterObservationV1>,
+    pub legacy_commit_namespaces: Vec<LegacyCommitNamespaceInventoryV1>,
 }
 
 impl V1ProjectCatalogInventory {
@@ -809,46 +948,9 @@ impl V1ProjectCatalogInventory {
         }
         let mut lane_kinds = BTreeSet::new();
         for evidence in &self.immutable_lane_evidence {
-            validate_stable_id(&evidence.source_id, "immutable lane source id")?;
-            validate_inventory_source_state(&evidence.source_state)?;
+            validate_immutable_lane_evidence(evidence)?;
             if !lane_kinds.insert(evidence.lane_kind) {
                 return Err(duplicate("immutable inventory lane"));
-            }
-            match evidence.completeness {
-                ImmutableInventoryLaneCompletenessV1::Complete => {
-                    if !matches!(
-                        &evidence.source_state,
-                        InventorySourceStateV1::Present { .. }
-                    ) {
-                        return Err(invalid(
-                            "complete immutable lane does not have present source evidence",
-                        ));
-                    }
-                }
-                ImmutableInventoryLaneCompletenessV1::Missing => {
-                    if evidence.row_count != 0
-                        || !matches!(
-                            &evidence.source_state,
-                            InventorySourceStateV1::Missing { .. }
-                        )
-                    {
-                        return Err(invalid(
-                            "missing immutable lane carries rows or wrong state",
-                        ));
-                    }
-                }
-                ImmutableInventoryLaneCompletenessV1::Corrupt => {
-                    if evidence.row_count != 0
-                        || !matches!(
-                            &evidence.source_state,
-                            InventorySourceStateV1::Corrupt { .. }
-                        )
-                    {
-                        return Err(invalid(
-                            "corrupt immutable lane carries rows or wrong state",
-                        ));
-                    }
-                }
             }
         }
         if lane_kinds != ImmutableInventoryLaneKindV1::all() {
@@ -865,7 +967,7 @@ impl V1ProjectCatalogInventory {
             ),
             (
                 ImmutableInventoryLaneKindV1::GitMetadata,
-                self.git_metadata.len() as u64,
+                (self.git_metadata.len() + self.legacy_commit_namespaces.len()) as u64,
             ),
             (
                 ImmutableInventoryLaneKindV1::Checkouts,
@@ -925,6 +1027,10 @@ impl V1ProjectCatalogInventory {
             (
                 "legacy namespace clusters",
                 self.legacy_namespace_clusters.len(),
+            ),
+            (
+                "legacy commit namespaces",
+                self.legacy_commit_namespaces.len(),
             ),
         ] {
             if count > MAX_PROJECT_CATALOG_ENTRIES {
@@ -1218,6 +1324,38 @@ impl V1ProjectCatalogInventory {
                 ensure_known_project(&projects, project_id)?;
             }
         }
+        let mut commit_namespaces = BTreeSet::new();
+        for row in &self.legacy_commit_namespaces {
+            insert_observation(&mut observations, &row.observation_id)?;
+            if !commit_namespaces.insert(row.namespace.clone()) {
+                return Err(duplicate("legacy commit namespace"));
+            }
+            match &row.attribution {
+                LegacyCommitNamespaceAttributionV1::Proved { project_ids } => {
+                    if project_ids.is_empty() {
+                        return Err(invalid(
+                            "proved legacy commit namespace has no project owner",
+                        ));
+                    }
+                    for project_id in project_ids {
+                        ensure_known_project(&projects, project_id)?;
+                    }
+                }
+                LegacyCommitNamespaceAttributionV1::Ambiguous {
+                    candidate_project_ids,
+                } => {
+                    if candidate_project_ids.len() < 2 {
+                        return Err(invalid(
+                            "ambiguous legacy commit namespace has fewer than two candidates",
+                        ));
+                    }
+                    for project_id in candidate_project_ids {
+                        ensure_known_project(&projects, project_id)?;
+                    }
+                }
+                LegacyCommitNamespaceAttributionV1::Unclaimed => {}
+            }
+        }
 
         validate_publisher_source_membership(self)?;
         let mut proof_ids = BTreeSet::new();
@@ -1426,6 +1564,8 @@ impl V1ProjectCatalogInventory {
         }
         self.legacy_namespace_clusters
             .sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
+        self.legacy_commit_namespaces
+            .sort_by(|left, right| left.namespace.cmp(&right.namespace));
     }
 }
 
@@ -4414,6 +4554,215 @@ fn domain_hash(domain: &[u8], bytes: &[u8]) -> Sha256ValueV1 {
     Sha256ValueV1(hex::encode(hasher.finalize()))
 }
 
+fn immutable_owner_row_set_hash(observation_ids: &BTreeSet<String>) -> Sha256ValueV1 {
+    let mut bytes = Vec::new();
+    for observation_id in observation_ids {
+        bytes.extend_from_slice(&(observation_id.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(observation_id.as_bytes());
+    }
+    domain_hash(IMMUTABLE_OWNER_ROW_SET_DOMAIN, &bytes)
+}
+
+fn lane_completeness(
+    owner_subsources: &[OwnerSubsourceEvidenceV1],
+) -> ImmutableInventoryLaneCompletenessV1 {
+    if owner_subsources
+        .iter()
+        .any(|source| matches!(&source.source_state, InventorySourceStateV1::Corrupt { .. }))
+    {
+        ImmutableInventoryLaneCompletenessV1::Corrupt
+    } else if owner_subsources
+        .iter()
+        .any(|source| matches!(&source.source_state, InventorySourceStateV1::Missing { .. }))
+    {
+        ImmutableInventoryLaneCompletenessV1::Missing
+    } else {
+        ImmutableInventoryLaneCompletenessV1::Complete
+    }
+}
+
+fn aggregate_lane_source_state(
+    lane_kind: ImmutableInventoryLaneKindV1,
+    owner_subsources: &[OwnerSubsourceEvidenceV1],
+) -> InventoryResult<InventorySourceStateV1> {
+    let bytes = serde_json::to_vec(&(lane_kind, owner_subsources)).map_err(|error| {
+        ProjectCatalogInventoryError::new(
+            "error.project_catalog_inventory_encode",
+            error.to_string(),
+        )
+    })?;
+    let fingerprint = domain_hash(IMMUTABLE_LANE_FINGERPRINT_DOMAIN, &bytes);
+    let content_hash = domain_hash(IMMUTABLE_LANE_CONTENT_DOMAIN, &bytes);
+    let byte_len = owner_subsources.iter().try_fold(0u64, |total, source| {
+        let source_len = match &source.source_state {
+            InventorySourceStateV1::Present { byte_len, .. } => *byte_len,
+            InventorySourceStateV1::Missing { .. } => 0,
+            InventorySourceStateV1::Corrupt { .. } => 0,
+        };
+        total
+            .checked_add(source_len)
+            .ok_or_else(|| limit("immutable lane aggregate bytes"))
+    })?;
+    Ok(match lane_completeness(owner_subsources) {
+        ImmutableInventoryLaneCompletenessV1::Complete => InventorySourceStateV1::Present {
+            fingerprint,
+            content_hash,
+            byte_len,
+        },
+        ImmutableInventoryLaneCompletenessV1::Missing => {
+            InventorySourceStateV1::Missing { fingerprint }
+        }
+        ImmutableInventoryLaneCompletenessV1::Corrupt => InventorySourceStateV1::Corrupt {
+            fingerprint,
+            content_hash: Some(content_hash),
+            diagnostic_code: "owner_subsource_corrupt".to_string(),
+        },
+    })
+}
+
+fn legacy_path_owner_kind(kind: LegacyPathStoreKindV1) -> ImmutableInventoryOwnerKindV1 {
+    match kind {
+        LegacyPathStoreKindV1::Knowledge => ImmutableInventoryOwnerKindV1::Knowledge,
+        LegacyPathStoreKindV1::Gap => ImmutableInventoryOwnerKindV1::Gap,
+        LegacyPathStoreKindV1::Thread => ImmutableInventoryOwnerKindV1::Thread,
+        LegacyPathStoreKindV1::Note => ImmutableInventoryOwnerKindV1::Note,
+        LegacyPathStoreKindV1::Pin => ImmutableInventoryOwnerKindV1::Pin,
+        LegacyPathStoreKindV1::Roadmap => ImmutableInventoryOwnerKindV1::Roadmap,
+        LegacyPathStoreKindV1::Packet => ImmutableInventoryOwnerKindV1::Packet,
+        LegacyPathStoreKindV1::Task => ImmutableInventoryOwnerKindV1::Task,
+        LegacyPathStoreKindV1::Proposal => ImmutableInventoryOwnerKindV1::Proposal,
+        LegacyPathStoreKindV1::SlackBinding => ImmutableInventoryOwnerKindV1::SlackBinding,
+        LegacyPathStoreKindV1::Whiteboard => ImmutableInventoryOwnerKindV1::Whiteboard,
+        LegacyPathStoreKindV1::Artifact => ImmutableInventoryOwnerKindV1::Artifact,
+        LegacyPathStoreKindV1::Provenance => ImmutableInventoryOwnerKindV1::Provenance,
+        LegacyPathStoreKindV1::TranscriptEdge => ImmutableInventoryOwnerKindV1::TranscriptEdge,
+    }
+}
+
+fn expected_lane_owner_kinds(
+    lane_kind: ImmutableInventoryLaneKindV1,
+) -> BTreeSet<ImmutableInventoryOwnerKindV1> {
+    use ImmutableInventoryOwnerKindV1 as Owner;
+    match lane_kind {
+        ImmutableInventoryLaneKindV1::ProjectScopedRefs => {
+            BTreeSet::from([Owner::Tantivy, Owner::VectorMetadata])
+        }
+        ImmutableInventoryLaneKindV1::EdgeWorkspaces => BTreeSet::from([Owner::EdgeManifest]),
+        ImmutableInventoryLaneKindV1::GitMetadata => {
+            BTreeSet::from([Owner::GitMetadata, Owner::Tantivy, Owner::VectorMetadata])
+        }
+        ImmutableInventoryLaneKindV1::Checkouts => BTreeSet::from([Owner::Checkout]),
+        ImmutableInventoryLaneKindV1::AttachmentCandidates => {
+            BTreeSet::from([Owner::LegacyProjectStore, Owner::Checkout])
+        }
+        ImmutableInventoryLaneKindV1::InventoryTargets => {
+            BTreeSet::from([Owner::Artifact, Owner::Provenance])
+        }
+        ImmutableInventoryLaneKindV1::MaterializedAliases => {
+            BTreeSet::from([Owner::LegacyProjectStore])
+        }
+        ImmutableInventoryLaneKindV1::LegacyPathObservations => LegacyPathStoreKindV1::all()
+            .into_iter()
+            .map(legacy_path_owner_kind)
+            .collect(),
+        ImmutableInventoryLaneKindV1::RepoGroupingProofs => {
+            BTreeSet::from([Owner::DerivedRepoGrouping])
+        }
+        ImmutableInventoryLaneKindV1::LegacyNamespaceClusters => {
+            BTreeSet::from([Owner::DerivedLegacyNamespaceClusters])
+        }
+    }
+}
+
+fn validate_immutable_lane_evidence(
+    evidence: &ImmutableInventoryLaneEvidenceV1,
+) -> InventoryResult<()> {
+    validate_stable_id(&evidence.source_id, "immutable lane source id")?;
+    if evidence.owner_subsources.is_empty()
+        || evidence.owner_subsources.len() > MAX_PROJECT_CATALOG_ENTRIES
+    {
+        return Err(invalid(
+            "immutable lane owner subsource coverage is incomplete",
+        ));
+    }
+    let mut source_ids = BTreeSet::new();
+    let mut owner_kinds = BTreeSet::new();
+    for source in &evidence.owner_subsources {
+        validate_stable_id(&source.source_id, "immutable owner source id")?;
+        validate_inventory_source_state(&source.source_state)?;
+        if !source_ids.insert(source.source_id.as_str()) {
+            return Err(duplicate("immutable owner source id"));
+        }
+        if !owner_kinds.insert(source.owner_kind) {
+            return Err(duplicate("immutable owner kind"));
+        }
+        for observation_id in &source.row_observation_ids {
+            validate_stable_id(observation_id, "immutable owner row observation id")?;
+        }
+        if source.row_set_sha256 != immutable_owner_row_set_hash(&source.row_observation_ids) {
+            return Err(invalid("immutable owner row-set hash mismatch"));
+        }
+        if !matches!(&source.source_state, InventorySourceStateV1::Present { .. })
+            && !source.row_observation_ids.is_empty()
+        {
+            return Err(invalid(
+                "missing or corrupt immutable owner source carries rows",
+            ));
+        }
+    }
+    if owner_kinds != expected_lane_owner_kinds(evidence.lane_kind) {
+        return Err(invalid(
+            "immutable lane owner subsource coverage is incomplete",
+        ));
+    }
+    let completeness = lane_completeness(&evidence.owner_subsources);
+    if evidence.completeness != completeness
+        || evidence.source_state
+            != aggregate_lane_source_state(evidence.lane_kind, &evidence.owner_subsources)?
+    {
+        return Err(invalid(
+            "immutable lane aggregate does not match owner subsources",
+        ));
+    }
+    match evidence.completeness {
+        ImmutableInventoryLaneCompletenessV1::Complete => {
+            if !matches!(
+                &evidence.source_state,
+                InventorySourceStateV1::Present { .. }
+            ) {
+                return Err(invalid(
+                    "complete immutable lane does not have present source evidence",
+                ));
+            }
+        }
+        ImmutableInventoryLaneCompletenessV1::Missing => {
+            if evidence.row_count != 0
+                || !matches!(
+                    &evidence.source_state,
+                    InventorySourceStateV1::Missing { .. }
+                )
+            {
+                return Err(invalid(
+                    "missing immutable lane carries rows or wrong state",
+                ));
+            }
+        }
+        ImmutableInventoryLaneCompletenessV1::Corrupt => {
+            if evidence.row_count != 0
+                || !matches!(
+                    &evidence.source_state,
+                    InventorySourceStateV1::Corrupt { .. }
+                )
+            {
+                return Err(invalid(
+                    "corrupt immutable lane carries rows or wrong state",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn mutable_source_row_set_hash(observation_ids: &BTreeSet<String>) -> Sha256ValueV1 {
     let mut bytes = Vec::new();
     for observation_id in observation_ids {
@@ -5066,17 +5415,30 @@ pub(crate) mod tests {
         source_id: &str,
         row_count: u64,
     ) -> ImmutableInventoryLaneEvidenceV1 {
-        ImmutableInventoryLaneEvidenceV1 {
+        let owner_subsources = expected_lane_owner_kinds(lane_kind)
+            .into_iter()
+            .enumerate()
+            .map(|(index, owner_kind)| {
+                let owner_source_id = format!("{source_id}_owner_{index}");
+                OwnerSubsourceEvidenceV1::new(
+                    owner_kind,
+                    owner_source_id.clone(),
+                    InventorySourceStateV1::Present {
+                        fingerprint: hash(&format!("{owner_source_id}_fingerprint")),
+                        content_hash: hash(&format!("{owner_source_id}_content")),
+                        byte_len: 1,
+                    },
+                    BTreeSet::new(),
+                )
+            })
+            .collect();
+        ImmutableInventoryLaneEvidenceV1::from_owner_subsources(
             lane_kind,
-            source_id: source_id.to_string(),
-            source_state: InventorySourceStateV1::Present {
-                fingerprint: hash(&format!("{source_id}_fingerprint")),
-                content_hash: hash(&format!("{source_id}_content")),
-                byte_len: row_count,
-            },
-            completeness: ImmutableInventoryLaneCompletenessV1::Complete,
+            source_id,
             row_count,
-        }
+            owner_subsources,
+        )
+        .unwrap()
     }
 
     fn mutable_evidence(
@@ -5493,6 +5855,7 @@ pub(crate) mod tests {
                 ],
             }],
             legacy_namespace_clusters: Vec::new(),
+            legacy_commit_namespaces: Vec::new(),
         }
     }
 
@@ -5512,6 +5875,101 @@ pub(crate) mod tests {
             },
             pointer_hash: hash("pointer"),
         }
+    }
+
+    #[test]
+    fn immutable_lane_cannot_launder_an_omitted_owner_subsource() {
+        let inventory = fixture_inventory();
+        let lane = inventory
+            .immutable_lane_evidence
+            .iter()
+            .find(|lane| lane.lane_kind == ImmutableInventoryLaneKindV1::LegacyPathObservations)
+            .unwrap();
+        let mut incomplete = lane.owner_subsources.clone();
+        incomplete.retain(|source| source.owner_kind != ImmutableInventoryOwnerKindV1::Whiteboard);
+
+        let error = ImmutableInventoryLaneEvidenceV1::from_owner_subsources(
+            lane.lane_kind,
+            lane.source_id.clone(),
+            lane.row_count,
+            incomplete,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_inventory_invalid");
+    }
+
+    #[test]
+    fn legacy_path_store_kind_set_matches_the_closed_owner_contract() {
+        assert_eq!(
+            LegacyPathStoreKindV1::all(),
+            BTreeSet::from([
+                LegacyPathStoreKindV1::Knowledge,
+                LegacyPathStoreKindV1::Gap,
+                LegacyPathStoreKindV1::Thread,
+                LegacyPathStoreKindV1::Note,
+                LegacyPathStoreKindV1::Pin,
+                LegacyPathStoreKindV1::Roadmap,
+                LegacyPathStoreKindV1::Packet,
+                LegacyPathStoreKindV1::Task,
+                LegacyPathStoreKindV1::Proposal,
+                LegacyPathStoreKindV1::SlackBinding,
+                LegacyPathStoreKindV1::Whiteboard,
+                LegacyPathStoreKindV1::Artifact,
+                LegacyPathStoreKindV1::Provenance,
+                LegacyPathStoreKindV1::TranscriptEdge,
+            ])
+        );
+    }
+
+    #[test]
+    fn legacy_commit_namespace_commitments_are_canonical_inventory() {
+        let mut inventory = fixture_inventory();
+        inventory
+            .legacy_commit_namespaces
+            .push(LegacyCommitNamespaceInventoryV1 {
+                observation_id: "commit_namespace_legacy".to_string(),
+                namespace: CommitNamespace::parse("legacy_namespace".to_string()).unwrap(),
+                commit_document_count: 7,
+                commit_document_set_sha256: hash("commit_documents"),
+                vector_key_count: 7,
+                vector_key_set_sha256: hash("commit_vectors"),
+                attribution: LegacyCommitNamespaceAttributionV1::Ambiguous {
+                    candidate_project_ids: BTreeSet::from([
+                        project_id("alpha"),
+                        project_id("beta"),
+                    ]),
+                },
+            });
+        let lane = inventory
+            .immutable_lane_evidence
+            .iter_mut()
+            .find(|lane| lane.lane_kind == ImmutableInventoryLaneKindV1::GitMetadata)
+            .unwrap();
+        let mut owner_subsources = lane.owner_subsources.clone();
+        let git_owner = owner_subsources
+            .iter_mut()
+            .find(|source| source.owner_kind == ImmutableInventoryOwnerKindV1::GitMetadata)
+            .unwrap();
+        git_owner
+            .row_observation_ids
+            .insert("commit_namespace_legacy".to_string());
+        git_owner.row_set_sha256 = immutable_owner_row_set_hash(&git_owner.row_observation_ids);
+        *lane = ImmutableInventoryLaneEvidenceV1::from_owner_subsources(
+            lane.lane_kind,
+            lane.source_id.clone(),
+            lane.row_count + 1,
+            owner_subsources,
+        )
+        .unwrap();
+
+        let original_hash = inventory.inventory_hash().unwrap();
+        inventory.legacy_commit_namespaces[0].commit_document_set_sha256 =
+            hash("changed_commit_documents");
+        let changed_hash = inventory.inventory_hash().unwrap();
+        assert_ne!(original_hash, changed_hash);
+
+        inventory.legacy_commit_namespaces.clear();
+        assert!(inventory.validate().is_err());
     }
 
     #[test]

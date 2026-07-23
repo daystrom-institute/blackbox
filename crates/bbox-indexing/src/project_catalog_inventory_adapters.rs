@@ -1991,6 +1991,7 @@ fn capture_inventory_locked(
         legacy_path_observations: lanes.legacy_path_observations.rows,
         repo_grouping_proofs: lanes.repo_grouping_proofs.rows,
         legacy_namespace_clusters: lanes.legacy_namespace_clusters.rows,
+        legacy_commit_namespaces: Vec::new(),
     };
     inventory
         .validate()
