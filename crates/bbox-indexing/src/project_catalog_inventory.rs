@@ -2,8 +2,8 @@
 //!
 //! This module accepts immutable observations only. It never opens a store,
 //! reads a checkout, consults process state, or mutates migration participants.
-//! Literal checkout and legacy selectors are confined to the private inventory
-//! and the explicitly sensitive local-path report.
+//! Literal checkout and legacy selectors are confined to non-serializable
+//! runtime bindings and the explicitly sensitive local-path report.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -124,33 +124,19 @@ impl<'de> Deserialize<'de> for Sha256ValueV1 {
 pub struct LegacyProjectRecordInventoryV1 {
     pub project_id: String,
     pub repo_id: Option<String>,
-    pub canonical_path: String,
+    pub canonical_path_digest: Sha256ValueV1,
     pub registered_at: String,
     pub is_git_repo: bool,
     pub languages: BTreeSet<Language>,
     pub aliases: BTreeSet<String>,
 }
 
-impl From<LegacyProjectRecordV1> for LegacyProjectRecordInventoryV1 {
-    fn from(record: LegacyProjectRecordV1) -> Self {
+impl LegacyProjectRecordInventoryV1 {
+    pub fn from_legacy(record: LegacyProjectRecordV1) -> Self {
         Self {
             project_id: record.project_id,
             repo_id: record.repo_id,
-            canonical_path: record.canonical_path,
-            registered_at: record.registered_at,
-            is_git_repo: record.is_git_repo,
-            languages: record.languages,
-            aliases: record.aliases,
-        }
-    }
-}
-
-impl From<LegacyProjectRecordInventoryV1> for LegacyProjectRecordV1 {
-    fn from(record: LegacyProjectRecordInventoryV1) -> Self {
-        Self {
-            project_id: record.project_id,
-            repo_id: record.repo_id,
-            canonical_path: record.canonical_path,
+            canonical_path_digest: digest_path(&record.canonical_path),
             registered_at: record.registered_at,
             is_git_repo: record.is_git_repo,
             languages: record.languages,
@@ -190,6 +176,13 @@ pub enum CollectedGenerationRoleV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "authority", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DurableSelectorEvidenceV1 {
+    ExactMaterialized { selector_hash: Sha256ValueV1 },
+    NoDurableSelector,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ImmutableCollectedDescriptorV1 {
     Valid {
@@ -220,7 +213,7 @@ pub struct CollectedGenerationObservationV1 {
     pub activation_scope: Option<PublishedScope>,
     pub descriptor: ImmutableCollectedDescriptorV1,
     pub manifest: ImmutableArtifactObservationV1,
-    pub selector_hash: Sha256ValueV1,
+    pub selector_evidence: DurableSelectorEvidenceV1,
     pub checkout_missing: bool,
     pub planned_metadata_v2_hash: Sha256ValueV1,
 }
@@ -235,6 +228,30 @@ pub struct QuarantinedGenerationObservationV1 {
     pub manifest: ImmutableArtifactObservationV1,
     pub manifest_hash: Sha256ValueV1,
     pub planned_metadata_v2_hash: Sha256ValueV1,
+    pub collision_lifecycle: CollisionLifecycleObservationV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollisionLifecycleStateObservationV1 {
+    Pending,
+    Queued,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollisionLifecycleObservationV1 {
+    pub version: u32,
+    pub state: CollisionLifecycleStateObservationV1,
+    pub project_id: ProjectId,
+    pub former_scope: PublishedScope,
+    pub generation_id: String,
+    pub selector_evidence: DurableSelectorEvidenceV1,
+    pub snapshot_id: String,
+    pub manifest_sha256: Sha256ValueV1,
+    pub inventory_hash: Sha256ValueV1,
+    pub plan_hash: Sha256ValueV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,6 +263,19 @@ pub struct CodeSourceObservationV1 {
     pub quarantine: Vec<QuarantinedGenerationObservationV1>,
     pub effective_manifest_hash: Sha256ValueV1,
     pub planned_activation_v2_hash: Option<Sha256ValueV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedGenerationOwnerResolutionObservationV1 {
+    pub observation_id: String,
+    pub generation_id: String,
+    pub published_scope: PublishedScope,
+    pub candidate_project_ids: BTreeSet<ProjectId>,
+    pub descriptor: ImmutableCollectedDescriptorV1,
+    pub manifest: ImmutableArtifactObservationV1,
+    pub selector_evidence: DurableSelectorEvidenceV1,
+    pub planned_metadata_v2_hash: Sha256ValueV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,6 +305,7 @@ pub enum MutableInventorySourceKindV1 {
     CodeSourceActivation,
     CodeSourceGenerationMetadata,
     CodeSourceGenerationManifest,
+    CodeSourceCollisionLifecycle,
     CommittedAuthorityProbe,
     CheckoutRoot,
     CheckoutMarker,
@@ -296,6 +327,9 @@ pub enum MutableInventorySourceLocatorV1 {
     CodeSourceGenerationManifest {
         scope_hash: Sha256ValueV1,
         generation_id: String,
+    },
+    CodeSourceCollisionLifecycle {
+        project_id: ProjectId,
     },
     CommittedProjectConfig {
         project_id: ProjectId,
@@ -419,7 +453,6 @@ pub struct EdgeWorkspaceObservationV1 {
 pub struct GitMetadataObservationV1 {
     pub observation_id: String,
     pub project_id: ProjectId,
-    pub canonical_common_directory: Option<String>,
     pub common_directory_digest: Option<Sha256ValueV1>,
     pub full_first_commit: Option<String>,
     pub materialized_commit_namespaces: BTreeSet<String>,
@@ -440,7 +473,6 @@ pub enum CheckoutMarkerStateV1 {
 #[serde(deny_unknown_fields)]
 pub struct CheckoutObservationV1 {
     pub observation_id: String,
-    pub canonical_checkout_root: String,
     pub canonical_root_digest: Sha256ValueV1,
     pub marker_state: CheckoutMarkerStateV1,
 }
@@ -512,7 +544,7 @@ pub struct LegacyPathObservationV1 {
     pub store_kind: LegacyPathStoreKindV1,
     pub stable_row_id: String,
     pub selector_kind: LegacySelectorKindV1,
-    pub literal_selector: String,
+    pub selector_digest: Sha256ValueV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -626,7 +658,6 @@ pub struct LegacyNamespaceClusterObservationV1 {
 pub struct V1ProjectCatalogInventory {
     pub version: u32,
     pub source_store_hash: Sha256ValueV1,
-    pub source_store_bytes: Vec<u8>,
     pub publisher_ref_source_hash: Sha256ValueV1,
     pub publisher_ref_source_bytes: Vec<u8>,
     pub code_source_inventory_hash: Sha256ValueV1,
@@ -636,6 +667,7 @@ pub struct V1ProjectCatalogInventory {
     pub immutable_lane_evidence: Vec<ImmutableInventoryLaneEvidenceV1>,
     pub legacy_projects: Vec<LegacyProjectObservationV1>,
     pub code_sources: Vec<CodeSourceObservationV1>,
+    pub retained_owner_resolutions: Vec<RetainedGenerationOwnerResolutionObservationV1>,
     pub publisher_pins: Vec<PublisherPinObservationV1>,
     pub project_scoped_refs: Vec<ProjectScopedRefObservationV1>,
     pub edge_workspaces: Vec<EdgeWorkspaceObservationV1>,
@@ -654,14 +686,10 @@ impl V1ProjectCatalogInventory {
         if self.version != PROJECT_CATALOG_INVENTORY_VERSION_V1 {
             return Err(invalid("unsupported inventory version"));
         }
-        if self.source_store_bytes.len() > MAX_SOURCE_STORE_BYTES
-            || self.publisher_ref_source_bytes.len() > MAX_SOURCE_STORE_BYTES
-        {
+        if self.publisher_ref_source_bytes.len() > MAX_SOURCE_STORE_BYTES {
             return Err(limit("captured source store"));
         }
-        if self.source_store_hash != Sha256ValueV1::digest(&self.source_store_bytes)
-            || self.publisher_ref_source_hash
-                != Sha256ValueV1::digest(&self.publisher_ref_source_bytes)
+        if self.publisher_ref_source_hash != Sha256ValueV1::digest(&self.publisher_ref_source_bytes)
         {
             return Err(ProjectCatalogInventoryError::new(
                 "error.project_catalog_inventory_source_hash_mismatch",
@@ -672,7 +700,9 @@ impl V1ProjectCatalogInventory {
             .code_sources
             .iter()
             .map(|source| source.generations.len() + source.quarantine.len())
-            .sum::<usize>() as u64;
+            .sum::<usize>()
+            + self.retained_owner_resolutions.len();
+        let materialized_generation_count = materialized_generation_count as u64;
         if self.code_source_generation_count < materialized_generation_count {
             return Err(invalid(
                 "code-source complete-set count omits a materialized generation",
@@ -710,7 +740,8 @@ impl V1ProjectCatalogInventory {
             .code_sources
             .iter()
             .map(|source| source.generations.len() + source.quarantine.len())
-            .sum::<usize>();
+            .sum::<usize>()
+            + self.retained_owner_resolutions.len();
         for (kind, expected) in [
             (MutableInventorySourceKindV1::LegacyProjectStore, 1),
             (MutableInventorySourceKindV1::PublisherRefStore, 1),
@@ -726,6 +757,13 @@ impl V1ProjectCatalogInventory {
             (
                 MutableInventorySourceKindV1::CodeSourceGenerationManifest,
                 generation_count,
+            ),
+            (
+                MutableInventorySourceKindV1::CodeSourceCollisionLifecycle,
+                self.code_sources
+                    .iter()
+                    .map(|source| source.quarantine.len())
+                    .sum(),
             ),
             (
                 MutableInventorySourceKindV1::CommittedAuthorityProbe,
@@ -863,6 +901,10 @@ impl V1ProjectCatalogInventory {
         for (kind, count) in [
             ("legacy projects", self.legacy_projects.len()),
             ("code sources", self.code_sources.len()),
+            (
+                "retained owner resolutions",
+                self.retained_owner_resolutions.len(),
+            ),
             ("publisher pins", self.publisher_pins.len()),
             ("project refs", self.project_scoped_refs.len()),
             ("edge workspaces", self.edge_workspaces.len()),
@@ -891,7 +933,6 @@ impl V1ProjectCatalogInventory {
         let mut authority_observations = BTreeMap::new();
         for row in &self.legacy_projects {
             insert_observation(&mut observations, &row.observation_id)?;
-            validate_absolute_path(&row.record.canonical_path)?;
             validate_timestamp(&row.record.registered_at)?;
             let project_id = ProjectId::parse(row.record.project_id.clone())
                 .map_err(|_| invalid("legacy project id is invalid"))?;
@@ -945,6 +986,21 @@ impl V1ProjectCatalogInventory {
                 }
                 validate_descriptor(&generation.descriptor)?;
                 validate_artifact(&generation.manifest)?;
+                match (&generation.role, &generation.selector_evidence) {
+                    (
+                        CollectedGenerationRoleV1::Active,
+                        DurableSelectorEvidenceV1::ExactMaterialized { .. },
+                    )
+                    | (
+                        CollectedGenerationRoleV1::Retained,
+                        DurableSelectorEvidenceV1::NoDurableSelector,
+                    ) => {}
+                    _ => {
+                        return Err(invalid(
+                            "collected generation selector authority disagrees with role",
+                        ));
+                    }
+                }
                 generations.insert(generation.observation_id.as_str(), generation);
             }
             for generation in &source.quarantine {
@@ -959,6 +1015,30 @@ impl V1ProjectCatalogInventory {
                 }
                 validate_descriptor(&generation.descriptor)?;
                 validate_artifact(&generation.manifest)?;
+                validate_collision_lifecycle(&generation.collision_lifecycle, generation)?;
+            }
+        }
+        for generation in &self.retained_owner_resolutions {
+            insert_observation(&mut observations, &generation.observation_id)?;
+            validate_token(&generation.generation_id, "retained generation id")?;
+            generation
+                .published_scope
+                .validate()
+                .map_err(|_| invalid("retained generation scope is invalid"))?;
+            if generation.candidate_project_ids.len() < 2 {
+                return Err(invalid(
+                    "ambiguous retained generation has fewer than two owner candidates",
+                ));
+            }
+            for project_id in &generation.candidate_project_ids {
+                ensure_known_project(&projects, project_id)?;
+            }
+            validate_descriptor(&generation.descriptor)?;
+            validate_artifact(&generation.manifest)?;
+            if generation.selector_evidence != DurableSelectorEvidenceV1::NoDurableSelector {
+                return Err(invalid(
+                    "ambiguous retained generation fabricates selector authority",
+                ));
             }
         }
 
@@ -1016,19 +1096,6 @@ impl V1ProjectCatalogInventory {
         for row in &self.git_metadata {
             insert_observation(&mut observations, &row.observation_id)?;
             ensure_known_project(&projects, &row.project_id)?;
-            match (
-                row.canonical_common_directory.as_deref(),
-                row.common_directory_digest.as_ref(),
-            ) {
-                (Some(path), Some(digest)) => {
-                    validate_absolute_path(path)?;
-                    if digest != &digest_path(path) {
-                        return Err(invalid("Git common directory digest mismatch"));
-                    }
-                }
-                (None, None) => {}
-                _ => return Err(invalid("Git common directory evidence is incomplete")),
-            }
             if let Some(commit) = &row.full_first_commit {
                 validate_full_commit(commit)?;
             }
@@ -1042,15 +1109,11 @@ impl V1ProjectCatalogInventory {
         }
 
         let mut checkout_observations = BTreeSet::new();
-        let mut canonical_checkout_roots = BTreeSet::new();
+        let mut canonical_checkout_root_digests = BTreeSet::new();
         for row in &self.checkouts {
             insert_observation(&mut observations, &row.observation_id)?;
             checkout_observations.insert(row.observation_id.as_str());
-            validate_absolute_path(&row.canonical_checkout_root)?;
-            if row.canonical_root_digest != digest_path(&row.canonical_checkout_root) {
-                return Err(invalid("checkout root digest mismatch"));
-            }
-            if !canonical_checkout_roots.insert(row.canonical_checkout_root.as_str()) {
+            if !canonical_checkout_root_digests.insert(&row.canonical_root_digest) {
                 return Err(duplicate("canonical checkout root"));
             }
             validate_marker_state(&row.marker_state)?;
@@ -1090,7 +1153,6 @@ impl V1ProjectCatalogInventory {
         for row in &self.legacy_path_observations {
             insert_observation(&mut observations, &row.observation_id)?;
             validate_stable_id(&row.stable_row_id, "legacy path row id")?;
-            validate_literal_selector(&row.literal_selector)?;
         }
         for row in &self.legacy_namespace_clusters {
             insert_observation(&mut observations, &row.observation_id)?;
@@ -1106,6 +1168,7 @@ impl V1ProjectCatalogInventory {
             }
         }
 
+        validate_publisher_source_membership(self)?;
         let mut proof_ids = BTreeSet::new();
         for proof in &self.repo_grouping_proofs {
             validate_stable_id(proof.proof_id(), "repo grouping proof id")?;
@@ -1147,10 +1210,23 @@ impl V1ProjectCatalogInventory {
     pub fn hard_refusals(&self) -> Vec<InventoryRefusalV1> {
         let mut refusals = Vec::new();
         for source in &self.mutable_source_evidence {
-            if matches!(&source.state, InventorySourceStateV1::Corrupt { .. }) {
+            let required_code_evidence_missing =
+                matches!(
+                    source.source_kind,
+                    MutableInventorySourceKindV1::CodeSourceGenerationMetadata
+                        | MutableInventorySourceKindV1::CodeSourceGenerationManifest
+                        | MutableInventorySourceKindV1::CodeSourceCollisionLifecycle
+                ) && matches!(&source.state, InventorySourceStateV1::Missing { .. });
+            if matches!(&source.state, InventorySourceStateV1::Corrupt { .. })
+                || required_code_evidence_missing
+            {
                 refusals.push(InventoryRefusalV1 {
                     record_id: source.source_id.clone(),
-                    diagnostic_code: "mutable_source_corrupt".to_string(),
+                    diagnostic_code: if required_code_evidence_missing {
+                        "required_code_source_evidence_missing".to_string()
+                    } else {
+                        "mutable_source_corrupt".to_string()
+                    },
                 });
             }
         }
@@ -1198,6 +1274,56 @@ impl V1ProjectCatalogInventory {
                     });
                 }
             }
+            for generation in &source.quarantine {
+                let diagnostic_code = match &generation.descriptor {
+                    ImmutableCollectedDescriptorV1::Missing => {
+                        Some("quarantined_descriptor_missing")
+                    }
+                    ImmutableCollectedDescriptorV1::Corrupt { .. } => {
+                        Some("quarantined_descriptor_corrupt")
+                    }
+                    ImmutableCollectedDescriptorV1::Valid { .. } => match &generation.manifest {
+                        ImmutableArtifactObservationV1::Valid { .. } => None,
+                        ImmutableArtifactObservationV1::Missing => {
+                            Some("quarantined_manifest_missing")
+                        }
+                        ImmutableArtifactObservationV1::Corrupt { .. } => {
+                            Some("quarantined_manifest_corrupt")
+                        }
+                    },
+                };
+                if let Some(diagnostic_code) = diagnostic_code {
+                    refusals.push(InventoryRefusalV1 {
+                        record_id: generation.observation_id.clone(),
+                        diagnostic_code: diagnostic_code.to_string(),
+                    });
+                }
+            }
+        }
+        for generation in &self.retained_owner_resolutions {
+            let diagnostic_code = match &generation.descriptor {
+                ImmutableCollectedDescriptorV1::Missing => {
+                    Some("retained_owner_descriptor_missing")
+                }
+                ImmutableCollectedDescriptorV1::Corrupt { .. } => {
+                    Some("retained_owner_descriptor_corrupt")
+                }
+                ImmutableCollectedDescriptorV1::Valid { .. } => match &generation.manifest {
+                    ImmutableArtifactObservationV1::Valid { .. } => None,
+                    ImmutableArtifactObservationV1::Missing => {
+                        Some("retained_owner_manifest_missing")
+                    }
+                    ImmutableArtifactObservationV1::Corrupt { .. } => {
+                        Some("retained_owner_manifest_corrupt")
+                    }
+                },
+            };
+            if let Some(diagnostic_code) = diagnostic_code {
+                refusals.push(InventoryRefusalV1 {
+                    record_id: generation.observation_id.clone(),
+                    diagnostic_code: diagnostic_code.to_string(),
+                });
+            }
         }
         refusals.sort_by(|left, right| left.record_id.cmp(&right.record_id));
         refusals
@@ -1220,6 +1346,8 @@ impl V1ProjectCatalogInventory {
                 .quarantine
                 .sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
         }
+        self.retained_owner_resolutions
+            .sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
         self.publisher_pins
             .sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
         self.project_scoped_refs
@@ -1644,7 +1772,7 @@ impl ProjectCatalogMigrationReportV1 {
                 .map_err(|_| invalid("legacy project id is invalid"))?;
             if row.project_id != project_id
                 || row.path_status != observed.path_status
-                || row.path_digest != digest_path(&observed.record.canonical_path)
+                || row.path_digest != observed.record.canonical_path_digest
                 || row.committed_authority_present != observed.committed_authority.is_some()
             {
                 return Err(invalid("report project row disagrees with inventory"));
@@ -1687,8 +1815,7 @@ impl ProjectCatalogMigrationReportV1 {
             let row = path_rows
                 .get(observed.observation_id.as_str())
                 .ok_or_else(|| unknown("report legacy-path observation"))?;
-            if row.store_kind != observed.store_kind
-                || row.path_digest != digest_path(&observed.literal_selector)
+            if row.store_kind != observed.store_kind || row.path_digest != observed.selector_digest
             {
                 return Err(invalid("report legacy-path row disagrees with inventory"));
             }
@@ -1714,7 +1841,7 @@ impl ProjectCatalogMigrationReportV1 {
                 Ok(MissingPathReportV1 {
                     project_id: ProjectId::parse(row.record.project_id.clone())
                         .map_err(|_| invalid("legacy project id is invalid"))?,
-                    path_digest: digest_path(&row.record.canonical_path),
+                    path_digest: row.record.canonical_path_digest.clone(),
                 })
             })
             .collect::<InventoryResult<Vec<_>>>()?;
@@ -1740,6 +1867,22 @@ impl ProjectCatalogMigrationReportV1 {
                 "report suppresses a non-overridable inventory refusal",
             ));
         }
+        for retained in &inventory.retained_owner_resolutions {
+            let expected_candidates = retained
+                .candidate_project_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect::<BTreeSet<_>>();
+            if !self.required_resolutions.iter().any(|resolution| {
+                resolution.resolution_id == retained.observation_id
+                    && resolution.kind == RequiredResolutionKindV1::ScopeOwner
+                    && resolution.candidate_record_ids == expected_candidates
+            }) {
+                return Err(invalid(
+                    "ambiguous retained owner lacks its exact bounded resolution",
+                ));
+            }
+        }
         self.validate_path_redaction(inventory)
     }
 
@@ -1747,36 +1890,13 @@ impl ProjectCatalogMigrationReportV1 {
         &self,
         inventory: &V1ProjectCatalogInventory,
     ) -> InventoryResult<()> {
-        let encoded = serde_json::to_vec(self).map_err(|error| {
+        let _encoded = serde_json::to_vec(self).map_err(|error| {
             ProjectCatalogInventoryError::new(
                 "error.project_catalog_report_encode",
                 error.to_string(),
             )
         })?;
-        for literal in inventory
-            .legacy_projects
-            .iter()
-            .map(|row| row.record.canonical_path.as_str())
-            .chain(
-                inventory
-                    .checkouts
-                    .iter()
-                    .map(|row| row.canonical_checkout_root.as_str()),
-            )
-            .chain(
-                inventory
-                    .legacy_path_observations
-                    .iter()
-                    .map(|row| row.literal_selector.as_str()),
-            )
-        {
-            if !literal.is_empty() && contains_subslice(&encoded, literal.as_bytes()) {
-                return Err(ProjectCatalogInventoryError::new(
-                    "error.project_catalog_report_path_leak",
-                    "default report contains a literal inventory path",
-                ));
-            }
-        }
+        inventory.canonical_json()?;
         Ok(())
     }
 }
@@ -1807,18 +1927,35 @@ pub struct SensitiveLocalPathReportV1 {
 }
 
 impl SensitiveLocalPathReportV1 {
-    pub fn from_inventory(inventory: &V1ProjectCatalogInventory) -> InventoryResult<Self> {
+    pub fn from_runtime_rows(
+        inventory: &V1ProjectCatalogInventory,
+        rows: Vec<SensitiveLocalPathRowV1>,
+    ) -> InventoryResult<Self> {
         inventory.validate()?;
-        let mut rows = inventory
+        if rows.len() != inventory.legacy_path_observations.len() {
+            return Err(invalid(
+                "sensitive local-path rows do not cover canonical observations",
+            ));
+        }
+        let canonical = inventory
             .legacy_path_observations
             .iter()
-            .map(|row| SensitiveLocalPathRowV1 {
-                observation_id: row.observation_id.clone(),
-                store_kind: row.store_kind,
-                stable_row_id: row.stable_row_id.clone(),
-                literal_selector: row.literal_selector.clone(),
-            })
-            .collect::<Vec<_>>();
+            .map(|row| (row.observation_id.as_str(), row))
+            .collect::<BTreeMap<_, _>>();
+        for row in &rows {
+            let observed = canonical
+                .get(row.observation_id.as_str())
+                .ok_or_else(|| unknown("sensitive local-path observation"))?;
+            if row.store_kind != observed.store_kind
+                || row.stable_row_id != observed.stable_row_id
+                || digest_path(&row.literal_selector) != observed.selector_digest
+            {
+                return Err(invalid(
+                    "sensitive local-path row disagrees with canonical digest",
+                ));
+            }
+        }
+        let mut rows = rows;
         rows.sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
         Ok(Self {
             version: SENSITIVE_LOCAL_PATH_REPORT_VERSION_V1,
@@ -2276,7 +2413,7 @@ impl DeterministicPostImageInputV1 {
         let known_path_observations = inventory
             .legacy_path_observations
             .iter()
-            .map(|row| (row.observation_id.as_str(), row.literal_selector.as_str()))
+            .map(|row| (row.observation_id.as_str(), &row.selector_digest))
             .collect::<BTreeMap<_, _>>();
 
         let mut resolved_projects = BTreeSet::new();
@@ -2400,7 +2537,7 @@ impl DeterministicPostImageInputV1 {
             let expected = known_path_observations
                 .get(row.observation_id.as_str())
                 .ok_or_else(|| unknown("legacy path binding observation"))?;
-            if *expected != row.literal_selector {
+            if **expected != digest_path(&row.literal_selector) {
                 return Err(invalid("legacy path binding literal was rewritten"));
             }
             if let Some(attachment_id) = &row.attachment_id
@@ -3209,6 +3346,11 @@ fn observed_scopes_for_project(
             }
         }
     }
+    for retained in &inventory.retained_owner_resolutions {
+        if retained.candidate_project_ids.contains(project_id) {
+            scopes.insert(retained.published_scope.clone());
+        }
+    }
     for attachment in &inventory.attachment_candidates {
         if attachment.project_id == *project_id
             && let Some(scope) = &attachment.observed_scope
@@ -3372,7 +3514,7 @@ fn project_has_repo_history_evidence(
 ) -> bool {
     inventory.git_metadata.iter().any(|row| {
         row.project_id == *project_id
-            && (row.canonical_common_directory.is_some()
+            && (row.common_directory_digest.is_some()
                 || row.full_first_commit.is_some()
                 || !row.materialized_commit_namespaces.is_empty()
                 || row.last_ingested_sha.is_some())
@@ -3429,7 +3571,7 @@ fn validate_grouping_proof<'a>(
             if members.len() != proof_projects.len() {
                 return Err(duplicate("Git proof project"));
             }
-            let mut shared: Option<(&str, &str)> = None;
+            let mut shared: Option<(&Sha256ValueV1, &str)> = None;
             for member in members {
                 let observed = git_observations
                     .get(member.git_observation_id.as_str())
@@ -3438,8 +3580,8 @@ fn validate_grouping_proof<'a>(
                     return Err(invalid("Git proof project disagrees with observation"));
                 }
                 let common_directory = observed
-                    .canonical_common_directory
-                    .as_deref()
+                    .common_directory_digest
+                    .as_ref()
                     .ok_or_else(|| invalid("Git proof lacks a canonical common directory"))?;
                 let first_commit = observed
                     .full_first_commit
@@ -3572,6 +3714,81 @@ fn validate_publisher_disposition(
             MAX_OPERATOR_NOTE_BYTES,
             "no-content acknowledgement",
         )?,
+    }
+    Ok(())
+}
+
+fn validate_publisher_source_membership(
+    inventory: &V1ProjectCatalogInventory,
+) -> InventoryResult<()> {
+    let projects = inventory
+        .legacy_projects
+        .iter()
+        .map(|row| {
+            (
+                ProjectId::parse(row.record.project_id.clone())
+                    .expect("validated legacy project id remains valid"),
+                row,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let attachments = inventory
+        .attachment_candidates
+        .iter()
+        .map(|row| (&row.attachment_id, row))
+        .collect::<BTreeMap<_, _>>();
+    for pin in &inventory.publisher_pins {
+        let project = projects
+            .get(&pin.project_id)
+            .ok_or_else(|| unknown("publisher project observation"))?;
+        let mut expected =
+            BTreeSet::from([pin.observation_id.clone(), project.observation_id.clone()]);
+        if pin.resolved_commit.is_some() != pin.resolved_scope.is_some()
+            || pin
+                .resolved_scope
+                .as_ref()
+                .is_some_and(|scope| scope != &pin.expected_scope)
+        {
+            return Err(invalid(
+                "publisher resolved commit and scope evidence is incomplete",
+            ));
+        }
+        if let Some(authority) = &project.committed_authority {
+            expected.insert(authority.observation_id.clone());
+        }
+        for attachment_id in &pin.candidate_attachment_ids {
+            let attachment = attachments
+                .get(attachment_id)
+                .ok_or_else(|| unknown("publisher candidate attachment"))?;
+            if attachment.project_id != pin.project_id
+                || attachment.observed_scope.as_ref() != Some(&pin.expected_scope)
+            {
+                return Err(invalid(
+                    "publisher candidate attachment crosses project or scope",
+                ));
+            }
+            expected.insert(attachment.observation_id.clone());
+            expected.insert(attachment.checkout_observation_id.clone());
+        }
+        if pin.resolved_commit.is_some() {
+            let git_rows = inventory
+                .git_metadata
+                .iter()
+                .filter(|row| row.project_id == pin.project_id)
+                .map(|row| row.observation_id.clone())
+                .collect::<BTreeSet<_>>();
+            if git_rows.is_empty() {
+                return Err(invalid(
+                    "resolved publisher commit lacks Git observation evidence",
+                ));
+            }
+            expected.extend(git_rows);
+        }
+        if pin.source_observation_ids != expected {
+            return Err(invalid(
+                "publisher source observations are incomplete or spliced",
+            ));
+        }
     }
     Ok(())
 }
@@ -3751,6 +3968,9 @@ fn validate_mutable_source_locator(
             MutableInventorySourceKindV1::CodeSourceGenerationManifest,
             MutableInventorySourceLocatorV1::CodeSourceGenerationManifest { .. }
         ) | (
+            MutableInventorySourceKindV1::CodeSourceCollisionLifecycle,
+            MutableInventorySourceLocatorV1::CodeSourceCollisionLifecycle { .. }
+        ) | (
             MutableInventorySourceKindV1::CommittedAuthorityProbe,
             MutableInventorySourceLocatorV1::CommittedProjectConfig { .. }
                 | MutableInventorySourceLocatorV1::CommittedProjectConfigUnavailable { .. }
@@ -3783,6 +4003,7 @@ fn validate_mutable_source_locator(
         | MutableInventorySourceLocatorV1::PublisherRefStore
         | MutableInventorySourceLocatorV1::CodeSourceAnchor
         | MutableInventorySourceLocatorV1::CodeSourceActivation { .. }
+        | MutableInventorySourceLocatorV1::CodeSourceCollisionLifecycle { .. }
         | MutableInventorySourceLocatorV1::CommittedProjectConfigUnavailable { .. }
         | MutableInventorySourceLocatorV1::CheckoutRoot { .. }
         | MutableInventorySourceLocatorV1::CheckoutMarker { .. } => {}
@@ -3827,6 +4048,12 @@ fn validate_mutable_source_row_coverage(
                     (row.observation_id.as_str(), (&row.generation_id, scope))
                 }))
         })
+        .chain(inventory.retained_owner_resolutions.iter().map(|row| {
+            (
+                row.observation_id.as_str(),
+                (&row.generation_id, Some(&row.published_scope)),
+            )
+        }))
         .collect::<BTreeMap<_, _>>();
     let authority_row_by_project = inventory
         .legacy_projects
@@ -3841,6 +4068,16 @@ fn validate_mutable_source_row_coverage(
                         authority.observation_id.as_str()
                     }),
             )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let quarantine_row_by_project = inventory
+        .code_sources
+        .iter()
+        .flat_map(|source| {
+            source
+                .quarantine
+                .iter()
+                .map(|row| (row.project_id.clone(), row.observation_id.as_str()))
         })
         .collect::<BTreeMap<_, _>>();
     let checkout_row_by_digest = inventory
@@ -3887,6 +4124,9 @@ fn validate_mutable_source_row_coverage(
                     .then_some(*observation_id)
                 },
             ),
+            MutableInventorySourceLocatorV1::CodeSourceCollisionLifecycle { project_id } => {
+                quarantine_row_by_project.get(project_id).copied()
+            }
             MutableInventorySourceLocatorV1::CommittedProjectConfig { project_id, .. }
             | MutableInventorySourceLocatorV1::CommittedProjectConfigUnavailable { project_id } => {
                 authority_row_by_project.get(project_id).copied()
@@ -3950,6 +4190,12 @@ fn validate_mutable_source_row_coverage(
                         .map(|row| row.observation_id.as_str()),
                 )
         })
+        .chain(
+            inventory
+                .retained_owner_resolutions
+                .iter()
+                .map(|row| row.observation_id.as_str()),
+        )
         .collect::<BTreeSet<_>>();
     let effective_rows = code_source_rows
         .iter()
@@ -3990,6 +4236,19 @@ fn validate_mutable_source_row_coverage(
         (
             MutableInventorySourceKindV1::CodeSourceGenerationManifest,
             generation_rows,
+        ),
+        (
+            MutableInventorySourceKindV1::CodeSourceCollisionLifecycle,
+            inventory
+                .code_sources
+                .iter()
+                .flat_map(|source| {
+                    source
+                        .quarantine
+                        .iter()
+                        .map(|row| row.observation_id.as_str())
+                })
+                .collect(),
         ),
         (
             MutableInventorySourceKindV1::CommittedAuthorityProbe,
@@ -4078,6 +4337,43 @@ fn validate_artifact(artifact: &ImmutableArtifactObservationV1) -> InventoryResu
     }
 }
 
+fn validate_collision_lifecycle(
+    lifecycle: &CollisionLifecycleObservationV1,
+    generation: &QuarantinedGenerationObservationV1,
+) -> InventoryResult<()> {
+    if lifecycle.version != 1
+        || lifecycle.project_id != generation.project_id
+        || lifecycle.generation_id != generation.generation_id
+        || lifecycle.manifest_sha256 != generation.manifest_hash
+    {
+        return Err(invalid(
+            "collision lifecycle disagrees with quarantined generation",
+        ));
+    }
+    lifecycle
+        .former_scope
+        .validate()
+        .map_err(|_| invalid("collision lifecycle former scope is invalid"))?;
+    if let ImmutableCollectedDescriptorV1::Valid {
+        published_scope, ..
+    } = &generation.descriptor
+        && published_scope != &lifecycle.former_scope
+    {
+        return Err(invalid(
+            "collision lifecycle former scope disagrees with descriptor",
+        ));
+    }
+    match &lifecycle.selector_evidence {
+        DurableSelectorEvidenceV1::ExactMaterialized { .. } => {}
+        DurableSelectorEvidenceV1::NoDurableSelector => {}
+    }
+    validate_bounded_text(
+        &lifecycle.snapshot_id,
+        MAX_STABLE_ID_BYTES,
+        "collision lifecycle snapshot id",
+    )
+}
+
 fn validate_inventory_source_state(state: &InventorySourceStateV1) -> InventoryResult<()> {
     match state {
         InventorySourceStateV1::Present { byte_len, .. } => {
@@ -4136,18 +4432,6 @@ fn validate_full_ref(value: &str) -> InventoryResult<()> {
         || value.contains('\\')
     {
         return Err(invalid("publisher ref is not a full Git ref"));
-    }
-    Ok(())
-}
-
-fn validate_absolute_path(value: &str) -> InventoryResult<()> {
-    validate_bounded_text(value, MAX_PATH_BYTES, "absolute path")?;
-    if !value.starts_with('/')
-        || value.contains('\\')
-        || value.split('/').any(|segment| segment == "..")
-        || (value.len() > 1 && value.ends_with('/'))
-    {
-        return Err(invalid("path is not normalized absolute form"));
     }
     Ok(())
 }
@@ -4214,13 +4498,6 @@ fn validate_bounded_text(value: &str, max_bytes: usize, kind: &'static str) -> I
         return Err(invalid(kind));
     }
     Ok(())
-}
-
-fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty()
-        && haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
 }
 
 fn invalid(detail: impl Into<String>) -> ProjectCatalogInventoryError {
@@ -4399,7 +4676,7 @@ mod tests {
             record: LegacyProjectRecordInventoryV1 {
                 project_id: project.to_string(),
                 repo_id: Some("weak_hint".to_string()),
-                canonical_path: path.to_string(),
+                canonical_path_digest: digest_path(path),
                 registered_at: "2026-01-02T03:04:05Z".to_string(),
                 is_git_repo: true,
                 languages: BTreeSet::new(),
@@ -4425,7 +4702,6 @@ mod tests {
         V1ProjectCatalogInventory {
             version: PROJECT_CATALOG_INVENTORY_VERSION_V1,
             source_store_hash: source_store_hash.clone(),
-            source_store_bytes,
             publisher_ref_source_hash: publisher_ref_source_hash.clone(),
             publisher_ref_source_bytes,
             code_source_inventory_hash: hash("code_source_inventory"),
@@ -4561,7 +4837,9 @@ mod tests {
                     manifest: ImmutableArtifactObservationV1::Valid {
                         content_hash: hash("manifest"),
                     },
-                    selector_hash: hash("selector"),
+                    selector_evidence: DurableSelectorEvidenceV1::ExactMaterialized {
+                        selector_hash: hash("selector"),
+                    },
                     checkout_missing: false,
                     planned_metadata_v2_hash: hash("metadata_v2"),
                 }],
@@ -4569,6 +4847,7 @@ mod tests {
                 effective_manifest_hash: hash("effective_manifest"),
                 planned_activation_v2_hash: Some(hash("activation_v2")),
             }],
+            retained_owner_resolutions: Vec::new(),
             publisher_pins: vec![PublisherPinObservationV1 {
                 observation_id: "pin_alpha".to_string(),
                 project_id: alpha.clone(),
@@ -4577,7 +4856,14 @@ mod tests {
                 candidate_attachment_ids: BTreeSet::from([alpha_attachment.clone()]),
                 resolved_commit: Some("a".repeat(40)),
                 resolved_scope: Some(scope("services/alpha")),
-                source_observation_ids: BTreeSet::from(["publisher_source".to_string()]),
+                source_observation_ids: BTreeSet::from([
+                    "pin_alpha".to_string(),
+                    "legacy_alpha".to_string(),
+                    "authority_alpha".to_string(),
+                    "attachment_alpha".to_string(),
+                    "checkout_acme".to_string(),
+                    "git_alpha".to_string(),
+                ]),
             }],
             project_scoped_refs: vec![
                 ProjectScopedRefObservationV1 {
@@ -4606,7 +4892,6 @@ mod tests {
                 GitMetadataObservationV1 {
                     observation_id: "git_alpha".to_string(),
                     project_id: alpha.clone(),
-                    canonical_common_directory: Some("/workspace/acme/.git".to_string()),
                     common_directory_digest: Some(digest_path("/workspace/acme/.git")),
                     full_first_commit: Some("b".repeat(40)),
                     materialized_commit_namespaces: BTreeSet::from(
@@ -4617,7 +4902,6 @@ mod tests {
                 GitMetadataObservationV1 {
                     observation_id: "git_beta".to_string(),
                     project_id: beta.clone(),
-                    canonical_common_directory: Some("/workspace/acme/.git".to_string()),
                     common_directory_digest: Some(digest_path("/workspace/acme/.git")),
                     full_first_commit: Some("b".repeat(40)),
                     materialized_commit_namespaces: BTreeSet::from(
@@ -4628,7 +4912,6 @@ mod tests {
             ],
             checkouts: vec![CheckoutObservationV1 {
                 observation_id: "checkout_acme".to_string(),
-                canonical_checkout_root: "/workspace/acme".to_string(),
                 canonical_root_digest: digest_path("/workspace/acme"),
                 marker_state: CheckoutMarkerStateV1::MissingOrEmpty,
             }],
@@ -4668,7 +4951,7 @@ mod tests {
                 store_kind: LegacyPathStoreKindV1::Knowledge,
                 stable_row_id: "knowledge_1".to_string(),
                 selector_kind: LegacySelectorKindV1::ProjectAndRelativePath,
-                literal_selector: "/workspace/acme/alpha/src/Example.java".to_string(),
+                selector_digest: digest_path("/workspace/acme/alpha/src/Example.java"),
             }],
             repo_grouping_proofs: vec![RepoGroupingProofV1::IdenticalCommittedRecordedAuthority {
                 proof_id: "proof_authority".to_string(),
@@ -4814,7 +5097,7 @@ mod tests {
                     observation_id: row.observation_id.clone(),
                     project_id: ProjectId::parse(row.record.project_id.clone()).unwrap(),
                     path_status: row.path_status,
-                    path_digest: digest_path(&row.record.canonical_path),
+                    path_digest: row.record.canonical_path_digest.clone(),
                     committed_authority_present: row.committed_authority.is_some(),
                 })
                 .collect(),
@@ -4929,6 +5212,131 @@ mod tests {
     }
 
     #[test]
+    fn retained_generation_cannot_carry_fabricated_selector_authority() {
+        let mut inventory = fixture_inventory();
+        let source = &mut inventory.code_sources[0];
+        source.generations[0].role = CollectedGenerationRoleV1::Retained;
+        source.planned_activation_v2_hash = None;
+        assert_eq!(
+            inventory.validate().unwrap_err().code(),
+            "error.project_catalog_inventory_invalid"
+        );
+
+        inventory.code_sources[0].generations[0].selector_evidence =
+            DurableSelectorEvidenceV1::NoDurableSelector;
+        inventory.validate().unwrap();
+    }
+
+    #[test]
+    fn publisher_sources_reject_cross_project_and_unknown_splices() {
+        let mut cross_project = fixture_inventory();
+        cross_project.attachment_candidates[0].project_id = project_id("beta");
+        assert_eq!(
+            cross_project.validate().unwrap_err().code(),
+            "error.project_catalog_inventory_invalid"
+        );
+
+        let mut unknown = fixture_inventory();
+        unknown.publisher_pins[0]
+            .source_observation_ids
+            .insert("unknown_observation".to_string());
+        assert_eq!(
+            unknown.validate().unwrap_err().code(),
+            "error.project_catalog_inventory_invalid"
+        );
+    }
+
+    #[test]
+    fn mutable_source_rows_reject_omission_and_substitution() {
+        let mut omitted = fixture_inventory();
+        let metadata = omitted
+            .mutable_source_evidence
+            .iter_mut()
+            .find(|row| {
+                row.source_kind == MutableInventorySourceKindV1::CodeSourceGenerationMetadata
+            })
+            .unwrap();
+        metadata.row_observation_ids.clear();
+        metadata.row_set_sha256 = mutable_source_row_set_hash(&metadata.row_observation_ids);
+        assert_eq!(
+            omitted.validate().unwrap_err().code(),
+            "error.project_catalog_inventory_invalid"
+        );
+
+        let mut substituted = fixture_inventory();
+        let metadata = substituted
+            .mutable_source_evidence
+            .iter_mut()
+            .find(|row| {
+                row.source_kind == MutableInventorySourceKindV1::CodeSourceGenerationMetadata
+            })
+            .unwrap();
+        metadata.row_observation_ids = BTreeSet::from(["legacy_alpha".to_string()]);
+        metadata.row_set_sha256 = mutable_source_row_set_hash(&metadata.row_observation_ids);
+        assert_eq!(
+            substituted.validate().unwrap_err().code(),
+            "error.project_catalog_inventory_invalid"
+        );
+    }
+
+    #[test]
+    fn corrupt_quarantine_manifest_is_a_non_overridable_refusal() {
+        let mut inventory = fixture_inventory();
+        let active = inventory.code_sources[0].generations.remove(0);
+        inventory.code_sources[0].planned_activation_v2_hash = None;
+        inventory.code_sources[0]
+            .quarantine
+            .push(QuarantinedGenerationObservationV1 {
+                observation_id: active.observation_id,
+                project_id: active.project_id.clone(),
+                generation_id: active.generation_id.clone(),
+                descriptor: active.descriptor,
+                manifest: ImmutableArtifactObservationV1::Corrupt {
+                    diagnostic_code: "manifest_invalid".to_string(),
+                },
+                manifest_hash: hash("manifest"),
+                planned_metadata_v2_hash: active.planned_metadata_v2_hash,
+                collision_lifecycle: CollisionLifecycleObservationV1 {
+                    version: 1,
+                    state: CollisionLifecycleStateObservationV1::Pending,
+                    project_id: active.project_id,
+                    former_scope: scope("services/alpha"),
+                    generation_id: active.generation_id,
+                    selector_evidence: DurableSelectorEvidenceV1::ExactMaterialized {
+                        selector_hash: hash("selector"),
+                    },
+                    snapshot_id: format!("collected-{}", "e".repeat(32)),
+                    manifest_sha256: hash("manifest"),
+                    inventory_hash: hash("inventory"),
+                    plan_hash: hash("plan"),
+                },
+            });
+        assert!(inventory.hard_refusals().iter().any(|refusal| {
+            refusal.record_id == "generation_alpha"
+                && refusal.diagnostic_code == "quarantined_manifest_corrupt"
+        }));
+    }
+
+    #[test]
+    fn canonical_inventory_contains_only_path_digests() {
+        let inventory = fixture_inventory();
+        let encoded = String::from_utf8(inventory.canonical_json().unwrap()).unwrap();
+        for forbidden in [
+            "/workspace/acme",
+            "Example.java",
+            "src/Example.java",
+            "\"canonical_path\":\"",
+            "literal_selector",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "canonical inventory leaked {forbidden}"
+            );
+        }
+        assert!(encoded.contains(digest_path("/workspace/acme").as_str()));
+    }
+
+    #[test]
     fn default_report_contains_no_literal_checkout_or_legacy_path() {
         let inventory = fixture_inventory();
         let resolution =
@@ -4956,7 +5364,16 @@ mod tests {
     #[test]
     fn local_path_report_requires_explicit_sensitive_shape() {
         let inventory = fixture_inventory();
-        let report = SensitiveLocalPathReportV1::from_inventory(&inventory).unwrap();
+        let report = SensitiveLocalPathReportV1::from_runtime_rows(
+            &inventory,
+            vec![SensitiveLocalPathRowV1 {
+                observation_id: "legacy_path_alpha".to_string(),
+                store_kind: LegacyPathStoreKindV1::Knowledge,
+                stable_row_id: "knowledge_1".to_string(),
+                literal_selector: "/workspace/acme/alpha/src/Example.java".to_string(),
+            }],
+        )
+        .unwrap();
         report.validate().unwrap();
         let encoded = serde_json::to_string(&report).unwrap();
         assert!(encoded.contains("\"local_paths_included\":true"));

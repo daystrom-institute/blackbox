@@ -12,16 +12,17 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use bbox_code_source::{
     GenerationState, source_selector, validate_collected_materialization_selector,
 };
 use bbox_code_source_store::{
-    ActivationRecord, ActivationRecordV2, CodeSourceStorePaths, MigrationLegacyAnchorEvidenceV1,
-    MigrationLegacyGenerationEvidenceV1, MigrationLegacyInventoryV1, StoreLimits,
-    StoredGenerationV2, decode_migration_effective_source_manifest_v1,
-    encode_activation_v2_for_migration, encode_stored_generation_v2_for_migration,
-    verify_generation_manifest_for_migration,
+    ActivationRecord, ActivationRecordV2, CodeSourceStore, CollisionRetirementLifecycleStateV1,
+    MigrationLegacyAnchorEvidenceV1, MigrationLegacyGenerationEvidenceV1,
+    MigrationOwnedLegacyInventoryV1, StoreLimits, StoredGenerationV2,
+    decode_migration_effective_source_manifest_v1, encode_activation_v2_for_migration,
+    encode_stored_generation_v2_for_migration, verify_generation_manifest_for_migration,
 };
 use bbox_corpus_core::git::{
     read_verified_committed_file_bytes_optional_bounded, verify_commit_oid_with_alternate,
@@ -29,29 +30,29 @@ use bbox_corpus_core::git::{
 use bbox_corpus_core::identity::{PublishedScope, resolve_recorded_repo_id};
 use bbox_corpus_core::json_store::NofollowDirectory;
 use bbox_corpus_core::project_catalog::{
-    AttachmentId, LegacyProjectStoreV1, MAX_PROJECT_CATALOG_BYTES, MAX_PROJECT_CATALOG_ENTRIES,
-    ProjectId, RecordedRepoAuthority, decode_legacy_project_store,
+    LegacyProjectStoreV1, MAX_PROJECT_CATALOG_BYTES, ProjectId, RecordedRepoAuthority,
+    decode_legacy_project_store,
 };
 use sha2::{Digest, Sha256};
 
 use crate::project_catalog_inventory::{
     AttachmentCandidateObservationV1, CheckoutMarkerStateV1, CheckoutObservationV1,
     CodeSourceObservationV1, CollectedGenerationObservationV1, CollectedGenerationRoleV1,
-    EdgeWorkspaceObservationV1, GitMetadataObservationV1, ImmutableArtifactObservationV1,
-    ImmutableCollectedDescriptorV1, ImmutableInventoryLaneCompletenessV1,
+    CollisionLifecycleObservationV1, CollisionLifecycleStateObservationV1,
+    DurableSelectorEvidenceV1, EdgeWorkspaceObservationV1, GitMetadataObservationV1,
+    ImmutableArtifactObservationV1, ImmutableCollectedDescriptorV1,
     ImmutableInventoryLaneEvidenceV1, ImmutableInventoryLaneKindV1, InventorySourceStateV1,
     InventoryTargetObservationV1, LegacyNamespaceClusterObservationV1, LegacyPathObservationV1,
     LegacyProjectObservationV1, LegacyProjectPathStatusV1, LegacyProjectRecordInventoryV1,
     MaterializedAliasObservationV1, MutableInventorySourceEvidenceV1, MutableInventorySourceKindV1,
     MutableInventorySourceLocatorV1, PROJECT_CATALOG_INVENTORY_VERSION_V1,
     ProjectScopedRefObservationV1, PublisherPinObservationV1, QuarantinedGenerationObservationV1,
-    RepoGroupingProofV1, Sha256ValueV1, V1ProjectCatalogInventory, digest_path,
-    mutable_source_row_set_hash,
+    RepoGroupingProofV1, RetainedGenerationOwnerResolutionObservationV1, Sha256ValueV1,
+    V1ProjectCatalogInventory, digest_path, mutable_source_row_set_hash,
 };
-use crate::publisher::{PublisherRefRow, decode_publisher_ref_source_v1};
+use crate::publisher::{MigrationPublisherRefSnapshotV1, PublisherRefRow, PublisherRefStore};
 
 const MAX_AUTHORIZED_PATH_BYTES: usize = 4_096;
-const MAX_PUBLISHER_REF_SOURCE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COMMITTED_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_CHECKOUT_MARKER_BYTES: usize = 128;
 
@@ -89,9 +90,20 @@ impl std::error::Error for InventoryAdapterError {}
 
 pub type AdapterResult<T> = Result<T, InventoryAdapterError>;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct AuthorizedInventoryPath {
     path: PathBuf,
+    authority: Arc<NofollowDirectory>,
+    authority_canonical_path: PathBuf,
+    target_identity: Option<FileIdentityV1>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct FileIdentityV1 {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
 }
 
 impl AuthorizedInventoryPath {
@@ -110,7 +122,39 @@ impl AuthorizedInventoryPath {
         {
             return Err(invalid_input("authorized path is unsafe"));
         }
-        Ok(Self { path })
+        let (authority_path, missing_suffix) = deepest_existing_directory(&path)?;
+        let authority = Arc::new(
+            NofollowDirectory::open_existing(&authority_path)
+                .map_err(|_| invalid_input("authorized path authority is unsafe"))?
+                .ok_or_else(|| invalid_input("authorized path authority is missing"))?,
+        );
+        let canonical_authority = authority_path
+            .canonicalize()
+            .map_err(|_| invalid_input("authorized path authority cannot be canonicalized"))?;
+        authority
+            .ensure_still_current()
+            .map_err(|_| invalid_input("authorized path authority changed"))?;
+        let canonical_path = missing_suffix
+            .iter()
+            .fold(canonical_authority.clone(), |path, component| {
+                path.join(component)
+            });
+        let target_identity = match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(invalid_input("authorized path contains a symlink"));
+                }
+                Some(file_identity(&metadata))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err(invalid_input("authorized path cannot be inspected")),
+        };
+        Ok(Self {
+            path: canonical_path,
+            authority,
+            authority_canonical_path: canonical_authority,
+            target_identity,
+        })
     }
 
     fn as_path(&self) -> &Path {
@@ -128,11 +172,89 @@ impl AuthorizedInventoryPath {
         }
         Self::new(self.path.join(relative))
     }
+
+    fn ensure_authority(&self) -> AdapterResult<()> {
+        self.authority
+            .ensure_still_current()
+            .map_err(|_| invalid_source("authorized_path_authority_changed"))?;
+        let current_identity = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(invalid_source("authorized_path_target_changed"));
+            }
+            Ok(metadata) => Some(file_identity(&metadata)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err(invalid_source("authorized_path_target_unreadable")),
+        };
+        if current_identity != self.target_identity {
+            return Err(invalid_source("authorized_path_target_changed"));
+        }
+        Ok(())
+    }
+
+    fn authority_path_for_read(&self) -> &Path {
+        &self.authority_canonical_path
+    }
+
+    fn checkout_identity_key(&self) -> AdapterResult<(PathBuf, FileIdentityV1)> {
+        Ok((
+            self.path.clone(),
+            self.target_identity
+                .ok_or_else(|| invalid_source("checkout root identity is missing"))?,
+        ))
+    }
 }
+
+impl PartialEq for AuthorizedInventoryPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path && self.target_identity == other.target_identity
+    }
+}
+
+impl Eq for AuthorizedInventoryPath {}
 
 impl fmt::Debug for AuthorizedInventoryPath {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("AuthorizedInventoryPath(<redacted>)")
+    }
+}
+
+fn deepest_existing_directory(path: &Path) -> AdapterResult<(PathBuf, Vec<std::ffi::OsString>)> {
+    let mut current = PathBuf::from("/");
+    let mut components = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_os_string()),
+            _ => None,
+        })
+        .peekable();
+    while let Some(component) = components.next() {
+        let candidate = current.join(&component);
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(invalid_input("authorized path contains a symlink"));
+            }
+            Ok(metadata) if metadata.is_dir() => current = candidate,
+            Ok(_) if components.peek().is_none() => {
+                return Ok((current, vec![component]));
+            }
+            Ok(_) => return Err(invalid_input("authorized path parent is not a directory")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut suffix = vec![component];
+                suffix.extend(components);
+                return Ok((current, suffix));
+            }
+            Err(_) => return Err(invalid_input("authorized path cannot be inspected")),
+        }
+    }
+    Ok((current, Vec::new()))
+}
+
+fn file_identity(metadata: &fs::Metadata) -> FileIdentityV1 {
+    FileIdentityV1 {
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
     }
 }
 
@@ -237,8 +359,14 @@ pub fn read_authorized_file(
     path: &AuthorizedInventoryPath,
     max_bytes: usize,
 ) -> AdapterResult<AuthorizedFileObservationV1> {
-    match inspect_path(path.as_path()) {
-        InspectedPath::Missing => return Ok(AuthorizedFileObservationV1::NotFound),
+    path.ensure_authority()?;
+    let refreshed = AuthorizedInventoryPath::new(path.as_path())?;
+    match inspect_path(refreshed.as_path()) {
+        InspectedPath::Missing => {
+            refreshed.ensure_authority()?;
+            path.ensure_authority()?;
+            return Ok(AuthorizedFileObservationV1::NotFound);
+        }
         InspectedPath::Symlinked => return Ok(invalid_file("source_path_symlinked")),
         InspectedPath::Unreadable => return Ok(invalid_file("source_path_unreadable")),
         InspectedPath::NonRegular | InspectedPath::Directory => {
@@ -249,26 +377,28 @@ pub fn read_authorized_file(
         }
         InspectedPath::Regular { .. } => {}
     }
-    let parent = path
+    let parent = refreshed
         .as_path()
         .parent()
         .ok_or_else(|| invalid_input("authorized file has no parent"))?;
-    let name = path
+    let name = refreshed
         .as_path()
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| invalid_input("authorized file has an invalid basename"))?;
-    let directory = match NofollowDirectory::open_existing(parent) {
-        Ok(Some(directory)) => directory,
-        Ok(None) => return Ok(AuthorizedFileObservationV1::NotFound),
-        Err(_) => return Ok(invalid_file("source_path_unreadable")),
-    };
-    let bytes = match directory.read_regular(name, max_bytes, "migration inventory source") {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => return Ok(AuthorizedFileObservationV1::NotFound),
-        Err(_) => return Ok(invalid_file("source_read_invalid")),
-    };
-    if directory.ensure_still_current().is_err() {
+    if refreshed.authority_path_for_read() != parent {
+        return Ok(AuthorizedFileObservationV1::NotFound);
+    }
+    let bytes =
+        match refreshed
+            .authority
+            .read_regular(name, max_bytes, "migration inventory source")
+        {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(AuthorizedFileObservationV1::NotFound),
+            Err(_) => return Ok(invalid_file("source_read_invalid")),
+        };
+    if refreshed.authority.ensure_still_current().is_err() || path.ensure_authority().is_err() {
         return Ok(invalid_file("source_path_changed"));
     }
     Ok(AuthorizedFileObservationV1::Present(
@@ -362,32 +492,28 @@ pub struct PublisherRefInventoryV1 {
     pub rows: Vec<PublisherRefRow>,
 }
 
-pub(crate) fn capture_publisher_ref_source(
-    path: &AuthorizedInventoryPath,
-) -> AdapterResult<DecodedSourceObservationV1<PublisherRefInventoryV1>> {
-    Ok(decode_source(
-        read_authorized_file(path, MAX_PUBLISHER_REF_SOURCE_BYTES)?,
-        |bytes| {
-            decode_publisher_ref_source_v1(bytes)
-                .map(|rows| PublisherRefInventoryV1 { rows })
-                .map_err(|_| ())
-        },
-        "publisher_refs_invalid",
-    ))
+struct LockedPublisherRefSourceV1 {
+    source: ExactDecodedSourceV1<PublisherRefInventoryV1>,
+    _owner: MigrationPublisherRefSnapshotV1,
 }
 
-fn accept_missing_publisher_ref_source(
-    observed: DecodedSourceObservationV1<PublisherRefInventoryV1>,
-) -> AdapterResult<ExactDecodedSourceV1<PublisherRefInventoryV1>> {
-    match observed {
-        DecodedSourceObservationV1::NotFound => Ok(ExactDecodedSourceV1 {
-            source: ExactSourceBytesV1::new(Vec::new()),
-            value: PublisherRefInventoryV1 { rows: Vec::new() },
-            was_missing: true,
-        }),
-        DecodedSourceObservationV1::Valid(source) => Ok(source),
-        DecodedSourceObservationV1::Invalid { .. } => Err(invalid_source("publisher_refs_invalid")),
-    }
+fn capture_publisher_ref_source(
+    store: &PublisherRefStore,
+) -> AdapterResult<LockedPublisherRefSourceV1> {
+    let snapshot = store
+        .snapshot_migration_source()
+        .map_err(|_| invalid_source("publisher_refs_invalid"))?;
+    let source = ExactDecodedSourceV1 {
+        source: ExactSourceBytesV1::new(snapshot.bytes.clone()),
+        value: PublisherRefInventoryV1 {
+            rows: snapshot.rows.clone(),
+        },
+        was_missing: snapshot.was_missing,
+    };
+    Ok(LockedPublisherRefSourceV1 {
+        source,
+        _owner: snapshot,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -528,6 +654,48 @@ struct LegacyProjectsCaptureV1 {
     observations: Vec<LegacyProjectObservationV1>,
     source_evidence: Vec<MutableInventorySourceEvidenceV1>,
     published_scopes: BTreeMap<ProjectId, PublishedScope>,
+    project_roots: BTreeMap<ProjectId, AuthorizedInventoryPath>,
+    runtime_project_paths: BTreeMap<String, AuthorizedInventoryPath>,
+}
+
+fn derive_legacy_project_probes(
+    source: &ExactDecodedSourceV1<LegacyProjectStoreV1>,
+) -> AdapterResult<Vec<LegacyProjectProbeInputV1>> {
+    source
+        .value
+        .projects
+        .iter()
+        .map(|record| {
+            let project_id = ProjectId::parse(record.project_id.clone())
+                .map_err(|_| invalid_source("legacy_project_id_invalid"))?;
+            let project_root = AuthorizedInventoryPath::new(&record.canonical_path)?;
+            let committed_config = if record.is_git_repo
+                && matches!(
+                    inspect_path(project_root.as_path()),
+                    InspectedPath::Directory
+                ) {
+                bbox_corpus_core::git::git_root_for_path(project_root.as_path())
+                    .and_then(|root| {
+                        bbox_corpus_core::git::current_head(&root)
+                            .map(|commit_oid| (root, commit_oid))
+                    })
+                    .map(|(root, commit_oid)| {
+                        Ok(CommittedConfigSourceV1 {
+                            repository_root: AuthorizedInventoryPath::new(root)?,
+                            commit_oid,
+                        })
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            Ok(LegacyProjectProbeInputV1 {
+                project_id,
+                authorized_canonical_path: project_root,
+                committed_config,
+            })
+        })
+        .collect()
 }
 
 fn observe_legacy_projects(
@@ -545,6 +713,8 @@ fn observe_legacy_projects(
     let mut observations = Vec::new();
     let mut source_evidence = Vec::new();
     let mut published_scopes = BTreeMap::new();
+    let mut project_roots = BTreeMap::new();
+    let mut runtime_project_paths = BTreeMap::new();
     for record in &source.value.projects {
         let project_id = ProjectId::parse(record.project_id.clone())
             .map_err(|_| invalid_source("legacy_project_id_invalid"))?;
@@ -591,10 +761,12 @@ fn observe_legacy_projects(
         if let Some(scope) = authority_probe.published_scope {
             published_scopes.insert(project_id.clone(), scope);
         }
+        project_roots.insert(project_id.clone(), probe.authorized_canonical_path.clone());
+        runtime_project_paths.insert(observation_id.clone(), probe.authorized_canonical_path);
         source_evidence.push(authority_probe.source_evidence);
         observations.push(LegacyProjectObservationV1 {
             observation_id,
-            record: LegacyProjectRecordInventoryV1::from(record.clone()),
+            record: LegacyProjectRecordInventoryV1::from_legacy(record.clone()),
             path_status,
             committed_authority,
         });
@@ -605,58 +777,66 @@ fn observe_legacy_projects(
         observations,
         source_evidence,
         published_scopes,
+        project_roots,
+        runtime_project_paths,
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublisherPinBindingInputV1 {
-    pub project_id: ProjectId,
-    pub expected_scope: PublishedScope,
-    pub candidate_attachment_ids: BTreeSet<AttachmentId>,
-    pub resolved_commit: Option<String>,
-    pub resolved_scope: Option<PublishedScope>,
-    pub source_observation_ids: BTreeSet<String>,
-}
-
-fn bind_publisher_pins(
+fn derive_publisher_pins(
     source: &ExactDecodedSourceV1<PublisherRefInventoryV1>,
-    bindings: Vec<PublisherPinBindingInputV1>,
+    legacy: &LegacyProjectsCaptureV1,
 ) -> AdapterResult<Vec<PublisherPinObservationV1>> {
-    let binding_count = bindings.len();
-    let mut bindings = bindings
-        .into_iter()
-        .map(|binding| (binding.expected_scope.clone(), binding))
-        .collect::<BTreeMap<_, _>>();
-    if binding_count != bindings.len() || bindings.len() != source.value.rows.len() {
-        return Err(invalid_input("publisher pin bindings are not exact"));
-    }
-    let publisher_source_id = stable_observation_id_v1(
-        "publisher-ref-source",
-        &[source.source.content_hash.as_str().as_bytes()],
-    )?;
     let mut rows = Vec::new();
     for publisher in &source.value.rows {
-        let binding = bindings
-            .remove(&publisher.scope)
-            .ok_or_else(|| invalid_input("publisher pin binding is missing"))?;
-        let mut source_observation_ids = binding.source_observation_ids;
-        source_observation_ids.insert(publisher_source_id.clone());
+        let owners = legacy
+            .published_scopes
+            .iter()
+            .filter(|(_, scope)| **scope == publisher.scope)
+            .map(|(project_id, _)| project_id)
+            .collect::<Vec<_>>();
+        if owners.len() != 1 {
+            return Err(invalid_source("publisher_scope_owner_not_unique"));
+        }
+        let project_id = owners[0].clone();
+        let project = legacy
+            .observations
+            .iter()
+            .find(|row| row.record.project_id == project_id.as_str())
+            .ok_or_else(|| invalid_source("publisher_project_observation_missing"))?;
+        let project_root = legacy
+            .project_roots
+            .get(&project_id)
+            .ok_or_else(|| invalid_source("publisher_project_root_missing"))?;
+        let resolved_commit =
+            bbox_corpus_core::git::resolve_commit(project_root.as_path(), &publisher.branch_ref);
+        if let Some(commit) = &resolved_commit {
+            let repository_root = bbox_corpus_core::git::git_root_for_path(project_root.as_path())
+                .ok_or_else(|| invalid_source("publisher_repository_root_missing"))?;
+            verify_commit_oid_with_alternate(&repository_root, commit, None)
+                .map_err(|_| invalid_source("publisher_commit_invalid"))?;
+        }
+        let observation_id = stable_observation_id_v1(
+            "publisher-pin",
+            &[
+                project_id.as_str().as_bytes(),
+                publisher.scope.repo_id().as_bytes(),
+                publisher.scope.bbox_root_relpath().as_bytes(),
+                publisher.branch_ref.as_bytes(),
+            ],
+        )?;
+        let mut source_observation_ids =
+            BTreeSet::from([observation_id.clone(), project.observation_id.clone()]);
+        if let Some(authority) = &project.committed_authority {
+            source_observation_ids.insert(authority.observation_id.clone());
+        }
         rows.push(PublisherPinObservationV1 {
-            observation_id: stable_observation_id_v1(
-                "publisher-pin",
-                &[
-                    binding.project_id.as_str().as_bytes(),
-                    publisher.scope.repo_id().as_bytes(),
-                    publisher.scope.bbox_root_relpath().as_bytes(),
-                    publisher.branch_ref.as_bytes(),
-                ],
-            )?,
-            project_id: binding.project_id,
+            observation_id,
+            project_id,
             expected_scope: publisher.scope.clone(),
             full_ref: publisher.branch_ref.clone(),
-            candidate_attachment_ids: binding.candidate_attachment_ids,
-            resolved_commit: binding.resolved_commit,
-            resolved_scope: binding.resolved_scope,
+            candidate_attachment_ids: BTreeSet::new(),
+            resolved_scope: resolved_commit.as_ref().map(|_| publisher.scope.clone()),
+            resolved_commit,
             source_observation_ids,
         });
     }
@@ -664,28 +844,24 @@ fn bind_publisher_pins(
     Ok(rows)
 }
 
-#[derive(Debug, Clone)]
-struct CodeSourceInventorySnapshotV1 {
+struct CodeSourceInventorySnapshotV1<'a> {
     anchor_source: ExactSourceBytesV1,
     anchor_missing: bool,
-    inventory: MigrationLegacyInventoryV1,
+    owner: MigrationOwnedLegacyInventoryV1<'a>,
 }
 
-fn capture_code_source_inventory(
-    paths: &CodeSourceStorePaths,
-    limits: &StoreLimits,
+fn capture_code_source_inventory<'a>(
+    store: &'a CodeSourceStore,
     catalog_scopes: &BTreeSet<PublishedScope>,
-) -> AdapterResult<CodeSourceInventorySnapshotV1> {
-    let guard = paths
-        .lock_migration_inventory()
-        .map_err(|_| invalid_source("code_source_lock_invalid"))?;
-    let inventory = guard
-        .snapshot_legacy_v1_for_scopes(limits, catalog_scopes)
+) -> AdapterResult<CodeSourceInventorySnapshotV1<'a>> {
+    let owned = store
+        .snapshot_legacy_migration_for_scopes(catalog_scopes)
         .map_err(|_| invalid_source("code_source_inventory_invalid"))?;
-    inventory
+    owned
+        .inventory
         .validate_evidence()
         .map_err(|_| invalid_source("code_source_inventory_evidence_invalid"))?;
-    let (anchor_source, anchor_missing) = match &inventory.anchor {
+    let (anchor_source, anchor_missing) = match &owned.inventory.anchor {
         MigrationLegacyAnchorEvidenceV1::Missing => (ExactSourceBytesV1::new(Vec::new()), true),
         MigrationLegacyAnchorEvidenceV1::Present { bytes, .. } => {
             (ExactSourceBytesV1::new(bytes.clone()), false)
@@ -694,7 +870,7 @@ fn capture_code_source_inventory(
     Ok(CodeSourceInventorySnapshotV1 {
         anchor_source,
         anchor_missing,
-        inventory,
+        owner: owned,
     })
 }
 
@@ -704,12 +880,18 @@ struct CodeSourceCaptureV1 {
     source_evidence: Vec<MutableInventorySourceEvidenceV1>,
 }
 
+#[derive(Debug, Clone)]
+struct CodeSourceInventoryCaptureV1 {
+    sources: Vec<CodeSourceCaptureV1>,
+    retained_owner_resolutions: Vec<RetainedGenerationOwnerResolutionObservationV1>,
+    retained_owner_source_evidence: Vec<MutableInventorySourceEvidenceV1>,
+}
+
 fn observe_code_sources(
-    snapshot: &CodeSourceInventorySnapshotV1,
+    snapshot: &CodeSourceInventorySnapshotV1<'_>,
     project_scopes: &BTreeMap<ProjectId, PublishedScope>,
     missing_checkout_projects: &BTreeSet<ProjectId>,
-    limits: &StoreLimits,
-) -> AdapterResult<Vec<CodeSourceCaptureV1>> {
+) -> AdapterResult<CodeSourceInventoryCaptureV1> {
     let generations_by_id = snapshot
         .inventory
         .generations
@@ -717,7 +899,8 @@ fn observe_code_sources(
         .map(|row| (row.generation_id.clone(), row))
         .collect::<BTreeMap<_, _>>();
     let mut owner_by_generation = BTreeMap::<String, ProjectId>::new();
-    if let MigrationLegacyAnchorEvidenceV1::Present { bytes, .. } = &snapshot.inventory.anchor {
+    if let MigrationLegacyAnchorEvidenceV1::Present { bytes, .. } = &snapshot.owner.inventory.anchor
+    {
         let manifest = decode_migration_effective_source_manifest_v1(bytes)
             .map_err(|_| invalid_source("effective_source_manifest_invalid"))?;
         for selection in manifest.selections {
@@ -728,21 +911,23 @@ fn observe_code_sources(
             )?;
         }
     }
-    for activation in &snapshot.inventory.activations {
+    for activation in &snapshot.owner.inventory.activations {
         insert_generation_owner(
             &mut owner_by_generation,
             &activation.record.generation_id,
             &activation.project_id,
         )?;
     }
-    for collision in &snapshot.inventory.collision_pending {
+    for collision in &snapshot.owner.inventory.collision_pending {
         insert_generation_owner(
             &mut owner_by_generation,
             &collision.record.generation_id,
             &collision.project_id,
         )?;
     }
-    for generation in &snapshot.inventory.generations {
+    let mut retained_owner_resolutions = Vec::new();
+    let mut retained_owner_source_evidence = Vec::new();
+    for generation in &snapshot.owner.inventory.generations {
         if owner_by_generation.contains_key(&generation.generation_id) {
             continue;
         }
@@ -751,28 +936,98 @@ fn observe_code_sources(
             .filter(|(_, scope)| **scope == generation.published_scope)
             .map(|(project_id, _)| project_id)
             .collect::<Vec<_>>();
-        if candidates.len() != 1 {
-            return Err(invalid_source("retained_generation_owner_ambiguous"));
+        if candidates.len() > 1 {
+            let observation_id = stable_observation_id_v1(
+                "retained-owner-resolution",
+                &[
+                    generation.generation_id.as_bytes(),
+                    bbox_code_source::scope_hash(&generation.published_scope).as_bytes(),
+                ],
+            )?;
+            let (descriptor, manifest, planned_metadata_v2_hash) =
+                describe_generation(generation, &snapshot.owner.limits)?;
+            retained_owner_resolutions.push(RetainedGenerationOwnerResolutionObservationV1 {
+                observation_id: observation_id.clone(),
+                generation_id: generation.generation_id.clone(),
+                published_scope: generation.published_scope.clone(),
+                candidate_project_ids: candidates.into_iter().cloned().collect(),
+                descriptor,
+                manifest,
+                selector_evidence: DurableSelectorEvidenceV1::NoDurableSelector,
+                planned_metadata_v2_hash,
+            });
+            let scope_hash =
+                Sha256ValueV1::parse(bbox_code_source::scope_hash(&generation.published_scope))
+                    .map_err(|_| invalid_source("code_source_scope_hash_invalid"))?;
+            let row_ids = BTreeSet::from([observation_id]);
+            retained_owner_source_evidence.push(source_evidence(
+                &stable_observation_id_v1(
+                    "generation-metadata",
+                    &[
+                        b"retained-owner-resolution",
+                        generation.generation_id.as_bytes(),
+                    ],
+                )?,
+                MutableInventorySourceKindV1::CodeSourceGenerationMetadata,
+                MutableInventorySourceLocatorV1::CodeSourceGenerationMetadata {
+                    scope_hash: scope_hash.clone(),
+                    generation_id: generation.generation_id.clone(),
+                },
+                present_bytes_state(&generation.metadata_bytes),
+                row_ids.clone(),
+            ));
+            retained_owner_source_evidence.push(source_evidence(
+                &stable_observation_id_v1(
+                    "generation-manifest",
+                    &[
+                        b"retained-owner-resolution",
+                        generation.generation_id.as_bytes(),
+                    ],
+                )?,
+                MutableInventorySourceKindV1::CodeSourceGenerationManifest,
+                MutableInventorySourceLocatorV1::CodeSourceGenerationManifest {
+                    scope_hash,
+                    generation_id: generation.generation_id.clone(),
+                },
+                present_bytes_state(&generation.manifest_bytes),
+                row_ids,
+            ));
+            continue;
+        }
+        if candidates.is_empty() {
+            return Err(invalid_source("retained_generation_owner_missing"));
         }
         owner_by_generation.insert(generation.generation_id.clone(), candidates[0].clone());
     }
-    let quarantined = snapshot
+    let collision_by_generation = snapshot
         .inventory
         .collision_pending
         .iter()
-        .map(|row| (row.project_id.clone(), row.record.generation_id.clone()))
+        .map(|row| {
+            (
+                (row.project_id.clone(), row.record.generation_id.clone()),
+                row,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let ambiguous_generation_ids = retained_owner_resolutions
+        .iter()
+        .map(|row| row.generation_id.as_str())
         .collect::<BTreeSet<_>>();
     let mut grouped = BTreeMap::<ProjectId, Vec<&MigrationLegacyGenerationEvidenceV1>>::new();
-    for generation in &snapshot.inventory.generations {
-        let project_id = owner_by_generation
-            .get(&generation.generation_id)
-            .ok_or_else(|| invalid_source("protected_generation_owner_missing"))?;
+    for generation in &snapshot.owner.inventory.generations {
+        let Some(project_id) = owner_by_generation.get(&generation.generation_id) else {
+            if ambiguous_generation_ids.contains(generation.generation_id.as_str()) {
+                continue;
+            }
+            return Err(invalid_source("protected_generation_owner_missing"));
+        };
         grouped
             .entry(project_id.clone())
             .or_default()
             .push(generation);
     }
-    for activation in &snapshot.inventory.activations {
+    for activation in &snapshot.owner.inventory.activations {
         grouped.entry(activation.project_id.clone()).or_default();
     }
     let mut captures = Vec::new();
@@ -791,7 +1046,9 @@ fn observe_code_sources(
         let mut evidence = Vec::new();
         for generation in generation_rows {
             let observation_id = stable_observation_id_v1(
-                if quarantined.contains(&(project_id.clone(), generation.generation_id.clone())) {
+                if collision_by_generation
+                    .contains_key(&(project_id.clone(), generation.generation_id.clone()))
+                {
                     "quarantined-generation"
                 } else {
                     "collected-generation"
@@ -802,7 +1059,7 @@ fn observe_code_sources(
                 ],
             )?;
             let (descriptor, manifest, planned_metadata_v2_hash) =
-                describe_generation(generation, limits)?;
+                describe_generation(generation, &snapshot.owner.limits)?;
             let row_ids = BTreeSet::from([observation_id.clone()]);
             let scope_hash =
                 Sha256ValueV1::parse(bbox_code_source::scope_hash(&generation.published_scope))
@@ -839,7 +1096,21 @@ fn observe_code_sources(
                 present_bytes_state(&generation.manifest_bytes),
                 row_ids,
             ));
-            if quarantined.contains(&(project_id.clone(), generation.generation_id.clone())) {
+            if let Some(collision) =
+                collision_by_generation.get(&(project_id.clone(), generation.generation_id.clone()))
+            {
+                evidence.push(source_evidence(
+                    &stable_observation_id_v1(
+                        "collision-lifecycle",
+                        &[project_id.as_str().as_bytes()],
+                    )?,
+                    MutableInventorySourceKindV1::CodeSourceCollisionLifecycle,
+                    MutableInventorySourceLocatorV1::CodeSourceCollisionLifecycle {
+                        project_id: project_id.clone(),
+                    },
+                    present_bytes_state(&collision.bytes),
+                    BTreeSet::from([observation_id.clone()]),
+                ));
                 quarantine.push(QuarantinedGenerationObservationV1 {
                     observation_id,
                     project_id: project_id.clone(),
@@ -849,17 +1120,60 @@ fn observe_code_sources(
                     manifest_hash: Sha256ValueV1::parse(generation.manifest_sha256.clone())
                         .map_err(|_| invalid_source("generation_manifest_hash_invalid"))?,
                     planned_metadata_v2_hash,
+                    collision_lifecycle: CollisionLifecycleObservationV1 {
+                        version: collision.record.version,
+                        state: match collision.record.state {
+                            CollisionRetirementLifecycleStateV1::Pending => {
+                                CollisionLifecycleStateObservationV1::Pending
+                            }
+                            CollisionRetirementLifecycleStateV1::Queued => {
+                                CollisionLifecycleStateObservationV1::Queued
+                            }
+                            CollisionRetirementLifecycleStateV1::Completed => {
+                                CollisionLifecycleStateObservationV1::Completed
+                            }
+                        },
+                        project_id: collision.record.project_id.clone(),
+                        former_scope: collision.record.former_scope.clone(),
+                        generation_id: collision.record.generation_id.clone(),
+                        selector_evidence: if active_generation_id
+                            == Some(generation.generation_id.as_str())
+                        {
+                            DurableSelectorEvidenceV1::ExactMaterialized {
+                                selector_hash: Sha256ValueV1::digest(
+                                    collision.record.selector.as_bytes(),
+                                ),
+                            }
+                        } else {
+                            DurableSelectorEvidenceV1::NoDurableSelector
+                        },
+                        snapshot_id: collision.record.snapshot_id.clone(),
+                        manifest_sha256: Sha256ValueV1::parse(
+                            collision.record.manifest_sha256.clone(),
+                        )
+                        .map_err(|_| invalid_source("collision_manifest_hash_invalid"))?,
+                        inventory_hash: Sha256ValueV1::parse(
+                            collision.record.inventory_hash.clone(),
+                        )
+                        .map_err(|_| invalid_source("collision_inventory_hash_invalid"))?,
+                        plan_hash: Sha256ValueV1::parse(collision.record.plan_hash.clone())
+                            .map_err(|_| invalid_source("collision_plan_hash_invalid"))?,
+                    },
                 });
             } else {
                 let active = active_generation_id == Some(generation.generation_id.as_str());
-                let literal_selector = if active {
-                    activation
-                        .expect("active generation has activation")
-                        .record
-                        .selector
-                        .clone()
+                let selector_evidence = if active {
+                    DurableSelectorEvidenceV1::ExactMaterialized {
+                        selector_hash: Sha256ValueV1::digest(
+                            activation
+                                .expect("active generation has activation")
+                                .record
+                                .selector
+                                .as_bytes(),
+                        ),
+                    }
                 } else {
-                    source_selector(project_id.as_str(), &generation.generation_id)
+                    DurableSelectorEvidenceV1::NoDurableSelector
                 };
                 generations.push(CollectedGenerationObservationV1 {
                     observation_id,
@@ -873,7 +1187,7 @@ fn observe_code_sources(
                     activation_scope: Some(generation.published_scope.clone()),
                     descriptor,
                     manifest,
-                    selector_hash: Sha256ValueV1::digest(literal_selector.as_bytes()),
+                    selector_evidence,
                     checkout_missing: missing_checkout_projects.contains(&project_id),
                     planned_metadata_v2_hash,
                 });
@@ -884,7 +1198,9 @@ fn observe_code_sources(
                 let generation = generations_by_id
                     .get(&activation.record.generation_id)
                     .ok_or_else(|| invalid_source("activation_generation_missing"))?;
-                if quarantined.contains(&(project_id.clone(), generation.generation_id.clone())) {
+                if collision_by_generation
+                    .contains_key(&(project_id.clone(), generation.generation_id.clone()))
+                {
                     None
                 } else {
                     Some(planned_activation_hash(&activation.record, generation)?)
@@ -930,7 +1246,14 @@ fn observe_code_sources(
             .observation_id
             .cmp(&right.observation.observation_id)
     });
-    Ok(captures)
+    retained_owner_resolutions
+        .sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
+    retained_owner_source_evidence.sort_by(|left, right| left.source_id.cmp(&right.source_id));
+    Ok(CodeSourceInventoryCaptureV1 {
+        sources: captures,
+        retained_owner_resolutions,
+        retained_owner_source_evidence,
+    })
 }
 
 fn insert_generation_owner(
@@ -1055,7 +1378,6 @@ fn observe_checkout(root: &AuthorizedInventoryPath) -> AdapterResult<CheckoutCap
     Ok(CheckoutCaptureV1 {
         observation: CheckoutObservationV1 {
             observation_id,
-            canonical_checkout_root: literal_root.to_string(),
             canonical_root_digest: root_digest.clone(),
             marker_state: marker_state(&marker),
         },
@@ -1148,71 +1470,159 @@ fn marker_state(source: &AuthorizedFileObservationV1) -> CheckoutMarkerStateV1 {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct ImmutableLaneCaptureV1<T> {
-    pub evidence: ImmutableInventoryLaneEvidenceV1,
-    pub rows: Vec<T>,
-}
-
-impl<T> ImmutableLaneCaptureV1<T> {
-    pub fn complete(
-        lane_kind: ImmutableInventoryLaneKindV1,
-        source_id: String,
-        fingerprint: Sha256ValueV1,
-        content_hash: Sha256ValueV1,
-        byte_len: u64,
-        rows: Vec<T>,
-    ) -> AdapterResult<Self> {
-        if rows.len() > MAX_PROJECT_CATALOG_ENTRIES {
-            return Err(invalid_input("immutable lane row count exceeds limit"));
-        }
-        Ok(Self {
-            evidence: ImmutableInventoryLaneEvidenceV1 {
-                lane_kind,
-                source_id,
-                source_state: InventorySourceStateV1::Present {
-                    fingerprint,
-                    content_hash,
-                    byte_len,
-                },
-                completeness: ImmutableInventoryLaneCompletenessV1::Complete,
-                row_count: rows.len() as u64,
-            },
-            rows,
-        })
-    }
+struct ImmutableLaneCaptureV1<T> {
+    evidence: ImmutableInventoryLaneEvidenceV1,
+    rows: Vec<T>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct ImmutableInventoryLanesV1 {
-    pub project_scoped_refs: ImmutableLaneCaptureV1<ProjectScopedRefObservationV1>,
-    pub edge_workspaces: ImmutableLaneCaptureV1<EdgeWorkspaceObservationV1>,
-    pub git_metadata: ImmutableLaneCaptureV1<GitMetadataObservationV1>,
-    pub checkouts: ImmutableLaneCaptureV1<CheckoutObservationV1>,
-    pub attachment_candidates: ImmutableLaneCaptureV1<AttachmentCandidateObservationV1>,
-    pub inventory_targets: ImmutableLaneCaptureV1<InventoryTargetObservationV1>,
-    pub materialized_aliases: ImmutableLaneCaptureV1<MaterializedAliasObservationV1>,
-    pub legacy_path_observations: ImmutableLaneCaptureV1<LegacyPathObservationV1>,
-    pub repo_grouping_proofs: ImmutableLaneCaptureV1<RepoGroupingProofV1>,
-    pub legacy_namespace_clusters: ImmutableLaneCaptureV1<LegacyNamespaceClusterObservationV1>,
+struct ImmutableInventoryLanesV1 {
+    project_scoped_refs: ImmutableLaneCaptureV1<ProjectScopedRefObservationV1>,
+    edge_workspaces: ImmutableLaneCaptureV1<EdgeWorkspaceObservationV1>,
+    git_metadata: ImmutableLaneCaptureV1<GitMetadataObservationV1>,
+    checkouts: ImmutableLaneCaptureV1<CheckoutObservationV1>,
+    attachment_candidates: ImmutableLaneCaptureV1<AttachmentCandidateObservationV1>,
+    inventory_targets: ImmutableLaneCaptureV1<InventoryTargetObservationV1>,
+    materialized_aliases: ImmutableLaneCaptureV1<MaterializedAliasObservationV1>,
+    legacy_path_observations: ImmutableLaneCaptureV1<LegacyPathObservationV1>,
+    repo_grouping_proofs: ImmutableLaneCaptureV1<RepoGroupingProofV1>,
+    legacy_namespace_clusters: ImmutableLaneCaptureV1<LegacyNamespaceClusterObservationV1>,
+}
+
+pub struct ProjectCatalogMigrationInventoryRequestV1<'a> {
+    pub legacy_project_store_path: AuthorizedInventoryPath,
+    pub publisher_ref_store: &'a PublisherRefStore,
+    pub code_source_store: &'a CodeSourceStore,
+    pub checkout_roots: Vec<AuthorizedInventoryPath>,
 }
 
 #[derive(Clone)]
-pub struct ProjectCatalogMigrationInventoryRequestV1 {
-    pub legacy_project_store_path: AuthorizedInventoryPath,
-    pub publisher_ref_store_path: AuthorizedInventoryPath,
-    pub code_source_store_paths: CodeSourceStorePaths,
-    pub code_source_limits: StoreLimits,
-    pub legacy_project_probes: Vec<LegacyProjectProbeInputV1>,
-    pub publisher_bindings: Vec<PublisherPinBindingInputV1>,
-    pub checkout_roots: Vec<AuthorizedInventoryPath>,
-    pub immutable_lanes: ImmutableInventoryLanesV1,
+pub struct InventoryRuntimeBindingsV1 {
+    legacy_project_store_source: ExactSourceBytesV1,
+    legacy_project_paths: BTreeMap<String, AuthorizedInventoryPath>,
+    checkout_paths: BTreeMap<String, AuthorizedInventoryPath>,
+    git_common_directories: BTreeMap<String, AuthorizedInventoryPath>,
+    legacy_selectors: BTreeMap<String, RuntimeLiteralBindingV1>,
+}
+
+#[derive(Clone)]
+struct RuntimeLiteralBindingV1 {
+    digest: Sha256ValueV1,
+    literal: String,
+}
+
+impl fmt::Debug for InventoryRuntimeBindingsV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InventoryRuntimeBindingsV1")
+            .field(
+                "legacy_project_store_byte_len",
+                &self.legacy_project_store_source.bytes.len(),
+            )
+            .field(
+                "legacy_project_path_count",
+                &self.legacy_project_paths.len(),
+            )
+            .field("checkout_path_count", &self.checkout_paths.len())
+            .field(
+                "git_common_directory_count",
+                &self.git_common_directories.len(),
+            )
+            .field("legacy_selector_count", &self.legacy_selectors.len())
+            .finish()
+    }
+}
+
+impl InventoryRuntimeBindingsV1 {
+    fn validate_pairing(&self, inventory: &V1ProjectCatalogInventory) -> AdapterResult<()> {
+        if self.legacy_project_store_source.content_hash != inventory.source_store_hash {
+            return Err(invalid_source(
+                "runtime legacy project source hash mismatch",
+            ));
+        }
+        let project_digests = inventory
+            .legacy_projects
+            .iter()
+            .map(|row| {
+                (
+                    row.observation_id.as_str(),
+                    &row.record.canonical_path_digest,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        validate_authorized_path_bindings(&self.legacy_project_paths, &project_digests)?;
+
+        let checkout_digests = inventory
+            .checkouts
+            .iter()
+            .map(|row| (row.observation_id.as_str(), &row.canonical_root_digest))
+            .collect::<BTreeMap<_, _>>();
+        validate_authorized_path_bindings(&self.checkout_paths, &checkout_digests)?;
+
+        let git_digests = inventory
+            .git_metadata
+            .iter()
+            .filter_map(|row| {
+                row.common_directory_digest
+                    .as_ref()
+                    .map(|digest| (row.observation_id.as_str(), digest))
+            })
+            .collect::<BTreeMap<_, _>>();
+        validate_authorized_path_bindings(&self.git_common_directories, &git_digests)?;
+
+        let selector_digests = inventory
+            .legacy_path_observations
+            .iter()
+            .map(|row| (row.observation_id.as_str(), &row.selector_digest))
+            .collect::<BTreeMap<_, _>>();
+        if self.legacy_selectors.len() != selector_digests.len() {
+            return Err(invalid_source(
+                "runtime selector binding coverage is incomplete",
+            ));
+        }
+        for (observation_id, expected) in selector_digests {
+            let binding = self
+                .legacy_selectors
+                .get(observation_id)
+                .ok_or_else(|| invalid_source("runtime selector binding is missing"))?;
+            if &binding.digest != expected || digest_path(&binding.literal) != *expected {
+                return Err(invalid_source("runtime selector binding digest mismatch"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_authorized_path_bindings(
+    bindings: &BTreeMap<String, AuthorizedInventoryPath>,
+    expected: &BTreeMap<&str, &Sha256ValueV1>,
+) -> AdapterResult<()> {
+    if bindings.len() != expected.len() {
+        return Err(invalid_source(
+            "runtime path binding coverage is incomplete",
+        ));
+    }
+    for (observation_id, digest) in expected {
+        let binding = bindings
+            .get(*observation_id)
+            .ok_or_else(|| invalid_source("runtime path binding is missing"))?;
+        binding.ensure_authority()?;
+        let literal = binding
+            .as_path()
+            .to_str()
+            .ok_or_else(|| invalid_source("runtime path binding is not utf8"))?;
+        if digest_path(literal) != **digest {
+            return Err(invalid_source("runtime path binding digest mismatch"));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
 pub struct ProjectCatalogMigrationInventoryResultV1 {
     pub inventory: V1ProjectCatalogInventory,
-    /// Host-local authorities are retained outside canonical source locators.
-    pub checkout_path_bindings: BTreeMap<String, AuthorizedInventoryPath>,
+    /// Host-local authorities are retained outside canonical inventory JSON.
+    pub runtime_bindings: InventoryRuntimeBindingsV1,
     pub code_source_canonical_sha256: Sha256ValueV1,
     pub code_source_generation_count: u64,
     pub code_source_generation_set_sha256: Sha256ValueV1,
@@ -1222,185 +1632,212 @@ pub struct ProjectCatalogMigrationInventoryFacadeV1;
 
 impl ProjectCatalogMigrationInventoryFacadeV1 {
     pub fn capture(
-        request: ProjectCatalogMigrationInventoryRequestV1,
+        request: ProjectCatalogMigrationInventoryRequestV1<'_>,
     ) -> AdapterResult<ProjectCatalogMigrationInventoryResultV1> {
-        let legacy_source = accept_missing_legacy_projects_source(capture_legacy_projects_source(
-            &request.legacy_project_store_path,
-        )?)?;
-        let mut legacy = observe_legacy_projects(&legacy_source, request.legacy_project_probes)?;
-        let catalog_scopes = legacy
-            .published_scopes
-            .values()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let code_snapshot = capture_code_source_inventory(
-            &request.code_source_store_paths,
-            &request.code_source_limits,
-            &catalog_scopes,
-        )?;
-        let missing_checkout_projects = legacy
-            .observations
-            .iter()
-            .filter(|row| row.path_status == LegacyProjectPathStatusV1::Missing)
-            .map(|row| {
-                ProjectId::parse(row.record.project_id.clone())
-                    .expect("validated legacy project id remains valid")
-            })
-            .collect::<BTreeSet<_>>();
-        let mut code_sources = observe_code_sources(
-            &code_snapshot,
-            &legacy.published_scopes,
-            &missing_checkout_projects,
-            &request.code_source_limits,
-        )?;
-        let publisher_source = accept_missing_publisher_ref_source(capture_publisher_ref_source(
-            &request.publisher_ref_store_path,
-        )?)?;
-        let publisher_pins = bind_publisher_pins(&publisher_source, request.publisher_bindings)?;
-        let mut checkout_captures = request
-            .checkout_roots
-            .iter()
-            .map(observe_checkout)
-            .collect::<AdapterResult<Vec<_>>>()?;
-        checkout_captures.sort_by(|left, right| {
-            left.observation
-                .observation_id
-                .cmp(&right.observation.observation_id)
-        });
-        let legacy_row_ids = legacy
-            .observations
-            .iter()
-            .map(|row| row.observation_id.clone())
-            .collect();
-        let mut mutable_source_evidence = vec![exact_source_evidence(
-            "legacy-project-store",
-            MutableInventorySourceKindV1::LegacyProjectStore,
-            MutableInventorySourceLocatorV1::LegacyProjectStore,
-            &legacy_source,
-            legacy_row_ids,
-        )];
-        mutable_source_evidence.append(&mut legacy.source_evidence);
-        let publisher_row_ids = publisher_pins
-            .iter()
-            .map(|row| row.observation_id.clone())
-            .collect();
-        mutable_source_evidence.push(exact_source_evidence(
-            "publisher-ref-store",
-            MutableInventorySourceKindV1::PublisherRefStore,
-            MutableInventorySourceLocatorV1::PublisherRefStore,
-            &publisher_source,
-            publisher_row_ids,
-        ));
-        let effective_row_ids = code_sources
-            .iter()
-            .flat_map(|capture| {
-                std::iter::once(capture.observation.observation_id.clone())
-                    .chain(
-                        capture
-                            .observation
-                            .generations
-                            .iter()
-                            .map(|row| row.observation_id.clone()),
-                    )
-                    .chain(
-                        capture
-                            .observation
-                            .quarantine
-                            .iter()
-                            .map(|row| row.observation_id.clone()),
-                    )
-            })
-            .collect();
-        mutable_source_evidence.push(source_evidence(
-            "effective-source-manifest",
-            MutableInventorySourceKindV1::EffectiveSourceManifest,
-            MutableInventorySourceLocatorV1::CodeSourceAnchor,
-            if code_snapshot.anchor_missing {
-                InventorySourceStateV1::Missing {
-                    fingerprint: missing_source_fingerprint("effective-source-manifest"),
-                }
-            } else {
-                present_source_state(&code_snapshot.anchor_source)
-            },
-            effective_row_ids,
-        ));
-        for capture in &mut code_sources {
-            mutable_source_evidence.append(&mut capture.source_evidence);
-        }
-        let checkout_observations = checkout_captures
-            .iter()
-            .map(|capture| capture.observation.clone())
-            .collect::<Vec<_>>();
-        let mut checkout_path_bindings = BTreeMap::new();
-        for capture in checkout_captures {
-            checkout_path_bindings.insert(
-                capture.observation.observation_id.clone(),
-                capture.runtime_root,
-            );
-            mutable_source_evidence.push(capture.root_source_evidence);
-            mutable_source_evidence.push(capture.marker_source_evidence);
-        }
-        mutable_source_evidence.sort_by(|left, right| left.source_id.cmp(&right.source_id));
-        let mut lanes = request.immutable_lanes;
-        if lanes.checkouts.evidence.completeness != ImmutableInventoryLaneCompletenessV1::Complete
-            || !matches!(
-                &lanes.checkouts.evidence.source_state,
-                InventorySourceStateV1::Present { .. }
-            )
-        {
-            return Err(invalid_input(
-                "runtime checkout composition requires a complete checkout lane",
-            ));
-        }
-        lanes.checkouts.rows = checkout_observations;
-        lanes.checkouts.evidence.row_count = lanes.checkouts.rows.len() as u64;
-        sort_lane_rows(&mut lanes);
-        validate_lane_kinds(&lanes)?;
-        let code_source_canonical_sha256 =
-            Sha256ValueV1::parse(code_snapshot.inventory.canonical_sha256.clone())
-                .map_err(|_| invalid_source("code_source_canonical_hash_invalid"))?;
-        let code_source_generation_set_sha256 =
-            Sha256ValueV1::parse(code_snapshot.inventory.generation_set_sha256.clone())
-                .map_err(|_| invalid_source("code_source_generation_set_hash_invalid"))?;
-        let inventory = V1ProjectCatalogInventory {
-            version: PROJECT_CATALOG_INVENTORY_VERSION_V1,
-            source_store_hash: legacy_source.source.content_hash.clone(),
-            source_store_bytes: legacy_source.source.bytes,
-            publisher_ref_source_hash: publisher_source.source.content_hash.clone(),
-            publisher_ref_source_bytes: publisher_source.source.bytes,
-            code_source_inventory_hash: code_source_canonical_sha256.clone(),
-            code_source_generation_count: code_snapshot.inventory.generation_count,
-            code_source_generation_set_sha256: code_source_generation_set_sha256.clone(),
-            mutable_source_evidence,
-            immutable_lane_evidence: lane_evidence(&lanes),
-            legacy_projects: legacy.observations,
-            code_sources: code_sources
-                .into_iter()
-                .map(|capture| capture.observation)
-                .collect(),
-            publisher_pins,
-            project_scoped_refs: lanes.project_scoped_refs.rows,
-            edge_workspaces: lanes.edge_workspaces.rows,
-            git_metadata: lanes.git_metadata.rows,
-            checkouts: lanes.checkouts.rows,
-            attachment_candidates: lanes.attachment_candidates.rows,
-            inventory_targets: lanes.inventory_targets.rows,
-            materialized_aliases: lanes.materialized_aliases.rows,
-            legacy_path_observations: lanes.legacy_path_observations.rows,
-            repo_grouping_proofs: lanes.repo_grouping_proofs.rows,
-            legacy_namespace_clusters: lanes.legacy_namespace_clusters.rows,
-        };
-        inventory
-            .validate()
-            .map_err(|error| invalid_source(error.to_string()))?;
-        Ok(ProjectCatalogMigrationInventoryResultV1 {
-            code_source_canonical_sha256,
-            code_source_generation_count: code_snapshot.inventory.generation_count,
-            code_source_generation_set_sha256,
-            inventory,
-            checkout_path_bindings,
-        })
+        let projects_path = request.legacy_project_store_path.as_path().to_path_buf();
+        crate::project_catalog_store::capture_migration_preflight_with(
+            &projects_path,
+            |error| invalid_source(error.to_string()),
+            || capture_inventory_locked(request),
+        )
     }
+}
+
+fn capture_inventory_locked(
+    request: ProjectCatalogMigrationInventoryRequestV1<'_>,
+) -> AdapterResult<ProjectCatalogMigrationInventoryResultV1> {
+    let legacy_source = accept_missing_legacy_projects_source(capture_legacy_projects_source(
+        &request.legacy_project_store_path,
+    )?)?;
+    let probes = derive_legacy_project_probes(&legacy_source)?;
+    let mut legacy = observe_legacy_projects(&legacy_source, probes)?;
+    let catalog_scopes = legacy
+        .published_scopes
+        .values()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let publisher_locked = capture_publisher_ref_source(request.publisher_ref_store)?;
+    let code_snapshot = capture_code_source_inventory(request.code_source_store, &catalog_scopes)?;
+    let missing_checkout_projects = legacy
+        .observations
+        .iter()
+        .filter(|row| row.path_status == LegacyProjectPathStatusV1::Missing)
+        .map(|row| {
+            ProjectId::parse(row.record.project_id.clone())
+                .expect("validated legacy project id remains valid")
+        })
+        .collect::<BTreeSet<_>>();
+    let mut code_capture = observe_code_sources(
+        &code_snapshot,
+        &legacy.published_scopes,
+        &missing_checkout_projects,
+    )?;
+    let mut code_sources = code_capture.sources;
+    let publisher_source = &publisher_locked.source;
+    let publisher_pins = derive_publisher_pins(publisher_source, &legacy)?;
+    let mut checkout_paths = BTreeSet::new();
+    let mut checkout_identities = BTreeSet::new();
+    for root in &request.checkout_roots {
+        let (canonical_path, identity) = root.checkout_identity_key()?;
+        if !checkout_paths.insert(canonical_path) || !checkout_identities.insert(identity) {
+            return Err(invalid_input("checkout roots contain a canonical alias"));
+        }
+    }
+    let mut checkout_captures = request
+        .checkout_roots
+        .iter()
+        .map(observe_checkout)
+        .collect::<AdapterResult<Vec<_>>>()?;
+    checkout_captures.sort_by(|left, right| {
+        left.observation
+            .observation_id
+            .cmp(&right.observation.observation_id)
+    });
+    let legacy_row_ids = legacy
+        .observations
+        .iter()
+        .map(|row| row.observation_id.clone())
+        .collect();
+    let mut mutable_source_evidence = vec![exact_source_evidence(
+        "legacy-project-store",
+        MutableInventorySourceKindV1::LegacyProjectStore,
+        MutableInventorySourceLocatorV1::LegacyProjectStore,
+        &legacy_source,
+        legacy_row_ids,
+    )];
+    mutable_source_evidence.append(&mut legacy.source_evidence);
+    let publisher_row_ids = publisher_pins
+        .iter()
+        .map(|row| row.observation_id.clone())
+        .collect();
+    mutable_source_evidence.push(exact_source_evidence(
+        "publisher-ref-store",
+        MutableInventorySourceKindV1::PublisherRefStore,
+        MutableInventorySourceLocatorV1::PublisherRefStore,
+        publisher_source,
+        publisher_row_ids,
+    ));
+    let effective_row_ids = code_sources
+        .iter()
+        .flat_map(|capture| {
+            std::iter::once(capture.observation.observation_id.clone())
+                .chain(
+                    capture
+                        .observation
+                        .generations
+                        .iter()
+                        .map(|row| row.observation_id.clone()),
+                )
+                .chain(
+                    capture
+                        .observation
+                        .quarantine
+                        .iter()
+                        .map(|row| row.observation_id.clone()),
+                )
+        })
+        .chain(
+            code_capture
+                .retained_owner_resolutions
+                .iter()
+                .map(|row| row.observation_id.clone()),
+        )
+        .collect();
+    mutable_source_evidence.push(source_evidence(
+        "effective-source-manifest",
+        MutableInventorySourceKindV1::EffectiveSourceManifest,
+        MutableInventorySourceLocatorV1::CodeSourceAnchor,
+        if code_snapshot.anchor_missing {
+            InventorySourceStateV1::Missing {
+                fingerprint: missing_source_fingerprint("effective-source-manifest"),
+            }
+        } else {
+            present_source_state(&code_snapshot.anchor_source)
+        },
+        effective_row_ids,
+    ));
+    for capture in &mut code_sources {
+        mutable_source_evidence.append(&mut capture.source_evidence);
+    }
+    mutable_source_evidence.append(&mut code_capture.retained_owner_source_evidence);
+    let checkout_observations = checkout_captures
+        .iter()
+        .map(|capture| capture.observation.clone())
+        .collect::<Vec<_>>();
+    let mut checkout_path_bindings = BTreeMap::new();
+    for capture in checkout_captures {
+        checkout_path_bindings.insert(
+            capture.observation.observation_id.clone(),
+            capture.runtime_root,
+        );
+        mutable_source_evidence.push(capture.root_source_evidence);
+        mutable_source_evidence.push(capture.marker_source_evidence);
+    }
+    mutable_source_evidence.sort_by(|left, right| left.source_id.cmp(&right.source_id));
+    let mut lanes = capture_required_owner_lanes(&checkout_observations)?;
+    sort_lane_rows(&mut lanes);
+    validate_lane_kinds(&lanes)?;
+    let runtime_bindings = InventoryRuntimeBindingsV1 {
+        legacy_project_store_source: legacy_source.source.clone(),
+        legacy_project_paths: legacy.runtime_project_paths,
+        checkout_paths: checkout_path_bindings,
+        git_common_directories: BTreeMap::new(),
+        legacy_selectors: BTreeMap::new(),
+    };
+    let code_source_canonical_sha256 =
+        Sha256ValueV1::parse(code_snapshot.owner.inventory.canonical_sha256.clone())
+            .map_err(|_| invalid_source("code_source_canonical_hash_invalid"))?;
+    let code_source_generation_set_sha256 =
+        Sha256ValueV1::parse(code_snapshot.owner.inventory.generation_set_sha256.clone())
+            .map_err(|_| invalid_source("code_source_generation_set_hash_invalid"))?;
+    let inventory = V1ProjectCatalogInventory {
+        version: PROJECT_CATALOG_INVENTORY_VERSION_V1,
+        source_store_hash: legacy_source.source.content_hash.clone(),
+        publisher_ref_source_hash: publisher_source.source.content_hash.clone(),
+        publisher_ref_source_bytes: publisher_source.source.bytes.clone(),
+        code_source_inventory_hash: code_source_canonical_sha256.clone(),
+        code_source_generation_count: code_snapshot.owner.inventory.generation_count,
+        code_source_generation_set_sha256: code_source_generation_set_sha256.clone(),
+        mutable_source_evidence,
+        immutable_lane_evidence: lane_evidence(&lanes),
+        legacy_projects: legacy.observations,
+        code_sources: code_sources
+            .into_iter()
+            .map(|capture| capture.observation)
+            .collect(),
+        retained_owner_resolutions: code_capture.retained_owner_resolutions,
+        publisher_pins,
+        project_scoped_refs: lanes.project_scoped_refs.rows,
+        edge_workspaces: lanes.edge_workspaces.rows,
+        git_metadata: lanes.git_metadata.rows,
+        checkouts: lanes.checkouts.rows,
+        attachment_candidates: lanes.attachment_candidates.rows,
+        inventory_targets: lanes.inventory_targets.rows,
+        materialized_aliases: lanes.materialized_aliases.rows,
+        legacy_path_observations: lanes.legacy_path_observations.rows,
+        repo_grouping_proofs: lanes.repo_grouping_proofs.rows,
+        legacy_namespace_clusters: lanes.legacy_namespace_clusters.rows,
+    };
+    inventory
+        .validate()
+        .map_err(|error| invalid_source(error.to_string()))?;
+    runtime_bindings.validate_pairing(&inventory)?;
+    Ok(ProjectCatalogMigrationInventoryResultV1 {
+        code_source_canonical_sha256,
+        code_source_generation_count: code_snapshot.owner.inventory.generation_count,
+        code_source_generation_set_sha256,
+        inventory,
+        runtime_bindings,
+    })
+}
+
+fn capture_required_owner_lanes(
+    _checkout_observations: &[CheckoutObservationV1],
+) -> AdapterResult<ImmutableInventoryLanesV1> {
+    Err(InventoryAdapterError::new(
+        "error.project_catalog_inventory_owner_lane_unsupported",
+        "required auxiliary inventory owners are not yet connected",
+    ))
 }
 
 fn source_evidence(
@@ -1654,7 +2091,7 @@ mod tests {
         dirty_fingerprint, generation_id, manifest_sha256,
     };
     use bbox_code_source_store::{
-        CollisionRetirementLifecycleStateV1, CollisionRetirementLifecycleV1, StoredGeneration,
+        CodeSourceStorePaths, CollisionRetirementLifecycleV1, StoredGeneration,
         encode_collision_retirement_pending_for_migration,
     };
 
@@ -1682,94 +2119,18 @@ mod tests {
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
-    fn empty_lane<T>(
-        kind: ImmutableInventoryLaneKindV1,
-        source_id: &str,
-        rows: Vec<T>,
-    ) -> ImmutableLaneCaptureV1<T> {
-        ImmutableLaneCaptureV1::complete(
-            kind,
-            source_id.to_string(),
-            Sha256ValueV1::digest(format!("{source_id}:fingerprint").as_bytes()),
-            Sha256ValueV1::digest(format!("{source_id}:content").as_bytes()),
-            0,
-            rows,
-        )
-        .unwrap()
-    }
-
-    fn empty_lanes() -> ImmutableInventoryLanesV1 {
-        ImmutableInventoryLanesV1 {
-            project_scoped_refs: empty_lane(
-                ImmutableInventoryLaneKindV1::ProjectScopedRefs,
-                "lane-project-refs",
-                Vec::new(),
-            ),
-            edge_workspaces: empty_lane(
-                ImmutableInventoryLaneKindV1::EdgeWorkspaces,
-                "lane-edge-workspaces",
-                Vec::new(),
-            ),
-            git_metadata: empty_lane(
-                ImmutableInventoryLaneKindV1::GitMetadata,
-                "lane-git-metadata",
-                Vec::new(),
-            ),
-            checkouts: empty_lane(
-                ImmutableInventoryLaneKindV1::Checkouts,
-                "lane-checkouts",
-                Vec::new(),
-            ),
-            attachment_candidates: empty_lane(
-                ImmutableInventoryLaneKindV1::AttachmentCandidates,
-                "lane-attachments",
-                Vec::new(),
-            ),
-            inventory_targets: empty_lane(
-                ImmutableInventoryLaneKindV1::InventoryTargets,
-                "lane-targets",
-                Vec::new(),
-            ),
-            materialized_aliases: empty_lane(
-                ImmutableInventoryLaneKindV1::MaterializedAliases,
-                "lane-aliases",
-                Vec::new(),
-            ),
-            legacy_path_observations: empty_lane(
-                ImmutableInventoryLaneKindV1::LegacyPathObservations,
-                "lane-legacy-paths",
-                Vec::new(),
-            ),
-            repo_grouping_proofs: empty_lane(
-                ImmutableInventoryLaneKindV1::RepoGroupingProofs,
-                "lane-repo-proofs",
-                Vec::new(),
-            ),
-            legacy_namespace_clusters: empty_lane(
-                ImmutableInventoryLaneKindV1::LegacyNamespaceClusters,
-                "lane-namespace-clusters",
-                Vec::new(),
-            ),
-        }
-    }
-
     #[test]
     fn publisher_adapter_uses_the_owner_codec() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let path = root.join("publisher-refs.json");
         write(&path, br#"{"version":1}"#);
-        let captured = capture_publisher_ref_source(&AuthorizedInventoryPath::new(&path).unwrap())
-            .unwrap()
-            .require_valid("publisher")
-            .unwrap();
-        assert!(captured.value.rows.is_empty());
+        let store = PublisherRefStore::open(&path).unwrap();
+        let captured = capture_publisher_ref_source(&store).unwrap();
+        assert!(captured.source.value.rows.is_empty());
 
         write(&path, br#"{"version":1,"refs":[],"invented":true}"#);
-        assert!(matches!(
-            capture_publisher_ref_source(&AuthorizedInventoryPath::new(&path).unwrap()).unwrap(),
-            DecodedSourceObservationV1::Invalid { .. }
-        ));
+        assert!(PublisherRefStore::open(&path).is_err());
     }
 
     #[test]
@@ -1815,7 +2176,9 @@ mod tests {
     fn quarantined_generation_keeps_exact_metadata_and_manifest_evidence() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
-        let paths = CodeSourceStorePaths::new(root.join("code-sources")).unwrap();
+        let store =
+            CodeSourceStore::open(root.join("code-sources"), StoreLimits::default()).unwrap();
+        let paths = CodeSourceStorePaths::new(store.root()).unwrap();
         let project_id = ProjectId::parse("project-a").unwrap();
         let scope = PublishedScope::try_new("repo-family", ".").unwrap();
         let content = b"fn main() {}\n";
@@ -1880,17 +2243,9 @@ mod tests {
             &paths.collision_retirement_pending(&project_id),
             &encode_collision_retirement_pending_for_migration(&collision).unwrap(),
         );
-        let snapshot =
-            capture_code_source_inventory(&paths, &StoreLimits::default(), &BTreeSet::new())
-                .unwrap();
-        let captures = observe_code_sources(
-            &snapshot,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-            &StoreLimits::default(),
-        )
-        .unwrap();
-        let quarantined = &captures[0].observation.quarantine[0];
+        let snapshot = capture_code_source_inventory(&store, &BTreeSet::new()).unwrap();
+        let capture = observe_code_sources(&snapshot, &BTreeMap::new(), &BTreeSet::new()).unwrap();
+        let quarantined = &capture.sources[0].observation.quarantine[0];
         assert_eq!(quarantined.generation_id, generation_id);
         assert!(matches!(
             quarantined.descriptor,
@@ -1900,7 +2255,19 @@ mod tests {
             quarantined.manifest,
             ImmutableArtifactObservationV1::Valid { .. }
         ));
-        let bound = captures[0]
+        assert_eq!(
+            quarantined.collision_lifecycle.selector_evidence,
+            DurableSelectorEvidenceV1::ExactMaterialized {
+                selector_hash: Sha256ValueV1::digest(collision.selector.as_bytes()),
+            }
+        );
+        assert!(capture.sources[0].source_evidence.iter().any(|source| {
+            source.source_kind == MutableInventorySourceKindV1::CodeSourceCollisionLifecycle
+                && source
+                    .row_observation_ids
+                    .contains(&quarantined.observation_id)
+        }));
+        let bound = capture.sources[0]
             .source_evidence
             .iter()
             .filter(|source| {
@@ -1919,6 +2286,103 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_retained_owner_emits_bounded_resolution_candidates() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store =
+            CodeSourceStore::open(root.join("code-sources"), StoreLimits::default()).unwrap();
+        let paths = CodeSourceStorePaths::new(store.root()).unwrap();
+        let scope = PublishedScope::try_new("repo-family", "services/shared").unwrap();
+        let content = b"fn retained() {}\n";
+        let entries = vec![ManifestEntry {
+            relative_path: "src/lib.rs".to_string(),
+            content_sha256: hex::encode(Sha256::digest(content)),
+            size: content.len() as u64,
+        }];
+        let head = "b".repeat(40);
+        let descriptor = GenerationDescriptor {
+            schema_version: SCHEMA_VERSION,
+            walker_policy_version: WALKER_POLICY_VERSION.to_string(),
+            scope: scope.clone(),
+            head_commit: head.clone(),
+            dirty_fingerprint: dirty_fingerprint(&head, &entries),
+            manifest_sha256: manifest_sha256(&entries),
+            file_count: 1,
+            logical_bytes: content.len() as u64,
+        };
+        let generation_id = generation_id("host-retained", &descriptor);
+        let stored = StoredGeneration {
+            version: 1,
+            generation_id: generation_id.clone(),
+            producer_id: "host-retained".to_string(),
+            ordinal: 1,
+            descriptor,
+            state: GenerationState::Superseded,
+            diagnostic: None,
+            created_unix_secs: 1,
+            materialized_doc_count: Some(1),
+            entity_inventory_sha256: Some("c".repeat(64)),
+        };
+        write(
+            &paths.generation_metadata(&scope, &generation_id).unwrap(),
+            &serde_json::to_vec(&stored).unwrap(),
+        );
+        let mut manifest = Vec::new();
+        serde_json::to_writer(&mut manifest, &entries[0]).unwrap();
+        manifest.push(b'\n');
+        write(
+            &paths.generation_manifest(&scope, &generation_id).unwrap(),
+            &manifest,
+        );
+
+        let snapshot =
+            capture_code_source_inventory(&store, &BTreeSet::from([scope.clone()])).unwrap();
+        let project_a = ProjectId::parse("project-a").unwrap();
+        let project_b = ProjectId::parse("project-b").unwrap();
+        let capture = observe_code_sources(
+            &snapshot,
+            &BTreeMap::from([
+                (project_a.clone(), scope.clone()),
+                (project_b.clone(), scope.clone()),
+            ]),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert!(capture.sources.is_empty());
+        assert_eq!(capture.retained_owner_resolutions.len(), 1);
+        let retained = &capture.retained_owner_resolutions[0];
+        assert_eq!(
+            retained.candidate_project_ids,
+            BTreeSet::from([project_a, project_b])
+        );
+        assert_eq!(
+            retained.selector_evidence,
+            DurableSelectorEvidenceV1::NoDurableSelector
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorized_path_rejects_symlink_and_target_swap() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let source = root.join("source.json");
+        let replacement = root.join("replacement.json");
+        write(&source, b"one");
+        write(&replacement, b"two");
+        let authorized = AuthorizedInventoryPath::new(&source).unwrap();
+        fs::remove_file(&source).unwrap();
+        symlink(&replacement, &source).unwrap();
+        assert_eq!(
+            read_authorized_file(&authorized, 32).unwrap_err().code(),
+            "error.project_catalog_inventory_adapter_source"
+        );
+        assert!(AuthorizedInventoryPath::new(&source).is_err());
+    }
+
+    #[test]
     fn checkout_root_fingerprint_ignores_directory_mtime_and_entry_order() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
@@ -1934,7 +2398,7 @@ mod tests {
     }
 
     #[test]
-    fn mutable_source_row_sets_reject_omission_and_substitution() {
+    fn facade_refuses_until_required_owner_lanes_are_connected() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let projects = root.join("projects.json");
@@ -1951,45 +2415,36 @@ mod tests {
             }))
             .unwrap(),
         );
-        let result = ProjectCatalogMigrationInventoryFacadeV1::capture(
+        let publisher = PublisherRefStore::open(root.join("publisher-refs.json")).unwrap();
+        let code_source =
+            CodeSourceStore::open(root.join("code-sources"), StoreLimits::default()).unwrap();
+        let error = ProjectCatalogMigrationInventoryFacadeV1::capture(
             ProjectCatalogMigrationInventoryRequestV1 {
                 legacy_project_store_path: AuthorizedInventoryPath::new(&projects).unwrap(),
-                publisher_ref_store_path: AuthorizedInventoryPath::new(
-                    root.join("publisher-refs.json"),
-                )
-                .unwrap(),
-                code_source_store_paths: CodeSourceStorePaths::new(root.join("code-sources"))
-                    .unwrap(),
-                code_source_limits: StoreLimits::default(),
-                legacy_project_probes: vec![LegacyProjectProbeInputV1 {
-                    project_id: ProjectId::parse("project-a").unwrap(),
-                    authorized_canonical_path: AuthorizedInventoryPath::new(&root).unwrap(),
-                    committed_config: None,
-                }],
-                publisher_bindings: Vec::new(),
+                publisher_ref_store: &publisher,
+                code_source_store: &code_source,
                 checkout_roots: Vec::new(),
-                immutable_lanes: empty_lanes(),
             },
         )
-        .unwrap();
-        let mut omitted = result.inventory.clone();
-        let legacy = omitted
-            .mutable_source_evidence
-            .iter_mut()
-            .find(|source| source.source_kind == MutableInventorySourceKindV1::LegacyProjectStore)
-            .unwrap();
-        legacy.row_observation_ids.clear();
-        legacy.row_set_sha256 = mutable_source_row_set_hash(&legacy.row_observation_ids);
-        assert!(omitted.validate().is_err());
+        .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_inventory_owner_lane_unsupported"
+        );
 
-        let mut substituted = result.inventory;
-        let legacy = substituted
-            .mutable_source_evidence
-            .iter_mut()
-            .find(|source| source.source_kind == MutableInventorySourceKindV1::LegacyProjectStore)
-            .unwrap();
-        legacy.row_observation_ids = BTreeSet::from(["lane-project-refs".to_string()]);
-        legacy.row_set_sha256 = mutable_source_row_set_hash(&legacy.row_observation_ids);
-        assert!(substituted.validate().is_err());
+        let checkout = AuthorizedInventoryPath::new(&root).unwrap();
+        let error = ProjectCatalogMigrationInventoryFacadeV1::capture(
+            ProjectCatalogMigrationInventoryRequestV1 {
+                legacy_project_store_path: AuthorizedInventoryPath::new(&projects).unwrap(),
+                publisher_ref_store: &publisher,
+                code_source_store: &code_source,
+                checkout_roots: vec![checkout.clone(), checkout],
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_inventory_adapter_input"
+        );
     }
 }

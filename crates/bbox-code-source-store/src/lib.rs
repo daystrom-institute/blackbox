@@ -103,6 +103,14 @@ pub struct MigrationCodeSourceInventoryGuard<'a> {
     _anchor: StoreLockGuard,
 }
 
+/// A migration snapshot captured by the live store owner under its mutation
+/// lock and with the exact configured limits used by that owner.
+pub struct MigrationOwnedLegacyInventoryV1<'a> {
+    pub inventory: MigrationLegacyInventoryV1,
+    pub limits: StoreLimits,
+    _mutation: StoreMutationGuard<'a>,
+}
+
 impl CodeSourceStorePaths {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
@@ -2799,6 +2807,29 @@ impl CodeSourceStore {
             .write()
             .map_err(|_| anyhow!("code-source limits lock poisoned"))? = limits;
         Ok(())
+    }
+
+    pub fn snapshot_legacy_migration_for_scopes(
+        &self,
+        catalog_scopes: &BTreeSet<PublishedScope>,
+    ) -> Result<MigrationOwnedLegacyInventoryV1<'_>> {
+        let mutation = self.lock_mutation()?;
+        let limits = self
+            .shared
+            .limits
+            .read()
+            .map_err(|_| anyhow!("code-source limits lock poisoned"))?
+            .clone();
+        let inventory = enumerate_legacy_migration_inventory_for_scopes_locked(
+            &self.paths,
+            &limits,
+            catalog_scopes,
+        )?;
+        Ok(MigrationOwnedLegacyInventoryV1 {
+            inventory,
+            limits,
+            _mutation: mutation,
+        })
     }
 
     pub fn begin_upload(

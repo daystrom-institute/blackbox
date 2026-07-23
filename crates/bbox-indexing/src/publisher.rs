@@ -31,8 +31,10 @@ use serde::{Deserialize, Serialize};
 
 use bbox_corpus_core::git;
 use bbox_corpus_core::identity::{RepoIdInputs, bbox_root_relpath, resolve_recorded_repo_id};
-use bbox_corpus_core::json_store::atomic_write_json_locked;
-use bbox_corpus_core::project_catalog::MAX_PROJECT_CATALOG_ENTRIES;
+use bbox_corpus_core::json_store::{
+    NofollowDirectory, StoreLockGuard, acquire_store_lock_nofollow, atomic_write_json_locked,
+};
+use bbox_corpus_core::project_catalog::{MAX_PROJECT_CATALOG_BYTES, MAX_PROJECT_CATALOG_ENTRIES};
 use bbox_corpus_core::project_record::ProjectRecord;
 
 pub use bbox_corpus_core::identity::PublishedScope;
@@ -77,6 +79,14 @@ pub enum PublisherResolution {
 pub struct PublisherRefRow {
     pub scope: PublishedScope,
     pub branch_ref: String,
+}
+
+#[derive(Debug)]
+pub struct MigrationPublisherRefSnapshotV1 {
+    pub bytes: Vec<u8>,
+    pub rows: Vec<PublisherRefRow>,
+    pub was_missing: bool,
+    _lock: StoreLockGuard,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,6 +199,44 @@ impl PublisherRefStore {
 
     pub fn pinned(&self, scope: &PublishedScope) -> Option<&PublisherRefRow> {
         self.data.refs.iter().find(|row| &row.scope == scope)
+    }
+
+    /// Capture the exact durable publisher source under the owner lock.
+    ///
+    /// The in-memory cache is deliberately not used: migration evidence binds
+    /// the current durable bytes, including exact absence.
+    pub fn snapshot_migration_source(&self) -> Result<MigrationPublisherRefSnapshotV1> {
+        let lock = acquire_store_lock_nofollow(&self.path)?;
+        let parent = self
+            .path
+            .parent()
+            .context("publisher ref source has no parent")?;
+        let name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("publisher ref source has an invalid basename")?;
+        let directory = NofollowDirectory::open_existing(parent)?
+            .context("publisher ref source parent is missing")?;
+        let Some(bytes) =
+            directory.read_regular(name, MAX_PROJECT_CATALOG_BYTES, "publisher ref source")?
+        else {
+            directory.ensure_still_current()?;
+            return Ok(MigrationPublisherRefSnapshotV1 {
+                bytes: Vec::new(),
+                rows: Vec::new(),
+                was_missing: true,
+                _lock: lock,
+            });
+        };
+        let rows = decode_publisher_ref_source_v1(&bytes)?;
+        directory.ensure_still_current()?;
+        Ok(MigrationPublisherRefSnapshotV1 {
+            bytes,
+            rows,
+            was_missing: false,
+            _lock: lock,
+        })
     }
 
     /// Seed a pin from the publisher's current symbolic branch. Existing pins

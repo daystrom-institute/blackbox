@@ -2717,11 +2717,21 @@ pub(crate) fn capture_migration_preflight<T>(
     projects_path: &Path,
     capture: impl FnOnce() -> ProjectCatalogStoreResult<T>,
 ) -> ProjectCatalogStoreResult<T> {
-    let paths = ProjectCatalogPaths::derive(projects_path)?;
+    capture_migration_preflight_with(projects_path, |error| error, capture)
+}
+
+pub(crate) fn capture_migration_preflight_with<T, E>(
+    projects_path: &Path,
+    map_lock_error: impl Fn(ProjectCatalogStoreError) -> E,
+    capture: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let paths = ProjectCatalogPaths::derive(projects_path).map_err(&map_lock_error)?;
     let _lifetime_lock = ProjectCatalogMigrationLock::acquire_shared(&paths.catalog)
-        .map_err(|error| io_error("acquire lifetime lock for", &paths.catalog, error))?;
+        .map_err(|error| io_error("acquire lifetime lock for", &paths.catalog, error))
+        .map_err(&map_lock_error)?;
     let _mutation_lock = acquire_store_lock_nofollow(&paths.catalog)
-        .map_err(|error| io_error("acquire mutation lock for", &paths.catalog, error))?;
+        .map_err(|error| io_error("acquire mutation lock for", &paths.catalog, error))
+        .map_err(map_lock_error)?;
     capture()
 }
 
