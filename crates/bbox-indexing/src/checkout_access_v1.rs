@@ -8,8 +8,8 @@ use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use bbox_corpus_core::identity::{PublishedScope, read_checkout_id};
-use bbox_corpus_core::project_record::ProjectRecord;
+use bbox_corpus_core::identity::{PublishedScope, ensure_checkout_id, read_checkout_id};
+use bbox_corpus_core::project_record::{ProjectContext, ProjectRecord};
 use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 
@@ -44,45 +44,9 @@ impl CheckoutAccessAuthority for V1CheckoutAccessAuthority {
         &self,
         request: &CheckoutAccessRequest,
     ) -> std::result::Result<CheckoutAccessCandidate, CheckoutAccessError> {
-        validate_source_lane(request)?;
         let projects = self.projects.read().list();
-        let mut candidate = match &request.attachment {
-            CheckoutAttachmentSelector::Selected => resolve_selected(request, &projects)?,
-            CheckoutAttachmentSelector::AttachmentId(_) => {
-                return Err(access_error(
-                    CheckoutAccessErrorCode::AttachmentNotFound,
-                    "version-1 authority cannot resolve a catalog attachment id",
-                ));
-            }
-            CheckoutAttachmentSelector::CheckoutId(checkout_id) => {
-                let rows = self
-                    .checkouts
-                    .read()
-                    .rows_for_checkout(checkout_id)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                resolve_checkout(request, checkout_id, rows, &projects)?
-            }
-        };
-
-        let write_gate_passes = resolution_roots(
-            &request.project_id,
-            &candidate.project_root,
-            &projects,
-            ResolveIntent::Write,
-        )
-        .is_ok_and(|roots| {
-            roots.checkout_root == candidate.checkout_root
-                && roots.project_root == candidate.project_root
-        });
-        let requested_capability_is_safe = match request.intent {
-            CheckoutAccessIntent::Read => true,
-            CheckoutAccessIntent::Write => write_gate_passes,
-        };
-        candidate.capabilities = requested_capability_is_safe
-            .then(|| BTreeSet::from([request.kind]))
-            .unwrap_or_default();
-        Ok(candidate)
+        let checkouts = self.checkouts.read().rows().to_vec();
+        resolve_candidate(request, &projects, &checkouts)
     }
 
     fn revalidate_conservative_path_gate(
@@ -90,33 +54,51 @@ impl CheckoutAccessAuthority for V1CheckoutAccessAuthority {
         request: &CheckoutAccessRequest,
         candidate: &CheckoutAccessCandidate,
     ) -> std::result::Result<(), CheckoutAccessError> {
-        // Resolve the selector again so detach, marker replacement, scope
-        // movement, and registry ambiguity are observed before a lease exists.
-        let refreshed = self.resolve(request)?;
-        let refreshed_checkout_root = canonical_directory(&refreshed.checkout_root)?;
-        let refreshed_project_root = canonical_directory(&refreshed.project_root)?;
-        if refreshed.project_id != candidate.project_id
-            || refreshed.attachment_id != candidate.attachment_id
-            || refreshed.checkout_id != candidate.checkout_id
-            || refreshed.published_scope != candidate.published_scope
-            || refreshed_checkout_root != candidate.checkout_root
-            || refreshed_project_root != candidate.project_root
-        {
-            return Err(access_error(
-                CheckoutAccessErrorCode::ConservativePathGateDenied,
-                "checkout authority changed while access was being validated",
-            ));
-        }
-
         let projects = self.projects.read().list();
+        let checkouts = self.checkouts.read().rows().to_vec();
+        revalidate_candidate(request, candidate, &projects, &checkouts)
+    }
+}
+
+fn revalidate_candidate(
+    request: &CheckoutAccessRequest,
+    candidate: &CheckoutAccessCandidate,
+    projects: &[ProjectRecord],
+    checkouts: &[CheckoutRow],
+) -> std::result::Result<(), CheckoutAccessError> {
+    // Resolve the selector again so read-side publication observes detach
+    // or relocation without retaining registry locks across filesystem I/O.
+    let refreshed = resolve_candidate(request, projects, checkouts)?;
+    let refreshed_checkout_root = canonical_directory(&refreshed.checkout_root)?;
+    let refreshed_project_root = canonical_directory(&refreshed.project_root)?;
+    if refreshed.project_id != candidate.project_id
+        || refreshed.attachment_id != candidate.attachment_id
+        || refreshed.checkout_id != candidate.checkout_id
+        || refreshed.published_scope != candidate.published_scope
+        || refreshed.branch_ref != candidate.branch_ref
+        || refreshed_checkout_root != candidate.checkout_root
+        || refreshed_project_root != candidate.project_root
+    {
+        return Err(access_error(
+            CheckoutAccessErrorCode::ConservativePathGateDenied,
+            "checkout authority changed while access was being validated",
+        ));
+    }
+
+    if request.intent == CheckoutAccessIntent::Write
+        || !matches!(
+            request.attachment,
+            CheckoutAttachmentSelector::CheckoutId(_)
+        )
+    {
         let intent = match request.intent {
             CheckoutAccessIntent::Read => ResolveIntent::Read,
             CheckoutAccessIntent::Write => ResolveIntent::Write,
         };
         let roots = resolution_roots(
-            &request.project_id,
+            &candidate.project_id,
             &candidate.project_root,
-            &projects,
+            projects,
             intent,
         )?;
         if roots.checkout_root != candidate.checkout_root
@@ -127,8 +109,51 @@ impl CheckoutAccessAuthority for V1CheckoutAccessAuthority {
                 "project resolver returned different roots during access validation",
             ));
         }
-        Ok(())
     }
+    Ok(())
+}
+
+fn resolve_candidate(
+    request: &CheckoutAccessRequest,
+    projects: &[ProjectRecord],
+    checkouts: &[CheckoutRow],
+) -> std::result::Result<CheckoutAccessCandidate, CheckoutAccessError> {
+    validate_source_lane(request)?;
+    let mut candidate = match &request.attachment {
+        CheckoutAttachmentSelector::Selected => resolve_selected(request, projects)?,
+        CheckoutAttachmentSelector::AttachmentId(_) => {
+            return Err(access_error(
+                CheckoutAccessErrorCode::AttachmentNotFound,
+                "version-1 authority cannot resolve a catalog attachment id",
+            ));
+        }
+        CheckoutAttachmentSelector::CheckoutId(checkout_id) => {
+            let rows = checkouts
+                .iter()
+                .filter(|row| row.checkout_id == *checkout_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            resolve_checkout(request, checkout_id, rows, projects)?
+        }
+        CheckoutAttachmentSelector::LegacyPath(raw) => resolve_legacy_path(request, raw, projects)?,
+    };
+    let requested_capability_is_safe = match request.intent {
+        CheckoutAccessIntent::Read => true,
+        CheckoutAccessIntent::Write => resolution_roots(
+            &candidate.project_id,
+            &candidate.project_root,
+            projects,
+            ResolveIntent::Write,
+        )
+        .is_ok_and(|roots| {
+            roots.checkout_root == candidate.checkout_root
+                && roots.project_root == candidate.project_root
+        }),
+    };
+    candidate.capabilities = requested_capability_is_safe
+        .then(|| BTreeSet::from([request.kind]))
+        .unwrap_or_default();
+    Ok(candidate)
 }
 
 fn validate_source_lane(
@@ -140,6 +165,7 @@ fn validate_source_lane(
             CheckoutAccessSourceLane::LegacyCheckoutRegistry
         }
         CheckoutAttachmentSelector::AttachmentId(_) => CheckoutAccessSourceLane::NativeAttachment,
+        CheckoutAttachmentSelector::LegacyPath(_) => CheckoutAccessSourceLane::LegacyPathResolver,
     };
     if request.source_lane != expected {
         return Err(access_error(
@@ -187,10 +213,12 @@ fn resolve_selected(
         attachment_id,
         checkout_id,
         published_scope,
+        branch_ref: current_branch_ref(&checkout_root),
         checkout_root,
         project_root,
         status: CheckoutAttachmentStatus::Active,
         capabilities: BTreeSet::new(),
+        lifetime_guard: None,
     })
 }
 
@@ -229,13 +257,17 @@ fn resolve_checkout(
         ));
     }
     let row = matching.pop().expect("one matching checkout row");
-    let project = unique_project(&request.project_id, projects)?;
-    if project_scope(project).as_ref() != Some(expected_scope) {
+    if row
+        .project_id
+        .as_deref()
+        .is_some_and(|project_id| project_id != request.project_id)
+    {
         return Err(access_error(
-            CheckoutAccessErrorCode::ScopeMismatch,
-            "requested project does not own the checkout row scope",
+            CheckoutAccessErrorCode::ProjectMismatch,
+            "checkout row belongs to a different logical project",
         ));
     }
+    let project = unique_project(&request.project_id, projects)?;
 
     let checkout_root = PathBuf::from(&row.checkout_dir);
     if !checkout_root.is_dir() {
@@ -254,18 +286,6 @@ fn resolve_checkout(
     }
     let project_root = join_scope_relpath(&checkout_root, &expected_scope.bbox_root_relpath)?;
     let project_root = canonical_directory(&project_root)?;
-    let roots = resolution_roots(
-        &request.project_id,
-        &project_root,
-        projects,
-        ResolveIntent::Read,
-    )?;
-    if roots.checkout_root != checkout_root || roots.project_root != project_root {
-        return Err(access_error(
-            CheckoutAccessErrorCode::ProjectMismatch,
-            "checkout row does not resolve back to the requested project",
-        ));
-    }
     let attachment_id = deterministic_id(
         "v1-attachment",
         &[
@@ -280,11 +300,179 @@ fn resolve_checkout(
         attachment_id,
         checkout_id: checkout_id.to_string(),
         published_scope: Some(expected_scope.clone()),
+        branch_ref: row.branch_ref.clone(),
         checkout_root,
         project_root,
         status: CheckoutAttachmentStatus::Active,
         capabilities: BTreeSet::new(),
+        lifetime_guard: None,
     })
+}
+
+fn resolve_legacy_path(
+    request: &CheckoutAccessRequest,
+    raw: &str,
+    projects: &[ProjectRecord],
+) -> std::result::Result<CheckoutAccessCandidate, CheckoutAccessError> {
+    let requested_intent = match request.intent {
+        CheckoutAccessIntent::Read => ResolveIntent::Read,
+        CheckoutAccessIntent::Write => ResolveIntent::Write,
+    };
+    let context = resolve_project_context(raw, projects, requested_intent).or_else(|| {
+        if requested_intent != ResolveIntent::Write {
+            return None;
+        }
+        resolve_project_context(raw, projects, ResolveIntent::Read)
+            .filter(|context| context.checkout.is_none())
+    });
+    let context = context.ok_or_else(|| {
+        access_error(
+            CheckoutAccessErrorCode::AttachmentNotFound,
+            "legacy path does not resolve to a registered writable project or checkout",
+        )
+    })?;
+    let project = if context.checkout.is_some() {
+        select_scope_project(raw, &context, projects)?
+    } else {
+        unique_project(&context.project_id, projects)?
+    };
+
+    let base_project_root = canonical_directory(Path::new(&project.canonical_path))?;
+    let base_checkout_root = bbox_corpus_core::git::git_root_for_path(&base_project_root)
+        .unwrap_or_else(|| base_project_root.clone());
+    let base_checkout_root = canonical_directory(&base_checkout_root)?;
+    let relative_project_root = base_project_root
+        .strip_prefix(&base_checkout_root)
+        .map_err(|_| {
+            access_error(
+                CheckoutAccessErrorCode::ConservativePathGateDenied,
+                "registered project root is outside its checkout root",
+            )
+        })?;
+    let checkout_root = context
+        .checkout
+        .as_ref()
+        .map(|checkout| canonical_directory(Path::new(&checkout.checkout_dir)))
+        .transpose()?
+        .unwrap_or(base_checkout_root);
+    let project_root = if relative_project_root.as_os_str().is_empty() {
+        checkout_root.clone()
+    } else {
+        canonical_directory(&checkout_root.join(relative_project_root))?
+    };
+    let roots = resolution_roots(
+        &project.project_id,
+        &project_root,
+        projects,
+        requested_intent,
+    )?;
+    if roots.checkout_root != checkout_root || roots.project_root != project_root {
+        return Err(access_error(
+            CheckoutAccessErrorCode::ConservativePathGateDenied,
+            "legacy path resolution changed before lease validation",
+        ));
+    }
+
+    let marker = checkout_root.join(".bbox/local/checkout-id");
+    let checkout_id = match read_checkout_id(&marker) {
+        Ok(Some(value)) if bounded_non_path_id(&value) => value,
+        Ok(Some(_)) | Err(_) => {
+            return Err(access_error(
+                CheckoutAccessErrorCode::CheckoutIdentityMismatch,
+                "checkout identity marker is invalid",
+            ));
+        }
+        Ok(None) if request.intent == CheckoutAccessIntent::Write => {
+            ensure_checkout_id(&checkout_root).map_err(|error| {
+                access_error(
+                    CheckoutAccessErrorCode::CheckoutIdentityMismatch,
+                    &format!("checkout identity could not be established: {error:#}"),
+                )
+            })?
+        }
+        Ok(None) => deterministic_id("v1-root", &[&project.project_id]),
+    };
+    let published_scope = project_scope(project);
+    let attachment_id = deterministic_id(
+        "v1-attachment",
+        &[&project.project_id, checkout_id.as_str()],
+    );
+    Ok(CheckoutAccessCandidate {
+        project_id: project.project_id.clone(),
+        attachment_id,
+        checkout_id,
+        published_scope,
+        branch_ref: current_branch_ref(&checkout_root),
+        checkout_root,
+        project_root,
+        status: CheckoutAttachmentStatus::Active,
+        capabilities: BTreeSet::new(),
+        lifetime_guard: None,
+    })
+}
+
+fn select_scope_project<'a>(
+    raw: &str,
+    context: &ProjectContext,
+    projects: &'a [ProjectRecord],
+) -> std::result::Result<&'a ProjectRecord, CheckoutAccessError> {
+    let checkout = context.checkout.as_ref().ok_or_else(|| {
+        access_error(
+            CheckoutAccessErrorCode::SelectorMismatch,
+            "scope selection requires a concrete checkout",
+        )
+    })?;
+    let checkout_root = canonical_directory(Path::new(&checkout.checkout_dir))?;
+    let raw = canonical_directory(Path::new(raw))?;
+    let raw_rel = raw.strip_prefix(&checkout_root).map_err(|_| {
+        access_error(
+            CheckoutAccessErrorCode::ConservativePathGateDenied,
+            "legacy path is outside its resolved checkout",
+        )
+    })?;
+    let common = bbox_corpus_core::git::git_common_dir(&checkout_root).ok_or_else(|| {
+        access_error(
+            CheckoutAccessErrorCode::ConservativePathGateDenied,
+            "resolved checkout has no stable git common directory",
+        )
+    })?;
+    let mut matches = projects
+        .iter()
+        .filter_map(|project| {
+            let project_root = canonical_directory(Path::new(&project.canonical_path)).ok()?;
+            let project_git_root = bbox_corpus_core::git::git_root_for_path(&project_root)?;
+            if bbox_corpus_core::git::git_common_dir(&project_git_root).as_ref() != Some(&common) {
+                return None;
+            }
+            let relpath = project_root.strip_prefix(&project_git_root).ok()?;
+            if !raw_rel.starts_with(relpath) {
+                return None;
+            }
+            Some((relpath.components().count(), project))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|(depth, _)| *depth);
+    let (depth, selected) = matches.pop().ok_or_else(|| {
+        access_error(
+            CheckoutAccessErrorCode::AttachmentNotFound,
+            "resolved checkout contains no registered project scope",
+        )
+    })?;
+    if matches
+        .last()
+        .is_some_and(|(other_depth, _)| *other_depth == depth)
+    {
+        return Err(access_error(
+            CheckoutAccessErrorCode::SelectorMismatch,
+            "legacy path resolves to more than one project scope",
+        ));
+    }
+    Ok(selected)
+}
+
+fn current_branch_ref(checkout_root: &Path) -> Option<String> {
+    bbox_corpus_core::git::current_branch(checkout_root)
+        .map(|branch| format!("refs/heads/{branch}"))
 }
 
 fn unique_project<'a>(
@@ -481,6 +669,9 @@ mod tests {
             CheckoutAttachmentSelector::AttachmentId(_) => {
                 CheckoutAccessSourceLane::NativeAttachment
             }
+            CheckoutAttachmentSelector::LegacyPath(_) => {
+                CheckoutAccessSourceLane::LegacyPathResolver
+            }
         };
         CheckoutAccessRequest {
             project_id: project_id.into(),
@@ -574,6 +765,75 @@ mod tests {
     }
 
     #[test]
+    fn legacy_path_write_resolves_managed_checkout_inside_authority() {
+        let fixture = GitFixture::new("bro-fleet/legacy-path");
+        std::fs::remove_file(fixture.checkout_root.join(".bbox/local/checkout-id")).unwrap();
+        let lease = fixture
+            .broker()
+            .acquire(request(
+                "",
+                CheckoutAttachmentSelector::LegacyPath(
+                    fixture.checkout_root.to_string_lossy().into_owned(),
+                ),
+                None,
+                CheckoutAccessKind::RepositoryMutation,
+                CheckoutAccessIntent::Write,
+            ))
+            .unwrap();
+        assert_eq!(lease.project_id(), fixture.record.project_id);
+        assert_eq!(lease.checkout_root(), fixture.checkout_root);
+        assert!(
+            lease
+                .branch_ref()
+                .is_some_and(|value| value.ends_with("legacy-path"))
+        );
+        assert_eq!(
+            read_checkout_id(&fixture.checkout_root.join(".bbox/local/checkout-id"))
+                .unwrap()
+                .as_deref(),
+            Some(lease.checkout_id())
+        );
+    }
+
+    #[test]
+    fn legacy_path_write_maps_plain_subdirectory_to_registered_base() {
+        let fixture = GitFixture::new("bro-fleet/plain-subdir-fixture");
+        let base = PathBuf::from(&fixture.record.canonical_path);
+        let subdir = base.join("src");
+        std::fs::create_dir(&subdir).unwrap();
+        let lease = fixture
+            .broker()
+            .acquire(request(
+                "",
+                CheckoutAttachmentSelector::LegacyPath(subdir.to_string_lossy().into_owned()),
+                None,
+                CheckoutAccessKind::RepositoryMutation,
+                CheckoutAccessIntent::Write,
+            ))
+            .unwrap();
+        assert_eq!(lease.project_root(), base);
+        assert_eq!(lease.checkout_root(), base);
+    }
+
+    #[test]
+    fn legacy_path_write_rejects_unmanaged_checkout() {
+        let fixture = GitFixture::new("arc/unmanaged-legacy-path");
+        let error = fixture
+            .broker()
+            .acquire(request(
+                "",
+                CheckoutAttachmentSelector::LegacyPath(
+                    fixture.checkout_root.to_string_lossy().into_owned(),
+                ),
+                None,
+                CheckoutAccessKind::RepositoryMutation,
+                CheckoutAccessIntent::Write,
+            ))
+            .unwrap_err();
+        assert_eq!(error.code, CheckoutAccessErrorCode::AttachmentNotFound);
+    }
+
+    #[test]
     fn checkout_selection_rejects_unknown_scope_inactive_and_ambiguous_rows() {
         let fixture = GitFixture::new("bro-fleet/selection-errors");
         let unknown = fixture
@@ -619,6 +879,7 @@ mod tests {
             .checkouts
             .write()
             .register(CheckoutRow {
+                project_id: None,
                 checkout_id: "inactive-checkout".into(),
                 checkout_dir: fixture
                     .checkout_root
@@ -643,6 +904,7 @@ mod tests {
         assert_eq!(inactive.code, CheckoutAccessErrorCode::AttachmentInactive);
 
         let duplicate = CheckoutRow {
+            project_id: None,
             checkout_id: fixture.checkout_id.clone(),
             checkout_dir: fixture.checkout_root.to_string_lossy().into(),
             repo_id: Some(fixture.scope.repo_id.clone()),
@@ -697,6 +959,7 @@ mod tests {
             checkouts
                 .write()
                 .register(CheckoutRow {
+                    project_id: None,
                     checkout_id: checkout_id.clone(),
                     checkout_dir: checkout_root.to_string_lossy().into(),
                     repo_id: Some(scope.repo_id.clone()),

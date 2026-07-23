@@ -1298,20 +1298,33 @@ impl GapStore {
 
     /// Ingest a pre-built [`GapNote`] (spool / packet producers). Honors the
     /// same open-duplicate dedupe by key+scope. Returns (id, created).
-    pub fn ingest(&mut self, mut gap: GapNote) -> Result<(String, bool)> {
+    pub fn ingest(&mut self, gap: GapNote) -> Result<(String, bool)> {
+        self.ingest_with_carrier(gap, None)
+    }
+
+    /// Ingest through an explicitly selected repository carrier. Checkout
+    /// spool imports use this path so reading from a worktree can never write
+    /// the resulting gap into the selected base checkout.
+    pub fn ingest_with_carrier(
+        &mut self,
+        mut gap: GapNote,
+        write_carrier_id: Option<&str>,
+    ) -> Result<(String, bool)> {
         let path = self.store_path.clone();
         bbox_corpus_core::json_store::with_store_lock(&path, || {
             self.reload()?;
-            if self.path_fallback_cut && gap.project.is_some() {
+            if self.path_fallback_cut && gap.project.is_some() && write_carrier_id.is_none() {
                 anyhow::bail!(
                     "path-scoped project fallback is retired; project gap ingestion requires checkout authority"
                 );
             }
+            if let Some(project) = gap.project.clone() {
+                self.seed_checkout_entries(Some(&project), write_carrier_id)?;
+                self.ensure_repo_owned_carrier(&project, write_carrier_id)?;
+                gap.write_dir = write_carrier_id.map(str::to_owned);
+            }
             if let Some(existing) = self.open_duplicate(&gap.dedupe_key, gap.project.as_deref()) {
                 return Ok((existing.id.clone(), false));
-            }
-            if let Some(project) = gap.project.clone() {
-                self.ensure_repo_owned_carrier(&project, None)?;
             }
             if gap.id.is_empty() {
                 gap.id = Self::gen_id();
@@ -1321,6 +1334,47 @@ impl GapStore {
             self.save()?;
             Ok((id, true))
         })
+    }
+
+    /// Ingest a spool entry while the caller holds mutation authority for the
+    /// exact carrier and `root`. This targeted path never reloads or saves a
+    /// different carrier, so a checkout inbox cannot mutate the selected base
+    /// repository and nested authority acquisition is unnecessary.
+    pub fn ingest_authorized_carrier(
+        &mut self,
+        mut gap: GapNote,
+        carrier: &GapRepoCarrier,
+        root: &Path,
+    ) -> Result<(String, bool)> {
+        let project = gap
+            .project
+            .as_deref()
+            .context("authorized repository gap ingestion requires a project")?;
+        if project != carrier.project {
+            anyhow::bail!("authorized gap carrier does not match the gap project");
+        }
+        for mut existing in load_repo_gap_entries(root, project)? {
+            existing.project = Some(project.to_string());
+            existing.write_dir = Some(carrier.carrier_id.clone());
+            if let Some(current) = self.data.gaps.iter_mut().find(|gap| gap.id == existing.id) {
+                *current = existing;
+            } else {
+                self.data.gaps.push(existing);
+            }
+        }
+        if let Some(existing) = self.open_duplicate(&gap.dedupe_key, Some(project)) {
+            return Ok((existing.id.clone(), false));
+        }
+        if gap.id.is_empty() {
+            gap.id = Self::gen_id();
+        }
+        gap.write_dir = Some(carrier.carrier_id.clone());
+        let id = gap.id.clone();
+        let known_ids = BTreeSet::from([id.as_str()]);
+        persist_repo_gap_entries(root, &[&gap], false, &known_ids, &BTreeSet::new())?;
+        self.repo_owned_carriers.insert(carrier.carrier_id.clone());
+        self.data.gaps.push(gap);
+        Ok((id, true))
     }
 
     // ── bbox_gap_resolve ───────────────────────────────────────────
@@ -2005,7 +2059,9 @@ mod tests {
         store.save().unwrap();
         assert_eq!(store.legacy_path_scoped_entry_count().unwrap(), 1);
 
+        store.set_project_roots(vec![project.clone()]).unwrap();
         fs::create_dir_all(project.join(".bbox/gaps")).unwrap();
+        store.reload().unwrap();
         store.save().unwrap();
         assert_eq!(store.legacy_path_scoped_entry_count().unwrap(), 0);
     }

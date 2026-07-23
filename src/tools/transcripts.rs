@@ -2,7 +2,6 @@ use crate::index::{CiteParams, ContextParams, SearchParams};
 use crate::mcp_tools;
 use crate::mcp_tools::discover_seed::DiscoverSeedParams;
 use crate::mcp_tools::hybrid_search::HybridSearchParams;
-use crate::providers::ProviderContext;
 use crate::server::BlackboxServer;
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -132,10 +131,10 @@ impl BlackboxServer {
             let knowledge_view =
                 server.session_knowledge_view(p.project.as_deref(), p.provisional.as_deref())?;
             let read_view = server.state.code_read_view.read().clone();
-            let provider_ctx =
-                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
-                    .with_knowledge_view(&knowledge_view.knowledge)
-                    .with_searcher(&read_view.searcher);
+            let provider_ctx = server
+                .provider_context()
+                .with_knowledge_view(&knowledge_view.knowledge)
+                .with_searcher(&read_view.searcher);
             let response =
                 mcp_tools::hybrid_search::hybrid_search_typed_with_active_selectors_and_searcher(
                     &server.state.idx.read(),
@@ -170,10 +169,10 @@ impl BlackboxServer {
             let knowledge_view =
                 server.session_knowledge_view(p.project.as_deref(), p.provisional.as_deref())?;
             let read_view = server.state.code_read_view.read().clone();
-            let provider_ctx =
-                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
-                    .with_knowledge_view(&knowledge_view.knowledge)
-                    .with_searcher(&read_view.searcher);
+            let provider_ctx = server
+                .provider_context()
+                .with_knowledge_view(&knowledge_view.knowledge)
+                .with_searcher(&read_view.searcher);
             let output = mcp_tools::discover_seed::discover_seed_entities(
                 &server.state.idx.read(),
                 &knowledge_view.knowledge,

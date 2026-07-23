@@ -57,6 +57,30 @@ pub struct PublishedKnowledgeSnapshot {
     pub entries: BTreeMap<String, PublishedKnowledgeEntry>,
 }
 
+/// Immutable checkout bytes captured by the authority adapter.
+///
+/// The overlay layer deliberately cannot reopen checkout paths. Production
+/// callers build this snapshot through the checkout lease's confined,
+/// descriptor-relative reader and retain the lease until recomputation
+/// finishes. This closes the former read-dir-then-open symlink race.
+#[derive(Debug, Clone, Default)]
+pub struct WorkingKnowledgeSnapshot {
+    files: BTreeMap<String, Vec<u8>>,
+}
+
+impl WorkingKnowledgeSnapshot {
+    pub fn new(files: BTreeMap<String, Vec<u8>>) -> Result<Self> {
+        for filename in files.keys() {
+            validate_snapshot_filename(filename, "knowledge")?;
+        }
+        Ok(Self { files })
+    }
+
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct OverlayKey {
     pub published_scope: PublishedScope,
@@ -365,9 +389,17 @@ pub fn load_published_snapshot_at_commit_unhydrated(
 pub fn recompute_overlay(
     publisher_root: &Path,
     published_ref: &str,
+    checkout_root: &Path,
+    working: &WorkingKnowledgeSnapshot,
     checkout: &ResolvedCheckoutScope,
 ) -> OverlaySnapshot {
-    match recompute_overlay_result(publisher_root, published_ref, checkout) {
+    match recompute_overlay_result(
+        publisher_root,
+        published_ref,
+        checkout_root,
+        working,
+        checkout,
+    ) {
         Ok(snapshot) => snapshot,
         Err(err) => OverlaySnapshot::invalid(checkout, format!("{err:#}")),
     }
@@ -378,9 +410,10 @@ pub fn recompute_overlay(
 pub fn recompute_overlay_result(
     publisher_root: &Path,
     published_ref: &str,
+    checkout_root: &Path,
+    working: &WorkingKnowledgeSnapshot,
     checkout: &ResolvedCheckoutScope,
 ) -> std::result::Result<OverlaySnapshot, OverlayRecomputeError> {
-    let checkout_root = Path::new(&checkout.checkout_dir);
     let publisher_commit = git::resolve_commit(publisher_root, published_ref)
         .with_context(|| {
             format!(
@@ -411,14 +444,13 @@ pub fn recompute_overlay_result(
         .map_err(OverlayRecomputeError::transient)?;
     let published = read_committed_map(publisher_root, &publisher_commit, &tree_dir, None)
         .map_err(OverlayRecomputeError::transient)?;
-    let working = read_working_map(Path::new(&checkout.checkout_project_dir))
-        .map_err(OverlayRecomputeError::transient)?;
+    let working = &working.files;
     validate_knowledge_map(&baseline, "baseline")
         .map_err(OverlayRecomputeError::invalid_content)?;
     validate_knowledge_map(&published, "published")
         .map_err(OverlayRecomputeError::invalid_content)?;
-    validate_knowledge_map(&working, "working").map_err(OverlayRecomputeError::invalid_content)?;
-    let working_fingerprint = fingerprint_map(&working);
+    validate_knowledge_map(working, "working").map_err(OverlayRecomputeError::invalid_content)?;
+    let working_fingerprint = fingerprint_map(working);
 
     let mut paths = BTreeSet::new();
     paths.extend(baseline.keys().cloned());
@@ -569,32 +601,19 @@ fn read_committed_map(
     Ok(files)
 }
 
-fn read_working_map(project_root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
-    let dir = project_root.join(".bbox").join("knowledge");
-    if !dir.exists() {
-        return Ok(BTreeMap::new());
+fn validate_snapshot_filename(filename: &str, label: &str) -> Result<()> {
+    let path = Path::new(filename);
+    let mut components = path.components();
+    let Some(std::path::Component::Normal(name)) = components.next() else {
+        anyhow::bail!("{label} snapshot filename is not a confined basename: {filename}");
+    };
+    if components.next().is_some()
+        || name.to_str() != Some(filename)
+        || path.extension().and_then(|extension| extension.to_str()) != Some("json")
+    {
+        anyhow::bail!("{label} snapshot filename is not a confined JSON basename: {filename}");
     }
-    let mut files = BTreeMap::new();
-    for entry in std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
-        let entry = entry.with_context(|| format!("reading entry in {}", dir.display()))?;
-        let file_type = entry
-            .file_type()
-            .with_context(|| format!("reading file type for {}", entry.path().display()))?;
-        if !file_type.is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-            continue;
-        }
-        let filename = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .with_context(|| format!("knowledge filename is not UTF-8: {}", path.display()))?;
-        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        files.insert(filename.to_string(), bytes);
-    }
-    Ok(files)
+    Ok(())
 }
 
 fn fingerprint_map(files: &BTreeMap<String, Vec<u8>>) -> String {
@@ -713,6 +732,23 @@ mod tests {
         .unwrap();
     }
 
+    fn working_snapshot(root: &Path) -> WorkingKnowledgeSnapshot {
+        let dir = root.join(".bbox/knowledge");
+        let mut files = BTreeMap::new();
+        if dir.is_dir() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().and_then(|extension| extension.to_str()) == Some("json")
+                    && path.is_file()
+                {
+                    let filename = path.file_name().unwrap().to_str().unwrap().to_string();
+                    files.insert(filename, std::fs::read(path).unwrap());
+                }
+            }
+        }
+        WorkingKnowledgeSnapshot::new(files).unwrap()
+    }
+
     #[test]
     fn overlay_captures_modifications_untracked_files_and_tombstones() {
         let temp = tempfile::tempdir().unwrap();
@@ -754,7 +790,9 @@ mod tests {
             checkout_project_dir: worktree.to_string_lossy().into_owned(),
             branch_ref: Some("refs/heads/feature".into()),
         };
-        let snapshot = recompute_overlay(&base, "refs/heads/main", &checkout);
+        let working = working_snapshot(&worktree);
+        write_entry(&worktree, &entry("keep", "swapped-after-capture"));
+        let snapshot = recompute_overlay(&base, "refs/heads/main", &worktree, &working, &checkout);
         assert_eq!(snapshot.status, OverlayStatus::Valid, "{snapshot:?}");
         assert!(matches!(
             snapshot.values.get("keep"),
@@ -768,7 +806,25 @@ mod tests {
             snapshot.values.get("remove"),
             Some(OverlayValue::Tombstone)
         ));
+        assert!(matches!(
+            snapshot.values.get("keep"),
+            Some(OverlayValue::Upsert { entry, .. }) if entry.content == "changed"
+        ));
         assert_eq!(snapshot.snapshot_id.len(), 64);
+    }
+
+    #[test]
+    fn working_snapshot_rejects_non_basename_paths() {
+        for filename in ["../escape.json", "nested/entry.json", "entry.txt"] {
+            assert!(
+                WorkingKnowledgeSnapshot::new(BTreeMap::from([(
+                    filename.to_string(),
+                    b"{}".to_vec(),
+                )]))
+                .is_err(),
+                "unsafe snapshot filename should be rejected: {filename}"
+            );
+        }
     }
 
     #[test]
@@ -810,7 +866,8 @@ mod tests {
             checkout_project_dir: worktree.to_string_lossy().into_owned(),
             branch_ref: Some("refs/heads/feature".into()),
         };
-        let snapshot = recompute_overlay(&base, "refs/heads/main", &checkout);
+        let working = working_snapshot(&worktree);
+        let snapshot = recompute_overlay(&base, "refs/heads/main", &worktree, &working, &checkout);
         assert_eq!(snapshot.status, OverlayStatus::Valid, "{snapshot:?}");
         assert!(snapshot.values.is_empty());
     }
@@ -855,7 +912,8 @@ mod tests {
             checkout_project_dir: worktree.to_string_lossy().into_owned(),
             branch_ref: Some("refs/heads/feature".into()),
         };
-        let snapshot = recompute_overlay(&base, "refs/heads/main", &checkout);
+        let working = working_snapshot(&worktree);
+        let snapshot = recompute_overlay(&base, "refs/heads/main", &worktree, &working, &checkout);
         assert_eq!(snapshot.status, OverlayStatus::Valid, "{snapshot:?}");
         assert!(snapshot.values.is_empty(), "{snapshot:?}");
     }
@@ -899,7 +957,9 @@ mod tests {
             branch_ref: Some("refs/heads/feature".into()),
         };
 
-        let snapshot = recompute_overlay(&project, "refs/heads/main", &checkout);
+        let working = working_snapshot(&worktree_project);
+        let snapshot =
+            recompute_overlay(&project, "refs/heads/main", &worktree, &working, &checkout);
         assert_eq!(snapshot.status, OverlayStatus::Valid, "{snapshot:?}");
         assert!(matches!(
             snapshot.values.get("web"),
@@ -971,14 +1031,29 @@ mod tests {
         };
 
         std::fs::write(worktree.join(".bbox/knowledge/broken.json"), b"{").unwrap();
-        let malformed = recompute_overlay_result(&base, "refs/heads/main", &checkout).unwrap_err();
+        let malformed_working = working_snapshot(&worktree);
+        let malformed = recompute_overlay_result(
+            &base,
+            "refs/heads/main",
+            &worktree,
+            &malformed_working,
+            &checkout,
+        )
+        .unwrap_err();
         assert_eq!(malformed.kind, OverlayRecomputeErrorKind::InvalidContent);
 
         let mut missing_checkout = checkout;
         missing_checkout.checkout_dir = root.join("missing").to_string_lossy().into_owned();
         missing_checkout.checkout_project_dir = missing_checkout.checkout_dir.clone();
-        let transient =
-            recompute_overlay_result(&base, "refs/heads/main", &missing_checkout).unwrap_err();
+        let missing_root = root.join("missing");
+        let transient = recompute_overlay_result(
+            &base,
+            "refs/heads/main",
+            &missing_root,
+            &WorkingKnowledgeSnapshot::empty(),
+            &missing_checkout,
+        )
+        .unwrap_err();
         assert_eq!(transient.kind, OverlayRecomputeErrorKind::Transient);
     }
 

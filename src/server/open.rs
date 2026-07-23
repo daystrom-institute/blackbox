@@ -109,10 +109,12 @@ fn backfill_project_languages(
                 continue;
             }
         };
+        let expected_scope = scope_lease.published_scope().cloned();
+        drop(scope_lease);
         let lease = match checkout_access.acquire(CheckoutAccessRequest {
             project_id: project.project_id.clone(),
             attachment: CheckoutAttachmentSelector::Selected,
-            expected_scope: scope_lease.published_scope().cloned(),
+            expected_scope,
             kind: CheckoutAccessKind::LocalProjectWalk,
             intent: CheckoutAccessIntent::Read,
             source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
@@ -136,6 +138,7 @@ fn backfill_project_languages(
             );
             continue;
         }
+        drop(lease);
         changed |= projects
             .write()
             .backfill_languages(&project.project_id, languages);
@@ -254,6 +257,10 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     });
 
     let path_fallback_cut = bbox_knowledge::inventory::path_fallback_was_cut(&cfg.paths.bro_home)?;
+    let repo_io = Arc::new(super::repo_io::RepoIoAuthority::new(
+        checkout_access.clone(),
+    ));
+    let registered_projects = projects_store.read().list();
     let mut kb = Knowledge::open(&kb_path)?;
     kb.set_path_fallback_cut(path_fallback_cut);
     tracing::info!("Knowledge store: {}", kb_path.display());
@@ -262,16 +269,12 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     // the tool-reference entry and triggers save()): a save with the repo's
     // entries not yet loaded would treat the in-memory set as authoritative and
     // purge the committed .bbox/knowledge files for a repo-owned project.
-    {
-        let kb_roots: Vec<std::path::PathBuf> = projects_store
-            .read()
-            .list()
-            .into_iter()
-            .map(|r| std::path::PathBuf::from(r.canonical_path))
-            .collect();
-        if let Err(e) = kb.set_project_roots(kb_roots) {
-            tracing::warn!("kb project-root load at startup: {e:#}");
-        }
+    if let Err(e) = kb.configure_repo_io(
+        repo_io.clone(),
+        repo_io.clone(),
+        super::repo_io::RepoIoAuthority::knowledge_base_carriers(&registered_projects)?,
+    ) {
+        tracing::warn!("kb repository-carrier load at startup: {e:#}");
     }
     let tool_docs_synced = sync_tool_docs(&mut kb);
 
@@ -284,16 +287,12 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     let mut gaps_store = crate::gaps::GapStore::open(&gaps_path)?;
     gaps_store.set_path_fallback_cut(path_fallback_cut);
     tracing::info!("Gap store: {}", gaps_path.display());
-    {
-        let gap_roots: Vec<std::path::PathBuf> = projects_store
-            .read()
-            .list()
-            .into_iter()
-            .map(|r| std::path::PathBuf::from(r.canonical_path))
-            .collect();
-        if let Err(e) = gaps_store.set_project_roots(gap_roots) {
-            tracing::warn!("gaps project-root load at startup: {e:#}");
-        }
+    if let Err(e) = gaps_store.configure_repo_io(
+        repo_io.clone(),
+        repo_io,
+        super::repo_io::RepoIoAuthority::gap_base_carriers(&registered_projects)?,
+    ) {
+        tracing::warn!("gaps repository-carrier load at startup: {e:#}");
     }
     load_system_memory_catalog(&cfg)?;
     configure_dispatch_mcp_env(&cfg);
@@ -382,6 +381,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     let code_sources = Arc::new(super::code_source::CodeSourceRuntime::open(
         &cfg,
         &projects_store.read().list(),
+        checkout_access.clone(),
     )?);
     if idx.schema_was_reset() {
         tracing::info!(

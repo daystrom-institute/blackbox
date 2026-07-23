@@ -20,6 +20,10 @@ use bbox_code_source_store::{
 };
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_record::ProjectRecord;
+use bbox_indexing::checkout_access::{
+    CheckoutAccessBroker, CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest,
+    CheckoutAccessSourceLane, CheckoutAttachmentSelector,
+};
 use bro_rpc::ServiceToken;
 use futures::StreamExt;
 use serde::Deserialize;
@@ -48,6 +52,7 @@ struct CodeSourceSnapshot {
 pub(crate) struct CodeSourceRuntime {
     snapshot: parking_lot::RwLock<Arc<CodeSourceSnapshot>>,
     activating_projects: parking_lot::Mutex<BTreeMap<String, bool>>,
+    checkout_access: Arc<CheckoutAccessBroker>,
 }
 
 #[derive(Default)]
@@ -57,10 +62,20 @@ pub(crate) struct SourceTransitions {
 }
 
 impl CodeSourceRuntime {
-    pub(crate) fn open(config: &crate::config::Config, projects: &[ProjectRecord]) -> Result<Self> {
+    pub(crate) fn open(
+        config: &crate::config::Config,
+        projects: &[ProjectRecord],
+        checkout_access: Arc<CheckoutAccessBroker>,
+    ) -> Result<Self> {
         Ok(Self {
-            snapshot: parking_lot::RwLock::new(Arc::new(build_snapshot(config, projects, None)?)),
+            snapshot: parking_lot::RwLock::new(Arc::new(build_snapshot(
+                config,
+                projects,
+                None,
+                &checkout_access,
+            )?)),
             activating_projects: parking_lot::Mutex::new(BTreeMap::new()),
+            checkout_access,
         })
     }
 
@@ -74,6 +89,7 @@ impl CodeSourceRuntime {
             config,
             projects,
             Some(previous.store.clone()),
+            &self.checkout_access,
         )?);
         replacement.store.update_limits(store_limits(config))?;
         let old_assignments = assignment_map(&previous);
@@ -106,6 +122,10 @@ impl CodeSourceRuntime {
                 store,
             })),
             activating_projects: parking_lot::Mutex::new(BTreeMap::new()),
+            checkout_access: Arc::new(CheckoutAccessBroker::new(
+                Arc::new(bbox_indexing::checkout_access::DenyCheckoutAccess),
+                bbox_indexing::checkout_access::CheckoutAccessObservations::in_memory(),
+            )),
         }
     }
 
@@ -199,6 +219,7 @@ fn build_snapshot(
     config: &crate::config::Config,
     projects: &[ProjectRecord],
     existing_store: Option<Arc<CodeSourceStore>>,
+    checkout_access: &CheckoutAccessBroker,
 ) -> Result<CodeSourceSnapshot> {
     let limits = store_limits(config);
     if config.code_collection.enabled
@@ -228,6 +249,26 @@ fn build_snapshot(
         bail!("enabled code collection requires at least one producer");
     }
 
+    let project_scopes = projects
+        .iter()
+        .map(|project| {
+            let lease = checkout_access
+                .acquire(CheckoutAccessRequest {
+                    project_id: project.project_id.clone(),
+                    attachment: CheckoutAttachmentSelector::Selected,
+                    expected_scope: None,
+                    kind: CheckoutAccessKind::PublisherConfigTreeRead,
+                    intent: CheckoutAccessIntent::Read,
+                    source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+                })
+                .map_err(anyhow::Error::new)?;
+            let scope = lease.published_scope().cloned();
+            checkout_access
+                .revalidate(&lease)
+                .map_err(anyhow::Error::new)?;
+            Ok::<_, anyhow::Error>((project, scope))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut auth = Vec::new();
     let mut producer_ids = BTreeSet::new();
     let mut token_digests = BTreeSet::new();
@@ -253,15 +294,10 @@ fn build_snapshot(
             if !assigned_scopes.insert(scope.clone()) {
                 bail!("code-collection scope is assigned more than once");
             }
-            let matching = projects
+            let matching = project_scopes
                 .iter()
-                .filter(|project| {
-                    bbox_indexing::publisher::project_published_scope(project, |root| {
-                        bbox_config::config::read_repo_id_inputs(root)
-                    })
-                    .as_ref()
-                        == Some(scope)
-                })
+                .filter(|(_, project_scope)| project_scope.as_ref() == Some(scope))
+                .map(|(project, _)| *project)
                 .collect::<Vec<_>>();
             let [project] = matching.as_slice() else {
                 if matching.is_empty() {

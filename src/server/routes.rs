@@ -2272,20 +2272,42 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
     }))
 }
 
-/// Re-derive the knowledge store's project roots from the live registry so its
-/// committed `.bbox/knowledge/` entries are loaded into the query surface.
-/// Called whenever the set of registered projects changes (register, rename,
-/// unregister) and at daemon startup.
+/// Re-derive repository carriers from the live registry so committed
+/// knowledge and gaps are loaded only through checkout authority.
 pub(crate) fn sync_kb_project_roots(state: &SharedState) {
-    let roots: Vec<std::path::PathBuf> = state
-        .projects
-        .read()
-        .list()
-        .into_iter()
-        .map(|r| std::path::PathBuf::from(r.canonical_path))
-        .collect();
-    if let Err(e) = state.kb.write().set_project_roots(roots) {
-        tracing::warn!("kb project-root sync: {e:#}");
+    let projects = state.projects.read().list();
+    let repo_io = std::sync::Arc::new(super::repo_io::RepoIoAuthority::new(
+        state.checkout_access.clone(),
+    ));
+    let knowledge_carriers =
+        match super::repo_io::RepoIoAuthority::knowledge_base_carriers(&projects) {
+            Ok(carriers) => carriers,
+            Err(error) => {
+                tracing::warn!("knowledge repository-carrier sync failed: {error:#}");
+                return;
+            }
+        };
+    let gap_carriers = match super::repo_io::RepoIoAuthority::gap_base_carriers(&projects) {
+        Ok(carriers) => carriers,
+        Err(error) => {
+            tracing::warn!("gap repository-carrier sync failed: {error:#}");
+            return;
+        }
+    };
+    if let Err(error) =
+        state
+            .kb
+            .write()
+            .configure_repo_io(repo_io.clone(), repo_io.clone(), knowledge_carriers)
+    {
+        tracing::warn!("knowledge repository-carrier sync failed: {error:#}");
+    }
+    if let Err(error) = state
+        .gaps
+        .write()
+        .configure_repo_io(repo_io.clone(), repo_io, gap_carriers)
+    {
+        tracing::warn!("gap repository-carrier sync failed: {error:#}");
     }
 }
 
@@ -2312,6 +2334,62 @@ pub(crate) fn enqueue_project_knowledge_embeds(
     state: &std::sync::Arc<SharedState>,
     project_dir: &str,
 ) -> usize {
+    let server = super::BlackboxServer::new(state.clone());
+    let projects = state.projects.read().list();
+    let matching = projects
+        .iter()
+        .filter(|project| project.canonical_path == project_dir)
+        .collect::<Vec<_>>();
+    let [project] = matching.as_slice() else {
+        tracing::warn!(
+            project = project_dir,
+            "project knowledge embed source has no unique registered attachment"
+        );
+        return 0;
+    };
+    let publication_lease = match super::checkout_access::published_scope_for_project(
+        &state.checkout_access,
+        &project.project_id,
+    ) {
+        Ok(Some(scope)) => match server
+            .authorize_publisher(&projects, &scope)
+            .and_then(|publisher| server.acquire_authorized_publisher_lease(&publisher))
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                tracing::warn!(
+                    project = project_dir,
+                    error = %error,
+                    "project knowledge embed publisher authority unavailable"
+                );
+                return 0;
+            }
+        },
+        Ok(None) => match super::checkout_access::acquire_selected_project_access(
+            &state.checkout_access,
+            &project.project_id,
+            bbox_indexing::checkout_access::CheckoutAccessKind::PublisherConfigTreeRead,
+            bbox_indexing::checkout_access::CheckoutAccessIntent::Read,
+        ) {
+            Ok(lease) => lease,
+            Err(error) => {
+                tracing::warn!(
+                    project = project_dir,
+                    error = %error,
+                    "legacy project knowledge embed authority unavailable"
+                );
+                return 0;
+            }
+        },
+        Err(error) => {
+            tracing::warn!(
+                project = project_dir,
+                error = %error,
+                "project knowledge embed scope authority unavailable"
+            );
+            return 0;
+        }
+    };
     let entries = match published_knowledge_for_embedding(state, Some(project_dir)) {
         Ok(entries) => entries,
         Err(error) => {
@@ -2319,6 +2397,17 @@ pub(crate) fn enqueue_project_knowledge_embeds(
                 project = project_dir,
                 error = %error,
                 "project knowledge embed source unavailable"
+            );
+            return 0;
+        }
+    };
+    let publication = match state.checkout_access.publication_guard(&publication_lease) {
+        Ok(publication) => publication,
+        Err(error) => {
+            tracing::warn!(
+                project = project_dir,
+                error = %error,
+                "project knowledge embed publication authority changed"
             );
             return 0;
         }
@@ -2336,6 +2425,7 @@ pub(crate) fn enqueue_project_knowledge_embeds(
         crate::embed_queue::enqueue_knowledge(entry, &entity_id, &chunk_hash);
         enqueued += 1;
     }
+    drop(publication);
     enqueued
 }
 
@@ -3197,6 +3287,18 @@ mod tests {
             published_knowledge_for_embedding(&server.state, Some(root.to_str().unwrap())).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].content, "published bytes");
+
+        let lifecycle = server
+            .state
+            .checkout_access
+            .lifecycle_mutation_guard()
+            .unwrap();
+        assert_eq!(
+            enqueue_project_knowledge_embeds(&server.state, root.to_str().unwrap()),
+            0,
+            "embedding publication must stop when its checkout fence is unavailable"
+        );
+        drop(lifecycle);
     }
 
     #[test]

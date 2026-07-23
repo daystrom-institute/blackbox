@@ -140,7 +140,7 @@ pub struct ForgetParams {
     pub superseded_by: Option<String>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RenderParams {
     /// Render for specific provider or all
     #[serde(default)]
@@ -4332,6 +4332,7 @@ mod tests {
         std::fs::create_dir_all(repo_kb_dir(&wt_root)).unwrap();
 
         let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        kb.set_project_roots(vec![base_root.clone()]).unwrap();
         let result = kb
             .learn_result_with_write_dir(
                 &LearnParams {
@@ -5508,8 +5509,11 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
 
         let kb_path = central.path().join("kb.json");
         let mut kb = Knowledge::open(&kb_path).unwrap();
-        // Only the BASE is a registered project root; the worktree is ephemeral.
-        kb.set_project_roots(vec![base_root.clone()]).unwrap();
+        // Both physical carriers are explicit test authority. Production uses
+        // the checkout broker to grant the worktree carrier without promoting
+        // it to a durable project.
+        kb.set_project_roots(vec![base_root.clone(), worktree_root.clone()])
+            .unwrap();
 
         let id = kb
             .learn_result(

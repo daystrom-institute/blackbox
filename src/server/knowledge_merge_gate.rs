@@ -9,7 +9,11 @@ use bro_tools::fleet_worktree::{CandidateGateReport, CandidateTree};
 pub(crate) fn evaluate(candidate: &CandidateTree) -> Result<CandidateGateReport> {
     let tree = tempfile::tempdir().context("creating candidate-tree sandbox")?;
     bro_tools::fleet_worktree::materialize_candidate_tree(candidate, tree.path())?;
-    let roots = discover_project_roots(tree.path())?;
+    let tree_root = tree
+        .path()
+        .canonicalize()
+        .context("canonicalizing candidate-tree sandbox")?;
+    let roots = discover_project_roots(&tree_root)?;
     if roots.is_empty() {
         let removed_existing_bbox = target_contains_bbox(candidate)?;
         return Ok(CandidateGateReport {
@@ -27,7 +31,8 @@ pub(crate) fn evaluate(candidate: &CandidateTree) -> Result<CandidateGateReport>
 
     let state = tempfile::tempdir().context("creating candidate knowledge state")?;
     let mut knowledge = bbox_knowledge::knowledge::Knowledge::open(&state.path().join("kb.json"))?;
-    knowledge.set_project_roots(roots.clone())?;
+    let (repo_io, carriers) = super::repo_io::ConfinedKnowledgeRepoIo::new(roots.iter().cloned())?;
+    knowledge.configure_repo_io(repo_io.clone(), repo_io, carriers)?;
 
     let mut projects = Vec::new();
     let mut render_mismatch_count = 0usize;
@@ -36,7 +41,7 @@ pub(crate) fn evaluate(candidate: &CandidateTree) -> Result<CandidateGateReport>
         let mut render = knowledge.check_project_render(&root)?;
         for mismatch in &mut render.mismatches {
             mismatch.path = Path::new(&mismatch.path)
-                .strip_prefix(tree.path())
+                .strip_prefix(&tree_root)
                 .unwrap_or_else(|_| Path::new(&mismatch.path))
                 .to_string_lossy()
                 .replace('\\', "/");
@@ -45,7 +50,7 @@ pub(crate) fn evaluate(candidate: &CandidateTree) -> Result<CandidateGateReport>
         render_mismatch_count += render.mismatches.len();
         contradiction_count += contradictions.len();
         let relative_root = root
-            .strip_prefix(tree.path())
+            .strip_prefix(&tree_root)
             .unwrap_or(root.as_path())
             .to_string_lossy()
             .replace('\\', "/");
@@ -272,7 +277,11 @@ mod tests {
         .unwrap();
         let state = tempfile::tempdir().unwrap();
         let mut knowledge = Knowledge::open(&state.path().join("kb.json")).unwrap();
-        knowledge.set_project_roots(vec![root.clone()]).unwrap();
+        let (repo_io, carriers) =
+            crate::server::repo_io::ConfinedKnowledgeRepoIo::new([root.clone()]).unwrap();
+        knowledge
+            .configure_repo_io(repo_io.clone(), repo_io, carriers)
+            .unwrap();
         knowledge
             .render(&RenderParams {
                 project: Some(root.to_string_lossy().into_owned()),

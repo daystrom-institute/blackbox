@@ -36,12 +36,15 @@ use serde::{Deserialize, Serialize};
 
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::json_store::atomic_write_json_locked;
-use bbox_corpus_core::project_record::ProjectRecord;
 
 /// One registered checkout. Enough to recompute its overlay and to re-verify it
 /// against the write gate; nothing that must travel with the repo.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckoutRow {
+    /// Logical project owner captured when the checkout was admitted. Older
+    /// rows may lack it and are repaired on the next registration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     /// Durable, reuse-safe checkout identity (`.bbox/local/checkout-id`). One
     /// half of the composite registry key and this checkout's GC identity.
     pub checkout_id: String,
@@ -288,7 +291,13 @@ impl CheckoutRow {
 /// registry (or they re-register on next write). The caller enriches each
 /// discovered dir into a [`CheckoutRow`] (its `checkout_id`, `repo_id`, etc.)
 /// when it registers; discovery yields locations only.
-pub fn discover_checkout_dirs(projects: &[ProjectRecord]) -> Vec<PathBuf> {
+pub struct CheckoutDiscoveryAccess<'a> {
+    pub checkout_root: &'a Path,
+    pub project_root: &'a Path,
+    pub is_git_repo: bool,
+}
+
+pub fn discover_checkout_dirs(projects: &[CheckoutDiscoveryAccess<'_>]) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = Vec::new();
     let push = |p: PathBuf, found: &mut Vec<PathBuf>| {
         if !found.contains(&p) {
@@ -313,12 +322,10 @@ pub fn discover_checkout_dirs(projects: &[ProjectRecord]) -> Vec<PathBuf> {
     // Every worktree of every registered repo.
     for project in projects {
         if !project.is_git_repo {
-            if let Ok(canonical) = std::fs::canonicalize(&project.canonical_path) {
-                push(canonical, &mut found);
-            }
+            push(project.project_root.to_path_buf(), &mut found);
             continue;
         }
-        for wt in bbox_corpus_core::git::list_worktree_paths(Path::new(&project.canonical_path)) {
+        for wt in bbox_corpus_core::git::list_worktree_paths(project.checkout_root) {
             push(wt, &mut found);
         }
     }
@@ -332,6 +339,7 @@ mod tests {
 
     fn row(id: &str, dir: &Path) -> CheckoutRow {
         CheckoutRow {
+            project_id: None,
             checkout_id: id.into(),
             checkout_dir: dir.to_string_lossy().into_owned(),
             repo_id: Some("repofam".into()),
@@ -620,14 +628,10 @@ mod tests {
         );
         let wt_d = wt.canonicalize().unwrap();
 
-        let projects = vec![ProjectRecord {
-            project_id: "p1".into(),
-            repo_id: None,
-            canonical_path: base_d.to_string_lossy().into_owned(),
-            registered_at: "2026-01-01".into(),
+        let projects = vec![CheckoutDiscoveryAccess {
+            checkout_root: &base_d,
+            project_root: &base_d,
             is_git_repo: true,
-            languages: Default::default(),
-            aliases: Default::default(),
         }];
         let found = discover_checkout_dirs(&projects);
         assert!(
@@ -652,14 +656,10 @@ mod tests {
         let root = temp.path().join("plain-project");
         std::fs::create_dir_all(&root).unwrap();
         let root = root.canonicalize().unwrap();
-        let project = ProjectRecord {
-            project_id: "plain".into(),
-            repo_id: None,
-            canonical_path: root.to_string_lossy().into_owned(),
-            registered_at: "2026-01-01T00:00:00Z".into(),
+        let project = CheckoutDiscoveryAccess {
+            checkout_root: &root,
+            project_root: &root,
             is_git_repo: false,
-            languages: Default::default(),
-            aliases: Default::default(),
         };
 
         let discovered = discover_checkout_dirs(&[project]);

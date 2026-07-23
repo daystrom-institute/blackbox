@@ -10,7 +10,8 @@ use tantivy::{IndexWriter, TantivyDocument};
 
 use super::{FieldHandles, FileMeta};
 use bbox_corpus_core::entity_ref::{EntityRef, PARSER_VERSION};
-use bbox_corpus_core::identity::PublishedScope;
+use bbox_corpus_core::identity::{PublishedScope, bbox_root_relpath, resolve_recorded_repo_id};
+use bbox_corpus_core::project_record::ProjectRecord;
 use bbox_knowledge::knowledge::{Knowledge, KnowledgeEntry, Status};
 use bbox_knowledge::overlay::{load_published_snapshot, published_scope_hash};
 
@@ -166,11 +167,93 @@ pub fn indexable_knowledge_entry(entry: &KnowledgeEntry) -> bool {
     matches!(entry.status, Status::Active | Status::Superseded)
 }
 
+/// Explicit, caller-authorized roots for one committed project knowledge
+/// generation. Config/Git resolution and snapshot loading are separate
+/// capabilities even when the v1 bridge resolves both to the same checkout.
+pub struct KnowledgeProjectAccess<'a> {
+    pub project: &'a ProjectRecord,
+    pub scope: &'a PublishedScope,
+    pub publisher_checkout_root: &'a Path,
+    pub publisher_project_root: &'a Path,
+    pub knowledge_project_root: &'a Path,
+}
+
+pub struct PreservedPublishedKnowledgeDocument {
+    pub scope_hash: String,
+    pub project_path: String,
+    pub document: TantivyDocument,
+}
+
+#[derive(Debug, Default)]
+pub struct PublisherRefPublicationBundle {
+    refs_path: Option<std::path::PathBuf>,
+    pins: Vec<crate::publisher::PublisherRefRow>,
+}
+
+impl PublisherRefPublicationBundle {
+    fn stage(&mut self, refs_path: &Path, pin: crate::publisher::PublisherRefRow) -> Result<()> {
+        if self
+            .refs_path
+            .as_ref()
+            .is_some_and(|existing| existing != refs_path)
+        {
+            anyhow::bail!("publisher-ref publication spans more than one durable store");
+        }
+        self.refs_path = Some(refs_path.to_path_buf());
+        if !self.pins.iter().any(|existing| existing == &pin) {
+            self.pins.push(pin);
+        }
+        Ok(())
+    }
+
+    pub fn publish(&mut self) -> Result<()> {
+        let Some(path) = self.refs_path.as_ref() else {
+            return Ok(());
+        };
+        let mut refs = crate::publisher::PublisherRefStore::open(path)?;
+        for pin in self.pins.drain(..) {
+            refs.persist_pin_candidate(&pin)?;
+        }
+        Ok(())
+    }
+}
+
 // executes inside the IndexWriterActor pass (sanctioned single-writer).
 #[allow(clippy::disallowed_methods)]
 pub fn reindex_knowledge_store_standalone(
     knowledge_path: &Path,
-    projects_path: &Path,
+    fields: FieldHandles,
+    writer: &mut IndexWriter,
+    meta: &mut HashMap<String, FileMeta>,
+) -> Result<u64> {
+    reindex_knowledge_store_with_access(
+        knowledge_path,
+        Path::new("publisher-refs.json"),
+        &[],
+        &[],
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+        &mut PublisherRefPublicationBundle::default(),
+        fields,
+        writer,
+        meta,
+    )
+}
+
+/// Rebuild central published knowledge plus every successfully authorized
+/// committed project scope. Existing scoped documents are supplied by the
+/// caller and retained for scopes that cannot be refreshed, preserving the
+/// last-good generation without reopening a registry path. A missing entry in
+/// `known_current_scope_hashes` means publisher authority was unavailable; a
+/// present `None` means the authorized project no longer publishes a scope.
+pub fn reindex_knowledge_store_with_access(
+    knowledge_path: &Path,
+    refs_path: &Path,
+    project_access: &[KnowledgeProjectAccess<'_>],
+    preserved_scoped: &[PreservedPublishedKnowledgeDocument],
+    current_project_paths: &BTreeSet<String>,
+    known_current_scope_hashes: &BTreeMap<String, Option<String>>,
+    publisher_ref_publication: &mut PublisherRefPublicationBundle,
     fields: FieldHandles,
     writer: &mut IndexWriter,
     meta: &mut HashMap<String, FileMeta>,
@@ -182,57 +265,19 @@ pub fn reindex_knowledge_store_standalone(
         fields.knowledge_visibility,
         "published",
     ));
-    // Central knowledge contributes globals and legacy, non-repo-owned
-    // projects. Registered project scopes are replaced below from their
-    // committed pinned publisher tree, never from working-tree bytes or a
-    // legacy central project copy.
     let knowledge = Knowledge::open(knowledge_path)?;
-    let projects =
-        crate::projects::ProjectRegistry::load_records(projects_path).unwrap_or_default();
-    // Before the migration cut, a registered project without recorded durable
-    // identity still publishes through its legacy central entry lane. Exclude
-    // only scopes whose committed publisher lane can replace those bytes. The
-    // cut gate separately guarantees that no legacy central entries remain, so
-    // this compatibility rule becomes inert after migration.
-    let managed_paths = projects
-        .iter()
-        .filter(|project| {
-            crate::publisher::project_published_scope(
-                project,
-                bbox_config::config::read_repo_id_inputs,
-            )
-            .is_some()
-        })
-        .map(|project| project.canonical_path.as_str())
-        .collect::<BTreeSet<_>>();
-    let mut documents = knowledge
-        .all_entries()
-        .iter()
-        .filter(|entry| {
-            !entry
-                .project
-                .as_deref()
-                .is_some_and(|project| managed_paths.contains(project))
-        })
-        .cloned()
-        .map(KnowledgeIndexDocument::published)
-        .collect::<Vec<_>>();
-
     let mut publishers = BTreeMap::<PublishedScope, Vec<_>>::new();
-    for project in &projects {
-        let Some(scope) = crate::publisher::project_published_scope(
-            project,
-            bbox_config::config::read_repo_id_inputs,
-        ) else {
-            continue;
-        };
-        publishers.entry(scope).or_default().push(project);
+    for access in project_access {
+        publishers
+            .entry(access.scope.clone())
+            .or_default()
+            .push(access);
     }
-    let refs_path = projects_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("publisher-refs.json");
-    let mut refs = crate::publisher::PublisherRefStore::open(refs_path)?;
+    let refs = (!publishers.is_empty())
+        .then(|| crate::publisher::PublisherRefStore::open(refs_path))
+        .transpose()?;
+    let mut refreshed_documents = Vec::new();
+    let mut refreshed_paths = BTreeSet::new();
     for (scope, claiming) in publishers {
         if claiming.len() != 1 {
             tracing::warn!(
@@ -242,16 +287,30 @@ pub fn reindex_knowledge_store_standalone(
             );
             continue;
         }
-        let project = claiming[0];
-        let root = Path::new(&project.canonical_path);
-        let pin = match refs.ensure_pinned(&scope, root) {
+        let access = claiming[0];
+        let project = access.project;
+        let pin = match refs
+            .as_ref()
+            .expect("publisher refs exist when project access is non-empty")
+            .pin_candidate(&scope, access.publisher_project_root)
+        {
             Ok(pin) => pin,
             Err(err) => {
                 tracing::warn!(scope = ?scope, error = %err, "knowledge reindex omitted unpinned scope");
                 continue;
             }
         };
-        let Some(commit) = bbox_corpus_core::git::resolve_commit(root, &pin.branch_ref) else {
+        if refs
+            .as_ref()
+            .expect("publisher refs exist when project access is non-empty")
+            .pinned(&scope)
+            .is_none()
+        {
+            publisher_ref_publication.stage(refs_path, pin.clone())?;
+        }
+        let Some(commit) =
+            bbox_corpus_core::git::resolve_commit(access.publisher_project_root, &pin.branch_ref)
+        else {
             tracing::warn!(
                 scope = ?scope,
                 published_ref = %pin.branch_ref,
@@ -259,7 +318,10 @@ pub fn reindex_knowledge_store_standalone(
             );
             continue;
         };
-        let pinned_inputs = match bbox_config::config::read_repo_id_inputs_at_ref(root, &commit) {
+        let pinned_inputs = match bbox_config::config::read_repo_id_inputs_at_ref(
+            access.publisher_project_root,
+            &commit,
+        ) {
             Ok(inputs) => inputs,
             Err(err) => {
                 tracing::warn!(
@@ -271,9 +333,17 @@ pub fn reindex_knowledge_store_standalone(
                 continue;
             }
         };
-        if crate::publisher::project_published_scope(project, |_| pinned_inputs.clone()).as_ref()
-            != Some(&scope)
-        {
+        let pinned_scope = resolve_recorded_repo_id(&pinned_inputs).and_then(|repo_id| {
+            bbox_root_relpath(
+                access.publisher_checkout_root,
+                access.publisher_project_root,
+            )
+            .map(|bbox_root_relpath| PublishedScope {
+                repo_id,
+                bbox_root_relpath,
+            })
+        });
+        if pinned_scope.as_ref() != Some(&scope) {
             tracing::warn!(
                 scope = ?scope,
                 published_ref = %pin.branch_ref,
@@ -282,7 +352,7 @@ pub fn reindex_knowledge_store_standalone(
             continue;
         }
         let published = match load_published_snapshot(
-            root,
+            access.knowledge_project_root,
             &commit,
             &scope,
             &project.canonical_path,
@@ -294,7 +364,8 @@ pub fn reindex_knowledge_store_standalone(
             }
         };
         let scope_hash = published_scope_hash(&scope);
-        documents.extend(published.entries.into_values().map(|published_entry| {
+        refreshed_paths.insert(project.canonical_path.clone());
+        refreshed_documents.extend(published.entries.into_values().map(|published_entry| {
             let logical_ref = knowledge_entity_id(&published_entry.entry.id);
             KnowledgeIndexDocument {
                 entity_id: logical_ref.clone(),
@@ -307,12 +378,47 @@ pub fn reindex_knowledge_store_standalone(
             }
         }));
     }
+    let retained_scoped = preserved_scoped
+        .iter()
+        .filter(|preserved| current_project_paths.contains(&preserved.project_path))
+        .filter(|preserved| !refreshed_paths.contains(&preserved.project_path))
+        .filter(
+            |preserved| match known_current_scope_hashes.get(&preserved.project_path) {
+                None => true,
+                Some(current) => current.as_deref() == Some(&preserved.scope_hash),
+            },
+        )
+        .collect::<Vec<_>>();
+    let retained_paths = retained_scoped
+        .iter()
+        .map(|preserved| preserved.project_path.as_str())
+        .collect::<BTreeSet<_>>();
+    // Exclude a legacy central copy when either a refreshed scoped generation
+    // or an authorized last-good scoped generation owns that project. Removed
+    // projects are absent from `current_project_paths`, so their old scoped
+    // documents are not retained indefinitely.
+    let documents = knowledge
+        .all_entries()
+        .iter()
+        .filter(|entry| {
+            !entry.project.as_deref().is_some_and(|project| {
+                refreshed_paths.contains(project) || retained_paths.contains(project)
+            })
+        })
+        .cloned()
+        .map(KnowledgeIndexDocument::published)
+        .chain(refreshed_documents)
+        .collect::<Vec<_>>();
     let mut docs = 0;
     for document in documents
         .iter()
         .filter(|document| indexable_knowledge_entry(&document.entry))
     {
         writer.add_document(build_knowledge_index_doc(document, knowledge_path, fields))?;
+        docs += 1;
+    }
+    for preserved in retained_scoped {
+        writer.add_document(preserved.document.clone())?;
         docs += 1;
     }
     match file_meta(knowledge_path) {
@@ -453,6 +559,180 @@ mod tests {
     }
 
     #[test]
+    fn denied_project_refresh_retains_supplied_last_good_scope_document() {
+        use tantivy::Index;
+        use tantivy::collector::Count;
+        use tantivy::query::TermQuery;
+        use tantivy::schema::IndexRecordOption;
+
+        let temp = tempfile::tempdir().unwrap();
+        let knowledge_path = temp.path().join("knowledge.json");
+        std::fs::write(
+            &knowledge_path,
+            serde_json::to_string(&bbox_knowledge::knowledge::KnowledgeStore {
+                version: 1,
+                built_from: Default::default(),
+                provenance: Default::default(),
+                entries: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let entry = KnowledgeEntry {
+            id: "lastgood".into(),
+            title: "retained generation".into(),
+            content: "LAST_GOOD_SCOPE".into(),
+            cluster: None,
+            variants: Default::default(),
+            category: Category::Convention,
+            scope: Scope::Project,
+            project: Some("/logical/project".into()),
+            providers: Vec::new(),
+            priority: Priority::Standard,
+            weight: 100,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            render: true,
+            decay: true,
+            review_at: None,
+            supersedes: None,
+            links: Vec::new(),
+            rationale: None,
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        };
+        std::fs::write(
+            &knowledge_path,
+            serde_json::to_string(&bbox_knowledge::knowledge::KnowledgeStore {
+                version: 1,
+                built_from: Default::default(),
+                provenance: Default::default(),
+                entries: vec![entry.clone()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let (schema, fields) = crate::index::build_schema();
+        let document = build_knowledge_index_doc(
+            &KnowledgeIndexDocument {
+                entity_id: knowledge_entity_id(&entry.id),
+                logical_ref: knowledge_entity_id(&entry.id),
+                entry,
+                visibility: "published".into(),
+                scope_hash: Some("scope-last-good".into()),
+                checkout_id: None,
+                snapshot_id: Some("commit-old".into()),
+            },
+            &knowledge_path,
+            fields,
+        );
+        let index = Index::create_in_ram(schema);
+        crate::index::register_code_tokenizer(&index);
+        let mut writer = index.writer(15_000_000).unwrap();
+        let preserved = vec![PreservedPublishedKnowledgeDocument {
+            scope_hash: "scope-last-good".into(),
+            project_path: "/logical/project".into(),
+            document,
+        }];
+        reindex_knowledge_store_with_access(
+            &knowledge_path,
+            &temp.path().join("publisher-refs.json"),
+            &[],
+            &preserved,
+            &BTreeSet::from(["/logical/project".into()]),
+            &BTreeMap::new(),
+            &mut PublisherRefPublicationBundle::default(),
+            fields,
+            &mut writer,
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        writer.commit().unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let query = TermQuery::new(
+            Term::from_field_text(fields.knowledge_scope_hash, "scope-last-good"),
+            IndexRecordOption::Basic,
+        );
+        assert_eq!(searcher.search(&query, &Count).unwrap(), 1);
+        let published = TermQuery::new(
+            Term::from_field_text(fields.knowledge_visibility, "published"),
+            IndexRecordOption::Basic,
+        );
+        assert_eq!(
+            searcher.search(&published, &Count).unwrap(),
+            1,
+            "retained scoped knowledge must replace, not duplicate, its central compatibility row"
+        );
+
+        let (schema, removed_fields) = crate::index::build_schema();
+        let removed_index = Index::create_in_ram(schema);
+        crate::index::register_code_tokenizer(&removed_index);
+        let mut removed_writer = removed_index.writer(15_000_000).unwrap();
+        reindex_knowledge_store_with_access(
+            &knowledge_path,
+            &temp.path().join("publisher-refs.json"),
+            &[],
+            &preserved,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &mut PublisherRefPublicationBundle::default(),
+            removed_fields,
+            &mut removed_writer,
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        removed_writer.commit().unwrap();
+        let removed_searcher = removed_index.reader().unwrap().searcher();
+        let removed_scope = TermQuery::new(
+            Term::from_field_text(removed_fields.knowledge_scope_hash, "scope-last-good"),
+            IndexRecordOption::Basic,
+        );
+        assert_eq!(removed_searcher.search(&removed_scope, &Count).unwrap(), 0);
+        let removed_published = TermQuery::new(
+            Term::from_field_text(removed_fields.knowledge_visibility, "published"),
+            IndexRecordOption::Basic,
+        );
+        assert_eq!(
+            removed_searcher.search(&removed_published, &Count).unwrap(),
+            1,
+            "a removed publisher drops its scoped generation without deleting an independent central row"
+        );
+
+        let (schema, changed_fields) = crate::index::build_schema();
+        let changed_index = Index::create_in_ram(schema);
+        crate::index::register_code_tokenizer(&changed_index);
+        let mut changed_writer = changed_index.writer(15_000_000).unwrap();
+        reindex_knowledge_store_with_access(
+            &knowledge_path,
+            &temp.path().join("publisher-refs.json"),
+            &[],
+            &preserved,
+            &BTreeSet::from(["/logical/project".into()]),
+            &BTreeMap::from([("/logical/project".into(), Some("scope-replaced".into()))]),
+            &mut PublisherRefPublicationBundle::default(),
+            changed_fields,
+            &mut changed_writer,
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        changed_writer.commit().unwrap();
+        let changed_searcher = changed_index.reader().unwrap().searcher();
+        let stale_scope = TermQuery::new(
+            Term::from_field_text(changed_fields.knowledge_scope_hash, "scope-last-good"),
+            IndexRecordOption::Basic,
+        );
+        assert_eq!(
+            changed_searcher.search(&stale_scope, &Count).unwrap(),
+            0,
+            "a known scope change must not retain the prior scoped generation"
+        );
+    }
+
+    #[test]
     fn reindex_includes_committed_project_bbox_entries() {
         use bbox_knowledge::knowledge::KnowledgeStore;
         use tantivy::Index;
@@ -533,29 +813,56 @@ mod tests {
         )
         .unwrap();
         let projects_path = central.path().join("projects.json");
-        {
+        let project = {
             let mut reg = crate::projects::ProjectRegistry::open(&projects_path).unwrap();
-            reg.register_path(&repo_root).unwrap();
+            let project = reg.register_path(&repo_root).unwrap();
             bbox_corpus_core::json_store::atomic_write_json_locked(
                 &projects_path,
                 &<crate::projects::ProjectRegistry as bbox_stores::store_persister::StoreSnapshot>::snapshot(&reg)
                     .unwrap(),
             )
             .unwrap();
-        }
+            project
+        };
+        let scope = PublishedScope {
+            repo_id: resolve_recorded_repo_id(&bbox_config::config::read_repo_id_inputs(
+                &repo_root,
+            ))
+            .unwrap(),
+            bbox_root_relpath: ".".into(),
+        };
 
         let (schema, fields) = crate::index::build_schema();
         let index = Index::create_in_ram(schema);
         let mut writer: IndexWriter = index.writer(15_000_000).unwrap();
         let mut meta = HashMap::new();
-        let docs = reindex_knowledge_store_standalone(
+        let refs_path = central.path().join("publisher-refs.json");
+        let mut publisher_ref_publication = PublisherRefPublicationBundle::default();
+        let docs = reindex_knowledge_store_with_access(
             &kb_path,
-            &projects_path,
+            &refs_path,
+            &[KnowledgeProjectAccess {
+                project: &project,
+                scope: &scope,
+                publisher_checkout_root: &repo_root,
+                publisher_project_root: &repo_root,
+                knowledge_project_root: &repo_root,
+            }],
+            &[],
+            &BTreeSet::from([project.canonical_path.clone()]),
+            &BTreeMap::new(),
+            &mut publisher_ref_publication,
             fields,
             &mut writer,
             &mut meta,
         )
         .unwrap();
+        assert!(
+            !refs_path.exists(),
+            "pin must remain staged until final authorized publication"
+        );
+        publisher_ref_publication.publish().unwrap();
+        assert!(refs_path.exists());
 
         assert_eq!(
             docs, 1,
@@ -628,7 +935,6 @@ mod tests {
         let mut writer: IndexWriter = index.writer(15_000_000).unwrap();
         let docs = reindex_knowledge_store_standalone(
             &knowledge_path,
-            &projects_path,
             fields,
             &mut writer,
             &mut HashMap::new(),

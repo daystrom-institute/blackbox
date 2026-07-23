@@ -33,6 +33,14 @@ pub struct ProvenanceProject {
 pub type LegacyTargetResolver<'a> =
     dyn Fn(&str, &Path, &Path, Option<(u64, u64)>) -> Result<Option<EntityRef>> + 'a;
 
+/// Checkout-derived provenance edges prepared entirely in memory. Callers
+/// must revalidate every lease used to build this value before publishing it
+/// to the durable edge sidecars.
+#[derive(Debug, Default)]
+pub struct PreparedProvenanceImport {
+    edges_by_project: BTreeMap<String, Vec<Edge>>,
+}
+
 pub fn export_provenance(edge_index: &EdgeIndex, projects: &[ProvenanceProject]) -> Result<String> {
     let project_map = project_map(projects);
     let mut grouped = BTreeMap::<(String, String), Vec<&Edge>>::new();
@@ -96,13 +104,13 @@ pub fn export_provenance(edge_index: &EdgeIndex, projects: &[ProvenanceProject])
     }))?)
 }
 
-pub fn import_provenance_to_edges_dir(
+/// Read and resolve Git-note provenance without mutating the edge store.
+pub fn prepare_provenance_import(
     projects: &[ProvenanceProject],
-    edges_dir: &Path,
     resolve_legacy_target: &LegacyTargetResolver<'_>,
-) -> Result<u64> {
+) -> Result<PreparedProvenanceImport> {
     let notes_ref = bbox_corpus_core::git::notes_ref("provenance");
-    let mut edges_imported = 0u64;
+    let mut prepared = PreparedProvenanceImport::default();
     for project in projects {
         let root = project.project_root.as_path();
         let notes = bbox_corpus_core::git::list_notes(root, &notes_ref).map_err(|_| {
@@ -126,18 +134,33 @@ pub fn import_provenance_to_edges_dir(
                 };
                 let edges =
                     edges_from_note(&project.project_id, root, &note, resolve_legacy_target)?;
-                edges_imported += bbox_edge_index::edge_index::append_explicit_edges(
-                    edges_dir,
-                    &project.project_id,
-                    &edges,
-                )
+                prepared
+                    .edges_by_project
+                    .entry(project.project_id.clone())
+                    .or_default()
+                    .extend(edges);
+            }
+        }
+    }
+    Ok(prepared)
+}
+
+/// Publish a previously prepared provenance import. The daemon calls this
+/// only while its publication guard remains held after final lease
+/// revalidation.
+pub fn publish_prepared_provenance_import(
+    prepared: PreparedProvenanceImport,
+    edges_dir: &Path,
+) -> Result<u64> {
+    let mut edges_imported = 0u64;
+    for (project_id, edges) in prepared.edges_by_project {
+        edges_imported +=
+            bbox_edge_index::edge_index::append_explicit_edges(edges_dir, &project_id, &edges)
                 .map_err(|_| {
                     anyhow::anyhow!(
                         "error.provenance_store_unavailable: imported provenance edges could not be persisted"
                     )
                 })? as u64;
-            }
-        }
     }
     Ok(edges_imported)
 }
@@ -289,6 +312,41 @@ mod tests {
             split_note_documents(&raw),
             vec!["{\"commit\":\"a\"}", "{\"commit\":\"b\"}"]
         );
+    }
+
+    #[test]
+    fn prepared_import_does_not_touch_sidecars_until_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let edge = Edge {
+            source: EntityRef::Transcript {
+                provider: "claude".into(),
+                session_id: "session-one".into(),
+                line_offset: 7,
+                event_idx: 0,
+            },
+            kind: "READ_FILE".into(),
+            target: EntityRef::ProjectFile {
+                project_id: "project-one".into(),
+                rel_path_hash: "path".into(),
+                chunk_hash: "a".repeat(64),
+                occurrence_idx: 0,
+            },
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Heuristic,
+            metadata: BTreeMap::new(),
+        };
+        let mut prepared = PreparedProvenanceImport::default();
+        prepared
+            .edges_by_project
+            .insert("project-one".into(), vec![edge]);
+
+        let sidecar = dir.path().join("project-one.jsonl");
+        assert!(!sidecar.exists());
+        assert_eq!(
+            publish_prepared_provenance_import(prepared, dir.path()).unwrap(),
+            1
+        );
+        assert!(sidecar.exists());
     }
 
     #[test]

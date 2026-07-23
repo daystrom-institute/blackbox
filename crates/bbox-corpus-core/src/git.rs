@@ -622,6 +622,39 @@ pub fn blame_for_line(file: &Path, line: u64) -> Result<Option<GitBlameLine>> {
     parse_blame_porcelain(&output.stdout, root, rel_path)
 }
 
+/// Run blame inside an already-authorized Git root. The relative path is
+/// lexical and cannot redirect Git into a different repository through a
+/// post-validation symlink swap.
+pub fn blame_for_line_in_root(
+    root: &Path,
+    relative_path: &Path,
+    line: u64,
+) -> Result<Option<GitBlameLine>> {
+    if line == 0 {
+        anyhow::bail!("line must be 1-based");
+    }
+    if relative_path.as_os_str().is_empty()
+        || relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        anyhow::bail!("blame path must be a non-empty safe relative path");
+    }
+    let rel_path = relative_path.to_string_lossy().replace('\\', "/");
+    let line_spec = format!("{line},{line}");
+    let output = git_output(
+        root,
+        &["blame", "--porcelain", "-L", &line_spec, "--", &rel_path],
+        "running git blame",
+    )
+    .with_context(|| format!("failed to execute git blame in {}", root.display()))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    parse_blame_porcelain(&output.stdout, root.to_path_buf(), rel_path)
+}
+
 pub fn parse_blame_porcelain(
     stdout: &[u8],
     root: PathBuf,

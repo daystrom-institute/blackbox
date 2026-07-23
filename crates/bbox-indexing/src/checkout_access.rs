@@ -8,10 +8,13 @@
 //! returning a lease. The broker deliberately has no dependency on the legacy
 //! `ProjectRecord` shape.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -23,6 +26,7 @@ use serde::{Deserialize, Serialize};
 
 const OBSERVATION_VERSION: u32 = 1;
 const MAX_ID_BYTES: usize = 256;
+const LIFECYCLE_MUTATION_BIT: usize = 1usize << (usize::BITS - 1);
 
 /// Closed set of operations permitted to obtain checkout filesystem authority.
 #[derive(
@@ -97,13 +101,15 @@ pub enum CheckoutAccessSourceLane {
     NativeAttachment,
     LegacyProjectRecord,
     LegacyCheckoutRegistry,
+    LegacyPathResolver,
 }
 
 impl CheckoutAccessSourceLane {
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 4] = [
         Self::NativeAttachment,
         Self::LegacyProjectRecord,
         Self::LegacyCheckoutRegistry,
+        Self::LegacyPathResolver,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -111,13 +117,14 @@ impl CheckoutAccessSourceLane {
             Self::NativeAttachment => "native_attachment",
             Self::LegacyProjectRecord => "legacy_project_record",
             Self::LegacyCheckoutRegistry => "legacy_checkout_registry",
+            Self::LegacyPathResolver => "legacy_path_resolver",
         }
     }
 
     pub const fn is_compatibility(self) -> bool {
         matches!(
             self,
-            Self::LegacyProjectRecord | Self::LegacyCheckoutRegistry
+            Self::LegacyProjectRecord | Self::LegacyCheckoutRegistry | Self::LegacyPathResolver
         )
     }
 }
@@ -130,6 +137,10 @@ pub enum CheckoutAttachmentSelector {
     Selected,
     AttachmentId(String),
     CheckoutId(String),
+    /// Phase-0 compatibility selector. The raw value is confined to the
+    /// authority request and is never recorded in observations or durable
+    /// corpus state. Later catalog phases delete this lane.
+    LegacyPath(String),
 }
 
 /// Complete request presented to the broker. `expected_scope = None` is valid
@@ -163,10 +174,59 @@ pub struct CheckoutAccessCandidate {
     pub attachment_id: String,
     pub checkout_id: String,
     pub published_scope: Option<PublishedScope>,
+    pub branch_ref: Option<String>,
     pub checkout_root: PathBuf,
     pub project_root: PathBuf,
     pub status: CheckoutAttachmentStatus,
     pub capabilities: BTreeSet<CheckoutAccessKind>,
+    pub lifetime_guard: Option<Arc<dyn CheckoutAccessLifetimeGuard>>,
+}
+
+/// Opaque mutation pin retained by write leases. It does not lock either
+/// registry or block read-side work. Lifecycle writers fail fast while a pin
+/// exists and may retry after the filesystem mutation completes.
+pub trait CheckoutAccessLifetimeGuard: fmt::Debug + Send + Sync + 'static {}
+
+#[derive(Debug)]
+struct ActiveCheckoutMutation {
+    state: Arc<AtomicUsize>,
+}
+
+impl CheckoutAccessLifetimeGuard for ActiveCheckoutMutation {}
+
+#[derive(Debug)]
+struct CombinedCheckoutAccessLifetimeGuards {
+    _guards: Vec<Arc<dyn CheckoutAccessLifetimeGuard>>,
+}
+
+impl CheckoutAccessLifetimeGuard for CombinedCheckoutAccessLifetimeGuards {}
+
+impl Drop for ActiveCheckoutMutation {
+    fn drop(&mut self) {
+        self.state.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Exclusive, fail-fast lifecycle token. Holding it prevents new write leases
+/// while a project or checkout attachment record is changed.
+#[derive(Debug)]
+pub struct CheckoutLifecycleMutationGuard {
+    state: Arc<AtomicUsize>,
+}
+
+impl Drop for CheckoutLifecycleMutationGuard {
+    fn drop(&mut self) {
+        self.state.store(0, Ordering::Release);
+    }
+}
+
+/// Short-lived publication fence acquired only after filesystem/Git
+/// preparation is complete. While it is alive, lifecycle mutations fail fast,
+/// closing the gap between final lease revalidation and publication without
+/// holding a registry lock across the expensive preparation phase.
+#[derive(Debug)]
+pub struct CheckoutPublicationGuard {
+    _pin: Arc<dyn CheckoutAccessLifetimeGuard>,
 }
 
 /// Adapter over the current host-local attachment authority. Phase 0 adapters
@@ -230,6 +290,7 @@ pub enum CheckoutAccessErrorCode {
     InvalidRoot,
     UnsafeRelativePath,
     WriteIntentRequired,
+    LifecycleBusy,
     DeniedByTestProbe,
     ObservationUnavailable,
 }
@@ -250,6 +311,7 @@ impl CheckoutAccessErrorCode {
             Self::InvalidRoot => "invalid_root",
             Self::UnsafeRelativePath => "unsafe_relative_path",
             Self::WriteIntentRequired => "write_intent_required",
+            Self::LifecycleBusy => "lifecycle_busy",
             Self::DeniedByTestProbe => "denied_by_test_probe",
             Self::ObservationUnavailable => "observation_unavailable",
         }
@@ -288,14 +350,19 @@ pub struct ValidatedCheckoutLease {
     attachment_id: String,
     checkout_id: String,
     published_scope: Option<PublishedScope>,
+    branch_ref: Option<String>,
     kind: CheckoutAccessKind,
     intent: CheckoutAccessIntent,
     source_lane: CheckoutAccessSourceLane,
     checkout_root: PathBuf,
     project_root: PathBuf,
+    checkout_root_handle: File,
+    project_root_handle: File,
+    _lifetime_guard: Option<Arc<dyn CheckoutAccessLifetimeGuard>>,
     acquisition_sequence: u64,
     attachment_selector: CheckoutAttachmentSelector,
     expected_scope: Option<PublishedScope>,
+    request_project_id: String,
 }
 
 impl ValidatedCheckoutLease {
@@ -313,6 +380,10 @@ impl ValidatedCheckoutLease {
 
     pub fn published_scope(&self) -> Option<&PublishedScope> {
         self.published_scope.as_ref()
+    }
+
+    pub fn branch_ref(&self) -> Option<&str> {
+        self.branch_ref.as_deref()
     }
 
     pub fn kind(&self) -> CheckoutAccessKind {
@@ -337,6 +408,52 @@ impl ValidatedCheckoutLease {
 
     pub fn acquisition_sequence(&self) -> u64 {
         self.acquisition_sequence
+    }
+
+    /// Read one regular file relative to the leased project root without
+    /// following symlinks in any relative component. The directory handle is
+    /// captured when the lease is acquired, closing the provider's former
+    /// canonicalize-then-open race.
+    pub fn read_relative_file(
+        &self,
+        relative: &Path,
+    ) -> std::result::Result<(PathBuf, Vec<u8>), CheckoutAccessError> {
+        let relative = validate_relative_path(relative)?;
+        let bytes = read_file_beneath(&self.project_root_handle, relative)?;
+        Ok((self.project_root.join(relative), bytes))
+    }
+
+    /// Capture every top-level JSON file in one relative directory through
+    /// the leased project-root descriptor. Directory replacement, symlinks,
+    /// entry churn, non-UTF-8 JSON names, and non-regular JSON entries fail
+    /// closed. A missing directory is the sole empty-snapshot case.
+    pub fn read_relative_json_directory(
+        &self,
+        relative: impl AsRef<Path>,
+    ) -> std::result::Result<BTreeMap<String, Vec<u8>>, CheckoutAccessError> {
+        let relative = validate_relative_path(relative.as_ref())?;
+        read_json_directory_beneath(&self.project_root_handle, relative)
+    }
+
+    /// Check one relative regular-file marker through the retained project
+    /// root descriptor. Missing is `false`; symlinks and non-regular entries
+    /// fail closed.
+    pub fn relative_regular_file_exists(
+        &self,
+        relative: impl AsRef<Path>,
+    ) -> std::result::Result<bool, CheckoutAccessError> {
+        let relative = validate_relative_path(relative.as_ref())?;
+        regular_file_exists_beneath(&self.project_root_handle, relative)
+    }
+
+    /// Checkout-root counterpart used for host-local transaction markers that
+    /// live above a nested project root.
+    pub fn checkout_relative_regular_file_exists(
+        &self,
+        relative: impl AsRef<Path>,
+    ) -> std::result::Result<bool, CheckoutAccessError> {
+        let relative = validate_relative_path(relative.as_ref())?;
+        regular_file_exists_beneath(&self.checkout_root_handle, relative)
     }
 
     /// Resolve an existing relative path and reject lexical or symlink escape.
@@ -416,12 +533,9 @@ impl ValidatedCheckoutLease {
 fn validate_relative_path(path: &Path) -> std::result::Result<&Path, CheckoutAccessError> {
     if path.as_os_str().is_empty()
         || path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
     {
         return Err(CheckoutAccessError::new(
             CheckoutAccessErrorCode::UnsafeRelativePath,
@@ -436,6 +550,7 @@ fn validate_relative_path(path: &Path) -> std::result::Result<&Path, CheckoutAcc
 pub struct CheckoutAccessBroker {
     authority: Arc<dyn CheckoutAccessAuthority>,
     observations: CheckoutAccessObservations,
+    lifecycle_state: Arc<AtomicUsize>,
 }
 
 impl CheckoutAccessBroker {
@@ -446,6 +561,7 @@ impl CheckoutAccessBroker {
         Self {
             authority,
             observations,
+            lifecycle_state: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -453,9 +569,128 @@ impl CheckoutAccessBroker {
         &self,
         request: CheckoutAccessRequest,
     ) -> std::result::Result<ValidatedCheckoutLease, CheckoutAccessError> {
-        let result = self.acquire_unobserved(&request);
+        let mutation_pin = match request.intent {
+            CheckoutAccessIntent::Read => None,
+            CheckoutAccessIntent::Write => match self.acquire_mutation_pin() {
+                Ok(pin) => Some(pin),
+                Err(error) => {
+                    self.observations
+                        .record(
+                            request.kind,
+                            request.source_lane,
+                            CheckoutAccessOutcome::Denied,
+                        )
+                        .map_err(observation_error)?;
+                    return Err(error);
+                }
+            },
+        };
+        let result = self.acquire_unobserved(&request).map(|mut candidate| {
+            candidate.lifetime_guard = match (candidate.lifetime_guard.take(), mutation_pin) {
+                (Some(authority), Some(mutation)) => {
+                    Some(Arc::new(CombinedCheckoutAccessLifetimeGuards {
+                        _guards: vec![authority, mutation],
+                    }))
+                }
+                (authority, mutation) => authority.or(mutation),
+            };
+            candidate
+        });
+        self.finish_acquire(request, result)
+    }
+
+    fn acquire_mutation_pin(
+        &self,
+    ) -> std::result::Result<Arc<dyn CheckoutAccessLifetimeGuard>, CheckoutAccessError> {
+        loop {
+            let current = self.lifecycle_state.load(Ordering::Acquire);
+            if current & LIFECYCLE_MUTATION_BIT != 0 {
+                return Err(CheckoutAccessError::new(
+                    CheckoutAccessErrorCode::LifecycleBusy,
+                    "checkout lifecycle mutation is in progress",
+                ));
+            }
+            let active = current & !LIFECYCLE_MUTATION_BIT;
+            if active == LIFECYCLE_MUTATION_BIT - 1 {
+                return Err(CheckoutAccessError::new(
+                    CheckoutAccessErrorCode::LifecycleBusy,
+                    "checkout mutation pin capacity is exhausted",
+                ));
+            }
+            if self
+                .lifecycle_state
+                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(Arc::new(ActiveCheckoutMutation {
+                    state: self.lifecycle_state.clone(),
+                }));
+            }
+        }
+    }
+
+    /// Acquire exclusive lifecycle authority without waiting for active
+    /// filesystem mutations. Callers retry or return the typed busy result.
+    pub fn lifecycle_mutation_guard(
+        &self,
+    ) -> std::result::Result<CheckoutLifecycleMutationGuard, CheckoutAccessError> {
+        self.lifecycle_state
+            .compare_exchange(
+                0,
+                LIFECYCLE_MUTATION_BIT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| CheckoutLifecycleMutationGuard {
+                state: self.lifecycle_state.clone(),
+            })
+            .map_err(|_| {
+                CheckoutAccessError::new(
+                    CheckoutAccessErrorCode::LifecycleBusy,
+                    "checkout filesystem mutation is in progress",
+                )
+            })
+    }
+
+    fn finish_acquire(
+        &self,
+        request: CheckoutAccessRequest,
+        result: std::result::Result<CheckoutAccessCandidate, CheckoutAccessError>,
+    ) -> std::result::Result<ValidatedCheckoutLease, CheckoutAccessError> {
         match result {
             Ok(candidate) => {
+                let checkout_root_handle = match File::open(&candidate.checkout_root) {
+                    Ok(handle) => handle,
+                    Err(_) => {
+                        self.observations
+                            .record(
+                                request.kind,
+                                request.source_lane,
+                                CheckoutAccessOutcome::Denied,
+                            )
+                            .map_err(observation_error)?;
+                        return Err(CheckoutAccessError::new(
+                            CheckoutAccessErrorCode::InvalidRoot,
+                            "validated checkout root could not be opened",
+                        ));
+                    }
+                };
+                let project_root_handle = match File::open(&candidate.project_root) {
+                    Ok(handle) => handle,
+                    Err(_) => {
+                        self.observations
+                            .record(
+                                request.kind,
+                                request.source_lane,
+                                CheckoutAccessOutcome::Denied,
+                            )
+                            .map_err(observation_error)?;
+                        return Err(CheckoutAccessError::new(
+                            CheckoutAccessErrorCode::InvalidRoot,
+                            "validated project root could not be opened",
+                        ));
+                    }
+                };
                 let sequence = self
                     .observations
                     .record(
@@ -469,14 +704,19 @@ impl CheckoutAccessBroker {
                     attachment_id: candidate.attachment_id,
                     checkout_id: candidate.checkout_id,
                     published_scope: candidate.published_scope,
+                    branch_ref: candidate.branch_ref,
                     kind: request.kind,
                     intent: request.intent,
                     source_lane: request.source_lane,
                     checkout_root: candidate.checkout_root,
                     project_root: candidate.project_root,
+                    checkout_root_handle,
+                    project_root_handle,
+                    _lifetime_guard: candidate.lifetime_guard,
                     acquisition_sequence: sequence,
                     attachment_selector: request.attachment,
                     expected_scope: request.expected_scope,
+                    request_project_id: request.project_id,
                 })
             }
             Err(error) => {
@@ -504,7 +744,7 @@ impl CheckoutAccessBroker {
         lease: &ValidatedCheckoutLease,
     ) -> std::result::Result<(), CheckoutAccessError> {
         let request = CheckoutAccessRequest {
-            project_id: lease.project_id.clone(),
+            project_id: lease.request_project_id.clone(),
             attachment: lease.attachment_selector.clone(),
             expected_scope: lease.expected_scope.clone(),
             kind: lease.kind,
@@ -516,6 +756,7 @@ impl CheckoutAccessBroker {
             || candidate.attachment_id != lease.attachment_id
             || candidate.checkout_id != lease.checkout_id
             || candidate.published_scope != lease.published_scope
+            || candidate.branch_ref != lease.branch_ref
             || candidate.checkout_root != lease.checkout_root
             || candidate.project_root != lease.project_root
         {
@@ -527,32 +768,57 @@ impl CheckoutAccessBroker {
         Ok(())
     }
 
+    /// Fence one final publication boundary. The lifecycle pin is acquired
+    /// before revalidation and retained by the returned guard, so an attachment
+    /// detach or relocation can happen either before this call (and invalidate
+    /// it) or after the caller drops the guard, never between validation and
+    /// publication.
+    pub fn publication_guard(
+        &self,
+        lease: &ValidatedCheckoutLease,
+    ) -> std::result::Result<CheckoutPublicationGuard, CheckoutAccessError> {
+        self.publication_guard_for(std::iter::once(lease))
+    }
+
+    /// Multi-lease form for one atomic derived publication. Every contributing
+    /// lease is revalidated while the same lifecycle pin is held.
+    pub fn publication_guard_for<'a>(
+        &self,
+        leases: impl IntoIterator<Item = &'a ValidatedCheckoutLease>,
+    ) -> std::result::Result<CheckoutPublicationGuard, CheckoutAccessError> {
+        let pin = self.acquire_mutation_pin()?;
+        let mut count = 0usize;
+        for lease in leases {
+            self.revalidate(lease)?;
+            count += 1;
+        }
+        if count == 0 {
+            return Err(CheckoutAccessError::new(
+                CheckoutAccessErrorCode::InvalidRequest,
+                "publication requires at least one checkout lease",
+            ));
+        }
+        Ok(CheckoutPublicationGuard { _pin: pin })
+    }
+
     fn acquire_unobserved(
         &self,
         request: &CheckoutAccessRequest,
     ) -> std::result::Result<CheckoutAccessCandidate, CheckoutAccessError> {
-        validate_id("project_id", &request.project_id)?;
-        match &request.attachment {
-            CheckoutAttachmentSelector::Selected => {}
-            CheckoutAttachmentSelector::AttachmentId(value) => {
-                validate_id("attachment_id", value)?;
-            }
-            CheckoutAttachmentSelector::CheckoutId(value) => {
-                validate_id("checkout_id", value)?;
-            }
-        }
-        if !request.kind.permits(request.intent) {
-            return Err(CheckoutAccessError::new(
-                CheckoutAccessErrorCode::IntentDenied,
-                "the requested access kind does not permit this intent",
-            ));
-        }
+        validate_request(request)?;
+        let candidate = self.authority.resolve(request)?;
+        self.validate_candidate_unobserved(request, candidate)
+    }
 
-        let mut candidate = self.authority.resolve(request)?;
+    fn validate_candidate_unobserved(
+        &self,
+        request: &CheckoutAccessRequest,
+        mut candidate: CheckoutAccessCandidate,
+    ) -> std::result::Result<CheckoutAccessCandidate, CheckoutAccessError> {
         validate_id("candidate project_id", &candidate.project_id)?;
         validate_id("candidate attachment_id", &candidate.attachment_id)?;
         validate_id("candidate checkout_id", &candidate.checkout_id)?;
-        if candidate.project_id != request.project_id {
+        if !request.project_id.is_empty() && candidate.project_id != request.project_id {
             return Err(CheckoutAccessError::new(
                 CheckoutAccessErrorCode::ProjectMismatch,
                 "the resolved attachment belongs to a different project",
@@ -576,6 +842,7 @@ impl CheckoutAccessBroker {
                     "the resolved attachment does not match the requested checkout id",
                 ));
             }
+            CheckoutAttachmentSelector::LegacyPath(_) => {}
             _ => {}
         }
         if candidate.status != CheckoutAttachmentStatus::Active {
@@ -584,10 +851,16 @@ impl CheckoutAccessBroker {
                 "the resolved attachment is not active",
             ));
         }
-        let scope_discovery = request.kind == CheckoutAccessKind::PublisherConfigTreeRead
+        let scope_discovery = (request.kind == CheckoutAccessKind::PublisherConfigTreeRead
             && request.expected_scope.is_none()
             && request.source_lane == CheckoutAccessSourceLane::LegacyProjectRecord
-            && matches!(&request.attachment, CheckoutAttachmentSelector::Selected);
+            && matches!(&request.attachment, CheckoutAttachmentSelector::Selected))
+            || (request.expected_scope.is_none()
+                && request.source_lane == CheckoutAccessSourceLane::LegacyPathResolver
+                && matches!(
+                    &request.attachment,
+                    CheckoutAttachmentSelector::LegacyPath(_)
+                ));
         if !scope_discovery && candidate.published_scope != request.expected_scope {
             return Err(CheckoutAccessError::new(
                 CheckoutAccessErrorCode::ScopeMismatch,
@@ -615,6 +888,331 @@ impl CheckoutAccessBroker {
             .revalidate_conservative_path_gate(request, &candidate)?;
         Ok(candidate)
     }
+}
+
+fn validate_request(
+    request: &CheckoutAccessRequest,
+) -> std::result::Result<(), CheckoutAccessError> {
+    match &request.attachment {
+        CheckoutAttachmentSelector::LegacyPath(value) => {
+            if !request.project_id.is_empty() {
+                validate_id("project_id", &request.project_id)?;
+            }
+            if value.trim().is_empty() || value.len() > 4096 || value.contains('\0') {
+                return Err(CheckoutAccessError::new(
+                    CheckoutAccessErrorCode::InvalidRequest,
+                    "legacy path selector must be a non-empty bounded value",
+                ));
+            }
+        }
+        CheckoutAttachmentSelector::Selected => {
+            validate_id("project_id", &request.project_id)?;
+        }
+        CheckoutAttachmentSelector::AttachmentId(value) => {
+            validate_id("project_id", &request.project_id)?;
+            validate_id("attachment_id", value)?;
+        }
+        CheckoutAttachmentSelector::CheckoutId(value) => {
+            validate_id("project_id", &request.project_id)?;
+            validate_id("checkout_id", value)?;
+        }
+    }
+    if !request.kind.permits(request.intent) {
+        return Err(CheckoutAccessError::new(
+            CheckoutAccessErrorCode::IntentDenied,
+            "the requested access kind does not permit this intent",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_file_beneath(
+    root: &File,
+    relative: &Path,
+) -> std::result::Result<Vec<u8>, CheckoutAccessError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let components = relative.components().collect::<Vec<_>>();
+    let mut directory = root.try_clone().map_err(file_read_error)?;
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            return Err(CheckoutAccessError::new(
+                CheckoutAccessErrorCode::UnsafeRelativePath,
+                "relative checkout path contains an unsafe component",
+            ));
+        };
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            CheckoutAccessError::new(
+                CheckoutAccessErrorCode::UnsafeRelativePath,
+                "relative checkout path contains a NUL byte",
+            )
+        })?;
+        let is_last = index + 1 == components.len();
+        let flags = if is_last {
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        } else {
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        };
+        // SAFETY: `directory` owns a live directory fd, `name` is NUL
+        // terminated, and a successful fd is immediately wrapped in `File`.
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(file_read_error(std::io::Error::last_os_error()));
+        }
+        // SAFETY: `openat` returned a new owned descriptor.
+        let mut opened = unsafe { File::from_raw_fd(fd) };
+        if is_last {
+            let metadata = opened.metadata().map_err(file_read_error)?;
+            if !metadata.is_file() {
+                return Err(CheckoutAccessError::new(
+                    CheckoutAccessErrorCode::UnsafeRelativePath,
+                    "relative checkout path does not name a regular file",
+                ));
+            }
+            let mut bytes = Vec::new();
+            opened.read_to_end(&mut bytes).map_err(file_read_error)?;
+            return Ok(bytes);
+        }
+        directory = opened;
+    }
+    Err(CheckoutAccessError::new(
+        CheckoutAccessErrorCode::UnsafeRelativePath,
+        "relative checkout path is empty",
+    ))
+}
+
+#[cfg(not(unix))]
+fn read_file_beneath(
+    _root: &File,
+    _relative: &Path,
+) -> std::result::Result<Vec<u8>, CheckoutAccessError> {
+    Err(CheckoutAccessError::new(
+        CheckoutAccessErrorCode::ConservativePathGateDenied,
+        "descriptor-relative checkout reads are unavailable on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn regular_file_exists_beneath(
+    root: &File,
+    relative: &Path,
+) -> std::result::Result<bool, CheckoutAccessError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let components = relative.components().collect::<Vec<_>>();
+    let mut directory = root.try_clone().map_err(file_read_error)?;
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            return Err(CheckoutAccessError::new(
+                CheckoutAccessErrorCode::UnsafeRelativePath,
+                "relative checkout marker contains an unsafe component",
+            ));
+        };
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            CheckoutAccessError::new(
+                CheckoutAccessErrorCode::UnsafeRelativePath,
+                "relative checkout marker contains a NUL byte",
+            )
+        })?;
+        let is_last = index + 1 == components.len();
+        let flags = if is_last {
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        } else {
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        };
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(false);
+            }
+            return Err(file_read_error(error));
+        }
+        let opened = unsafe { File::from_raw_fd(fd) };
+        if is_last {
+            if !opened.metadata().map_err(file_read_error)?.is_file() {
+                return Err(CheckoutAccessError::new(
+                    CheckoutAccessErrorCode::UnsafeRelativePath,
+                    "relative checkout marker is not a regular file",
+                ));
+            }
+            return Ok(true);
+        }
+        directory = opened;
+    }
+    Err(CheckoutAccessError::new(
+        CheckoutAccessErrorCode::UnsafeRelativePath,
+        "relative checkout marker is empty",
+    ))
+}
+
+#[cfg(not(unix))]
+fn regular_file_exists_beneath(
+    _root: &File,
+    _relative: &Path,
+) -> std::result::Result<bool, CheckoutAccessError> {
+    Err(CheckoutAccessError::new(
+        CheckoutAccessErrorCode::ConservativePathGateDenied,
+        "descriptor-relative checkout marker reads are unavailable on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn read_json_directory_beneath(
+    root: &File,
+    relative: &Path,
+) -> std::result::Result<BTreeMap<String, Vec<u8>>, CheckoutAccessError> {
+    use std::ffi::{CStr, CString};
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut directory = root.try_clone().map_err(file_read_error)?;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(CheckoutAccessError::new(
+                CheckoutAccessErrorCode::UnsafeRelativePath,
+                "relative checkout directory contains an unsafe component",
+            ));
+        };
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            CheckoutAccessError::new(
+                CheckoutAccessErrorCode::UnsafeRelativePath,
+                "relative checkout directory contains a NUL byte",
+            )
+        })?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(BTreeMap::new());
+            }
+            return Err(file_read_error(error));
+        }
+        directory = unsafe { File::from_raw_fd(fd) };
+    }
+
+    let raw_directory = directory.into_raw_fd();
+    let stream = unsafe { libc::fdopendir(raw_directory) };
+    if stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(raw_directory);
+        }
+        return Err(file_read_error(error));
+    }
+    struct DirectoryStream(*mut libc::DIR);
+    impl Drop for DirectoryStream {
+        fn drop(&mut self) {
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+    let stream = DirectoryStream(stream);
+    let directory_fd = unsafe { libc::dirfd(stream.0) };
+    if directory_fd < 0 {
+        return Err(file_read_error(std::io::Error::last_os_error()));
+    }
+
+    let mut files = BTreeMap::new();
+    loop {
+        unsafe {
+            *checkout_access_errno_location() = 0;
+        }
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error().is_some_and(|code| code != 0) {
+                return Err(file_read_error(error));
+            }
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let name_bytes = name.to_bytes();
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+        let filename = std::str::from_utf8(name_bytes).map_err(|_| {
+            CheckoutAccessError::new(
+                CheckoutAccessErrorCode::UnsafeRelativePath,
+                "checkout JSON directory contains a non-UTF-8 entry name",
+            )
+        })?;
+        if Path::new(filename)
+            .extension()
+            .and_then(|value| value.to_str())
+            != Some("json")
+        {
+            continue;
+        }
+        let filename_c = CString::new(name_bytes).map_err(|_| {
+            CheckoutAccessError::new(
+                CheckoutAccessErrorCode::UnsafeRelativePath,
+                "checkout JSON entry name contains a NUL byte",
+            )
+        })?;
+        let fd = unsafe {
+            libc::openat(
+                directory_fd,
+                filename_c.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(file_read_error(std::io::Error::last_os_error()));
+        }
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        if !file.metadata().map_err(file_read_error)?.is_file() {
+            return Err(CheckoutAccessError::new(
+                CheckoutAccessErrorCode::UnsafeRelativePath,
+                "checkout JSON entry is not a regular file",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(file_read_error)?;
+        files.insert(filename.to_owned(), bytes);
+    }
+    Ok(files)
+}
+
+#[cfg(all(unix, target_vendor = "apple"))]
+unsafe fn checkout_access_errno_location() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+unsafe fn checkout_access_errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(not(unix))]
+fn read_json_directory_beneath(
+    _root: &File,
+    _relative: &Path,
+) -> std::result::Result<BTreeMap<String, Vec<u8>>, CheckoutAccessError> {
+    Err(CheckoutAccessError::new(
+        CheckoutAccessErrorCode::ConservativePathGateDenied,
+        "descriptor-relative checkout directory reads are unavailable on this platform",
+    ))
+}
+
+fn file_read_error(error: std::io::Error) -> CheckoutAccessError {
+    CheckoutAccessError::new(
+        CheckoutAccessErrorCode::ConservativePathGateDenied,
+        format!("descriptor-relative checkout read failed: {error}"),
+    )
 }
 
 fn validate_id(field: &str, value: &str) -> std::result::Result<(), CheckoutAccessError> {
@@ -981,10 +1579,12 @@ mod tests {
                 attachment_id: "attachment-1".into(),
                 checkout_id: "checkout-1".into(),
                 published_scope: Some(scope()),
+                branch_ref: Some("refs/heads/main".into()),
                 checkout_root: root.to_path_buf(),
                 project_root: root.join("project"),
                 status: CheckoutAttachmentStatus::Active,
                 capabilities: BTreeSet::from([kind]),
+                lifetime_guard: None,
             },
             allow_gate: true,
         }
@@ -1024,6 +1624,152 @@ mod tests {
         assert_eq!(operation.granted, 1);
         assert_eq!(operation.denied, 0);
         assert!(operation.last_success_unix_secs.is_some());
+    }
+
+    #[test]
+    fn lease_captures_json_directory_through_retained_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = root.join("project");
+        let knowledge = project.join(".bbox/knowledge");
+        std::fs::create_dir_all(&knowledge).unwrap();
+        std::fs::write(knowledge.join("one.json"), br#"{"id":"one"}"#).unwrap();
+        std::fs::write(knowledge.join("ignored.txt"), b"ignored").unwrap();
+        let broker = CheckoutAccessBroker::new(
+            Arc::new(authority(
+                &root,
+                CheckoutAccessKind::KnowledgeGapOverlayRead,
+            )),
+            CheckoutAccessObservations::in_memory(),
+        );
+        let lease = broker
+            .acquire(request(
+                CheckoutAccessKind::KnowledgeGapOverlayRead,
+                CheckoutAccessIntent::Read,
+            ))
+            .unwrap();
+        let files = lease
+            .read_relative_json_directory(".bbox/knowledge")
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files.get("one.json").unwrap(), br#"{"id":"one"}"#);
+        assert!(
+            lease
+                .read_relative_json_directory(".bbox/gaps")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lease_json_directory_rejects_symlinked_json_entry() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = root.join("project");
+        let knowledge = project.join(".bbox/knowledge");
+        std::fs::create_dir_all(&knowledge).unwrap();
+        let outside = root.join("outside.json");
+        std::fs::write(&outside, b"{}").unwrap();
+        symlink(&outside, knowledge.join("escape.json")).unwrap();
+        let broker = CheckoutAccessBroker::new(
+            Arc::new(authority(
+                &root,
+                CheckoutAccessKind::KnowledgeGapOverlayRead,
+            )),
+            CheckoutAccessObservations::in_memory(),
+        );
+        let lease = broker
+            .acquire(request(
+                CheckoutAccessKind::KnowledgeGapOverlayRead,
+                CheckoutAccessIntent::Read,
+            ))
+            .unwrap();
+        assert_eq!(
+            lease
+                .read_relative_json_directory(".bbox/knowledge")
+                .unwrap_err()
+                .code,
+            CheckoutAccessErrorCode::ConservativePathGateDenied
+        );
+    }
+
+    #[test]
+    fn mutation_pin_and_lifecycle_change_exclude_each_other_without_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("project")).unwrap();
+        let broker = CheckoutAccessBroker::new(
+            Arc::new(authority(&root, CheckoutAccessKind::RepositoryMutation)),
+            CheckoutAccessObservations::in_memory(),
+        );
+        let mutation = broker
+            .acquire(request(
+                CheckoutAccessKind::RepositoryMutation,
+                CheckoutAccessIntent::Write,
+            ))
+            .unwrap();
+        assert_eq!(
+            broker.lifecycle_mutation_guard().unwrap_err().code,
+            CheckoutAccessErrorCode::LifecycleBusy
+        );
+        drop(mutation);
+
+        let lifecycle = broker.lifecycle_mutation_guard().unwrap();
+        assert_eq!(
+            broker
+                .acquire(request(
+                    CheckoutAccessKind::RepositoryMutation,
+                    CheckoutAccessIntent::Write,
+                ))
+                .unwrap_err()
+                .code,
+            CheckoutAccessErrorCode::LifecycleBusy
+        );
+        drop(lifecycle);
+
+        assert!(
+            broker
+                .acquire(request(
+                    CheckoutAccessKind::RepositoryMutation,
+                    CheckoutAccessIntent::Write,
+                ))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn publication_guard_closes_revalidate_to_publish_lifecycle_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("project")).unwrap();
+        let broker = CheckoutAccessBroker::new(
+            Arc::new(authority(&root, CheckoutAccessKind::LocalProjectWalk)),
+            CheckoutAccessObservations::in_memory(),
+        );
+        let lease = broker
+            .acquire(request(
+                CheckoutAccessKind::LocalProjectWalk,
+                CheckoutAccessIntent::Read,
+            ))
+            .unwrap();
+
+        let publication = broker.publication_guard(&lease).unwrap();
+        assert_eq!(
+            broker.lifecycle_mutation_guard().unwrap_err().code,
+            CheckoutAccessErrorCode::LifecycleBusy
+        );
+        drop(publication);
+
+        let lifecycle = broker.lifecycle_mutation_guard().unwrap();
+        assert_eq!(
+            broker.publication_guard(&lease).unwrap_err().code,
+            CheckoutAccessErrorCode::LifecycleBusy
+        );
+        drop(lifecycle);
+        assert!(broker.publication_guard(&lease).is_ok());
     }
 
     #[test]

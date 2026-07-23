@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::BufRead;
 use std::path::Path;
@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tantivy::collector::TopDocs;
+use tantivy::collector::{Count, TopDocs};
 use tantivy::query::{BooleanQuery, BoostQuery, Occur, QueryParser, TermQuery};
 use tantivy::schema::*;
 use tantivy::snippet::SnippetGenerator;
@@ -185,7 +185,10 @@ impl TranscriptIndex {
         let records =
             bbox_corpus_core::project_record::load_project_records(&self.config.projects_path)
                 .ok()?;
-        if let Some(record) = records.iter().find(|record| record.project_id == raw) {
+        if let Some(record) = records
+            .iter()
+            .find(|record| record.project_id == raw || record.canonical_path == raw)
+        {
             return Some(record.project_id.clone());
         }
         let mut aliased = records.iter().filter(|record| record.aliases.contains(raw));
@@ -193,8 +196,33 @@ impl TranscriptIndex {
             // Ambiguous alias claims fail closed to the substring lane.
             return aliased.next().is_none().then(|| record.project_id.clone());
         }
-        bbox_corpus_core::project_record::resolve_base_project_for_scope(raw, &records)
-            .map(|record| record.project_id.clone())
+        None
+    }
+
+    fn session_ids_for_base_project(&self, project_id: &str) -> Result<HashSet<String>> {
+        let searcher = self.reader.searcher();
+        let query = TermQuery::new(
+            Term::from_field_text(self.fields.base_project_id, project_id),
+            IndexRecordOption::Basic,
+        );
+        let count = searcher.search(&query, &Count)?;
+        if count == 0 {
+            return Ok(HashSet::new());
+        }
+        let mut sessions = HashSet::new();
+        for (_, address) in searcher.search(&query, &TopDocs::with_limit(count))? {
+            let document = searcher.doc::<TantivyDocument>(address)?;
+            if let Some(session_id) = document
+                .get_first(self.fields.session_id)
+                .and_then(|value| match value {
+                    OwnedValue::Str(value) => Some(value.clone()),
+                    _ => None,
+                })
+            {
+                sessions.insert(session_id);
+            }
+        }
+        Ok(sessions)
     }
 
     /// Project filter as an OR of the legacy substring lane (literal cwd in
@@ -1286,41 +1314,21 @@ impl TranscriptIndex {
         let limit = p.limit.unwrap_or(30).min(100) as usize;
         let offset = p.offset.unwrap_or(0) as usize;
 
-        // Base-project lane for the project filter (gap-72fd5932): sessions
-        // are listed from metadata files (not stamped index docs), so when
-        // the filter resolves to a registered project, each candidate
-        // session's cwd resolves through the same gate — memoized per
-        // distinct cwd, so the git probes are bounded by checkout count,
-        // not session count.
+        // Base-project lane for the project filter (gap-72fd5932): resolve
+        // candidate sessions from already-stamped transcript documents. This
+        // keeps list/search parity without reopening session cwd paths or
+        // probing Git from a read-only corpus query.
         let filter_base_id = project_filter.and_then(|pf| self.base_project_filter_id(pf));
-        let base_records = if filter_base_id.is_some() {
-            bbox_corpus_core::project_record::load_project_records(&self.config.projects_path)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let mut cwd_base_memo: HashMap<String, Option<String>> = HashMap::new();
-        let mut project_matches = |pf: &str, session_cwd: &str| -> bool {
+        let base_session_ids = filter_base_id
+            .as_deref()
+            .map(|project_id| self.session_ids_for_base_project(project_id))
+            .transpose()?
+            .unwrap_or_default();
+        let project_matches = |pf: &str, session_cwd: &str, session_id: &str| -> bool {
             if session_cwd.to_lowercase().contains(&pf.to_lowercase()) {
                 return true;
             }
-            let Some(filter_base) = filter_base_id.as_deref() else {
-                return false;
-            };
-            if session_cwd.is_empty() {
-                return false;
-            }
-            cwd_base_memo
-                .entry(session_cwd.to_string())
-                .or_insert_with(|| {
-                    bbox_corpus_core::project_record::resolve_base_project_for_scope(
-                        session_cwd,
-                        &base_records,
-                    )
-                    .map(|record| record.project_id.clone())
-                })
-                .as_deref()
-                == Some(filter_base)
+            filter_base_id.is_some() && base_session_ids.contains(session_id)
         };
 
         // Load session name maps
@@ -1366,8 +1374,9 @@ impl TranscriptIndex {
                 };
 
                 let project = v["project_path"].as_str().unwrap_or("").to_string();
+                let sid = v["session_id"].as_str().unwrap_or("").to_string();
                 if let Some(pf) = project_filter {
-                    if !project_matches(pf, &project) {
+                    if !project_matches(pf, &project, &sid) {
                         continue;
                     }
                 }
@@ -1384,8 +1393,6 @@ impl TranscriptIndex {
                 } else {
                     first_prompt
                 };
-
-                let sid = v["session_id"].as_str().unwrap_or("").to_string();
 
                 let name = claude_names.get(&sid).cloned().unwrap_or_default();
 
@@ -1429,7 +1436,7 @@ impl TranscriptIndex {
                         let project = cwd.as_deref().unwrap_or("");
 
                         if let Some(pf) = project_filter {
-                            if !project_matches(pf, project) {
+                            if !project_matches(pf, project, &session_id) {
                                 continue;
                             }
                         }
@@ -1646,8 +1653,24 @@ impl TranscriptIndex {
         let mut indexed_docs = 0u64;
         let mut skipped = 0u64;
         let f = self.fields;
-        let tool_edges =
-            crate::index::tool_edges::ToolEdgeContext::from_config(&self.config, !full)?;
+        let tool_edges = crate::index::tool_edges::ToolEdgeContext::with_project_access(
+            project_access
+                .iter()
+                .filter_map(|access| {
+                    access.local_root.map(|local_root| {
+                        crate::index::tool_edges::ToolEdgeProjectAccess {
+                            project: access.project.clone(),
+                            local_root: local_root.to_path_buf(),
+                            git_root: access.git_root.map(Path::to_path_buf),
+                        }
+                    })
+                })
+                .collect(),
+            bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
+                &self.config.projects_path,
+            ),
+            !full,
+        );
 
         index_transcripts_via_adapters(
             &self.config,
@@ -1723,6 +1746,7 @@ impl TranscriptIndex {
             purged += 1;
         }
 
+        tool_edges.publish_pending_edges()?;
         writer.commit()?;
         if full {
             writer.wait_merging_threads()?;

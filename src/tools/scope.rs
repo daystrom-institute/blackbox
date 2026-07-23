@@ -9,16 +9,18 @@
 //! store's interpretation identical (gap-de82a74d: bbox_learn and bbox_render
 //! disagreeing on scope made worktree-written entries unrenderable).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use bbox_corpus_core::identity::{PublishedScope, bbox_root_relpath, resolve_recorded_repo_id};
-use bbox_corpus_core::project_record::{ProjectRecord, ResolvedCheckoutScope};
+use bbox_corpus_core::project_record::ResolvedCheckoutScope;
+use bbox_indexing::checkout_access::{
+    CheckoutAccessErrorCode, CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest,
+    CheckoutAccessSourceLane, CheckoutAttachmentSelector,
+};
 
 use crate::server::BlackboxServer;
 
 pub(crate) struct ProjectWriteResolution {
     pub(crate) durable_scope: String,
-    pub(crate) write_dir: Option<String>,
     pub(crate) checkout_scope: Option<ResolvedCheckoutScope>,
 }
 
@@ -31,126 +33,89 @@ impl BlackboxServer {
     ///   files into the worktree checkout.
     /// - Other registered projects resolve through the registry to their
     ///   canonical path (`write_dir = None`).
-    /// - Unregistered paths fall back to filesystem canonicalization;
-    ///   non-path values (registry misses) pass through untouched.
-    // Blocking fs (canonicalize/git probes): call from run_blocking /
-    // spawn_blocking closures only, like the store mutations it scopes.
-    #[allow(clippy::disallowed_methods)]
+    /// - Unregistered selectors pass through untouched without filesystem
+    ///   probing outside checkout authority.
     pub(crate) fn resolve_project_write_scope(&self, raw: &str) -> (String, Option<String>) {
-        let projects = self.state.projects.read().list();
-        if let Some(context) = crate::projects::resolve_project_context(
-            raw,
-            &projects,
-            crate::projects::ResolveIntent::Write,
-        ) {
-            let record = select_scope_record(raw, &context, &projects).unwrap_or_else(|| {
-                projects
-                    .iter()
-                    .find(|project| project.project_id == context.project_id)
-                    .expect("resolved project context must name a registered project")
-            });
-            let write_dir = context.checkout.and_then(|checkout| {
-                let base_root = Path::new(&record.canonical_path);
-                let base_git_root = bbox_corpus_core::git::git_root_for_path(base_root)?;
-                let relpath = bbox_root_relpath(&base_git_root, base_root)?;
-                Some(
-                    join_repo_relpath(Path::new(&checkout.checkout_dir), &relpath)
-                        .to_string_lossy()
-                        .into_owned(),
-                )
-            });
-            return (record.canonical_path.clone(), write_dir);
-        }
-        let project = std::fs::canonicalize(raw)
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| raw.to_string());
-        (project, None)
+        self.resolve_project_write(raw)
+            .map(|resolution| {
+                let write_dir = resolution
+                    .checkout_scope
+                    .as_ref()
+                    .map(|checkout| checkout.checkout_project_dir.clone());
+                (resolution.durable_scope, write_dir)
+            })
+            .unwrap_or_else(|_| (raw.to_owned(), None))
     }
 
     /// Rich write resolution used by the dark provisional overlay. Existing
     /// store callers can keep the tuple wrapper above until their own overlay
     /// migration lands.
-    #[allow(clippy::disallowed_methods)]
     pub(crate) fn resolve_project_write(
         &self,
         raw: &str,
     ) -> anyhow::Result<ProjectWriteResolution> {
-        let projects = self.state.projects.read().list();
-        if let Some(ctx) = crate::projects::resolve_project_context(
-            raw,
-            &projects,
-            crate::projects::ResolveIntent::Write,
-        ) {
-            let record = select_scope_record(raw, &ctx, &projects).unwrap_or_else(|| {
-                projects
-                    .iter()
-                    .find(|p| p.project_id == ctx.project_id)
-                    .unwrap()
-            });
-            let base_project = Path::new(&record.canonical_path);
-            let base_git_root = bbox_corpus_core::git::git_root_for_path(base_project);
-            let checkout_dir = ctx
-                .checkout
-                .as_ref()
-                .map(|checkout| PathBuf::from(&checkout.checkout_dir))
-                .or_else(|| base_git_root.clone());
-            let relpath = base_git_root
-                .as_deref()
-                .and_then(|git_root| bbox_root_relpath(git_root, base_project));
-            let checkout_project_dir = checkout_dir.as_ref().map(|checkout| {
-                relpath
-                    .as_deref()
-                    .map(|relpath| join_repo_relpath(checkout, relpath))
-                    .unwrap_or_else(|| checkout.clone())
-            });
-            let write_dir = ctx.checkout.as_ref().and_then(|_| {
-                checkout_project_dir
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().into_owned())
-            });
-
-            let checkout_scope = match (base_git_root, checkout_dir, checkout_project_dir, relpath)
-            {
-                (Some(_), Some(checkout_dir), Some(checkout_project_dir), Some(relpath)) => {
-                    let inputs = crate::config::read_repo_id_inputs(base_project);
-                    let Some(repo_id) = resolve_recorded_repo_id(&inputs) else {
-                        return Ok(ProjectWriteResolution {
-                            durable_scope: record.canonical_path.clone(),
-                            write_dir,
-                            checkout_scope: None,
-                        });
-                    };
-                    let checkout_id =
-                        bbox_corpus_core::identity::ensure_checkout_id(&checkout_dir)?;
-                    let branch_ref = bbox_corpus_core::git::current_branch(&checkout_dir)
-                        .map(|branch| format!("refs/heads/{branch}"));
-                    Some(ResolvedCheckoutScope {
-                        project_id: record.project_id.clone(),
-                        published_scope: PublishedScope {
-                            repo_id,
-                            bbox_root_relpath: relpath,
-                        },
-                        checkout_id,
-                        checkout_dir: checkout_dir.to_string_lossy().into_owned(),
-                        checkout_project_dir: checkout_project_dir.to_string_lossy().into_owned(),
-                        branch_ref,
-                    })
-                }
-                _ => None,
-            };
-            return Ok(ProjectWriteResolution {
-                durable_scope: record.canonical_path.clone(),
-                write_dir,
-                checkout_scope,
-            });
+        let lease = match self.state.checkout_access.acquire(CheckoutAccessRequest {
+            project_id: String::new(),
+            attachment: CheckoutAttachmentSelector::LegacyPath(raw.to_owned()),
+            expected_scope: None,
+            kind: CheckoutAccessKind::RepositoryMutation,
+            intent: CheckoutAccessIntent::Write,
+            source_lane: CheckoutAccessSourceLane::LegacyPathResolver,
+        }) {
+            Ok(lease) => lease,
+            Err(error) if error.code == CheckoutAccessErrorCode::AttachmentNotFound => {
+                return Ok(ProjectWriteResolution {
+                    durable_scope: raw.to_owned(),
+                    checkout_scope: None,
+                });
+            }
+            Err(error) => return Err(anyhow::Error::new(error)),
+        };
+        let record = self
+            .state
+            .projects
+            .read()
+            .list()
+            .into_iter()
+            .find(|project| project.project_id == lease.project_id())
+            .ok_or_else(|| {
+                anyhow::anyhow!("validated checkout project disappeared from registry")
+            })?;
+        let checkout_scope =
+            lease
+                .published_scope()
+                .cloned()
+                .map(|published_scope| ResolvedCheckoutScope {
+                    project_id: lease.project_id().to_owned(),
+                    published_scope,
+                    checkout_id: lease.checkout_id().to_owned(),
+                    checkout_dir: lease.checkout_root().to_string_lossy().into_owned(),
+                    checkout_project_dir: lease.project_root().to_string_lossy().into_owned(),
+                    branch_ref: lease.branch_ref().map(str::to_owned),
+                });
+        self.state
+            .checkout_access
+            .revalidate(&lease)
+            .map_err(anyhow::Error::new)?;
+        if let Some(checkout) = checkout_scope.as_ref() {
+            // The write lease's mutation pin excludes detach/relocation while
+            // this row is materialized. Registering before the lease drops
+            // prevents callers from carrying an unfenced path descriptor into
+            // a later lifecycle mutation.
+            self.state.checkout_registry.write().register(
+                bbox_indexing::checkout_registry::CheckoutRow {
+                    project_id: Some(checkout.project_id.clone()),
+                    checkout_id: checkout.checkout_id.clone(),
+                    checkout_dir: checkout.checkout_dir.clone(),
+                    repo_id: Some(checkout.published_scope.repo_id.clone()),
+                    bbox_root_relpath: Some(checkout.published_scope.bbox_root_relpath.clone()),
+                    branch_ref: checkout.branch_ref.clone(),
+                },
+            )?;
         }
-        let project = std::fs::canonicalize(raw)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| raw.to_string());
         Ok(ProjectWriteResolution {
-            durable_scope: project,
-            write_dir: None,
-            checkout_scope: None,
+            durable_scope: record.canonical_path,
+            checkout_scope,
         })
     }
 
@@ -160,73 +125,29 @@ impl BlackboxServer {
     /// value). Substring filters and other non-path values pass through
     /// untouched, preserving each store's existing match semantics.
     pub(crate) fn rescope_project_filter_value(&self, raw: &str) -> Option<String> {
-        crate::projects::resolve_project_context(
-            raw,
-            &self.state.projects.read().list(),
-            crate::projects::ResolveIntent::Write,
-        )
-        .filter(|ctx| ctx.checkout.is_some())
-        .map(|ctx| ctx.host_root)
-    }
-}
-
-fn join_repo_relpath(checkout_dir: &Path, relpath: &str) -> PathBuf {
-    if relpath == "." {
-        checkout_dir.to_path_buf()
-    } else {
-        relpath
-            .split('/')
-            .fold(checkout_dir.to_path_buf(), |path, component| {
-                path.join(component)
+        let lease = self
+            .state
+            .checkout_access
+            .acquire(CheckoutAccessRequest {
+                project_id: String::new(),
+                attachment: CheckoutAttachmentSelector::LegacyPath(raw.to_owned()),
+                expected_scope: None,
+                kind: CheckoutAccessKind::KnowledgeGapOverlayRead,
+                intent: CheckoutAccessIntent::Read,
+                source_lane: CheckoutAccessSourceLane::LegacyPathResolver,
             })
+            .ok()?;
+        let record = self
+            .state
+            .projects
+            .read()
+            .list()
+            .into_iter()
+            .find(|project| project.project_id == lease.project_id())?;
+        let is_checkout_alias = lease.project_root() != Path::new(&record.canonical_path);
+        self.state.checkout_access.revalidate(&lease).ok()?;
+        is_checkout_alias.then_some(record.canonical_path)
     }
-}
-
-/// Correct the shared-common-dir resolver's first-match ambiguity for a
-/// monorepo by selecting the deepest registered bbox root containing the raw
-/// path inside this checkout.
-// Called only by resolve_project_write, whose contract requires a blocking
-// pool because it also performs git subprocess and filesystem probes.
-#[allow(clippy::disallowed_methods)]
-fn select_scope_record<'a>(
-    raw: &str,
-    context: &bbox_corpus_core::project_record::ProjectContext,
-    projects: &'a [ProjectRecord],
-) -> Option<&'a ProjectRecord> {
-    let checkout = context.checkout.as_ref()?;
-    let checkout_dir = Path::new(&checkout.checkout_dir);
-    let raw = std::fs::canonicalize(raw).ok()?;
-    let raw_rel = raw.strip_prefix(checkout_dir).ok()?;
-    let common = bbox_corpus_core::git::git_common_dir(checkout_dir)?;
-    let mut matches = projects
-        .iter()
-        .filter_map(|project| {
-            let project_root = Path::new(&project.canonical_path);
-            let project_git_root = bbox_corpus_core::git::git_root_for_path(project_root)?;
-            if bbox_corpus_core::git::git_common_dir(&project_git_root).as_ref() != Some(&common) {
-                return None;
-            }
-            let relpath = bbox_root_relpath(&project_git_root, project_root)?;
-            let rel = (relpath != ".").then(|| PathBuf::from(&relpath));
-            if rel.as_ref().is_some_and(|rel| !raw_rel.starts_with(rel)) {
-                return None;
-            }
-            let depth = rel
-                .as_ref()
-                .map(|rel| rel.components().count())
-                .unwrap_or(0);
-            Some((depth, project))
-        })
-        .collect::<Vec<_>>();
-    matches.sort_by_key(|(depth, _)| *depth);
-    let (depth, selected) = matches.pop()?;
-    if matches
-        .last()
-        .is_some_and(|(other_depth, _)| *other_depth == depth)
-    {
-        return None;
-    }
-    Some(selected)
 }
 
 #[cfg(test)]

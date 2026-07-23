@@ -5,46 +5,79 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 
-use super::{ReindexConfig, project_files};
+use super::project_files;
 use bbox_chunker::{EdgeConfidence, EdgeProvenance};
 use bbox_corpus_core::entity_ref::EntityRef;
-use bbox_corpus_core::project_record::{
-    ProjectRecord, load_project_records, resolve_base_project_for_scope,
-};
+use bbox_corpus_core::project_record::ProjectRecord;
 use bbox_edge_sidecar::edge_sidecar::Edge;
 use bro_transcript::{self as parser, ParsedEvent, ToolCallInfo, ToolCallKind};
 
 pub struct ToolEdgeContext {
-    projects: Vec<ProjectRecord>,
+    projects: Vec<ToolEdgeProjectAccess>,
     edges_dir: PathBuf,
     emit_sidecars: bool,
+    pending_edges: std::sync::Mutex<Vec<(String, Edge)>>,
     /// Session-cwd → resolved base project id memo (gap-72fd5932). Distinct
     /// cwds are few relative to session files, and resolution can git-probe,
     /// so memoize per reindex pass.
     base_project_cache: std::sync::Mutex<BTreeMap<String, Option<String>>>,
 }
 
+#[derive(Debug, Default)]
+pub struct ToolEdgePublishBundle {
+    edges_dir: PathBuf,
+    grouped: BTreeMap<String, Vec<Edge>>,
+}
+
+impl ToolEdgePublishBundle {
+    pub fn is_empty(&self) -> bool {
+        self.grouped.is_empty()
+    }
+
+    pub fn publish(self) -> Result<usize> {
+        let mut written = 0;
+        for (project_id, edges) in self.grouped {
+            bbox_edge_sidecar::edge_sidecar::append_observed_edges(
+                &self.edges_dir,
+                &project_id,
+                &edges,
+            )?;
+            written += edges.len();
+        }
+        Ok(written)
+    }
+}
+
+/// Filesystem authority already validated by the daemon/indexing boundary.
+/// This lower corpus crate may consume these roots, but it may not discover a
+/// checkout from `ProjectRecord::canonical_path` or probe an alternate
+/// worktree on its own.
+#[derive(Debug, Clone)]
+pub struct ToolEdgeProjectAccess {
+    pub project: ProjectRecord,
+    pub local_root: PathBuf,
+    pub git_root: Option<PathBuf>,
+}
+
 impl ToolEdgeContext {
-    pub fn from_config(config: &ReindexConfig, emit_sidecars: bool) -> Result<Self> {
-        Ok(Self {
-            projects: load_project_records(&config.projects_path)?,
-            edges_dir: bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
-                &config.projects_path,
-            ),
+    pub fn with_project_access(
+        projects: Vec<ToolEdgeProjectAccess>,
+        edges_dir: PathBuf,
+        emit_sidecars: bool,
+    ) -> Self {
+        Self {
+            projects,
+            edges_dir,
             emit_sidecars,
+            pending_edges: std::sync::Mutex::default(),
             base_project_cache: std::sync::Mutex::default(),
-        })
+        }
     }
 
     /// Single-project context for backfill use — restricts edge resolution
     /// to the given project so unrelated transcript paths are cheap to skip.
-    pub fn for_project(project: ProjectRecord, edges_dir: PathBuf) -> Self {
-        Self {
-            projects: vec![project],
-            edges_dir,
-            emit_sidecars: true,
-            base_project_cache: std::sync::Mutex::default(),
-        }
+    pub fn for_project_access(project: ToolEdgeProjectAccess, edges_dir: PathBuf) -> Self {
+        Self::with_project_access(vec![project], edges_dir, true)
     }
 
     /// Resolve a session cwd to the registered base project's id, memoized
@@ -61,8 +94,10 @@ impl ToolEdgeContext {
         if let Some(hit) = cache.get(cwd) {
             return hit.clone();
         }
-        let resolved = resolve_base_project_for_scope(cwd, &self.projects)
-            .map(|record| record.project_id.clone());
+        let resolved = fs::canonicalize(cwd)
+            .ok()
+            .and_then(|cwd| self.project_for_absolute_path(&cwd))
+            .map(|(access, _)| access.project.project_id.clone());
         cache.insert(cwd.to_string(), resolved.clone());
         resolved
     }
@@ -112,6 +147,31 @@ impl ToolEdgeContext {
         }
     }
 
+    /// Detach the observed edges accumulated during this pass into an explicit
+    /// final-publication bundle. The caller publishes it only while holding the
+    /// checkout publication guard that covers the contributing roots.
+    pub fn take_publish_bundle(&self) -> ToolEdgePublishBundle {
+        let mut pending = self
+            .pending_edges
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut grouped = BTreeMap::<String, Vec<Edge>>::new();
+        for (project_id, edge) in pending.drain(..) {
+            grouped.entry(project_id).or_default().push(edge);
+        }
+        ToolEdgePublishBundle {
+            edges_dir: self.edges_dir.clone(),
+            grouped,
+        }
+    }
+
+    /// Standalone lower-crate indexing has no checkout lease lifecycle. Daemon
+    /// callers use `take_publish_bundle` and publish under their authority
+    /// fence instead.
+    pub fn publish_pending_edges(&self) -> Result<usize> {
+        self.take_publish_bundle().publish()
+    }
+
     fn build_file_tool_edge(
         &self,
         event: &ParsedEvent,
@@ -123,8 +183,7 @@ impl ToolEdgeContext {
         let Some(raw_path) = parser::tool_call_file_path(tool_call) else {
             return Ok(None);
         };
-        let Some((project, root, absolute_path)) = self.resolve_project_path(event, raw_path)
-        else {
+        let Some((access, root, absolute_path)) = self.resolve_project_path(event, raw_path) else {
             tracing::debug!(
                 path = raw_path,
                 cwd = event.cwd.as_deref().unwrap_or(""),
@@ -141,7 +200,7 @@ impl ToolEdgeContext {
         };
         let byte_range = byte_range_for_tool(tool_call, &bytes);
         let Some(target) = project_files::resolve_current_chunk_entity(
-            project,
+            &access.project,
             &root,
             &absolute_path,
             byte_range,
@@ -173,8 +232,9 @@ impl ToolEdgeContext {
             metadata: anchor_metadata(
                 event,
                 tool_call,
-                project,
+                &access.project,
                 &root,
+                access.git_root.as_deref(),
                 &absolute_path,
                 byte_range,
                 &bytes,
@@ -190,7 +250,7 @@ impl ToolEdgeContext {
         event_idx: u32,
         tool_call: &ToolCallInfo,
     ) -> Result<Option<Edge>> {
-        let Some((project, _root)) = self.project_for_cwd(event) else {
+        let Some((access, _root)) = self.project_for_cwd(event) else {
             tracing::debug!(
                 cwd = event.cwd.as_deref().unwrap_or(""),
                 "skipping bash tool edge outside registered projects"
@@ -212,7 +272,7 @@ impl ToolEdgeContext {
             },
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Exact,
-            metadata: bash_metadata(event, tool_call, project, line_offset),
+            metadata: bash_metadata(event, tool_call, &access.project, line_offset),
         }))
     }
 
@@ -236,11 +296,10 @@ impl ToolEdgeContext {
             }
             _ => return Ok(0),
         };
-        bbox_edge_sidecar::edge_sidecar::append_observed_edges(
-            &self.edges_dir,
-            &project_id,
-            &[edge],
-        )?;
+        self.pending_edges
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((project_id, edge));
         Ok(1)
     }
 
@@ -252,7 +311,7 @@ impl ToolEdgeContext {
         event_idx: u32,
         tool_call: &ToolCallInfo,
     ) -> Result<usize> {
-        let Some((project, _root)) = self.project_for_cwd(event) else {
+        let Some((access, _root)) = self.project_for_cwd(event) else {
             tracing::debug!(
                 cwd = event.cwd.as_deref().unwrap_or(""),
                 "skipping bash tool edge outside registered projects"
@@ -274,13 +333,12 @@ impl ToolEdgeContext {
             },
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Exact,
-            metadata: bash_metadata(event, tool_call, project, line_offset),
+            metadata: bash_metadata(event, tool_call, &access.project, line_offset),
         };
-        bbox_edge_sidecar::edge_sidecar::append_observed_edges(
-            &self.edges_dir,
-            &project.project_id,
-            &[edge],
-        )?;
+        self.pending_edges
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((access.project.project_id.clone(), edge));
         Ok(1)
     }
 
@@ -290,7 +348,7 @@ impl ToolEdgeContext {
         &'a self,
         event: &ParsedEvent,
         raw_path: &str,
-    ) -> Option<(&'a ProjectRecord, PathBuf, PathBuf)> {
+    ) -> Option<(&'a ToolEdgeProjectAccess, PathBuf, PathBuf)> {
         let raw = Path::new(raw_path);
         let absolute = if raw.is_absolute() {
             raw.to_path_buf()
@@ -303,20 +361,24 @@ impl ToolEdgeContext {
         Some((project, root, absolute))
     }
 
-    fn project_for_cwd(&self, event: &ParsedEvent) -> Option<(&ProjectRecord, PathBuf)> {
+    fn project_for_cwd(&self, event: &ParsedEvent) -> Option<(&ToolEdgeProjectAccess, PathBuf)> {
         let cwd = event.cwd.as_deref()?;
         let cwd = fs::canonicalize(cwd).ok()?;
         self.project_for_absolute_path(&cwd)
     }
 
-    fn project_for_absolute_path(&self, absolute: &Path) -> Option<(&ProjectRecord, PathBuf)> {
+    fn project_for_absolute_path(
+        &self,
+        absolute: &Path,
+    ) -> Option<(&ToolEdgeProjectAccess, PathBuf)> {
         self.projects
             .iter()
-            .filter_map(|project| {
-                let root = fs::canonicalize(&project.canonical_path).ok()?;
-                absolute.starts_with(&root).then_some((project, root))
+            .filter_map(|access| {
+                absolute
+                    .starts_with(&access.local_root)
+                    .then_some((access, access.local_root.clone()))
             })
-            .max_by_key(|(_project, root)| root.as_os_str().len())
+            .max_by_key(|(_access, root)| root.as_os_str().len())
     }
 }
 
@@ -325,6 +387,7 @@ fn anchor_metadata(
     tool_call: &ToolCallInfo,
     project: &ProjectRecord,
     root: &Path,
+    git_root: Option<&Path>,
     absolute_path: &Path,
     byte_range: Option<(u64, u64)>,
     bytes: &[u8],
@@ -341,7 +404,7 @@ fn anchor_metadata(
         metadata.insert("anchor.byte_end".to_string(), end.to_string());
     }
     metadata.insert("anchor.content_hash_at_edit".to_string(), sha256_hex(bytes));
-    if let Some(commit_sha) = bbox_corpus_core::git::current_head(root) {
+    if let Some(commit_sha) = git_root.and_then(bbox_corpus_core::git::current_head) {
         metadata.insert("anchor.commit_sha_at_edit".to_string(), commit_sha);
     }
     metadata.insert(
@@ -475,6 +538,7 @@ mod tests {
             projects: Vec::new(),
             edges_dir: dir.path().to_path_buf(),
             emit_sidecars: false,
+            pending_edges: Default::default(),
             base_project_cache: Default::default(),
         };
         let event = ParsedEvent {
@@ -509,5 +573,65 @@ mod tests {
                 "unexpected turn collision at synthetic event {idx}"
             );
         }
+    }
+
+    #[test]
+    fn explicit_local_root_works_with_bogus_record_path_and_without_git_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let source = root.join("src.rs");
+        fs::write(&source, "pub fn visible() {}\n").unwrap();
+        let project = ProjectRecord {
+            project_id: "project-1".into(),
+            repo_id: None,
+            canonical_path: "/unavailable/not-authority".into(),
+            registered_at: "2026-01-01T00:00:00Z".into(),
+            is_git_repo: true,
+            languages: Default::default(),
+            aliases: Default::default(),
+        };
+        let ctx = ToolEdgeContext::with_project_access(
+            vec![ToolEdgeProjectAccess {
+                project,
+                local_root: root.clone(),
+                git_root: None,
+            }],
+            root.join("edges"),
+            true,
+        );
+        let event = ParsedEvent {
+            role: MessageRole::ToolUse,
+            content: String::new(),
+            session_id: "sess-1".into(),
+            timestamp: None,
+            git_branch: None,
+            is_subagent: false,
+            agent_slug: None,
+            cwd: Some(root.to_string_lossy().into_owned()),
+            tool_call: Some(ToolCallInfo {
+                kind: ToolCallKind::Read,
+                name: "Read".into(),
+                tool_use_id: None,
+                input: json!({"file_path": source}),
+            }),
+        };
+
+        let edge = ctx
+            .build_event_edges(&event, "claude", 10, 0)
+            .unwrap()
+            .expect("authorized local root resolves the file");
+        assert_eq!(edge.metadata["anchor.file_path"], "src.rs");
+        assert!(!edge.metadata.contains_key("anchor.commit_sha_at_edit"));
+
+        assert_eq!(ctx.emit_event_edges(&event, "claude", 10, 0).unwrap(), 1);
+        let observed = root.join("edges").join("project-1.jsonl");
+        assert!(
+            !observed.exists(),
+            "observed edges must remain staged before final publication"
+        );
+        let publication = ctx.take_publish_bundle();
+        assert!(!publication.is_empty());
+        publication.publish().unwrap();
+        assert!(observed.exists());
     }
 }

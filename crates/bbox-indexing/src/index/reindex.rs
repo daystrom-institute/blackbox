@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -12,7 +11,7 @@ use tantivy::{Index, IndexWriter, TantivyDocument};
 use super::knowledge_docs;
 pub use super::passes::*;
 use super::project_files;
-use super::tool_edges::ToolEdgeContext;
+use super::tool_edges::{ToolEdgeContext, ToolEdgeProjectAccess};
 use super::writer_actor::IndexWriterActor;
 use super::{FieldHandles, FileMetaSource, ReindexConfig};
 use crate::checkout_access::CheckoutAccessBroker;
@@ -40,7 +39,12 @@ pub(super) fn needs_reindex(
     checkout_access: &Arc<CheckoutAccessBroker>,
 ) -> Result<bool> {
     let meta = load_meta(&config.meta_path).unwrap_or_default();
-    let leased = super::writer_actor::acquire_project_leases(config, projects, checkout_access)?;
+    let leased = super::writer_actor::acquire_project_leases(
+        config,
+        projects,
+        checkout_access,
+        super::writer_actor::ProjectLeasePurpose::SpeculativeScan,
+    )?;
     let lower = leased
         .iter()
         .map(|project| project.lower())
@@ -49,6 +53,14 @@ pub(super) fn needs_reindex(
     files.extend(project_files::scan_project_files_with_access(
         config, &lower,
     )?);
+    for access in &leased {
+        if access.git.is_none() && access.git_denial.is_some() {
+            let source_key = super::git_history::git_source_key(&access.project.project_id);
+            if let Some(previous) = meta.get(&source_key) {
+                files.push((source_key, previous.mtime, previous.size));
+            }
+        }
+    }
     super::writer_actor::revalidate_project_leases(checkout_access, &leased)?;
     let current_paths: std::collections::HashSet<&str> =
         files.iter().map(|(p, _, _)| p.as_str()).collect();
@@ -155,7 +167,13 @@ pub(super) fn execute_reindex_pass(
     } else {
         Vec::new()
     };
-    let leased = super::writer_actor::acquire_project_leases(config, projects, checkout_access)?;
+    let preserved_published_knowledge = collect_scoped_published_knowledge(index, fields)?;
+    let leased = super::writer_actor::acquire_project_leases(
+        config,
+        projects,
+        checkout_access,
+        super::writer_actor::ProjectLeasePurpose::Reindex,
+    )?;
     for access in &leased {
         if let Some(error) = &access.local_denial {
             tracing::warn!(
@@ -171,7 +189,46 @@ pub(super) fn execute_reindex_pass(
                 "GitHistory unavailable during project reindex"
             );
         }
+        if let Some(error) = &access.publisher_config_denial {
+            tracing::warn!(
+                project_id = %access.project.project_id,
+                error_code = %error.split(':').next().unwrap_or("checkout_access_denied"),
+                "PublisherConfigTreeRead unavailable; retaining last-good published knowledge"
+            );
+        }
+        if let Some(error) = &access.knowledge_overlay_denial {
+            tracing::warn!(
+                project_id = %access.project.project_id,
+                error_code = %error.split(':').next().unwrap_or("checkout_access_denied"),
+                "KnowledgeGapOverlayRead unavailable; retaining last-good published knowledge"
+            );
+        }
     }
+    let unavailable_record_projects = leased
+        .iter()
+        .filter(|access| access.local.is_none())
+        .map(|access| access.project.canonical_path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let unavailable_git_projects = leased
+        .iter()
+        .filter(|access| access.git.is_none() && access.git_denial.is_some())
+        .map(|access| access.project.canonical_path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let unavailable_git_ids = leased
+        .iter()
+        .filter(|access| access.git.is_none() && access.git_denial.is_some())
+        .map(|access| access.project.project_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let preserved_record_documents = if full {
+        collect_unavailable_project_record_documents(index, fields, &unavailable_record_projects)?
+    } else {
+        Vec::new()
+    };
+    let preserved_git_documents = if full {
+        collect_unavailable_git_documents(index, fields, &unavailable_git_projects)?
+    } else {
+        Vec::new()
+    };
     let project_access = leased
         .iter()
         .map(|project| project.lower())
@@ -205,6 +262,12 @@ pub(super) fn execute_reindex_pass(
         for document in preserved_unavailable {
             writer.add_document(document)?;
         }
+        for document in preserved_record_documents {
+            writer.add_document(document)?;
+        }
+        for document in preserved_git_documents {
+            writer.add_document(document)?;
+        }
         // Don't commit yet — let the rebuild work and the trailing
         // writer.commit() atomically commit delete+adds together.
         // If we commit delete now and a later step fails, the index
@@ -217,7 +280,9 @@ pub(super) fn execute_reindex_pass(
                     &row.source,
                     FileMetaSource::LocalProjectFile { project_id, .. }
                         if unavailable_local.contains(project_id)
-                )
+                ) || _path
+                    .strip_prefix("git:")
+                    .is_some_and(|project_id| unavailable_git_ids.contains(project_id))
             })
             .collect()
     } else {
@@ -228,7 +293,23 @@ pub(super) fn execute_reindex_pass(
     let mut indexed_files = 0u64;
     let mut indexed_docs = 0u64;
     let mut skipped = 0u64;
-    let tool_edges = ToolEdgeContext::from_config(config, !full)?;
+    let tool_edges = ToolEdgeContext::with_project_access(
+        leased
+            .iter()
+            .filter_map(|access| {
+                access.local.as_ref().map(|local| ToolEdgeProjectAccess {
+                    project: access.project.clone(),
+                    local_root: local.project_root().to_path_buf(),
+                    git_root: access
+                        .git
+                        .as_ref()
+                        .map(|git| git.checkout_root().to_path_buf()),
+                })
+            })
+            .collect(),
+        edges_dir.clone(),
+        !full,
+    );
 
     let transcript_phase = Instant::now();
     index_transcripts_via_adapters(
@@ -254,7 +335,7 @@ pub(super) fn execute_reindex_pass(
     drain(writer);
 
     let project_phase = Instant::now();
-    let project_stats = project_files::index_projects_with_access(
+    let mut project_stats = project_files::index_projects_with_access(
         config,
         &project_access,
         fields,
@@ -289,9 +370,52 @@ pub(super) fn execute_reindex_pass(
     drain(writer);
 
     let stores_phase = Instant::now();
-    let knowledge_docs = knowledge_docs::reindex_knowledge_store_standalone(
+    let knowledge_access = leased
+        .iter()
+        .filter_map(|access| {
+            let publisher = access.publisher_config.as_ref()?;
+            let overlay = access.knowledge_overlay.as_ref()?;
+            let scope = publisher.published_scope()?;
+            Some(knowledge_docs::KnowledgeProjectAccess {
+                project: &access.project,
+                scope,
+                publisher_checkout_root: publisher.checkout_root(),
+                publisher_project_root: publisher.project_root(),
+                knowledge_project_root: overlay.project_root(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let publisher_refs_path = config
+        .projects_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("publisher-refs.json");
+    let current_knowledge_projects = leased
+        .iter()
+        .map(|access| access.project.canonical_path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let known_current_knowledge_scopes = leased
+        .iter()
+        .filter_map(|access| {
+            access.publisher_config.as_ref().map(|publisher| {
+                (
+                    access.project.canonical_path.clone(),
+                    publisher
+                        .published_scope()
+                        .map(bbox_knowledge::overlay::published_scope_hash),
+                )
+            })
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut publisher_ref_publication = knowledge_docs::PublisherRefPublicationBundle::default();
+    let knowledge_docs = knowledge_docs::reindex_knowledge_store_with_access(
         &config.knowledge_path,
-        &config.projects_path,
+        &publisher_refs_path,
+        &knowledge_access,
+        &preserved_published_knowledge,
+        &current_knowledge_projects,
+        &known_current_knowledge_scopes,
+        &mut publisher_ref_publication,
         fields,
         &mut *writer,
         &mut meta,
@@ -310,8 +434,20 @@ pub(super) fn execute_reindex_pass(
         indexed_files += 1;
         indexed_docs += thread_docs;
     }
-    let record_docs = super::thread_docs::reindex_project_records_standalone(
-        &config.projects_path,
+    let record_access = leased
+        .iter()
+        .filter_map(|access| {
+            access
+                .local
+                .as_ref()
+                .map(|local| super::thread_docs::ProjectRecordAccess {
+                    project: &access.project,
+                    root: local.project_root(),
+                })
+        })
+        .collect::<Vec<_>>();
+    let record_docs = super::thread_docs::reindex_project_records_with_access(
+        &record_access,
         &config.threads_path,
         fields,
         &mut *writer,
@@ -343,6 +479,12 @@ pub(super) fn execute_reindex_pass(
         config,
         &project_access,
     )?);
+    for project_id in &unavailable_git_ids {
+        let source_key = super::git_history::git_source_key(project_id);
+        if let Some(previous) = meta.get(&source_key) {
+            current_files.push((source_key, previous.mtime, previous.size));
+        }
+    }
     let current_paths: std::collections::HashSet<String> =
         current_files.iter().map(|(p, _, _)| p.clone()).collect();
     let mut purged = 0u64;
@@ -383,31 +525,43 @@ pub(super) fn execute_reindex_pass(
     // A dirty-triggered pass must still commit even when no *tracked* source
     // file changed: the knowledge reindex above may have deleted/re-added repo
     // entries (e.g. a deleted `.bbox/knowledge` file) whose delete_term must
-    // land. Only short-circuit when nothing triggered us. (Drained small ops
-    // still need a commit, but the actor commits its own batches; an op that
-    // landed in this no-op pass commits with the actor's next cycle or the
-    // pass's caller — never lost, reconciled by the next triggered pass.)
-    if !full
+    // land. Remember the no-change outcome for the summary, but still flow
+    // through the one guarded commit path so drained ops and authority checks
+    // can never be bypassed.
+    let no_changes = !full
         && indexed_files == 0
         && purged == 0
         && !dirty
         && project_stats.pending_local_snapshots.is_empty()
-    {
-        let summary = "auto-reindex: no changes after re-check".to_string();
-        tracing::debug!("{}", summary);
-        // Commit anyway when ops were drained into this writer mid-pass;
-        // detecting that precisely isn't worth the bookkeeping — an empty
-        // commit is cheap and keeps drained ops from straddling passes.
-        writer.commit()?;
-        return Ok(summary);
-    }
+        && project_stats.publication.is_empty();
 
     // 5. Commit + atomic meta/edge-view publication. The durable journal is
     // written before the Tantivy commit, and each project gets a marker in
     // that same commit. Startup can therefore tell whether it must finish the
     // manifest switch or discard an uncommitted journal.
     let commit_phase = Instant::now();
-    super::writer_actor::revalidate_project_leases(checkout_access, &leased)?;
+    let lease_refs = leased
+        .iter()
+        .flat_map(|access| {
+            [
+                access.publisher_config.as_ref(),
+                access.knowledge_overlay.as_ref(),
+                access.local.as_ref(),
+                access.git.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+        })
+        .collect::<Vec<_>>();
+    let _publication_guard = if lease_refs.is_empty() {
+        None
+    } else {
+        Some(checkout_access.publication_guard_for(lease_refs)?)
+    };
+    publisher_ref_publication.publish()?;
+    let tool_edge_publication = tool_edges.take_publish_bundle();
+    project_stats.pending_local_snapshots = project_stats.publication.publish()?;
+    tool_edge_publication.publish()?;
     let pending_journal = if project_stats.pending_local_snapshots.is_empty() {
         None
     } else {
@@ -442,6 +596,12 @@ pub(super) fn execute_reindex_pass(
         "auto-reindex: commit phase complete"
     );
 
+    if no_changes {
+        let summary = "auto-reindex: no changes after re-check".to_string();
+        tracing::debug!("{}", summary);
+        return Ok(summary);
+    }
+
     let segments = segment_count(index);
     let summary = format!(
         "auto-reindex: indexed {indexed_files} files ({indexed_docs} docs), skipped {skipped} unchanged, purged {purged} deleted, segments {segments}"
@@ -469,6 +629,108 @@ fn collect_provisional_documents(
         .into_iter()
         .map(|(_, address)| searcher.doc::<TantivyDocument>(address).map_err(Into::into))
         .collect()
+}
+
+fn collect_scoped_published_knowledge(
+    index: &Index,
+    fields: FieldHandles,
+) -> Result<Vec<knowledge_docs::PreservedPublishedKnowledgeDocument>> {
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let query = TermQuery::new(
+        Term::from_field_text(fields.knowledge_visibility, "published"),
+        IndexRecordOption::Basic,
+    );
+    let count = searcher.search(&query, &Count)?;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut documents = Vec::new();
+    for (_, address) in searcher.search(&query, &TopDocs::with_limit(count))? {
+        let document = searcher.doc::<TantivyDocument>(address)?;
+        let scope_hash =
+            document
+                .get_all(fields.knowledge_scope_hash)
+                .find_map(|value| match value {
+                    tantivy::schema::OwnedValue::Str(value) if !value.is_empty() => {
+                        Some(value.clone())
+                    }
+                    _ => None,
+                });
+        if let Some(scope_hash) = scope_hash {
+            documents.push(knowledge_docs::PreservedPublishedKnowledgeDocument {
+                scope_hash,
+                project_path: first_document_text(&document, fields.project),
+                document,
+            });
+        }
+    }
+    Ok(documents)
+}
+
+fn collect_unavailable_project_record_documents(
+    index: &Index,
+    fields: FieldHandles,
+    unavailable_projects: &std::collections::BTreeSet<String>,
+) -> Result<Vec<TantivyDocument>> {
+    if unavailable_projects.is_empty() {
+        return Ok(Vec::new());
+    }
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let query = TermQuery::new(
+        Term::from_field_text(fields.doc_type, "thread"),
+        IndexRecordOption::Basic,
+    );
+    let count = searcher.search(&query, &Count)?;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut documents = Vec::new();
+    for (_, address) in searcher.search(&query, &TopDocs::with_limit(count))? {
+        let document = searcher.doc::<TantivyDocument>(address)?;
+        let project = first_document_text(&document, fields.project);
+        let file_path = first_document_text(&document, fields.file_path);
+        if unavailable_projects.contains(project.as_str()) && file_path.contains("/.bbox/record/") {
+            documents.push(document);
+        }
+    }
+    Ok(documents)
+}
+
+fn collect_unavailable_git_documents(
+    index: &Index,
+    fields: FieldHandles,
+    unavailable_projects: &std::collections::BTreeSet<String>,
+) -> Result<Vec<TantivyDocument>> {
+    if unavailable_projects.is_empty() {
+        return Ok(Vec::new());
+    }
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let query = TermQuery::new(
+        Term::from_field_text(fields.doc_type, "commit"),
+        IndexRecordOption::Basic,
+    );
+    let count = searcher.search(&query, &Count)?;
+    let mut documents = Vec::new();
+    for (_, address) in searcher.search(&query, &TopDocs::with_limit(count))? {
+        let document = searcher.doc::<TantivyDocument>(address)?;
+        if unavailable_projects.contains(first_document_text(&document, fields.project).as_str()) {
+            documents.push(document);
+        }
+    }
+    Ok(documents)
+}
+
+fn first_document_text(document: &TantivyDocument, field: tantivy::schema::Field) -> String {
+    document
+        .get_all(field)
+        .find_map(|value| match value {
+            tantivy::schema::OwnedValue::Str(value) => Some(value.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 /// Spawn the background reindex thread. Runs every `interval` seconds.
@@ -526,13 +788,23 @@ pub fn spawn_reindex_thread(
 ///
 /// Idempotent: uses `append_edges_dedup` so re-running produces no duplicates.
 /// Returns the number of new edges written.
-pub fn backfill_tool_edges_for_project(
+pub fn backfill_tool_edges_for_project<G>(
     config: &ReindexConfig,
     project: &ProjectRecord,
+    local_root: &std::path::Path,
+    git_root: Option<&std::path::Path>,
+    publication_guard: impl FnOnce() -> Result<G>,
 ) -> Result<usize> {
     let edges_dir =
         bbox_edge_index::edge_index::edges_dir_from_projects_path(&config.projects_path);
-    let ctx = ToolEdgeContext::for_project(project.clone(), edges_dir.clone());
+    let ctx = ToolEdgeContext::for_project_access(
+        ToolEdgeProjectAccess {
+            project: project.clone(),
+            local_root: local_root.to_path_buf(),
+            git_root: git_root.map(std::path::Path::to_path_buf),
+        },
+        edges_dir.clone(),
+    );
     let registry = TranscriptAdapterRegistry::from_reindex_config(config);
     let mut collected: Vec<bbox_edge_index::edge_index::Edge> = Vec::new();
 
@@ -579,6 +851,7 @@ pub fn backfill_tool_edges_for_project(
         }
     }
 
+    let _publication_guard = publication_guard()?;
     if collected.is_empty() {
         return Ok(0);
     }
@@ -589,6 +862,8 @@ pub fn backfill_tool_edges_for_project(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use tantivy::schema::Field;
 
     use super::*;
@@ -600,6 +875,37 @@ mod tests {
     use bro_core::Provider;
     use bro_transcript::{MessageRole, ParsedEvent};
     use tantivy::TantivyDocument;
+
+    #[test]
+    fn full_rebuild_preserves_only_git_documents_for_denied_projects() {
+        let (schema, fields) = crate::index::build_schema();
+        let index = Index::create_in_ram(schema);
+        crate::index::register_code_tokenizer(&index);
+        let mut writer = index.writer(15_000_000).unwrap();
+        for (project, entity) in [
+            ("/projects/denied", "commit:denied"),
+            ("/projects/available", "commit:available"),
+        ] {
+            let mut document = TantivyDocument::new();
+            document.add_text(fields.doc_type, "commit");
+            document.add_text(fields.project, project);
+            document.add_text(fields.entity_id, entity);
+            writer.add_document(document).unwrap();
+        }
+        writer.commit().unwrap();
+
+        let preserved = collect_unavailable_git_documents(
+            &index,
+            fields,
+            &std::collections::BTreeSet::from(["/projects/denied".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(
+            first_document_text(&preserved[0], fields.entity_id),
+            "commit:denied"
+        );
+    }
 
     #[test]
     fn transcript_docs_include_doc_type_and_parser_version() {
@@ -699,7 +1005,11 @@ mod tests {
         let mut writer = index.writer(50_000_000).unwrap();
         let mut meta = HashMap::new();
         let (mut files, mut docs, mut skipped) = (0u64, 0u64, 0u64);
-        let tool_edges = ToolEdgeContext::from_config(&config, false).unwrap();
+        let tool_edges = ToolEdgeContext::with_project_access(
+            Vec::new(),
+            bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&config.projects_path),
+            false,
+        );
 
         index_transcripts_via_adapters(
             &config,

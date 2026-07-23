@@ -132,7 +132,7 @@ mod tests {
         let files = ValidatedFileInputs::from([(
             "docs/design.md".into(),
             FileInputResolution::Validated(ValidatedFileInput {
-                file_path: file_path.clone(),
+                bytes: std::fs::metadata(&file_path).unwrap().len(),
             }),
         )]);
         let out = ref_size_with_validated_files(
@@ -172,7 +172,9 @@ mod tests {
         let files = ValidatedFileInputs::from([(
             "scripts/guard.py".into(),
             FileInputResolution::Validated(ValidatedFileInput {
-                file_path: worktree.path().join("scripts/guard.py"),
+                bytes: std::fs::metadata(worktree.path().join("scripts/guard.py"))
+                    .unwrap()
+                    .len(),
             }),
         )]);
         let out = ref_size_with_validated_files(

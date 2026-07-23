@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use rmcp::schemars;
@@ -42,7 +42,9 @@ pub enum BlameTargetIdentity {
 /// caller retains that lease for the complete blame operation.
 #[derive(Debug, Clone)]
 pub struct ValidatedBlameTarget {
-    pub file_path: PathBuf,
+    pub git_root: PathBuf,
+    pub git_relative_path: PathBuf,
+    pub content: Vec<u8>,
     pub display_path: String,
     pub line: Option<u64>,
     pub byte_offset: Option<u64>,
@@ -95,19 +97,24 @@ pub fn target_identity(p: &BlameParams, ctx: &ProviderContext<'_>) -> Result<Bla
 pub fn blame(target: ValidatedBlameTarget, edge_index: &EdgeIndex) -> Result<String> {
     let line = match target.line {
         Some(line) => line,
-        None => line_for_byte_offset(&target.file_path, target.byte_offset.unwrap_or_default())?,
+        None => line_for_byte_offset(&target.content, target.byte_offset.unwrap_or_default()),
     };
     let target = BlameTarget {
-        file_path: target.file_path,
+        git_root: target.git_root,
+        git_relative_path: target.git_relative_path,
         display_path: target.display_path,
         line,
     };
-    let blame =
-        bbox_corpus_core::git::blame_for_line(&target.file_path, target.line).map_err(|_| {
-            anyhow::anyhow!(
-                "error.checkout_io_failed: git blame could not read the validated checkout file"
-            )
-        })?;
+    let blame = bbox_corpus_core::git::blame_for_line_in_root(
+        &target.git_root,
+        &target.git_relative_path,
+        target.line,
+    )
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "error.checkout_io_failed: git blame could not read the validated checkout file"
+        )
+    })?;
     let Some(blame) = blame else {
         return Ok(serde_json::to_string_pretty(&json!({
             "status": "error.not_found",
@@ -166,19 +173,15 @@ pub fn blame(target: ValidatedBlameTarget, edge_index: &EdgeIndex) -> Result<Str
 }
 
 struct BlameTarget {
-    file_path: PathBuf,
+    git_root: PathBuf,
+    git_relative_path: PathBuf,
     display_path: String,
     line: u64,
 }
 
-fn line_for_byte_offset(path: &Path, byte_offset: u64) -> Result<u64> {
-    let bytes = std::fs::read(path).map_err(|_| {
-        anyhow::anyhow!(
-            "error.checkout_io_failed: validated checkout file could not be read for line resolution"
-        )
-    })?;
+fn line_for_byte_offset(bytes: &[u8], byte_offset: u64) -> u64 {
     let upto = (byte_offset as usize).min(bytes.len());
-    Ok(bytes[..upto].iter().filter(|byte| **byte == b'\n').count() as u64 + 1)
+    bytes[..upto].iter().filter(|byte| **byte == b'\n').count() as u64 + 1
 }
 
 fn matching_anchors<'a>(

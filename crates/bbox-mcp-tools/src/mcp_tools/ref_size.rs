@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
 use rmcp::schemars;
@@ -29,7 +27,7 @@ pub struct RefSizeParams {
 /// This lower layer deliberately has no project registry or checkout authority.
 #[derive(Debug, Clone)]
 pub struct ValidatedFileInput {
-    pub file_path: PathBuf,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -152,10 +150,7 @@ fn size_file_ref(path: &str, validated_files: &ValidatedFileInputs) -> Result<(u
         FileInputResolution::Validated(input) => input,
         FileInputResolution::Rejected(error) => return Err(anyhow!(error.clone())),
     };
-    let content = fs::read(&input.file_path).map_err(|_| {
-        anyhow!("error.checkout_io_failed: validated checkout file could not be read")
-    })?;
-    Ok((content.len() as u64, "file_content"))
+    Ok((input.bytes, "file_content"))
 }
 
 fn byte_len(value: &str) -> u64 {

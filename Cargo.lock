@@ -586,6 +586,7 @@ dependencies = [
  "bro-transcript",
  "fs2",
  "hex",
+ "libc",
  "parking_lot",
  "rmcp",
  "schemars 0.8.22",
@@ -715,6 +716,7 @@ dependencies = [
  "bbox-whiteboards",
  "parking_lot",
  "tantivy",
+ "tempfile",
 ]
 
 [[package]]

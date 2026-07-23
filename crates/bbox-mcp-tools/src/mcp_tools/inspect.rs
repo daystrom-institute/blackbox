@@ -139,6 +139,9 @@ pub fn inspect_entity(
     let provider = providers::provider_for(r.entity_type());
     let mut entity = match entity_loader::load(ctx, r) {
         Ok(entity) => entity,
+        Err(error) if error.to_string().starts_with("error.checkout_access.") => {
+            return Err(error);
+        }
         Err(_) => return Ok(not_found(r, similar_refs(edge_index, r))),
     };
     let full_neighborhood = full_neighborhood(edge_index, r);

@@ -27,8 +27,14 @@ impl BlackboxServer {
         let checkout = resolution.checkout_scope;
         let write_dir = checkout
             .as_ref()
-            .map(|checkout| checkout.checkout_project_dir.clone())
-            .or(resolution.write_dir);
+            .map(|checkout| {
+                crate::server::repo_io::RepoIoAuthority::gap_checkout_carrier(
+                    durable_scope.clone(),
+                    checkout,
+                )
+                .map(|carrier| carrier.carrier_id)
+            })
+            .transpose()?;
         if self.path_fallback_is_cut() && checkout.is_none() {
             anyhow::bail!(
                 "path-scoped project fallback is retired; project gap writes require a registered checkout with recorded repo identity"
@@ -162,7 +168,11 @@ impl BlackboxServer {
                 "built_from": &built_from,
                 "diagnostics": &view.diagnostics,
             });
-            let mut rendered = view.gaps.list_rendered(&p)?;
+            let mut rendered = if p.json.unwrap_or(false) {
+                serde_json::to_string_pretty(&structured)?
+            } else {
+                view.gaps.list_rendered(&p)?
+            };
             if !p.json.unwrap_or(false) {
                 if !view.diagnostics.is_empty() {
                     rendered.push_str("\n\nProvisional gap diagnostics:\n- ");
@@ -309,6 +319,9 @@ mod tests {
         std::fs::write(dir.join("README.md"), "base").unwrap();
         run_git(dir, &["add", "."]);
         run_git(dir, &["commit", "-m", "init"]);
+        crate::config::ensure_recorded_repo_id(dir).unwrap();
+        run_git(dir, &["add", ".bbox/config.toml"]);
+        run_git(dir, &["commit", "-m", "record project identity"]);
         dir.canonicalize().unwrap()
     }
 
@@ -325,18 +338,26 @@ mod tests {
             .write()
             .register_path(base_canon)
             .unwrap();
+        let projects = server.state.projects.read().list();
+        let repo_io = std::sync::Arc::new(crate::server::repo_io::RepoIoAuthority::new(
+            server.state.checkout_access.clone(),
+        ));
+        server
+            .state
+            .gaps
+            .write()
+            .configure_repo_io(
+                repo_io.clone(),
+                repo_io,
+                crate::server::repo_io::RepoIoAuthority::gap_base_carriers(&projects).unwrap(),
+            )
+            .unwrap();
         let filed = server
             .bbox_gap(Parameters(gap_params(
                 base_canon.to_string_lossy().into_owned(),
             )))
             .await;
         assert_ne!(filed.is_error, Some(true), "bbox_gap failed: {filed:?}");
-        server
-            .state
-            .gaps
-            .write()
-            .set_project_roots(vec![base_canon.clone()])
-            .unwrap();
         let id = server.state.gaps.read().all().first().unwrap().id.clone();
         (server, id)
     }
@@ -730,6 +751,7 @@ mod tests {
             .expect("gap overlay published");
         let id = snapshot.values.keys().next().unwrap().clone();
         server.set_session_checkout_for_test(
+            row.project_id.clone().expect("checkout row project id"),
             scope,
             row.checkout_id.clone(),
             worktree_canon.clone(),
@@ -816,5 +838,22 @@ mod tests {
             .as_str()
             .expect("row stamp reference");
         assert!(structured["built_from"].get(reference).is_some());
+
+        let json_list = server.bbox_gaps(Parameters(GapListParams {
+            project: Some(worktree_canon.to_string_lossy().into_owned()),
+            provisional: Some("own".into()),
+            include_addressed: Some(true),
+            json: Some(true),
+            ..Default::default()
+        }));
+        assert_ne!(
+            json_list.is_error,
+            Some(true),
+            "json list failed: {json_list:?}"
+        );
+        let json_body = format!("{:?}", json_list.content);
+        assert!(json_body.contains("built_from_ref"), "{json_body}");
+        assert!(json_body.contains("built_from"), "{json_body}");
+        assert!(json_body.contains(reference), "{json_body}");
     }
 }

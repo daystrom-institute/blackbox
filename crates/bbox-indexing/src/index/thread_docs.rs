@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
 use tantivy::{IndexWriter, TantivyDocument, Term};
 
 use super::{FieldHandles, FileMeta};
+use crate::projects::ProjectRecord;
+#[cfg(test)]
 use crate::projects::ProjectRegistry;
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_threads::threads::{Thread, ThreadRecord, Threads};
@@ -109,12 +111,12 @@ fn build_thread_doc(thread: &Thread, threads_path: &Path, f: FieldHandles) -> Ta
     doc
 }
 
-fn record_content(record: &ThreadRecord, project_dir: &Path) -> String {
+fn record_content(record: &ThreadRecord, project: &str) -> String {
     let mut fields = vec![
         "entity: thread".to_string(),
         format!("thread_id: {}", record.id),
         format!("topic: {}", record.topic),
-        format!("project: {}", project_dir.display()),
+        format!("project: {project}"),
         format!("status: {}", record.status.as_ref()),
     ];
     if let Some(kind) = record.kind {
@@ -134,11 +136,11 @@ fn record_content(record: &ThreadRecord, project_dir: &Path) -> String {
 
 fn build_record_doc(
     record: &ThreadRecord,
-    project_dir: &Path,
+    project: &str,
     record_path: &Path,
     f: FieldHandles,
 ) -> TantivyDocument {
-    let content = record_content(record, project_dir);
+    let content = record_content(record, project);
     let mut doc = TantivyDocument::new();
     // Indexed as a `thread` so a committed record is found exactly like the
     // live thread it snapshots (same entity_id); on a clone it is the only copy.
@@ -150,17 +152,12 @@ fn build_record_doc(
     doc.add_text(f.content, &content);
     doc.add_text(f.entity_id, thread_entity_id(&record.id));
     doc.add_text(f.account, "blackbox");
-    doc.add_text(f.project, project_dir.to_string_lossy());
+    doc.add_text(f.project, project);
     doc.add_text(f.role, "thread");
     doc.add_text(f.file_path, record_path.to_string_lossy());
     doc.add_text(
         f.path_tokens,
-        format!(
-            "thread {} {} {}",
-            record.id,
-            record.topic,
-            project_dir.display()
-        ),
+        format!("thread {} {} {}", record.id, record.topic, project),
     );
     doc.add_text(f.chunk_kind, "thread");
     doc.add_text(f.symbol, &record.topic);
@@ -174,8 +171,13 @@ fn build_record_doc(
 /// investigations are searchable on a clone where the live thread store doesn't
 /// carry them. Deduped against the live thread store by id — on the origin
 /// machine the live thread is already indexed, so its record is skipped.
-pub fn reindex_project_records_standalone(
-    projects_path: &Path,
+pub struct ProjectRecordAccess<'a> {
+    pub project: &'a ProjectRecord,
+    pub root: &'a Path,
+}
+
+pub fn reindex_project_records_with_access(
+    projects: &[ProjectRecordAccess<'_>],
     threads_path: &Path,
     f: FieldHandles,
     writer: &mut IndexWriter,
@@ -189,13 +191,9 @@ pub fn reindex_project_records_standalone(
     } else {
         HashSet::new()
     };
-    let roots: Vec<PathBuf> = ProjectRegistry::load_records(projects_path)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| PathBuf::from(r.canonical_path))
-        .collect();
     let mut docs = 0u64;
-    for root in &roots {
+    for access in projects {
+        let root = access.root;
         for record in bbox_threads::threads::load_repo_records(root) {
             if live_ids.contains(&record.id) {
                 continue;
@@ -209,7 +207,12 @@ pub fn reindex_project_records_standalone(
                 f.file_path,
                 record_path.to_string_lossy().as_ref(),
             ));
-            writer.add_document(build_record_doc(&record, root, &record_path, f))?;
+            writer.add_document(build_record_doc(
+                &record,
+                &access.project.canonical_path,
+                &record_path,
+                f,
+            ))?;
             docs += 1;
         }
     }
@@ -355,9 +358,9 @@ mod tests {
         .unwrap();
     }
 
-    fn register(projects_path: &Path, repo_root: &Path) {
+    fn register(projects_path: &Path, repo_root: &Path) -> ProjectRecord {
         let mut reg = ProjectRegistry::open(projects_path).unwrap();
-        reg.register_path(repo_root).unwrap();
+        let record = reg.register_path(repo_root).unwrap();
         // register_path is memory-only post-persister-conversion; the
         // standalone reindex reads projects.json from disk, so flush the
         // snapshot explicitly (the production path persists via the actor).
@@ -367,6 +370,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
+        record
     }
 
     #[test]
@@ -378,15 +382,22 @@ mod tests {
         write_committed_record(&repo_root, &record);
 
         let projects_path = central.path().join("projects.json");
-        register(&projects_path, &repo_root);
+        let project = register(&projects_path, &repo_root);
         let threads_path = central.path().join("threads.json"); // absent → no live ids
 
         let (schema, fields) = build_schema();
         let index = tantivy::Index::create_in_ram(schema);
         let mut writer: IndexWriter = index.writer(15_000_000).unwrap();
-        let docs =
-            reindex_project_records_standalone(&projects_path, &threads_path, fields, &mut writer)
-                .unwrap();
+        let docs = reindex_project_records_with_access(
+            &[ProjectRecordAccess {
+                project: &project,
+                root: &repo_root,
+            }],
+            &threads_path,
+            fields,
+            &mut writer,
+        )
+        .unwrap();
         assert_eq!(
             docs, 1,
             "committed record should index when no live thread carries it"
@@ -402,7 +413,7 @@ mod tests {
         write_committed_record(&repo_root, &record);
 
         let projects_path = central.path().join("projects.json");
-        register(&projects_path, &repo_root);
+        let project = register(&projects_path, &repo_root);
 
         // Live thread store carries the same id (origin machine): record skipped.
         let threads_path = central.path().join("threads.json");
@@ -437,9 +448,16 @@ mod tests {
         let (schema, fields) = build_schema();
         let index = tantivy::Index::create_in_ram(schema);
         let mut writer: IndexWriter = index.writer(15_000_000).unwrap();
-        let docs =
-            reindex_project_records_standalone(&projects_path, &threads_path, fields, &mut writer)
-                .unwrap();
+        let docs = reindex_project_records_with_access(
+            &[ProjectRecordAccess {
+                project: &project,
+                root: &repo_root,
+            }],
+            &threads_path,
+            fields,
+            &mut writer,
+        )
+        .unwrap();
         assert_eq!(
             docs, 0,
             "record must be skipped when the live thread is already indexed"

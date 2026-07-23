@@ -83,14 +83,25 @@ pub struct CorpusStores<'a> {
     pub threads: &'a RwLock<Threads>,
     pub notes: &'a RwLock<Notes>,
     pub projects: &'a RwLock<ProjectRegistry>,
+    pub checkout_registry: &'a RwLock<bbox_indexing::checkout_registry::CheckoutRegistry>,
+    pub checkout_access: &'a bbox_indexing::checkout_access::CheckoutAccessBroker,
     pub packets: &'a RwLock<Packets>,
     pub artifacts: &'a RwLock<ArtifactCatalog>,
     pub whiteboards: &'a WhiteboardRegistry,
     pub store_dir: &'a std::path::Path,
 }
 
+/// Path-free request authority for relative checkout-backed providers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCheckoutSelection {
+    pub project_id: String,
+    pub checkout_id: String,
+    pub published_scope: bbox_corpus_core::identity::PublishedScope,
+}
+
 pub struct ProviderContext<'a> {
     stores: Option<CorpusStores<'a>>,
+    checkout_selection: Option<ProviderCheckoutSelection>,
     /// Request-local knowledge visibility view. When present, knowledge
     /// providers must use it instead of the daemon's mutable aggregate store.
     knowledge_view: Option<&'a Knowledge>,
@@ -116,6 +127,7 @@ impl<'a> ProviderContext<'a> {
     pub fn new(stores: CorpusStores<'a>) -> Self {
         Self {
             stores: Some(stores),
+            checkout_selection: None,
             knowledge_view: None,
             ext: None,
             edges: None,
@@ -129,6 +141,7 @@ impl<'a> ProviderContext<'a> {
     ) -> Self {
         Self {
             stores: Some(stores),
+            checkout_selection: None,
             knowledge_view: None,
             ext: Some(ext),
             edges: None,
@@ -146,6 +159,11 @@ impl<'a> ProviderContext<'a> {
         self
     }
 
+    pub fn with_checkout_selection(mut self, selection: ProviderCheckoutSelection) -> Self {
+        self.checkout_selection = Some(selection);
+        self
+    }
+
     pub fn with_searcher(mut self, searcher: &'a tantivy::Searcher) -> Self {
         self.searcher = Some(searcher);
         self
@@ -154,6 +172,7 @@ impl<'a> ProviderContext<'a> {
     pub fn empty_for_tests() -> Self {
         Self {
             stores: None,
+            checkout_selection: None,
             knowledge_view: None,
             ext: None,
             edges: None,
@@ -163,6 +182,10 @@ impl<'a> ProviderContext<'a> {
 
     pub fn stores(&self) -> Option<&CorpusStores<'a>> {
         self.stores.as_ref()
+    }
+
+    pub fn checkout_selection(&self) -> Option<&ProviderCheckoutSelection> {
+        self.checkout_selection.as_ref()
     }
 
     pub fn knowledge_view(&self) -> Option<&Knowledge> {

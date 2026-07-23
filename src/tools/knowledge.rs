@@ -86,28 +86,57 @@ fn knowledge_entity_ref(id: &str) -> String {
 fn stable_knowledge_overlay(
     publisher_root: &std::path::Path,
     published_ref: &str,
+    checkout_lease: &bbox_indexing::checkout_access::ValidatedCheckoutLease,
     checkout: &bbox_corpus_core::project_record::ResolvedCheckoutScope,
 ) -> Result<bbox_knowledge::overlay::OverlaySnapshot, bbox_knowledge::overlay::OverlayRecomputeError>
 {
-    use bbox_knowledge::overlay::{OverlayRecomputeError, recompute_overlay_result};
+    use bbox_knowledge::overlay::{
+        OverlayRecomputeError, WorkingKnowledgeSnapshot, recompute_overlay_result,
+    };
 
-    let checkout_root = std::path::Path::new(&checkout.checkout_dir);
-    if bbox_knowledge::transaction::has_pending_transaction(checkout_root) {
+    let pending = || {
+        checkout_lease
+            .checkout_relative_regular_file_exists(
+                ".bbox/local/knowledge-transactions/pending.json",
+            )
+            .map_err(anyhow::Error::new)
+            .map_err(OverlayRecomputeError::transient)
+    };
+    let working = || {
+        let files = checkout_lease
+            .read_relative_json_directory(".bbox/knowledge")
+            .map_err(anyhow::Error::new)
+            .map_err(OverlayRecomputeError::transient)?;
+        WorkingKnowledgeSnapshot::new(files).map_err(OverlayRecomputeError::transient)
+    };
+    if pending()? {
         return Err(OverlayRecomputeError::transient(anyhow::anyhow!(
             "checkout transaction is pending; provisional overlay refresh deferred"
         )));
     }
-    let mut candidate = recompute_overlay_result(publisher_root, published_ref, checkout)?;
+    let first_working = working()?;
+    let mut candidate = recompute_overlay_result(
+        publisher_root,
+        published_ref,
+        checkout_lease.checkout_root(),
+        &first_working,
+        checkout,
+    )?;
     for _ in 0..2 {
-        if bbox_knowledge::transaction::has_pending_transaction(checkout_root) {
+        if pending()? {
             return Err(OverlayRecomputeError::transient(anyhow::anyhow!(
                 "checkout transaction began during provisional overlay refresh"
             )));
         }
-        let next = recompute_overlay_result(publisher_root, published_ref, checkout)?;
-        if same_knowledge_snapshot(&candidate, &next)
-            && !bbox_knowledge::transaction::has_pending_transaction(checkout_root)
-        {
+        let next_working = working()?;
+        let next = recompute_overlay_result(
+            publisher_root,
+            published_ref,
+            checkout_lease.checkout_root(),
+            &next_working,
+            checkout,
+        )?;
+        if same_knowledge_snapshot(&candidate, &next) && !pending()? {
             return Ok(next);
         }
         candidate = next;
@@ -115,6 +144,15 @@ fn stable_knowledge_overlay(
     Err(OverlayRecomputeError::transient(anyhow::anyhow!(
         "checkout state changed repeatedly during provisional overlay refresh"
     )))
+}
+
+fn classify_knowledge_overlay_access_error(
+    error: anyhow::Error,
+) -> bbox_knowledge::overlay::OverlayRecomputeError {
+    match error.downcast::<bbox_knowledge::overlay::OverlayRecomputeError>() {
+        Ok(error) => error,
+        Err(error) => bbox_knowledge::overlay::OverlayRecomputeError::transient(error),
+    }
 }
 
 fn same_knowledge_snapshot(
@@ -191,7 +229,7 @@ impl BlackboxServer {
         &self,
         project: &mut Option<String>,
     ) -> anyhow::Result<(
-        Option<String>,
+        Option<bbox_knowledge::repo_io::KnowledgeRepoCarrier>,
         Option<bbox_corpus_core::project_record::ResolvedCheckoutScope>,
     )> {
         let Some(raw) = project.clone().filter(|s| !s.trim().is_empty()) else {
@@ -200,27 +238,29 @@ impl BlackboxServer {
         let resolution = self.resolve_project_write(&raw)?;
         let durable_scope = resolution.durable_scope;
         let checkout = resolution.checkout_scope;
-        let write_dir = checkout
+        let write_carrier = checkout
             .as_ref()
-            .map(|checkout| self.resolved_dark_knowledge_carrier(checkout))
-            .or(resolution.write_dir);
+            .map(|checkout| {
+                crate::server::repo_io::RepoIoAuthority::knowledge_checkout_carrier(
+                    durable_scope.clone(),
+                    checkout,
+                )
+            })
+            .transpose()?;
         if self.path_fallback_is_cut() && checkout.is_none() {
             anyhow::bail!(
                 "path-scoped project fallback is retired; project writes require a registered checkout with recorded repo identity"
             );
         }
-        let managed_repo_owned = checkout.is_none()
+        let registered_without_checkout = checkout.is_none()
             && self
                 .state
                 .projects
                 .read()
                 .list()
                 .iter()
-                .any(|record| record.canonical_path == durable_scope)
-            && std::path::Path::new(&durable_scope)
-                .join(".bbox/knowledge")
-                .is_dir();
-        if (write_dir.is_some() || managed_repo_owned) && checkout.is_none() {
+                .any(|record| record.canonical_path == durable_scope);
+        if registered_without_checkout {
             anyhow::bail!(
                 "managed checkout {raw} has no provisional identity; refusing a write that cannot be reconstructed after restart"
             );
@@ -229,15 +269,21 @@ impl BlackboxServer {
         if let Some(checkout) = checkout.as_ref() {
             self.register_dark_knowledge_checkout(checkout)?;
         }
-        Ok((write_dir, checkout))
+        Ok((write_carrier, checkout))
     }
 
     pub(crate) fn register_dark_knowledge_checkout(
         &self,
         checkout: &bbox_corpus_core::project_record::ResolvedCheckoutScope,
     ) -> anyhow::Result<()> {
+        let _lifecycle = self
+            .state
+            .checkout_access
+            .lifecycle_mutation_guard()
+            .map_err(anyhow::Error::new)?;
         self.state.checkout_registry.write().register(
             bbox_indexing::checkout_registry::CheckoutRow {
+                project_id: Some(checkout.project_id.clone()),
                 checkout_id: checkout.checkout_id.clone(),
                 checkout_dir: checkout.checkout_dir.clone(),
                 repo_id: Some(checkout.published_scope.repo_id.clone()),
@@ -245,6 +291,7 @@ impl BlackboxServer {
                 branch_ref: checkout.branch_ref.clone(),
             },
         )?;
+        drop(_lifecycle);
         self.watch_resolved_dark_knowledge_checkout(checkout);
         Ok(())
     }
@@ -255,7 +302,8 @@ impl BlackboxServer {
     ) -> crate::server::KnowledgeOverlayRefreshOutcome {
         use crate::server::KnowledgeOverlayRefreshOutcome;
         use bbox_knowledge::overlay::{
-            OverlayKey, OverlayRecomputeErrorKind, OverlaySnapshot, OverlayStatus,
+            OverlayKey, OverlayRecomputeError, OverlayRecomputeErrorKind, OverlaySnapshot,
+            OverlayStatus,
         };
 
         let _refresh = self.state.knowledge_overlay_refresh.lock();
@@ -283,16 +331,40 @@ impl BlackboxServer {
             .as_ref()
             .is_some_and(|snapshot| snapshot.status == OverlayStatus::Valid);
         let mut publisher_project = None;
+        let mut publication_guard = None;
         let snapshot = match self
             .authorize_publisher_classified(&projects, &checkout.published_scope)
         {
             Ok(publisher) => {
-                publisher_project = Some(publisher.root.clone());
-                match stable_knowledge_overlay(
-                    std::path::Path::new(&publisher.root),
-                    &publisher.branch_ref,
-                    checkout,
-                ) {
+                publisher_project = projects
+                    .iter()
+                    .find(|project| project.project_id == publisher.project_id)
+                    .map(|project| project.canonical_path.clone());
+                let refreshed = match self.acquire_authorized_overlay_access(&publisher, checkout) {
+                    Ok((publisher_lease, checkout_lease)) => {
+                        let prepared = stable_knowledge_overlay(
+                            publisher_lease.project_root(),
+                            &publisher.branch_ref,
+                            &checkout_lease,
+                            checkout,
+                        );
+                        match self
+                            .state
+                            .checkout_access
+                            .publication_guard_for([&publisher_lease, &checkout_lease])
+                        {
+                            Ok(guard) => {
+                                publication_guard = Some(guard);
+                                prepared
+                            }
+                            Err(error) => {
+                                Err(OverlayRecomputeError::transient(anyhow::Error::new(error)))
+                            }
+                        }
+                    }
+                    Err(error) => Err(classify_knowledge_overlay_access_error(error)),
+                };
+                match refreshed {
                     Ok(snapshot) => snapshot,
                     Err(err)
                         if err.kind == OverlayRecomputeErrorKind::Transient && prior_is_valid =>
@@ -341,6 +413,7 @@ impl BlackboxServer {
             }
             Err(err) => OverlaySnapshot::invalid(checkout, format!("{err:#}")),
         };
+        let _publication_is_held = publication_guard.as_ref();
         let invalid = snapshot.status == OverlayStatus::Invalid;
         let prior_commit = prior
             .as_ref()
@@ -484,7 +557,7 @@ impl BlackboxServer {
             };
             let (write_dir, checkout) = server.prepare_knowledge_write(&mut p.project)?;
             if let Some(update) = &update
-                && (update.carrier.as_deref() != write_dir.as_deref()
+                && (update.carrier.as_ref() != write_dir.as_ref()
                     || update.checkout.as_ref().map(|scope| &scope.checkout_id)
                         != checkout.as_ref().map(|scope| &scope.checkout_id))
             {
@@ -496,10 +569,12 @@ impl BlackboxServer {
             let result = kb.learn_result_with_checkout(
                 &p,
                 false,
-                write_dir.as_deref(),
+                write_dir
+                    .as_ref()
+                    .map(|carrier| carrier.carrier_id.as_str()),
                 update.as_ref().and_then(|update| update.seed.as_ref()),
             )?;
-            let rider = kb.repo_record_rider_at(&result.id, write_dir.as_deref());
+            let rider = kb.repo_record_rider_at(&result.id, write_dir.as_ref())?;
             drop(kb);
             let overlay_refreshed = checkout.is_some();
             if let Some(checkout) = checkout.as_ref() {
@@ -581,8 +656,14 @@ impl BlackboxServer {
             let mut p = p;
             let (write_dir, checkout) = server.prepare_knowledge_write(&mut p.project)?;
             let mut kb = server.state.kb.write();
-            let result = kb.remember_result_with_write_dir(&p, false, write_dir.as_deref())?;
-            let rider = kb.repo_record_rider_at(&result.id, write_dir.as_deref());
+            let result = kb.remember_result_with_write_dir(
+                &p,
+                false,
+                write_dir
+                    .as_ref()
+                    .map(|carrier| carrier.carrier_id.as_str()),
+            )?;
+            let rider = kb.repo_record_rider_at(&result.id, write_dir.as_ref())?;
             drop(kb);
             let overlay_refreshed = checkout.is_some();
             if let Some(checkout) = checkout.as_ref() {
@@ -635,7 +716,7 @@ impl BlackboxServer {
             let superseded = match p.supersedes.as_deref() {
                 Some(old_ref) => {
                     let existing = server.prepare_existing_knowledge_mutation(old_ref)?;
-                    if existing.carrier.as_deref() != write_dir.as_deref()
+                    if existing.carrier.as_ref() != write_dir.as_ref()
                         || existing.checkout.as_ref().map(|scope| &scope.checkout_id)
                             != checkout.as_ref().map(|scope| &scope.checkout_id)
                     {
@@ -652,10 +733,12 @@ impl BlackboxServer {
             let result = kb.decide_result_with_checkout(
                 &p,
                 false,
-                write_dir.as_deref(),
+                write_dir
+                    .as_ref()
+                    .map(|carrier| carrier.carrier_id.as_str()),
                 superseded.as_ref(),
             )?;
-            let rider = kb.repo_record_rider_at(&result.id, write_dir.as_deref());
+            let rider = kb.repo_record_rider_at(&result.id, write_dir.as_ref())?;
             drop(kb);
             let overlay_refreshed = checkout.is_some();
             if let Some(checkout) = checkout.as_ref() {
@@ -877,7 +960,10 @@ impl BlackboxServer {
             p.source = format!("knowledge:{}", target.id);
             let edge = server.state.kb.write().append_link_with_write_dir(
                 &p,
-                target.carrier.as_deref(),
+                target
+                    .carrier
+                    .as_ref()
+                    .map(|carrier| carrier.carrier_id.as_str()),
                 target.seed.as_ref(),
             )?;
             server.finish_existing_knowledge_mutation(target.checkout.as_ref());
@@ -925,7 +1011,10 @@ impl BlackboxServer {
             p.id = target.id.clone();
             let message = server.state.kb.write().forget_with_write_dir(
                 &p,
-                target.carrier.as_deref(),
+                target
+                    .carrier
+                    .as_ref()
+                    .map(|carrier| carrier.carrier_id.as_str()),
                 target.seed.as_ref(),
             )?;
             server.finish_existing_knowledge_mutation(target.checkout.as_ref());
@@ -1283,12 +1372,13 @@ mod tests {
         let server = crate::server::BlackboxServer::new(std::sync::Arc::new(
             crate::server::state::SharedState::for_test(tmp.path()),
         ));
-        server
+        let project_id = server
             .state
             .projects
             .write()
             .register_path(&base_canon)
-            .unwrap();
+            .unwrap()
+            .project_id;
 
         let learn = server
             .bbox_learn(Parameters(LearnParams {
@@ -1358,7 +1448,7 @@ mod tests {
 
         // Tool arguments cannot grant own-checkout visibility. Model the MCP
         // transport authority that a real worktree session records at init.
-        server.set_session_checkout_for_test(scope, checkout_id, wt_canon.clone());
+        server.set_session_checkout_for_test(project_id, scope, checkout_id, wt_canon.clone());
         let own = server
             .session_knowledge_view(Some(base_canon.to_str().unwrap()), Some("own"))
             .unwrap();

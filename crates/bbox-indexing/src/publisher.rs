@@ -124,6 +124,19 @@ impl PublisherRefStore {
         scope: &PublishedScope,
         publisher_root: &Path,
     ) -> Result<PublisherRefRow> {
+        let row = self.pin_candidate(scope, publisher_root)?;
+        self.persist_pin_candidate(&row)?;
+        Ok(row)
+    }
+
+    /// Compute the immutable pin a caller would establish without mutating
+    /// durable state. Reindex uses this during preparation and persists it
+    /// only inside the checkout publication fence.
+    pub fn pin_candidate(
+        &self,
+        scope: &PublishedScope,
+        publisher_root: &Path,
+    ) -> Result<PublisherRefRow> {
         if let Some(existing) = self.pinned(scope) {
             return Ok(existing.clone());
         }
@@ -137,11 +150,23 @@ impl PublisherRefStore {
             scope: scope.clone(),
             branch_ref: format!("refs/heads/{branch}"),
         };
+        Ok(row)
+    }
+
+    /// Persist a previously prepared immutable pin. A competing different pin
+    /// fails closed instead of redefining published truth.
+    pub fn persist_pin_candidate(&mut self, row: &PublisherRefRow) -> Result<()> {
+        if let Some(existing) = self.pinned(&row.scope) {
+            if existing == row {
+                return Ok(());
+            }
+            anyhow::bail!("publisher pin changed before prepared publication");
+        }
         let mut next = self.data.clone();
         next.refs.push(row.clone());
         next.refs.sort_by(|a, b| a.scope.cmp(&b.scope));
         self.replace_data(next)?;
-        Ok(row)
+        Ok(())
     }
 
     /// Explicit operator-authority primitive. Tool/API exposure is a later

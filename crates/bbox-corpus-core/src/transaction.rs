@@ -179,6 +179,25 @@ pub fn recover_abandoned_pending_transaction(
     recover_pending_transaction_with_lock(checkout_dir, false)
 }
 
+/// Probe whether a pending transaction is still owned by a live lane without
+/// waiting or mutating recovery state. Callers can use this cheap read phase
+/// before acquiring broader repository-mutation authority.
+pub fn pending_transaction_lane_is_busy(checkout_dir: &Path) -> Result<bool> {
+    let pointer_path = pending_path(checkout_dir);
+    if !pointer_path.exists() {
+        return Ok(false);
+    }
+    let checkout_dir = checkout_dir
+        .canonicalize()
+        .with_context(|| format!("canonicalizing checkout {}", checkout_dir.display()))?;
+    let root = transaction_root(&checkout_dir);
+    reject_symlink_components(
+        &checkout_dir,
+        Path::new(".bbox/local/knowledge-transactions/pending.json"),
+    )?;
+    Ok(acquire_transaction_lane(&root, false)?.is_none())
+}
+
 fn recover_pending_transaction_with_lock(
     checkout_dir: &Path,
     wait_for_lane: bool,

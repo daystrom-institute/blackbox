@@ -20,6 +20,7 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 ///     the WORKTREE checkout root, filter by the registered base path
 ///     (`scope_project`);
 ///   - unregistered paths and non-path values → untouched.
+#[cfg(test)]
 fn rescope_render_project(p: &mut RenderParams, projects: &[crate::projects::ProjectRecord]) {
     let Some(raw) = p.project.as_deref().filter(|raw| raw.starts_with('/')) else {
         return;
@@ -93,13 +94,61 @@ impl BlackboxServer {
         let server = self.clone();
         Self::run_blocking("bbox_render", move || {
             let mut p = p;
-            if p.project.is_some() {
-                let projects = server.state.projects.read().list();
-                rescope_render_project(&mut p, &projects);
-            }
-            let scope_project = p.scope_project.as_deref().or(p.project.as_deref());
-            let view = server.session_knowledge_view(scope_project, p.provisional.as_deref())?;
-            let rendered = view.knowledge.render(&p)?;
+            let project_render = p.project.is_some()
+                && matches!(p.scope.as_deref().unwrap_or("both"), "project" | "both");
+            let rendered = if project_render {
+                let raw = p.project.clone().expect("project render has a target");
+                let resolution = server.resolve_project_write(&raw)?;
+                let durable_scope = resolution.durable_scope;
+                let checkout = resolution.checkout_scope;
+                if let Some(checkout) = checkout.as_ref() {
+                    server.register_dark_knowledge_checkout(checkout)?;
+                }
+                let view = server.session_knowledge_view(
+                    Some(&durable_scope),
+                    p.provisional.as_deref(),
+                )?;
+                let mut render = |root: &std::path::Path| {
+                    p.project = Some(root.to_string_lossy().into_owned());
+                    p.scope_project = Some(durable_scope.clone());
+                    view.knowledge.render(&p)
+                };
+                if let Some(checkout) = checkout.as_ref() {
+                    crate::server::checkout_access::with_resolved_checkout_access(
+                        &server.state.checkout_access,
+                        checkout,
+                        bbox_indexing::checkout_access::CheckoutAccessKind::RenderFileProvider,
+                        bbox_indexing::checkout_access::CheckoutAccessIntent::Write,
+                        |lease| render(lease.project_root()),
+                    )?
+                } else {
+                    let projects = server.state.projects.read().list();
+                    let project = projects
+                        .iter()
+                        .find(|project| project.canonical_path == durable_scope)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "error.attachment_required: project render target is not a registered attachment"
+                            )
+                        })?;
+                    crate::server::checkout_access::with_selected_project_access(
+                        &server.state.checkout_access,
+                        &project.project_id,
+                        bbox_indexing::checkout_access::CheckoutAccessKind::RenderFileProvider,
+                        bbox_indexing::checkout_access::CheckoutAccessIntent::Write,
+                        |lease| render(lease.project_root()),
+                    )?
+                }
+            } else {
+                let scope_project = p.scope_project.as_deref().or(p.project.as_deref());
+                let view =
+                    server.session_knowledge_view(scope_project, p.provisional.as_deref())?;
+                view.knowledge.render(&p)?
+            };
+            let view = server.session_knowledge_view(
+                p.scope_project.as_deref().or(p.project.as_deref()),
+                p.provisional.as_deref(),
+            )?;
             match view.diagnostics_text() {
                 Some(diagnostics) => Ok(format!("{rendered}\n{diagnostics}")),
                 None => Ok(rendered),
@@ -148,7 +197,10 @@ impl BlackboxServer {
             p.id = Some(target.id.clone());
             let out = server.state.kb.write().review_with_write_dir(
                 &p,
-                target.carrier.as_deref(),
+                target
+                    .carrier
+                    .as_ref()
+                    .map(|carrier| carrier.carrier_id.as_str()),
                 target.seed.as_ref(),
             )?;
             server.finish_existing_knowledge_mutation(target.checkout.as_ref());

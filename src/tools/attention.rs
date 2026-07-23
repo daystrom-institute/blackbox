@@ -7,6 +7,7 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router};
+use std::collections::BTreeSet;
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::attention_tools()
@@ -91,15 +92,65 @@ impl BlackboxServer {
                 p.project = Some(base);
             }
             let import_report = if p.import_gap_spool.unwrap_or(false) {
-                let projects = server.state.projects.read();
-                let mut gaps = server.state.gaps.write();
+                let projects = server.state.projects.read().list();
+                let repo_write = crate::server::repo_io::RepoIoAuthority::new(
+                    server.state.checkout_access.clone(),
+                );
+                let mut carriers = crate::server::repo_io::RepoIoAuthority::gap_base_carriers(
+                    &projects,
+                )?
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+                let checkout_rows = server.state.checkout_registry.read().rows().to_vec();
+                for row in &checkout_rows {
+                    let Some(scope) = row.published_scope() else {
+                        continue;
+                    };
+                    let project_id = if let Some(project_id) = row.project_id.clone() {
+                        project_id
+                    } else {
+                        match crate::server::checkout_access::project_id_for_published_scope(
+                            &server.state.checkout_access,
+                            projects.iter().map(|project| project.project_id.clone()),
+                            &scope,
+                        ) {
+                            Ok(Some(project_id)) => project_id,
+                            Ok(None) => continue,
+                            Err(error) => {
+                                tracing::warn!(
+                                    checkout_id = %row.checkout_id,
+                                    error = %error,
+                                    "gap spool skipped checkout carrier with unavailable scope authority"
+                                );
+                                continue;
+                            }
+                        }
+                    };
+                    let project = projects
+                        .iter()
+                        .find(|project| project.project_id == project_id)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "published checkout scope resolved to an unknown project"
+                            )
+                        })?;
+                    carriers.insert(
+                        crate::server::repo_io::RepoIoAuthority::gap_checkout_carrier_for_ids(
+                            project.canonical_path.clone(),
+                            &project_id,
+                            &row.checkout_id,
+                        )?,
+                    );
+                }
+                let carriers = carriers.into_iter().collect::<Vec<_>>();
                 let state_dir = server.state.config.read().paths.state_dir.clone();
-                let roots: Vec<String> = projects
-                    .list()
-                    .into_iter()
-                    .map(|record| record.canonical_path)
-                    .collect();
-                Some(gap_spool::import_gap_spool(&mut gaps, &roots, &state_dir)?)
+                let mut gaps = server.state.gaps.write();
+                Some(gap_spool::import_gap_spool(
+                    &mut gaps,
+                    &carriers,
+                    &repo_write,
+                    &state_dir,
+                )?)
             } else {
                 None
             };

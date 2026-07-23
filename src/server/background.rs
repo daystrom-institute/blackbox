@@ -46,18 +46,19 @@ async fn run_knowledge_lifecycle_pass(shared: Arc<SharedState>) {
         // Recovery is nonblocking even during startup. A live writer or
         // closeout retains its advisory lane; the periodic pass retries after
         // that owner releases it instead of delaying listener availability.
+        let initial_reconciliation = server.reconcile_dark_knowledge_checkouts();
         let recovered = server.recover_abandoned_dark_knowledge_transactions();
+        let reconciliation = if recovered > 0 {
+            server.reconcile_dark_knowledge_checkouts()
+        } else {
+            initial_reconciliation
+        };
         let inventory = server.run_knowledge_schema_epoch_inventory();
         let path_fallback = inventory
             .as_ref()
             .ok()
             .map(|report| server.reconcile_path_fallback_cut(report));
-        (
-            recovered,
-            inventory,
-            path_fallback,
-            server.reconcile_dark_knowledge_checkouts(),
-        )
+        (recovered, inventory, path_fallback, reconciliation)
     })
     .await;
     match result {
@@ -266,13 +267,24 @@ fn spawn_system_event_signal_bridge(shared: Arc<SharedState>) {
 }
 
 fn start_bbox_watcher(shared: &Arc<SharedState>) {
-    let project_roots: Vec<(String, std::path::PathBuf)> = shared
-        .projects
-        .read()
-        .list()
-        .into_iter()
-        .map(|r| (r.project_id, std::path::PathBuf::from(r.canonical_path)))
-        .collect();
+    let projects = shared.projects.read().list();
+    let project_carriers = projects
+        .iter()
+        .filter_map(|project| {
+            watcher::ArtifactWatchCarrier::selected(project.project_id.clone())
+                .map_err(|error| {
+                    tracing::warn!(
+                        project = %project.project_id,
+                        error = %error,
+                        "artifact watcher skipped invalid project carrier"
+                    );
+                })
+                .ok()
+        })
+        .collect::<Vec<_>>();
+    let watch_access = Arc::new(super::checkout_access::DaemonArtifactWatchAccess::new(
+        shared.checkout_access.clone(),
+    ));
     let catalog = Arc::new(shared.artifacts.read().clone());
 
     // On a committed `.bbox/knowledge/` or top-level `.bbox/gaps/` change (e.g.
@@ -285,62 +297,111 @@ fn start_bbox_watcher(shared: &Arc<SharedState>) {
     // against `idx`/`kb` readers. Gaps are not search-indexed, so reloading them
     // is reload-only (no reindex contribution).
     let weak = Arc::downgrade(shared);
-    let on_knowledge_change: watcher::KnowledgeChangeCallback = Arc::new(move || {
-        let Some(state) = weak.upgrade() else {
-            return;
-        };
-        {
-            let mut kb = state.kb.write();
-            if let Err(e) = kb.reload() {
-                tracing::warn!("watcher: kb reload after .bbox/knowledge change failed: {e:#}");
-            }
-        }
-        {
-            let mut gaps = state.gaps.write();
-            if let Err(e) = gaps.reload() {
-                tracing::warn!("watcher: gaps reload after .bbox/gaps change failed: {e:#}");
-            }
-        }
-        state
-            .reindex_dirty
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Err(err) = std::thread::Builder::new()
-            .name("blackbox-knowledge-watch-refresh".into())
-            .spawn(move || {
+    let (refresh_tx, refresh_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    if let Err(error) = std::thread::Builder::new()
+        .name("blackbox-knowledge-watch-refresh".into())
+        .spawn(move || {
+            while refresh_rx.recv().is_ok() {
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                {
+                    let mut kb = state.kb.write();
+                    if let Err(error) = kb.reload() {
+                        tracing::warn!(
+                            "watcher: kb reload after .bbox/knowledge change failed: {error:#}"
+                        );
+                    }
+                }
+                {
+                    let mut gaps = state.gaps.write();
+                    if let Err(error) = gaps.reload() {
+                        tracing::warn!(
+                            "watcher: gaps reload after .bbox/gaps change failed: {error:#}"
+                        );
+                    }
+                }
+                state
+                    .reindex_dirty
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 let server = crate::server::BlackboxServer::new(state);
-                if let Err(err) = server.reconcile_dark_knowledge_checkouts() {
+                if let Err(error) = server.reconcile_dark_knowledge_checkouts() {
                     tracing::warn!(
-                        error = %err,
+                        error = %error,
                         "watcher: checkout overlay reconciliation failed"
                     );
                 }
-            })
-        {
-            tracing::warn!(error = %err, "watcher: could not spawn overlay refresh");
-        }
-        tracing::debug!("watcher: .bbox repo-store change → kb+gaps reloaded, reindex flagged");
-    });
+                tracing::debug!(
+                    "watcher: .bbox repo-store change reloaded, reconciled, and flagged reindex"
+                );
+            }
+        })
+    {
+        tracing::warn!(error = %error, "watcher: could not start overlay refresh coordinator");
+    }
+    let on_knowledge_change: watcher::KnowledgeChangeCallback =
+        Arc::new(move |_carrier| match refresh_tx.try_send(()) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => {}
+            Err(std::sync::mpsc::TrySendError::Disconnected(())) => {
+                tracing::warn!("watcher: overlay refresh coordinator is unavailable");
+            }
+        });
 
-    match watcher::BbxWatcher::start(project_roots, catalog, Some(on_knowledge_change)) {
+    match watcher::BbxWatcher::start(
+        project_carriers,
+        watch_access,
+        catalog,
+        Some(on_knowledge_change),
+    ) {
         Ok(mut w) => {
             for row in shared.checkout_registry.read().rows().to_vec() {
                 let scope = match row.published_scope() {
                     Some(scope) => scope,
                     None => continue,
                 };
-                let project_dir = if scope.bbox_root_relpath == "." {
-                    std::path::PathBuf::from(&row.checkout_dir)
+                let project_id = if let Some(project_id) = row.project_id.clone() {
+                    project_id
                 } else {
-                    scope
-                        .bbox_root_relpath
-                        .split('/')
-                        .fold(std::path::PathBuf::from(&row.checkout_dir), |path, part| {
-                            path.join(part)
-                        })
+                    match super::checkout_access::project_id_for_published_scope(
+                        &shared.checkout_access,
+                        projects.iter().map(|project| project.project_id.clone()),
+                        &scope,
+                    ) {
+                        Ok(Some(project_id)) => project_id,
+                        Ok(None) => {
+                            tracing::warn!(
+                                checkout_id = %row.checkout_id,
+                                "provisional knowledge watcher has no registered project for scope"
+                            );
+                            continue;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                checkout_id = %row.checkout_id,
+                                error = %error,
+                                "provisional knowledge watcher could not resolve project scope"
+                            );
+                            continue;
+                        }
+                    }
                 };
-                if let Err(err) = w.watch_repo_store(&project_dir) {
+                let carrier = match watcher::ArtifactWatchCarrier::checkout(
+                    project_id,
+                    row.checkout_id.clone(),
+                ) {
+                    Ok(carrier) => carrier,
+                    Err(error) => {
+                        tracing::warn!(
+                            checkout_id = %row.checkout_id,
+                            error = %error,
+                            "provisional knowledge watcher rejected checkout carrier"
+                        );
+                        continue;
+                    }
+                };
+                if let Err(err) = w.watch_repo_store(carrier) {
                     tracing::warn!(
-                        checkout = %project_dir.display(),
+                        checkout_id = %row.checkout_id,
                         error = %err,
                         "provisional knowledge watcher failed to start"
                     );

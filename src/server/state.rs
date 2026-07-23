@@ -438,6 +438,8 @@ impl SharedState {
             threads: self.threads.as_ref(),
             notes: self.notes.as_ref(),
             projects: self.projects.as_ref(),
+            checkout_registry: self.checkout_registry.as_ref(),
+            checkout_access: self.checkout_access.as_ref(),
             packets: &self.packets,
             artifacts: &self.artifacts,
             whiteboards: self.whiteboards.as_ref(),
@@ -497,20 +499,29 @@ impl SharedState {
         let path_fallback_cut =
             bbox_knowledge::inventory::path_fallback_was_cut(store_dir).unwrap();
         kb.set_path_fallback_cut(path_fallback_cut);
-        let kb_project_roots: Vec<std::path::PathBuf> =
-            ProjectRegistry::load_records(store_dir.join("projects.json"))
-                .unwrap_or_default()
-                .into_iter()
-                .map(|r| std::path::PathBuf::from(r.canonical_path))
-                .collect();
-        kb.set_project_roots(kb_project_roots.clone()).unwrap();
+        let repo_projects =
+            ProjectRegistry::load_records(store_dir.join("projects.json")).unwrap_or_default();
+        let repo_io = Arc::new(super::repo_io::RepoIoAuthority::new(
+            checkout_access.clone(),
+        ));
+        kb.configure_repo_io(
+            repo_io.clone(),
+            repo_io.clone(),
+            super::repo_io::RepoIoAuthority::knowledge_base_carriers(&repo_projects).unwrap(),
+        )
+        .unwrap();
         let kb_store = Arc::new(RwLock::new(kb));
         let kb_persister = StorePersister::spawn("knowledge-test", kb_store.clone(), kb_path);
         // Gap store mirrors the kb repo-owned model: load every registered
         // project's committed `.bbox/gaps/` into the query surface at startup.
         let mut gaps = GapStore::open(&store_dir.join("blackbox-gaps.json")).unwrap();
         gaps.set_path_fallback_cut(path_fallback_cut);
-        gaps.set_project_roots(kb_project_roots).unwrap();
+        gaps.configure_repo_io(
+            repo_io.clone(),
+            repo_io,
+            super::repo_io::RepoIoAuthority::gap_base_carriers(&repo_projects).unwrap(),
+        )
+        .unwrap();
         crate::threads::register_thread_embed_hook(crate::embed_queue::enqueue_thread_hook);
         crate::notes::register_note_embed_hook(crate::embed_queue::enqueue_note_hook);
         crate::index::writer_actor::register_embed_bootstrap(

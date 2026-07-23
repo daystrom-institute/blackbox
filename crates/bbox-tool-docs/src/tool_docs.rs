@@ -300,7 +300,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_ref_size",
         category: ToolCategory::Graph,
-        summary: "Measure the byte payload size of entity refs. file refs resolve against optional project_dir first, then registered project file content; project_file and project_file_v2 refs resolve to full indexed chunk content; other refs resolve through entity providers and measure serialized provider-properties JSON. Accepts up to 500 refs; successful refs are canonicalized and unresolved/omitted refs are reported under degraded.",
+        summary: "Measure the byte payload size of entity refs. file refs resolve through a validated current checkout attachment selected by exact project_dir, authoritative session checkout, or an unambiguous registered project; project_file and project_file_v2 refs resolve to full indexed chunk content without checkout access; other refs resolve through entity providers and measure serialized provider-properties JSON. Accepts up to 500 refs; successful refs are canonicalized and unresolved/omitted refs are reported under degraded.",
         when_to_use: "Use when planning context-budget-sensitive dispatches. Pass the exact entity refs a downstream actor would need to read; the response returns per-ref byte counts, total_bytes, canonicalized successful refs, and unresolved/omitted refs without estimating from prose.",
         example: Some(r#"bbox_ref_size(project_dir="/repo/worktree", refs=["file:src/lib.rs"])"#),
     },
@@ -1415,7 +1415,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_doctor",
         category: ToolCategory::Operations,
-        summary: "Read-only health aggregation across daemon, index, vectors, graph, projects, memories, knowledge, and attention. Findings are classified ok/info/warn/action/blocked with suggested next commands; format=summary (compact text) or json.",
+        summary: "Read-only health aggregation across daemon, index, code sources, vectors, graph, projects, checkout access, memories, knowledge, and attention. Findings are classified ok/info/warn/action/blocked with suggested next commands; format=summary (compact text) or json (including bounded checkout-access counters).",
         when_to_use: "Use as the first call when asking \"what do I need to know about Blackbox right now?\" — replaces the scattered manual smoke checklist (bbox_stats, bbox_embed_status, bbox_project_list, bbox_lint, bbox_inbox) with one ranked surface. Route findings distinguish real failures (action) from opt-in absence like unconfigured visual chunk kinds (info). Artifact/inlet/workflow drift sections land with the bundle phases.",
         example: Some(r#"bbox_doctor(format="summary")"#),
     },

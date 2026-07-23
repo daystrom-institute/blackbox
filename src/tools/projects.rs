@@ -1,7 +1,7 @@
 use anyhow::Context;
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::artifacts;
 use crate::config;
@@ -21,12 +21,9 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router};
-use serde_json::json;
+use serde_json::{Value, json};
 
-use bbox_indexing::checkout_access::{
-    CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest, CheckoutAccessSourceLane,
-    CheckoutAttachmentSelector,
-};
+use bbox_indexing::checkout_access::{CheckoutAccessIntent, CheckoutAccessKind};
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::projects_tools()
@@ -39,6 +36,80 @@ struct ProjectInitResult {
     skipped: Vec<String>,
     repo_id: Option<String>,
     repo_id_recorded: bool,
+}
+
+#[derive(Debug)]
+struct PreparedProjectArtifact {
+    kind: artifacts::ArtifactKind,
+    source: String,
+    local: bool,
+    value: Value,
+}
+
+fn prepare_project_artifacts(project_root: &Path) -> anyhow::Result<Vec<PreparedProjectArtifact>> {
+    let mut prepared = Vec::new();
+    for artifact in artifacts::discover_project_artifacts(project_root)? {
+        let raw = match fs::read_to_string(&artifact.path) {
+            Ok(raw) => raw,
+            Err(error) => {
+                tracing::warn!(
+                    path = %artifact.path,
+                    error = %error,
+                    "artifact registration preparation skipped unreadable artifact"
+                );
+                continue;
+            }
+        };
+        let value = match serde_json::from_str(&raw) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(
+                    path = %artifact.path,
+                    error = %error,
+                    "artifact registration preparation skipped invalid artifact"
+                );
+                continue;
+            }
+        };
+        prepared.push(PreparedProjectArtifact {
+            kind: artifact.kind,
+            source: artifact.path,
+            local: artifact.local,
+            value,
+        });
+    }
+    Ok(prepared)
+}
+
+fn publish_project_artifacts(
+    prepared: Vec<PreparedProjectArtifact>,
+    project_id: &str,
+    catalog: &artifacts::ArtifactCatalog,
+) -> Vec<artifacts::ArtifactMetadata> {
+    let mut installed = Vec::new();
+    for artifact in prepared {
+        let scope = artifacts::ArtifactScope::Project {
+            project_id,
+            local: artifact.local,
+        };
+        match catalog.install_value_scoped(
+            scope,
+            artifact.kind,
+            artifact.source.clone(),
+            &artifact.value,
+            None,
+            None,
+            None,
+        ) {
+            Ok(metadata) => installed.push(metadata),
+            Err(error) => tracing::warn!(
+                path = %artifact.source,
+                error = %error,
+                "artifact registration publication failed"
+            ),
+        }
+    }
+    installed
 }
 
 // migration debt: project-init scaffolding writes inline; run_blocking conversion tracked in thread-935b467d.
@@ -187,6 +258,12 @@ impl BlackboxServer {
         let declared_aliases = config::load_project_at_ref(Path::new(&p.path), "HEAD")
             .map(|cfg| cfg.project.aliases.into_iter().collect::<BTreeSet<_>>())
             .unwrap_or_default();
+        let lifecycle = match self.state.checkout_access.lifecycle_mutation_guard() {
+            Ok(guard) => guard,
+            Err(error) => {
+                return Self::err_text(&format!("Error: {error}"));
+            }
+        };
         let res = {
             let mut projects = self.state.projects.write();
             projects.register_path(&p.path).and_then(|record| {
@@ -196,6 +273,7 @@ impl BlackboxServer {
                 })
             })
         };
+        drop(lifecycle);
         let record = match res {
             Ok(record) => record,
             Err(e) => {
@@ -214,75 +292,69 @@ impl BlackboxServer {
         // provenance import, watcher, kb sync) on the blocking pool.
         let server = self.clone();
         let result: anyhow::Result<String> = tokio::task::spawn_blocking(move || {
-            orchestration::mcp::migrate_project_mcp_path(&PathBuf::from(&record.canonical_path))?;
-            let project_config = config::load_project(Path::new(&record.canonical_path))?;
-            let project_config_loaded = true;
+            let migration_lease =
+                crate::server::checkout_access::acquire_selected_project_access(
+                &server.state.checkout_access,
+                &record.project_id,
+                CheckoutAccessKind::RepositoryMutation,
+                CheckoutAccessIntent::Write,
+            )?;
+            let migration_publication = server
+                .state
+                .checkout_access
+                .publication_guard(&migration_lease)
+                .map_err(anyhow::Error::new)?;
+            orchestration::mcp::migrate_project_mcp_path(migration_lease.project_root())?;
+            drop(migration_publication);
+            let artifact_lease =
+                crate::server::checkout_access::acquire_selected_project_access(
+                &server.state.checkout_access,
+                &record.project_id,
+                CheckoutAccessKind::ArtifactWatchDiscovery,
+                CheckoutAccessIntent::Read,
+            )?;
+            let project_config = config::load_project(artifact_lease.project_root())?;
             if project_config.mcp.enabled == Some(false) {
                 tracing::info!(
                     "Project MCP is disabled via {}",
-                    Path::new(&record.canonical_path)
-                        .join(".bbox")
-                        .join("config.toml")
+                    artifact_lease
+                        .project_root()
+                        .join(".bbox/config.toml")
                         .display()
                 );
             }
-            // Auto-discover and install .bbox/ artifacts unless explicitly disabled.
-            if project_config.artifacts.auto_discover != Some(false) {
-                let catalog = server.state.artifacts.read();
-                match artifacts::discover_and_install_project_artifacts(
-                    Path::new(&record.canonical_path),
-                    &record.project_id,
-                    &catalog,
-                ) {
-                    Ok(installed) if !installed.is_empty() => {
-                        tracing::info!(
-                            "Installed {} project artifact(s) for {}",
-                            installed.len(),
-                            record.project_id
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!("artifact auto-discover for {}: {e:#}", record.project_id)
-                    }
-                }
+            let prepared_artifacts = if project_config.artifacts.auto_discover != Some(false) {
+                prepare_project_artifacts(artifact_lease.project_root())?
+            } else {
+                Vec::new()
+            };
+            let artifact_publication = server
+                .state
+                .checkout_access
+                .publication_guard(&artifact_lease)
+                .map_err(anyhow::Error::new)?;
+            let installed = publish_project_artifacts(
+                prepared_artifacts,
+                &record.project_id,
+                &server.state.artifacts.read(),
+            );
+            if !installed.is_empty() {
+                tracing::info!(
+                    "Installed {} project artifact(s) for {}",
+                    installed.len(),
+                    record.project_id
+                );
             }
+            drop(artifact_publication);
+            let project_config_loaded = true;
             let edges_dir = edge_index::edges_dir_from_bro_store(&server.state.store_dir);
-            let broker = crate::server::checkout_access::checkout_access_broker(&server.state);
-            let scope_discovery_lease = broker
-                .acquire(CheckoutAccessRequest {
-                    project_id: record.project_id.clone(),
-                    attachment: CheckoutAttachmentSelector::Selected,
-                    expected_scope: None,
-                    kind: CheckoutAccessKind::PublisherConfigTreeRead,
-                    intent: CheckoutAccessIntent::Read,
-                    source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
-                })
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "error.checkout_access.{}: {}",
-                        error.code.as_str(),
-                        error.diagnostic
-                    )
-                })?;
-            let expected_scope = scope_discovery_lease.published_scope().cloned();
-            let provenance_lease = broker
-                .acquire(CheckoutAccessRequest {
-                    project_id: record.project_id.clone(),
-                    attachment: CheckoutAttachmentSelector::Selected,
-                    expected_scope,
-                    kind: CheckoutAccessKind::ProvenanceNoteIo,
-                    intent: CheckoutAccessIntent::Read,
-                    source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
-                })
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "error.checkout_access.{}: {}",
-                        error.code.as_str(),
-                        error.diagnostic
-                    )
-                })?;
-            drop(scope_discovery_lease);
+            let provenance_lease =
+                crate::server::checkout_access::acquire_selected_project_access(
+                &server.state.checkout_access,
+                &record.project_id,
+                CheckoutAccessKind::ProvenanceNoteIo,
+                CheckoutAccessIntent::Read,
+            )?;
             let provenance_project = mcp_tools::provenance::ProvenanceProject {
                 project_id: record.project_id.clone(),
                 project_root: provenance_lease.project_root().to_path_buf(),
@@ -304,27 +376,41 @@ impl BlackboxServer {
                         byte_range,
                     )
                 };
-            mcp_tools::provenance::import_provenance_to_edges_dir(
+            let prepared_provenance = mcp_tools::provenance::prepare_provenance_import(
                 std::slice::from_ref(&provenance_project),
-                &edges_dir,
                 &resolve_legacy_target,
             )?;
-            broker.revalidate(&provenance_lease).map_err(|error| {
-                anyhow::anyhow!(
-                    "error.checkout_access.{}: {}",
-                    error.code.as_str(),
-                    error.diagnostic
-                )
-            })?;
-            drop(provenance_lease);
+            let provenance_publication = server
+                .state
+                .checkout_access
+                .publication_guard(&provenance_lease)
+                .map_err(anyhow::Error::new)?;
+            mcp_tools::provenance::publish_prepared_provenance_import(
+                prepared_provenance,
+                &edges_dir,
+            )?;
+            drop(provenance_publication);
             // Register with the live .bbox/ watcher so future file changes
             // are picked up without a daemon restart.
             if let Ok(mut guard) = server.state.bbox_watcher.lock() {
                 if let Some(w) = guard.as_mut() {
-                    if let Err(e) =
-                        w.watch_project(&record.project_id, Path::new(&record.canonical_path))
-                    {
-                        tracing::warn!("watcher add project {}: {e:#}", record.project_id);
+                    match crate::watcher::ArtifactWatchCarrier::selected(
+                        record.project_id.clone(),
+                    ) {
+                        Ok(carrier) => {
+                            if let Err(e) = w.watch_project(carrier) {
+                                tracing::warn!(
+                                    "watcher add project {}: {e:#}",
+                                    record.project_id
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "watcher rejected project {} carrier: {e:#}",
+                                record.project_id
+                            );
+                        }
                     }
                 }
             }
@@ -344,12 +430,42 @@ impl BlackboxServer {
             {
                 let reindex_cfg = server.state.idx.read().reindex_config();
                 let project_for_backfill = record.clone();
+                let checkout_access = server.state.checkout_access.clone();
                 // lint-concurrency: allow(thread-spawn) — one-shot registration backfill; relocation to an owner module tracked in thread-935b467d
                 std::thread::spawn(move || {
-                    match index::backfill_tool_edges_for_project(
-                        &reindex_cfg,
-                        &project_for_backfill,
-                    ) {
+                    let result = (|| {
+                        let local = crate::server::checkout_access::acquire_selected_project_access(
+                        &checkout_access,
+                        &project_for_backfill.project_id,
+                        bbox_indexing::checkout_access::CheckoutAccessKind::LocalProjectWalk,
+                        bbox_indexing::checkout_access::CheckoutAccessIntent::Read,
+                        )?;
+                        let git = project_for_backfill
+                            .is_git_repo
+                            .then(|| {
+                                crate::server::checkout_access::acquire_selected_project_access(
+                                    &checkout_access,
+                                    &project_for_backfill.project_id,
+                                    bbox_indexing::checkout_access::CheckoutAccessKind::GitHistory,
+                                    bbox_indexing::checkout_access::CheckoutAccessIntent::Read,
+                                )
+                            })
+                            .transpose()?;
+                        index::backfill_tool_edges_for_project(
+                            &reindex_cfg,
+                            &project_for_backfill,
+                            local.project_root(),
+                            git.as_ref().map(|lease| lease.checkout_root()),
+                            || {
+                                checkout_access
+                                    .publication_guard_for(
+                                        std::iter::once(&local).chain(git.iter()),
+                                    )
+                                    .map_err(anyhow::Error::new)
+                            },
+                        )
+                    })();
+                    match result {
                         Ok(written) => tracing::info!(
                             project_id = %project_for_backfill.project_id,
                             edges_written = written,
@@ -432,10 +548,17 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let start = std::time::Instant::now();
         // Phase 1: rename in registry + async persist.
+        let lifecycle = match self.state.checkout_access.lifecycle_mutation_guard() {
+            Ok(guard) => guard,
+            Err(error) => {
+                return Self::err_text(&format!("Error: {error}"));
+            }
+        };
         let res = {
             let mut projects = self.state.projects.write();
             projects.rename_project(&p)
         };
+        drop(lifecycle);
         let response = match res {
             Ok(response) => response,
             Err(e) => {
@@ -466,21 +589,33 @@ impl BlackboxServer {
                     &new_project,
                     &response.record,
                 )?;
-                // Re-point kb roots at the new path now that migration has
-                // rewritten entries into the renamed repo's `.bbox/`, and
-                // re-enqueue embeds under the new path.
-                // Use update_project_roots (no reload) because in-memory
-                // mutations from migrate_rename are still live; reload would
-                // clobber them.
-                let roots: Vec<std::path::PathBuf> = server
-                    .state
-                    .projects
-                    .read()
-                    .list()
-                    .into_iter()
-                    .map(|r| std::path::PathBuf::from(r.canonical_path))
-                    .collect();
-                server.state.kb.write().update_project_roots(roots);
+                // Re-point logical carriers without reloading because the
+                // in-memory mutations from migrate_rename are still live.
+                let projects = server.state.projects.read().list();
+                let carriers =
+                    crate::server::repo_io::RepoIoAuthority::knowledge_base_carriers(&projects)?;
+                server.state.kb.write().update_project_carriers(carriers);
+                if let Ok(mut guard) = server.state.bbox_watcher.lock()
+                    && let Some(watcher) = guard.as_mut()
+                    && let Ok(carrier) = crate::watcher::ArtifactWatchCarrier::selected(
+                        response.record.project_id.clone(),
+                    )
+                {
+                    if let Err(error) = watcher.unwatch_carrier(&carrier) {
+                        tracing::warn!(
+                            project = %response.record.project_id,
+                            error = %error,
+                            "project rename could not remove the prior watcher registration"
+                        );
+                    }
+                    if let Err(error) = watcher.watch_project(carrier) {
+                        tracing::warn!(
+                            project = %response.record.project_id,
+                            error = %error,
+                            "project rename could not register the replacement watcher"
+                        );
+                    }
+                }
                 crate::server::routes::enqueue_project_knowledge_embeds(
                     &server.state,
                     &new_project,
@@ -580,11 +715,50 @@ impl BlackboxServer {
                 );
             }
 
+            let _lifecycle = self
+                .state
+                .checkout_access
+                .lifecycle_mutation_guard()
+                .map_err(anyhow::Error::new)?;
             let removed = {
                 let mut projects = self.state.projects.write();
                 projects.unregister_project(&p.project)?
             };
+            drop(_lifecycle);
             self.state.persist_projects_durable().await?;
+
+            let checkout_rows = self.state.checkout_registry.read().rows().to_vec();
+            if let Ok(mut guard) = self.state.bbox_watcher.lock()
+                && let Some(watcher) = guard.as_mut()
+            {
+                if let Ok(carrier) =
+                    crate::watcher::ArtifactWatchCarrier::selected(record.project_id.clone())
+                    && let Err(error) = watcher.unwatch_carrier(&carrier)
+                {
+                    tracing::warn!(
+                        project = %record.project_id,
+                        error = %error,
+                        "project unregister could not remove its watcher registration"
+                    );
+                }
+                for row in &checkout_rows {
+                    if row.project_id.as_deref() != Some(record.project_id.as_str()) {
+                        continue;
+                    }
+                    if let Ok(carrier) = crate::watcher::ArtifactWatchCarrier::checkout(
+                        record.project_id.clone(),
+                        row.checkout_id.clone(),
+                    ) && let Err(error) = watcher.unwatch_carrier(&carrier)
+                    {
+                        tracing::warn!(
+                            project = %record.project_id,
+                            checkout_id = %row.checkout_id,
+                            error = %error,
+                            "project unregister could not remove a checkout watcher registration"
+                        );
+                    }
+                }
+            }
 
             // Drop the unregistered project's repo from kb roots; its committed
             // `.bbox/knowledge/` stays on disk and reloads on re-register.
@@ -640,7 +814,20 @@ impl BlackboxServer {
             let dir = record.canonical_path.clone();
             let dry_run = p.dry_run.unwrap_or(false);
             let recorded_repo_id = if !dry_run && record.is_git_repo {
-                Some(config::ensure_recorded_repo_id(Path::new(&dir))?)
+                let lease = crate::server::checkout_access::acquire_selected_project_access(
+                    &server.state.checkout_access,
+                    &record.project_id,
+                    CheckoutAccessKind::RepositoryMutation,
+                    CheckoutAccessIntent::Write,
+                )?;
+                let publication = server
+                    .state
+                    .checkout_access
+                    .publication_guard(&lease)
+                    .map_err(anyhow::Error::new)?;
+                let repo_id = config::ensure_recorded_repo_id(lease.project_root())?;
+                drop(publication);
+                Some(repo_id)
             } else {
                 None
             };
@@ -924,6 +1111,31 @@ mod tests {
             std::fs::read_to_string(root.join(".bbox/config.toml")).unwrap(),
             config_before
         );
+    }
+
+    #[test]
+    fn prepared_registration_artifacts_are_not_installed_until_publish() {
+        let dir = tempdir().unwrap();
+        let project_dir = dir.path().join("myproject");
+        let workflow_dir = project_dir.join(".bbox/workflows");
+        std::fs::create_dir_all(&workflow_dir).unwrap();
+        std::fs::write(
+            workflow_dir.join("prepared-flow.json"),
+            r#"{"name":"prepared-flow","version":"1","steps":[]}"#,
+        )
+        .unwrap();
+        let catalog_dir = dir.path().join("catalog");
+        let catalog = artifacts::ArtifactCatalog::open(&catalog_dir).unwrap();
+        let installed_path =
+            catalog_dir.join("projects/proj-prepared/committed/workflow/prepared-flow.json");
+
+        let prepared = prepare_project_artifacts(&project_dir).unwrap();
+        assert_eq!(prepared.len(), 1);
+        assert!(!installed_path.exists());
+
+        let installed = publish_project_artifacts(prepared, "proj-prepared", &catalog);
+        assert_eq!(installed.len(), 1);
+        assert!(installed_path.exists());
     }
 
     #[test]

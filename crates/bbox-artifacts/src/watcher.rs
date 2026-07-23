@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -82,12 +83,21 @@ fn validate_logical_id(label: &str, value: &str) -> anyhow::Result<()> {
 ///
 /// Implementations resolve the logical carrier, acquire
 /// `ArtifactWatchDiscovery` read authority, and invoke `operation` exactly once
-/// while the opaque lease remains alive. A denial must not invoke `operation`.
+/// while the opaque lease remains alive. Checkout bytes are available only
+/// through the descriptor-relative reader, which must reject symlinks in every
+/// path component. A denial must not invoke `operation`.
+pub trait ArtifactWatchRead {
+    fn project_root(&self) -> &Path;
+
+    fn read_relative_file(&self, relative: &Path) -> anyhow::Result<Vec<u8>>;
+}
+
 pub trait ArtifactWatchAccess: Send + Sync {
     fn with_discovery(
         &self,
         carrier: &ArtifactWatchCarrier,
-        operation: &mut dyn FnMut(&Path) -> anyhow::Result<()>,
+        prepare: &mut dyn FnMut(&dyn ArtifactWatchRead) -> anyhow::Result<()>,
+        publish: &mut dyn FnMut() -> anyhow::Result<()>,
     ) -> anyhow::Result<()>;
 }
 
@@ -218,13 +228,15 @@ impl BbxWatcher {
 
         let mut invoked = false;
         let mut discovered_root = None;
+        let mut installed_new_watch = false;
         let registrations = self.registrations.clone();
         let debouncer = &mut self.debouncer;
-        let mut operation = |project_root: &Path| {
+        let mut operation = |read: &dyn ArtifactWatchRead| {
             if invoked {
                 anyhow::bail!("artifact watch authority invoked registration more than once");
             }
             invoked = true;
+            let project_root = read.project_root();
             let Some(bbox_root) = canonical_bbox_root(project_root) else {
                 return Ok(());
             };
@@ -241,13 +253,22 @@ impl BbxWatcher {
                 .any(|registration| registration.bbox_root == bbox_root);
             if !already_watched {
                 debouncer.watch(&bbox_root, notify::RecursiveMode::Recursive)?;
+                installed_new_watch = true;
             }
             discovered_root = Some(bbox_root);
             Ok(())
         };
-        let discovery_result = self.access.with_discovery(&carrier, &mut operation);
+        let mut publish = || Ok(());
+        let discovery_result = self
+            .access
+            .with_discovery(&carrier, &mut operation, &mut publish);
         drop(operation);
-        discovery_result?;
+        if let Err(error) = discovery_result {
+            if installed_new_watch && let Some(root) = discovered_root.as_ref() {
+                let _ = self.debouncer.unwatch(root);
+            }
+            return Err(error);
+        }
         if !invoked {
             anyhow::bail!("artifact watch authority did not invoke registration");
         }
@@ -311,13 +332,95 @@ fn canonical_bbox_root(project_dir: &Path) -> Option<PathBuf> {
     bbox_dir.starts_with(&project_dir).then_some(bbox_dir)
 }
 
-/// Route an authorized event to the appropriate artifact action.
-fn handle_artifact_event(
+enum PreparedArtifactAction {
+    Install {
+        project_id: String,
+        local: bool,
+        kind: crate::artifacts::ArtifactKind,
+        source: String,
+        value: serde_json::Value,
+    },
+    Remove {
+        project_id: String,
+        local: bool,
+        kind: crate::artifacts::ArtifactKind,
+        source: PathBuf,
+    },
+}
+
+impl PreparedArtifactAction {
+    fn publish(self, catalog: &ArtifactCatalog) {
+        match self {
+            Self::Install {
+                project_id,
+                local,
+                kind,
+                source,
+                value,
+            } => match catalog.install_value_scoped(
+                ArtifactScope::Project {
+                    project_id: &project_id,
+                    local,
+                },
+                kind,
+                source,
+                &value,
+                None,
+                None,
+                None,
+            ) {
+                Ok(meta) => tracing::info!(
+                    "watcher: installed {}/{} v{} (project {})",
+                    kind.as_str(),
+                    meta.name,
+                    meta.version,
+                    project_id,
+                ),
+                Err(error) => tracing::warn!(
+                    artifact_kind = %kind.as_str(),
+                    error = %error,
+                    "watcher: prepared artifact install failed"
+                ),
+            },
+            Self::Remove {
+                project_id,
+                local,
+                kind,
+                source,
+            } => match catalog.mark_removed_by_source(
+                ArtifactScope::Project {
+                    project_id: &project_id,
+                    local,
+                },
+                kind,
+                &source,
+            ) {
+                Ok(Some(meta)) => tracing::info!(
+                    "watcher: marked removed {}/{} (project {})",
+                    kind.as_str(),
+                    meta.name,
+                    project_id,
+                ),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    artifact_kind = %kind.as_str(),
+                    error = %error,
+                    "watcher: prepared artifact removal failed"
+                ),
+            },
+        }
+    }
+}
+
+/// Read and validate an authorized event without publishing catalog state.
+/// Publication happens only after the daemon adapter has revalidated the
+/// lease that guarded these bytes.
+fn prepare_artifact_event(
     event: &notify::Event,
     project_id: &str,
     bbox_root: &Path,
-    catalog: &ArtifactCatalog,
-) {
+    read: &dyn ArtifactWatchRead,
+) -> Vec<PreparedArtifactAction> {
     let is_create_or_rename_to = matches!(
         event.kind,
         notify::EventKind::Create(_)
@@ -328,9 +431,10 @@ fn handle_artifact_event(
     let is_remove = matches!(event.kind, notify::EventKind::Remove(_));
 
     if !is_create_or_rename_to && !is_remove {
-        return;
+        return Vec::new();
     }
 
+    let mut actions = Vec::new();
     for path in &event.paths {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
@@ -349,11 +453,14 @@ fn handle_artifact_event(
         }
 
         if is_create_or_rename_to {
-            handle_create(path, project_id, bbox_root, catalog);
-        } else {
-            handle_remove(path, project_id, bbox_root, catalog);
+            if let Some(action) = prepare_create(path, project_id, bbox_root, read) {
+                actions.push(action);
+            }
+        } else if let Some(action) = prepare_remove(path, project_id, bbox_root) {
+            actions.push(action);
         }
     }
+    actions
 }
 
 fn handle_event_batch(
@@ -364,126 +471,116 @@ fn handle_event_batch(
     on_knowledge_change: Option<&KnowledgeChangeCallback>,
 ) {
     for registration in registrations {
-        if !events.iter().any(|event| {
+        let mut repo_store_dirty = false;
+        for event in events.iter().filter(|event| {
             event
                 .paths
                 .iter()
                 .any(|path| path.starts_with(&registration.bbox_root))
         }) {
-            continue;
-        }
-
-        let mut invoked = false;
-        let mut operation = |project_root: &Path| {
-            if invoked {
-                anyhow::bail!("artifact watch authority invoked event handling more than once");
-            }
-            invoked = true;
-            let Some(bbox_root) = canonical_bbox_root(project_root) else {
-                anyhow::bail!("authorized artifact watch root has no .bbox directory");
-            };
-            if bbox_root != registration.bbox_root {
-                anyhow::bail!("artifact watch registration no longer matches authorized root");
-            }
-
-            let mut repo_store_dirty = false;
-            for event in events {
-                if !event.paths.iter().any(|path| path.starts_with(&bbox_root)) {
-                    continue;
+            let mut invoked = false;
+            let mut event_repo_store_dirty = false;
+            let prepared_actions = RefCell::new(Vec::new());
+            let mut operation = |read: &dyn ArtifactWatchRead| {
+                if invoked {
+                    anyhow::bail!("artifact watch authority invoked event handling more than once");
+                }
+                invoked = true;
+                let project_root = read.project_root();
+                let Some(bbox_root) = canonical_bbox_root(project_root) else {
+                    anyhow::bail!("authorized artifact watch root has no .bbox directory");
+                };
+                if bbox_root != registration.bbox_root {
+                    anyhow::bail!("artifact watch registration no longer matches authorized root");
                 }
                 if registration.artifact_routing {
-                    handle_artifact_event(
+                    *prepared_actions.borrow_mut() = prepare_artifact_event(
                         event,
                         &registration.carrier.project_id,
                         &bbox_root,
-                        catalog,
+                        read,
                     );
                 }
-                repo_store_dirty |=
+                event_repo_store_dirty =
                     event_touches_repo_store(event, std::slice::from_ref(&bbox_root));
+                Ok(())
+            };
+            let mut publish = || {
+                for action in prepared_actions.borrow_mut().drain(..) {
+                    action.publish(catalog);
+                }
+                Ok(())
+            };
+            let discovery_result =
+                access.with_discovery(&registration.carrier, &mut operation, &mut publish);
+            drop(operation);
+            if let Err(err) = discovery_result {
+                tracing::debug!(
+                    project = %registration.carrier.project_id,
+                    attachment = ?registration.carrier.attachment,
+                    error = %err,
+                    "artifact watcher skipped event for unavailable carrier"
+                );
+            } else if !invoked {
+                tracing::debug!(
+                    project = %registration.carrier.project_id,
+                    attachment = ?registration.carrier.attachment,
+                    "artifact watcher authority skipped event operation"
+                );
+            } else {
+                repo_store_dirty |= event_repo_store_dirty;
             }
-            if repo_store_dirty && let Some(callback) = on_knowledge_change {
-                callback(&registration.carrier);
-            }
-            Ok(())
-        };
-        let discovery_result = access.with_discovery(&registration.carrier, &mut operation);
-        drop(operation);
-        if let Err(err) = discovery_result {
-            tracing::debug!(
-                project = %registration.carrier.project_id,
-                attachment = ?registration.carrier.attachment,
-                error = %err,
-                "artifact watcher skipped event for unavailable carrier"
-            );
-        } else if !invoked {
-            tracing::debug!(
-                project = %registration.carrier.project_id,
-                attachment = ?registration.carrier.attachment,
-                "artifact watcher authority skipped event operation"
-            );
+        }
+        if repo_store_dirty && let Some(callback) = on_knowledge_change {
+            callback(&registration.carrier);
         }
     }
 }
 
-fn handle_create(path: &Path, project_id: &str, bbox_root: &Path, catalog: &ArtifactCatalog) {
-    let path = match path.canonicalize() {
-        Ok(path) if path.starts_with(bbox_root) => path,
-        Ok(_) => {
-            tracing::debug!("watcher: refused artifact path outside authorized .bbox root");
-            return;
-        }
+fn prepare_create(
+    path: &Path,
+    project_id: &str,
+    bbox_root: &Path,
+    read: &dyn ArtifactWatchRead,
+) -> Option<PreparedArtifactAction> {
+    let Some(source) = logical_artifact_source(path, bbox_root) else {
+        return None;
+    };
+    let raw = match read.read_relative_file(&source) {
+        Ok(raw) => raw,
         Err(e) => {
-            tracing::debug!("watcher: could not resolve {}: {e}", path.display());
-            return;
+            tracing::debug!("watcher: confined read refused {}: {e}", source.display());
+            return None;
         }
     };
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::debug!("watcher: could not read {}: {e}", path.display());
-            return;
-        }
-    };
-    let value: serde_json::Value = match serde_json::from_str(&raw) {
+    let value: serde_json::Value = match serde_json::from_slice(&raw) {
         Ok(v) => v,
         Err(e) => {
             tracing::debug!("watcher: could not parse {}: {e}", path.display());
-            return;
+            return None;
         }
     };
     let local = is_local_path(&path, bbox_root);
     let kind = match path_to_artifact_kind(&path, bbox_root) {
         Some(k) => k,
-        None => return,
+        None => return None,
     };
-    let Some(source) = logical_artifact_source(&path, bbox_root) else {
-        return;
-    };
-    let scope = ArtifactScope::Project { project_id, local };
-    match catalog.install_value_scoped(
-        scope,
+    Some(PreparedArtifactAction::Install {
+        project_id: project_id.to_owned(),
+        local,
         kind,
-        source.to_string_lossy().into_owned(),
-        &value,
-        None,
-        None,
-        None,
-    ) {
-        Ok(meta) => tracing::info!(
-            "watcher: installed {}/{} v{} (project {})",
-            kind.as_str(),
-            meta.name,
-            meta.version,
-            project_id,
-        ),
-        Err(e) => tracing::warn!("watcher: install failed for {}: {e}", path.display()),
-    }
+        source: source.to_string_lossy().into_owned(),
+        value,
+    })
 }
 
-fn handle_remove(path: &Path, project_id: &str, bbox_root: &Path, catalog: &ArtifactCatalog) {
+fn prepare_remove(
+    path: &Path,
+    project_id: &str,
+    bbox_root: &Path,
+) -> Option<PreparedArtifactAction> {
     let Ok(relative) = path.strip_prefix(bbox_root) else {
-        return;
+        return None;
     };
     if relative.components().any(|component| {
         matches!(
@@ -493,27 +590,22 @@ fn handle_remove(path: &Path, project_id: &str, bbox_root: &Path, catalog: &Arti
                 | std::path::Component::Prefix(_)
         )
     }) {
-        return;
+        return None;
     }
     let Some(source) = logical_artifact_source(path, bbox_root) else {
-        return;
+        return None;
     };
     let local = is_local_path(path, bbox_root);
     let kind = match path_to_artifact_kind(path, bbox_root) {
         Some(k) => k,
-        None => return,
+        None => return None,
     };
-    let scope = ArtifactScope::Project { project_id, local };
-    match catalog.mark_removed_by_source(scope, kind, &source) {
-        Ok(Some(meta)) => tracing::info!(
-            "watcher: marked removed {}/{} (project {})",
-            kind.as_str(),
-            meta.name,
-            project_id,
-        ),
-        Ok(None) => {}
-        Err(e) => tracing::warn!("watcher: mark_removed failed for {}: {e}", path.display()),
-    }
+    Some(PreparedArtifactAction::Remove {
+        project_id: project_id.to_owned(),
+        local,
+        kind,
+        source,
+    })
 }
 
 /// True when an event is a create/modify/remove of a committed repo-owned store
@@ -588,8 +680,51 @@ mod tests {
     struct TestWatchAccess {
         roots: Mutex<BTreeMap<ArtifactWatchCarrier, PathBuf>>,
         denied: AtomicBool,
+        deny_relative_reads: AtomicBool,
+        fail_after_operation: AtomicBool,
         operation_calls: AtomicUsize,
+        relative_read_calls: AtomicUsize,
         operation_active: AtomicBool,
+    }
+
+    struct TestWatchRead<'a> {
+        access: &'a TestWatchAccess,
+        root: PathBuf,
+    }
+
+    impl ArtifactWatchRead for TestWatchRead<'_> {
+        fn project_root(&self) -> &Path {
+            &self.root
+        }
+
+        fn read_relative_file(&self, relative: &Path) -> anyhow::Result<Vec<u8>> {
+            self.access
+                .relative_read_calls
+                .fetch_add(1, Ordering::SeqCst);
+            if self.access.deny_relative_reads.load(Ordering::SeqCst) {
+                anyhow::bail!("confined artifact read denied");
+            }
+            let mut current = self.root.clone();
+            let components = relative.components().collect::<Vec<_>>();
+            if components.is_empty() {
+                anyhow::bail!("empty relative artifact path");
+            }
+            for (index, component) in components.iter().enumerate() {
+                let std::path::Component::Normal(name) = component else {
+                    anyhow::bail!("unsafe relative artifact path");
+                };
+                current.push(name);
+                let metadata = std::fs::symlink_metadata(&current)?;
+                if metadata.file_type().is_symlink() {
+                    anyhow::bail!("symlinked artifact path refused");
+                }
+                let is_last = index + 1 == components.len();
+                if (is_last && !metadata.is_file()) || (!is_last && !metadata.is_dir()) {
+                    anyhow::bail!("artifact path component has the wrong type");
+                }
+            }
+            Ok(std::fs::read(current)?)
+        }
     }
 
     impl TestWatchAccess {
@@ -602,7 +737,8 @@ mod tests {
         fn with_discovery(
             &self,
             carrier: &ArtifactWatchCarrier,
-            operation: &mut dyn FnMut(&Path) -> anyhow::Result<()>,
+            prepare: &mut dyn FnMut(&dyn ArtifactWatchRead) -> anyhow::Result<()>,
+            publish: &mut dyn FnMut() -> anyhow::Result<()>,
         ) -> anyhow::Result<()> {
             if self.denied.load(Ordering::SeqCst) {
                 anyhow::bail!("artifact watch discovery denied");
@@ -616,9 +752,14 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("unknown artifact watch carrier"))?;
             self.operation_calls.fetch_add(1, Ordering::SeqCst);
             self.operation_active.store(true, Ordering::SeqCst);
-            let result = operation(&root);
+            let read = TestWatchRead { access: self, root };
+            let result = prepare(&read);
             self.operation_active.store(false, Ordering::SeqCst);
-            result
+            result?;
+            if self.fail_after_operation.load(Ordering::SeqCst) {
+                anyhow::bail!("artifact watch discovery changed after operation");
+            }
+            publish()
         }
     }
 
@@ -855,22 +996,33 @@ mod tests {
     }
 
     #[test]
-    fn provisional_root_is_watched_without_artifact_authority() {
+    fn provisional_carrier_resolves_without_artifact_routing() {
         let dir = tempdir().unwrap();
         let project = dir.path().canonicalize().unwrap().join("checkout");
         std::fs::create_dir_all(project.join(".bbox/knowledge")).unwrap();
-        let catalog = Arc::new(ArtifactCatalog::open(dir.path().join("catalog")).unwrap());
         let carrier = ArtifactWatchCarrier::checkout("proj-gamma", "checkout-gamma").unwrap();
-        let access = Arc::new(TestWatchAccess::default());
-        access.insert(carrier.clone(), project);
-        let mut watcher = BbxWatcher::start(Vec::new(), access, catalog, None).unwrap();
+        let access = TestWatchAccess::default();
+        access.insert(carrier.clone(), project.clone());
+        let mut discovered = None;
+        let mut publish = || Ok(());
+        access
+            .with_discovery(
+                &carrier,
+                &mut |read| {
+                    discovered = Some(registration(carrier.clone(), read.project_root(), false));
+                    Ok(())
+                },
+                &mut publish,
+            )
+            .unwrap();
 
-        assert!(watcher.watch_repo_store(carrier.clone()).unwrap());
-        assert_eq!(watcher.registrations.lock().unwrap().len(), 1);
-        assert!(!watcher.registrations.lock().unwrap()[0].artifact_routing);
-        assert!(!watcher.watch_repo_store(carrier.clone()).unwrap());
-        assert!(watcher.unwatch_repo_store(&carrier).unwrap());
-        assert!(watcher.registrations.lock().unwrap().is_empty());
+        let discovered = discovered.unwrap();
+        assert_eq!(discovered.carrier, carrier);
+        assert_eq!(
+            discovered.bbox_root,
+            project.join(".bbox").canonicalize().unwrap()
+        );
+        assert!(!discovered.artifact_routing);
     }
 
     #[test]
@@ -890,11 +1042,9 @@ mod tests {
         std::fs::write(&knowledge_path, "{}").unwrap();
         let carrier = ArtifactWatchCarrier::selected("proj-denied").unwrap();
         let access = Arc::new(TestWatchAccess::default());
-        access.insert(carrier.clone(), project);
+        access.insert(carrier.clone(), project.clone());
         let catalog = Arc::new(ArtifactCatalog::open(dir.path().join("catalog")).unwrap());
-        let mut watcher =
-            BbxWatcher::start(Vec::new(), access.clone(), catalog.clone(), None).unwrap();
-        assert!(watcher.watch_project(carrier).unwrap());
+        let registration = registration(carrier, &project, true);
         let registration_calls = access.operation_calls.load(Ordering::SeqCst);
         access.denied.store(true, Ordering::SeqCst);
         let artifact_event = notify::Event {
@@ -917,7 +1067,7 @@ mod tests {
 
         handle_event_batch(
             &[artifact_event, knowledge_event],
-            &watcher.registrations.lock().unwrap().clone(),
+            &[registration],
             access.as_ref(),
             &catalog,
             Some(&callback),
@@ -947,7 +1097,100 @@ mod tests {
     }
 
     #[test]
-    fn repo_change_callback_runs_inside_discovery_scope() {
+    fn artifact_event_reads_only_through_authority_reader() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().canonicalize().unwrap().join("project");
+        let workflows = project.join(".bbox/workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        let artifact_path = workflows.join("confined-flow.json");
+        std::fs::write(
+            &artifact_path,
+            serde_json::to_vec(&make_workflow("confined-flow")).unwrap(),
+        )
+        .unwrap();
+        let carrier = ArtifactWatchCarrier::selected("proj-confined").unwrap();
+        let access = TestWatchAccess::default();
+        access.insert(carrier.clone(), project.clone());
+        access.deny_relative_reads.store(true, Ordering::SeqCst);
+        let event = notify::Event {
+            kind: notify::EventKind::Create(notify::event::CreateKind::File),
+            paths: vec![artifact_path],
+            attrs: Default::default(),
+        };
+        let catalog = ArtifactCatalog::open(dir.path().join("catalog")).unwrap();
+
+        handle_event_batch(
+            &[event],
+            &[registration(carrier, &project, true)],
+            &access,
+            &catalog,
+            None,
+        );
+
+        assert_eq!(access.relative_read_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            catalog
+                .load_artifact_value_scoped(
+                    Some("proj-confined"),
+                    crate::artifacts::ArtifactKind::Workflow,
+                    "confined-flow",
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_artifact_leaf_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = root.join("project");
+        let workflows = project.join(".bbox/workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        let outside = root.join("outside.json");
+        std::fs::write(
+            &outside,
+            serde_json::to_vec(&make_workflow("linked-flow")).unwrap(),
+        )
+        .unwrap();
+        let linked = workflows.join("linked-flow.json");
+        symlink(&outside, &linked).unwrap();
+        let carrier = ArtifactWatchCarrier::selected("proj-linked").unwrap();
+        let access = TestWatchAccess::default();
+        access.insert(carrier.clone(), project.clone());
+        let event = notify::Event {
+            kind: notify::EventKind::Create(notify::event::CreateKind::File),
+            paths: vec![linked],
+            attrs: Default::default(),
+        };
+        let catalog = ArtifactCatalog::open(root.join("catalog")).unwrap();
+
+        handle_event_batch(
+            &[event],
+            &[registration(carrier, &project, true)],
+            &access,
+            &catalog,
+            None,
+        );
+
+        assert_eq!(access.relative_read_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            catalog
+                .load_artifact_value_scoped(
+                    Some("proj-linked"),
+                    crate::artifacts::ArtifactKind::Workflow,
+                    "linked-flow",
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn repo_change_callback_runs_only_after_discovery_scope_succeeds() {
         let dir = tempdir().unwrap();
         let project = dir.path().canonicalize().unwrap().join("project");
         let knowledge = project.join(".bbox/knowledge");
@@ -963,8 +1206,8 @@ mod tests {
         let callback_calls_cb = callback_calls.clone();
         let callback: KnowledgeChangeCallback = Arc::new(move |_| {
             assert!(
-                access_cb.operation_active.load(Ordering::SeqCst),
-                "repository callback must run while discovery authority is active"
+                !access_cb.operation_active.load(Ordering::SeqCst),
+                "repository callback must run only after discovery revalidation succeeds"
             );
             callback_calls_cb.fetch_add(1, Ordering::SeqCst);
         });
@@ -987,5 +1230,54 @@ mod tests {
 
         assert_eq!(callback_calls.load(Ordering::SeqCst), 1);
         assert!(!access.operation_active.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn post_operation_authority_failure_publishes_no_artifact_or_reload() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().canonicalize().unwrap().join("project");
+        let workflows = project.join(".bbox/workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        let artifact_path = workflows.join("stale-flow.json");
+        std::fs::write(
+            &artifact_path,
+            serde_json::to_string(&make_workflow("stale-flow")).unwrap(),
+        )
+        .unwrap();
+        let carrier = ArtifactWatchCarrier::selected("proj-stale").unwrap();
+        let access = Arc::new(TestWatchAccess::default());
+        access.insert(carrier.clone(), project.clone());
+        access.fail_after_operation.store(true, Ordering::SeqCst);
+        let callback_calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls_cb = callback_calls.clone();
+        let callback: KnowledgeChangeCallback = Arc::new(move |_| {
+            callback_calls_cb.fetch_add(1, Ordering::SeqCst);
+        });
+        let event = notify::Event {
+            kind: notify::EventKind::Create(notify::event::CreateKind::File),
+            paths: vec![artifact_path],
+            attrs: Default::default(),
+        };
+        let catalog = ArtifactCatalog::open(dir.path().join("catalog")).unwrap();
+
+        handle_event_batch(
+            &[event],
+            &[registration(carrier, &project, true)],
+            access.as_ref(),
+            &catalog,
+            Some(&callback),
+        );
+
+        assert!(
+            catalog
+                .load_artifact_value_scoped(
+                    Some("proj-stale"),
+                    crate::artifacts::ArtifactKind::Workflow,
+                    "stale-flow",
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(callback_calls.load(Ordering::SeqCst), 0);
     }
 }

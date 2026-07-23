@@ -11,6 +11,7 @@ mod knowledge_view;
 mod mcp;
 mod open;
 pub mod progress;
+pub(crate) mod repo_io;
 pub mod response;
 mod restore;
 pub mod routes;
@@ -78,6 +79,23 @@ impl BlackboxServer {
             surface: std::sync::OnceLock::new(),
             surface_project: std::sync::OnceLock::new(),
             session_checkout: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn provider_context(&self) -> crate::providers::ProviderContext<'_> {
+        let context = crate::providers::ProviderContext::new_with_ext(
+            self.state.corpus_stores(),
+            self.state.as_ref(),
+        );
+        match self.authoritative_session_checkout() {
+            Some(checkout) => {
+                context.with_checkout_selection(crate::providers::ProviderCheckoutSelection {
+                    project_id: checkout.project_id.clone(),
+                    checkout_id: checkout.checkout_id.clone(),
+                    published_scope: checkout.published_scope.clone(),
+                })
+            }
+            None => context,
         }
     }
 }

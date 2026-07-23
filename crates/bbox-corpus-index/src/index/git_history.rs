@@ -29,11 +29,43 @@ pub struct GitIndexContext<'a> {
     pub edges_dir: &'a Path,
     pub git_meta_dir: &'a Path,
     pub force_full: bool,
+    pub publication: &'a mut super::project_files::ProjectIndexPublicationBundle,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct GitIngestMeta {
     last_ingested_sha: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct GitHistoryPublication {
+    edges_dir: PathBuf,
+    project_id: String,
+    edges: Vec<Edge>,
+    force_full: bool,
+    git_meta_path: PathBuf,
+    git_meta: GitIngestMeta,
+}
+
+impl GitHistoryPublication {
+    pub(crate) fn publish(self) -> Result<()> {
+        if self.force_full {
+            bbox_edge_sidecar::edge_sidecar::replace_materialized_edges(
+                &self.edges_dir,
+                "git",
+                &self.project_id,
+                &self.edges,
+            )?;
+        } else {
+            bbox_edge_sidecar::edge_sidecar::merge_materialized_edges(
+                &self.edges_dir,
+                "git",
+                &self.project_id,
+                &self.edges,
+            )?;
+        }
+        save_git_meta(&self.git_meta_path, &self.git_meta)
+    }
 }
 
 pub fn git_source_key(project_id: &str) -> String {
@@ -91,7 +123,14 @@ pub fn index_git_history_for_project(
     let commits = bbox_corpus_core::git::commit_log(root, since)?;
     if commits.is_empty() {
         git_meta.last_ingested_sha = Some(head);
-        save_git_meta(&git_meta_path, &git_meta)?;
+        ctx.publication.stage_git_history(GitHistoryPublication {
+            edges_dir: ctx.edges_dir.to_path_buf(),
+            project_id: project.project_id.clone(),
+            edges: Vec::new(),
+            force_full: ctx.force_full,
+            git_meta_path,
+            git_meta,
+        });
         ctx.meta.insert(
             source_key,
             FileMeta {
@@ -121,27 +160,17 @@ pub fn index_git_history_for_project(
         edges.extend(commit_edges(root, repo_id, &commit, project_chunks)?);
     }
     stats.emitted_edges = edges.len() as u64;
-    // Phase 2: git commit edges are materialized (Derived). Use managed
-    // merge: full replacement on force_full, incremental deduped merge on
-    // incremental ingest. Deferred: repo-scoped content-addressed lane keyed
-    // by commit SHA.
-    if ctx.force_full {
-        bbox_edge_sidecar::edge_sidecar::replace_materialized_edges(
-            ctx.edges_dir,
-            "git",
-            &project.project_id,
-            &edges,
-        )?;
-    } else {
-        bbox_edge_sidecar::edge_sidecar::merge_materialized_edges(
-            ctx.edges_dir,
-            "git",
-            &project.project_id,
-            &edges,
-        )?;
-    }
+    // Stage the managed Git sidecar and ingest cursor together. The daemon
+    // publishes both only inside its final checkout-authority fence.
     git_meta.last_ingested_sha = Some(head);
-    save_git_meta(&git_meta_path, &git_meta)?;
+    ctx.publication.stage_git_history(GitHistoryPublication {
+        edges_dir: ctx.edges_dir.to_path_buf(),
+        project_id: project.project_id.clone(),
+        edges,
+        force_full: ctx.force_full,
+        git_meta_path,
+        git_meta,
+    });
     ctx.meta.insert(
         source_key,
         FileMeta {
@@ -438,6 +467,7 @@ mod tests {
         let mut meta: HashMap<String, FileMeta> = HashMap::new();
         let edges_dir = state.path().join("edges");
         let git_meta_dir = state.path().join("git_meta");
+        let mut publication = crate::index::project_files::ProjectIndexPublicationBundle::default();
         let mut ctx = GitIndexContext {
             f: fields,
             writer: &mut writer,
@@ -445,10 +475,26 @@ mod tests {
             edges_dir: &edges_dir,
             git_meta_dir: &git_meta_dir,
             force_full: true,
+            publication: &mut publication,
         };
         let stats = index_git_history_for_project(&project, repo.path(), &HashMap::new(), &mut ctx)
             .unwrap();
+        drop(ctx);
         assert_eq!(stats.indexed_commits, 2);
+        assert!(
+            !git_meta_dir.join("proj1234.json").exists(),
+            "Git ingest metadata must remain staged until final publication"
+        );
+        assert!(
+            bbox_edge_sidecar::edge_sidecar::read_managed_derived_edges(
+                &edges_dir, "git", "proj1234",
+            )
+            .unwrap()
+            .is_empty(),
+            "Git sidecars must remain unchanged until final publication"
+        );
+        publication.publish().unwrap();
+        assert!(git_meta_dir.join("proj1234.json").exists());
         writer.commit().unwrap();
 
         let reader = index.reader().unwrap();

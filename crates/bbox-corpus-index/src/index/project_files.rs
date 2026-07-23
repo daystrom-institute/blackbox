@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
@@ -43,6 +44,204 @@ pub struct ProjectIndexStats {
     pub skipped_unsupported: u64,
     pub skipped_oversize: u64,
     pub pending_local_snapshots: Vec<bbox_edge_sidecar::snapshot::PendingLocalSnapshotActivation>,
+    pub publication: ProjectIndexPublicationBundle,
+}
+
+#[derive(Debug, Default)]
+pub struct ProjectIndexPublicationBundle {
+    actions: Vec<ProjectIndexPublication>,
+}
+
+#[derive(Debug)]
+enum ProjectIndexPublication {
+    SnapshotRename {
+        staged: PathBuf,
+        destination: PathBuf,
+    },
+    ProjectEdges {
+        edges_dir: PathBuf,
+        project_id: String,
+        edges: Vec<Edge>,
+        deleted_rel_hashes: std::collections::HashSet<String>,
+        compact_legacy: bool,
+    },
+    GitHistory(super::git_history::GitHistoryPublication),
+    SnapshotGitCurrent {
+        edges_dir: PathBuf,
+        project_id: String,
+        snapshot_id: String,
+        include_managed_git: bool,
+    },
+    LocalSnapshot(LocalSnapshotPublication),
+}
+
+#[derive(Debug)]
+struct LocalSnapshotPublication {
+    edges_dir: PathBuf,
+    project_id: String,
+    repo_id: String,
+    branch: Option<String>,
+    head_sha: String,
+    dirty: bool,
+    dirty_fingerprint: Option<String>,
+    snapshot_id: String,
+}
+
+impl ProjectIndexPublicationBundle {
+    pub fn is_empty(&self) -> bool {
+        self.actions.is_empty()
+    }
+
+    pub(crate) fn stage_git_history(
+        &mut self,
+        publication: super::git_history::GitHistoryPublication,
+    ) {
+        self.actions
+            .push(ProjectIndexPublication::GitHistory(publication));
+    }
+
+    pub fn stage_snapshot_git_current(
+        &mut self,
+        edges_dir: &Path,
+        project_id: &str,
+        snapshot_id: &str,
+        include_managed_git: bool,
+    ) {
+        self.actions
+            .push(ProjectIndexPublication::SnapshotGitCurrent {
+                edges_dir: edges_dir.to_path_buf(),
+                project_id: project_id.to_string(),
+                snapshot_id: snapshot_id.to_string(),
+                include_managed_git,
+            });
+    }
+
+    /// Publish every filesystem-derived effect staged by the corpus pass.
+    /// The caller must hold the checkout publication guard for all leases that
+    /// contributed to this bundle for the entire call and the Tantivy commit.
+    pub fn publish(
+        &mut self,
+    ) -> Result<Vec<bbox_edge_sidecar::snapshot::PendingLocalSnapshotActivation>> {
+        let mut pending_local_snapshots = Vec::new();
+        for action in self.actions.drain(..) {
+            match action {
+                ProjectIndexPublication::SnapshotRename {
+                    staged,
+                    destination,
+                } => {
+                    fs::rename(&staged, &destination)?;
+                    if let Some(parent) = destination.parent() {
+                        fs::File::open(parent)?.sync_all()?;
+                    }
+                }
+                ProjectIndexPublication::ProjectEdges {
+                    edges_dir,
+                    project_id,
+                    edges,
+                    deleted_rel_hashes,
+                    compact_legacy,
+                } => {
+                    bbox_edge_sidecar::edge_sidecar::replace_materialized_edges_incremental(
+                        &edges_dir,
+                        "project",
+                        &project_id,
+                        &edges,
+                    )?;
+                    bbox_edge_sidecar::edge_sidecar::purge_managed_edges_for_path_hashes(
+                        &edges_dir,
+                        "project",
+                        &project_id,
+                        &deleted_rel_hashes,
+                    )?;
+                    if compact_legacy
+                        && let Err(error) = bbox_edge_sidecar::edge_sidecar::compact_legacy_sidecar(
+                            &edges_dir,
+                            &project_id,
+                            true,
+                        )
+                    {
+                        tracing::warn!(
+                            project_id = %project_id,
+                            error = %error,
+                            "failed to compact legacy edge sidecar after full project refresh"
+                        );
+                    }
+                }
+                ProjectIndexPublication::GitHistory(publication) => publication.publish()?,
+                ProjectIndexPublication::SnapshotGitCurrent {
+                    edges_dir,
+                    project_id,
+                    snapshot_id,
+                    include_managed_git,
+                } => {
+                    let git_edges = if include_managed_git {
+                        bbox_edge_sidecar::edge_sidecar::read_managed_derived_edges(
+                            &edges_dir,
+                            "git",
+                            &project_id,
+                        )?
+                        .into_iter()
+                        .map(|edge| bbox_edge_sidecar::edge_sidecar::Edge {
+                            source: edge.source,
+                            kind: edge.kind,
+                            target: edge.target,
+                            provenance: edge.provenance,
+                            confidence: edge.confidence,
+                            metadata: Default::default(),
+                        })
+                        .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                    bbox_edge_sidecar::snapshot::write_snapshot_files(
+                        &edges_dir,
+                        &project_id,
+                        &snapshot_id,
+                        &[("git-current.jsonl", git_edges.as_slice())],
+                    )?;
+                }
+                ProjectIndexPublication::LocalSnapshot(publication) => {
+                    let project_edges =
+                        bbox_edge_sidecar::edge_sidecar::read_managed_derived_edges(
+                            &publication.edges_dir,
+                            "project",
+                            &publication.project_id,
+                        )?;
+                    let git_edges = bbox_edge_sidecar::edge_sidecar::read_managed_derived_edges(
+                        &publication.edges_dir,
+                        "git",
+                        &publication.project_id,
+                    )?;
+                    pending_local_snapshots.push(
+                        bbox_edge_sidecar::snapshot::stage_local_snapshot_activation(
+                            &publication.edges_dir,
+                            &publication.project_id,
+                            &publication.repo_id,
+                            publication.branch.as_deref(),
+                            &publication.head_sha,
+                            publication.dirty,
+                            publication.dirty_fingerprint.as_deref(),
+                            &publication.snapshot_id,
+                            &project_edges,
+                            &[],
+                            &git_edges,
+                        )?,
+                    );
+                }
+            }
+        }
+        Ok(pending_local_snapshots)
+    }
+}
+
+impl Drop for ProjectIndexPublicationBundle {
+    fn drop(&mut self) {
+        for action in &self.actions {
+            if let ProjectIndexPublication::SnapshotRename { staged, .. } = action {
+                let _ = fs::remove_file(staged);
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -163,6 +362,9 @@ pub fn collect_project_documents(
             IndexRecordOption::Basic,
         );
         let count = searcher.search(&query, &Count)?;
+        if count == 0 {
+            continue;
+        }
         for (_score, address) in searcher.search(&query, &TopDocs::with_limit(count))? {
             documents.push(searcher.doc::<TantivyDocument>(address)?);
         }
@@ -252,7 +454,12 @@ pub fn collect_preserved_collected_documents(
         }
         let mut entity_ids = Vec::with_capacity(count);
         let mut documents = Vec::with_capacity(count);
-        for (_score, address) in searcher.search(&query, &TopDocs::with_limit(count))? {
+        let hits = if count == 0 {
+            Vec::new()
+        } else {
+            searcher.search(&query, &TopDocs::with_limit(count))?
+        };
+        for (_score, address) in hits {
             let document = searcher.doc::<TantivyDocument>(address)?;
             let entity_id = document
                 .get_first(f.entity_id)
@@ -512,6 +719,7 @@ fn index_active_collected_project(
             f,
             writer,
             edges_dir,
+            &mut stats.publication,
             |entry| {
                 let mut file = store.verified_blob_file(&entry.content_sha256, entry.size)?;
                 let mut bytes = Vec::with_capacity(entry.size as usize);
@@ -551,6 +759,7 @@ fn index_active_collected_project(
             edges_dir,
             git_meta_dir,
             force_full,
+            publication: &mut stats.publication,
         };
         let stats = super::git_history::index_git_history_for_project(
             project,
@@ -585,41 +794,22 @@ fn index_active_collected_project(
     stats.indexed_commits += git_stats.indexed_commits;
     stats.indexed_docs += git_stats.indexed_commits;
     stats.emitted_edges += git_stats.emitted_edges;
-    let git_edges = if git_root.is_some() {
-        bbox_edge_sidecar::edge_sidecar::read_managed_derived_edges(
-            edges_dir,
-            "git",
-            &project.project_id,
-        )?
-        .into_iter()
-        .map(|edge| bbox_edge_sidecar::edge_sidecar::Edge {
-            source: edge.source,
-            kind: edge.kind,
-            target: edge.target,
-            provenance: edge.provenance,
-            confidence: edge.confidence,
-            metadata: Default::default(),
-        })
-        .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
     if let Some(staged) = staged {
-        bbox_edge_sidecar::snapshot::write_snapshot_files(
+        stats.publication.stage_snapshot_git_current(
             edges_dir,
             &project.project_id,
             &staged.snapshot_id,
-            &[("git-current.jsonl", git_edges.as_slice())],
-        )?;
+            project.repo_id.is_some(),
+        );
         stats.indexed_docs += staged.document_count;
         stats.indexed_files += stored.descriptor.file_count;
     } else {
-        bbox_edge_sidecar::snapshot::write_snapshot_files(
+        stats.publication.stage_snapshot_git_current(
             edges_dir,
             &project.project_id,
             &activation.snapshot_id,
-            &[("git-current.jsonl", git_edges.as_slice())],
-        )?;
+            project.repo_id.is_some(),
+        );
     }
     Ok(())
 }
@@ -657,6 +847,7 @@ pub fn stage_collected_project_generation<F>(
     f: FieldHandles,
     writer: &mut IndexWriter,
     edges_dir: &Path,
+    publication: &mut ProjectIndexPublicationBundle,
     open_bytes: F,
 ) -> Result<CollectedIndexResult>
 where
@@ -677,6 +868,7 @@ where
         f,
         writer,
         edges_dir,
+        publication,
         None,
         open_bytes,
     )
@@ -690,6 +882,7 @@ pub fn stage_local_project_generation(
     f: FieldHandles,
     writer: &mut IndexWriter,
     edges_dir: &Path,
+    publication: &mut ProjectIndexPublicationBundle,
 ) -> Result<CollectedIndexResult> {
     let root = project_root
         .canonicalize()
@@ -765,6 +958,7 @@ pub fn stage_local_project_generation(
         f,
         writer,
         edges_dir,
+        publication,
         Some(&root),
         |entry| {
             read_regular_file_confined(&root, Path::new(&entry.relative_path))
@@ -785,6 +979,7 @@ fn stage_project_file_generation<F>(
     f: FieldHandles,
     writer: &mut IndexWriter,
     edges_dir: &Path,
+    publication: &mut ProjectIndexPublicationBundle,
     display_root: Option<&Path>,
     mut open_bytes: F,
 ) -> Result<CollectedIndexResult>
@@ -847,11 +1042,17 @@ where
     let mut entity_ids = Vec::new();
     let mut entity_id_bytes = 0_usize;
     let mut current_chunk_targets = HashMap::new();
+    static STAGED_SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let staged_filename = format!(
+        ".project.publish-pending-{}-{}.jsonl",
+        std::process::id(),
+        STAGED_SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
     let mut edge_writer = bbox_edge_sidecar::snapshot::create_snapshot_edge_writer(
         edges_dir,
         &project.project_id,
         snapshot_id,
-        "project.jsonl",
+        &staged_filename,
     )?;
     for entry in entries {
         let Some((display_path, chunks, parser_edges)) = chunk_entry(entry)? else {
@@ -913,6 +1114,14 @@ where
         }
     }
     edge_writer.finish()?;
+    let snapshot_dir =
+        bbox_edge_sidecar::snapshot::snapshot_dir(edges_dir, &project.project_id, snapshot_id);
+    publication
+        .actions
+        .push(ProjectIndexPublication::SnapshotRename {
+            staged: snapshot_dir.join(&staged_filename),
+            destination: snapshot_dir.join("project.jsonl"),
+        });
 
     entity_ids.sort();
     let mut inventory = Sha256::new();
@@ -1219,12 +1428,6 @@ fn index_project(
         );
         ctx.stats.indexed_files += 1;
     }
-    bbox_edge_sidecar::edge_sidecar::replace_materialized_edges_incremental(
-        ctx.edges_dir,
-        "project",
-        &project.project_id,
-        &project_edges,
-    )?;
     let git_stats = if let Some(git_root) = git_root {
         let mut git_ctx = super::git_history::GitIndexContext {
             f: ctx.f,
@@ -1233,6 +1436,7 @@ fn index_project(
             edges_dir: ctx.edges_dir,
             git_meta_dir: ctx.git_meta_dir,
             force_full: ctx.force_git_full,
+            publication: &mut ctx.stats.publication,
         };
         super::git_history::index_git_history_for_project(
             project,
@@ -1249,32 +1453,6 @@ fn index_project(
         ctx.stats.indexed_files += 1;
     }
     ctx.stats.emitted_edges += git_stats.emitted_edges;
-    if ctx.force_git_full {
-        match bbox_edge_sidecar::edge_sidecar::compact_legacy_sidecar(
-            ctx.edges_dir,
-            &project.project_id,
-            true,
-        ) {
-            Ok(stats) if stats.applied => {
-                tracing::info!(
-                    project_id = %project.project_id,
-                    removed = stats.derived_edges_removed,
-                    retained = stats.retained_lines,
-                    bytes_before = stats.bytes_before,
-                    bytes_after = stats.bytes_after,
-                    "compacted legacy edge sidecar after full project refresh"
-                );
-            }
-            Ok(_) => {}
-            Err(err) => {
-                tracing::warn!(
-                    project_id = %project.project_id,
-                    error = %err,
-                    "failed to compact legacy edge sidecar after full project refresh"
-                );
-            }
-        }
-    }
     // Purge derived edges for tracked files that were deleted (or are no longer
     // indexable) this pass: present in meta under `root` but absent from the
     // current on-disk scan. The Tantivy docs are purged separately by the
@@ -1292,24 +1470,29 @@ fn index_project(
             Some(short_hash(rel.to_string_lossy().as_bytes()))
         })
         .collect();
-    let deletions_purged = if deleted_rel_hashes.is_empty() {
-        0
-    } else {
-        bbox_edge_sidecar::edge_sidecar::purge_managed_edges_for_path_hashes(
-            ctx.edges_dir,
-            "project",
-            &project.project_id,
-            &deleted_rel_hashes,
-        )?
-    };
+    let has_deletions = !deleted_rel_hashes.is_empty();
+    if !project_edges.is_empty() || has_deletions || ctx.force_git_full {
+        ctx.stats
+            .publication
+            .actions
+            .push(ProjectIndexPublication::ProjectEdges {
+                edges_dir: ctx.edges_dir.to_path_buf(),
+                project_id: project.project_id.clone(),
+                edges: project_edges,
+                deleted_rel_hashes,
+                compact_legacy: ctx.force_git_full,
+            });
+    }
 
-    let materialization_changed =
-        files_changed || git_stats.indexed_commits > 0 || deletions_purged > 0;
+    let materialization_changed = files_changed || git_stats.indexed_commits > 0 || has_deletions;
     if let Some(git_root) = git_root {
         if let Some(pending) =
             snapshot_after_reindex(project, git_root, ctx.edges_dir, materialization_changed)?
         {
-            ctx.stats.pending_local_snapshots.push(pending);
+            ctx.stats
+                .publication
+                .actions
+                .push(ProjectIndexPublication::LocalSnapshot(pending));
         }
     }
     Ok(())
@@ -1984,7 +2167,7 @@ fn snapshot_after_reindex(
     root: &Path,
     edges_dir: &Path,
     materialization_changed: bool,
-) -> Result<Option<bbox_edge_sidecar::snapshot::PendingLocalSnapshotActivation>> {
+) -> Result<Option<LocalSnapshotPublication>> {
     let Some(repo_id) = project.repo_id.as_deref() else {
         return Ok(None);
     };
@@ -2015,75 +2198,27 @@ fn snapshot_after_reindex(
         return Ok(None);
     }
 
-    let project_edges = bbox_edge_sidecar::edge_sidecar::read_managed_derived_edges(
-        edges_dir,
-        "project",
-        &project.project_id,
-    )?;
-    let git_edges = bbox_edge_sidecar::edge_sidecar::read_managed_derived_edges(
-        edges_dir,
-        "git",
-        &project.project_id,
-    )?;
-
-    let snapshot_edges: Vec<bbox_edge_sidecar::edge_sidecar::Edge> = project_edges
-        .iter()
-        .map(|e| bbox_edge_sidecar::edge_sidecar::Edge {
-            source: e.source.clone(),
-            kind: e.kind.clone(),
-            target: e.target.clone(),
-            provenance: e.provenance,
-            confidence: e.confidence,
-            metadata: Default::default(),
-        })
-        .collect();
-    let git_snapshot_edges: Vec<bbox_edge_sidecar::edge_sidecar::Edge> = git_edges
-        .iter()
-        .map(|e| bbox_edge_sidecar::edge_sidecar::Edge {
-            source: e.source.clone(),
-            kind: e.kind.clone(),
-            target: e.target.clone(),
-            provenance: e.provenance,
-            confidence: e.confidence,
-            metadata: Default::default(),
-        })
-        .collect();
-
-    let pending = if worktree_dirty {
+    let (dirty_fingerprint, snapshot_id) = if worktree_dirty {
         let fingerprint = bbox_corpus_core::git::dirty_fingerprint(root).unwrap_or_default();
         let snapshot_id =
             bbox_edge_sidecar::snapshot::nongit_snapshot_id(&project.project_id, &fingerprint);
-        bbox_edge_sidecar::snapshot::stage_local_snapshot_activation(
-            edges_dir,
-            &project.project_id,
-            repo_id,
-            branch.as_deref(),
-            &head_sha,
-            true,
-            Some(&fingerprint),
-            &snapshot_id,
-            &snapshot_edges,
-            &[],
-            &git_snapshot_edges,
-        )?
+        (Some(fingerprint), snapshot_id)
     } else {
-        let snapshot_id =
-            bbox_edge_sidecar::snapshot::clean_snapshot_id(repo_id, &project.project_id, &head_sha);
-        bbox_edge_sidecar::snapshot::stage_local_snapshot_activation(
-            edges_dir,
-            &project.project_id,
-            repo_id,
-            branch.as_deref(),
-            &head_sha,
-            false,
+        (
             None,
-            &snapshot_id,
-            &snapshot_edges,
-            &[],
-            &git_snapshot_edges,
-        )?
+            bbox_edge_sidecar::snapshot::clean_snapshot_id(repo_id, &project.project_id, &head_sha),
+        )
     };
-    Ok(Some(pending))
+    Ok(Some(LocalSnapshotPublication {
+        edges_dir: edges_dir.to_path_buf(),
+        project_id: project.project_id.clone(),
+        repo_id: repo_id.to_string(),
+        branch,
+        head_sha,
+        dirty: worktree_dirty,
+        dirty_fingerprint,
+        snapshot_id,
+    }))
 }
 
 #[cfg(test)]

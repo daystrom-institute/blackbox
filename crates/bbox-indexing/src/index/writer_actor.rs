@@ -156,10 +156,15 @@ struct ActorCtx {
 
 pub(super) struct LeasedProjectAccess {
     pub(super) project: ProjectRecord,
+    pub(super) publisher_config: Option<ValidatedCheckoutLease>,
+    pub(super) publisher_config_denial: Option<String>,
+    pub(super) knowledge_overlay: Option<ValidatedCheckoutLease>,
+    pub(super) knowledge_overlay_denial: Option<String>,
     pub(super) local: Option<ValidatedCheckoutLease>,
     pub(super) local_denial: Option<String>,
     pub(super) git: Option<ValidatedCheckoutLease>,
     pub(super) git_denial: Option<String>,
+    pub(super) code_local_enabled: bool,
 }
 
 impl LeasedProjectAccess {
@@ -167,34 +172,46 @@ impl LeasedProjectAccess {
         super::project_files::ProjectIndexAccess {
             project: &self.project,
             local_root: self
-                .local
-                .as_ref()
+                .code_local_enabled
+                .then(|| self.local.as_ref())
+                .flatten()
                 .map(ValidatedCheckoutLease::project_root),
             git_root: self.git.as_ref().map(ValidatedCheckoutLease::checkout_root),
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProjectLeasePurpose {
+    SpeculativeScan,
+    Reindex,
+}
+
 pub(super) fn acquire_project_leases(
     config: &ReindexConfig,
     projects: &Arc<parking_lot::RwLock<ProjectRegistry>>,
     broker: &Arc<CheckoutAccessBroker>,
+    purpose: ProjectLeasePurpose,
 ) -> Result<Vec<LeasedProjectAccess>> {
     let collected = super::project_files::active_collected_sources(config)?;
     let records = projects.read().list();
     records
         .into_iter()
         .map(|project| {
-            let scope = broker.acquire(access_request(
+            let publisher_config = broker.acquire(access_request(
                 &project,
                 None,
                 CheckoutAccessKind::PublisherConfigTreeRead,
             ));
-            let expected_scope = scope
+            let expected_scope = publisher_config
                 .as_ref()
                 .ok()
                 .and_then(|lease| lease.published_scope().cloned());
-            let (local, local_denial) = if collected.contains_key(&project.project_id) {
+            let publisher_config_denial = publisher_config.as_ref().err().map(ToString::to_string);
+            let publisher_config = publisher_config.ok();
+            let code_local_enabled = !collected.contains_key(&project.project_id);
+            let needs_local = code_local_enabled || purpose == ProjectLeasePurpose::Reindex;
+            let (local, local_denial) = if !needs_local {
                 (None, None)
             } else {
                 match broker.acquire(access_request(
@@ -206,10 +223,10 @@ pub(super) fn acquire_project_leases(
                     Err(error) => (None, Some(error.to_string())),
                 }
             };
-            let (git, git_denial) = if project.repo_id.is_some() {
+            let (git, git_denial) = if project.is_git_repo {
                 match broker.acquire(access_request(
                     &project,
-                    expected_scope,
+                    expected_scope.clone(),
                     CheckoutAccessKind::GitHistory,
                 )) {
                     Ok(lease) => (Some(lease), None),
@@ -218,12 +235,30 @@ pub(super) fn acquire_project_leases(
             } else {
                 (None, None)
             };
+            let (knowledge_overlay, knowledge_overlay_denial) =
+                if purpose == ProjectLeasePurpose::Reindex {
+                    match broker.acquire(access_request(
+                        &project,
+                        expected_scope,
+                        CheckoutAccessKind::KnowledgeGapOverlayRead,
+                    )) {
+                        Ok(lease) => (Some(lease), None),
+                        Err(error) => (None, Some(error.to_string())),
+                    }
+                } else {
+                    (None, None)
+                };
             Ok(LeasedProjectAccess {
                 project,
+                publisher_config,
+                publisher_config_denial,
+                knowledge_overlay,
+                knowledge_overlay_denial,
                 local,
                 local_denial,
                 git,
                 git_denial,
+                code_local_enabled,
             })
         })
         .collect()
@@ -234,6 +269,22 @@ pub(super) fn revalidate_project_leases(
     projects: &[LeasedProjectAccess],
 ) -> Result<()> {
     for access in projects {
+        if let Some(publisher_config) = &access.publisher_config {
+            broker.revalidate(publisher_config).with_context(|| {
+                format!(
+                    "PublisherConfigTreeRead authority changed for project {}",
+                    access.project.project_id
+                )
+            })?;
+        }
+        if let Some(knowledge_overlay) = &access.knowledge_overlay {
+            broker.revalidate(knowledge_overlay).with_context(|| {
+                format!(
+                    "KnowledgeGapOverlayRead authority changed for project {}",
+                    access.project.project_id
+                )
+            })?;
+        }
         if let Some(local) = &access.local {
             broker.revalidate(local).with_context(|| {
                 format!(
@@ -610,7 +661,7 @@ fn run_collected_stage(
     entries: &[bbox_code_source::ManifestEntry],
     store: &bbox_code_source_store::CodeSourceStore,
 ) -> Result<super::project_files::CollectedIndexResult> {
-    let git_lease = if project.repo_id.is_some() {
+    let mut git_lease = if project.repo_id.is_some() {
         match ctx.checkout_access.acquire(access_request(
             project,
             Some(descriptor.scope.clone()),
@@ -648,26 +699,30 @@ fn run_collected_stage(
     };
     let edges_dir =
         bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&ctx.config.projects_path);
-    let stage_code = |writer: &mut IndexWriter| {
-        super::project_files::stage_collected_project_generation(
-            project,
-            descriptor,
-            generation_id,
-            entries,
-            ctx.fields,
-            writer,
-            &edges_dir,
-            |entry| {
-                let mut file = store.verified_blob_file(&entry.content_sha256, entry.size)?;
-                let mut bytes = Vec::with_capacity(entry.size as usize);
-                std::io::Read::read_to_end(&mut file, &mut bytes)?;
-                Ok(bytes)
-            },
-        )
-    };
+    let stage_code =
+        |writer: &mut IndexWriter,
+         publication: &mut super::project_files::ProjectIndexPublicationBundle| {
+            super::project_files::stage_collected_project_generation(
+                project,
+                descriptor,
+                generation_id,
+                entries,
+                ctx.fields,
+                writer,
+                &edges_dir,
+                publication,
+                |entry| {
+                    let mut file = store.verified_blob_file(&entry.content_sha256, entry.size)?;
+                    let mut bytes = Vec::with_capacity(entry.size as usize);
+                    std::io::Read::read_to_end(&mut file, &mut bytes)?;
+                    Ok(bytes)
+                },
+            )
+        };
     let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
     writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
-    let mut result = stage_code(&mut writer)?;
+    let mut publication = super::project_files::ProjectIndexPublicationBundle::default();
+    let mut result = stage_code(&mut writer, &mut publication)?;
     stage_git_current_edges(
         ctx,
         project,
@@ -677,9 +732,10 @@ fn run_collected_stage(
         &result,
         &mut writer,
         &edges_dir,
+        &mut publication,
     )?;
-    if let Some(git_lease) = &git_lease
-        && let Err(error) = ctx.checkout_access.revalidate(git_lease)
+    if let Some(active_git_lease) = &git_lease
+        && let Err(error) = ctx.checkout_access.revalidate(active_git_lease)
     {
         tracing::warn!(
             project_id = %project.project_id,
@@ -698,11 +754,27 @@ fn run_collected_stage(
             );
         }
         drop(writer);
+        drop(publication);
         writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
         writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
-        result = stage_code(&mut writer)?;
-        stage_git_current_edges(ctx, project, None, &result, &mut writer, &edges_dir)?;
+        publication = super::project_files::ProjectIndexPublicationBundle::default();
+        result = stage_code(&mut writer, &mut publication)?;
+        stage_git_current_edges(
+            ctx,
+            project,
+            None,
+            &result,
+            &mut writer,
+            &edges_dir,
+            &mut publication,
+        )?;
+        git_lease = None;
     }
+    let _publication_guard = git_lease
+        .as_ref()
+        .map(|lease| ctx.checkout_access.publication_guard(lease))
+        .transpose()?;
+    publication.publish()?;
     writer.commit()?;
     post_commit(ctx);
     Ok(result)
@@ -727,6 +799,7 @@ fn run_local_stage(
     writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
     let edges_dir =
         bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&ctx.config.projects_path);
+    let mut publication = super::project_files::ProjectIndexPublicationBundle::default();
     let result = super::project_files::stage_local_project_generation(
         project,
         scope,
@@ -735,6 +808,7 @@ fn run_local_stage(
         ctx.fields,
         &mut writer,
         &edges_dir,
+        &mut publication,
     )?;
     stage_git_current_edges(
         ctx,
@@ -743,9 +817,12 @@ fn run_local_stage(
         &result,
         &mut writer,
         &edges_dir,
+        &mut publication,
     )?;
-    ctx.checkout_access.revalidate(&local_lease)?;
-    ctx.checkout_access.revalidate(&git_lease)?;
+    let _publication_guard = ctx
+        .checkout_access
+        .publication_guard_for([&local_lease, &git_lease])?;
+    publication.publish()?;
     writer.commit()?;
     post_commit(ctx);
     Ok(result)
@@ -758,15 +835,16 @@ fn stage_git_current_edges(
     result: &super::project_files::CollectedIndexResult,
     writer: &mut IndexWriter,
     edges_dir: &Path,
+    publication: &mut super::project_files::ProjectIndexPublicationBundle,
 ) -> Result<()> {
     let Some(root) = git_root else {
-        let no_edges: &[bbox_edge_sidecar::edge_sidecar::Edge] = &[];
-        return bbox_edge_sidecar::snapshot::write_snapshot_files(
+        publication.stage_snapshot_git_current(
             edges_dir,
             &project.project_id,
             &result.snapshot_id,
-            &[("git-current.jsonl", no_edges)],
+            project.repo_id.is_some(),
         );
+        return Ok(());
     };
     let git_meta_dir =
         super::git_history::git_meta_dir_from_projects_path(&ctx.config.projects_path);
@@ -778,6 +856,7 @@ fn stage_git_current_edges(
         edges_dir,
         git_meta_dir: &git_meta_dir,
         force_full: true,
+        publication,
     };
     super::git_history::index_git_history_for_project(
         project,
@@ -785,27 +864,14 @@ fn stage_git_current_edges(
         &result.current_chunk_targets,
         &mut git_ctx,
     )?;
-    let git_edges = bbox_edge_sidecar::edge_sidecar::read_managed_derived_edges(
-        edges_dir,
-        "git",
-        &project.project_id,
-    )?
-    .into_iter()
-    .map(|edge| bbox_edge_sidecar::edge_sidecar::Edge {
-        source: edge.source,
-        kind: edge.kind,
-        target: edge.target,
-        provenance: edge.provenance,
-        confidence: edge.confidence,
-        metadata: Default::default(),
-    })
-    .collect::<Vec<_>>();
-    bbox_edge_sidecar::snapshot::write_snapshot_files(
+    drop(git_ctx);
+    publication.stage_snapshot_git_current(
         edges_dir,
         &project.project_id,
         &result.snapshot_id,
-        &[("git-current.jsonl", git_edges.as_slice())],
-    )
+        true,
+    );
+    Ok(())
 }
 
 fn run_selector_retirement(ctx: &ActorCtx, selector: &str) -> Result<u64> {
@@ -1093,7 +1159,6 @@ fn manual_knowledge_store_pass(
 ) -> Result<u64> {
     super::knowledge_docs::reindex_knowledge_store_standalone(
         &config.knowledge_path,
-        &config.projects_path,
         fields,
         writer,
         meta,
@@ -1249,7 +1314,13 @@ mod tests {
             observations,
         ));
         let index = test_index(&root);
-        let leased = acquire_project_leases(&index.reindex_config(), &projects, &broker).unwrap();
+        let leased = acquire_project_leases(
+            &index.reindex_config(),
+            &projects,
+            &broker,
+            ProjectLeasePurpose::Reindex,
+        )
+        .unwrap();
         assert_eq!(leased.len(), 1);
         assert!(leased[0].local.is_some());
         assert!(leased[0].git.is_some());
@@ -1259,6 +1330,7 @@ mod tests {
             CheckoutAccessKind::PublisherConfigTreeRead,
             CheckoutAccessKind::LocalProjectWalk,
             CheckoutAccessKind::GitHistory,
+            CheckoutAccessKind::KnowledgeGapOverlayRead,
         ] {
             let operation = health
                 .operations

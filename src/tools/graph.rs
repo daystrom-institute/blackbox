@@ -20,7 +20,6 @@ use crate::mcp_tools::inspect::InspectEntityParams;
 use crate::mcp_tools::provenance::ProvenanceParams;
 use crate::mcp_tools::provenance_plan::ProvenanceExportPlanParams;
 use crate::mcp_tools::ref_size::RefSizeParams;
-use crate::providers::ProviderContext;
 use crate::server::BlackboxServer;
 use crate::{edge_index, entity_ref, git};
 
@@ -45,10 +44,9 @@ struct CheckoutFileSelection {
 
 #[derive(Debug)]
 struct AcquiredCheckoutFile {
-    #[allow(dead_code)]
     lease: ValidatedCheckoutLease,
-    file_path: PathBuf,
     relative_path: String,
+    content: Vec<u8>,
 }
 
 fn checkout_access_error(error: CheckoutAccessError) -> anyhow::Error {
@@ -67,6 +65,7 @@ fn acquire_selected_operation(
 ) -> Result<ValidatedCheckoutLease> {
     let discovery = acquire_scope_discovery(broker, project_id)?;
     let expected_scope = discovery.published_scope().cloned();
+    drop(discovery);
     let lease = broker
         .acquire(CheckoutAccessRequest {
             project_id: project_id.to_string(),
@@ -77,7 +76,6 @@ fn acquire_selected_operation(
             source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
         })
         .map_err(checkout_access_error)?;
-    drop(discovery);
     Ok(lease)
 }
 
@@ -152,16 +150,6 @@ fn checkout_file_selection(
         source_lane: CheckoutAccessSourceLane::LegacyCheckoutRegistry,
         relative_path,
     }
-}
-
-fn relative_under(root: &Path, input: &Path) -> Result<PathBuf> {
-    let relative = input.strip_prefix(root).map_err(|_| {
-        anyhow!("error.checkout_path_mismatch: file is outside the selected project scope")
-    })?;
-    if relative.as_os_str().is_empty() {
-        bail!("error.checkout_path_invalid: file path must name an entry below the project root");
-    }
-    Ok(relative.to_path_buf())
 }
 
 fn lexical_absolute_selection(
@@ -327,16 +315,13 @@ fn acquire_file_selection(
             })
             .map_err(checkout_access_error)?
     };
-    let file_path = lease
-        .resolve_existing(&selection.relative_path)
+    let (_, content) = lease
+        .read_relative_file(&selection.relative_path)
         .map_err(checkout_access_error)?;
-    if !file_path.is_file() {
-        bail!("error.checkout_path_invalid: validated checkout entry is not a file");
-    }
     Ok(AcquiredCheckoutFile {
         lease,
-        file_path,
         relative_path: selection.relative_path.to_string_lossy().into_owned(),
+        content,
     })
 }
 
@@ -384,16 +369,13 @@ fn acquire_project_file(
     if relative.as_os_str().is_empty() {
         bail!("error.indexed_path_invalid: project_file path hint does not name a file");
     }
-    let file_path = lease
-        .resolve_existing(&relative)
+    let (_, content) = lease
+        .read_relative_file(&relative)
         .map_err(checkout_access_error)?;
-    if !file_path.is_file() {
-        bail!("error.checkout_path_invalid: validated checkout entry is not a file");
-    }
     Ok(AcquiredCheckoutFile {
         lease,
-        file_path,
         relative_path: relative.to_string_lossy().into_owned(),
+        content,
     })
 }
 
@@ -522,11 +504,11 @@ impl BlackboxServer {
                 );
                 return knowledge_view.enrich_json_response(output);
             }
-            let provider_ctx =
-                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
-                    .with_knowledge_view(&knowledge_view.knowledge)
-                    .with_edge_index(edge_index)
-                    .with_searcher(&read_view.searcher);
+            let provider_ctx = server
+                .provider_context()
+                .with_knowledge_view(&knowledge_view.knowledge)
+                .with_edge_index(edge_index)
+                .with_searcher(&read_view.searcher);
             let output =
                 mcp_tools::inspect::inspect_entity(&p, &provider_ctx, &entity_ref, edge_index)?;
             knowledge_view.enrich_json_response(output)
@@ -567,10 +549,10 @@ impl BlackboxServer {
         Self::run_blocking("bbox_find_paths", move || {
             let read_view = server.state.code_read_view.read().clone();
             let edge_index = read_view.edge_index.as_ref();
-            let provider_ctx =
-                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
-                    .with_edge_index(edge_index)
-                    .with_searcher(&read_view.searcher);
+            let provider_ctx = server
+                .provider_context()
+                .with_edge_index(edge_index)
+                .with_searcher(&read_view.searcher);
             mcp_tools::find_paths::find_paths(
                 &p,
                 &provider_ctx,
@@ -594,11 +576,11 @@ impl BlackboxServer {
             let knowledge_view = server.session_knowledge_view(None, p.provisional.as_deref())?;
             let read_view = server.state.code_read_view.read().clone();
             let edge_index = read_view.edge_index.as_ref();
-            let provider_ctx =
-                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
-                    .with_knowledge_view(&knowledge_view.knowledge)
-                    .with_edge_index(edge_index)
-                    .with_searcher(&read_view.searcher);
+            let provider_ctx = server
+                .provider_context()
+                .with_knowledge_view(&knowledge_view.knowledge)
+                .with_edge_index(edge_index)
+                .with_searcher(&read_view.searcher);
             let output = mcp_tools::bundle_evidence::bundle_evidence(
                 &p,
                 &provider_ctx,
@@ -651,15 +633,15 @@ impl BlackboxServer {
                     )
                 });
                 match resolved {
-                    Ok(acquired) => {
+                    Ok(mut acquired) => {
+                        let bytes = acquired.content.len() as u64;
                         validated_files.insert(
                             path,
                             mcp_tools::ref_size::FileInputResolution::Validated(
-                                mcp_tools::ref_size::ValidatedFileInput {
-                                    file_path: acquired.file_path.clone(),
-                                },
+                                mcp_tools::ref_size::ValidatedFileInput { bytes },
                             ),
                         );
+                        acquired.content = Vec::new();
                         acquired_files.push(acquired);
                     }
                     Err(error) => {
@@ -672,10 +654,10 @@ impl BlackboxServer {
             }
             let read_view = server.state.code_read_view.read().clone();
             let edge_index = read_view.edge_index.as_ref();
-            let provider_ctx =
-                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
-                    .with_edge_index(edge_index)
-                    .with_searcher(&read_view.searcher);
+            let provider_ctx = server
+                .provider_context()
+                .with_edge_index(edge_index)
+                .with_searcher(&read_view.searcher);
             let output = mcp_tools::ref_size::ref_size_with_validated_files(
                 &p,
                 &provider_ctx,
@@ -730,10 +712,10 @@ impl BlackboxServer {
         Self::run_blocking("bbox_blame", move || {
             let read_view = server.state.code_read_view.read().clone();
             let edge_index = read_view.edge_index.as_ref();
-            let provider_ctx =
-                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
-                    .with_edge_index(edge_index)
-                    .with_searcher(&read_view.searcher);
+            let provider_ctx = server
+                .provider_context()
+                .with_edge_index(edge_index)
+                .with_searcher(&read_view.searcher);
             let projects = server.state.projects.read().list();
             let target = match mcp_tools::blame::target_identity(&p, &provider_ctx) {
                 Ok(target) => target,
@@ -770,10 +752,20 @@ impl BlackboxServer {
                     (acquired, Some(line), None)
                 }
             };
-            let (acquired, line, byte_offset) = acquired;
+            let (mut acquired, line, byte_offset) = acquired;
+            let project_rel = acquired
+                .lease
+                .project_root()
+                .strip_prefix(acquired.lease.checkout_root())
+                .map_err(|_| {
+                    anyhow!("error.checkout_scope_invalid: project root escaped checkout root")
+                })?;
+            let git_relative_path = project_rel.join(&acquired.relative_path);
             let output = mcp_tools::blame::blame(
                 mcp_tools::blame::ValidatedBlameTarget {
-                    file_path: acquired.file_path.clone(),
+                    git_root: acquired.lease.checkout_root().to_path_buf(),
+                    git_relative_path,
+                    content: std::mem::take(&mut acquired.content),
                     display_path: acquired.relative_path.clone(),
                     line,
                     byte_offset,
@@ -803,12 +795,19 @@ impl BlackboxServer {
             let (leases, inputs) =
                 acquire_provenance_projects(&broker, &p, &projects, CheckoutAccessIntent::Write)?;
             let read_view = server.state.code_read_view.read().clone();
-            let output =
-                mcp_tools::provenance::export_provenance(read_view.edge_index.as_ref(), &inputs)?;
-            for lease in &leases {
-                broker.revalidate(lease).map_err(checkout_access_error)?;
-            }
-            drop(leases);
+            let output = if leases.is_empty() {
+                mcp_tools::provenance::export_provenance(read_view.edge_index.as_ref(), &inputs)?
+            } else {
+                let publication = broker
+                    .publication_guard_for(leases.iter())
+                    .map_err(checkout_access_error)?;
+                let output = mcp_tools::provenance::export_provenance(
+                    read_view.edge_index.as_ref(),
+                    &inputs,
+                )?;
+                drop(publication);
+                output
+            };
             Ok(output)
         })
         .await
@@ -892,16 +891,21 @@ impl BlackboxServer {
                         byte_range,
                     )
                 };
-            let edges_imported = mcp_tools::provenance::import_provenance_to_edges_dir(
-                &inputs,
-                &edges_dir,
-                &resolve_legacy_target,
-            )?;
-            for lease in &leases {
-                broker.revalidate(lease).map_err(checkout_access_error)?;
-            }
-            drop(leases);
-            server.rebuild_edge_index_from_stores();
+            let prepared =
+                mcp_tools::provenance::prepare_provenance_import(&inputs, &resolve_legacy_target)?;
+            let edges_imported = if leases.is_empty() {
+                0
+            } else {
+                let publication = broker
+                    .publication_guard_for(leases.iter())
+                    .map_err(checkout_access_error)?;
+                let imported = mcp_tools::provenance::publish_prepared_provenance_import(
+                    prepared, &edges_dir,
+                )?;
+                server.rebuild_edge_index_from_stores();
+                drop(publication);
+                imported
+            };
             Ok(serde_json::to_string_pretty(&json!({
                 "status": "ok",
                 "edges_imported": edges_imported,
@@ -968,6 +972,7 @@ mod tests {
                 project_id: request.project_id.clone(),
                 attachment_id: format!("attachment-{}", request.project_id),
                 checkout_id,
+                branch_ref: None,
                 published_scope: self
                     .published_scopes
                     .get(&request.project_id)
@@ -977,6 +982,7 @@ mod tests {
                 project_root: root,
                 status: CheckoutAttachmentStatus::Active,
                 capabilities: BTreeSet::from([request.kind]),
+                lifetime_guard: None,
             })
         }
 
@@ -1162,6 +1168,7 @@ mod tests {
             bbox_root_relpath: ".".into(),
         };
         let row = CheckoutRow {
+            project_id: None,
             checkout_id: "checkout-one".into(),
             checkout_dir: checkout.to_string_lossy().into_owned(),
             repo_id: Some(scope.repo_id.clone()),
@@ -1590,6 +1597,7 @@ mod tests {
         let root = tmp.path().canonicalize().unwrap();
         let server = test_server(&tmp);
         server.set_session_checkout_for_test(
+            "unregistered-project".into(),
             bbox_corpus_core::identity::PublishedScope {
                 repo_id: "repo".into(),
                 bbox_root_relpath: ".".into(),

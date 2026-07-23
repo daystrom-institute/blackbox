@@ -7,7 +7,6 @@ use bbox_corpus_core::built_from::{BuiltFromStamp, BuiltFromTable};
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_record::{ProjectRecord, ResolvedCheckoutScope};
-use bbox_indexing::publisher::project_published_scope;
 use bbox_knowledge::knowledge::{Knowledge, KnowledgeEntry, KnowledgeViewMetadata, Scope};
 use bbox_knowledge::overlay::{
     OverlaySnapshot, OverlayStatus, OverlayValue, ProvisionalMode, PublishedKnowledgeSnapshot,
@@ -18,7 +17,7 @@ use super::BlackboxServer;
 
 #[derive(Clone)]
 pub(crate) struct PublishedKnowledgeCacheEntry {
-    publisher_root: String,
+    publisher_project_id: String,
     publisher_commit: String,
     durable_project: String,
     snapshot: PublishedKnowledgeSnapshot,
@@ -252,13 +251,14 @@ impl BlackboxServer {
     #[cfg(test)]
     pub(crate) fn set_session_checkout_for_test(
         &self,
+        project_id: String,
         published_scope: PublishedScope,
         checkout_id: String,
         checkout_dir: std::path::PathBuf,
     ) {
         self.session_checkout
             .set(Some(Arc::new(ResolvedCheckoutScope {
-                project_id: "test-project".into(),
+                project_id,
                 published_scope,
                 checkout_id,
                 checkout_project_dir: checkout_dir.to_string_lossy().into_owned(),
@@ -330,11 +330,14 @@ impl BlackboxServer {
             .unwrap_or_else(|| projects.clone());
         let mut selected_scopes = BTreeMap::<PublishedScope, ProjectRecord>::new();
         for project in selected_projects {
-            match project_published_scope(&project, crate::config::read_repo_id_inputs) {
-                Some(scope) => {
+            match super::checkout_access::published_scope_for_project(
+                &self.state.checkout_access,
+                &project.project_id,
+            ) {
+                Ok(Some(scope)) => {
                     selected_scopes.entry(scope).or_insert(project);
                 }
-                None if !self.path_fallback_is_cut() => {
+                Ok(None) if !self.path_fallback_is_cut() => {
                     // Inventory-bounded compatibility until the final path
                     // fallback cut: registered projects without a recorded
                     // scope keep their legacy loaded knowledge view.
@@ -353,15 +356,20 @@ impl BlackboxServer {
                         has_legacy_compatibility_rows = true;
                     }
                 }
-                None if explicit_managed_scope => {
+                Ok(None) if explicit_managed_scope => {
                     anyhow::bail!(
                         "registered project {} has no authoritative published scope",
                         project.canonical_path
                     );
                 }
-                None => diagnostics.push(format!(
+                Ok(None) => diagnostics.push(format!(
                     "registered project {} has no authoritative published scope",
                     project.canonical_path
+                )),
+                Err(error) if explicit_managed_scope => return Err(error),
+                Err(error) => diagnostics.push(format!(
+                    "registered project {} scope authority failed: {error:#}",
+                    project.project_id
                 )),
             }
         }
@@ -376,9 +384,7 @@ impl BlackboxServer {
                 }
             };
             let published = self.cached_published_knowledge_snapshot(
-                Path::new(&publisher.root),
-                &publisher.branch_ref,
-                &publisher.commit,
+                &publisher,
                 &scope,
                 &project.canonical_path,
             );
@@ -539,56 +545,61 @@ impl BlackboxServer {
 
     fn cached_published_knowledge_snapshot(
         &self,
-        publisher_root: &Path,
-        published_ref: &str,
-        publisher_commit: &str,
+        publisher: &super::knowledge_lifecycle::AuthorizedPublisher,
         scope: &PublishedScope,
         durable_project: &str,
     ) -> Result<PublishedKnowledgeSnapshot> {
-        let publisher_root = publisher_root.to_string_lossy().into_owned();
         let cached = self
             .state
             .knowledge_published_cache
             .read()
             .get(scope)
             .filter(|entry| {
-                entry.publisher_root == publisher_root
-                    && entry.snapshot.published_ref == published_ref
-                    && entry.publisher_commit == publisher_commit
+                entry.publisher_project_id == publisher.project_id
+                    && entry.snapshot.published_ref == publisher.branch_ref
+                    && entry.publisher_commit == publisher.commit
                     && entry.durable_project == durable_project
             })
             .cloned();
         if let Some(cached) = cached {
             let mut snapshot = cached.snapshot.clone();
-            hydrate_published_snapshot(&publisher_root, &mut snapshot);
+            self.with_authorized_publisher_root(publisher, |root| {
+                hydrate_published_snapshot(root, &mut snapshot);
+                Ok(())
+            })?;
             return Ok(snapshot);
         }
 
-        let snapshot = load_published_snapshot_at_commit_unhydrated(
-            Path::new(&publisher_root),
-            published_ref,
-            publisher_commit,
-            scope,
-            durable_project,
-        )?;
+        let snapshot = self.with_authorized_publisher_root(publisher, |root| {
+            load_published_snapshot_at_commit_unhydrated(
+                root,
+                &publisher.branch_ref,
+                &publisher.commit,
+                scope,
+                durable_project,
+            )
+        })?;
         self.state.knowledge_published_cache.write().insert(
             scope.clone(),
             PublishedKnowledgeCacheEntry {
-                publisher_root: publisher_root.clone(),
-                publisher_commit: publisher_commit.to_string(),
+                publisher_project_id: publisher.project_id.clone(),
+                publisher_commit: publisher.commit.clone(),
                 durable_project: durable_project.to_string(),
                 snapshot: snapshot.clone(),
             },
         );
         let mut hydrated = snapshot;
-        hydrate_published_snapshot(&publisher_root, &mut hydrated);
+        self.with_authorized_publisher_root(publisher, |root| {
+            hydrate_published_snapshot(root, &mut hydrated);
+            Ok(())
+        })?;
         Ok(hydrated)
     }
 }
 
-fn hydrate_published_snapshot(publisher_root: &str, snapshot: &mut PublishedKnowledgeSnapshot) {
+fn hydrate_published_snapshot(publisher_root: &Path, snapshot: &mut PublishedKnowledgeSnapshot) {
     bbox_knowledge::knowledge::hydrate_repo_recall_stats(
-        Path::new(publisher_root),
+        publisher_root,
         snapshot
             .entries
             .values_mut()
@@ -859,14 +870,14 @@ mod tests {
         let state_dir = temp.path().join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
         let state = Arc::new(crate::server::SharedState::for_test(&state_dir));
-        state.projects.write().register_path(&base).unwrap();
+        let project = state.projects.write().register_path(&base).unwrap();
         let server = BlackboxServer::new(state.clone());
         let scope = PublishedScope {
             repo_id: repo_id.repo_id,
             bbox_root_relpath: ".".into(),
         };
 
-        let own_id = "own-checkout";
+        let own_id = bbox_corpus_core::identity::ensure_checkout_id(&base).unwrap();
         let peer_id = "peer-checkout";
         write_entry(&base, &entry("shared", "OWN_CONTENT"));
         std::fs::remove_file(base.join(".bbox/knowledge/deleted.json")).unwrap();
@@ -894,13 +905,16 @@ mod tests {
             diagnostics: vec!["malformed entry".into()],
         });
         let own_checkout = ResolvedCheckoutScope {
-            project_id: "test-project".into(),
+            project_id: project.project_id,
             published_scope: scope.clone(),
-            checkout_id: own_id.into(),
+            checkout_id: own_id.clone(),
             checkout_dir: base.to_string_lossy().into_owned(),
             checkout_project_dir: base.to_string_lossy().into_owned(),
             branch_ref: Some("refs/heads/main".into()),
         };
+        server
+            .register_dark_knowledge_checkout(&own_checkout)
+            .unwrap();
         server
             .session_checkout
             .set(Some(Arc::new(own_checkout.clone())))
@@ -932,7 +946,7 @@ mod tests {
         let refreshed_own = server
             .session_knowledge_view(Some(base.to_str().unwrap()), Some("own"))
             .expect("missing own overlay should receive one bounded refresh");
-        let refreshed_own_ref = provisional_entity_ref(&scope, own_id, "shared");
+        let refreshed_own_ref = provisional_entity_ref(&scope, &own_id, "shared");
         assert_eq!(
             refreshed_own
                 .knowledge
@@ -942,9 +956,6 @@ mod tests {
             "OWN_CONTENT"
         );
         assert!(refreshed_own.knowledge.entry("deleted").is_none());
-        server
-            .register_dark_knowledge_checkout(&own_checkout)
-            .unwrap();
         server.refresh_dark_knowledge_overlay(&own_checkout);
 
         // A model-supplied peer checkout path scopes the published project but
@@ -952,7 +963,7 @@ mod tests {
         let mut own = server
             .session_knowledge_view(Some(peer_path.to_str().unwrap()), Some("own"))
             .unwrap();
-        let own_ref = provisional_entity_ref(&scope, own_id, "shared");
+        let own_ref = provisional_entity_ref(&scope, &own_id, "shared");
         let peer_ref = provisional_entity_ref(&scope, peer_id, "shared");
         assert_eq!(
             own.knowledge.entry(&own_ref).unwrap().content,
@@ -1180,11 +1191,19 @@ mod tests {
         let first_record = state.projects.write().register_path(&first).unwrap();
         let second_record = state.projects.write().register_path(&second).unwrap();
         assert!(
-            project_published_scope(&first_record, crate::config::read_repo_id_inputs).is_none(),
+            bbox_indexing::publisher::project_published_scope(
+                &first_record,
+                crate::config::read_repo_id_inputs,
+            )
+            .is_none(),
             "the fixture must not have recorded repo identity"
         );
         assert!(
-            project_published_scope(&second_record, crate::config::read_repo_id_inputs).is_none(),
+            bbox_indexing::publisher::project_published_scope(
+                &second_record,
+                crate::config::read_repo_id_inputs,
+            )
+            .is_none(),
             "the fixture must not have recorded repo identity"
         );
 

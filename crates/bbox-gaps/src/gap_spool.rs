@@ -9,7 +9,10 @@ use crate::gaps::{GapNote, GapStore};
 use crate::repo_io::{GapRepoCarrier, GapRepoWrite};
 
 const GAP_NOTE_TYPE: &str = "blackbox.gap_note.v1";
-const MAX_CARRIER_ID_BYTES: usize = 256;
+// Daemon carrier envelopes encode two separately bounded logical ids plus
+// versioned JSON. Keep the envelope bounded without applying the broker's
+// per-component limit to the encoded aggregate.
+const MAX_CARRIER_ID_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GapSpoolImportReport {
@@ -73,6 +76,7 @@ pub struct SkippedGapFile {
 struct SpoolSource {
     inbox_dir: PathBuf,
     project: Option<String>,
+    repo_carrier: Option<GapRepoCarrier>,
     logical_prefix: Option<String>,
     allowed_root: Option<PathBuf>,
 }
@@ -85,6 +89,7 @@ impl SpoolSource {
         Ok(Self {
             inbox_dir: root.join(".bbox").join("gaps").join("inbox"),
             project: Some(carrier.project.clone()),
+            repo_carrier: Some(carrier.clone()),
             logical_prefix: Some(format!("carrier:{}/.bbox/gaps/inbox", carrier.carrier_id)),
             allowed_root: Some(root),
         })
@@ -94,6 +99,7 @@ impl SpoolSource {
         Self {
             inbox_dir,
             project: None,
+            repo_carrier: None,
             logical_prefix: None,
             allowed_root: None,
         }
@@ -258,6 +264,7 @@ fn import_source(
     let source = SpoolSource {
         inbox_dir,
         project: source.project.clone(),
+        repo_carrier: source.repo_carrier.clone(),
         logical_prefix: source.logical_prefix.clone(),
         allowed_root: source.allowed_root.clone(),
     };
@@ -355,7 +362,17 @@ fn import_one(
     };
     gap.project = source.project.clone();
 
-    let (gap_id, created) = gaps.ingest(gap)?;
+    let (gap_id, created) = match source.repo_carrier.as_ref() {
+        Some(carrier) => gaps.ingest_authorized_carrier(
+            gap,
+            carrier,
+            source
+                .allowed_root
+                .as_deref()
+                .context("repository gap spool has no authorized root")?,
+        )?,
+        None => gaps.ingest(gap)?,
+    };
     let moved_to = move_file(path, &source.inbox_dir.join("imported"), &source.inbox_dir)?;
     if created {
         state.imported.push(ImportedFingerprint {
@@ -517,6 +534,48 @@ mod tests {
         assert_eq!(
             report.imported[0].path,
             "carrier:checkout:test/.bbox/gaps/inbox/gap.json"
+        );
+    }
+
+    #[test]
+    fn checkout_spool_import_leaves_selected_base_bytes_unchanged() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let base = root.join("base");
+        let checkout = root.join("checkout");
+        fs::create_dir_all(base.join(".bbox/gaps")).unwrap();
+        fs::create_dir_all(checkout.join(".bbox/gaps/inbox")).unwrap();
+        let base_gap = base.join(".bbox/gaps/gap-existing.json");
+        let base_bytes = br#"{"id":"gap-existing","title":"base stays fixed"}"#;
+        fs::write(&base_gap, base_bytes).unwrap();
+        fs::write(
+            checkout.join(".bbox/gaps/inbox/gap.json"),
+            gap_body("Checkout-only gap", "checkout-only"),
+        )
+        .unwrap();
+        let project = base.to_string_lossy().into_owned();
+        let carrier = GapRepoCarrier::new(&project, "checkout:session").unwrap();
+        let io = TestGapRepoIo::default();
+        io.replace(&[(carrier.clone(), checkout.clone())]);
+        let mut gaps = GapStore::open(&root.join("gaps.json")).unwrap();
+
+        let report =
+            import_gap_spool_with_host_inbox(&mut gaps, &[carrier], &io, &root.join("state"), None)
+                .unwrap();
+
+        assert_eq!(report.imported.len(), 1);
+        assert_eq!(fs::read(&base_gap).unwrap(), base_bytes);
+        assert!(checkout.join(".bbox/gaps/inbox/imported/gap.json").exists());
+        assert!(
+            checkout
+                .join(".bbox/gaps")
+                .read_dir()
+                .unwrap()
+                .any(|entry| {
+                    entry.ok().is_some_and(|entry| {
+                        entry.file_name().to_string_lossy().starts_with("gap-")
+                    })
+                })
         );
     }
 
