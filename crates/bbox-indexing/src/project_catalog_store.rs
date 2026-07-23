@@ -62,12 +62,17 @@ const MAX_MIGRATION_IMMUTABLE_ASSETS: usize =
     MAX_MIGRATION_INVENTORY_GENERATIONS + MAX_PUBLISHER_REF_ROWS + 2;
 const MAX_MIGRATION_CHECKOUT_ACTIONS: usize = MAX_PROJECT_CATALOG_ENTRIES;
 const MAX_MIGRATION_PUBLISHER_PINS: usize = MAX_PUBLISHER_REF_ROWS;
-// Pins and dispositions share this serialized budget. The compatibility proof
-// below reserves the remaining 384 MiB for the maximum closed participant,
-// immutable-asset, checkout-action, and journal-envelope sets.
+// Publisher rows have their own aggregate serialized budget. All other
+// variable durable evidence is charged once under the structural budget. The
+// fixed margin covers scalar envelope fields, collection delimiters, and the
+// final newline in either pretty-JSON artifact.
 const MAX_MIGRATION_PUBLISHER_EVIDENCE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_JOURNAL_BYTES: usize = 512 * 1024 * 1024;
 const MAX_MARKER_BYTES: usize = 512 * 1024 * 1024;
+const MAX_MIGRATION_DURABLE_ENVELOPE_BYTES: usize = 1024 * 1024;
+const MAX_MIGRATION_DURABLE_STRUCTURAL_EVIDENCE_BYTES: usize = MAX_JOURNAL_BYTES
+    - MAX_MIGRATION_PUBLISHER_EVIDENCE_BYTES
+    - MAX_MIGRATION_DURABLE_ENVELOPE_BYTES;
 const MAX_CODE_SOURCE_EFFECTIVE_MANIFEST_BYTES: usize = 512 * 1024 * 1024;
 const MAX_CODE_SOURCE_ACTIVATION_BYTES: usize = 512 * 1024 * 1024;
 const MAX_CODE_SOURCE_GENERATION_METADATA_BYTES: usize = 64 * 1024;
@@ -1195,42 +1200,83 @@ fn add_publisher_evidence_size(
     evidence: &impl Serialize,
     owner: &str,
 ) -> ProjectCatalogStoreResult<()> {
-    let encoded = serde_json::to_vec_pretty(evidence).map_err(|error| {
+    let charged = nested_pretty_json_row_charge(evidence).map_err(|error| {
         ProjectCatalogStoreError::new(
             "error.project_catalog_invalid_publisher_evidence",
             format!("{owner} publisher evidence could not be encoded: {error}"),
         )
     })?;
-    // serde_json's pretty formatter uses two spaces per nesting level. Evidence
-    // rows sit no more than four additional levels deep in either durable
-    // envelope, so eight bytes per emitted newline plus two bytes for the row
-    // separator conservatively bounds the outer journal/marker indentation.
-    let outer_indentation = encoded
-        .iter()
-        .filter(|byte| **byte == b'\n')
-        .count()
-        .checked_mul(8)
-        .and_then(|bytes| bytes.checked_add(2))
-        .ok_or_else(|| {
-            ProjectCatalogStoreError::new(
-                "error.project_catalog_invalid_publisher_evidence",
-                format!("{owner} publisher evidence size overflows"),
-            )
-        })?;
-    *total = total
-        .checked_add(encoded.len())
-        .and_then(|bytes| bytes.checked_add(outer_indentation))
-        .ok_or_else(|| {
-            ProjectCatalogStoreError::new(
-                "error.project_catalog_invalid_publisher_evidence",
-                format!("{owner} publisher evidence size overflows"),
-            )
-        })?;
+    *total = total.checked_add(charged).ok_or_else(|| {
+        ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_publisher_evidence",
+            format!("{owner} publisher evidence size overflows"),
+        )
+    })?;
     if *total > MAX_MIGRATION_PUBLISHER_EVIDENCE_BYTES {
         return Err(ProjectCatalogStoreError::new(
             "error.project_catalog_invalid_publisher_evidence",
             format!("{owner} publisher evidence exceeds its aggregate byte limit"),
         ));
+    }
+    Ok(())
+}
+
+fn nested_pretty_json_row_charge(evidence: &impl Serialize) -> Result<usize, serde_json::Error> {
+    let encoded = serde_json::to_vec_pretty(evidence)?;
+    // serde_json's pretty formatter uses two spaces per nesting level. Every
+    // charged row sits no more than four additional levels deep in the marker
+    // or journal. Eight bytes per emitted newline plus two bytes for the comma
+    // and newline between rows therefore overbounds durable nesting overhead.
+    let nesting_overhead = encoded
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+        .saturating_mul(8)
+        .saturating_add(2);
+    Ok(encoded.len().saturating_add(nesting_overhead))
+}
+
+fn add_durable_structural_evidence_size(
+    total: &mut usize,
+    evidence: &impl Serialize,
+    owner: &str,
+) -> ProjectCatalogStoreResult<()> {
+    let charged = nested_pretty_json_row_charge(evidence).map_err(|error| {
+        ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_journal",
+            format!("{owner} durable structural evidence could not be encoded: {error}"),
+        )
+    })?;
+    *total = total.checked_add(charged).ok_or_else(|| {
+        ProjectCatalogStoreError::new(
+            "error.project_catalog_durable_evidence_exhausted",
+            format!("{owner} aggregate durable-evidence budget is exhausted"),
+        )
+    })?;
+    if *total > MAX_MIGRATION_DURABLE_STRUCTURAL_EVIDENCE_BYTES {
+        return Err(ProjectCatalogStoreError::new(
+            "error.project_catalog_durable_evidence_exhausted",
+            format!("{owner} aggregate durable-evidence budget is exhausted"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_durable_structural_evidence<P: Serialize, A: Serialize, C: Serialize>(
+    participants: &[P],
+    immutable_assets: &[A],
+    checkout_actions: &[C],
+    owner: &str,
+) -> ProjectCatalogStoreResult<()> {
+    let mut total = 0_usize;
+    for participant in participants {
+        add_durable_structural_evidence_size(&mut total, participant, owner)?;
+    }
+    for asset in immutable_assets {
+        add_durable_structural_evidence_size(&mut total, asset, owner)?;
+    }
+    for action in checkout_actions {
+        add_durable_structural_evidence_size(&mut total, action, owner)?;
     }
     Ok(())
 }
@@ -3387,7 +3433,11 @@ impl ProjectCatalogTransactionOwner {
         {
             return Ok(false);
         }
-        self.verify_expected_pair(&journal, ExpectedSide::Old)?;
+        // The committed rollback proved exact restoration before publishing this
+        // terminal journal. A corrected attempt may legitimately start from
+        // subsequently changed legacy inputs, so only their structural legacy
+        // shape remains authoritative here. The incoming plan rebinds the live
+        // bytes and complete migration inventory under the same locks.
         self.verify_journal_pair_invariants(&journal, ExpectedSide::Old)?;
         for participant in &journal.participants {
             if participant.old.sha256().is_some()
@@ -3845,7 +3895,6 @@ impl ProjectCatalogTransactionOwner {
                 )
             })?;
         let planned_catalog = decode_catalog_snapshot(catalog_bytes).map_err(contract_error)?;
-        self.verify_live_code_source_snapshot(&plan.code_source_snapshot, &planned_catalog)?;
         let mut old_images = std::collections::BTreeMap::new();
         for participant in &plan.journal.participants {
             let target = self.target_for_role(&participant.role)?;
@@ -3913,6 +3962,10 @@ impl ProjectCatalogTransactionOwner {
                 _ => {}
             }
         }
+        // Verify pinned bytes before replaying their semantic inventory. This
+        // preserves the precise distinction between a disappeared pinned asset
+        // and a present immutable target whose bytes collide with its hash.
+        self.verify_live_code_source_snapshot(&plan.code_source_snapshot, &planned_catalog)?;
         let immutable_evidence = plan
             .journal
             .immutable_assets
@@ -6054,6 +6107,12 @@ impl ProjectCatalogTransactionJournalV1 {
                 "journal header is invalid",
             ));
         }
+        validate_durable_structural_evidence(
+            &self.participants,
+            &self.immutable_assets,
+            &self.monotonic_checkout_identity_actions,
+            "transaction journal",
+        )?;
         match (self.state, self.outcome, self.committed_at) {
             (TransactionStateV1::Prepared, None, None)
             | (TransactionStateV1::Committed, Some(_), Some(_)) => {}
@@ -6346,6 +6405,16 @@ impl ProjectCatalogMigrationMarkerV1 {
                 "migration marker is invalid",
             ));
         }
+        // The marker omits checkout actions and installable-stage names. It
+        // validates its own projection here; the matching transaction journal
+        // charges the strictly larger participant/asset/action superset and is
+        // authoritative for the complete transaction budget.
+        validate_durable_structural_evidence(
+            &self.participants,
+            &self.immutable_assets,
+            &[] as &[CheckoutIdentityActionV1],
+            "migration marker",
+        )?;
         let participant_roles = self
             .participants
             .iter()
@@ -7712,8 +7781,25 @@ mod tests {
     fn assert_known_migration_state_or_absent(
         path: &Path,
         registry: MigrationParticipantRegistry,
+        expected_legacy_bytes: &[u8],
         allowed_states: &[(u64, String, String)],
     ) {
+        let paths = ProjectCatalogPaths::derive(path).unwrap();
+        if let Ok(catalog_bytes) = fs::read(path)
+            && decode_legacy_project_store(&catalog_bytes).is_ok()
+        {
+            assert_eq!(catalog_bytes, expected_legacy_bytes);
+            assert!(!paths.attachments.exists());
+            let journal: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
+                &fs::read(paths.journal).unwrap(),
+                MAX_JOURNAL_BYTES,
+                "transaction journal",
+            )
+            .unwrap();
+            assert_eq!(journal.state, TransactionStateV1::Committed);
+            assert_eq!(journal.outcome, Some(TransactionOutcomeV1::RolledBack));
+            return;
+        }
         match ProjectCatalogStore::open_existing_after_migration(path.to_path_buf(), registry) {
             Ok(store) => {
                 let state = store.snapshot().unwrap();
@@ -9655,7 +9741,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_evidence_cardinality_and_encoded_size_bounds_are_compatible() {
+    fn migration_evidence_cardinality_limits_fail_closed() {
         let (_directory, path) = projects_path();
         let legacy_bytes = b"{\"version\":1,\"projects\":[]}\n";
         let (registry, mut draft, _) = basic_migration_draft(&path, legacy_bytes);
@@ -9673,47 +9759,88 @@ mod tests {
             vec![draft.publisher_pins[0].clone(); MAX_MIGRATION_PUBLISHER_PINS + 1];
         let error = validate_migration_plan(&path, registry, draft).unwrap_err();
         assert_eq!(error.code(), "error.project_catalog_invalid_migration_plan");
+    }
 
+    fn maximum_scope_structural_evidence() -> (TransactionParticipantV1, ImmutableAssetV1) {
+        let max_root = [
+            std::iter::repeat_n("p".repeat(255), 15).collect::<Vec<_>>(),
+            vec!["q".repeat(254), "r".into()],
+        ]
+        .concat()
+        .join("/");
+        assert_eq!(max_root.len(), 4096);
+        let scope = PublishedScope::try_new("s".repeat(256), max_root).unwrap();
         let transaction_id = ProjectCatalogTransactionId::mint();
-        let project_id = ProjectId::parse("x".repeat(96)).unwrap();
-        let role = ParticipantRoleV1::StoredGenerationMetadata {
-            project_id: project_id.clone(),
-            published_scope: PublishedScope::try_new("r".repeat(128), ".").unwrap(),
-            generation_id: Sha256Hex::digest(b"generation"),
+        let generation_id = Sha256Hex::digest(b"maximum-scope-generation");
+        let participant = build_transaction_participant(
+            &transaction_id,
+            ParticipantRoleV1::StoredGenerationMetadata {
+                project_id: ProjectId::parse("x".repeat(96)).unwrap(),
+                published_scope: scope.clone(),
+                generation_id: generation_id.clone(),
+            },
+            Some(Sha256Hex::digest(b"old metadata")),
+            &Some(vec![b'x']),
+        )
+        .unwrap();
+        let asset_role = ImmutableAssetRoleV1::CollectedGenerationManifest {
+            published_scope: scope,
+            generation_id,
         };
-        let image = Some(vec![b'x']);
-        let participant =
-            build_transaction_participant(&transaction_id, role, None, &image).unwrap();
-        let encoded_participant = serde_json::to_vec(&participant).unwrap().len();
-        let asset_role = ImmutableAssetRoleV1::LegacyProjectStoreBackup;
-        let asset_hash = Sha256Hex::digest(b"asset");
-        let encoded_asset = serde_json::to_vec(&ImmutableAssetV1 {
+        let asset_hash = Sha256Hex::digest(b"manifest bytes");
+        let asset = ImmutableAssetV1 {
             validated_name: immutable_target_name(&transaction_id, &asset_role, &asset_hash)
                 .unwrap(),
-            stage_name: Some(
-                immutable_stage_name(&transaction_id, &asset_role, &asset_hash).unwrap(),
-            ),
+            stage_name: None,
             role: asset_role,
-            mode: ImmutableAssetModeV1::Installable,
+            mode: ImmutableAssetModeV1::PinnedExisting,
             sha256: asset_hash,
-        })
-        .unwrap()
-        .len();
-        let encoded_action = serde_json::to_vec(&CheckoutIdentityActionV1 {
-            observation_id: "o".repeat(256),
-            planned_id: "a".repeat(32),
-        })
-        .unwrap()
-        .len();
-        let conservative_max = encoded_participant
-            .saturating_mul(MAX_MIGRATION_PARTICIPANTS)
-            .saturating_add(encoded_asset.saturating_mul(MAX_MIGRATION_IMMUTABLE_ASSETS))
-            .saturating_add(encoded_action.saturating_mul(MAX_MIGRATION_CHECKOUT_ACTIONS))
-            .saturating_add(MAX_MIGRATION_PUBLISHER_EVIDENCE_BYTES)
-            .saturating_add(1024 * 1024);
+        };
+        (participant, asset)
+    }
+
+    #[test]
+    fn durable_structural_evidence_budget_accepts_the_exact_encoded_boundary() {
+        assert_eq!(MAX_MARKER_BYTES, MAX_JOURNAL_BYTES);
+        assert_eq!(
+            MAX_MIGRATION_DURABLE_STRUCTURAL_EVIDENCE_BYTES
+                + MAX_MIGRATION_PUBLISHER_EVIDENCE_BYTES
+                + MAX_MIGRATION_DURABLE_ENVELOPE_BYTES,
+            MAX_JOURNAL_BYTES
+        );
+        let (participant, asset) = maximum_scope_structural_evidence();
+        let combined_charge = nested_pretty_json_row_charge(&participant)
+            .unwrap()
+            .checked_add(nested_pretty_json_row_charge(&asset).unwrap())
+            .unwrap();
+        assert!(combined_charge <= MAX_MIGRATION_DURABLE_STRUCTURAL_EVIDENCE_BYTES);
+
+        let mut exact = MAX_MIGRATION_DURABLE_STRUCTURAL_EVIDENCE_BYTES - combined_charge;
+        add_durable_structural_evidence_size(&mut exact, &participant, "test journal").unwrap();
+        add_durable_structural_evidence_size(&mut exact, &asset, "test journal").unwrap();
+        assert_eq!(exact, MAX_MIGRATION_DURABLE_STRUCTURAL_EVIDENCE_BYTES);
+    }
+
+    #[test]
+    fn durable_structural_evidence_budget_refuses_the_first_excess_byte() {
+        let (participant, asset) = maximum_scope_structural_evidence();
+        let combined_charge = nested_pretty_json_row_charge(&participant)
+            .unwrap()
+            .checked_add(nested_pretty_json_row_charge(&asset).unwrap())
+            .unwrap();
+        assert!(combined_charge <= MAX_MIGRATION_DURABLE_STRUCTURAL_EVIDENCE_BYTES);
+        let mut excess = MAX_MIGRATION_DURABLE_STRUCTURAL_EVIDENCE_BYTES - combined_charge + 1;
+        add_durable_structural_evidence_size(&mut excess, &participant, "test journal").unwrap();
+        let error =
+            add_durable_structural_evidence_size(&mut excess, &asset, "test journal").unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_durable_evidence_exhausted"
+        );
         assert!(
-            conservative_max <= MAX_JOURNAL_BYTES,
-            "closed evidence maxima require {conservative_max} bytes but the journal allows {MAX_JOURNAL_BYTES}"
+            error
+                .to_string()
+                .contains("aggregate durable-evidence budget is exhausted")
         );
     }
 
@@ -9726,8 +9853,7 @@ mod tests {
             full_ref: FullPublisherRef::parse("refs/heads/main").unwrap(),
             bounded_reason: "bounded reason".into(),
         };
-        let encoded = serde_json::to_vec_pretty(&evidence).unwrap();
-        let charged = encoded.len() + encoded.iter().filter(|byte| **byte == b'\n').count() * 8 + 2;
+        let charged = nested_pretty_json_row_charge(&evidence).unwrap();
         let mut exact = MAX_MIGRATION_PUBLISHER_EVIDENCE_BYTES - charged;
         add_publisher_evidence_size(&mut exact, &evidence, "test").unwrap();
         assert_eq!(exact, MAX_MIGRATION_PUBLISHER_EVIDENCE_BYTES);
@@ -10532,7 +10658,7 @@ mod tests {
                     published_scope: long_scope.clone(),
                     generation_id: Sha256Hex::digest(&ordinal.to_le_bytes()),
                 },
-                None,
+                Some(Sha256Hex::digest(&ordinal.to_le_bytes())),
                 &Some(vec![b'x']),
             )
             .unwrap();
@@ -11239,7 +11365,8 @@ mod tests {
         let recovery_trace = recovery_recording.trace();
 
         for index in 0..recovery_trace.len() {
-            let (_directory, path, plan, expected_new, _) = migration_fault_fixture();
+            let (_directory, path, plan, expected_new, expected_legacy_bytes) =
+                migration_fault_fixture();
             let registry = plan.registry.clone();
             let initial = Arc::new(TracingIo::failing_at(initial_failure));
             assert!(transact_migration_with_io(&path, plan, initial).is_err());
@@ -11247,7 +11374,12 @@ mod tests {
             let _ = recover_migration_with_io(&path, registry.clone(), recovery_failure);
             recover_migration_with_io(&path, registry.clone(), Arc::new(RealCatalogStoreIo))
                 .unwrap();
-            assert_known_migration_state_or_absent(&path, registry, &[expected_new]);
+            assert_known_migration_state_or_absent(
+                &path,
+                registry,
+                &expected_legacy_bytes,
+                &[expected_new],
+            );
             assert_retained_journal_artifacts(&path);
         }
     }
