@@ -29,9 +29,10 @@ use bbox_corpus_core::project_catalog::{
     AttachmentKind, AttachmentSnapshotV1, AttachmentStatus, CatalogOriginV2, CatalogSnapshotV2,
     CheckoutAttachment, CommitNamespace, CorpusProject, LegacyPathBindingId,
     LegacyPathBindingStatus, LegacyPathLedgerEntry, LegacyPathRelationship,
-    MAX_PROJECT_CATALOG_ENTRIES, ProjectCatalogTransactionId, ProjectId, ProjectScope,
-    RecordedRepoAuthority, RepoHistoryAuthority, RepoHistoryId, RepoHistoryRecord,
-    encode_attachment_snapshot, encode_catalog_snapshot, validate_catalog_attachments,
+    MAX_PROJECT_CATALOG_BYTES, MAX_PROJECT_CATALOG_ENTRIES, ProjectCatalogTransactionId, ProjectId,
+    ProjectScope, RecordedRepoAuthority, RepoHistoryAuthority, RepoHistoryId, RepoHistoryRecord,
+    decode_legacy_project_store, encode_attachment_snapshot, encode_catalog_snapshot,
+    validate_catalog_attachments,
 };
 use bbox_corpus_core::project_record::ProjectRecord;
 use serde::Serialize;
@@ -1126,7 +1127,9 @@ fn assess_migration_semantics(
         .map(|selection| (selection.scope.clone(), selection))
         .collect::<BTreeMap<_, _>>();
     if selected_owners.len() != resolution.selected_scope_owners.len() {
-        refusal_count = refusal_count.saturating_add(1);
+        return Err(invalid_resolution_artifact(
+            "resolution repeats a selected scope owner",
+        ));
     }
 
     let mut scope_conflicts = Vec::new();
@@ -1169,13 +1172,9 @@ fn assess_migration_semantics(
             || selected_candidates != *candidates
             || !candidates.contains(&selection.owner_project_id)
         {
-            refusal_count = refusal_count.saturating_add(1);
-            for project in &mut resolved_project_scopes {
-                if candidates.contains(&project.project_id) {
-                    project.published_scope = None;
-                }
-            }
-            continue;
+            return Err(invalid_resolution_artifact(
+                "selected scope owner does not exactly match its conflict",
+            ));
         }
         for project in &mut resolved_project_scopes {
             if candidates.contains(&project.project_id) {
@@ -1191,7 +1190,9 @@ fn assess_migration_semantics(
         .keys()
         .any(|scope| !canonical_conflict_scopes.contains(scope))
     {
-        refusal_count = refusal_count.saturating_add(1);
+        return Err(invalid_resolution_artifact(
+            "resolution contains an unknown scope owner disposition",
+        ));
     }
 
     let resolved_alias_owners = resolution
@@ -1210,7 +1211,9 @@ fn assess_migration_semantics(
         .map(|selection| selection.owned_aliases.len())
         .sum::<usize>();
     if resolved_alias_owners.len() != resolved_alias_count {
-        refusal_count = refusal_count.saturating_add(1);
+        return Err(invalid_resolution_artifact(
+            "resolution repeats an alias owner disposition",
+        ));
     }
     let mut aliases = BTreeMap::<String, BTreeSet<ProjectId>>::new();
     for project in &inventory.legacy_projects {
@@ -1262,7 +1265,9 @@ fn assess_migration_semantics(
         .iter()
         .any(|(alias, owner)| !aliases.get(*alias).is_some_and(|set| set.contains(*owner)))
     {
-        refusal_count = refusal_count.saturating_add(1);
+        return Err(invalid_resolution_artifact(
+            "resolution contains an unknown alias owner disposition",
+        ));
     }
 
     let resolved_scopes = resolved_project_scopes
@@ -1275,7 +1280,9 @@ fn assess_migration_semantics(
         .map(|row| (row.attachment_id.clone(), row))
         .collect::<BTreeMap<_, _>>();
     if exclusion_rows.len() != resolution.excluded_attachments.len() {
-        refusal_count = refusal_count.saturating_add(1);
+        return Err(invalid_resolution_artifact(
+            "resolution repeats an attachment exclusion",
+        ));
     }
     let duplicate_attachment_keys = inventory
         .attachment_candidates
@@ -1328,7 +1335,9 @@ fn assess_migration_semantics(
                 unresolved_resolution_ids.insert(resolution_id);
             }
             Some(row) if row.resolution_id != resolution_id => {
-                refusal_count = refusal_count.saturating_add(1);
+                return Err(invalid_resolution_artifact(
+                    "attachment exclusion does not match its conflict",
+                ));
             }
             Some(_) => {}
         }
@@ -1337,7 +1346,9 @@ fn assess_migration_semantics(
         .keys()
         .any(|attachment_id| !canonical_exclusions.contains(attachment_id))
     {
-        refusal_count = refusal_count.saturating_add(1);
+        return Err(invalid_resolution_artifact(
+            "resolution contains an unknown attachment exclusion",
+        ));
     }
 
     let group_memberships =
@@ -1351,7 +1362,9 @@ fn assess_migration_semantics(
         .map(|row| (row.source_cluster_id.as_str(), row))
         .collect::<BTreeMap<_, _>>();
     if split_rows.len() != resolution.repo_history_group_splits.len() {
-        refusal_count = refusal_count.saturating_add(1);
+        return Err(invalid_resolution_artifact(
+            "resolution repeats a repository history split",
+        ));
     }
     let mut namespace_conflicts = Vec::new();
     for cluster in &inventory.legacy_namespace_clusters {
@@ -1386,7 +1399,9 @@ fn assess_migration_semantics(
                 group_memberships.get(&partition.target_group_id) == Some(&partition.project_ids)
             });
         if !partitions_are_exact {
-            refusal_count = refusal_count.saturating_add(1);
+            return Err(invalid_resolution_artifact(
+                "repository history split does not match its conflict",
+            ));
         }
     }
     if split_rows.keys().any(|cluster_id| {
@@ -1395,12 +1410,13 @@ fn assess_migration_semantics(
             .iter()
             .any(|cluster| cluster.cluster_id == **cluster_id)
     }) {
-        refusal_count = refusal_count.saturating_add(1);
+        return Err(invalid_resolution_artifact(
+            "resolution contains an unknown repository history split",
+        ));
     }
     if !resolution.repo_history_group_merges.is_empty() {
-        return Err(ProjectCatalogMigrationError::no_mutation(
-            "error.project_catalog_inventory_unsupported_merge",
-            "repository-history groups already reflect every strong same-repository proof",
+        return Err(invalid_resolution_artifact(
+            "repository history merge dispositions are unsupported",
         ));
     }
 
@@ -1410,7 +1426,9 @@ fn assess_migration_semantics(
         .map(|row| ((row.project_id.clone(), row.generation_id.as_str()), row))
         .collect::<BTreeMap<_, _>>();
     if quarantine_rows.len() != resolution.quarantine_collected.len() {
-        refusal_count = refusal_count.saturating_add(1);
+        return Err(invalid_resolution_artifact(
+            "resolution repeats a collected quarantine",
+        ));
     }
     let mut expected_quarantines = BTreeSet::new();
     let mut activation_conflicts = Vec::new();
@@ -1443,7 +1461,9 @@ fn assess_migration_semantics(
                         unresolved_resolution_ids.insert(resolution_id);
                     }
                     Some(row) if row.resolution_id != resolution_id => {
-                        refusal_count = refusal_count.saturating_add(1);
+                        return Err(invalid_resolution_artifact(
+                            "collected quarantine does not match its conflict",
+                        ));
                     }
                     Some(_) => {}
                 }
@@ -1453,7 +1473,9 @@ fn assess_migration_semantics(
     if quarantine_rows.keys().any(|(project_id, generation_id)| {
         !expected_quarantines.contains(&(project_id.clone(), (*generation_id).to_string()))
     }) {
-        refusal_count = refusal_count.saturating_add(1);
+        return Err(invalid_resolution_artifact(
+            "resolution contains an unknown collected quarantine",
+        ));
     }
 
     let resolution_publishers = resolution
@@ -1471,7 +1493,9 @@ fn assess_migration_semantics(
         })
         .collect::<BTreeMap<_, _>>();
     if resolution_publishers.len() != resolution.publisher_binding_dispositions.len() {
-        refusal_count = refusal_count.saturating_add(1);
+        return Err(invalid_resolution_artifact(
+            "resolution repeats a publisher binding disposition",
+        ));
     }
     let mut publisher_bindings = Vec::new();
     let mut publisher_binding_conflicts = Vec::new();
@@ -1490,7 +1514,9 @@ fn assess_migration_semantics(
             && pin.resolved_scope.as_ref() == Some(&pin.expected_scope);
         let status = if automatic {
             if resolution_publishers.contains_key(&key) {
-                refusal_count = refusal_count.saturating_add(1);
+                return Err(invalid_resolution_artifact(
+                    "resolution overrides an unambiguous publisher binding",
+                ));
             }
             PublisherBindingReportStatusV1::SeedG1Predicted
         } else {
@@ -1543,7 +1569,9 @@ fn assess_migration_semantics(
             pin.project_id == key.0 && pin.expected_scope == key.1 && pin.full_ref == key.2
         })
     }) {
-        refusal_count = refusal_count.saturating_add(1);
+        return Err(invalid_resolution_artifact(
+            "resolution contains an unknown publisher binding disposition",
+        ));
     }
 
     for checkout in &inventory.checkouts {
@@ -3426,6 +3454,13 @@ fn inventory_error(
 
 fn planner_error(message: &'static str) -> ProjectCatalogMigrationError {
     ProjectCatalogMigrationError::no_mutation("error.project_catalog_migration_planner", message)
+}
+
+fn invalid_resolution_artifact(message: &'static str) -> ProjectCatalogMigrationError {
+    ProjectCatalogMigrationError::no_mutation(
+        "error.project_catalog_migration_artifact_identity",
+        message,
+    )
 }
 
 struct CurrentClosedMigrationIntegrationV1;
