@@ -5159,6 +5159,7 @@ mod tests {
         let discovered =
             ProjectCatalogMigrationInventoryFacadeV1::discover_attachment_candidate_keys(
                 ProjectCatalogAttachmentCandidateDiscoveryRequestV1 {
+                    rehearsal_root: None,
                     legacy_project_store_path: projects.clone(),
                     checkout_roots: vec![root.clone()],
                 },
@@ -5168,6 +5169,7 @@ mod tests {
         assert_eq!(discovered[0].base_relpath, ".");
         let second = ProjectCatalogMigrationInventoryFacadeV1::discover_attachment_candidate_keys(
             ProjectCatalogAttachmentCandidateDiscoveryRequestV1 {
+                rehearsal_root: None,
                 legacy_project_store_path: projects.clone(),
                 checkout_roots: vec![root.clone()],
             },
@@ -5177,6 +5179,7 @@ mod tests {
 
         let error = ProjectCatalogMigrationInventoryFacadeV1::discover_attachment_candidate_keys(
             ProjectCatalogAttachmentCandidateDiscoveryRequestV1 {
+                rehearsal_root: None,
                 legacy_project_store_path: projects,
                 checkout_roots: vec![root.clone(), root],
             },
@@ -5221,6 +5224,7 @@ mod tests {
         let sources = ProjectCatalogMigrationInventoryFacadeV1::discover_provenance_owner_sources(
             projects,
             "refs/notes/blackbox".to_string(),
+            None,
         )
         .unwrap();
 
