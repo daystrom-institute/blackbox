@@ -1770,6 +1770,7 @@ pub struct ProjectCatalogMigrationReportV1 {
     pub predicted_catalog_hash: Sha256ValueV1,
     pub predicted_attachment_hash: Sha256ValueV1,
     pub predicted_participant_hashes: BTreeMap<String, Sha256ValueV1>,
+    pub predicted_immutable_asset_hashes: BTreeMap<String, Sha256ValueV1>,
 }
 
 impl ProjectCatalogMigrationReportV1 {
@@ -1806,6 +1807,14 @@ impl ProjectCatalogMigrationReportV1 {
             (
                 "report required resolutions",
                 self.required_resolutions.len(),
+            ),
+            (
+                "report predicted participant hashes",
+                self.predicted_participant_hashes.len(),
+            ),
+            (
+                "report predicted immutable asset hashes",
+                self.predicted_immutable_asset_hashes.len(),
             ),
         ] {
             if count > MAX_PROJECT_CATALOG_ENTRIES {
@@ -1939,6 +1948,9 @@ impl ProjectCatalogMigrationReportV1 {
         }
         for role in self.predicted_participant_hashes.keys() {
             validate_stable_id(role, "predicted participant role")?;
+        }
+        for role in self.predicted_immutable_asset_hashes.keys() {
+            validate_stable_id(role, "predicted immutable asset role")?;
         }
         match self.status {
             ProjectCatalogMigrationStatusV1::ResolutionRequired
@@ -6267,6 +6279,7 @@ pub(crate) mod tests {
             predicted_catalog_hash: post_image.predicted_hashes.catalog_hash.clone(),
             predicted_attachment_hash: post_image.predicted_hashes.attachment_hash.clone(),
             predicted_participant_hashes: post_image.predicted_hashes.participant_hashes.clone(),
+            predicted_immutable_asset_hashes: BTreeMap::new(),
         }
     }
 
