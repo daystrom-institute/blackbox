@@ -342,6 +342,49 @@ impl ProjectCatalogStore {
         )
     }
 
+    /// Returns path-redacted committed migration evidence after a fresh
+    /// marker, journal, participant, immutable-asset, and registry check.
+    #[allow(dead_code)] // P1-C verification and apply receipts consume this seam.
+    pub(crate) fn migration_artifact_identity(
+        &self,
+    ) -> ProjectCatalogStoreResult<MigrationArtifactIdentityV1> {
+        let _mutation_lock = self
+            .owner
+            .io
+            .acquire_mutation_lock(&self.owner.paths.catalog)?;
+        let _auxiliary_locks = self.owner.acquire_auxiliary_locks()?;
+        let journal = self.owner.read_journal_locked()?.ok_or_else(|| {
+            ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_incomplete",
+                "migration verification lacks its retained transaction journal",
+            )
+        })?;
+        if journal.kind != TransactionKindV1::V1Migration
+            || journal.state != TransactionStateV1::Committed
+            || journal.outcome != Some(TransactionOutcomeV1::Committed)
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_incomplete",
+                "migration verification requires a committed migration journal",
+            ));
+        }
+        let marker_bytes = self
+            .owner
+            .io
+            .read_regular_nofollow(&self.owner.paths.migration_marker, MAX_MARKER_BYTES)?
+            .ok_or_else(|| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_migration_incomplete",
+                    "migration verification lacks its retained marker",
+                )
+            })?;
+        let marker: ProjectCatalogMigrationMarkerV1 =
+            decode_bounded_json(&marker_bytes, MAX_MARKER_BYTES, "migration marker")?;
+        verify_migration_marker_journal_binding(&marker, &marker_bytes, &journal)?;
+        self.owner.verify_current_migration_state(&journal)?;
+        migration_artifact_identity_from_journal(&journal, marker)
+    }
+
     fn open_existing_with_registry_and_io(
         projects_path: PathBuf,
         registry: ParticipantRegistry,
@@ -2398,6 +2441,8 @@ fn validate_new_side_cross_roles(
 pub(crate) struct MigrationPlanDraftV1 {
     pub(crate) transaction_id: ProjectCatalogTransactionId,
     pub(crate) plan_hash: Sha256Hex,
+    pub(crate) report_artifact_sha256: Sha256Hex,
+    pub(crate) resolution_artifact_sha256: Sha256Hex,
     pub(crate) source_store_sha256: Sha256Hex,
     pub(crate) publisher_ref_source: MigrationPublisherSourceDraftV1,
     pub(crate) inventory_sha256: Sha256Hex,
@@ -2421,6 +2466,61 @@ pub(crate) struct ValidatedMigrationPlanV1 {
     post_images: std::collections::BTreeMap<ParticipantRoleV1, Option<Vec<u8>>>,
     immutable_asset_bytes: std::collections::BTreeMap<ImmutableAssetRoleV1, Vec<u8>>,
     code_source_snapshot: MigrationCodeSourceSnapshotDraftV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MigrationParticipantArtifactIdentityV1 {
+    pub(crate) role: ParticipantRoleV1,
+    pub(crate) old_sha256: Option<Sha256Hex>,
+    pub(crate) new_sha256: Option<Sha256Hex>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MigrationImmutableAssetIdentityV1 {
+    pub(crate) role: ImmutableAssetRoleV1,
+    pub(crate) sha256: Sha256Hex,
+}
+
+/// Path-redacted durable identity returned to the migration facade.
+///
+/// Private marker and journal wire types never cross this seam. The facade
+/// receives only exact reviewed-artifact identity and code-owned role
+/// evidence suitable for verification receipts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MigrationArtifactIdentityV1 {
+    pub(crate) transaction_id: ProjectCatalogTransactionId,
+    pub(crate) plan_hash: Sha256Hex,
+    pub(crate) inventory_sha256: Sha256Hex,
+    pub(crate) report_artifact_sha256: Sha256Hex,
+    pub(crate) resolution_artifact_sha256: Sha256Hex,
+    pub(crate) participants: Vec<MigrationParticipantArtifactIdentityV1>,
+    pub(crate) immutable_assets: Vec<MigrationImmutableAssetIdentityV1>,
+}
+
+impl ValidatedMigrationPlanV1 {
+    #[allow(dead_code)] // P1-C consumes the exact pre-install receipt projection.
+    pub(crate) fn artifact_identity(&self) -> MigrationArtifactIdentityV1 {
+        migration_artifact_identity_from_journal(
+            &self.journal,
+            self.marker()
+                .expect("validated migration plan has a valid marker"),
+        )
+        .expect("validated migration plan journal and marker agree")
+    }
+
+    fn marker(&self) -> ProjectCatalogStoreResult<ProjectCatalogMigrationMarkerV1> {
+        let bytes = self
+            .post_images
+            .get(&ParticipantRoleV1::MigrationMarker)
+            .and_then(Option::as_deref)
+            .ok_or_else(|| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_invalid_migration_plan",
+                    "validated migration plan lacks its marker post-image",
+                )
+            })?;
+        decode_bounded_json(bytes, MAX_MARKER_BYTES, "migration marker")
+    }
 }
 
 #[allow(dead_code)] // P1-B validation seam consumed by P1-C.
@@ -2791,6 +2891,8 @@ pub(crate) fn validate_migration_plan(
         version: MIGRATION_MARKER_VERSION,
         transaction_id: draft.transaction_id.clone(),
         plan_hash: draft.plan_hash.clone(),
+        report_artifact_sha256: draft.report_artifact_sha256.clone(),
+        resolution_artifact_sha256: draft.resolution_artifact_sha256.clone(),
         source_store_sha256: draft.source_store_sha256.clone(),
         publisher_ref_source: publisher_source_evidence.clone(),
         inventory_sha256: draft.inventory_sha256.clone(),
@@ -2841,6 +2943,8 @@ pub(crate) fn validate_migration_plan(
         state: TransactionStateV1::Prepared,
         outcome: None,
         plan_hash: Some(draft.plan_hash),
+        report_artifact_sha256: Some(draft.report_artifact_sha256),
+        resolution_artifact_sha256: Some(draft.resolution_artifact_sha256),
         publisher_ref_source: Some(publisher_source_evidence),
         publisher_pins: draft.publisher_pins,
         publisher_dispositions: draft.publisher_dispositions,
@@ -3157,7 +3261,7 @@ impl ProjectCatalogTransactionOwner {
             })?;
         let marker: ProjectCatalogMigrationMarkerV1 =
             decode_bounded_json(&marker_bytes, MAX_MARKER_BYTES, "migration marker")?;
-        marker.validate()?;
+        verify_migration_marker_journal_binding(&marker, &marker_bytes, &plan.journal)?;
         let planned_marker_bytes = plan
             .post_images
             .get(&ParticipantRoleV1::MigrationMarker)
@@ -3176,6 +3280,9 @@ impl ProjectCatalogTransactionOwner {
             .and_then(|participant| participant.new.sha256());
         if marker.transaction_id != plan.journal.transaction_id
             || Some(&marker.plan_hash) != plan.journal.plan_hash.as_ref()
+            || Some(&marker.report_artifact_sha256) != plan.journal.report_artifact_sha256.as_ref()
+            || Some(&marker.resolution_artifact_sha256)
+                != plan.journal.resolution_artifact_sha256.as_ref()
             || marker.migration_epoch != plan.journal.new_epoch
             || marker_bytes != planned_marker_bytes
             || planned_marker_hash != Some(&sha256(&marker_bytes))
@@ -3283,6 +3390,7 @@ impl ProjectCatalogTransactionOwner {
             })?;
         let marker: ProjectCatalogMigrationMarkerV1 =
             decode_bounded_json(&marker_bytes, MAX_MARKER_BYTES, "migration marker")?;
+        verify_migration_marker_journal_binding(&marker, &marker_bytes, journal)?;
         for participant in &journal.participants {
             let ParticipantRoleV1::CollisionRetirement { project_id } = &participant.role else {
                 continue;
@@ -3887,59 +3995,7 @@ impl ProjectCatalogTransactionOwner {
                     )?;
                     journal.validate()?;
                     if journal.transaction_id == marker.transaction_id {
-                        let marker_hash = journal
-                            .participants
-                            .iter()
-                            .find(|participant| {
-                                participant.role == ParticipantRoleV1::MigrationMarker
-                            })
-                            .and_then(|participant| participant.new.sha256());
-                        let journal_participants = journal
-                            .participants
-                            .iter()
-                            .filter(|participant| {
-                                participant.role != ParticipantRoleV1::MigrationMarker
-                            })
-                            .map(|participant| MigrationParticipantEvidenceV1 {
-                                role: participant.role.clone(),
-                                old: participant.old.clone(),
-                                new: participant.new.clone(),
-                            })
-                            .collect::<Vec<_>>();
-                        let journal_immutable_assets = journal
-                            .immutable_assets
-                            .iter()
-                            .map(|asset| MigrationImmutableAssetEvidenceV1 {
-                                role: asset.role.clone(),
-                                mode: asset.mode,
-                                sha256: asset.sha256.clone(),
-                                validated_name: asset.validated_name.clone(),
-                            })
-                            .collect::<Vec<_>>();
-                        if journal.kind != TransactionKindV1::V1Migration
-                            || !matches!(
-                                (journal.state, journal.outcome),
-                                (TransactionStateV1::Prepared, None)
-                                    | (
-                                        TransactionStateV1::Committed,
-                                        Some(TransactionOutcomeV1::Committed)
-                                    )
-                            )
-                            || journal.plan_hash.as_ref() != Some(&marker.plan_hash)
-                            || journal.publisher_ref_source.as_ref()
-                                != Some(&marker.publisher_ref_source)
-                            || journal.publisher_pins != marker.publisher_pins
-                            || journal.publisher_dispositions != marker.publisher_dispositions
-                            || journal.new_epoch != marker.migration_epoch
-                            || marker_hash != Some(&sha256(&bytes))
-                            || journal_participants != marker.participants
-                            || journal_immutable_assets != marker.immutable_assets
-                        {
-                            return Err(ProjectCatalogStoreError::new(
-                                "error.project_catalog_migration_incomplete",
-                                "migration marker disagrees with its retained transaction journal",
-                            ));
-                        }
+                        verify_migration_marker_journal_binding(&marker, &bytes, &journal)?;
                     }
                 }
                 Ok(())
@@ -4027,6 +4083,8 @@ impl ProjectCatalogTransactionOwner {
             state: TransactionStateV1::Prepared,
             outcome: None,
             plan_hash: None,
+            report_artifact_sha256: None,
+            resolution_artifact_sha256: None,
             publisher_ref_source: None,
             publisher_pins: Vec::new(),
             publisher_dispositions: Vec::new(),
@@ -4686,6 +4744,9 @@ impl ProjectCatalogTransactionOwner {
         };
         let marker: ProjectCatalogMigrationMarkerV1 =
             decode_bounded_json(&marker_bytes, MAX_MARKER_BYTES, "migration marker")?;
+        if verify_migration_marker_journal_binding(&marker, &marker_bytes, journal).is_err() {
+            return Ok(false);
+        }
         let catalog_participant = journal
             .participants
             .iter()
@@ -6257,7 +6318,7 @@ pub(crate) enum ParticipantRoleV1 {
 }
 
 impl ParticipantRoleV1 {
-    fn artifact_token(&self) -> String {
+    pub(crate) fn artifact_token(&self) -> String {
         match self {
             Self::Catalog => "catalog".into(),
             Self::Attachments => "attachments".into(),
@@ -6420,7 +6481,7 @@ pub(crate) enum ImmutableAssetRoleV1 {
 }
 
 impl ImmutableAssetRoleV1 {
-    fn artifact_token(&self) -> String {
+    pub(crate) fn artifact_token(&self) -> String {
         let encoded = serde_json::to_vec(self).expect("closed immutable role must serialize");
         format!("immutable-role-{}", &sha256(&encoded).as_str()[..24])
     }
@@ -6515,6 +6576,10 @@ struct ProjectCatalogTransactionJournalV1 {
     outcome: Option<TransactionOutcomeV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     plan_hash: Option<Sha256Hex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    report_artifact_sha256: Option<Sha256Hex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolution_artifact_sha256: Option<Sha256Hex>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     publisher_ref_source: Option<MigrationPublisherSourceEvidenceV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -6630,6 +6695,8 @@ impl ProjectCatalogTransactionJournalV1 {
                 });
                 if roles != required
                     || self.plan_hash.is_some()
+                    || self.report_artifact_sha256.is_some()
+                    || self.resolution_artifact_sha256.is_some()
                     || self.publisher_ref_source.is_some()
                     || !self.publisher_pins.is_empty()
                     || !self.publisher_dispositions.is_empty()
@@ -6775,6 +6842,8 @@ impl ProjectCatalogTransactionJournalV1 {
                     .map(|action| action.observation_id.as_str())
                     .collect::<BTreeSet<_>>();
                 if self.plan_hash.is_none()
+                    || self.report_artifact_sha256.is_none()
+                    || self.resolution_artifact_sha256.is_none()
                     || self.publisher_ref_source.is_none()
                     || self.old_epoch != 0
                     || self.new_epoch != 1
@@ -6852,6 +6921,8 @@ struct ProjectCatalogMigrationMarkerV1 {
     version: u32,
     transaction_id: ProjectCatalogTransactionId,
     plan_hash: Sha256Hex,
+    report_artifact_sha256: Sha256Hex,
+    resolution_artifact_sha256: Sha256Hex,
     source_store_sha256: Sha256Hex,
     publisher_ref_source: MigrationPublisherSourceEvidenceV1,
     inventory_sha256: Sha256Hex,
@@ -7059,6 +7130,116 @@ impl ProjectCatalogMigrationMarkerV1 {
         validate_publisher_evidence(&self.publisher_pins, &self.publisher_dispositions, "marker")?;
         Ok(())
     }
+}
+
+fn verify_migration_marker_journal_binding(
+    marker: &ProjectCatalogMigrationMarkerV1,
+    marker_bytes: &[u8],
+    journal: &ProjectCatalogTransactionJournalV1,
+) -> ProjectCatalogStoreResult<()> {
+    marker.validate()?;
+    journal.validate()?;
+    let marker_hash = journal
+        .participants
+        .iter()
+        .find(|participant| participant.role == ParticipantRoleV1::MigrationMarker)
+        .and_then(|participant| participant.new.sha256());
+    let journal_participants = journal
+        .participants
+        .iter()
+        .filter(|participant| participant.role != ParticipantRoleV1::MigrationMarker)
+        .map(|participant| MigrationParticipantEvidenceV1 {
+            role: participant.role.clone(),
+            old: participant.old.clone(),
+            new: participant.new.clone(),
+        })
+        .collect::<Vec<_>>();
+    let journal_immutable_assets = journal
+        .immutable_assets
+        .iter()
+        .map(|asset| MigrationImmutableAssetEvidenceV1 {
+            role: asset.role.clone(),
+            mode: asset.mode,
+            sha256: asset.sha256.clone(),
+            validated_name: asset.validated_name.clone(),
+        })
+        .collect::<Vec<_>>();
+    if journal.kind != TransactionKindV1::V1Migration
+        || !matches!(
+            (journal.state, journal.outcome),
+            (TransactionStateV1::Prepared, None)
+                | (
+                    TransactionStateV1::Committed,
+                    Some(TransactionOutcomeV1::Committed)
+                )
+        )
+        || journal.transaction_id != marker.transaction_id
+        || journal.plan_hash.as_ref() != Some(&marker.plan_hash)
+        || journal.report_artifact_sha256.as_ref() != Some(&marker.report_artifact_sha256)
+        || journal.resolution_artifact_sha256.as_ref() != Some(&marker.resolution_artifact_sha256)
+        || journal.publisher_ref_source.as_ref() != Some(&marker.publisher_ref_source)
+        || journal.publisher_pins != marker.publisher_pins
+        || journal.publisher_dispositions != marker.publisher_dispositions
+        || journal.new_epoch != marker.migration_epoch
+        || marker_hash != Some(&sha256(marker_bytes))
+        || journal_participants != marker.participants
+        || journal_immutable_assets != marker.immutable_assets
+    {
+        return Err(ProjectCatalogStoreError::new(
+            "error.project_catalog_migration_incomplete",
+            "migration marker disagrees with its retained transaction journal",
+        ));
+    }
+    Ok(())
+}
+
+fn migration_artifact_identity_from_journal(
+    journal: &ProjectCatalogTransactionJournalV1,
+    marker: ProjectCatalogMigrationMarkerV1,
+) -> ProjectCatalogStoreResult<MigrationArtifactIdentityV1> {
+    let report_artifact_sha256 = journal.report_artifact_sha256.clone().ok_or_else(|| {
+        ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_journal",
+            "migration journal lacks its reviewed report identity",
+        )
+    })?;
+    let resolution_artifact_sha256 =
+        journal.resolution_artifact_sha256.clone().ok_or_else(|| {
+            ProjectCatalogStoreError::new(
+                "error.project_catalog_invalid_journal",
+                "migration journal lacks its reviewed resolution identity",
+            )
+        })?;
+    let plan_hash = journal.plan_hash.clone().ok_or_else(|| {
+        ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_journal",
+            "migration journal lacks its plan identity",
+        )
+    })?;
+    Ok(MigrationArtifactIdentityV1 {
+        transaction_id: journal.transaction_id.clone(),
+        plan_hash,
+        inventory_sha256: marker.inventory_sha256,
+        report_artifact_sha256,
+        resolution_artifact_sha256,
+        participants: journal
+            .participants
+            .iter()
+            .map(|participant| MigrationParticipantArtifactIdentityV1 {
+                role: participant.role.clone(),
+                old_sha256: participant.old.sha256().cloned(),
+                new_sha256: participant.new.sha256().cloned(),
+            })
+            .collect(),
+        immutable_assets: journal
+            .immutable_assets
+            .iter()
+            .map(|asset| MigrationImmutableAssetIdentityV1 {
+                role: asset.role.clone(),
+                sha256: asset.sha256.clone(),
+            })
+            .collect(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -8543,6 +8724,8 @@ mod tests {
         let draft = MigrationPlanDraftV1 {
             transaction_id,
             plan_hash: plan_hash.clone(),
+            report_artifact_sha256: Sha256Hex::digest(b"reviewed migration report"),
+            resolution_artifact_sha256: Sha256Hex::digest(b"reviewed migration resolution"),
             source_store_sha256: Sha256Hex::digest(legacy_bytes),
             publisher_ref_source: MigrationPublisherSourceDraftV1::Missing,
             inventory_sha256,
@@ -11464,6 +11647,44 @@ mod tests {
     }
 
     #[test]
+    fn migration_v1_codecs_require_exact_reviewed_artifact_identity() {
+        let (_directory, _path, plan, _, _) = migration_fault_fixture();
+        let marker_bytes = plan
+            .post_images
+            .get(&ParticipantRoleV1::MigrationMarker)
+            .and_then(Option::as_deref)
+            .unwrap();
+        let mut marker: serde_json::Value = serde_json::from_slice(marker_bytes).unwrap();
+        marker
+            .as_object_mut()
+            .unwrap()
+            .remove("report_artifact_sha256");
+        assert!(
+            decode_bounded_json::<ProjectCatalogMigrationMarkerV1>(
+                &serde_json::to_vec(&marker).unwrap(),
+                MAX_MARKER_BYTES,
+                "migration marker",
+            )
+            .is_err()
+        );
+
+        let mut journal = serde_json::to_value(&plan.journal).unwrap();
+        let journal = journal.as_object_mut().unwrap();
+        journal.remove("report_artifact_sha256");
+        journal.remove("resolution_artifact_sha256");
+        let decoded: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
+            &serde_json::to_vec(journal).unwrap(),
+            MAX_JOURNAL_BYTES,
+            "transaction journal",
+        )
+        .unwrap();
+        assert_eq!(
+            decoded.validate().unwrap_err().code(),
+            "error.project_catalog_invalid_journal"
+        );
+    }
+
+    #[test]
     fn journal_validation_enforces_epoch_images_and_unique_checkout_actions() {
         let (_directory, path) = projects_path();
         let store = ProjectCatalogStore::initialize_empty(path.clone()).unwrap();
@@ -11905,6 +12126,113 @@ mod tests {
     }
 
     #[test]
+    fn completed_plan_retry_refuses_same_plan_with_different_report_bytes() {
+        let (_directory, path) = projects_path();
+        let legacy = b"{\"version\":1,\"projects\":[]}\n";
+        fs::write(&path, legacy).unwrap();
+        let (registry, draft, _) = basic_migration_draft(&path, legacy);
+        let mut changed = draft.clone();
+        changed.report_artifact_sha256 = Sha256Hex::digest(b"different reviewed report bytes");
+        let original = validate_migration_plan(&path, registry.clone(), draft).unwrap();
+        let retry = validate_migration_plan(&path, registry, changed).unwrap();
+
+        transact_migration(&path, original).unwrap();
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        let marker_before = fs::read(&paths.migration_marker).unwrap();
+        let error = transact_migration(&path, retry).unwrap_err();
+
+        assert_eq!(error.code(), "error.project_catalog_migration_incomplete");
+        assert_eq!(fs::read(paths.migration_marker).unwrap(), marker_before);
+    }
+
+    #[test]
+    fn completed_plan_retry_refuses_same_plan_with_different_resolution_bytes() {
+        let (_directory, path) = projects_path();
+        let legacy = b"{\"version\":1,\"projects\":[]}\n";
+        fs::write(&path, legacy).unwrap();
+        let (registry, draft, _) = basic_migration_draft(&path, legacy);
+        let mut changed = draft.clone();
+        changed.resolution_artifact_sha256 =
+            Sha256Hex::digest(b"different reviewed resolution bytes");
+        let original = validate_migration_plan(&path, registry.clone(), draft).unwrap();
+        let retry = validate_migration_plan(&path, registry, changed).unwrap();
+
+        transact_migration(&path, original).unwrap();
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        let marker_before = fs::read(&paths.migration_marker).unwrap();
+        let error = transact_migration(&path, retry).unwrap_err();
+
+        assert_eq!(error.code(), "error.project_catalog_migration_incomplete");
+        assert_eq!(fs::read(paths.migration_marker).unwrap(), marker_before);
+    }
+
+    #[test]
+    fn fresh_migration_identity_requires_exact_committed_marker_and_journal() {
+        let (_directory, path, plan, _, _) = migration_fault_fixture();
+        let expected = plan.artifact_identity();
+        let registry = plan.registry.clone();
+        transact_migration(&path, plan).unwrap();
+
+        let store =
+            ProjectCatalogStore::open_existing_after_migration(path.clone(), registry.clone())
+                .unwrap();
+        assert_eq!(store.migration_artifact_identity().unwrap(), expected);
+        drop(store);
+
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        let mut journal: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
+            &fs::read(&paths.journal).unwrap(),
+            MAX_JOURNAL_BYTES,
+            "transaction journal",
+        )
+        .unwrap();
+        journal.report_artifact_sha256 = Some(Sha256Hex::digest(b"mismatched report identity"));
+        fs::write(
+            &paths.journal,
+            encode_bounded_json(&journal, MAX_JOURNAL_BYTES, "transaction journal").unwrap(),
+        )
+        .unwrap();
+
+        let error = ProjectCatalogStore::open_existing_after_migration(path, registry).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_migration_incomplete");
+    }
+
+    #[test]
+    fn recovery_refuses_forward_when_reviewed_artifact_identity_disagrees() {
+        let (_directory, path, plan, _, legacy) = migration_fault_fixture();
+        let registry = plan.registry.clone();
+        let failing = Arc::new(TracingIo::failing_points([FaultPoint::ParticipantInstall]));
+        assert!(transact_migration_with_io(&path, plan, failing).is_err());
+
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        let mut journal: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
+            &fs::read(&paths.journal).unwrap(),
+            MAX_JOURNAL_BYTES,
+            "transaction journal",
+        )
+        .unwrap();
+        assert_eq!(journal.state, TransactionStateV1::Prepared);
+        journal.resolution_artifact_sha256 =
+            Some(Sha256Hex::digest(b"mismatched recovery resolution"));
+        fs::write(
+            &paths.journal,
+            encode_bounded_json(&journal, MAX_JOURNAL_BYTES, "transaction journal").unwrap(),
+        )
+        .unwrap();
+
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), legacy);
+        assert!(!paths.attachments.exists());
+        let recovered: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
+            &fs::read(paths.journal).unwrap(),
+            MAX_JOURNAL_BYTES,
+            "transaction journal",
+        )
+        .unwrap();
+        assert_eq!(recovered.outcome, Some(TransactionOutcomeV1::RolledBack));
+    }
+
+    #[test]
     fn completed_plan_retry_accepts_a_strict_later_code_source_generation() {
         let (_directory, path, plan, _, _) = active_migration_fault_fixture();
         let retry = plan.clone();
@@ -12109,6 +12437,8 @@ mod tests {
             version: MIGRATION_MARKER_VERSION,
             transaction_id: transaction_id.clone(),
             plan_hash: Sha256Hex::digest(b"plan"),
+            report_artifact_sha256: Sha256Hex::digest(b"report"),
+            resolution_artifact_sha256: Sha256Hex::digest(b"resolution"),
             source_store_sha256: source_hash,
             publisher_ref_source: MigrationPublisherSourceEvidenceV1::Present {
                 sha256: Sha256Hex::digest(b"publisher refs"),
@@ -12150,6 +12480,8 @@ mod tests {
             state: TransactionStateV1::Prepared,
             outcome: None,
             plan_hash: Some(Sha256Hex::digest(b"plan")),
+            report_artifact_sha256: Some(Sha256Hex::digest(b"report")),
+            resolution_artifact_sha256: Some(Sha256Hex::digest(b"resolution")),
             publisher_ref_source: Some(MigrationPublisherSourceEvidenceV1::Present {
                 sha256: Sha256Hex::digest(b"publisher refs"),
             }),
