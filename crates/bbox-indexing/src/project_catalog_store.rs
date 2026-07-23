@@ -13942,7 +13942,7 @@ mod tests {
 
         assert_eq!(
             failure.disposition,
-            MigrationMutationDispositionV1::RetryExactPlanRequired
+            MigrationMutationDispositionV1::RecoveredToCommittedState
         );
     }
 
