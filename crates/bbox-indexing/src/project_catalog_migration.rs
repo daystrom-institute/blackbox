@@ -3988,7 +3988,7 @@ fn owner_inventory_paths(
         task_store_path: layout.bro_home.join("tasks.json"),
         proposal_root: layout.bro_home.join("badgey").join("proposals"),
         slack_store_root: layout.bro_home.clone(),
-        whiteboard_root: layout.bro_home.clone(),
+        whiteboard_root: layout.bro_home.join("whiteboards"),
         artifact_root: layout.artifacts_dir.clone(),
         provenance_sources,
     }
