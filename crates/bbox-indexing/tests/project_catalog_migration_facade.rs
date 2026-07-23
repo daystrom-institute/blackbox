@@ -283,14 +283,6 @@ fn prepare_rehearsal(root: &Path, config: &Config) -> RehearsalFixture {
         &winner_checkout.join(".bbox/config.toml"),
         b"[project]\nrepo_id = \"neutral-repository\"\n",
     );
-    write(
-        &winner_checkout.join(".bbox/knowledge/context.md"),
-        b"# Context\n\nNeutral migration fixture.\n",
-    );
-    write(
-        &winner_checkout.join(".bbox/gaps/open.md"),
-        b"# Open question\n\nNo unresolved fixture question.\n",
-    );
     git(&winner_checkout, &["add", ".bbox"]);
     git(
         &winner_checkout,
