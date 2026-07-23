@@ -995,7 +995,7 @@ pub(crate) fn bootstrap_migration_checkout_registry(
 }
 
 fn path_exists_nofollow(path: &Path) -> ProjectCatalogStoreResult<bool> {
-    match fs::symlink_metadata(path) {
+    match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(io_error("inspect", path, error)),
@@ -2698,7 +2698,6 @@ pub(crate) struct MigrationPlanDraftV1 {
     pub(crate) plan_hash: Sha256Hex,
     pub(crate) report_artifact_sha256: Sha256Hex,
     pub(crate) resolution_artifact_sha256: Sha256Hex,
-    pub(crate) observed_marker_sha256: Sha256Hex,
     pub(crate) legacy_project_source: MigrationLegacyProjectSourceDraftV1,
     pub(crate) publisher_ref_source: MigrationPublisherSourceDraftV1,
     pub(crate) inventory_sha256: Sha256Hex,
@@ -2749,6 +2748,7 @@ pub(crate) struct MigrationArtifactIdentityV1 {
     pub(crate) inventory_sha256: Sha256Hex,
     pub(crate) report_artifact_sha256: Sha256Hex,
     pub(crate) resolution_artifact_sha256: Sha256Hex,
+    pub(crate) observed_marker_sha256: Sha256Hex,
     pub(crate) participants: Vec<MigrationParticipantArtifactIdentityV1>,
     pub(crate) immutable_assets: Vec<MigrationImmutableAssetIdentityV1>,
     pub(crate) epoch: u64,

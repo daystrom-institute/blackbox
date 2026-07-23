@@ -2473,7 +2473,12 @@ fn prepare_publisher_generation(
         },
         &AcceptedPublicationLimits::default(),
     )
-    .map_err(|error| ProjectCatalogMigrationError::no_mutation(error.code(), error.to_string()))
+    .map_err(|error| {
+        ProjectCatalogMigrationError::no_mutation(
+            error.code(),
+            "accepted publication G1 preparation failed",
+        )
+    })
 }
 
 fn repo_relative_lane_root(scope_root: &str, lane: &str) -> String {
@@ -4171,11 +4176,6 @@ fn validate_planned_identity(
 ) -> Result<IdentityProjectionsV1, ProjectCatalogMigrationError> {
     let identity = plan.artifact_identity();
     let projections = identity_projections(&identity)?;
-    let marker_bytes = read_artifact_required(
-        &layout.migration_marker_path,
-        MAX_PROJECT_CATALOG_REPORT_BYTES,
-        "migration marker",
-    )?;
     if identity.transaction_id != report.transaction_id
         || identity.plan_hash.as_str() != report.plan_hash.as_str()
         || identity.inventory_sha256.as_str() != report.inventory_hash.as_str()
