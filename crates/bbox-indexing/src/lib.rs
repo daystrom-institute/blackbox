@@ -2,6 +2,7 @@
 //! Modules move verbatim; the origin re-exports them under their original
 //! `crate::<module>` paths.
 
+pub mod accepted_publication_store;
 pub mod checkout_access;
 pub mod checkout_access_v1;
 pub mod checkout_registry;
