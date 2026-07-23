@@ -181,6 +181,18 @@ pub struct PublisherRefStore {
 }
 
 impl PublisherRefStore {
+    /// Construct a migration-only source handle without probing the path.
+    ///
+    /// The first filesystem access remains `snapshot_migration_source`, which
+    /// acquires the owner lock and performs the descriptor-bound no-follow
+    /// read. The in-memory publisher cache is intentionally empty and unused.
+    pub(crate) fn migration_source(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            data: PublisherRefData::default(),
+        }
+    }
+
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let data = if path.exists() {
