@@ -24,7 +24,8 @@ use bbox_code_source_store::{
     encode_stored_generation_v2_for_migration, verify_generation_manifest_for_migration,
 };
 use bbox_corpus_core::git::{
-    read_verified_committed_file_bytes_optional_bounded, verify_commit_oid_with_alternate,
+    StableGitRepository, VerifiedCommit, open_stable_git_repository,
+    read_verified_committed_file_bytes_optional_bounded,
 };
 use bbox_corpus_core::identity::{PublishedScope, resolve_recorded_repo_id};
 use bbox_corpus_core::json_store::NofollowDirectory;
@@ -524,7 +525,8 @@ fn capture_publisher_ref_source(
 #[derive(Debug, Clone)]
 struct CommittedConfigSourceV1 {
     pub repository_root: AuthorizedInventoryPath,
-    pub commit_oid: String,
+    pub repository: StableGitRepository,
+    pub commit: VerifiedCommit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -576,21 +578,15 @@ fn observe_committed_authority_probe(
     } else {
         format!("{relative_root}/.bbox/config.toml")
     };
-    let verified = verify_commit_oid_with_alternate(
-        source.repository_root.as_path(),
-        &source.commit_oid,
-        None,
-    )
-    .map_err(|_| invalid_source("committed_config_commit_invalid"))?;
     let bytes = read_verified_committed_file_bytes_optional_bounded(
-        &verified,
+        &source.commit,
         &repo_relative_path,
         MAX_COMMITTED_CONFIG_BYTES,
     )
     .map_err(|_| invalid_source("committed_config_read_invalid"))?;
     let locator = MutableInventorySourceLocatorV1::CommittedProjectConfig {
         project_id: project_id.clone(),
-        commit_oid: verified.oid().to_string(),
+        commit_oid: source.commit.oid().to_string(),
         repo_relative_path,
     };
     let Some(bytes) = bytes else {
@@ -652,6 +648,7 @@ struct LegacyProjectProbeInputV1 {
     pub project_id: ProjectId,
     pub authorized_canonical_path: AuthorizedInventoryPath,
     pub repository_root: Option<AuthorizedInventoryPath>,
+    pub repository: Option<StableGitRepository>,
     pub committed_config: Option<CommittedConfigSourceV1>,
 }
 
@@ -662,6 +659,7 @@ struct LegacyProjectsCaptureV1 {
     owner_state: InventorySourceStateV1,
     published_scopes: BTreeMap<ProjectId, PublishedScope>,
     project_roots: BTreeMap<ProjectId, AuthorizedInventoryPath>,
+    repositories: BTreeMap<ProjectId, StableGitRepository>,
     runtime_project_paths: BTreeMap<String, AuthorizedInventoryPath>,
 }
 
@@ -678,35 +676,52 @@ fn derive_legacy_project_probes(
                 .map_err(|_| invalid_source("legacy_project_id_invalid"))?;
             let project_root = AuthorizedInventoryPath::new(&record.canonical_path)?;
             validate_authorized_containment(std::slice::from_ref(&project_root), rehearsal_root)?;
-            let repository_root = if record.is_git_repo
+            let repository = if record.is_git_repo
                 && matches!(
                     inspect_path(project_root.as_path()),
                     InspectedPath::Directory
                 ) {
-                bbox_corpus_core::git::git_root_for_path(project_root.as_path())
-                    .map(AuthorizedInventoryPath::new)
-                    .transpose()?
+                open_stable_git_repository(&project_root.authority)
+                    .map_err(|_| invalid_source("stable_git_repository_open_failed"))?
             } else {
                 None
             };
+            if let Some(repository) = &repository {
+                validate_stable_repository_containment(repository, rehearsal_root)?;
+            }
+            let repository_root = repository
+                .as_ref()
+                .map(|repository| AuthorizedInventoryPath::new(repository.repository_root()))
+                .transpose()?;
             if let Some(repository_root) = &repository_root {
                 validate_authorized_containment(
                     std::slice::from_ref(repository_root),
                     rehearsal_root,
                 )?;
             }
-            let committed_config = repository_root.as_ref().and_then(|root| {
-                bbox_corpus_core::git::current_head(root.as_path()).map(|commit_oid| {
-                    CommittedConfigSourceV1 {
-                        repository_root: root.clone(),
-                        commit_oid,
-                    }
+            let committed_config = repository
+                .as_ref()
+                .map(|repository| {
+                    repository
+                        .verified_head()
+                        .map_err(|_| invalid_source("committed_config_commit_invalid"))
                 })
-            });
+                .transpose()?
+                .flatten()
+                .map(|commit| CommittedConfigSourceV1 {
+                    repository_root: repository_root
+                        .clone()
+                        .expect("verified repository has a root authority"),
+                    repository: repository
+                        .clone()
+                        .expect("verified commit has a repository authority"),
+                    commit,
+                });
             Ok(LegacyProjectProbeInputV1 {
                 project_id,
                 authorized_canonical_path: project_root,
                 repository_root,
+                repository,
                 committed_config,
             })
         })
@@ -729,6 +744,7 @@ fn observe_legacy_projects(
     let mut source_evidence = Vec::new();
     let mut published_scopes = BTreeMap::new();
     let mut project_roots = BTreeMap::new();
+    let mut repositories = BTreeMap::new();
     let mut runtime_project_paths = BTreeMap::new();
     for record in &source.value.projects {
         let project_id = ProjectId::parse(record.project_id.clone())
@@ -778,6 +794,9 @@ fn observe_legacy_projects(
             published_scopes.insert(project_id.clone(), scope);
         }
         project_roots.insert(project_id.clone(), probe.authorized_canonical_path.clone());
+        if let Some(repository) = probe.repository {
+            repositories.insert(project_id.clone(), repository);
+        }
         runtime_project_paths.insert(observation_id.clone(), probe.authorized_canonical_path);
         source_evidence.push(authority_probe.source_evidence);
         observations.push(LegacyProjectObservationV1 {
@@ -809,6 +828,7 @@ fn observe_legacy_projects(
         },
         published_scopes,
         project_roots,
+        repositories,
         runtime_project_paths,
     })
 }
@@ -835,16 +855,16 @@ fn derive_publisher_pins(
             .iter()
             .find(|row| row.record.project_id == project_id.as_str())
             .ok_or_else(|| invalid_source("publisher_project_observation_missing"))?;
-        let project_root = legacy
-            .project_roots
+        let repository = legacy
+            .repositories
             .get(&project_id)
-            .ok_or_else(|| invalid_source("publisher_project_root_missing"))?;
-        let resolved_commit =
-            bbox_corpus_core::git::resolve_commit(project_root.as_path(), &publisher.branch_ref);
+            .ok_or_else(|| invalid_source("publisher_repository_authority_missing"))?;
+        let resolved_commit = repository
+            .resolve_commit_oid(&publisher.branch_ref)
+            .map_err(|_| invalid_source("publisher_commit_invalid"))?;
         if let Some(commit) = &resolved_commit {
-            let repository_root = bbox_corpus_core::git::git_root_for_path(project_root.as_path())
-                .ok_or_else(|| invalid_source("publisher_repository_root_missing"))?;
-            verify_commit_oid_with_alternate(&repository_root, commit, None)
+            repository
+                .verify_commit_oid(commit)
                 .map_err(|_| invalid_source("publisher_commit_invalid"))?;
         }
         let observation_id = stable_observation_id_v1(
@@ -1539,16 +1559,18 @@ fn planned_activation_hash(
 struct CheckoutCaptureV1 {
     observation: CheckoutObservationV1,
     runtime_root: AuthorizedInventoryPath,
+    repository: Option<StableGitRepository>,
     root_source_evidence: MutableInventorySourceEvidenceV1,
     marker_source_evidence: MutableInventorySourceEvidenceV1,
 }
 
 fn capture_checkout_roots(
     roots: &[AuthorizedInventoryPath],
+    rehearsal_root: Option<&Path>,
 ) -> AdapterResult<Vec<CheckoutCaptureV1>> {
     let mut captures = roots
         .iter()
-        .map(observe_checkout)
+        .map(|root| observe_checkout(root, rehearsal_root))
         .collect::<AdapterResult<Vec<_>>>()?;
     captures.sort_by(|left, right| {
         left.observation
@@ -1607,7 +1629,10 @@ fn discover_attachment_candidate_keys_locked(
     Ok(keys)
 }
 
-fn observe_checkout(root: &AuthorizedInventoryPath) -> AdapterResult<CheckoutCaptureV1> {
+fn observe_checkout(
+    root: &AuthorizedInventoryPath,
+    rehearsal_root: Option<&Path>,
+) -> AdapterResult<CheckoutCaptureV1> {
     if !matches!(inspect_path(root.as_path()), InspectedPath::Directory) {
         return Err(invalid_source("checkout_root_invalid"));
     }
@@ -1630,6 +1655,11 @@ fn observe_checkout(root: &AuthorizedInventoryPath) -> AdapterResult<CheckoutCap
     if directory_fingerprint(root.as_path(), &root_digest)? != root_fingerprint {
         return Err(invalid_source("checkout_root_changed"));
     }
+    let repository = open_stable_git_repository(&root.authority)
+        .map_err(|_| invalid_source("stable_checkout_repository_open_failed"))?;
+    if let Some(repository) = &repository {
+        validate_stable_repository_containment(repository, rehearsal_root)?;
+    }
     let observation_id = stable_observation_id_v1("checkout", &[root_digest.as_str().as_bytes()])?;
     let marker_source_id =
         stable_observation_id_v1("checkout-marker-source", &[root_digest.as_str().as_bytes()])?;
@@ -1641,6 +1671,7 @@ fn observe_checkout(root: &AuthorizedInventoryPath) -> AdapterResult<CheckoutCap
             marker_state: marker_state(&marker),
         },
         runtime_root: root.clone(),
+        repository,
         root_source_evidence: source_evidence(
             &stable_observation_id_v1("checkout-root-source", &[root_digest.as_str().as_bytes()])?,
             MutableInventorySourceKindV1::CheckoutRoot,
@@ -1793,7 +1824,7 @@ pub(crate) struct ProjectCatalogOwnerInventoryPathsV1 {
     pub(crate) slack_store_root: PathBuf,
     pub(crate) whiteboard_root: PathBuf,
     pub(crate) artifact_root: PathBuf,
-    pub(crate) provenance_sources: Vec<ProjectCatalogProvenanceOwnerSourceV1>,
+    pub(crate) provenance_notes_ref: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2070,7 +2101,7 @@ impl ProjectCatalogMigrationInventoryFacadeV1 {
         checkout_roots: Vec<PathBuf>,
     ) -> Result<BTreeMap<String, PathBuf>, InventoryAdapterError> {
         let checkout_roots = authorize_checkout_roots(&checkout_roots)?;
-        capture_checkout_roots(&checkout_roots)?
+        capture_checkout_roots(&checkout_roots, None)?
             .into_iter()
             .map(|capture| {
                 Ok((
@@ -2105,7 +2136,8 @@ impl ProjectCatalogMigrationInventoryFacadeV1 {
                     request.rehearsal_root.as_deref(),
                 )?;
                 let legacy = observe_legacy_projects(&legacy_source, probes)?;
-                let checkout_captures = capture_checkout_roots(&checkout_roots)?;
+                let checkout_captures =
+                    capture_checkout_roots(&checkout_roots, request.rehearsal_root.as_deref())?;
                 discover_attachment_candidate_keys_locked(&legacy, &checkout_captures)
             },
         )
@@ -2119,14 +2151,6 @@ impl ProjectCatalogMigrationInventoryFacadeV1 {
         let checkout_roots = authorize_checkout_roots(&request.checkout_roots)?;
         validate_authorized_containment(&checkout_roots, request.rehearsal_root.as_deref())?;
         let owner_paths = authorize_owner_paths(request.owner_paths)?;
-        validate_authorized_containment(
-            &owner_paths
-                .provenance_sources
-                .iter()
-                .map(|source| source.repository_root.clone())
-                .collect::<Vec<_>>(),
-            request.rehearsal_root.as_deref(),
-        )?;
         let code_source_store = CodeSourceStore::open_existing_for_migration(
             &request.code_source_store_root,
             request.code_source_store_limits,
@@ -2183,6 +2207,26 @@ fn validate_authorized_containment(
     Ok(())
 }
 
+fn validate_stable_repository_containment(
+    repository: &StableGitRepository,
+    rehearsal_root: Option<&Path>,
+) -> AdapterResult<()> {
+    let Some(rehearsal_root) = rehearsal_root else {
+        return Ok(());
+    };
+    let canonical_root = rehearsal_root
+        .canonicalize()
+        .map_err(|_| invalid_input("rehearsal root is not canonicalizable"))?;
+    if repository
+        .authority_paths()
+        .iter()
+        .any(|path| !path.starts_with(&canonical_root))
+    {
+        return Err(invalid_input("stable Git authority escapes rehearsal root"));
+    }
+    Ok(())
+}
+
 fn validate_probe_containment(
     probes: &[LegacyProjectProbeInputV1],
     rehearsal_root: Option<&Path>,
@@ -2195,13 +2239,6 @@ fn validate_probe_containment(
         })
         .collect::<Vec<_>>();
     validate_authorized_containment(&paths, rehearsal_root)
-}
-
-#[derive(Clone)]
-struct AuthorizedProjectCatalogProvenanceOwnerSourceV1 {
-    project_id: ProjectId,
-    repository_root: AuthorizedInventoryPath,
-    notes_ref: String,
 }
 
 #[derive(Clone)]
@@ -2222,7 +2259,7 @@ struct AuthorizedProjectCatalogOwnerInventoryPathsV1 {
     slack_store_root: AuthorizedInventoryPath,
     whiteboard_root: AuthorizedInventoryPath,
     artifact_root: AuthorizedInventoryPath,
-    provenance_sources: Vec<AuthorizedProjectCatalogProvenanceOwnerSourceV1>,
+    provenance_notes_ref: String,
 }
 
 fn authorize_checkout_roots(paths: &[PathBuf]) -> AdapterResult<Vec<AuthorizedInventoryPath>> {
@@ -2244,38 +2281,15 @@ fn authorize_checkout_roots(paths: &[PathBuf]) -> AdapterResult<Vec<AuthorizedIn
 fn authorize_owner_paths(
     paths: ProjectCatalogOwnerInventoryPathsV1,
 ) -> AdapterResult<AuthorizedProjectCatalogOwnerInventoryPathsV1> {
-    let mut provenance_sources = paths
-        .provenance_sources
-        .into_iter()
-        .map(|source| {
-            if source.notes_ref.is_empty()
-                || source.notes_ref.len() > MAX_AUTHORIZED_PATH_BYTES
-                || source
-                    .notes_ref
-                    .bytes()
-                    .any(|byte| byte == 0 || byte.is_ascii_control())
-            {
-                return Err(invalid_input("provenance notes ref is invalid"));
-            }
-            Ok(AuthorizedProjectCatalogProvenanceOwnerSourceV1 {
-                project_id: source.project_id,
-                repository_root: AuthorizedInventoryPath::new(source.repository_root)?,
-                notes_ref: source.notes_ref,
-            })
-        })
-        .collect::<AdapterResult<Vec<_>>>()?;
-    provenance_sources.sort_by(|left, right| {
-        left.project_id
-            .cmp(&right.project_id)
-            .then_with(|| left.notes_ref.cmp(&right.notes_ref))
-    });
-    if provenance_sources
-        .windows(2)
-        .any(|pair| pair[0].project_id == pair[1].project_id)
+    if paths.provenance_notes_ref.is_empty()
+        || paths.provenance_notes_ref.len() > MAX_AUTHORIZED_PATH_BYTES
+        || paths
+            .provenance_notes_ref
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+        || bbox_provenance::validate_notes_ref(&paths.provenance_notes_ref).is_err()
     {
-        return Err(invalid_input(
-            "provenance sources contain a duplicate project",
-        ));
+        return Err(invalid_input("provenance notes ref is invalid"));
     }
     Ok(AuthorizedProjectCatalogOwnerInventoryPathsV1 {
         corpus_index_root: AuthorizedInventoryPath::new(paths.corpus_index_root)?,
@@ -2294,7 +2308,7 @@ fn authorize_owner_paths(
         slack_store_root: AuthorizedInventoryPath::new(paths.slack_store_root)?,
         whiteboard_root: AuthorizedInventoryPath::new(paths.whiteboard_root)?,
         artifact_root: AuthorizedInventoryPath::new(paths.artifact_root)?,
-        provenance_sources,
+        provenance_notes_ref: paths.provenance_notes_ref,
     })
 }
 
@@ -2330,7 +2344,8 @@ fn capture_inventory_locked(
     )?;
     let mut code_sources = code_capture.sources;
     let publisher_source = &publisher_locked.source;
-    let checkout_captures = capture_checkout_roots(&request.checkout_roots)?;
+    let checkout_captures =
+        capture_checkout_roots(&request.checkout_roots, request.rehearsal_root.as_deref())?;
     let legacy_row_ids = legacy
         .observations
         .iter()
@@ -2523,11 +2538,7 @@ fn capture_required_owner_lanes(
                 .map_err(|_| invalid_source("legacy_project_id_invalid"))
         })
         .collect::<AdapterResult<BTreeSet<_>>>()?;
-    let supplied_provenance_projects = paths
-        .provenance_sources
-        .iter()
-        .map(|source| source.project_id.clone())
-        .collect::<BTreeSet<_>>();
+    let supplied_provenance_projects = legacy.repositories.keys().cloned().collect::<BTreeSet<_>>();
     if expected_provenance_projects != supplied_provenance_projects {
         return Err(invalid_input(
             "provenance owner sources do not exactly cover present Git projects",
@@ -2548,7 +2559,7 @@ fn capture_required_owner_lanes(
     })?;
     paths.git_cursor_root.ensure_authority()?;
 
-    let durable = capture_durable_owner_snapshots(paths, limits.durable_owners)?;
+    let durable = capture_durable_owner_snapshots(paths, limits.durable_owners, legacy)?;
     let project_scoped_refs = capture_project_scoped_refs_lane(&corpus, &vectors)?;
     let edge_workspaces = capture_edge_workspaces_lane(&edges)?;
     let checkouts = capture_checkouts_lane(checkout_captures)?;
@@ -2617,6 +2628,7 @@ fn capture_owner_snapshot_path(
 fn capture_durable_owner_snapshots(
     paths: &AuthorizedProjectCatalogOwnerInventoryPathsV1,
     limits: OwnerSnapshotLimitsV1,
+    legacy: &LegacyProjectsCaptureV1,
 ) -> AdapterResult<DurableOwnerSnapshotsV1> {
     let knowledge = capture_owner_snapshot_path(&paths.knowledge_store_path, |path| {
         bbox_knowledge::knowledge::capture_project_catalog_owner_snapshot(path, limits)
@@ -2661,18 +2673,15 @@ fn capture_durable_owner_snapshots(
         bbox_edge_sidecar::edge_sidecar::capture_project_catalog_owner_snapshot(path, limits)
     })?;
     let mut provenance = Vec::new();
-    for source in &paths.provenance_sources {
-        provenance.push(capture_owner_snapshot_path(
-            &source.repository_root,
-            |path| {
-                bbox_provenance::capture_project_catalog_owner_snapshot(
-                    path,
-                    &source.notes_ref,
-                    source.project_id.as_str(),
-                    limits,
-                )
-            },
-        )?);
+    for (project_id, repository) in &legacy.repositories {
+        provenance.push(
+            bbox_provenance::capture_project_catalog_owner_snapshot_stable(
+                repository,
+                &paths.provenance_notes_ref,
+                project_id.as_str(),
+                limits,
+            ),
+        );
     }
     Ok(DurableOwnerSnapshotsV1 {
         knowledge: vec![knowledge],
@@ -3688,14 +3697,20 @@ fn capture_git_metadata_lane(
             .get(attachment.checkout_observation_id.as_str())
             .copied()
             .ok_or_else(|| invalid_source("attachment_checkout_missing"))?;
-        let project_root = legacy
-            .project_roots
-            .get(&attachment.project_id)
-            .ok_or_else(|| invalid_source("attachment_project_root_missing"))?;
+        let repository = checkout.repository.as_ref();
         let common_directory =
-            bbox_corpus_core::git::git_common_dir(checkout.runtime_root.as_path());
-        let first_commit =
-            bbox_corpus_core::git::git_first_commit_for_path(checkout.runtime_root.as_path());
+            repository.map(|repository| repository.common_directory().to_path_buf());
+        let head = repository
+            .map(StableGitRepository::verified_head)
+            .transpose()
+            .map_err(|_| invalid_source("git_repository_head_unavailable"))?
+            .flatten();
+        let first_commit = match (repository, head.as_ref()) {
+            (Some(repository), Some(head)) => repository
+                .first_commit_oid(head.oid())
+                .map_err(|_| invalid_source("git_first_commit_unavailable"))?,
+            _ => None,
+        };
         if project.record.is_git_repo && (common_directory.is_none() || first_commit.is_none()) {
             git_probe_corrupt.get_or_insert("git_repository_evidence_unavailable");
             continue;
@@ -3714,8 +3729,10 @@ fn capture_git_metadata_lane(
             if !belongs {
                 continue;
             }
-            if let Some(commit) =
-                bbox_corpus_core::git::resolve_commit(project_root.as_path(), &publisher.branch_ref)
+            if let Some(commit) = repository
+                .ok_or_else(|| invalid_source("publisher_repository_authority_missing"))?
+                .resolve_commit_oid(&publisher.branch_ref)
+                .map_err(|_| invalid_source("publisher_ref_invalid"))?
             {
                 resolved_refs.insert(publisher.branch_ref.clone(), commit);
             }

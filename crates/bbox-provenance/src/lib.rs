@@ -409,6 +409,39 @@ pub fn capture_project_catalog_owner_snapshot(
     bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotV1,
     bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotError,
 > {
+    let repository_authority =
+        match bbox_corpus_core::json_store::NofollowDirectory::open_existing(root) {
+            Ok(Some(authority)) => authority,
+            _ => {
+                return bbox_corpus_core::project_catalog_snapshot::corrupt_owner_snapshot(
+                    "provenance",
+                    "provenance:repository",
+                    "provenance_repository_unsafe",
+                    limits,
+                );
+            }
+        };
+    let repository = match bbox_corpus_core::git::open_stable_git_repository(&repository_authority)
+    {
+        Ok(Some(repository)) => repository,
+        _ => {
+            return bbox_corpus_core::project_catalog_snapshot::corrupt_owner_snapshot(
+                "provenance",
+                "provenance:repository",
+                "provenance_repository_unsafe",
+                limits,
+            );
+        }
+    };
+    capture_project_catalog_owner_snapshot_stable(&repository, notes_ref, project_id, limits)
+}
+
+pub fn capture_project_catalog_owner_snapshot_stable(
+    repository: &bbox_corpus_core::git::StableGitRepository,
+    notes_ref: &str,
+    project_id: &str,
+    limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
+) -> bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotV1 {
     use bbox_corpus_core::project_catalog_snapshot::{
         OwnerSnapshotRowV1, OwnerSnapshotStateV1, build_owner_snapshot, corrupt_owner_snapshot,
         finalize_owner_snapshot, missing_owner_snapshot, owner_subsource,
@@ -422,127 +455,35 @@ pub fn capture_project_catalog_owner_snapshot(
             limits,
         );
     }
-    match std::fs::symlink_metadata(root) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return missing_owner_snapshot("provenance", "provenance:repository", limits);
-        }
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-        _ => {
-            return corrupt_owner_snapshot(
-                "provenance",
-                "provenance:repository",
-                "provenance_repository_unsafe",
-                limits,
-            );
-        }
-    }
-    let repository_authority =
-        match bbox_corpus_core::json_store::NofollowDirectory::open_existing(root) {
-            Ok(Some(authority)) => authority,
-            _ => {
-                return corrupt_owner_snapshot(
-                    "provenance",
-                    "provenance:repository",
-                    "provenance_repository_unsafe",
-                    limits,
-                );
-            }
-        };
-    let root = match root.canonicalize() {
-        Ok(root) => root,
-        Err(_) => {
-            return corrupt_owner_snapshot(
-                "provenance",
-                "provenance:repository",
-                "provenance_repository_unreadable",
-                limits,
-            );
-        }
-    };
-    let ref_status = Command::new("git")
-        .arg("-C")
-        .arg(&root)
-        .args(["show-ref", "--verify", "--quiet", notes_ref])
-        .status();
-    match ref_status {
-        Ok(status) if status.success() => {}
-        Ok(status) if status.code() == Some(1) => {
-            return missing_owner_snapshot("provenance", "provenance:notes-ref", limits);
-        }
-        _ => {
-            return corrupt_owner_snapshot(
-                "provenance",
-                "provenance:notes-ref",
-                "provenance_notes_ref_unreadable",
-                limits,
-            );
-        }
-    }
-    let list = match git_stdout_bounded(
-        &root,
-        &["notes", "--ref", notes_ref, "list"],
+    let note_entries = match repository.snapshot_notes_bounded(
+        notes_ref,
+        limits.max_subsources,
         limits.max_source_bytes,
     ) {
-        Ok(list) => list,
-        Err(code) => {
-            return corrupt_owner_snapshot("provenance", "provenance:notes-ref", code, limits);
+        Ok(Some(entries)) => entries,
+        Ok(None) => {
+            return missing_owner_snapshot("provenance", "provenance:notes-ref", limits);
         }
-    };
-    let list = match std::str::from_utf8(&list) {
-        Ok(list) => list,
         Err(_) => {
             return corrupt_owner_snapshot(
                 "provenance",
                 "provenance:notes-ref",
-                "provenance_notes_list_invalid",
+                "provenance_notes_snapshot_unreadable",
                 limits,
             );
         }
     };
-    let mut note_refs = Vec::new();
-    for line in list.lines().filter(|line| !line.trim().is_empty()) {
-        let mut fields = line.split_whitespace();
-        let (Some(note_oid), Some(commit_oid), None) =
-            (fields.next(), fields.next(), fields.next())
-        else {
-            return corrupt_owner_snapshot(
-                "provenance",
-                "provenance:notes-ref",
-                "provenance_notes_list_invalid",
-                limits,
-            );
-        };
-        if !is_commit_id(note_oid) || !is_commit_id(commit_oid) {
-            return corrupt_owner_snapshot(
-                "provenance",
-                "provenance:notes-ref",
-                "provenance_notes_list_invalid",
-                limits,
-            );
-        }
-        note_refs.push((note_oid.to_string(), commit_oid.to_string()));
+    let mut listing_commitment = Vec::new();
+    for entry in &note_entries {
+        listing_commitment.extend_from_slice(entry.target_oid.as_bytes());
+        listing_commitment.push(0);
+        listing_commitment.extend_from_slice(sha256_hex(&entry.bytes).as_bytes());
+        listing_commitment.push(b'\n');
     }
-    if note_refs.len() > limits.max_subsources {
-        return corrupt_owner_snapshot(
-            "provenance",
-            "provenance:notes-ref",
-            "owner_subsource_limit",
-            limits,
-        );
-    }
-    note_refs.sort_by(|left, right| left.1.cmp(&right.1));
-    if note_refs.is_empty() {
-        if repository_authority.ensure_still_current().is_err() {
-            return corrupt_owner_snapshot(
-                "provenance",
-                "provenance:repository",
-                "provenance_repository_changed",
-                limits,
-            );
-        }
+    if note_entries.is_empty() {
         let state = OwnerSnapshotStateV1::Present {
-            content_sha256: sha256_hex(list.as_bytes()),
-            byte_len: list.len() as u64,
+            content_sha256: sha256_hex(&listing_commitment),
+            byte_len: 0,
         };
         return build_owner_snapshot(
             "provenance",
@@ -551,22 +492,12 @@ pub fn capture_project_catalog_owner_snapshot(
             limits,
         );
     }
-    let mut total_bytes = list.len();
+    let mut total_bytes = listing_commitment.len();
     let mut rows = Vec::new();
     let mut subsources = Vec::new();
-    for (note_oid, commit_oid) in note_refs {
-        let remaining = limits.max_source_bytes.saturating_sub(total_bytes);
-        let bytes = match git_stdout_bounded(&root, &["cat-file", "blob", &note_oid], remaining) {
-            Ok(bytes) => bytes,
-            Err(code) => {
-                return corrupt_owner_snapshot(
-                    "provenance",
-                    &format!("provenance:{project_id}:{commit_oid}"),
-                    code,
-                    limits,
-                );
-            }
-        };
+    for entry in note_entries {
+        let commit_oid = entry.target_oid;
+        let bytes = entry.bytes;
         total_bytes = match total_bytes.checked_add(bytes.len()) {
             Some(total_bytes) => total_bytes,
             None => {
@@ -578,6 +509,14 @@ pub fn capture_project_catalog_owner_snapshot(
                 );
             }
         };
+        if total_bytes > limits.max_source_bytes {
+            return corrupt_owner_snapshot(
+                "provenance",
+                "provenance:notes-ref",
+                "owner_source_byte_limit",
+                limits,
+            );
+        }
         let body = match std::str::from_utf8(&bytes) {
             Ok(body) => body,
             Err(_) => {
@@ -624,14 +563,6 @@ pub fn capture_project_catalog_owner_snapshot(
         };
         subsources.push(owner_subsource(subsource_id, state, &subsource_rows));
         rows.extend(subsource_rows);
-    }
-    if repository_authority.ensure_still_current().is_err() {
-        return corrupt_owner_snapshot(
-            "provenance",
-            "provenance:repository",
-            "provenance_repository_changed",
-            limits,
-        );
     }
     finalize_owner_snapshot(
         "provenance",

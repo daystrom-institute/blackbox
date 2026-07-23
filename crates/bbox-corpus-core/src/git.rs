@@ -8,6 +8,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
+use crate::json_store::NofollowDirectory;
+
 /// Exact contents of the host-local marker that opts a full independent
 /// clone into managed-checkout resolution. The marker opens only the managed
 /// gate; callers must still match the clone's durable repo identity to one
@@ -56,6 +58,186 @@ impl VerifiedCommit {
     }
 }
 
+/// A read-only repository lease rooted in held no-follow directory handles.
+///
+/// Discovery begins from a caller-held worktree directory descriptor. Every
+/// later ref and object read uses the captured Git/common/object authorities
+/// without reopening the worktree pathname.
+#[derive(Clone)]
+pub struct StableGitRepository {
+    #[cfg(unix)]
+    authority: Arc<StableRepositoryAuthority>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StableGitNoteSnapshotEntry {
+    pub target_oid: String,
+    pub bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for StableGitRepository {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StableGitRepository(<held authority>)")
+    }
+}
+
+impl StableGitRepository {
+    pub fn repository_root(&self) -> &Path {
+        #[cfg(unix)]
+        {
+            &self.authority.root
+        }
+        #[cfg(not(unix))]
+        {
+            unreachable!("stable Git repositories require Unix")
+        }
+    }
+
+    pub fn authority_paths(&self) -> Vec<PathBuf> {
+        #[cfg(unix)]
+        {
+            vec![
+                self.authority.worktree.path.clone(),
+                self.authority.git_dir.path.clone(),
+                self.authority.common_dir.path.clone(),
+                self.authority.objects.path.clone(),
+            ]
+        }
+        #[cfg(not(unix))]
+        {
+            Vec::new()
+        }
+    }
+
+    pub fn common_directory(&self) -> &Path {
+        #[cfg(unix)]
+        {
+            &self.authority.common_dir.path
+        }
+        #[cfg(not(unix))]
+        {
+            unreachable!("stable Git repositories require Unix")
+        }
+    }
+
+    pub fn verified_head(&self) -> Result<Option<VerifiedCommit>> {
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("stable Git repositories require Unix directory-handle confinement");
+        }
+        #[cfg(unix)]
+        {
+            let head = self
+                .authority
+                .git_dir
+                .read_regular_bounded("HEAD", 4096, "stable repository HEAD")?
+                .context("stable repository HEAD is missing")?;
+            let head = std::str::from_utf8(&head)
+                .context("stable repository HEAD is not UTF-8")?
+                .trim();
+            let oid = if let Some(reference) = head.strip_prefix("ref: ") {
+                validate_stable_reference(reference)?;
+                resolve_stable_repository_ref(&self.authority, reference)?
+            } else if head.is_empty() {
+                None
+            } else {
+                Some(head.to_string())
+            };
+            let Some(oid) = oid else {
+                return Ok(None);
+            };
+            verify_commit_oid_in_stable_unix(duplicate_stable_repository(&self.authority)?, &oid)
+                .map(Some)
+        }
+    }
+
+    pub fn resolve_commit_oid(&self, commitish: &str) -> Result<Option<String>> {
+        validate_stable_commitish(commitish)?;
+        #[cfg(not(unix))]
+        {
+            let _ = commitish;
+            anyhow::bail!("stable Git repositories require Unix directory-handle confinement");
+        }
+        #[cfg(unix)]
+        {
+            resolve_stable_repository_commitish(&self.authority, commitish)
+        }
+    }
+
+    pub fn verify_commit_oid(&self, oid: &str) -> Result<VerifiedCommit> {
+        #[cfg(not(unix))]
+        {
+            let _ = oid;
+            anyhow::bail!("stable Git repositories require Unix directory-handle confinement");
+        }
+        #[cfg(unix)]
+        {
+            verify_commit_oid_in_stable_unix(duplicate_stable_repository(&self.authority)?, oid)
+        }
+    }
+
+    pub fn first_commit_oid(&self, head_oid: &str) -> Result<Option<String>> {
+        validate_full_object_id(head_oid)?;
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("stable Git repositories require Unix directory-handle confinement");
+        }
+        #[cfg(unix)]
+        {
+            let bytes = run_stable_repository_stdout_bounded(
+                &self.authority,
+                &["rev-list", "--max-parents=0", head_oid],
+                "deriving stable first commit",
+                16 * 1024,
+            )?;
+            Ok(git_first_commit_from_stdout(&bytes))
+        }
+    }
+
+    pub fn snapshot_notes_bounded(
+        &self,
+        notes_ref: &str,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<StableGitNoteSnapshotEntry>>> {
+        validate_stable_reference(notes_ref)?;
+        #[cfg(not(unix))]
+        {
+            let _ = (notes_ref, max_entries, max_bytes);
+            anyhow::bail!("stable Git repositories require Unix directory-handle confinement");
+        }
+        #[cfg(unix)]
+        {
+            let Some(commit_oid) = resolve_stable_repository_ref(&self.authority, notes_ref)?
+            else {
+                return Ok(None);
+            };
+            let commit = verify_commit_oid_in_stable_unix(
+                duplicate_stable_repository(&self.authority)?,
+                &commit_oid,
+            )?;
+            let paths = list_verified_committed_dir_bounded(&commit, ".", max_entries, max_bytes)?;
+            let mut total_bytes = 0_usize;
+            let mut entries = Vec::with_capacity(paths.len());
+            for path in paths {
+                let normalized_path = path.strip_prefix("./").unwrap_or(&path);
+                let target_oid = normalized_path.replace('/', "");
+                validate_full_object_id(&target_oid)?;
+                let remaining = max_bytes
+                    .checked_sub(total_bytes)
+                    .context("stable Git notes snapshot exceeds its aggregate byte limit")?;
+                let bytes = read_verified_committed_file_bytes_bounded(&commit, &path, remaining)?;
+                total_bytes = total_bytes
+                    .checked_add(bytes.len())
+                    .context("stable Git notes snapshot byte count overflow")?;
+                entries.push(StableGitNoteSnapshotEntry { target_oid, bytes });
+            }
+            entries.sort_by(|left, right| left.target_oid.cmp(&right.target_oid));
+            Ok(Some(entries))
+        }
+    }
+}
+
 #[cfg(unix)]
 struct StableDirectory {
     path: PathBuf,
@@ -63,9 +245,100 @@ struct StableDirectory {
 }
 
 #[cfg(unix)]
+impl StableDirectory {
+    fn open_directory_optional(&self, name: &str, label: &str) -> Result<Option<Self>> {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        if name.is_empty() || name.contains(['/', '\\']) {
+            anyhow::bail!("{label} has an invalid relative name");
+        }
+        let name = CString::new(name).context("stable Git directory name contains a NUL byte")?;
+        let descriptor = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(None);
+            }
+            return Err(error)
+                .with_context(|| format!("opening {label} through held directory authority"));
+        }
+        Ok(Some(Self {
+            path: self.path.join(name.to_string_lossy().as_ref()),
+            file: unsafe { fs::File::from_raw_fd(descriptor) },
+        }))
+    }
+
+    fn open_parent(&self) -> Result<Self> {
+        let mut parent_path = self.path.clone();
+        if !parent_path.pop() {
+            anyhow::bail!("stable Git directory has no parent");
+        }
+        self.open_directory_optional("..", "stable Git parent directory")?
+            .map(|mut parent| {
+                parent.path = parent_path;
+                parent
+            })
+            .context("stable Git parent directory is missing")
+    }
+
+    fn read_regular_bounded(
+        &self,
+        name: &str,
+        max_bytes: usize,
+        label: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        if name.is_empty() || name.contains(['/', '\\']) {
+            anyhow::bail!("{label} has an invalid relative name");
+        }
+        let name = CString::new(name).context("stable Git filename contains a NUL byte")?;
+        let descriptor = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(None);
+            }
+            return Err(error)
+                .with_context(|| format!("opening {label} through held directory authority"));
+        }
+        let mut file = unsafe { fs::File::from_raw_fd(descriptor) };
+        if !file.metadata()?.file_type().is_file() {
+            anyhow::bail!("{label} is not a regular file");
+        }
+        let limit = max_bytes
+            .checked_add(1)
+            .context("stable Git read byte limit overflow")?;
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take(limit as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > max_bytes {
+            anyhow::bail!("{label} exceeds its byte limit");
+        }
+        Ok(Some(bytes))
+    }
+}
+
+#[cfg(unix)]
 #[allow(dead_code)] // Retained handles keep the verified repository authority alive.
 struct StableRepositoryAuthority {
     root: PathBuf,
+    worktree: StableDirectory,
     git_dir: StableDirectory,
     common_dir: StableDirectory,
     objects: StableDirectory,
@@ -451,6 +724,57 @@ struct HardenedWorktreeRoot {
     objects: PathBuf,
 }
 
+/// Discover and retain one repository from an already-held no-follow
+/// worktree directory. A non-repository is returned as `None`.
+pub fn open_stable_git_repository(
+    caller_directory: &NofollowDirectory,
+) -> Result<Option<StableGitRepository>> {
+    #[cfg(not(unix))]
+    {
+        let _ = caller_directory;
+        anyhow::bail!("stable Git repositories require Unix directory-handle confinement");
+    }
+    #[cfg(unix)]
+    {
+        caller_directory.ensure_still_current()?;
+        let mut worktree = StableDirectory {
+            path: caller_directory.path_for_diagnostics().to_path_buf(),
+            file: caller_directory.duplicate_descriptor()?,
+        };
+        let authority = loop {
+            match worktree.open_directory_optional(".git", "stable Git directory") {
+                Ok(Some(git_dir)) => {
+                    let common_dir = duplicate_stable_directory(&git_dir)?;
+                    let objects = git_dir
+                        .open_directory_optional("objects", "stable Git object directory")?
+                        .context("stable Git object directory is missing")?;
+                    break Some(StableRepositoryAuthority {
+                        root: worktree.path.clone(),
+                        worktree,
+                        git_dir,
+                        common_dir,
+                        objects,
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(error).context(
+                        "stable migration reads do not support linked-worktree .git files",
+                    );
+                }
+            }
+            if worktree.path.parent().is_none() || worktree.path == Path::new("/") {
+                break None;
+            }
+            worktree = worktree.open_parent()?;
+        };
+        caller_directory.ensure_still_current()?;
+        Ok(authority.map(|authority| StableGitRepository {
+            authority: Arc::new(authority),
+        }))
+    }
+}
+
 fn resolve_hardened_worktree_root(caller_root: &Path, label: &str) -> Result<HardenedWorktreeRoot> {
     let caller_root = caller_root
         .canonicalize()
@@ -522,6 +846,7 @@ fn run_hardened_repository_path_query(
 fn open_stable_repository(discovered: HardenedWorktreeRoot) -> Result<StableRepositoryAuthority> {
     Ok(StableRepositoryAuthority {
         root: discovered.root,
+        worktree: open_stable_directory(&discovered.root, "worktree root")?,
         git_dir: open_stable_directory(&discovered.git_dir, "Git directory")?,
         common_dir: open_stable_directory(&discovered.common_dir, "common Git directory")?,
         objects: open_stable_directory(&discovered.objects, "Git object directory")?,
@@ -656,6 +981,163 @@ fn read_stable_repository_object_format(repository: &StableRepositoryAuthority) 
     }
 }
 
+fn validate_stable_reference(reference: &str) -> Result<()> {
+    if reference.is_empty()
+        || reference.len() > 1024
+        || !reference.starts_with("refs/")
+        || reference
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+        || reference.contains("..")
+        || reference.contains("@{")
+        || reference.contains('\\')
+        || reference.ends_with('.')
+        || reference.ends_with('/')
+        || reference.split('/').any(|part| part.is_empty())
+    {
+        anyhow::bail!("stable Git reference is invalid");
+    }
+    Ok(())
+}
+
+fn validate_full_object_id(oid: &str) -> Result<()> {
+    if !matches!(oid.len(), 40 | 64)
+        || !oid
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        anyhow::bail!("stable Git object id is invalid");
+    }
+    Ok(())
+}
+
+fn validate_stable_commitish(commitish: &str) -> Result<()> {
+    if commitish.is_empty()
+        || commitish.len() > 1024
+        || commitish.starts_with('-')
+        || commitish
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+        || commitish.contains("@{")
+        || commitish.contains('\\')
+        || commitish.contains(' ')
+    {
+        anyhow::bail!("stable Git commit selector is invalid");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn resolve_stable_repository_ref(
+    repository: &StableRepositoryAuthority,
+    reference: &str,
+) -> Result<Option<String>> {
+    validate_stable_reference(reference)?;
+    let specification = format!("{reference}^{{commit}}");
+    let mut command = Command::new("git");
+    command.args(["rev-parse", "--verify", &specification]);
+    configure_stable_repository_command(&mut command, repository)?;
+    let output = run_bounded_with_timeout_and_stdout_limit(
+        command,
+        &repository.root,
+        "resolving stable Git reference",
+        GIT_OUTPUT_TIMEOUT,
+        Some(128),
+    )
+    .context("running Git to resolve stable reference")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    if output.stdout_overflowed {
+        anyhow::bail!("stable Git reference output exceeded its byte limit");
+    }
+    let oid = std::str::from_utf8(&output.stdout)
+        .context("stable Git reference output is not UTF-8")?
+        .trim();
+    validate_full_object_id(oid)?;
+    Ok(Some(oid.to_string()))
+}
+
+#[cfg(unix)]
+fn resolve_stable_repository_commitish(
+    repository: &StableRepositoryAuthority,
+    commitish: &str,
+) -> Result<Option<String>> {
+    validate_stable_commitish(commitish)?;
+    let specification = format!("{commitish}^{{commit}}");
+    let mut command = Command::new("git");
+    command.args(["rev-parse", "--verify", "--end-of-options", &specification]);
+    configure_stable_repository_command(&mut command, repository)?;
+    let output = run_bounded_with_timeout_and_stdout_limit(
+        command,
+        &repository.root,
+        "resolving stable Git commit selector",
+        GIT_OUTPUT_TIMEOUT,
+        Some(128),
+    )
+    .context("running Git to resolve stable commit selector")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    if output.stdout_overflowed {
+        anyhow::bail!("stable Git commit selector output exceeded its byte limit");
+    }
+    let oid = std::str::from_utf8(&output.stdout)
+        .context("stable Git commit selector output is not UTF-8")?
+        .trim();
+    validate_full_object_id(oid)?;
+    Ok(Some(oid.to_string()))
+}
+
+#[cfg(unix)]
+fn run_stable_repository_stdout_bounded(
+    repository: &StableRepositoryAuthority,
+    args: &[&str],
+    action: &'static str,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    let mut command = Command::new("git");
+    command.args(args);
+    configure_stable_repository_command(&mut command, repository)?;
+    let output = run_bounded_with_timeout_and_stdout_limit(
+        command,
+        &repository.root,
+        action,
+        GIT_OUTPUT_TIMEOUT,
+        Some(max_bytes),
+    )
+    .with_context(|| format!("running Git while {action}"))?;
+    ensure_exact_git_success(&output, &repository.root, action)?;
+    if output.stdout_overflowed {
+        anyhow::bail!("{action} output exceeded its byte limit");
+    }
+    Ok(output.stdout)
+}
+
+#[cfg(unix)]
+fn duplicate_stable_directory(directory: &StableDirectory) -> Result<StableDirectory> {
+    Ok(StableDirectory {
+        path: directory.path.clone(),
+        file: directory
+            .file
+            .try_clone()
+            .context("duplicating stable Git directory handle")?,
+    })
+}
+
+#[cfg(unix)]
+fn duplicate_stable_repository(
+    repository: &StableRepositoryAuthority,
+) -> Result<StableRepositoryAuthority> {
+    Ok(StableRepositoryAuthority {
+        root: repository.root.clone(),
+        worktree: duplicate_stable_directory(&repository.worktree)?,
+        git_dir: duplicate_stable_directory(&repository.git_dir)?,
+        common_dir: duplicate_stable_directory(&repository.common_dir)?,
+        objects: duplicate_stable_directory(&repository.objects)?,
+    })
+}
+
 #[cfg(unix)]
 fn verify_commit_oid_with_alternate_unix(
     root: &Path,
@@ -674,6 +1156,9 @@ fn verify_commit_oid_with_alternate_unix(
             )?)
         })
         .transpose()?;
+    if alternate.is_none() {
+        return verify_commit_oid_in_stable_unix(primary, oid);
+    }
     if configured_alternates_exist(&primary.objects)?
         || alternate
             .as_ref()
@@ -733,6 +1218,51 @@ fn verify_commit_oid_with_alternate_unix(
         authority: Arc::new(VerifiedGitAuthority {
             primary,
             alternate,
+            sessions: Mutex::new(sessions),
+        }),
+    })
+}
+
+#[cfg(unix)]
+fn verify_commit_oid_in_stable_unix(
+    primary: StableRepositoryAuthority,
+    oid: &str,
+) -> Result<VerifiedCommit> {
+    validate_full_object_id(oid)?;
+    if configured_alternates_exist(&primary.objects)? {
+        anyhow::bail!(
+            "exact publication reads do not honor repository-configured object alternates"
+        );
+    }
+    let object_id_hex_len = read_stable_repository_object_format(&primary)?;
+    if oid.len() != object_id_hex_len {
+        anyhow::bail!("exact commit object id length does not match repository object format");
+    }
+    let mut sessions = VerifiedObjectSessions {
+        primary: CatFileSession::spawn(&primary)?,
+        alternate: None,
+    };
+    sessions.primary.initialize_alternates(object_id_hex_len)?;
+    if configured_alternates_exist(&primary.objects)? {
+        anyhow::bail!("repository-configured object alternates appeared during exact verification");
+    }
+    let commit = sessions
+        .read_object(oid, GIT_COMMIT_OBJECT_LIMIT)?
+        .context("exact commit object is absent from verified object database")?;
+    if commit.object_type != "commit" {
+        anyhow::bail!("exact object id does not name a commit");
+    }
+    let root_tree_oid =
+        parse_commit_tree_oid(&commit.bytes, object_id_hex_len).context("parsing exact commit")?;
+    let repository_root = primary.root.clone();
+    Ok(VerifiedCommit {
+        repository_root,
+        oid: oid.to_string(),
+        root_tree_oid,
+        object_id_hex_len,
+        authority: Arc::new(VerifiedGitAuthority {
+            primary,
+            alternate: None,
             sessions: Mutex::new(sessions),
         }),
     })
