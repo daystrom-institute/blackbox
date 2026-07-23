@@ -3063,6 +3063,43 @@ impl CodeSourceStore {
             )
         })?;
         let paths = CodeSourceStorePaths::new(root)?;
+        Self::from_existing_paths(paths, limits)
+    }
+
+    /// Open an existing migration owner without creating its root, lock, or
+    /// conventional child directories.
+    ///
+    /// Normal daemon startup uses [`Self::open`] to initialize a new store.
+    /// Migration preflight must instead prove that the owner already exists
+    /// and was initialized by that path before it may take the existing owner
+    /// lock and enumerate exact source bytes.
+    pub fn open_existing_for_migration(
+        root: impl Into<PathBuf>,
+        limits: StoreLimits,
+    ) -> Result<Option<Self>> {
+        let paths = CodeSourceStorePaths::new(root)?;
+        let metadata = match fs::symlink_metadata(paths.root()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("inspecting existing code-source store root"),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("existing code-source store root is not a safe directory");
+        }
+        let lock_path = bbox_corpus_core::json_store::canonical_store_lock_path(&paths.anchor());
+        let lock_metadata = fs::symlink_metadata(&lock_path)
+            .context("inspecting existing code-source store lock")?;
+        if lock_metadata.file_type().is_symlink() || !lock_metadata.is_file() {
+            bail!("existing code-source store lock is not a safe regular file");
+        }
+        let root = paths
+            .root()
+            .canonicalize()
+            .context("canonicalizing existing code-source store root")?;
+        Self::from_existing_paths(CodeSourceStorePaths::new(root)?, limits).map(Some)
+    }
+
+    fn from_existing_paths(paths: CodeSourceStorePaths, limits: StoreLimits) -> Result<Self> {
         let mut registry = STORE_REGISTRY
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
@@ -5596,6 +5633,27 @@ mod tests {
             bytes.push(b'\n');
         }
         bytes
+    }
+
+    #[test]
+    fn migration_existing_open_never_creates_a_missing_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store_root = root.join("code-sources");
+        assert!(
+            CodeSourceStore::open_existing_for_migration(&store_root, StoreLimits::default())
+                .unwrap()
+                .is_none()
+        );
+        assert!(!store_root.exists());
+
+        let store = CodeSourceStore::open(&store_root, StoreLimits::default()).unwrap();
+        drop(store);
+        let existing =
+            CodeSourceStore::open_existing_for_migration(&store_root, StoreLimits::default())
+                .unwrap()
+                .unwrap();
+        assert_eq!(existing.root(), store_root.canonicalize().unwrap());
     }
 
     fn materialized_selector(project_id: &str, generation_id: &str) -> String {
