@@ -2691,7 +2691,7 @@ impl ProjectCatalogTransactionOwner {
                 "code-source snapshot verification requires the complete registry",
             ));
         };
-        let stale = |detail| {
+        let stale = |detail: &str| {
             ProjectCatalogStoreError::new(
                 "error.project_catalog_migration_inventory_stale",
                 format!("code-source inventory changed after capture: {detail}"),
@@ -2702,7 +2702,7 @@ impl ProjectCatalogTransactionOwner {
             &registry.code_source_limits,
             &published_catalog_scopes(catalog),
         )
-        .map_err(|error| stale(error.to_string()))?;
+        .map_err(|error| stale(&error.to_string()))?;
         if current.canonical_sha256 != snapshot.legacy_inventory.canonical_sha256 {
             return Err(stale("canonical legacy source row set differs"));
         }
