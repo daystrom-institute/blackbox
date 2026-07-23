@@ -321,3 +321,27 @@ until a later entry explicitly supersedes it.
   a routinely archived report into a path disclosure surface.
 - Revisit only if: the report is replaced by an equally deterministic local
   review format with explicit sensitive-data handling.
+
+## D-014: Bound accepted-publication generations and hash exact source bytes
+
+- Date: 2026-07-22
+- Phase: durable project catalog, accepted publication migration
+- Status: accepted during implementation
+- Decision: Migration retains at most 2 MiB per accepted source file, 100,000
+  knowledge entries, 100,000 gap entries, 128 MiB of source bytes per lane,
+  and 256 MiB for the encoded generation. Deployment configuration may lower
+  but never raise these limits. The generation records the exact committed
+  source JSON bytes and their hashes, and its id is the lowercase SHA-256 of
+  `bbox-accepted-publication-generation-v1`, a NUL separator, and the exact
+  persisted generation bytes.
+- Evidence:
+  - Exact source bytes make commit provenance independently verifiable without
+    trusting a reserialization of decoded values.
+  - Explicit file, entry, lane, and generation limits prevent migration from
+    turning malformed or unexpectedly large history into unbounded memory use.
+  - A domain-separated content id is deterministic across rehearsal, apply,
+    recovery, and remote-only verification.
+- Rationale: Accepted publication is a durable recovery asset, so its identity
+  must bind the exact evidence while every allocation remains bounded.
+- Revisit only if: a replacement publication substrate provides equivalent
+  byte-exact provenance, deterministic identity, and stricter resource bounds.
