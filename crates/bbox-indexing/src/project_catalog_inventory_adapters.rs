@@ -1859,6 +1859,7 @@ pub(crate) struct InventoryRuntimeBindingsV1 {
     legacy_project_store_was_missing: bool,
     legacy_project_paths: BTreeMap<String, AuthorizedInventoryPath>,
     checkout_paths: BTreeMap<String, AuthorizedInventoryPath>,
+    checkout_repositories: BTreeMap<String, StableGitRepository>,
     git_common_directories: BTreeMap<String, AuthorizedInventoryPath>,
     legacy_selectors: BTreeMap<String, RuntimeLiteralBindingV1>,
 }
@@ -1882,6 +1883,10 @@ impl fmt::Debug for InventoryRuntimeBindingsV1 {
                 &self.legacy_project_paths.len(),
             )
             .field("checkout_path_count", &self.checkout_paths.len())
+            .field(
+                "checkout_repository_count",
+                &self.checkout_repositories.len(),
+            )
             .field(
                 "git_common_directory_count",
                 &self.git_common_directories.len(),
@@ -1922,6 +1927,14 @@ impl InventoryRuntimeBindingsV1 {
         self.checkout_paths
             .iter()
             .map(|(id, path)| (id.as_str(), path.as_path()))
+    }
+
+    pub(crate) fn checkout_repositories(
+        &self,
+    ) -> impl Iterator<Item = (&str, &StableGitRepository)> {
+        self.checkout_repositories
+            .iter()
+            .map(|(id, repository)| (id.as_str(), repository))
     }
 
     pub(crate) fn git_common_directory(&self, observation_id: &str) -> Option<&Path> {
@@ -1972,6 +1985,15 @@ impl InventoryRuntimeBindingsV1 {
             .map(|row| (row.observation_id.as_str(), &row.canonical_root_digest))
             .collect::<BTreeMap<_, _>>();
         validate_authorized_path_bindings(&self.checkout_paths, &checkout_digests)?;
+        if self
+            .checkout_repositories
+            .keys()
+            .any(|observation_id| !self.checkout_paths.contains_key(observation_id))
+        {
+            return Err(invalid_source(
+                "runtime checkout repository lacks its path binding",
+            ));
+        }
 
         let git_digests = inventory
             .git_metadata
@@ -2356,11 +2378,18 @@ fn capture_inventory_locked(
     }
     mutable_source_evidence.append(&mut code_capture.retained_owner_source_evidence);
     let mut checkout_path_bindings = BTreeMap::new();
+    let mut checkout_repository_bindings = BTreeMap::new();
     for capture in &checkout_captures {
         checkout_path_bindings.insert(
             capture.observation.observation_id.clone(),
             capture.runtime_root.clone(),
         );
+        if let Some(repository) = &capture.repository {
+            checkout_repository_bindings.insert(
+                capture.observation.observation_id.clone(),
+                repository.clone(),
+            );
+        }
         mutable_source_evidence.push(capture.root_source_evidence.clone());
         mutable_source_evidence.push(capture.marker_source_evidence.clone());
     }
@@ -2399,6 +2428,7 @@ fn capture_inventory_locked(
         legacy_project_store_was_missing: legacy_source.was_missing,
         legacy_project_paths: legacy.runtime_project_paths,
         checkout_paths: checkout_path_bindings,
+        checkout_repositories: checkout_repository_bindings,
         git_common_directories: owner_capture.git_common_directories,
         legacy_selectors: owner_capture.legacy_selectors,
     };

@@ -20,8 +20,8 @@ use bbox_code_source_store::{
 };
 use bbox_config::config::Config;
 use bbox_corpus_core::git::{
-    list_verified_committed_dir_bounded, read_verified_committed_file_bytes_bounded,
-    verify_commit_oid_with_alternate,
+    StableGitRepository, list_verified_committed_dir_bounded,
+    read_verified_committed_file_bytes_bounded,
 };
 use bbox_corpus_core::json_store::{NofollowDirectory, canonical_store_lock_path};
 use bbox_corpus_core::project_catalog::{
@@ -29,10 +29,9 @@ use bbox_corpus_core::project_catalog::{
     AttachmentKind, AttachmentSnapshotV1, AttachmentStatus, CatalogOriginV2, CatalogSnapshotV2,
     CheckoutAttachment, CommitNamespace, CorpusProject, LegacyPathBindingId,
     LegacyPathBindingStatus, LegacyPathLedgerEntry, LegacyPathRelationship,
-    MAX_PROJECT_CATALOG_BYTES, MAX_PROJECT_CATALOG_ENTRIES, ProjectCatalogTransactionId, ProjectId,
-    ProjectScope, RecordedRepoAuthority, RepoHistoryAuthority, RepoHistoryId, RepoHistoryRecord,
-    decode_legacy_project_store, encode_attachment_snapshot, encode_catalog_snapshot,
-    validate_catalog_attachments,
+    MAX_PROJECT_CATALOG_ENTRIES, ProjectCatalogTransactionId, ProjectId, ProjectScope,
+    RecordedRepoAuthority, RepoHistoryAuthority, RepoHistoryId, RepoHistoryRecord,
+    encode_attachment_snapshot, encode_catalog_snapshot, validate_catalog_attachments,
 };
 use bbox_corpus_core::project_record::ProjectRecord;
 use serde::Serialize;
@@ -959,6 +958,7 @@ struct MigrationRuntimeBindingsViewV1 {
     legacy_project_store_was_missing: bool,
     legacy_project_paths: BTreeMap<String, PathBuf>,
     checkout_paths: BTreeMap<String, PathBuf>,
+    checkout_repositories: BTreeMap<String, StableGitRepository>,
     git_common_directories: BTreeMap<String, PathBuf>,
     legacy_selectors: BTreeMap<String, String>,
 }
@@ -2751,11 +2751,12 @@ fn prepare_publisher_generation(
         .iter()
         .find(|row| &row.attachment_id == attachment_id && &row.project_id == project_id)
         .ok_or_else(|| planner_error("publisher attachment is not inventoried for the project"))?;
-    let checkout_root = runtime
-        .checkout_paths
+    let repository = runtime
+        .checkout_repositories
         .get(&attachment.checkout_observation_id)
-        .ok_or_else(|| planner_error("publisher checkout runtime binding is missing"))?;
-    let commit = verify_commit_oid_with_alternate(checkout_root, accepted_commit, None)
+        .ok_or_else(|| planner_error("publisher checkout repository authority is missing"))?;
+    let commit = repository
+        .verify_commit_oid(accepted_commit)
         .map_err(|_| planner_error("publisher accepted commit cannot be verified exactly"))?;
     let scope_root = scope.bbox_root_relpath();
     let knowledge_root = repo_relative_lane_root(scope_root, "knowledge");
@@ -3783,6 +3784,11 @@ fn prepare_closed_migration(
             .runtime_bindings()
             .checkout_paths()
             .map(|(id, path)| (id.to_string(), path.to_path_buf()))
+            .collect(),
+        checkout_repositories: captured
+            .runtime_bindings()
+            .checkout_repositories()
+            .map(|(id, repository)| (id.to_string(), repository.clone()))
             .collect(),
         git_common_directories: captured
             .runtime_bindings()
@@ -4935,30 +4941,6 @@ fn validate_rehearsal_runtime_authorities(
     for checkout in checkout_roots {
         require_contained(checkout)?;
     }
-    let metadata = match std::fs::symlink_metadata(&layout.projects_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Err(unsafe_layout("legacy catalog cannot be inspected")),
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(unsafe_layout("legacy catalog must be a no-follow file"));
-    }
-    let bytes = std::fs::read(&layout.projects_path)
-        .map_err(|_| unsafe_layout("legacy catalog cannot be read"))?;
-    if bytes.len() > MAX_PROJECT_CATALOG_BYTES {
-        return Err(unsafe_layout("legacy catalog exceeds its size limit"));
-    }
-    let legacy = decode_legacy_project_store(&bytes)
-        .map_err(|_| unsafe_layout("legacy catalog is invalid"))?;
-    for project in legacy.projects {
-        let project_root = require_contained(Path::new(&project.canonical_path))?;
-        if let Some(git_root) = bbox_corpus_core::git::git_root_for_path(&project_root) {
-            require_contained(&git_root)?;
-        }
-        if let Some(common_dir) = bbox_corpus_core::git::git_common_dir(&project_root) {
-            require_contained(&common_dir)?;
-        }
-    }
     Ok(())
 }
 
@@ -5213,11 +5195,27 @@ pub(crate) fn build_compatibility_projection(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::process::Command;
 
     use bbox_config::config;
     use tempfile::tempdir;
 
     use super::*;
+
+    fn run_git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
 
     fn test_config(root: &Path) -> Config {
         let _guard = bbox_util::util::test_env_lock();
@@ -5294,32 +5292,31 @@ mod tests {
         let outside = root.join("outside");
         fs::create_dir_all(rehearsal.join("state")).unwrap();
         fs::create_dir_all(&outside).unwrap();
-        fs::write(
-            rehearsal.join("state/projects.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "version": 1,
-                "projects": [{
-                    "project_id": "outside-project",
-                    "repo_id": null,
-                    "canonical_path": outside,
-                    "registered_at": "2026-01-02T03:04:05Z",
-                    "is_git_repo": false,
-                    "languages": [],
-                    "aliases": []
-                }]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
         let layout =
             ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(&rehearsal, &config)
                 .unwrap();
         assert_eq!(
-            validate_rehearsal_runtime_authorities(&layout, &[])
+            validate_rehearsal_runtime_authorities(&layout, std::slice::from_ref(&outside))
                 .unwrap_err()
                 .code,
             "error.project_catalog_migration_unsafe_layout"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let checkout = rehearsal.join("checkouts/swap");
+            let held = rehearsal.join("checkouts/held");
+            fs::create_dir_all(&checkout).unwrap();
+            fs::rename(&checkout, &held).unwrap();
+            symlink(&outside, &checkout).unwrap();
+            assert_eq!(
+                validate_rehearsal_runtime_authorities(&layout, std::slice::from_ref(&checkout),)
+                    .unwrap_err()
+                    .code,
+                "error.project_catalog_migration_unsafe_layout"
+            );
+        }
     }
 
     #[test]
@@ -5492,6 +5489,7 @@ mod tests {
                 "checkout_acme".to_string(),
                 PathBuf::from("/workspace/acme"),
             )]),
+            checkout_repositories: BTreeMap::new(),
             git_common_directories: BTreeMap::new(),
             legacy_selectors: BTreeMap::from([(
                 "legacy_path_alpha".to_string(),
@@ -5589,6 +5587,7 @@ mod tests {
                 "checkout_acme".to_string(),
                 PathBuf::from("/workspace/acme"),
             )]),
+            checkout_repositories: BTreeMap::new(),
             git_common_directories: BTreeMap::new(),
             legacy_selectors: BTreeMap::from([(
                 "legacy_path_alpha".to_string(),
@@ -5701,5 +5700,73 @@ mod tests {
             LegacyPathRelationshipV1::UnsafeSelector
         );
         assert_eq!(unsafe_selector.refusals.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publisher_generation_uses_captured_repository_after_checkout_swap() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let rehearsal = root.join("rehearsal");
+        let checkout = rehearsal.join("checkout");
+        let protected = root.join("protected");
+        fs::create_dir_all(&checkout).unwrap();
+        fs::create_dir_all(&protected).unwrap();
+        for repository in [&checkout, &protected] {
+            run_git(repository, &["init", "-q"]);
+            run_git(repository, &["config", "user.email", "test@example.com"]);
+            run_git(repository, &["config", "user.name", "Test"]);
+        }
+        fs::write(checkout.join("tracked.txt"), "inside\n").unwrap();
+        run_git(&checkout, &["add", "tracked.txt"]);
+        run_git(&checkout, &["commit", "-qm", "inside"]);
+        let accepted_commit = run_git(&checkout, &["rev-parse", "HEAD"]);
+        fs::write(protected.join("tracked.txt"), "outside-sentinel\n").unwrap();
+        run_git(&protected, &["add", "tracked.txt"]);
+        run_git(&protected, &["commit", "-qm", "outside"]);
+
+        let checkout_authority = NofollowDirectory::open_existing(&checkout)
+            .unwrap()
+            .unwrap();
+        let repository = bbox_corpus_core::git::open_stable_git_repository(&checkout_authority)
+            .unwrap()
+            .unwrap();
+        let held = rehearsal.join("held-checkout");
+        fs::rename(&checkout, &held).unwrap();
+        symlink(&protected, &checkout).unwrap();
+
+        let inventory = crate::project_catalog_inventory::tests::fixture_inventory();
+        let attachment = inventory
+            .attachment_candidates
+            .iter()
+            .find(|row| row.observation_id == "attachment_alpha")
+            .unwrap();
+        let runtime = MigrationRuntimeBindingsViewV1 {
+            legacy_project_store_bytes: Vec::new(),
+            legacy_project_store_was_missing: false,
+            legacy_project_paths: BTreeMap::new(),
+            checkout_paths: BTreeMap::from([(
+                attachment.checkout_observation_id.clone(),
+                checkout,
+            )]),
+            checkout_repositories: BTreeMap::from([(
+                attachment.checkout_observation_id.clone(),
+                repository,
+            )]),
+            git_common_directories: BTreeMap::new(),
+            legacy_selectors: BTreeMap::new(),
+        };
+        prepare_publisher_generation(
+            &inventory,
+            &runtime,
+            &attachment.project_id,
+            &attachment.attachment_id,
+            attachment.observed_scope.as_ref().unwrap(),
+            "refs/heads/main",
+            &accepted_commit,
+        )
+        .unwrap();
     }
 }

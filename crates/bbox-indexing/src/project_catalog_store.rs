@@ -10918,7 +10918,10 @@ mod tests {
             &published_catalog_scopes(&draft.catalog),
         )
         .unwrap();
-        draft.inventory_sha256 = Sha256Hex::parse(inventory.canonical_sha256.clone()).unwrap();
+        let code_source_inventory_sha256 =
+            Sha256Hex::parse(inventory.canonical_sha256.clone()).unwrap();
+        draft.inventory_sha256 = code_source_inventory_sha256.clone();
+        draft.code_source_inventory_sha256 = code_source_inventory_sha256;
         draft.code_source_snapshot.legacy_inventory = inventory;
         let plan = validate_migration_plan(&path, registry, draft).unwrap();
 
