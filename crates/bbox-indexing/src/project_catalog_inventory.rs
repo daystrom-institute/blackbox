@@ -455,10 +455,12 @@ pub struct EdgeWorkspaceObservationV1 {
 pub struct GitMetadataObservationV1 {
     pub observation_id: String,
     pub project_id: ProjectId,
+    pub checkout_observation_id: String,
     pub common_directory_digest: Option<Sha256ValueV1>,
     pub full_first_commit: Option<String>,
     pub materialized_commit_namespaces: BTreeSet<String>,
     pub last_ingested_sha: Option<String>,
+    pub resolved_refs: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1135,6 +1137,7 @@ impl V1ProjectCatalogInventory {
         for row in &self.git_metadata {
             insert_observation(&mut observations, &row.observation_id)?;
             ensure_known_project(&projects, &row.project_id)?;
+            validate_stable_id(&row.checkout_observation_id, "Git checkout observation id")?;
             if let Some(commit) = &row.full_first_commit {
                 validate_full_commit(commit)?;
             }
@@ -1143,6 +1146,10 @@ impl V1ProjectCatalogInventory {
             }
             for namespace in &row.materialized_commit_namespaces {
                 validate_token(namespace, "materialized commit namespace")?;
+            }
+            for (full_ref, commit) in &row.resolved_refs {
+                validate_full_ref(full_ref)?;
+                validate_full_commit(commit)?;
             }
             git_observations.insert(row.observation_id.as_str(), row);
         }
@@ -1156,6 +1163,11 @@ impl V1ProjectCatalogInventory {
                 return Err(duplicate("canonical checkout root"));
             }
             validate_marker_state(&row.marker_state)?;
+        }
+        for row in &self.git_metadata {
+            if !checkout_observations.contains(row.checkout_observation_id.as_str()) {
+                return Err(unknown("Git checkout observation"));
+            }
         }
 
         let mut seen_attachment_ids = BTreeSet::new();
@@ -3815,10 +3827,24 @@ fn validate_publisher_source_membership(
         .iter()
         .map(|row| (&row.attachment_id, row))
         .collect::<BTreeMap<_, _>>();
+    let checkouts = inventory
+        .checkouts
+        .iter()
+        .map(|row| (row.observation_id.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
     for pin in &inventory.publisher_pins {
         let project = projects
             .get(&pin.project_id)
             .ok_or_else(|| unknown("publisher project observation"))?;
+        let authority_scope =
+            project_authority_scope(inventory, &pin.project_id)?.ok_or_else(|| {
+                invalid("publisher project lacks committed or active scope authority")
+            })?;
+        if authority_scope != &pin.expected_scope {
+            return Err(invalid(
+                "publisher expected scope disagrees with project authority",
+            ));
+        }
         let mut expected =
             BTreeSet::from([pin.observation_id.clone(), project.observation_id.clone()]);
         if pin.resolved_commit.is_some() != pin.resolved_scope.is_some()
@@ -3834,6 +3860,7 @@ fn validate_publisher_source_membership(
         if let Some(authority) = &project.committed_authority {
             expected.insert(authority.observation_id.clone());
         }
+        let mut provenance_git_ids = BTreeSet::new();
         for attachment_id in &pin.candidate_attachment_ids {
             let attachment = attachments
                 .get(attachment_id)
@@ -3845,23 +3872,48 @@ fn validate_publisher_source_membership(
                     "publisher candidate attachment crosses project or scope",
                 ));
             }
-            expected.insert(attachment.observation_id.clone());
-            expected.insert(attachment.checkout_observation_id.clone());
-        }
-        if pin.resolved_commit.is_some() {
-            let git_rows = inventory
+            if !checkouts.contains_key(attachment.checkout_observation_id.as_str()) {
+                return Err(unknown("publisher candidate checkout observation"));
+            }
+            let matching_git = inventory
                 .git_metadata
                 .iter()
-                .filter(|row| row.project_id == pin.project_id)
-                .map(|row| row.observation_id.clone())
-                .collect::<BTreeSet<_>>();
-            if git_rows.is_empty() {
+                .filter(|row| {
+                    row.project_id == pin.project_id
+                        && row.checkout_observation_id == attachment.checkout_observation_id
+                        && row.resolved_refs.get(&pin.full_ref) == pin.resolved_commit.as_ref()
+                })
+                .collect::<Vec<_>>();
+            if matching_git.len() != 1 {
+                return Err(invalid(
+                    "publisher candidate lacks unique checkout Git ref provenance",
+                ));
+            }
+            expected.insert(attachment.observation_id.clone());
+            expected.insert(attachment.checkout_observation_id.clone());
+            provenance_git_ids.insert(matching_git[0].observation_id.clone());
+        }
+        if pin.resolved_commit.is_some() {
+            if provenance_git_ids.is_empty() {
+                provenance_git_ids.extend(
+                    inventory
+                        .git_metadata
+                        .iter()
+                        .filter(|row| {
+                            row.project_id == pin.project_id
+                                && row.resolved_refs.get(&pin.full_ref)
+                                    == pin.resolved_commit.as_ref()
+                        })
+                        .map(|row| row.observation_id.clone()),
+                );
+            }
+            if provenance_git_ids.is_empty() {
                 return Err(invalid(
                     "resolved publisher commit lacks Git observation evidence",
                 ));
             }
-            expected.extend(git_rows);
         }
+        expected.extend(provenance_git_ids);
         if pin.source_observation_ids != expected {
             return Err(invalid(
                 "publisher source observations are incomplete or spliced",
@@ -3869,6 +3921,48 @@ fn validate_publisher_source_membership(
         }
     }
     Ok(())
+}
+
+fn project_authority_scope<'a>(
+    inventory: &'a V1ProjectCatalogInventory,
+    project_id: &ProjectId,
+) -> InventoryResult<Option<&'a PublishedScope>> {
+    let committed = inventory
+        .legacy_projects
+        .iter()
+        .find(|row| row.record.project_id == project_id.as_str())
+        .and_then(|row| row.committed_scope.as_ref());
+    let active_generations = inventory
+        .code_sources
+        .iter()
+        .filter(|source| source.project_id == *project_id)
+        .flat_map(|source| source.generations.iter())
+        .filter(|generation| generation.role == CollectedGenerationRoleV1::Active)
+        .collect::<Vec<_>>();
+    if active_generations.len() > 1 {
+        return Err(invalid(
+            "publisher project has multiple active scope authorities",
+        ));
+    }
+    let active = active_generations
+        .first()
+        .and_then(|generation| match &generation.descriptor {
+            ImmutableCollectedDescriptorV1::Valid {
+                published_scope, ..
+            } if generation.activation_scope.as_ref() == Some(published_scope) => {
+                Some(published_scope)
+            }
+            ImmutableCollectedDescriptorV1::Valid { .. }
+            | ImmutableCollectedDescriptorV1::Missing
+            | ImmutableCollectedDescriptorV1::Corrupt { .. } => None,
+        });
+    match (committed, active) {
+        (Some(committed), Some(active)) if committed != active => Err(invalid(
+            "publisher committed and active scope authorities disagree",
+        )),
+        (Some(committed), _) => Ok(Some(committed)),
+        (None, active) => Ok(active),
+    }
 }
 
 fn publisher_pin_key(
@@ -4981,22 +5075,32 @@ mod tests {
                 GitMetadataObservationV1 {
                     observation_id: "git_alpha".to_string(),
                     project_id: alpha.clone(),
+                    checkout_observation_id: "checkout_acme".to_string(),
                     common_directory_digest: Some(digest_path("/workspace/acme/.git")),
                     full_first_commit: Some("b".repeat(40)),
                     materialized_commit_namespaces: BTreeSet::from(
                         ["legacy_namespace".to_string()],
                     ),
                     last_ingested_sha: Some("c".repeat(40)),
+                    resolved_refs: BTreeMap::from([(
+                        "refs/heads/main".to_string(),
+                        "a".repeat(40),
+                    )]),
                 },
                 GitMetadataObservationV1 {
                     observation_id: "git_beta".to_string(),
                     project_id: beta.clone(),
+                    checkout_observation_id: "checkout_acme".to_string(),
                     common_directory_digest: Some(digest_path("/workspace/acme/.git")),
                     full_first_commit: Some("b".repeat(40)),
                     materialized_commit_namespaces: BTreeSet::from(
                         ["legacy_namespace".to_string()],
                     ),
                     last_ingested_sha: Some("d".repeat(40)),
+                    resolved_refs: BTreeMap::from([(
+                        "refs/heads/main".to_string(),
+                        "d".repeat(40),
+                    )]),
                 },
             ],
             checkouts: vec![CheckoutObservationV1 {
@@ -5323,6 +5427,108 @@ mod tests {
         cross_project.attachment_candidates[0].project_id = project_id("beta");
         assert_eq!(
             cross_project.validate().unwrap_err().code(),
+            "error.project_catalog_inventory_invalid"
+        );
+
+        let mut coherent_splice = fixture_inventory();
+        let checkout_beta_digest = digest_path("/workspace/beta");
+        coherent_splice.checkouts.push(CheckoutObservationV1 {
+            observation_id: "checkout_beta".to_string(),
+            canonical_root_digest: checkout_beta_digest.clone(),
+            marker_state: CheckoutMarkerStateV1::MissingOrEmpty,
+        });
+        let checkout_lane = coherent_splice
+            .immutable_lane_evidence
+            .iter_mut()
+            .find(|lane| lane.lane_kind == ImmutableInventoryLaneKindV1::Checkouts)
+            .unwrap();
+        checkout_lane.row_count += 1;
+        if let InventorySourceStateV1::Present { byte_len, .. } = &mut checkout_lane.source_state {
+            *byte_len += 1;
+        }
+        for (source_id, source_kind, locator) in [
+            (
+                "source_checkout_root_beta",
+                MutableInventorySourceKindV1::CheckoutRoot,
+                MutableInventorySourceLocatorV1::CheckoutRoot {
+                    canonical_root_digest: checkout_beta_digest.clone(),
+                },
+            ),
+            (
+                "source_checkout_marker_beta",
+                MutableInventorySourceKindV1::CheckoutMarker,
+                MutableInventorySourceLocatorV1::CheckoutMarker {
+                    canonical_root_digest: checkout_beta_digest.clone(),
+                },
+            ),
+        ] {
+            let row_observation_ids = BTreeSet::from(["checkout_beta".to_string()]);
+            coherent_splice
+                .mutable_source_evidence
+                .push(MutableInventorySourceEvidenceV1 {
+                    source_id: source_id.to_string(),
+                    source_kind,
+                    source_locator: locator,
+                    state: InventorySourceStateV1::Present {
+                        fingerprint: hash(&format!("{source_id}_fingerprint")),
+                        content_hash: hash(&format!("{source_id}_content")),
+                        byte_len: 1,
+                    },
+                    row_set_sha256: mutable_source_row_set_hash(&row_observation_ids),
+                    row_observation_ids,
+                });
+        }
+        let beta_attachment_id = {
+            let beta_attachment = coherent_splice
+                .attachment_candidates
+                .iter_mut()
+                .find(|attachment| attachment.project_id == project_id("beta"))
+                .unwrap();
+            beta_attachment.checkout_observation_id = "checkout_beta".to_string();
+            beta_attachment.attachment_id.clone()
+        };
+        let beta_scope = scope("services/beta");
+        let beta_commit = "d".repeat(40);
+        let pin_full_ref = {
+            let pin = &mut coherent_splice.publisher_pins[0];
+            pin.project_id = project_id("beta");
+            pin.expected_scope = beta_scope.clone();
+            pin.candidate_attachment_ids = BTreeSet::from([beta_attachment_id]);
+            pin.resolved_commit = Some(beta_commit);
+            pin.resolved_scope = Some(beta_scope.clone());
+            pin.source_observation_ids = BTreeSet::from([
+                pin.observation_id.clone(),
+                "legacy_beta".to_string(),
+                "authority_beta".to_string(),
+                "attachment_beta".to_string(),
+                "checkout_beta".to_string(),
+                "git_beta".to_string(),
+            ]);
+            pin.full_ref.clone()
+        };
+        coherent_splice.publisher_ref_source_bytes = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "refs": [{
+                "scope": {
+                    "repo_id": beta_scope.repo_id(),
+                    "bbox_root_relpath": beta_scope.bbox_root_relpath()
+                },
+                "branch_ref": pin_full_ref
+            }]
+        }))
+        .unwrap();
+        coherent_splice.publisher_ref_source_hash =
+            Sha256ValueV1::digest(&coherent_splice.publisher_ref_source_bytes);
+        let publisher_source = coherent_splice
+            .mutable_source_evidence
+            .iter_mut()
+            .find(|source| source.source_kind == MutableInventorySourceKindV1::PublisherRefStore)
+            .unwrap();
+        if let InventorySourceStateV1::Present { content_hash, .. } = &mut publisher_source.state {
+            *content_hash = coherent_splice.publisher_ref_source_hash.clone();
+        }
+        assert_eq!(
+            coherent_splice.validate().unwrap_err().code(),
             "error.project_catalog_inventory_invalid"
         );
 

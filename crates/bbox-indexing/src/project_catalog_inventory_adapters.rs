@@ -770,12 +770,12 @@ fn observe_legacy_projects(
 fn derive_publisher_pins(
     source: &ExactDecodedSourceV1<PublisherRefInventoryV1>,
     legacy: &LegacyProjectsCaptureV1,
+    project_authority_scopes: &BTreeMap<ProjectId, PublishedScope>,
     lanes: &ImmutableInventoryLanesV1,
 ) -> AdapterResult<Vec<PublisherPinObservationV1>> {
     let mut rows = Vec::new();
     for publisher in &source.value.rows {
-        let owners = legacy
-            .published_scopes
+        let owners = project_authority_scopes
             .iter()
             .filter(|(_, scope)| **scope == publisher.scope)
             .map(|(project_id, _)| project_id)
@@ -828,23 +828,57 @@ fn derive_publisher_pins(
             .iter()
             .map(|attachment| attachment.attachment_id.clone())
             .collect::<BTreeSet<_>>();
+        let mut provenance_git_ids = BTreeSet::new();
         for attachment in candidates {
-            source_observation_ids.insert(attachment.observation_id.clone());
-            source_observation_ids.insert(attachment.checkout_observation_id.clone());
-        }
-        if resolved_commit.is_some() {
-            let git_rows = lanes
+            if !lanes
+                .checkouts
+                .rows
+                .iter()
+                .any(|checkout| checkout.observation_id == attachment.checkout_observation_id)
+            {
+                return Err(invalid_source(
+                    "publisher_candidate_checkout_evidence_missing",
+                ));
+            }
+            let matching_git = lanes
                 .git_metadata
                 .rows
                 .iter()
-                .filter(|row| row.project_id == project_id)
+                .filter(|row| {
+                    row.project_id == project_id
+                        && row.checkout_observation_id == attachment.checkout_observation_id
+                        && row.resolved_refs.get(&publisher.branch_ref) == resolved_commit.as_ref()
+                })
                 .collect::<Vec<_>>();
-            if git_rows.is_empty() {
+            if matching_git.len() != 1 {
+                return Err(invalid_source(
+                    "publisher_candidate_git_provenance_not_unique",
+                ));
+            }
+            source_observation_ids.insert(attachment.observation_id.clone());
+            source_observation_ids.insert(attachment.checkout_observation_id.clone());
+            provenance_git_ids.insert(matching_git[0].observation_id.clone());
+        }
+        if resolved_commit.is_some() {
+            if provenance_git_ids.is_empty() {
+                provenance_git_ids.extend(
+                    lanes
+                        .git_metadata
+                        .rows
+                        .iter()
+                        .filter(|row| {
+                            row.project_id == project_id
+                                && row.resolved_refs.get(&publisher.branch_ref)
+                                    == resolved_commit.as_ref()
+                        })
+                        .map(|row| row.observation_id.clone()),
+                );
+            }
+            if provenance_git_ids.is_empty() {
                 return Err(invalid_source("publisher_git_evidence_missing"));
             }
-            source_observation_ids
-                .extend(git_rows.into_iter().map(|row| row.observation_id.clone()));
         }
+        source_observation_ids.extend(provenance_git_ids);
         rows.push(PublisherPinObservationV1 {
             observation_id,
             project_id,
@@ -899,6 +933,7 @@ struct CodeSourceCaptureV1 {
 #[derive(Debug, Clone)]
 struct CodeSourceInventoryCaptureV1 {
     sources: Vec<CodeSourceCaptureV1>,
+    project_authority_scopes: BTreeMap<ProjectId, PublishedScope>,
     retained_owner_resolutions: Vec<RetainedGenerationOwnerResolutionObservationV1>,
     retained_owner_source_evidence: Vec<MutableInventorySourceEvidenceV1>,
 }
@@ -933,7 +968,7 @@ fn observe_code_sources(
             rows
         }
     };
-    let mut retained_owner_scopes = project_scopes.clone();
+    let mut project_authority_scopes = project_scopes.clone();
     for activation in &snapshot.owner.inventory.activations {
         let selection = effective_by_project
             .get(&activation.project_id)
@@ -955,20 +990,18 @@ fn observe_code_sources(
         {
             return Err(invalid_source("active_descriptor_committed_scope_mismatch"));
         }
-        if missing_checkout_projects.contains(&activation.project_id) {
-            match retained_owner_scopes.get(&activation.project_id) {
-                Some(scope) if scope != &selection.published_scope => {
-                    return Err(invalid_source(
-                        "active_descriptor_retained_owner_scope_mismatch",
-                    ));
-                }
-                Some(_) => {}
-                None => {
-                    retained_owner_scopes.insert(
-                        activation.project_id.clone(),
-                        selection.published_scope.clone(),
-                    );
-                }
+        match project_authority_scopes.get(&activation.project_id) {
+            Some(scope) if scope != &selection.published_scope => {
+                return Err(invalid_source(
+                    "active_descriptor_retained_owner_scope_mismatch",
+                ));
+            }
+            Some(_) => {}
+            None => {
+                project_authority_scopes.insert(
+                    activation.project_id.clone(),
+                    selection.published_scope.clone(),
+                );
             }
         }
         insert_generation_owner(
@@ -995,7 +1028,7 @@ fn observe_code_sources(
         if owner_by_generation.contains_key(&generation.generation_id) {
             continue;
         }
-        let candidates = retained_owner_scopes
+        let candidates = project_authority_scopes
             .iter()
             .filter(|(_, scope)| **scope == generation.published_scope)
             .map(|(project_id, _)| project_id)
@@ -1327,6 +1360,7 @@ fn observe_code_sources(
     retained_owner_source_evidence.sort_by(|left, right| left.source_id.cmp(&right.source_id));
     Ok(CodeSourceInventoryCaptureV1 {
         sources: captures,
+        project_authority_scopes,
         retained_owner_resolutions,
         retained_owner_source_evidence,
     })
@@ -1860,7 +1894,12 @@ fn capture_inventory_locked(
     let mut lanes = capture_required_owner_lanes(&checkout_observations)?;
     sort_lane_rows(&mut lanes);
     validate_lane_kinds(&lanes)?;
-    let publisher_pins = derive_publisher_pins(publisher_source, &legacy, &lanes)?;
+    let publisher_pins = derive_publisher_pins(
+        publisher_source,
+        &legacy,
+        &code_capture.project_authority_scopes,
+        &lanes,
+    )?;
     let publisher_row_ids = publisher_pins
         .iter()
         .map(|row| row.observation_id.clone())
@@ -2414,6 +2453,30 @@ mod tests {
             .to_string(),
             "error.project_catalog_inventory_adapter_source: active_descriptor_committed_scope_mismatch"
         );
+        let present_checkout_capture =
+            observe_code_sources(&snapshot, &BTreeMap::new(), &BTreeSet::new()).unwrap();
+        assert_eq!(
+            present_checkout_capture
+                .project_authority_scopes
+                .get(&project_id),
+            Some(&scope)
+        );
+        let retained_with_present_checkout = present_checkout_capture
+            .sources
+            .iter()
+            .find(|source| source.observation.project_id == project_id)
+            .and_then(|source| {
+                source
+                    .observation
+                    .generations
+                    .iter()
+                    .find(|generation| generation.generation_id == retained_generation_id)
+            })
+            .unwrap();
+        assert_eq!(
+            retained_with_present_checkout.role,
+            CollectedGenerationRoleV1::Retained
+        );
         let capture = observe_code_sources(
             &snapshot,
             &BTreeMap::new(),
@@ -2522,10 +2585,19 @@ mod tests {
             &BTreeSet::new(),
         )
         .unwrap();
+        let retained_collision_source = capture
+            .sources
+            .iter()
+            .find(|source| source.observation.project_id == retained_project_id)
+            .unwrap();
+        let retained_collision = retained_collision_source
+            .observation
+            .quarantine
+            .iter()
+            .find(|generation| generation.generation_id == active_generation_id)
+            .unwrap();
         assert_eq!(
-            capture.sources[0].observation.quarantine[0]
-                .collision_lifecycle
-                .selector_evidence,
+            retained_collision.collision_lifecycle.selector_evidence,
             DurableSelectorEvidenceV1::NoDurableSelector
         );
     }
