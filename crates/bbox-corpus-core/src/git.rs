@@ -844,9 +844,10 @@ fn run_hardened_repository_path_query(
 
 #[cfg(unix)]
 fn open_stable_repository(discovered: HardenedWorktreeRoot) -> Result<StableRepositoryAuthority> {
+    let worktree = open_stable_directory(&discovered.root, "worktree root")?;
     Ok(StableRepositoryAuthority {
         root: discovered.root,
-        worktree: open_stable_directory(&discovered.root, "worktree root")?,
+        worktree,
         git_dir: open_stable_directory(&discovered.git_dir, "Git directory")?,
         common_dir: open_stable_directory(&discovered.common_dir, "common Git directory")?,
         objects: open_stable_directory(&discovered.objects, "Git object directory")?,
