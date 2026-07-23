@@ -571,6 +571,7 @@ name = "bbox-indexing"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bbox-chunker",
  "bbox-code-source",
  "bbox-code-source-store",
  "bbox-config",
@@ -578,6 +579,7 @@ dependencies = [
  "bbox-corpus-index",
  "bbox-edge-index",
  "bbox-edge-sidecar",
+ "bbox-gaps",
  "bbox-knowledge",
  "bbox-stores",
  "bbox-threads",
