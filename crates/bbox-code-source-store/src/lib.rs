@@ -894,6 +894,7 @@ impl CanonicalGenerationSetCommitment {
         }
     }
 
+    #[cfg(test)]
     fn add(&mut self, row: &MigrationLegacyGenerationEvidenceV1) -> Result<()> {
         self.add_fields(
             &row.published_scope,
@@ -1414,10 +1415,7 @@ fn stream_verify_generation_manifest_for_migration(
     let mut previous_path = None::<String>;
     let mut file_count = 0_u64;
     let mut logical_bytes = 0_u64;
-    let max_line_bytes = (64 * 1024).min(limits.max_migration_survivor_bytes);
-    if max_line_bytes == 0 && manifest_len > 0 {
-        bail!("generation manifest record exceeds its byte limit");
-    }
+    let max_line_bytes = 64 * 1024;
     loop {
         let read = read_bounded_manifest_line(&mut reader, &mut line, max_line_bytes)?;
         if read == 0 {
@@ -1506,7 +1504,7 @@ fn walk_legacy_generation_rows(
                 let metadata_bytes = directory
                     .read_regular(
                         "metadata.json",
-                        MAX_STORED_GENERATION_RECORD_BYTES.min(limits.max_migration_survivor_bytes),
+                        MAX_STORED_GENERATION_RECORD_BYTES,
                         "legacy generation metadata",
                     )?
                     .ok_or_else(|| anyhow!("legacy generation metadata is missing"))?;
@@ -1573,9 +1571,6 @@ fn insert_legacy_retention_candidate(
         return Ok(());
     }
     let added_bytes = candidate.evidence_bytes()?;
-    if added_bytes > limits.max_migration_survivor_bytes {
-        bail!("retained legacy generation row exceeds its configured survivor byte limit");
-    }
     let added_materialized = usize::from(candidate.summary.is_some());
     let candidates = candidates_by_scope.entry(scope).or_default();
     let compare = |left: &LegacyRetentionCandidate, right: &LegacyRetentionCandidate| {
@@ -1589,6 +1584,9 @@ fn insert_legacy_retention_candidate(
         .unwrap_or_else(|position| position);
     if position >= retained_generations {
         return Ok(());
+    }
+    if added_bytes > limits.max_migration_survivor_bytes {
+        bail!("retained legacy generation row exceeds its configured survivor byte limit");
     }
     let removed = (candidates.len() == retained_generations).then(|| {
         candidates
@@ -2245,7 +2243,7 @@ pub fn enumerate_current_migration_inventory_for_scopes_locked(
                 let metadata_bytes = directory
                     .read_regular(
                         "metadata.json",
-                        MAX_STORED_GENERATION_RECORD_BYTES.min(limits.max_migration_survivor_bytes),
+                        MAX_STORED_GENERATION_RECORD_BYTES,
                         "current generation metadata",
                     )?
                     .ok_or_else(|| anyhow!("current generation metadata is missing"))?;
@@ -4024,47 +4022,23 @@ impl CodeSourceStore {
     fn collision_retirement_pending_records_for_gc(
         &self,
     ) -> Result<Vec<CollisionRetirementLifecycleV1>> {
-        let directory = self.root().join("collision-retirements");
-        let Some(held_directory) = NofollowDirectory::open_existing(&directory)? else {
-            return Ok(Vec::new());
-        };
-        let entries = match fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(error) => return Err(error.into()),
-        };
         let mut records = Vec::new();
-        for entry in entries {
-            let entry = entry?;
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                bail!("collision retirement directory contains a non-utf8 entry");
-            };
-            if Path::new(&name)
-                .extension()
-                .and_then(|value| value.to_str())
-                != Some("json")
-            {
-                bail!("collision retirement directory contains an unexpected entry");
-            }
-            let bytes = held_directory
-                .read_regular(
-                    &name,
-                    MAX_COLLISION_RETIREMENT_RECORD_BYTES,
-                    "collision retirement pending",
-                )?
-                .ok_or_else(|| anyhow!("collision retirement pending disappeared"))?;
-            let record = decode_collision_retirement_pending_for_migration(&bytes)?;
-            let expected_path = self.paths.collision_retirement_pending(&record.project_id);
-            let expected_name = expected_path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .expect("code-owned collision retirement path has a utf8 filename");
-            if name != expected_name {
-                bail!("collision retirement pending path does not match project id");
-            }
-            records.push(record);
+        let mut commitment = CanonicalCollisionLifecycleCommitment::new();
+        walk_collision_lifecycle_records(
+            &self.paths,
+            "collision retirement lifecycle",
+            |project_id, bytes, record| {
+                commitment.add(&project_id, &bytes)?;
+                if record.state != CollisionRetirementLifecycleStateV1::Completed {
+                    records.push(record);
+                }
+                Ok(())
+            },
+        )?;
+        let (count, sha256) = commitment.finish();
+        if count > 0 {
+            validate_sha256(&sha256)?;
         }
-        held_directory.ensure_still_current()?;
-        records.sort_by(|left, right| left.project_id.cmp(&right.project_id));
         Ok(records)
     }
 
@@ -5470,15 +5444,13 @@ mod tests {
         let root = directory.path().canonicalize().unwrap().join("source");
         let paths = CodeSourceStorePaths::new(root).unwrap();
         fs::create_dir_all(paths.root()).unwrap();
-        fs::write(
-            paths.anchor(),
+        let effective =
             encode_migration_effective_source_manifest_v1(&MigrationEffectiveSourceManifestV1 {
                 version: 1,
                 selections: Vec::new(),
             })
-            .unwrap(),
-        )
-        .unwrap();
+            .unwrap();
+        fs::write(paths.anchor(), &effective).unwrap();
         let mut scope = None;
         for index in 0..4 {
             let legacy = write_legacy_generation_fixture(
@@ -5503,6 +5475,7 @@ mod tests {
         }
         let limits = StoreLimits {
             max_migration_survivor_rows: 1,
+            max_migration_survivor_bytes: effective.len(),
             ..StoreLimits::default()
         };
         let guard = paths.lock_migration_inventory().unwrap();
@@ -6768,6 +6741,48 @@ mod tests {
     }
 
     #[test]
+    fn gc_streams_completed_collision_history_without_protecting_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let mut limits = StoreLimits::default();
+        limits.unreferenced_blob_grace_hours = 0;
+        let store = CodeSourceStore::open(root.join("code-sources"), limits).unwrap();
+        let lifecycle_directory = store.root().join("collision-retirements");
+        fs::create_dir_all(&lifecycle_directory).unwrap();
+        for index in 0..(RADIX_BUCKET_MAX_NAMES + 8) {
+            let project_id = ProjectId::parse(format!("completed-gc-{index:04}")).unwrap();
+            let generation_id = format!("{:064x}", index + 1);
+            let lifecycle = CollisionRetirementLifecycleV1 {
+                version: STORE_VERSION,
+                state: CollisionRetirementLifecycleStateV1::Completed,
+                project_id: project_id.clone(),
+                former_scope: PublishedScope::try_new(format!("gc-repo-{index:04}"), ".").unwrap(),
+                generation_id: generation_id.clone(),
+                selector: materialized_selector(project_id.as_str(), &generation_id),
+                snapshot_id: format!("collected-{:032x}", index + 1),
+                manifest_sha256: "b".repeat(64),
+                inventory_hash: "c".repeat(64),
+                plan_hash: "d".repeat(64),
+            };
+            fs::write(
+                store.paths.collision_retirement_pending(&project_id),
+                encode_collision_retirement_pending_for_migration(&lifecycle).unwrap(),
+            )
+            .unwrap();
+        }
+        let orphan_bytes = b"completed history orphan";
+        let orphan_hash = sha256_hex(orphan_bytes);
+        let orphan_path = store.blob_path(&orphan_hash);
+        fs::create_dir_all(orphan_path.parent().unwrap()).unwrap();
+        fs::write(&orphan_path, orphan_bytes).unwrap();
+
+        let stats = store.gc_blobs().unwrap();
+
+        assert!(!orphan_path.exists());
+        assert_eq!(stats.reclaimed_blobs, 1);
+    }
+
+    #[test]
     fn post_migration_gc_classifies_mixed_v1_v2_generations_without_reviving_history() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
@@ -6782,13 +6797,14 @@ mod tests {
             content_sha256: protected_hash.clone(),
             size: protected_bytes.len() as u64,
         }];
-        let descriptor = descriptor(&entries);
-        let legacy = stored_generation_v1("host-current", descriptor.clone());
+        let current_descriptor = descriptor(&entries);
+        let legacy = stored_generation_v1("host-current", current_descriptor.clone());
         let current =
-            StoredGenerationV2::from_v1_for_migration(legacy, descriptor.scope.clone()).unwrap();
+            StoredGenerationV2::from_v1_for_migration(legacy, current_descriptor.scope.clone())
+                .unwrap();
         let generation_directory = store
             .paths
-            .generation_metadata(&descriptor.scope, &current.generation_id)
+            .generation_metadata(&current_descriptor.scope, &current.generation_id)
             .unwrap();
         fs::create_dir_all(generation_directory.parent().unwrap()).unwrap();
         fs::write(
@@ -6799,7 +6815,7 @@ mod tests {
         fs::write(
             store
                 .paths
-                .generation_manifest(&descriptor.scope, &current.generation_id)
+                .generation_manifest(&current_descriptor.scope, &current.generation_id)
                 .unwrap(),
             manifest_bytes(&entries),
         )
@@ -6820,7 +6836,7 @@ mod tests {
                 version: 1,
                 selections: vec![MigrationEffectiveSourceSelectionV1 {
                     project_id: activation.project_id.clone(),
-                    published_scope: descriptor.scope.clone(),
+                    published_scope: current_descriptor.scope.clone(),
                     generation_id: current.generation_id.clone(),
                     selector: activation.selector.clone(),
                 }],
@@ -6867,7 +6883,7 @@ mod tests {
         fs::write(&inert_path, inert_bytes).unwrap();
 
         let stats = store
-            .gc_blobs_for_scopes(&BTreeSet::from([descriptor.scope]))
+            .gc_blobs_for_scopes(&BTreeSet::from([current_descriptor.scope]))
             .unwrap();
 
         assert!(protected_path.is_file());
