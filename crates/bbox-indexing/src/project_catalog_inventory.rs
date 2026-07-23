@@ -2878,7 +2878,7 @@ struct CanonicalPlanHashInputV1<'a> {
     post_image: CanonicalSemanticPostImageV1<'a>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct CanonicalSemanticPostImageV1<'a> {
     version: u32,
     transaction_id: &'a ProjectCatalogTransactionId,
