@@ -5332,22 +5332,29 @@ mod tests {
             .find(|project| project.record.project_id == project_id.as_str())
             .unwrap()
             .committed_scope = None;
-        let generation = inventory
+        inventory
             .code_sources
             .iter_mut()
             .find(|source| source.project_id == project_id)
             .unwrap()
             .generations
             .first_mut()
-            .unwrap();
-
-        generation.checkout_missing = false;
+            .unwrap()
+            .checkout_missing = false;
         assert_eq!(
             project_authority_scope(&inventory, &project_id).unwrap(),
             None
         );
 
-        generation.checkout_missing = true;
+        inventory
+            .code_sources
+            .iter_mut()
+            .find(|source| source.project_id == project_id)
+            .unwrap()
+            .generations
+            .first_mut()
+            .unwrap()
+            .checkout_missing = true;
         assert_eq!(
             project_authority_scope(&inventory, &project_id).unwrap(),
             Some(&scope("services/alpha"))
