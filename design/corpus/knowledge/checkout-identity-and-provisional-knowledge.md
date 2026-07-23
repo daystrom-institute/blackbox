@@ -496,6 +496,16 @@ reads and merge-base calculation therefore add the elected publisher's object
 directory as a read-only alternate for the command. This makes the pinned
 publisher commit readable without fetching into or mutating the checkout.
 
+The durable project-catalog design supersedes that alternate rule after
+accepted publication generations land. A verified accepted generation remains
+published truth after publisher detach and supplies accepted commit P plus the
+canonical relative-filename knowledge and gap manifests. It supplies neither
+Git ancestry nor a synthetic merge base. Each checkout may recompute only when
+its own object database contains P and proves `B = merge_base(H, P)`. It never
+borrows an unrelated attachment silently. A checkout that lacks P is
+`overlay_baseline_unavailable`; this affects only its provisional overlay, not
+the accepted published generation.
+
 For the publisher checkout on the pinned branch, `H == P` and `B == P`, so the
 same algorithm yields only its uncommitted changes. For a checkout strictly
 behind, `B == H` and its unchanged files emit nothing, so current published
@@ -547,6 +557,15 @@ hard error. An unscoped aggregate omits that scope and returns structured
 `degraded.scopes` diagnostics while continuing to serve global and healthy
 scopes. No failure path falls back to working-tree-as-published or chooses a
 publisher by scan order.
+
+That whole-scope rule applies to the pre-catalog publisher model. Once a
+verified accepted generation exists, publisher absence blocks advance and
+alternate-object assistance only. `published` continues from the accepted
+generation. An `own` request whose checkout cannot prove the overlay baseline
+returns `provisional_overlay_unavailable`; `all` omits that checkout and reports
+it in `degraded.overlays` while preserving published and valid peer rows. A
+previous valid overlay remains eligible only while accepted commit, attachment
+lease, checkout HEAD, and working-tree fingerprint revalidate unchanged.
 
 ### 4.3 Visibility: hybrid, session-authoritative (closes round 2, finding 6)
 

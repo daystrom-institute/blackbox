@@ -173,6 +173,7 @@ RecordedRepoAuthority(String)
 RepoBootstrapHint(String)
 CommitNamespace(String)
 RepoHistoryId(String)
+ScopeMigrationId(String)
 
 CorpusProject {
     project_id: ProjectId,
@@ -197,6 +198,7 @@ RepoHistoryRecord {
 
 RepoHistoryAuthority =
     Recorded(RecordedRepoAuthority)
+  | LocalProject(ProjectId)
   | LegacyNamespace(CommitNamespace)
 
 AmbiguousNamespaceRecord {
@@ -204,7 +206,31 @@ AmbiguousNamespaceRecord {
     candidate_repo_history_ids: Vec<RepoHistoryId>,
     status: Quarantined,
 }
+
+CatalogOriginV2 =
+    FreshV2
+  | MigratedV1 { transaction_id }
+
+CatalogSnapshotV2 {
+    version: 2,
+    epoch,
+    origin: CatalogOriginV2,
+    projects,
+    repo_histories,
+    ambiguous_namespaces,
+    scope_migrations: BTreeMap<ScopeMigrationId, ScopeMigrationRecord>,
+}
 ```
+
+`ScopeMigrationRecord` is the path-free record defined in section 7.2. It is
+catalog data, not a sidecar, so the logical scope change and its compatibility
+bridge share the regular catalog/attachment pair transaction. A fresh v2
+initializer writes `FreshV2`. The v1 importer writes
+`MigratedV1 { transaction_id }`; strict open then requires a committed
+migration marker with the same transaction id. The complete plan hash remains
+in the marker and journal, avoiding a hash cycle through the catalog
+post-image. Marker loss is therefore distinguishable from a store that was
+born at v2.
 
 `ProjectId::parse` accepts the already-persisted legacy ids plus new ids under
 one bounded, path-safe contract: 1 through 96 ASCII alphanumeric, `_`, `-`, or
@@ -246,10 +272,16 @@ only after the same-repo proof below. Existing refs are not rewritten. Lookup
 during the compatibility epoch searches primary plus compatibility namespaces,
 while all new commit materialization uses the primary. The catalog and this
 mapping move together, so another host never re-derives the choice. A
-`LegacyLocal` project created under v2 has no history record and creates no
-commit documents. Historical commit documents imported for an old LegacyLocal
-record remain queryable through its legacy-authority record but are not
-refreshed until explicit scope promotion.
+`LegacyLocal` project created under v2 receives a server-minted local history
+record whose authority is `LocalProject(project_id)` and whose primary
+namespace is an independent random `CommitNamespace`. It may ingest
+attachment-backed local Git history, preserving the existing registered-Git
+capability, but that record cannot authorize publishing, producer grants,
+cross-host repository identity, or another project. Historical commit
+documents imported for an old LegacyLocal record remain queryable through its
+legacy-authority record. Promotion records proved repository authority while
+preserving any safely materialized local or legacy namespace as the primary or
+a compatibility namespace under the same rules.
 
 A colliding namespace that cannot be attributed safely is not an established
 primary for either repo. It lives in `AmbiguousNamespaceRecord`, is excluded
@@ -292,6 +324,16 @@ CheckoutAttachment {
     status: Attached | Detached,
     attached_at: String,
 }
+
+AttachmentSnapshotV1 {
+    version: 1,
+    epoch,
+    attachments,
+    scope_migration_proofs:
+        BTreeMap<ScopeMigrationId, ScopeMigrationAttachmentProof>,
+    legacy_path_bindings:
+        BTreeMap<LegacyPathBindingId, LegacyPathLedgerEntry>,
+}
 ```
 
 One checkout may carry multiple monorepo attachments. The key is
@@ -310,6 +352,17 @@ The existing `CheckoutRegistry` remains the recoverable provisional-overlay
 discovery census. Its corrupt-file behavior may still degrade to an empty
 index. It may gain `project_id` and `attachment_id` references, but it is not
 the authoritative attachment store and cannot authorize filesystem access.
+
+The path-bearing compatibility ledger from section 7.3 lives in this host-local
+strict snapshot, not the path-free catalog. A `LegacyPathLedgerEntry` is mapped,
+unscoped, or quarantined and retains its bounded historical path,
+source-store/row identity, relationship, and inventory epoch. Attachment
+relocation appends a binding in the same pair transaction that updates the
+attachment and any path-free catalog `ScopeMigrationRecord`.
+An attachment-proved scope migration also stores its attachment id, checkout
+id, revalidated old/new scope evidence, and proof timestamp here as
+`ScopeMigrationAttachmentProof`. The catalog record stores only the logical
+provenance class and never a host-local attachment id.
 
 ### 5.3 Compatibility views
 
@@ -351,6 +404,15 @@ corrupt JSON, invalid ids, duplicate scope or alias, dangling attachment, and
 scope mismatch fail closed at open, before server routes bind. Only the separate
 provisional checkout census is recoverable-by-recompute.
 
+The short catalog mutation lock is the existing canonical
+`projects.json.lock` derived by `with_store_lock(projects_path)`. The bridge
+`StorePersister`, v2 pair owner, preflight capture, and migration coordinator
+all honor that one lock. No second lock file guards the same logical store.
+The process-lifetime migration lock is acquired first. Auxiliary participant
+locks follow `projects.json.lock` in deterministic role/path order. Immutable
+inventory snapshots plus apply-time byte-hash revalidation protect stores that
+cannot share this lock.
+
 ### 6.2 Two-file transaction protocol
 
 Registration and any operation that changes both stores use one locked,
@@ -375,6 +437,39 @@ injection covers every write, fsync, rename, verify, and journal transition.
 Catalog-only actions use the same machinery with an unchanged attachment
 post-image. Attachment-only actions use an unchanged catalog post-image. This
 keeps one recovery protocol and one visible epoch.
+Every regular transaction preserves `CatalogOriginV2` byte-for-byte. Only the
+fresh initializer or v1 importer sets it, so later administration cannot erase
+the marker requirement.
+
+Migration uses the same transaction owner with a closed, role-bounded
+participant plan rather than invoking an independently committing pair
+transaction. Catalog and attachment post-images are mandatory participants.
+The migration plan additionally includes the complete effective
+source-manifest post-image, versioned scope-bearing activation and retained
+generation metadata post-images, typed collision-retirement records and losing
+legacy activation removals, accepted-publication pointer post-images, and the
+migration marker. Every mutable participant records:
+
+```text
+role
+old: Absent | { hash, backup_name }
+new: Absent | { hash, stage_name }
+```
+
+Roles derive their targets in code; the journal never accepts arbitrary target
+paths. Immutable G1 knowledge/gap generations and quarantined collected
+generations are transaction assets named by hash. A prepared journal and a
+committed marker pin every asset and backup against GC.
+
+The migration owner stages every asset and mutable post-image, fsyncs all
+backups and stages, writes one prepared journal, installs every participant,
+verifies every hash and cross-store invariant, then marks that journal
+committed. Recovery classifies every participant together as old, new, other,
+or missing. It completes forward only when every new image is installed or
+available from a verified stage. It rolls back only when every old image is
+installed or available from a verified backup. `old = Absent` rollback removes
+only an exact matching transaction-created image. Any incomplete set fails
+closed without mixing epochs.
 
 ### 6.3 Version-1 import and rollout command
 
@@ -405,11 +500,38 @@ Before import, take a read-only inventory of:
 - every old `ProjectRecord` and its current or missing path;
 - committed recorded scope when safely readable;
 - active and retained code-source activations and immutable descriptors;
+- every `PublisherRefStore` pin, its exact source bytes, full ref, current
+  unique publisher candidates, resolved commit, and scope proof;
 - Tantivy/vector project ids and entity refs;
 - edge manifests and workspace selectors;
 - Git metadata and legacy commit namespaces;
-- artifacts, provenance targets, and durable project-scoped store references;
+- artifacts and provenance targets;
+- one typed observation for every durable project-scoped store row, including
+  store kind, stable row id, and the bounded literal project/path selector
+  required for inventory-time deepest-root classification; and
 - materialized aliases and registration timestamps.
+
+Literal legacy selectors remain inside the immutable inventory and strict
+host-local attachment post-image. Default reports expose only observation id,
+store kind, relationship/status, and a domain-separated path digest. The local
+CLI may display a selected ambiguous row or write an explicit
+`--include-local-paths` review artifact with owner-only permissions and a
+sensitive marker. That artifact is never a public fixture or commit candidate.
+Apply reruns the typed inventory and never performs a second untracked live
+store read to build the ledger.
+
+Preflight also inventories `.bbox/local/checkout-id` once per canonical
+checkout root as valid, missing-or-empty, malformed, unreadable, or symlinked.
+For each eligible missing-or-empty root the persisted preflight report contains
+one planned strong-random checkout id. The report, resolution, planned identity
+actions, and all predicted post-images are bound by one plan hash. Apply writes
+that plan to the prepared migration journal before installing a missing marker
+through no-follow create-if-absent semantics. An already matching id resumes;
+any different id or other marker transition refuses. A successfully installed
+marker is monotonic v1-compatible host identity and is not deleted on rollback.
+Malformed, unreadable, or symlinked markers require attachment exclusion or
+keep migration refused. Synthetic path-derived `v1-root` ids never enter the
+authoritative attachment snapshot.
 
 Preflight groups old records into one repo-history record only with same-repo
 evidence independent of the weak namespace: identical committed recorded repo
@@ -477,18 +599,68 @@ attachment-backed local generation succeeds or the project is explicitly
 retired. Without the disposition, apply refuses. The migration report lists
 the exact search, graph, vector, and source generations made unavailable.
 
-The original version-1 bytes and their checksum are retained until the
-catalog, attachments, index materialization, and durable-store backfills have
-passed the closeout gate. A migration marker names the complete inventory,
-post-image hashes, and schema epoch. Startup with a torn migration recovers or
-rolls back before exposing either registry.
+The staged complete active-manifest post-image removes every losing workspace
+row in the same migration transaction that installs the catalog. This is the
+authority cut: no search selector or graph snapshot for the loser remains
+effective at first v2 bind. Physical Tantivy documents, vector partitions, and
+edge snapshots may remain pinned for idempotent retirement, but deferring
+physical deletion never defers the selection cut.
 
-The supported rollout is: deploy the v1-compatible bridge daemon under the
-normal shared-service approval process, run preflight, resolve every refusal,
-stop that daemon, run apply while holding the exclusive lifetime lock, then
-start v2. Tests cover a live bridge preventing apply, refused preflight, a
-hash-bound resolution, successful retry, and v2 startup refusal when apply was
+For every surviving active or retained collected generation, migration writes
+strict version-2 metadata with an explicit `PublishedScope`. Legacy
+`StoredGeneration.descriptor.scope` and the immutable manifest are the only
+backfill evidence: descriptor, manifest, legacy activation, effective
+selector, and the migrated catalog project must agree exactly. Any missing or
+ambiguous join refuses. `ActivationRecordV2.published_scope` and
+`StoredGenerationV2.published_scope` have no serde default and must equal the
+immutable descriptor scope. Losing collision records preserve their former
+scope under the typed quarantine instead of producing an active v2 record.
+Thus first v2 startup validates already-rewritten scope-bearing metadata; it
+never guesses scope from project id.
+An active or retained legacy generation whose descriptor is missing or corrupt
+keeps preflight refused. No resolution may invent its scope; the operator must
+repair or retire it with the bridge-compatible v1 tooling and rerun preflight.
+
+Every legacy publisher pin has exactly one migration disposition. A uniquely
+resolved old publisher produces `SeedG1` with project id, attachment id,
+expected scope, full ref, accepted commit, generation id, canonical knowledge
+and gap file manifests, payload hashes, and pointer hash. Ambiguous or missing
+candidates require a hash-bound resolution that selects one inventoried
+attachment or records `NoPublishedContentAcknowledged` with a bounded reason.
+A resolution cannot invent a ref, scope, commit, or attachment. Apply writes
+and verifies immutable G1 assets and installs accepted pointers through the
+same migration transaction. Exact `publisher-refs.json` bytes and checksum are
+retained as rollback input, named by the journal and marker, and never
+consulted by the v2 runtime.
+
+The original version-1 bytes, `publisher-refs.json`, and their checksums are
+retained until the catalog, attachments, index materialization,
+accepted-publication state, and durable-store backfills have passed the final
+parity and rollback closeout gate. The migration marker is a staged mutable
+participant, not an after-commit receipt. It names the transaction id and plan
+hash, complete inventory, every mutable post-image, every immutable G1 and
+quarantine asset, retained backups, and schema epoch. Startup runs migration
+recovery before opening any participant. A v2 catalog with neither a valid
+marker nor a recoverable prepared journal fails with
+`error.project_catalog_migration_incomplete`; it never infers completion from
+valid catalog bytes alone. External storage GC excludes all prepared-journal,
+marker, stage, backup, G1, and quarantine roots.
+
+Phase 1 through Phase 5 run this exact protocol only against isolated copied
+state. The supported live rollout occurs in Phase 6: deploy the v1-compatible
+bridge under the normal shared-service approval process, run preflight, resolve
+every refusal, stop that daemon, run apply while holding the exclusive lifetime
+lock, then start the complete v2 runtime. Tests cover a live bridge preventing
+apply, refused preflight, hash-bound resolution, successful retry, every
+auxiliary participant crash boundary, and v2 startup refusal when apply was
 skipped.
+
+The configured live service remains on the last deployed v1-compatible bridge
+binary throughout Phases 2 through 5. Those phase binaries are exercised only
+against isolated v2 state and are not installed over the live bridge. Phase 6
+is the one approved service replacement: apply completes under the stopped
+bridge's exclusive lock, then the complete v2 binary starts and refuses any
+remaining v1 bytes.
 
 ## 7. Project selection, administration, and path-bound state
 
@@ -533,6 +705,18 @@ Add explicit operator surfaces after list/get deduplication:
 
 Producer traffic cannot invoke these surfaces.
 
+The daemon does not authenticate a human operator separately from an agent MCP
+client. Tool-surface filtering is visibility control, not operator
+authentication. Attachment-backed operations with live repository proof may
+remain MCP-callable only with the expected catalog epoch, required explicit
+authority acknowledgement, and a bounded audit reason. Agents may pass
+operator-supplied acknowledgements but may not default or infer them.
+Proofless authority operations, including unattached import or scope migration,
+conflict-resolution apply, and whole-store migration apply, are local
+`blackbox project-catalog` CLI operations protected by the lifetime lock.
+Adding authenticated operator roles is a repository-wide transport change, not
+an authority property this catalog design pretends already exists.
+
 `bbox_project_register` remains a compatibility composite: resolve committed
 scope, find or create the catalog project according to operator-local register
 authority, then attach the path in one transaction. For a new published scope,
@@ -547,10 +731,12 @@ id and proposed scope. It does not create a second project or move the
 attachment. `bbox_project_promote` requires that project id, revalidates the
 explicit promotion attachment and committed authority, proves no published
 project already owns the scope, then changes the same catalog record to
-`Published(scope)` in the journaled transaction. The audit stores old kind,
-new scope, operator invocation, and catalog epoch. If another project already
-owns the scope, promotion refuses and points to the offline compatibility
-resolution workflow; it never merges automatically.
+`Published(scope)` in the journaled transaction. It inserts the typed
+`promotion` `ScopeMigrationRecord` plus matching attachment proof in the same
+pair transaction; that record stores old kind, new scope, operator invocation,
+and catalog epoch. If another project already owns the scope, promotion refuses
+and points to the offline compatibility resolution workflow; it never merges
+automatically.
 
 When the project has multiple active attachments, promotion validates every
 one with readable committed authority and requires the exact same proposed
@@ -560,18 +746,18 @@ not allowed to overrule siblings.
 
 Promotion preserves every project-id-keyed store and active local
 materialization. It creates a recorded repo-history record by section 5.1 if
-none exists. If the project references a `LegacyNamespace` history record,
-promotion changes that record's authority to `Recorded` without changing its
-stable `RepoHistoryId`, primary namespace, compatibility namespaces, or commit
-refs. Every sibling project referencing the same id continues to reference the
-same record. The transaction verifies that all siblings with readable
-authority name the same repo; a conflicting sibling blocks promotion and
-requires explicit history-record split/resolution. A sibling that remains
-LegacyLocal may read retained history but cannot refresh it until its own scope
-promotion. In-flight local staging pins the old catalog epoch, loses its publish
-compare-and-swap after promotion, and retries against the published identity.
-Init and eject report promotion as the required next operator action after the
-new authority is committed.
+none exists. If the project references a `LegacyNamespace` or `LocalProject`
+history record, promotion changes that record's authority to `Recorded`
+without changing its stable `RepoHistoryId`, primary namespace, compatibility
+namespaces, or commit refs. Every sibling project referencing the same id
+continues to reference the same record. The transaction verifies that all
+siblings with readable authority name the same repo; a conflicting sibling
+blocks promotion and requires explicit history-record split/resolution. A
+sibling that remains LegacyLocal may read retained history but cannot publish
+or refresh through the promoted sibling's authority. In-flight local staging
+pins the old catalog epoch, loses its publish compare-and-swap after promotion,
+and retries against the published identity. Init and eject report promotion as
+the required next operator action after the new authority is committed.
 
 `bbox_project_rename` becomes attachment relocation. It verifies the same
 checkout and same `PublishedScope` after the move before committing the new
@@ -607,19 +793,22 @@ either channel additionally requires an explicit
 it. The target scope must be unowned. If it is already owned, the command
 refuses and points to the offline survivor/compatibility workflow.
 
-The project-store transaction atomically changes the catalog scope, revalidates
-and updates the selected attachment when present, appends applicable path
-bindings, and records:
+The regular catalog/attachment pair transaction atomically changes the catalog
+scope, revalidates and updates the selected attachment when present, appends
+applicable host-local path bindings inside `AttachmentSnapshotV1`, and inserts
+the path-free migration record into `CatalogSnapshotV2.scope_migrations`:
 
 ```text
 ScopeMigrationRecord {
+    scope_migration_id,
     project_id,
-    attachment_id?,
+    catalog_epoch,
     authority_provenance,
+    operator_invocation,
     operator_reason?,
-    old_scope,
-    new_scope,
-    kind,
+    old_scope: ProjectScope,
+    new_scope: ProjectScope,
+    kind: promotion | relpath_move | repo_authority_change,
     migrated_at,
     code_bridge_generation?,
     publication_bridge_generation?,
@@ -627,10 +816,27 @@ ScopeMigrationRecord {
 }
 ```
 
-The old scope is a historical alias for provenance and exact legacy selector
-diagnostics only. It is excluded from catalog uniqueness, publisher election,
-producer grants, config resolution, upload authentication, and new writes.
-`build_snapshot` resolves only `CorpusProject.scope`, never historical aliases.
+For attachment-proved migration, the pair transaction also inserts the matching
+`ScopeMigrationAttachmentProof` in `AttachmentSnapshotV1`. Operator-attested
+unattached migration has no attachment proof row. The catalog never serializes
+a host-local attachment or path merely to retain audit evidence.
+Strict cross-validation is bidirectional: every attachment-proved record has
+exactly one matching proof that revalidates its old/new scopes and attachment,
+and every proof has one record. Operator-attested records have no proof row.
+
+Promotion is the `LegacyLocal -> Published` transition kind in this same
+path-free audit chain. Relpath moves and recorded-authority changes are
+`Published -> Published`. Other shape/kind combinations refuse. The explicit
+`catalog_epoch` is the new epoch committed by the pair transaction, and
+`operator_invocation` is the bounded audit source. This is the durable home for
+the promotion audit; it is not journal-only.
+
+A published old scope is a historical alias for provenance and exact legacy
+selector diagnostics only. `LegacyLocal` in a promotion record carries no wire
+scope. Historical values are excluded from catalog uniqueness, publisher
+election, producer grants, config resolution, upload authentication, and new
+writes. `build_snapshot` resolves only `CorpusProject.scope`, never historical
+aliases.
 
 An already-active collected generation remains selected by project id through
 `code_bridge_generation`, but its response/source metadata truthfully retains
@@ -682,14 +888,16 @@ watcher roots remain attachment/workspace data. They gain a project or
 attachment reference only where needed for resolution while preserving their
 execution path.
 
-A persisted `LegacyPathBinding` ledger records the v1 inventory's historical
-path, mapped project id, relationship (`root` or `contained_subdirectory`),
-source store/row id, and inventory epoch. Mapping uses the registered-root
-snapshot captured at inventory time with deepest-containing-root semantics,
-not the current attachment path and not a freshly computed path hash. This
-explicitly covers the known legacy quirk where state was written under a plain
+A persisted `LegacyPathBinding` ledger inside the strict host-local
+`AttachmentSnapshotV1` records the v1 inventory's historical path, mapped
+project id, relationship (`root` or `contained_subdirectory`), source
+store/row id, and inventory epoch. Mapping uses the registered-root snapshot
+captured at inventory time with deepest-containing-root semantics, not the
+current attachment path and not a freshly computed path hash. This explicitly
+covers the known legacy quirk where state was written under a plain
 subdirectory rather than the registered root. Ambiguous rows are quarantined
-with an operator mapping action.
+with an operator mapping action. The path-free `ScopeMigrationRecord` lives in
+the catalog; the path-bearing binding never does.
 
 Rows whose literal project/path never belonged to any inventory-time
 registered root are `UnscopedLegacyPath`, not catalog migration failures. They
@@ -814,8 +1022,10 @@ receive a checkout path.
 
 Published Git local projects retain the versioned clean-snapshot derivation
 bound to project id, recorded scope, commit namespace, `HEAD`, and working-tree
-fingerprint. A v2-created `LegacyLocal` project has no commit namespace and no
-commit documents. Its local code snapshot id comes from
+fingerprint. A v2-created attached Git `LegacyLocal` project has the random
+local-only commit namespace from section 5.1; a non-Git `LegacyLocal` project
+has no commit documents. Neither kind uses a head-bound clean snapshot for code
+identity. Its local code snapshot id comes from
 `legacy_local_snapshot_id(project_id, manifest_digest)`: a domain-separated
 SHA-256 folded to the existing lowercase colon-free snapshot-id shape.
 `manifest_digest` hashes the sorted normalized relative path, content hash, and
@@ -827,15 +1037,19 @@ converge.
 The local freshness cache retains normalized path, size/mtime fingerprint, and
 last content hash. An incremental event re-reads and re-hashes only changed or
 uncertain files, then folds the cached complete manifest into the new digest;
-full rebuild validates every entry. Migrated LegacyLocal history may remain
-queryable under its compatibility namespace but is not refreshed until
-promotion. Non-Git local walking remains a first-class lease-backed source
-lane.
+full rebuild validates every entry. An attached Git `LegacyLocal` project may
+refresh history through its validated Git-history lease under its local or
+imported legacy namespace. That refresh grants no published-scope or cross-host
+authority. Detach preserves the last history generation as stale and blocks
+refresh. Non-Git local walking remains a first-class lease-backed source lane.
 
-Add `PublishedScope` to every activation and retained-generation record.
+All new writers emit the strict scope-bearing activation and
+retained-generation metadata introduced by the Phase 1 migration substrate.
 Startup validates exact agreement among catalog project, activation,
 descriptor, manifest, and source assignment before selecting a generation.
-Recovery never scans checkout paths or guesses a scope from a project id.
+Legacy scopeless records are accepted only as offline migration input and are
+rewritten transactionally before the first v2 bind. Recovery never scans
+checkout paths or guesses a scope from a project id.
 
 ### 10.2 Index schema and response paths
 
@@ -933,6 +1147,22 @@ documents once per authoritative repo and preserved commit namespace. Map
 changed repo-relative paths into each project's `bbox_root_relpath`, then emit
 project-specific file edges only for paths inside that project. This removes
 the current duplicate monorepo ingestion and last-writer-wins commit record.
+
+That consolidation applies only after recorded authority or an explicit
+same-repository migration proof gives the projects one shared history record.
+Unpromoted `LegacyLocal` monorepo siblings keep separate project-bound history
+records and may perform duplicate local walks. The design accepts that bounded
+cost rather than merging authority from path proximity; promotion or explicit
+history resolution can consolidate them later without rewriting existing refs.
+
+The first consolidated repo-history generation never seeds from one legacy
+per-project `last_ingested_sha`: those values are commit identities, not an
+ordered cursor, and monorepo siblings may disagree. Migration inventories and
+backs up all old cursor files for diagnostics, initializes the new
+repo-history record without a cursor, performs one complete reachable-history
+walk through a validated attachment, publishes the complete generation, and
+only then records its new cursor. Divergent sibling cursors therefore trade one
+bounded rewalk for proof that no commit interval was skipped.
 
 Repo-level commit documents and vectors have their own immutable
 `RepoHistoryGeneration`, keyed by stable `RepoHistoryId` plus the catalog's
@@ -1075,8 +1305,10 @@ the catalog project or collected code.
 The durable source of that promise is a strict `AcceptedPublicationStore`
 beside the catalog state, not the current in-memory TTL cache. One immutable
 publication generation contains normalized knowledge entries, normalized gap
-entries, scope, full ref, accepted commit, per-file/content hashes, counts, and
-total encoded bytes. One atomically replaced
+entries, canonical relative-filename manifests for both lanes, scope, full ref,
+accepted commit, per-file/content hashes, counts, and total encoded bytes. The
+manifests preserve the filename presence and equality inputs needed by overlay
+and promotion logic. One atomically replaced
 `AcceptedPublicationPointer` contains the complete publisher binding and the
 selected current generation plus the bounded prior pointer used for rollback.
 There is no separately committed binding/manifest pair.
@@ -1105,6 +1337,25 @@ host-local. `own` uses the authoritative session attachment. `all` means all
 valid overlays on this corpus host, not overlays on remote checkout hosts. The
 new response stamps make that distinction explicit.
 
+After publisher detach, the verified accepted generation remains published
+truth and names accepted commit P plus the canonical published file manifests.
+It does not fabricate Git ancestry, a merge base, or Git objects. Each
+attachment may recompute its overlay only when its own object database contains
+P and can prove and read `B = merge_base(H, P)`. It never silently borrows
+another attachment. A previously valid overlay remains eligible only while the
+accepted pointer still names the same P and its attachment lease, checkout
+HEAD, and working-tree fingerprint all revalidate unchanged. Otherwise it is
+`overlay_baseline_unavailable`.
+
+`published` continues from the accepted generation. An explicit or default
+`own` request for an authoritative checkout whose baseline is unavailable
+returns `provisional_overlay_unavailable`. `all` serves published plus every
+valid peer, omits unavailable peers, and lists them in structured
+`degraded.overlays`. Health reports accepted-publication integrity,
+publisher-advance availability, and per-checkout overlay-baseline availability
+separately. No live publisher blocks advance and alternate-object assistance,
+not accepted published reads.
+
 ### 13.2 Publisher binding
 
 Replace path-scan election with an operator-owned binding:
@@ -1131,16 +1382,22 @@ and reports publisher-unavailable until an operator rebinds.
 
 Migrate existing `PublisherRefStore` pins by resolving their current unique
 publisher under the old rules during preflight. Ambiguous or missing matches
-block automatic migration and require an explicit binding.
+block automatic migration and require an explicit binding to one inventoried
+attachment, full ref, expected scope, and resolved commit. Every old pin maps
+to one seeded binding or one explicit no-content acknowledgement. The exact
+legacy store bytes and checksum remain rollback input, and v2 never consults
+that store.
 
 Apply seeds publication generation G1 for every migrated binding before the
 catalog epoch commits. It resolves the pinned full ref, validates the exact
 commit and scope, reads knowledge and gaps through the migration command's
 explicit publisher/config-read lease, writes the immutable accepted generation,
-and installs its pointer. The migration journal inventories each G1 payload and
-pointer hash as an auxiliary staged asset. Forward recovery requires them all;
-rollback leaves them unreachable from v1 and records them for bounded orphan
-GC. A binding that cannot be seeded is a preflight
+and installs its pointer. G1 payloads are immutable transaction assets and
+pointers are mutable migration participants. The prepared journal inventories
+every payload and pointer hash; the committed marker retains them as GC roots.
+Forward recovery requires them all. Rollback leaves immutable assets
+unreachable from v1 and pinned for bounded orphan GC. A binding that cannot be
+seeded is a preflight
 refusal unless the resolution file explicitly records
 `no_published_content_acknowledged`; that choice creates no binding and reports
 the published capability unavailable. It never enables a committed-tree
@@ -1152,7 +1409,11 @@ Committed `.bbox/config.toml` aliases become nominations read from the exact
 accepted publisher commit. They cannot overwrite operator aliases or become
 active on conflict. Existing materialized aliases migrate as operator aliases
 to preserve selectors. Accept/reject is an explicit catalog action, and alias
-uniqueness is checked against both ids and active aliases.
+uniqueness is checked against both ids and active aliases. Registration,
+publisher advance, and reload report pending nominations and the exact
+epoch-checked accept command. A missing or changed committed declaration never
+silently revokes an accepted alias, and a remote-only project preserves its
+accepted aliases without opening a checkout.
 
 ## 14. Remaining checkout-side adapters
 
@@ -1199,14 +1460,20 @@ counted, and a remote-shaped test path can deny access deterministically.
 1. Add typed ids, catalog, attachment, scope-authority, bootstrap-hint, and
    commit-namespace types to `bbox-corpus-core`.
 2. Add versioned pure decoders and full-store validation.
-3. Implement the journaled catalog/attachment transaction owner in
-   `bbox-indexing`.
-4. Implement the offline v1 preflight/apply command, hash-bound resolution
-   file, fault-injected migration, backups, and collision refusal/retry.
-5. Preserve `ProjectRecord` only as an attached compatibility view.
+3. Implement the journaled catalog/attachment transaction owner and its
+   role-bounded multi-participant migration mode in `bbox-indexing`.
+4. Add migration-only accepted-publication persistence, G1 seeding, source
+   selection quarantine, scope-bearing activation/retained metadata rewrites,
+   and the journaled migration marker.
+5. Implement the offline v1 preflight/apply command, hash-bound resolution
+   file, fault-injected isolated rehearsal, backups, and collision
+   refusal/retry.
+6. Preserve `ProjectRecord` only as an attached compatibility view.
 
 Exit gate: every existing id/ref/selector namespace round-trips, no catalog
-serialization contains a path, and every torn transaction recovers one epoch.
+serialization contains a path, every old publisher pin has a G1 or explicit
+no-content disposition, and every torn participant transaction recovers one
+coherent state.
 
 ### Phase 2: resolver and administration cut
 
@@ -1220,7 +1487,8 @@ serialization contains a path, and every torn transaction recovers one epoch.
 
 Exit gate: id/alias/scope corpus queries work with no attachment; path
 operations select exactly one valid attachment; ambiguity and unknown paths
-fail closed.
+fail closed. This phase proves the v2 runtime path against isolated migrated
+state; it does not apply v2 bytes to configured operator state.
 
 ### Phase 3: path-free index and optional Git overlay
 
@@ -1237,7 +1505,8 @@ graph data under `DenyCheckoutAccess`; new docs contain no host path.
 
 ### Phase 4: catalog-based collector and state transitions
 
-1. Resolve grants from catalog scope only and add scope to activation records.
+1. Resolve grants from catalog scope only and make every live activation writer
+   emit the strict scope-bearing v2 record.
 2. Separate auth swap from desired/effective source changes.
 3. Implement persisted no-attachment cutback pending and event-driven resume.
 4. Validate catalog/activation/descriptor/manifest agreement at startup.
@@ -1247,9 +1516,10 @@ reattach, reassign, restart, and explicit retirement converge exactly once.
 
 ### Phase 5: publisher, views, and remaining adapters
 
-1. Migrate publisher pins to explicit bindings and accepted commits.
-2. Persist accepted knowledge/gap publication generations and key their views
-   by catalog identity and stamps.
+1. Wire the migration-seeded publisher bindings and accepted generations into
+   live views, rebind, and advance.
+2. Key accepted knowledge/gap views by catalog identity and stamps, including
+   per-checkout overlay-baseline degradation after publisher detach.
 3. Move blame, render, provenance notes, file providers, artifact watchers,
    refactor/mutation, and tool-edge path resolution to leases.
 4. Surface capability-specific health and typed attachment errors.
@@ -1259,13 +1529,22 @@ checkout open is lease-counted and remote-only projects degrade per capability.
 
 ### Phase 6: overlap proof and cut
 
-1. Run durable-store inventory/backfill and clear all quarantines.
-2. Rebuild the new index schema while preserving active collected generations.
-3. Observe compatibility-path and direct-checkout counters through the agreed
-   closeout window and exercise cutback.
-4. Delete direct `load_project_records` consumers and eight-hex selector
-   assumptions.
-5. Retain the version-1 backup and compatibility reader until a later explicit
+1. Delete direct `load_project_records` consumers and eight-hex selector
+   assumptions, then prove the complete v2 binary against isolated migrated
+   state.
+2. Observe compatibility-path and direct-checkout counters through the agreed
+   bridge closeout window and exercise cutback.
+3. Run the complete isolated multi-participant migration rehearsal, durable
+   backfills, new-index rebuild, quarantine handling, and exact post-image
+   verification against a final copied inventory.
+4. Through the shared-service approval runbook, stop the bridge and apply to
+   configured state under the exclusive lifetime lock.
+5. Before any v2 route binds, run the offline durable-store backfills and
+   path-free index rebuild against the applied catalog, preserving active
+   collected generations, then require the complete startup validation gate.
+6. Start the v2 daemon and run the catalog-only, cutback, and adapter live
+   checks.
+7. Retain the version-1 backup and compatibility reader until a later explicit
    retirement after rollback proof.
 
 Exit gate: the daemon can start with an empty attachment store and serve all
@@ -1280,6 +1559,10 @@ the explicit adapter table.
 - No lock is held across filesystem walking, Git, embedding, or index commit.
   Mutation prepares off-lock and compare-and-swaps against the catalog/source
   epoch before publication.
+- Lock order is the process-lifetime migration lock, the existing
+  `projects.json.lock`, then auxiliary participant locks in deterministic
+  role/path order. Preflight and the bridge persister contend on that same
+  project-store lock.
 - A project detach racing local indexing invalidates the lease before commit;
   the last-good read view remains selected.
 - A collected activation racing detach is unaffected because it has no lease.
@@ -1296,12 +1579,22 @@ the explicit adapter table.
 - Unattached scope migration is operator authority equivalent to explicit
   catalog import, requires zero active attachments plus acknowledgement and
   audit reason, and is never reachable from producer or model-facing routes.
+- Same-user MCP administration is delegated automation, not authenticated
+  human identity. Attachment proof, expected epochs, acknowledgement
+  pass-through, and audit records constrain it. Proofless authority remains
+  local CLI-only.
 - Corrupt catalog, attachment, accepted-publication pointer/generation,
   migration journal, or source selector fails closed for its capability. A
   repo-history reference-manifest mismatch disables GC until deterministic
   rebuild. A missing optional attachment degrades only its capability.
+- Accepted publication never substitutes content for Git ancestry. A missing
+  overlay baseline degrades only that checkout's provisional view while the
+  verified published generation remains readable.
 - GC pins active read views, active/retained code generations, the selected Git
-  overlay, in-flight rebuild inventories, and migration backups.
+  overlay, in-flight rebuild inventories, prepared migration journals,
+  committed migration markers, G1 assets, quarantined generations, and
+  migration backups. General storage sweeps exclude transaction stage and
+  backup roots.
 
 ## 17. Verification matrix
 
@@ -1324,8 +1617,29 @@ the explicit adapter table.
 - A duplicate-scope loser with active collected state requires explicit
   quarantine, is absent from v2 read views at first bind, and completes normal
   retirement without serving the winner's scope.
-- Fault injection at every two-file transaction boundary proves recovery to a
-  complete old or new epoch.
+- Fault injection at every regular pair and migration-participant boundary
+  proves recovery to one complete old or new state. A pair installed without a
+  marker is recovered through the prepared journal or fails closed.
+- Preflight and a bridge `StorePersister` contend on the same
+  `projects.json.lock`; apply-time source hashing detects every auxiliary input
+  change.
+- Every old publisher pin produces exactly one verified G1 pointer or one
+  explicit hash-bound no-content acknowledgement. V2 never consults the legacy
+  publisher-ref store, whose exact bytes remain rollback-pinned.
+- Missing checkout markers receive their persisted planned random id
+  idempotently. Shared monorepo roots receive one id; a different, malformed,
+  unreadable, or symlinked marker refuses without overwrite.
+- Every surviving legacy collected activation and retained-generation metadata
+  gains explicit scope only from exact descriptor/manifest/catalog agreement.
+  First v2 startup selects it without a compatibility guess; any ambiguous join
+  refuses preflight.
+- Typed legacy-path observations classify every durable row from the captured
+  literal selector. Default reports contain only path digests; an explicit
+  owner-only local review artifact is marked sensitive.
+- A fresh-v2 catalog opens without a migration marker. A migrated-v1 catalog
+  records its transaction id in `CatalogOriginV2`, opens only with the matching
+  committed marker, and detects marker loss after commit. The marker and
+  journal retain the complete plan hash.
 - New ids use the fixed random format, collision-check, and resolve by exact
   membership rather than string shape.
 - New published repos use recorded authority as one shared commit namespace;
@@ -1342,6 +1656,10 @@ the explicit adapter table.
   retain reads when one promotes: the stable history id remains, authority
   becomes recorded, both references remain valid, and conflicting sibling
   authority blocks the transaction.
+- A newly registered attached Git `LegacyLocal` project ingests and queries
+  history under a random local-only namespace, survives detach as stale
+  history, refreshes after reattach, and preserves its refs through promotion
+  without acquiring publisher or producer authority early.
 
 ### Resolution and administration
 
@@ -1367,6 +1685,9 @@ the explicit adapter table.
 - Scope migration to an already-owned target refuses without modifying either
   project. Fault injection yields the complete old or new catalog/attachment
   epoch plus its matching migration record.
+- Scope migration stores its path-free record inside the catalog and its
+  path-bearing historical bindings inside the attachment snapshot. Fault
+  injection cannot publish one without the other.
 - A remote-only collected project with zero attachments uses the offline
   `operator_attested` CLI after explicit acknowledgement, preserves
   project id, bridge, active collected generation, and durable state through
@@ -1430,6 +1751,9 @@ the explicit adapter table.
   edges atomically.
 - Commit history ingests once per repo while two monorepo projects receive only
   their own file edges.
+- Divergent legacy monorepo cursor SHAs seed no consolidated cursor. One full
+  reachable-history walk publishes the initial repo-history generation before
+  its new cursor is recorded.
 - Retiring one monorepo project cannot tombstone shared commit documents or
   vectors while another project/overlay/read view references the repo-history
   generation.
@@ -1457,6 +1781,11 @@ the explicit adapter table.
 - Accepted knowledge and gap generations survive restart with no attachment;
   a partial/corrupt candidate cannot advance the manifest or accepted commit,
   and bounded GC preserves pinned/rollback generations.
+- After publisher detach, a peer containing accepted commit P recomputes its
+  overlay from its own Git database. A peer lacking P reports
+  `overlay_baseline_unavailable`: `published` remains available, `own` returns
+  the typed provisional error, and `all` omits only that peer with structured
+  degradation. Restart preserves the same outcomes without inventing ancestry.
 - Fault injection before/after the accepted-publication pointer swap yields a
   complete old or new binding/content epoch, never mixed provenance.
 - Migration seeds G1 before catalog commit; restart before the first publisher

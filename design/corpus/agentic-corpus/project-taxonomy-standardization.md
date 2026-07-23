@@ -216,14 +216,16 @@ must fail closed and ask for an id or registered root.
 
 Resolved 2026-06-12 after grounding the proposal in the current code.
 
-**Alias storage: both, with distinct roles.** `.bbox/config.toml` declares the
-canonical alias — repo-owned, reviewable, travels with the checkout, and
-compensates for the host-scoped `project_id` (two hosts registering the same
-repo converge on the same alias). The central project registry materializes
-declared aliases at register/reindex time (query-time resolution cannot read
-every repo's config) and additionally accepts operator-set host-local aliases
-for projects that cannot carry a committed config (non-git roots, third-party
-repos). Conflicting aliases fail closed at registration and at resolution.
+**Alias storage: superseded by catalog authority.** `.bbox/config.toml`
+declares portable alias nominations. The durable project catalog owns accepted
+selector aliases and changes them only through an epoch-checked catalog
+transaction. Registration, publisher advance, and reload may report new
+nominations but do not activate or revoke them. Migration preserves every
+already-materialized registry alias as accepted state so selectors do not
+regress. Conflicting nominations fail closed at acceptance and ambiguous active
+aliases fail closed at resolution. This supersedes the earlier rule that
+register/reindex materialized committed declarations automatically; see
+`design/daemon-runtime/durable-project-catalog-impl.md` section 13.2.
 
 **Checkout/worktree stay implicit in tool schemas.** The dispatch session
 already binds the execution target (`AmbientContext` pins, structural worktree

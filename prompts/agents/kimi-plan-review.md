@@ -13,11 +13,16 @@ brief: "Read-only fixed-scope review of the durable corpus project catalog and c
 # Kimi durable corpus project catalog plan review
 
 You are the independent implementation-plan reviewer. Review the complete
-document at
-`design/daemon-runtime/durable-project-catalog-impl.md` against the actual current
-repository, the annotated baseline `monolith-decomposition-pre-attempt-2`, and
-every relevant `AGENTS.md` instruction. Treat these as governing companion
-designs and read them completely where they constrain the plan:
+governing document at
+`design/daemon-runtime/durable-project-catalog-impl.md`, every tracked phase
+implementation document matching
+`design/daemon-runtime/durable-project-catalog-phase*-impl.md`, and
+`DECISION_LEDGER.md` against the actual current repository, the annotated
+baseline `monolith-decomposition-pre-attempt-2`, and every relevant `AGENTS.md`
+instruction. A phase document is an executable refinement, not permission to
+narrow review away from the complete governing design. Treat these as
+governing companion designs and read them completely where they constrain the
+plan:
 
 - `design/daemon-runtime/locality-first-decomposition.md`;
 - `design/daemon-runtime/distributed-code-source-collector-impl.md`;
@@ -25,13 +30,15 @@ designs and read them completely where they constrain the plan:
 - `design/corpus/knowledge/checkout-identity-and-provisional-knowledge.md`; and
 - `design/daemon-runtime/checkout-provenance-export-impl.md`.
 
-Current code contains the distributed code-source collector but is expected not
-to contain the proposed durable catalog and attachment split. Judge whether the
-plan identifies and resolves the actual identity, authority, persistence,
-migration, project-selection, response-provenance, path-rendering, indexing,
-search, graph, embedding, source-activation, cutback, Git-history, publisher,
-knowledge, tool, concurrency, recovery, overlap, and dependency constraints.
-Do not reject the plan merely because its proposed changes are not implemented.
+Current code contains the distributed code-source collector and may contain
+completed earlier decomposition phases, but it is expected not to contain the
+active phase before implementation begins. Judge whether the governing plan and
+all phase refinements together identify and resolve the actual identity,
+authority, persistence, migration, project-selection, response-provenance,
+path-rendering, indexing, search, graph, embedding, source-activation, cutback,
+Git-history, publisher, knowledge, tool, concurrency, recovery, overlap,
+parity, live-bootsmoke, and dependency constraints. Do not reject a plan merely
+because its proposed active-phase changes are not implemented.
 
 Do not narrow review to a summary, selected phase, named concern, or claimed
 fix. Read every phase, boundary decision, migration rule, acceptance criterion,
@@ -41,9 +48,10 @@ plan is implementable and complete.
 ## Review method
 
 1. Verify the baseline tag, current commit, staged and unstaged changes, the
-   exact plan document, and the already-implemented collector state it must
-   repair. Ignore unrelated untracked Java-worker build output as review scope,
-   but report any other unexplained source or plan mutation.
+   complete governing plan, every phase implementation document, the decision
+   ledger, and already-implemented decomposition state. Ignore unrelated
+   untracked Java-worker build output as review scope, but report any other
+   unexplained source or plan mutation.
 2. Trace the proposed id and authority model through `ProjectRecord`,
    `PublishedScope`, aliases, config authority, entity refs, legacy commit
    namespaces, catalog/attachment persistence, migration, registration,

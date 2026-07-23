@@ -1,0 +1,323 @@
+# Monolith Decomposition Decision Ledger
+
+This ledger records autonomous decisions made while executing the durable
+project-catalog decomposition. It is not a release log. Entries exist only for
+material forks where repository evidence made one choice clearly better for
+correctness and completeness. A decision that survives review remains binding
+until a later entry explicitly supersedes it.
+
+## D-001: Keep offline administration out of `blackboxd`
+
+- Date: 2026-07-22
+- Phase: durable project catalog, Phase 1
+- Status: accepted after independent plan review
+- Decision: Add a separate `blackbox` executable in the root package for
+  `project-catalog migrate` and later offline catalog administration. Keep
+  `blackboxd` as the zero-argument foreground daemon.
+- Evidence:
+  - `src/main.rs` deliberately accepts only `--help` and `--version`; unknown
+    arguments fail instead of accidentally starting another daemon.
+  - The root package already owns `clap`, the `blackbox` library target, and the
+    daemon wiring needed by a thin administration binary.
+  - No `blackbox` executable currently exists, while the governing design names
+    `blackbox project-catalog ...` as the offline surface.
+- Rationale: Adding migration modes to `blackboxd` would mix offline exclusive
+  state mutation with daemon startup and weaken a side-effect-free command-line
+  contract. A separate executable matches the designed command, preserves the
+  daemon safety boundary, and avoids introducing another package solely for a
+  thin adapter.
+- Revisit only if: the root package is split before Phase 1 implementation, or
+  a reviewed repository-wide administration CLI replaces the designed
+  `blackbox` surface.
+
+## D-002: Do not activate v2 state before the complete v2 runtime can preserve parity
+
+- Date: 2026-07-22
+- Phase: durable project catalog, Phase 1 to Phase 6 boundary
+- Status: accepted after independent plan review
+- Decision: Phase 1 implements and fault-tests the complete v1-to-v2 migration
+  engine, but its CLI may install post-images only into an explicitly selected
+  isolated rehearsal root. Applying to the configured live project store stays
+  fail-closed until the Phase 6 cut, after the catalog resolver, path-free
+  index, collector state machine, accepted-publication store, publisher
+  migration, remaining adapters, and v2 daemon startup path have all landed.
+- Evidence:
+  - The current daemon opens `projects.json` through the version-1
+    `ProjectRegistry` and persists it asynchronously through
+    `StorePersister`.
+  - Phase 1 creates the pure model, strict stores, transaction owner, migration
+    engine, and rehearsal participants. Phases 2 through 5 create the runtime
+    consumers required to preserve existing behavior.
+  - The governing Phase 6 is already the overlap-proof and cut phase.
+  - Installing v2 bytes at the configured path before those consumers exist
+    would either strand the bridge daemon or activate a partial runtime.
+- Rationale: A migration command that can strand the only runnable daemon is
+  incomplete. A dual-format daemon would weaken the explicit migration cut and
+  make rollback authority ambiguous. Isolated apply rehearsal proves the
+  Phase 1 engine without creating an operator-state trap. Phase 6 removes the
+  guard only after exact-state rehearsal and live runtime parity are
+  demonstrated. The configured service remains on the last deployed
+  bridge-compatible binary through Phases 2 to 5.
+- Revisit only if: an earlier phase is deliberately expanded to include every
+  remaining runtime consumer and the complete reviewed cut.
+
+## D-003: Preserve local Git history without inventing repository authority
+
+- Date: 2026-07-22
+- Phase: durable project catalog, identity and Git overlay
+- Status: accepted after independent plan review
+- Decision: A newly created `LegacyLocal` project receives a server-minted,
+  project-bound local history record and commit namespace. It may ingest and
+  query attachment-backed local Git history, but that namespace cannot
+  authorize publishing, producer grants, cross-host repository identity, or
+  another catalog project. Promotion records proved repository authority while
+  preserving the materialized local namespace as compatibility history.
+- Evidence:
+  - The current runtime indexes Git history for registered Git projects even
+    when their repository id is only a computed bootstrap hint.
+  - Treating that computed hint as v2 authority would preserve behavior by
+    violating the new authority model.
+  - Creating no history record would remove an existing user capability and
+    violate the final parity requirement.
+- Rationale: A random, catalog-owned local namespace preserves history without
+  laundering a path hash or computed repository hint into cross-host
+  authority. Explicit promotion remains the only way to acquire published
+  repository authority.
+- Revisit only if: local Git history is removed as an explicitly approved
+  product change after the decomposition parity gate.
+
+## D-004: Split catalog administration by proof, not by a claimed MCP identity
+
+- Date: 2026-07-22
+- Phase: durable project catalog, administration
+- Status: accepted after independent plan review
+- Decision: Attachment-backed operations with live repository proof may remain
+  model-facing MCP tools when they require the expected catalog epoch, explicit
+  acknowledgement for authority changes, and an audit reason. Agents may pass
+  operator-supplied acknowledgement values but may not default or infer them.
+  Proofless authority operations, including unattached import or scope
+  migration, conflict-resolution apply, and whole-store migration apply, are
+  local `blackbox project-catalog` CLI operations. Read-only inspection stays
+  available on both surfaces.
+- Evidence:
+  - The current MCP transport has tool-surface filtering but no authenticated
+    human-operator identity distinct from a model-facing client.
+  - The governing security model already excludes unattached scope migration
+    from model-facing routes.
+  - Existing project mutations are model-facing MCP tools and the repository's
+    operator-authority convention permits agents to pass through, but never
+    invent, explicit operator acknowledgements.
+  - The governing design already places proofless unattached scope migration
+    outside model-facing routes.
+  - The new local CLI provides the required boundary for operations that
+    cannot derive authority from a validated attachment.
+- Rationale: The transport does not prove a human identity, so the design must
+  not claim that it does. Repository proof plus compare-and-swap and explicit
+  authority acknowledgement preserves the established delegated MCP workflow.
+  Operations without that proof remain local rather than trusting a request
+  boolean as identity.
+- Revisit only if: a reviewed authenticated operator capability is added to
+  the MCP transport and its audit model distinguishes operator delegation from
+  agent discretion.
+
+## D-005: Repository aliases nominate; the catalog accepts
+
+- Date: 2026-07-22
+- Phase: durable project catalog, alias migration
+- Status: accepted after independent plan review
+- Decision: Existing materialized aliases migrate as accepted catalog aliases
+  so selectors do not regress. Later committed `.bbox/config.toml` alias
+  changes create bounded nominations only. Acceptance or rejection is an
+  explicit local catalog-authority action.
+- Evidence:
+  - The bridge daemon currently rewrites central alias state from committed
+    config during startup.
+  - Repository content is portable producer input, while alias uniqueness and
+    selector ownership span the host catalog.
+  - Allowing startup sync to accept aliases would let one checkout rewrite
+    host-wide selector authority without a catalog transaction.
+- Rationale: Migration preserves every active alias. New alias capability
+  remains available through an explicit action, but repository content cannot
+  self-elect into host-wide selector authority.
+- Revisit only if: alias authority moves into a separately authenticated,
+  distributed control plane.
+
+## D-006: Migration rehearsal changes destination, not transaction semantics
+
+- Date: 2026-07-22
+- Phase: durable project catalog, Phase 1 migration
+- Status: accepted after independent plan review
+- Decision: Phase 1 uses one generalized migration transaction owner for the
+  catalog, attachments, effective source-manifest quarantine, accepted
+  publication pointers, migration marker, and their immutable assets. Rehearsal
+  redirects every participant to isolated copies, but runs the same prepare,
+  install, verify, recovery, and rollback protocol used by the Phase 6 cut.
+- Evidence:
+  - A duplicate-scope loser must leave effective collected selection before v2
+    binds.
+  - Existing publisher pins must have verified accepted publication generation
+    G1 before the catalog epoch becomes visible.
+  - Deferring either transition would make Phase 6 use a path the rehearsal and
+    fault matrix never exercised.
+- Rationale: A catalog-only rehearsal would prove the least risky files while
+  leaving the actual cross-store cut untested. One role-bounded participant
+  plan gives every mutable post-image one commit decision and lets immutable
+  assets remain unreachable on rollback.
+- Revisit only if: the migration is redesigned around an equally strict
+  transactional substrate with complete end-to-end rehearsal and recovery.
+
+## D-007: Accepted publication does not fabricate Git ancestry
+
+- Date: 2026-07-22
+- Phase: durable project catalog, provisional overlays
+- Status: accepted after independent plan review
+- Decision: A verified accepted publication generation remains published truth
+  after publisher detach and supplies commit P plus canonical knowledge and gap
+  file manifests. It does not supply a merge base or Git objects. Each
+  attachment may compute its overlay only when its own object database proves P
+  and the merge base. `own` fails explicitly when that proof is unavailable;
+  `all` omits only unavailable peers with diagnostics; `published` remains
+  available.
+- Evidence:
+  - The overlay algorithm needs both commit ancestry and the committed file map
+    at the merge base.
+  - Accepted publication bytes can preserve published content but cannot prove
+    Git ancestry.
+  - Requiring a live publisher for all reads would discard the remote-only
+    capability the catalog is intended to provide.
+- Rationale: This separates durable published truth from checkout-specific Git
+  evidence without silently borrowing another attachment or treating content
+  hashes as ancestry.
+- Revisit only if: accepted publication generations later carry a separately
+  verified immutable Git object bundle with explicit ancestry semantics.
+
+## D-008: Normalize markerless legacy checkouts during explicit migration
+
+- Date: 2026-07-22
+- Phase: durable project catalog, attachment migration
+- Status: accepted after independent plan review
+- Decision: Read-only preflight inventories checkout marker state and persists
+  one planned strong-random checkout id per eligible canonical checkout root.
+  Apply journals and installs each planned missing marker idempotently before
+  admitting attachments. A matching marker resumes; a different, malformed,
+  unreadable, or symlinked marker refuses. Rollback never deletes a successfully
+  installed marker.
+- Evidence:
+  - The bridge currently synthesizes a path-derived id for markerless reads and
+    mints the durable random marker on first write.
+  - A synthetic id cannot become authoritative v2 attachment identity without
+    reintroducing path-reuse bugs.
+  - Excluding markerless roots would remove current local capabilities.
+- Rationale: Explicit migration is the safe normalization point. Persisting the
+  planned random value makes crashes and retries deterministic, while leaving a
+  successfully installed host-local marker after rollback is benign and
+  compatible with the bridge.
+- Revisit only if: checkout identity moves to a stronger host-local authority
+  that preserves the same reuse and recovery properties.
+
+## D-009: Split scope-migration audit from path-bearing compatibility state
+
+- Date: 2026-07-22
+- Phase: durable project catalog, administration and compatibility
+- Status: accepted after independent plan review
+- Decision: Path-free `ScopeMigrationRecord` values live inside
+  `CatalogSnapshotV2`. Path-bearing `LegacyPathLedgerEntry` values live inside
+  the strict host-local `AttachmentSnapshotV1`, along with any
+  attachment-specific migration proof. Catalog records never contain a
+  host-local attachment id. A regular pair transaction changes both snapshots
+  atomically.
+- Evidence:
+  - Scope migration requires a durable logical record to authorize temporary
+    activation and publication bridges.
+  - Historical path bindings contain absolute host paths and therefore cannot
+    enter the catalog.
+  - A sidecar written after the pair would leave crash windows where the new
+    scope and its compatibility proof disagree.
+- Rationale: The split follows the catalog/attachment trust boundary while
+  retaining one atomic commit decision.
+- Revisit only if: both record families move to another path-free/path-bearing
+  paired substrate with equivalent crash recovery.
+
+## D-010: Rewrite collected scope metadata during migration
+
+- Date: 2026-07-22
+- Phase: durable project catalog, collected-source migration
+- Status: accepted after independent plan review
+- Decision: Migration writes strict scope-bearing v2 activation and retained
+  generation metadata for every surviving collected generation. Scope comes
+  only from exact agreement among the immutable descriptor, manifest, legacy
+  activation/selector, and migrated published catalog project. An ambiguous
+  join refuses.
+- Evidence:
+  - Current `ActivationRecord` has no scope field.
+  - The v2 startup contract requires exact scope agreement before selecting a
+    generation.
+  - Deferring the rewrite would make the first remote-only v2 boot reject its
+    active generation or guess from project id.
+- Rationale: The immutable descriptor already records producer-authorized
+  scope. Transactional rewrite makes that evidence explicit before the strict
+  runtime opens it.
+- Revisit only if: a stronger immutable source-authority record replaces the
+  descriptor and participates in the same migration proof.
+
+## D-011: Catalog origin makes migration-marker loss detectable
+
+- Date: 2026-07-22
+- Phase: durable project catalog, recovery
+- Status: accepted after independent plan review
+- Decision: Every v2 catalog records whether it was initialized fresh or
+  migrated from v1. A migrated origin carries its transaction id and requires
+  a committed marker with the same transaction id at strict open. The
+  complete plan hash remains in the marker and journal to avoid a hash cycle
+  through the catalog post-image. A fresh-v2 origin does not require a marker.
+- Evidence:
+  - Valid v2 bytes alone cannot distinguish a fresh store from a migrated store
+    whose marker was deleted.
+  - Migration backups, G1 assets, and quarantine pins depend on the marker
+    through final parity and rollback closeout.
+- Rationale: Self-identifying origin turns marker retention from a convention
+  into an enforceable invariant without burdening genuine fresh stores.
+- Revisit only if: migration provenance becomes intrinsic to a replacement
+  snapshot schema with the same strict-open property.
+
+## D-012: Promotion is a typed scope transition, not an orphan audit
+
+- Date: 2026-07-22
+- Phase: durable project catalog, administration
+- Status: accepted after independent plan review
+- Decision: `ScopeMigrationRecord` covers `LegacyLocal -> Published`
+  promotion as well as published relpath and recorded-authority changes. It
+  carries a typed old/new `ProjectScope`, transition kind, catalog epoch, and
+  bounded operator invocation. Attachment-proved transitions require exactly
+  one matching host-local proof; operator-attested transitions require none.
+- Evidence:
+  - Promotion already promises a durable audit containing old kind, new scope,
+    invocation, and catalog epoch.
+  - A journal alone is recovery evidence, not the queryable catalog audit
+    surface.
+  - A separate promotion ledger would duplicate the same nonbranching
+    project-scope transition chain.
+- Rationale: One typed transition chain gives promotion and migration the same
+  atomicity and validation while preserving the catalog/attachment boundary.
+- Revisit only if: catalog authority transitions move to a single replacement
+  audit substrate with equivalent bidirectional proof validation.
+
+## D-013: Full legacy paths stay out of default migration reports
+
+- Date: 2026-07-22
+- Phase: durable project catalog, compatibility inventory
+- Status: accepted after independent plan review
+- Decision: Immutable inventory observations contain the bounded literal
+  selector required to classify legacy rows, but default reports expose only a
+  domain-separated path digest. Full paths live in the strict host-local
+  attachment snapshot. An operator may explicitly display an ambiguous row or
+  request an owner-only, sensitive local-path review artifact.
+- Evidence:
+  - Deepest-root classification cannot be reproduced from row ids and counts.
+  - Full historical paths may contain private repository or user identifiers.
+  - Apply already reruns and hash-checks the immutable inventory, so the
+    persisted default report need not carry literals to build exact post-images.
+- Rationale: The engine receives complete deterministic inputs without turning
+  a routinely archived report into a path disclosure surface.
+- Revisit only if: the report is replaced by an equally deterministic local
+  review format with explicit sensitive-data handling.
