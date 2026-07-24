@@ -536,7 +536,7 @@ impl ProjectCatalogStore {
         match (
             owner
                 .io
-                .read_regular_nofollow(&paths.catalog, MAX_PROJECT_CATALOG_BYTES)?,
+                .read_regular_nofollow(&paths.catalog, MAX_LEGACY_PROJECT_STORE_BYTES)?,
             owner
                 .io
                 .read_regular_nofollow(&paths.attachments, MAX_PROJECT_CATALOG_BYTES)?,
@@ -4029,7 +4029,7 @@ impl ProjectCatalogTransactionOwner {
     ) -> ProjectCatalogStoreResult<Option<ProjectCatalogCommit>> {
         let Some(catalog_bytes) = self
             .io
-            .read_regular_nofollow(&self.paths.catalog, MAX_PROJECT_CATALOG_BYTES)?
+            .read_regular_nofollow(&self.paths.catalog, MAX_LEGACY_PROJECT_STORE_BYTES)?
         else {
             return Ok(None);
         };
@@ -6386,7 +6386,7 @@ impl ProjectCatalogTransactionOwner {
         if epoch == 0 {
             let catalog = self
                 .io
-                .read_regular_nofollow(&self.paths.catalog, MAX_PROJECT_CATALOG_BYTES)?;
+                .read_regular_nofollow(&self.paths.catalog, MAX_LEGACY_PROJECT_STORE_BYTES)?;
             let attachments = self
                 .io
                 .read_regular_nofollow(&self.paths.attachments, MAX_PROJECT_CATALOG_BYTES)?;

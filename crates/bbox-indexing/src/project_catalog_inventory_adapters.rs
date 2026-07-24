@@ -30,7 +30,7 @@ use bbox_corpus_core::git::{
 use bbox_corpus_core::identity::{PublishedScope, resolve_recorded_repo_id};
 use bbox_corpus_core::json_store::NofollowDirectory;
 use bbox_corpus_core::project_catalog::{
-    AttachmentId, CommitNamespace, LegacyProjectStoreV1, MAX_PROJECT_CATALOG_BYTES, ProjectId,
+    AttachmentId, CommitNamespace, LegacyProjectStoreV1, MAX_LEGACY_PROJECT_STORE_BYTES, ProjectId,
     RecordedRepoAuthority, decode_legacy_project_store,
 };
 use bbox_corpus_core::project_catalog_snapshot::{
@@ -472,7 +472,7 @@ fn capture_legacy_projects_source(
     path: &AuthorizedInventoryPath,
 ) -> AdapterResult<DecodedSourceObservationV1<LegacyProjectStoreV1>> {
     Ok(decode_source(
-        read_authorized_file(path, MAX_PROJECT_CATALOG_BYTES)?,
+        read_authorized_file(path, MAX_LEGACY_PROJECT_STORE_BYTES)?,
         |bytes| decode_legacy_project_store(bytes).map_err(|_| ()),
         "legacy_projects_invalid",
     ))
