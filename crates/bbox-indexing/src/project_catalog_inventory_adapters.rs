@@ -494,6 +494,57 @@ fn accept_missing_legacy_projects_source(
     }
 }
 
+struct InventoryLegacySourceV1 {
+    exact: ExactDecodedSourceV1<LegacyProjectStoreV1>,
+    state: InventorySourceStateV1,
+}
+
+fn accept_legacy_projects_source_for_inventory(
+    observed: DecodedSourceObservationV1<LegacyProjectStoreV1>,
+) -> InventoryLegacySourceV1 {
+    match observed {
+        DecodedSourceObservationV1::NotFound => {
+            let exact = ExactDecodedSourceV1 {
+                source: ExactSourceBytesV1::new(Vec::new()),
+                value: LegacyProjectStoreV1::default(),
+                was_missing: true,
+            };
+            InventoryLegacySourceV1 {
+                state: InventorySourceStateV1::Missing {
+                    fingerprint: missing_source_fingerprint("legacy-project-store"),
+                },
+                exact,
+            }
+        }
+        DecodedSourceObservationV1::Valid(exact) => InventoryLegacySourceV1 {
+            state: present_source_state(&exact.source),
+            exact,
+        },
+        DecodedSourceObservationV1::Invalid {
+            source,
+            diagnostic_code,
+        } => {
+            let fingerprint = source
+                .as_ref()
+                .map(|source| source.fingerprint.clone())
+                .unwrap_or_else(|| missing_source_fingerprint("legacy-project-store"));
+            let content_hash = source.as_ref().map(|source| source.content_hash.clone());
+            InventoryLegacySourceV1 {
+                exact: ExactDecodedSourceV1 {
+                    source: source.unwrap_or_else(|| ExactSourceBytesV1::new(Vec::new())),
+                    value: LegacyProjectStoreV1::default(),
+                    was_missing: false,
+                },
+                state: InventorySourceStateV1::Corrupt {
+                    fingerprint,
+                    content_hash,
+                    diagnostic_code,
+                },
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PublisherRefInventoryV1 {
     pub rows: Vec<PublisherRefRow>,
@@ -2180,9 +2231,11 @@ impl ProjectCatalogMigrationInventoryFacadeV1 {
             &projects_path,
             |error| invalid_source(error.to_string()),
             || {
-                let legacy_source = accept_missing_legacy_projects_source(
-                    capture_legacy_projects_source(&legacy_project_store_path)?,
-                )?;
+                let observed = capture_legacy_projects_source(&legacy_project_store_path)?;
+                if matches!(observed, DecodedSourceObservationV1::Invalid { .. }) {
+                    return Ok(Vec::new());
+                }
+                let legacy_source = accept_missing_legacy_projects_source(observed)?;
                 let probes = derive_legacy_project_probes(
                     &legacy_source,
                     request.rehearsal_root.as_deref(),
@@ -2369,9 +2422,10 @@ fn authorize_owner_paths(
 fn capture_inventory_locked(
     request: AuthorizedProjectCatalogMigrationInventoryRequestV1<'_>,
 ) -> AdapterResult<ProjectCatalogMigrationInventoryResultV1> {
-    let legacy_source = accept_missing_legacy_projects_source(capture_legacy_projects_source(
-        &request.legacy_project_store_path,
-    )?)?;
+    let captured_legacy = accept_legacy_projects_source_for_inventory(
+        capture_legacy_projects_source(&request.legacy_project_store_path)?,
+    );
+    let legacy_source = &captured_legacy.exact;
     let probes = derive_legacy_project_probes(&legacy_source, request.rehearsal_root.as_deref())?;
     validate_probe_containment(&probes, request.rehearsal_root.as_deref())?;
     let mut legacy = observe_legacy_projects(&legacy_source, probes)?;
@@ -2405,11 +2459,11 @@ fn capture_inventory_locked(
         .iter()
         .map(|row| row.observation_id.clone())
         .collect();
-    let mut mutable_source_evidence = vec![exact_source_evidence(
+    let mut mutable_source_evidence = vec![source_evidence(
         "legacy-project-store",
         MutableInventorySourceKindV1::LegacyProjectStore,
         MutableInventorySourceLocatorV1::LegacyProjectStore,
-        &legacy_source,
+        captured_legacy.state,
         legacy_row_ids,
     )];
     mutable_source_evidence.append(&mut legacy.source_evidence);
@@ -4929,6 +4983,27 @@ mod tests {
             observed,
             AuthorizedFileObservationV1::Invalid { diagnostic_code }
                 if diagnostic_code == "source_path_changed"
+        ));
+    }
+
+    #[test]
+    fn corrupt_legacy_source_is_retained_as_refusal_evidence() {
+        let raw = ExactSourceBytesV1::new(b"{not-json".to_vec());
+        let captured =
+            accept_legacy_projects_source_for_inventory(DecodedSourceObservationV1::Invalid {
+                source: Some(raw.clone()),
+                diagnostic_code: "legacy_projects_invalid".to_string(),
+            });
+
+        assert_eq!(captured.exact.source, raw);
+        assert!(!captured.exact.was_missing);
+        assert!(captured.exact.value.projects.is_empty());
+        assert!(matches!(
+            captured.state,
+            InventorySourceStateV1::Corrupt {
+                diagnostic_code,
+                ..
+            } if diagnostic_code == "legacy_projects_invalid"
         ));
     }
 
