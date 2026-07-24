@@ -2736,10 +2736,38 @@ mod tests {
         install_test_assignment(&state, producer_id, &scope, &project.project_id);
 
         let store = state.code_sources.store();
-        let descriptor = empty_generation_descriptor(scope.clone(), &"c".repeat(40));
+        let head = "c".repeat(40);
+        let collected_source = b"pub fn collected_phase_one() {}\n";
+        let entries = vec![ManifestEntry {
+            relative_path: "src/lib.rs".into(),
+            content_sha256: hex::encode(Sha256::digest(collected_source)),
+            size: collected_source.len() as u64,
+        }];
+        let descriptor = GenerationDescriptor {
+            schema_version: SCHEMA_VERSION,
+            walker_policy_version: WALKER_POLICY_VERSION.into(),
+            scope: scope.clone(),
+            head_commit: head.clone(),
+            dirty_fingerprint: dirty_fingerprint(&head, &entries),
+            manifest_sha256: manifest_sha256(&entries),
+            file_count: entries.len() as u64,
+            logical_bytes: collected_source.len() as u64,
+        };
         let upload = store.begin_upload(producer_id, descriptor).unwrap();
         store
+            .put_manifest_page(producer_id, &upload.upload_id, 0, &entries)
+            .unwrap();
+        store
             .complete_manifest(producer_id, &upload.upload_id)
+            .unwrap();
+        store
+            .install_blob(
+                producer_id,
+                &upload.upload_id,
+                &entries[0].content_sha256,
+                entries[0].size,
+                std::io::Cursor::new(collected_source),
+            )
             .unwrap();
         let ready = store
             .finalize_upload(producer_id, &upload.upload_id)
