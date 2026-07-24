@@ -1230,34 +1230,31 @@ impl MigrationCheckoutRegistryBoundSessionV1 {
             .io
             .read_regular_nofollow(&owner.paths.attachments, MAX_PROJECT_CATALOG_BYTES)
             .map_err(|error| bootstrap_journal_failure(error, journal_disposition))?;
-        let attachment_bytes = match installed {
-            Some(bytes) if sha256(&bytes) == *expected_hash => bytes,
-            _ => {
-                let staged = owner
-                    .io
-                    .read_regular_nofollow(
-                        &owner.paths.stage_dir.join(artifact_name.as_str()),
-                        MAX_PROJECT_CATALOG_BYTES,
-                    )
-                    .map_err(|error| bootstrap_journal_failure(error, journal_disposition))?
-                    .ok_or_else(|| {
-                        ProjectCatalogStoreError::new(
-                            "error.project_catalog_migration_incomplete",
-                            "migration registry bootstrap cannot find the attachment post-image",
-                        )
-                    })
-                    .map_err(|error| bootstrap_journal_failure(error, journal_disposition))?;
-                if sha256(&staged) != *expected_hash {
-                    return Err(bootstrap_journal_failure(
-                        ProjectCatalogStoreError::new(
-                            "error.project_catalog_migration_incomplete",
-                            "migration registry bootstrap attachment hash disagrees with the journal",
-                        ),
-                        journal_disposition,
-                    ));
-                }
-                staged
+        let staged = owner
+            .io
+            .read_regular_nofollow(
+                &owner.paths.stage_dir.join(artifact_name.as_str()),
+                MAX_PROJECT_CATALOG_BYTES,
+            )
+            .map_err(|error| bootstrap_journal_failure(error, journal_disposition))?;
+        let attachment_bytes = installed
+            .filter(|bytes| sha256(bytes) == *expected_hash)
+            .or_else(|| staged.filter(|bytes| sha256(bytes) == *expected_hash));
+        let Some(attachment_bytes) = attachment_bytes else {
+            if journal.state == TransactionStateV1::Prepared {
+                return checkout_action_roots_for_rollback(
+                    journal,
+                    discovered_checkout_roots,
+                    journal_disposition,
+                );
             }
+            return Err(bootstrap_journal_failure(
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_migration_incomplete",
+                    "migration registry bootstrap cannot find the exact attachment post-image",
+                ),
+                journal_disposition,
+            ));
         };
         let attachments = decode_attachment_snapshot(&attachment_bytes)
             .map_err(contract_error)
@@ -1410,6 +1407,32 @@ impl MigrationCheckoutRegistryBoundSessionV1 {
             },
         ))
     }
+}
+
+fn checkout_action_roots_for_rollback(
+    journal: &ProjectCatalogTransactionJournalV1,
+    discovered_checkout_roots: &BTreeMap<String, PathBuf>,
+    disposition: MigrationMutationDispositionV1,
+) -> Result<BTreeMap<String, PathBuf>, MigrationBootstrapFailureV1> {
+    journal
+        .monotonic_checkout_identity_actions
+        .iter()
+        .map(|action| {
+            discovered_checkout_roots
+                .get(&action.observation_id)
+                .cloned()
+                .map(|root| (action.observation_id.clone(), root))
+                .ok_or_else(|| {
+                    bootstrap_journal_failure(
+                        ProjectCatalogStoreError::new(
+                            "error.project_catalog_invalid_migration_registry",
+                            "rollback action observation is absent from strict checkout discovery",
+                        ),
+                        disposition,
+                    )
+                })
+        })
+        .collect()
 }
 
 fn path_exists_nofollow(path: &Path) -> ProjectCatalogStoreResult<bool> {
@@ -11846,8 +11869,7 @@ mod tests {
         let (_directory, path, plan, _) = missing_source_migration_fault_fixture();
         let retry = plan.clone();
         let registry = plan.registry.clone();
-        let mut expected_identity = plan.artifact_identity();
-        expected_identity.migration_install_is_current = false;
+        let expected_identity = plan.artifact_identity();
         let failing = Arc::new(TracingIo::failing_points([FaultPoint::ParticipantInstall]));
 
         let error = transact_migration_with_io(&path, plan, failing).unwrap_err();
@@ -12591,7 +12613,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_corrupt_pinned_manifest_refuses_apply_and_recovery() {
+    fn missing_or_corrupt_pinned_manifest_refuses_apply_but_allows_rollback() {
         let (_directory, path, plan, manifest_target, _) = extended_migration_fault_fixture();
         fs::remove_file(&manifest_target).unwrap();
         let error = transact_migration(&path, plan).unwrap_err();
@@ -12642,12 +12664,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(journal.outcome, Some(TransactionOutcomeV1::RolledBack));
-        assert!(
-            error
-                .to_string()
-                .contains("pinned immutable recovery asset has unexpected bytes"),
-            "{error}"
-        );
     }
 
     #[test]
@@ -13357,7 +13373,8 @@ mod tests {
     #[test]
     fn regular_transactions_retain_migration_identity_and_reopen_authority() {
         let (_directory, path, plan, _, _) = migration_fault_fixture();
-        let expected_identity = plan.artifact_identity();
+        let mut expected_identity = plan.artifact_identity();
+        expected_identity.migration_install_is_current = false;
         let registry = plan.registry.clone();
         transact_migration(&path, plan).unwrap();
 
