@@ -104,6 +104,14 @@ pub(crate) struct MigrationStoreOpenV1 {
     pub(crate) disposition: MigrationMutationDispositionV1,
 }
 
+#[derive(Debug)]
+pub(crate) enum MigrationStoreOpenOutcomeV1 {
+    Installed(MigrationStoreOpenV1),
+    RolledBackNotInstalled {
+        disposition: MigrationMutationDispositionV1,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct MigrationStoreOpenFailureV1 {
     pub(crate) error: ProjectCatalogStoreError,
@@ -414,7 +422,7 @@ impl ProjectCatalogStore {
             .map_err(open_recovery_uncertain_failure)?;
         let disposition = match before {
             None => MigrationMutationDispositionV1::NoDurableMutation,
-            Some(_) => {
+            Some(journal) if journal.kind == TransactionKindV1::V1Migration => {
                 let after = owner
                     .read_journal_locked()
                     .map_err(open_recovery_uncertain_failure)?;
@@ -422,6 +430,32 @@ impl ProjectCatalogStore {
                     open_recovery_uncertain_failure(ProjectCatalogStoreError::new(
                         "error.project_catalog_recovery_incomplete",
                         "migration recovery did not reach a terminal journal outcome",
+                    ))
+                })?
+            }
+            Some(_) => {
+                let marker_bytes = owner
+                    .io
+                    .read_regular_nofollow(&owner.paths.migration_marker, MAX_MARKER_BYTES)
+                    .map_err(open_recovery_uncertain_failure)?
+                    .ok_or_else(|| {
+                        open_recovery_uncertain_failure(ProjectCatalogStoreError::new(
+                            "error.project_catalog_migration_incomplete",
+                            "regular catalog history lacks its retained migration marker",
+                        ))
+                    })?;
+                let marker: ProjectCatalogMigrationMarkerV1 =
+                    decode_bounded_json(&marker_bytes, MAX_MARKER_BYTES, "migration marker")
+                        .map_err(open_recovery_uncertain_failure)?;
+                let migration = owner
+                    .migration_journal_for_marker_locked(&marker)
+                    .map_err(open_recovery_uncertain_failure)?;
+                verify_migration_marker_journal_binding(&marker, &marker_bytes, &migration)
+                    .map_err(open_recovery_uncertain_failure)?;
+                recovered_journal_disposition(Some(&migration)).ok_or_else(|| {
+                    open_recovery_uncertain_failure(ProjectCatalogStoreError::new(
+                        "error.project_catalog_recovery_incomplete",
+                        "retained migration journal is not committed",
                     ))
                 })?
             }
@@ -453,21 +487,6 @@ impl ProjectCatalogStore {
             .io
             .acquire_mutation_lock(&self.owner.paths.catalog)?;
         let _auxiliary_locks = self.owner.acquire_auxiliary_locks()?;
-        let journal = self.owner.read_journal_locked()?.ok_or_else(|| {
-            ProjectCatalogStoreError::new(
-                "error.project_catalog_migration_incomplete",
-                "migration verification lacks its retained transaction journal",
-            )
-        })?;
-        if journal.kind != TransactionKindV1::V1Migration
-            || journal.state != TransactionStateV1::Committed
-            || journal.outcome != Some(TransactionOutcomeV1::Committed)
-        {
-            return Err(ProjectCatalogStoreError::new(
-                "error.project_catalog_migration_incomplete",
-                "migration verification requires a committed migration journal",
-            ));
-        }
         let marker_bytes = self
             .owner
             .io
@@ -480,9 +499,20 @@ impl ProjectCatalogStore {
             })?;
         let marker: ProjectCatalogMigrationMarkerV1 =
             decode_bounded_json(&marker_bytes, MAX_MARKER_BYTES, "migration marker")?;
+        let migration_install_is_current =
+            self.owner.read_journal_locked()?.is_some_and(|active| {
+                active.kind == TransactionKindV1::V1Migration
+                    && active.transaction_id == marker.transaction_id
+            });
+        let journal = self.owner.migration_journal_for_marker_locked(&marker)?;
         verify_migration_marker_journal_binding(&marker, &marker_bytes, &journal)?;
         self.owner.verify_current_migration_state(&journal)?;
-        migration_artifact_identity_from_journal(&journal, marker, sha256(&marker_bytes))
+        migration_artifact_identity_from_journal(
+            &journal,
+            marker,
+            sha256(&marker_bytes),
+            migration_install_is_current,
+        )
     }
 
     fn open_existing_with_registry_and_io(
@@ -741,6 +771,9 @@ pub(crate) struct MigrationParticipantRegistry {
 
 pub(crate) enum MigrationCheckoutRegistryBootstrapV1 {
     FreshLegacyNotInstalled,
+    RolledBackNotInstalled {
+        disposition: MigrationMutationDispositionV1,
+    },
     RequiresRegistry(MigrationCheckoutRegistryBootstrapSessionV1),
 }
 
@@ -766,6 +799,10 @@ impl fmt::Debug for MigrationCheckoutRegistryBootstrapV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::FreshLegacyNotInstalled => formatter.write_str("FreshLegacyNotInstalled"),
+            Self::RolledBackNotInstalled { disposition } => formatter
+                .debug_struct("RolledBackNotInstalled")
+                .field("disposition", disposition)
+                .finish(),
             Self::RequiresRegistry(session) => formatter
                 .debug_struct("RequiresRegistry")
                 .field("disposition", &session.disposition)
@@ -1006,7 +1043,7 @@ fn begin_migration_checkout_registry_bootstrap_with_io(
         .io
         .acquire_mutation_lock(&owner.paths.catalog)
         .map_err(bootstrap_pre_entry_failure)?;
-    let Some(journal) = owner
+    let Some(mut journal) = owner
         .read_journal_locked()
         .map_err(bootstrap_retry_failure)?
     else {
@@ -1037,17 +1074,30 @@ fn begin_migration_checkout_registry_bootstrap_with_io(
         }
         return Ok(MigrationCheckoutRegistryBootstrapV1::FreshLegacyNotInstalled);
     };
+    if journal.kind == TransactionKindV1::RegularPair {
+        owner.recover_locked().map_err(bootstrap_retry_failure)?;
+        let marker_bytes = owner
+            .io
+            .read_regular_nofollow(&owner.paths.migration_marker, MAX_MARKER_BYTES)
+            .map_err(bootstrap_retry_failure)?
+            .ok_or_else(|| {
+                bootstrap_retry_failure(ProjectCatalogStoreError::new(
+                    "error.project_catalog_migration_incomplete",
+                    "regular catalog history lacks its retained migration marker",
+                ))
+            })?;
+        let marker: ProjectCatalogMigrationMarkerV1 =
+            decode_bounded_json(&marker_bytes, MAX_MARKER_BYTES, "migration marker")
+                .map_err(bootstrap_retry_failure)?;
+        journal = owner
+            .migration_journal_for_marker_locked(&marker)
+            .map_err(bootstrap_retry_failure)?;
+        verify_migration_marker_journal_binding(&marker, &marker_bytes, &journal)
+            .map_err(bootstrap_retry_failure)?;
+    }
     let journal_disposition = recovered_journal_disposition(Some(&journal))
         .unwrap_or(MigrationMutationDispositionV1::RetryExactPlanRequired);
-    if journal.kind != TransactionKindV1::V1Migration
-        || matches!(
-            (journal.state, journal.outcome),
-            (
-                TransactionStateV1::Committed,
-                Some(TransactionOutcomeV1::RolledBack)
-            )
-        )
-    {
+    if journal.kind != TransactionKindV1::V1Migration {
         return Err(bootstrap_journal_failure(
             ProjectCatalogStoreError::new(
                 "error.project_catalog_migration_incomplete",
@@ -1055,6 +1105,19 @@ fn begin_migration_checkout_registry_bootstrap_with_io(
             ),
             journal_disposition,
         ));
+    }
+    if matches!(
+        (journal.state, journal.outcome),
+        (
+            TransactionStateV1::Committed,
+            Some(TransactionOutcomeV1::RolledBack)
+        )
+    ) {
+        return Ok(
+            MigrationCheckoutRegistryBootstrapV1::RolledBackNotInstalled {
+                disposition: journal_disposition,
+            },
+        );
     }
     return Ok(MigrationCheckoutRegistryBootstrapV1::RequiresRegistry(
         MigrationCheckoutRegistryBootstrapSessionV1 {
@@ -1266,7 +1329,7 @@ impl MigrationCheckoutRegistryBoundSessionV1 {
     pub(crate) fn finish_open(
         mut self,
         discovered_checkout_roots: &BTreeMap<String, PathBuf>,
-    ) -> Result<MigrationStoreOpenV1, MigrationStoreOpenFailureV1> {
+    ) -> Result<MigrationStoreOpenOutcomeV1, MigrationStoreOpenFailureV1> {
         let retained_checkout_roots = self
             .retained_checkout_roots(discovered_checkout_roots)
             .map_err(|failure| MigrationStoreOpenFailureV1 {
@@ -1295,22 +1358,30 @@ impl MigrationCheckoutRegistryBoundSessionV1 {
                 error,
                 disposition: self.disposition,
             })?;
-        let disposition = self
-            .owner
-            .read_journal_locked()
-            .map_err(|error| MigrationStoreOpenFailureV1 {
-                error,
-                disposition: self.disposition,
-            })?
-            .as_ref()
-            .and_then(|journal| recovered_journal_disposition(Some(journal)))
-            .ok_or_else(|| MigrationStoreOpenFailureV1 {
-                error: ProjectCatalogStoreError::new(
-                    "error.project_catalog_recovery_incomplete",
-                    "migration bootstrap recovery did not reach a terminal journal outcome",
-                ),
-                disposition: self.disposition,
-            })?;
+        let disposition = if self.journal.state == TransactionStateV1::Prepared {
+            self.owner
+                .read_journal_locked()
+                .map_err(|error| MigrationStoreOpenFailureV1 {
+                    error,
+                    disposition: self.disposition,
+                })?
+                .as_ref()
+                .and_then(|journal| recovered_journal_disposition(Some(journal)))
+                .ok_or_else(|| MigrationStoreOpenFailureV1 {
+                    error: ProjectCatalogStoreError::new(
+                        "error.project_catalog_recovery_incomplete",
+                        "migration bootstrap recovery did not reach a terminal journal outcome",
+                    ),
+                    disposition: self.disposition,
+                })?
+        } else {
+            self.disposition
+        };
+        if disposition == MigrationMutationDispositionV1::RecoveredToOldState {
+            drop(self.auxiliary_locks);
+            drop(self.mutation_lock);
+            return Ok(MigrationStoreOpenOutcomeV1::RolledBackNotInstalled { disposition });
+        }
         let current = Arc::new(
             self.owner
                 .read_strict_pair_locked()
@@ -1318,22 +1389,35 @@ impl MigrationCheckoutRegistryBoundSessionV1 {
         );
         drop(self.auxiliary_locks);
         drop(self.mutation_lock);
-        Ok(MigrationStoreOpenV1 {
-            store: ProjectCatalogStore {
-                owner: self.owner,
-                current: RwLock::new(PublishedStoreState::Ready(current)),
-                _lifetime_lock: self.lifetime_lock,
+        Ok(MigrationStoreOpenOutcomeV1::Installed(
+            MigrationStoreOpenV1 {
+                store: ProjectCatalogStore {
+                    owner: self.owner,
+                    current: RwLock::new(PublishedStoreState::Ready(current)),
+                    _lifetime_lock: self.lifetime_lock,
+                },
+                disposition,
             },
-            disposition,
-        })
+        ))
     }
 }
 
 fn path_exists_nofollow(path: &Path) -> ProjectCatalogStoreResult<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) if exact_enoent(&error) => Ok(false),
         Err(error) => Err(io_error("inspect", path, error)),
+    }
+}
+
+fn exact_enoent(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::ENOENT)
+    }
+    #[cfg(not(unix))]
+    {
+        error.kind() == std::io::ErrorKind::NotFound
     }
 }
 
@@ -3086,6 +3170,7 @@ pub(crate) struct MigrationArtifactIdentityV1 {
     pub(crate) observed_marker_sha256: Sha256Hex,
     pub(crate) participants: Vec<MigrationParticipantArtifactIdentityV1>,
     pub(crate) immutable_assets: Vec<MigrationImmutableAssetIdentityV1>,
+    pub(crate) migration_install_is_current: bool,
     pub(crate) epoch: u64,
     pub(crate) checkout_action_count: u64,
     pub(crate) publisher_pin_count: u64,
@@ -3105,6 +3190,7 @@ impl ValidatedMigrationPlanV1 {
             self.marker()
                 .expect("validated migration plan has a valid marker"),
             sha256(marker_bytes),
+            true,
         )
         .expect("validated migration plan journal and marker agree")
     }
@@ -3775,9 +3861,14 @@ fn transact_migration_attempt_with_io(
         Ok(None) => {}
         Err(error) => return Err(MigrationAttemptFailureV1::Classify(error)),
     }
-    owner
-        .commit_migration_plan_locked(plan)
-        .map_err(MigrationAttemptFailureV1::Classify)
+    let cleanup_plan = plan.clone();
+    match owner.commit_migration_plan_locked(plan) {
+        Ok(commit) => Ok(commit),
+        Err(error) => match owner.cleanup_unjournaled_migration_attempt(&cleanup_plan) {
+            Ok(true) => Err(MigrationAttemptFailureV1::NoDurableMutation(error)),
+            Ok(false) | Err(_) => Err(MigrationAttemptFailureV1::Classify(error)),
+        },
+    }
 }
 
 fn classify_migration_failure(
@@ -4705,6 +4796,79 @@ impl ProjectCatalogTransactionOwner {
         )
     }
 
+    fn preserve_committed_migration_journal(
+        &self,
+        journal: &ProjectCatalogTransactionJournalV1,
+    ) -> ProjectCatalogStoreResult<()> {
+        journal.validate()?;
+        if journal.kind != TransactionKindV1::V1Migration
+            || journal.state != TransactionStateV1::Committed
+            || journal.outcome != Some(TransactionOutcomeV1::Committed)
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_incomplete",
+                "only a committed migration journal can become retained migration evidence",
+            ));
+        }
+        let bytes = encode_bounded_json(journal, MAX_JOURNAL_BYTES, "transaction journal")?;
+        let hash = sha256(&bytes);
+        let name = retained_migration_journal_name(&journal.transaction_id)?;
+        self.write_artifact(
+            &self.paths.backup_dir.join(name.as_str()),
+            &bytes,
+            hash,
+            FaultPoint::BackupWrite,
+            FaultPoint::BackupFsync,
+        )
+    }
+
+    fn migration_journal_for_marker_locked(
+        &self,
+        marker: &ProjectCatalogMigrationMarkerV1,
+    ) -> ProjectCatalogStoreResult<ProjectCatalogTransactionJournalV1> {
+        if let Some(active) = self.read_journal_locked()?
+            && active.kind == TransactionKindV1::V1Migration
+            && active.transaction_id == marker.transaction_id
+        {
+            if active.state != TransactionStateV1::Committed
+                || active.outcome != Some(TransactionOutcomeV1::Committed)
+            {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_migration_incomplete",
+                    "migration marker is bound to a non-committed active journal",
+                ));
+            }
+            return Ok(active);
+        }
+        let name = retained_migration_journal_name(&marker.transaction_id)?;
+        let bytes = self
+            .io
+            .read_regular_nofollow(
+                &self.paths.backup_dir.join(name.as_str()),
+                MAX_JOURNAL_BYTES,
+            )?
+            .ok_or_else(|| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_migration_incomplete",
+                    "migration verification lacks its retained transaction journal",
+                )
+            })?;
+        let journal: ProjectCatalogTransactionJournalV1 =
+            decode_bounded_json(&bytes, MAX_JOURNAL_BYTES, "retained migration journal")?;
+        journal.validate()?;
+        if journal.kind != TransactionKindV1::V1Migration
+            || journal.state != TransactionStateV1::Committed
+            || journal.outcome != Some(TransactionOutcomeV1::Committed)
+            || journal.transaction_id != marker.transaction_id
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_incomplete",
+                "retained migration journal does not prove the marker transaction",
+            ));
+        }
+        Ok(journal)
+    }
+
     fn read_strict_pair_locked(&self) -> ProjectCatalogStoreResult<ProjectCatalogState> {
         let catalog_bytes = self
             .io
@@ -4782,20 +4946,8 @@ impl ProjectCatalogTransactionOwner {
                         "migration marker transaction does not match catalog origin",
                     ));
                 }
-                if let Some(journal_bytes) = self
-                    .io
-                    .read_regular_nofollow(&self.paths.journal, MAX_JOURNAL_BYTES)?
-                {
-                    let journal: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
-                        &journal_bytes,
-                        MAX_JOURNAL_BYTES,
-                        "transaction journal",
-                    )?;
-                    journal.validate()?;
-                    if journal.transaction_id == marker.transaction_id {
-                        verify_migration_marker_journal_binding(&marker, &bytes, &journal)?;
-                    }
-                }
+                let journal = self.migration_journal_for_marker_locked(&marker)?;
+                verify_migration_marker_journal_binding(&marker, &bytes, &journal)?;
                 Ok(())
             }
             (CatalogOriginV2::MigratedV1 { .. }, None) => Err(ProjectCatalogStoreError::new(
@@ -4814,6 +4966,13 @@ impl ProjectCatalogTransactionOwner {
         self.io.create_private_dir_nofollow(&self.paths.stage_dir)?;
         self.io
             .create_private_dir_nofollow(&self.paths.backup_dir)?;
+        if let Some(prior) = prior_journal.as_ref()
+            && prior.kind == TransactionKindV1::V1Migration
+            && prior.state == TransactionStateV1::Committed
+            && prior.outcome == Some(TransactionOutcomeV1::Committed)
+        {
+            self.preserve_committed_migration_journal(prior)?;
+        }
 
         let transaction_id = ProjectCatalogTransactionId::mint();
         let mut participants = Vec::with_capacity(2);
@@ -4978,6 +5137,47 @@ impl ProjectCatalogTransactionOwner {
             }
         }
         Ok(())
+    }
+
+    fn cleanup_unjournaled_migration_attempt(
+        &self,
+        plan: &ValidatedMigrationPlanV1,
+    ) -> ProjectCatalogStoreResult<bool> {
+        if self.read_journal_locked()?.is_some() {
+            return Ok(false);
+        }
+        for participant in &plan.journal.participants {
+            for (root, image) in [
+                (&self.paths.backup_dir, &participant.old),
+                (&self.paths.stage_dir, &participant.new),
+            ] {
+                let ExpectedImageV1::Present {
+                    sha256,
+                    artifact_name,
+                } = image
+                else {
+                    continue;
+                };
+                let path = root.join(artifact_name.as_str());
+                if path_exists_nofollow(&path)? {
+                    self.io
+                        .remove_regular_exact(&path, sha256, participant.role.max_bytes())?;
+                }
+            }
+        }
+        for asset in &plan.journal.immutable_assets {
+            let Some(stage_name) = asset.stage_name.as_ref() else {
+                continue;
+            };
+            let path = self.paths.stage_dir.join(stage_name.as_str());
+            if path_exists_nofollow(&path)? {
+                self.io
+                    .remove_regular_exact(&path, &asset.sha256, asset.role.max_bytes())?;
+            }
+        }
+        self.io.remove_empty_dir_nofollow(&self.paths.stage_dir)?;
+        self.io.remove_empty_dir_nofollow(&self.paths.backup_dir)?;
+        Ok(true)
     }
 
     #[allow(dead_code)] // P1-B apply seam consumed by P1-C.
@@ -5202,7 +5402,6 @@ impl ProjectCatalogTransactionOwner {
                 FaultPoint::ImmutableAssetFsync,
             )?;
         }
-        self.install_immutable_assets(&plan.journal)?;
 
         for participant in &plan.journal.participants {
             let actual = old_images
@@ -5252,6 +5451,7 @@ impl ProjectCatalogTransactionOwner {
 
         let mut journal = plan.journal;
         self.write_journal(&journal, FaultPoint::PreparedJournalWrite)?;
+        self.install_immutable_assets(&journal)?;
         let checkout_locks = self.acquire_checkout_action_locks(&journal)?;
         self.prevalidate_monotonic_checkout_actions_locked(&journal, &checkout_locks)?;
         self.verify_nonaction_checkout_bindings_locked(
@@ -5377,11 +5577,15 @@ impl ProjectCatalogTransactionOwner {
                 self.verify_journal_pair_invariants(&journal, ExpectedSide::Old)
             }
             (TransactionStateV1::Prepared, None) => {
-                self.verify_pinned_immutable_assets_for_recovery(&journal)?;
                 let rollback_available =
                     self.classify_recovery(&journal, true)? == RecoveryDecision::Rollback;
                 let mut forward_available =
                     self.classify_recovery(&journal, false)? == RecoveryDecision::Forward;
+                if forward_available && journal.kind == TransactionKindV1::V1Migration {
+                    forward_available = self
+                        .verify_pinned_immutable_assets_for_recovery(&journal)
+                        .is_ok();
+                }
                 let mut checkout_locks = Vec::new();
                 if forward_available {
                     match self.acquire_checkout_action_locks(&journal) {
@@ -6393,14 +6597,27 @@ impl ProjectCatalogTransactionOwner {
                 TransactionKindV1::RegularPair if catalog.is_none() && attachments.is_none() => {
                     return Ok(());
                 }
-                TransactionKindV1::V1Migration
-                    if side == ExpectedSide::Old
-                        && attachments.is_none()
-                        && catalog
-                            .as_deref()
-                            .is_some_and(|bytes| decode_legacy_project_store(bytes).is_ok()) =>
-                {
-                    return Ok(());
+                TransactionKindV1::V1Migration if side == ExpectedSide::Old => {
+                    let legacy_matches =
+                        match (journal.legacy_project_source.as_ref(), catalog.as_deref()) {
+                            (
+                                Some(MigrationLegacyProjectSourceEvidenceV1::Missing { .. }),
+                                None,
+                            ) => true,
+                            (
+                                Some(MigrationLegacyProjectSourceEvidenceV1::Present {
+                                    sha256: expected,
+                                }),
+                                Some(bytes),
+                            ) => {
+                                decode_legacy_project_store(bytes).is_ok()
+                                    && sha256(bytes) == *expected
+                            }
+                            _ => false,
+                        };
+                    if attachments.is_none() && legacy_matches {
+                        return Ok(());
+                    }
                 }
                 _ => {}
             }
@@ -7343,6 +7560,12 @@ fn immutable_stage_name(
     ))
 }
 
+fn retained_migration_journal_name(
+    transaction_id: &ProjectCatalogTransactionId,
+) -> ProjectCatalogStoreResult<ValidatedBasename> {
+    ValidatedBasename::parse(format!("{transaction_id}.migration-journal.json"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ImmutableAssetModeV1 {
@@ -8025,6 +8248,7 @@ fn migration_artifact_identity_from_journal(
     journal: &ProjectCatalogTransactionJournalV1,
     marker: ProjectCatalogMigrationMarkerV1,
     observed_marker_sha256: Sha256Hex,
+    migration_install_is_current: bool,
 ) -> ProjectCatalogStoreResult<MigrationArtifactIdentityV1> {
     let report_artifact_sha256 = journal.report_artifact_sha256.clone().ok_or_else(|| {
         ProjectCatalogStoreError::new(
@@ -8069,6 +8293,7 @@ fn migration_artifact_identity_from_journal(
                 sha256: asset.sha256.clone(),
             })
             .collect(),
+        migration_install_is_current,
         epoch: journal.new_epoch,
         checkout_action_count: u64::try_from(journal.monotonic_checkout_identity_actions.len())
             .unwrap_or(u64::MAX),
@@ -8247,6 +8472,7 @@ trait CatalogStoreIo: Send + Sync {
         expected_hash: &Sha256Hex,
         max_bytes: usize,
     ) -> ProjectCatalogStoreResult<()>;
+    fn remove_empty_dir_nofollow(&self, path: &Path) -> ProjectCatalogStoreResult<()>;
     fn fsync_dir(&self, path: &Path) -> ProjectCatalogStoreResult<()>;
     fn checkpoint(&self, _point: FaultPoint) -> ProjectCatalogStoreResult<()> {
         Ok(())
@@ -8377,11 +8603,14 @@ impl RealCatalogStoreIo {
                 descriptor = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
             }
             if descriptor < 0 {
-                return Err(io_error(
-                    "open directory component for",
-                    path,
-                    std::io::Error::last_os_error(),
-                ));
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ENOENT) {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_path_not_found",
+                        format!("directory component for {} is missing", path.display()),
+                    ));
+                }
+                return Err(io_error("open directory component for", path, error));
             }
             directory = unsafe { File::from_raw_fd(descriptor) };
         }
@@ -8419,10 +8648,7 @@ impl RealCatalogStoreIo {
 
         let (parent, filename) = match Self::open_parent_unix(path) {
             Ok(value) => value,
-            Err(error)
-                if !path.parent().is_some_and(Path::exists)
-                    && error.code() == "error.project_catalog_io" =>
-            {
+            Err(error) if error.code() == "error.project_catalog_path_not_found" => {
                 return Ok(None);
             }
             Err(error) => return Err(error),
@@ -8905,6 +9131,42 @@ impl CatalogStoreIo for RealCatalogStoreIo {
         }
     }
 
+    fn remove_empty_dir_nofollow(&self, path: &Path) -> ProjectCatalogStoreResult<()> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            let (parent, filename) = match Self::open_parent_unix(path) {
+                Ok(value) => value,
+                Err(error) if error.code() == "error.project_catalog_path_not_found" => {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            let removed = unsafe {
+                libc::unlinkat(parent.as_raw_fd(), filename.as_ptr(), libc::AT_REMOVEDIR)
+            };
+            if removed < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ENOENT) {
+                    return Ok(());
+                }
+                return Err(io_error("remove empty directory", path, error));
+            }
+            return parent
+                .sync_all()
+                .map_err(|error| io_error("fsync directory for", path, error));
+        }
+        #[cfg(not(unix))]
+        {
+            match fs::remove_dir(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(io_error("remove empty directory", path, error)),
+            }
+        }
+    }
+
     fn fsync_dir(&self, path: &Path) -> ProjectCatalogStoreResult<()> {
         #[cfg(unix)]
         {
@@ -9223,6 +9485,10 @@ mod tests {
         ) -> ProjectCatalogStoreResult<()> {
             self.real
                 .remove_regular_exact(path, expected_hash, max_bytes)
+        }
+
+        fn remove_empty_dir_nofollow(&self, path: &Path) -> ProjectCatalogStoreResult<()> {
+            self.real.remove_empty_dir_nofollow(path)
         }
 
         fn fsync_dir(&self, path: &Path) -> ProjectCatalogStoreResult<()> {
@@ -10998,6 +11264,21 @@ mod tests {
         assert!(ProjectCatalogPaths::derive(Path::new("projects.json")).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn non_directory_parent_is_not_mapped_to_absent() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let parent = root.join("not-a-directory");
+        fs::write(&parent, b"file").unwrap();
+
+        let error = RealCatalogStoreIo
+            .read_regular_nofollow(&parent.join("child"), 128)
+            .unwrap_err();
+
+        assert_eq!(error.code(), "error.project_catalog_io");
+    }
+
     #[test]
     fn initialize_and_transact_publish_only_verified_pairs() {
         let (_directory, path) = projects_path();
@@ -11466,7 +11747,8 @@ mod tests {
         let (_directory, path, plan, _, legacy_bytes) = migration_fault_fixture();
         let retry = plan.clone();
         let registry = plan.registry.clone();
-        let expected_identity = plan.artifact_identity();
+        let mut expected_identity = plan.artifact_identity();
+        expected_identity.migration_install_is_current = false;
         let failing = Arc::new(TracingIo::failing_points([FaultPoint::ParticipantInstall]));
 
         let error = transact_migration_with_io(&path, plan, failing).unwrap_err();
@@ -12931,6 +13213,153 @@ mod tests {
     }
 
     #[test]
+    fn missing_legacy_source_can_roll_back_and_reapply_the_exact_plan() {
+        let (_directory, path, plan, expected) = missing_source_migration_fault_fixture();
+        let registry = plan.registry.clone();
+        let reopen_registry = registry.clone();
+        let retry = plan.clone();
+        let initial = Arc::new(TracingIo::failing_points([FaultPoint::ParticipantInstall]));
+        assert!(transact_migration_with_io(&path, plan, initial).is_err());
+
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        let journal: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
+            &fs::read(&paths.journal).unwrap(),
+            MAX_JOURNAL_BYTES,
+            "transaction journal",
+        )
+        .unwrap();
+        let attachment_stage = journal
+            .participants
+            .iter()
+            .find(|participant| participant.role == ParticipantRoleV1::Attachments)
+            .and_then(|participant| match &participant.new {
+                ExpectedImageV1::Present { artifact_name, .. } => {
+                    Some(paths.stage_dir.join(artifact_name.as_str()))
+                }
+                ExpectedImageV1::Absent {} => None,
+            })
+            .unwrap();
+        fs::remove_file(attachment_stage).unwrap();
+
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        assert_absent_pair(&path);
+        let rolled_back: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
+            &fs::read(&paths.journal).unwrap(),
+            MAX_JOURNAL_BYTES,
+            "transaction journal",
+        )
+        .unwrap();
+        assert_eq!(rolled_back.outcome, Some(TransactionOutcomeV1::RolledBack));
+
+        assert_eq!(transact_migration(&path, retry).unwrap().epoch, 1);
+        let reopened =
+            ProjectCatalogStore::open_existing_after_migration(path, reopen_registry).unwrap();
+        assert_eq!(state_fingerprint(&reopened.snapshot().unwrap()), expected);
+    }
+
+    #[test]
+    fn missing_pinned_immutable_asset_does_not_block_prepared_rollback() {
+        let (_directory, path, plan, _, _) = active_migration_fault_fixture();
+        let registry = plan.registry.clone();
+        let pinned = plan
+            .journal
+            .immutable_assets
+            .iter()
+            .find(|asset| asset.mode == ImmutableAssetModeV1::PinnedExisting)
+            .unwrap();
+        let pinned_target = registry.immutable_target(&pinned.role, &pinned.validated_name);
+        let initial = Arc::new(TracingIo::failing_points([FaultPoint::ParticipantInstall]));
+        assert!(transact_migration_with_io(&path, plan, initial).is_err());
+        fs::remove_file(pinned_target).unwrap();
+
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        let recovered: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
+            &fs::read(paths.journal).unwrap(),
+            MAX_JOURNAL_BYTES,
+            "transaction journal",
+        )
+        .unwrap();
+        assert_eq!(recovered.outcome, Some(TransactionOutcomeV1::RolledBack));
+    }
+
+    #[test]
+    fn unrecoverable_prepared_migration_is_stably_classified_for_retry() {
+        let (_directory, path, plan, _, _) = migration_fault_fixture();
+        let registry = plan.registry.clone();
+        let retry = plan.clone();
+        let initial = Arc::new(TracingIo::failing_points([FaultPoint::ParticipantInstall]));
+        assert!(transact_migration_with_io(&path, plan, initial).is_err());
+        fs::write(&path, b"unexplained catalog bytes").unwrap();
+
+        for _ in 0..2 {
+            let error =
+                recover_migration_with_io(&path, registry.clone(), Arc::new(RealCatalogStoreIo))
+                    .unwrap_err();
+            assert_eq!(error.code(), "error.project_catalog_recovery_incomplete");
+        }
+        let failure =
+            transact_migration_classified_with_io(&path, retry, Arc::new(RealCatalogStoreIo))
+                .unwrap_err();
+        assert_eq!(
+            failure.disposition,
+            MigrationMutationDispositionV1::RetryExactPlanRequired
+        );
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        let journal: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
+            &fs::read(paths.journal).unwrap(),
+            MAX_JOURNAL_BYTES,
+            "transaction journal",
+        )
+        .unwrap();
+        assert_eq!(journal.state, TransactionStateV1::Prepared);
+        assert_eq!(journal.outcome, None);
+    }
+
+    #[test]
+    fn regular_transactions_retain_migration_identity_and_reopen_authority() {
+        let (_directory, path, plan, _, _) = migration_fault_fixture();
+        let expected_identity = plan.artifact_identity();
+        let registry = plan.registry.clone();
+        transact_migration(&path, plan).unwrap();
+
+        let store =
+            ProjectCatalogStore::open_existing_after_migration(path.clone(), registry.clone())
+                .unwrap();
+        assert_eq!(store.transact(1, |_, _| Ok(())).unwrap().epoch, 2);
+        assert_eq!(
+            store.migration_artifact_identity().unwrap(),
+            expected_identity
+        );
+        drop(store);
+
+        let reopened =
+            ProjectCatalogStore::open_existing_after_migration(path.clone(), registry).unwrap();
+        assert_eq!(
+            reopened.migration_artifact_identity().unwrap(),
+            expected_identity
+        );
+        let paths = ProjectCatalogPaths::derive(&path).unwrap();
+        let marker: ProjectCatalogMigrationMarkerV1 = decode_bounded_json(
+            &fs::read(paths.migration_marker).unwrap(),
+            MAX_MARKER_BYTES,
+            "migration marker",
+        )
+        .unwrap();
+        assert!(
+            paths
+                .backup_dir
+                .join(
+                    retained_migration_journal_name(&marker.transaction_id)
+                        .unwrap()
+                        .as_str()
+                )
+                .is_file()
+        );
+    }
+
+    #[test]
     fn rollback_recovery_fault_matrix_deletes_only_the_exact_new_image() {
         let (_trace_directory, successful_path) = projects_path();
         let recording = Arc::new(TracingIo::recording());
@@ -13975,7 +14404,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_only_pre_journal_state_requires_exact_plan_retry() {
+    fn pre_journal_failure_removes_exact_orphan_artifacts() {
         let (_directory, path, plan, _, _) = migration_fault_fixture();
         let paths = ProjectCatalogPaths::derive(&path).unwrap();
 
@@ -13988,10 +14417,10 @@ mod tests {
 
         assert_eq!(
             failure.disposition,
-            MigrationMutationDispositionV1::RetryExactPlanRequired
+            MigrationMutationDispositionV1::NoDurableMutation
         );
-        assert!(paths.stage_dir.is_dir());
-        assert!(paths.backup_dir.is_dir());
+        assert!(!paths.stage_dir.exists());
+        assert!(!paths.backup_dir.exists());
         assert!(!paths.journal.exists());
         for participant in &plan.journal.participants {
             for (root, image) in [
@@ -14003,8 +14432,6 @@ mod tests {
                 }
             }
         }
-        assert!(fs::read_dir(&paths.stage_dir).unwrap().next().is_none());
-        assert!(fs::read_dir(&paths.backup_dir).unwrap().next().is_none());
         for asset in &plan.journal.immutable_assets {
             assert!(
                 !plan

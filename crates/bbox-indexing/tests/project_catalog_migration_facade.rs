@@ -962,9 +962,9 @@ fn absent_legacy_catalog_is_fresh_for_first_apply_but_public_verify_fails_closed
     let applied =
         ProjectCatalogMigrationFacadeV1::apply_rehearsal(ProjectCatalogMigrationApplyRequestV1 {
             rehearsal_layout: rehearsal.clone(),
-            protected_layout: protected,
-            report_path,
-            resolution_path,
+            protected_layout: protected.clone(),
+            report_path: report_path.clone(),
+            resolution_path: resolution_path.clone(),
         })
         .unwrap();
     assert_eq!(
@@ -973,8 +973,63 @@ fn absent_legacy_catalog_is_fresh_for_first_apply_but_public_verify_fails_closed
     );
     let verified =
         ProjectCatalogMigrationFacadeV1::verify(ProjectCatalogMigrationVerifyRequestV1 {
-            rehearsal_layout: rehearsal,
+            rehearsal_layout: rehearsal.clone(),
         })
         .unwrap();
     assert_eq!(verified.receipt(), &applied.receipt.verification);
+
+    let journal_path = rehearsal_root.join("state/project-catalog-transaction.json");
+    let mut journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+    let attachment_stage = journal["participants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|participant| participant["role"]["kind"] == "attachments")
+        .and_then(|participant| participant["new"]["artifact_name"].as_str())
+        .unwrap()
+        .to_string();
+    journal["state"] = serde_json::Value::String("prepared".to_string());
+    journal.as_object_mut().unwrap().remove("outcome");
+    journal.as_object_mut().unwrap().remove("committed_at");
+    fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+    fs::remove_file(&rehearsal.attachments_path).unwrap();
+    fs::remove_file(
+        rehearsal_root
+            .join("state/project-catalog-stage")
+            .join(attachment_stage),
+    )
+    .unwrap();
+
+    let rolled_back =
+        ProjectCatalogMigrationFacadeV1::verify(ProjectCatalogMigrationVerifyRequestV1 {
+            rehearsal_layout: rehearsal.clone(),
+        })
+        .unwrap_err();
+    assert_eq!(rolled_back.code, "error.project_catalog_invalid_snapshot");
+    assert_eq!(
+        rolled_back.mutation_disposition,
+        ProjectCatalogMigrationMutationDispositionV1::RecoveredToOldState
+    );
+    assert!(!rehearsal.projects_path.exists());
+    assert!(!rehearsal.attachments_path.exists());
+
+    let reapplied =
+        ProjectCatalogMigrationFacadeV1::apply_rehearsal(ProjectCatalogMigrationApplyRequestV1 {
+            rehearsal_layout: rehearsal.clone(),
+            protected_layout: protected,
+            report_path,
+            resolution_path,
+        })
+        .unwrap();
+    assert_eq!(
+        reapplied.receipt.outcome,
+        ProjectCatalogMigrationApplyOutcomeV1::Applied
+    );
+    let reverified =
+        ProjectCatalogMigrationFacadeV1::verify(ProjectCatalogMigrationVerifyRequestV1 {
+            rehearsal_layout: rehearsal,
+        })
+        .unwrap();
+    assert_eq!(reverified.receipt(), &reapplied.receipt.verification);
 }
