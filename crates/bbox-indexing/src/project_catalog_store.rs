@@ -4903,6 +4903,36 @@ impl ProjectCatalogTransactionOwner {
         )
     }
 
+    fn remove_provisional_migration_receipt_for_rollback(
+        &self,
+        journal: &ProjectCatalogTransactionJournalV1,
+    ) -> ProjectCatalogStoreResult<()> {
+        let Some(bytes) = self
+            .io
+            .read_regular_nofollow(&self.paths.migration_receipt, MAX_JOURNAL_BYTES)?
+        else {
+            return Ok(());
+        };
+        let existing: ProjectCatalogTransactionJournalV1 =
+            decode_bounded_json(&bytes, MAX_JOURNAL_BYTES, "migration receipt")?;
+        existing.validate()?;
+        let mut expected = journal.clone();
+        expected.state = TransactionStateV1::Committed;
+        expected.outcome = Some(TransactionOutcomeV1::Committed);
+        expected.committed_at = existing.committed_at;
+        if existing != expected {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_artifact_collision",
+                "provisional migration receipt disagrees with the rolling-back transaction",
+            ));
+        }
+        self.io.remove_regular_exact(
+            &self.paths.migration_receipt,
+            &sha256(&bytes),
+            MAX_JOURNAL_BYTES,
+        )
+    }
+
     fn migration_journal_for_marker_locked(
         &self,
         marker: &ProjectCatalogMigrationMarkerV1,
@@ -5779,6 +5809,11 @@ impl ProjectCatalogTransactionOwner {
                             "neither complete forward recovery nor complete rollback is possible",
                         ));
                     }
+                }
+                if journal.kind == TransactionKindV1::V1Migration
+                    && journal.outcome == Some(TransactionOutcomeV1::RolledBack)
+                {
+                    self.remove_provisional_migration_receipt_for_rollback(&journal)?;
                 }
                 journal.committed_at = Some(unix_timestamp()?);
                 journal.validate()?;

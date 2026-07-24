@@ -446,7 +446,10 @@ is the existing canonical `projects.json.lock` returned by
 `with_store_lock(projects_path)`, so the bridge `StorePersister`, preflight,
 regular v2 transactions, and migration transactions exclude one another. Path
 derivation is centralized and unit-tested for an arbitrary configured filename
-and parent.
+and parent. A crash may expose the receipt before the active journal commit. If
+recovery can only prove rollback, it removes only the exact matching provisional
+receipt before publishing the rollback journal. Missing, malformed, or
+disagreeing receipt bytes fail closed.
 
 The process-lifetime migration lock and `projects.json.lock` have different
 jobs:
