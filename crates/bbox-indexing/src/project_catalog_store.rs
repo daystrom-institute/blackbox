@@ -5068,7 +5068,8 @@ impl ProjectCatalogTransactionOwner {
             && prior.state == TransactionStateV1::Committed
             && prior.outcome == Some(TransactionOutcomeV1::Committed)
         {
-            self.preserve_committed_migration_journal(prior)?;
+            let mut retained = prior.clone();
+            self.preserve_committed_migration_journal(&mut retained)?;
         }
 
         let transaction_id = ProjectCatalogTransactionId::mint();
