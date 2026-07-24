@@ -2071,7 +2071,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let scope = PublishedScope::try_new("http-repo", ".").unwrap();
         let (state, token) = enabled_http_state(directory.path(), &scope);
-        let app = router(state.clone()).with_state(state);
+        let app = router(state.clone()).with_state(state.clone());
         let entries = vec![ManifestEntry {
             relative_path: "src/lib.rs".into(),
             content_sha256: "b".repeat(64),
@@ -2170,6 +2170,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let response = app
+            .clone()
             .oneshot(authenticated_request(
                 "POST",
                 format!(
