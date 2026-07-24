@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -743,6 +743,70 @@ fn repo_kb_dir(project_dir: &Path) -> PathBuf {
     project_dir.join(".bbox").join("knowledge")
 }
 
+const MAX_LIVE_KNOWLEDGE_FILE_BYTES: usize = 2 * 1024 * 1024;
+
+fn validate_repo_knowledge_id(id: &str) -> Result<()> {
+    let mut components = Path::new(id).components();
+    let Some(std::path::Component::Normal(name)) = components.next() else {
+        anyhow::bail!("knowledge id is not a confined basename: {id:?}");
+    };
+    if components.next().is_some() || name.to_str() != Some(id) {
+        anyhow::bail!("knowledge id is not a confined basename: {id:?}");
+    }
+    Ok(())
+}
+
+fn validate_repo_knowledge_filename(path: &Path, id: &str) -> Result<()> {
+    validate_repo_knowledge_id(id)?;
+    let expected = format!("{id}.json");
+    if path.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
+        anyhow::bail!(
+            "repo-owned knowledge filename/id mismatch: {} contains id {id}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn read_live_knowledge_file(path: &Path) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting repo-owned knowledge file {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        anyhow::bail!(
+            "repo-owned knowledge entry is not a regular non-symlink file: {}",
+            path.display()
+        );
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("opening repo-owned knowledge file {}", path.display()))?;
+    if !file.metadata()?.file_type().is_file() {
+        anyhow::bail!(
+            "repo-owned knowledge entry is not a regular file: {}",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take((MAX_LIVE_KNOWLEDGE_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_LIVE_KNOWLEDGE_FILE_BYTES {
+        anyhow::bail!(
+            "repo-owned knowledge entry exceeds {} bytes: {}",
+            MAX_LIVE_KNOWLEDGE_FILE_BYTES,
+            path.display()
+        );
+    }
+    Ok(bytes)
+}
+
 /// Host-local recall telemetry for a repo's entries. Recall stats (`recall_count`,
 /// `last_recalled`) are high-churn *activity*, not durable knowledge: bumping them
 /// on every search would rewrite the committed `.bbox/knowledge/<id>.json` files
@@ -827,10 +891,12 @@ fn persist_repo_kb_stats(
         let _ = fs::write(&gitignore, "*\n!.gitignore\n");
     }
     let new_bytes = bbox_corpus_core::json_store::to_vec_pretty_newline(stats)?;
-    if fs::read(&path).map(|cur| cur == new_bytes).unwrap_or(false) {
-        return Ok(());
-    }
-    bbox_corpus_core::json_store::atomic_write_json_locked(&path, stats)?;
+    bbox_corpus_core::json_store::with_store_lock(&path, || {
+        if fs::read(&path).map(|cur| cur == new_bytes).unwrap_or(false) {
+            return Ok(());
+        }
+        bbox_corpus_core::json_store::atomic_write_json_locked(&path, stats)
+    })?;
     sync_parent_directory(&path)
 }
 
@@ -907,7 +973,7 @@ fn load_repo_kb_entries(
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let raw = match fs::read_to_string(&path) {
+        let raw = match read_live_knowledge_file(&path) {
             Ok(raw) => raw,
             Err(e) => {
                 tracing::warn!("kb load: skipping unreadable {}: {e}", path.display());
@@ -915,7 +981,7 @@ fn load_repo_kb_entries(
                 continue;
             }
         };
-        let mut entry: KnowledgeEntry = match serde_json::from_str(&raw) {
+        let mut entry: KnowledgeEntry = match serde_json::from_slice(&raw) {
             Ok(entry) => entry,
             Err(e) => {
                 tracing::warn!("kb load: skipping unparseable {}: {e}", path.display());
@@ -923,6 +989,14 @@ fn load_repo_kb_entries(
                 continue;
             }
         };
+        if let Err(error) = validate_repo_knowledge_filename(&path, &entry.id) {
+            tracing::warn!(
+                "kb load: skipping unsafe repo-owned entry {}: {error}",
+                path.display()
+            );
+            skipped += 1;
+            continue;
+        }
         entry.project = Some(durable_project.to_string());
         // Published-vs-provisional label (slice 3.2): a working file
         // byte-identical to its committed-tree blob is Published; anything else
@@ -935,7 +1009,7 @@ fn load_repo_kb_entries(
             let repo_rel = format!("{rel_prefix}.bbox/knowledge/{}.json", entry.id);
             let prov = match bbox_corpus_core::git::read_committed_file(git_root, "HEAD", &repo_rel)
             {
-                Some(committed) if committed == raw => EntryProvenance::Published,
+                Some(committed) if committed.as_bytes() == raw => EntryProvenance::Published,
                 _ => EntryProvenance::Provisional,
             };
             provenance.insert(entry.id.clone(), prov);
@@ -988,29 +1062,16 @@ fn provenance_context(project_dir: &Path) -> Option<(PathBuf, String)> {
 /// meaning its logical carrier was loaded through read authority.
 /// Purging against an incomplete view would delete committed entries that were
 /// never loaded; callers pass `purge=false` in that case (additive write only).
+/// Even in purge mode, unknown or load-rejected ids and checkout-redirected ids
+/// are retained. Only a record known to the complete store may be affirmatively
+/// removed or reassigned.
 fn persist_repo_kb_entries(
     project_dir: &Path,
     entries: &[&KnowledgeEntry],
     purge: bool,
+    known_ids: &BTreeSet<&str>,
+    redirected_ids: &BTreeSet<&str>,
 ) -> Result<()> {
-    let dir = repo_kb_dir(project_dir);
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-
-    if purge {
-        let keep: BTreeSet<&str> = entries.iter().map(|e| e.id.as_str()).collect();
-        for de in fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
-            let path = de?.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                if !keep.contains(stem) {
-                    let _ = fs::remove_file(&path);
-                }
-            }
-        }
-    }
-
     // Recall telemetry -> host-local sidecar. When authoritative (purge), rebuild
     // from scratch so stats for removed ids are pruned. When additive (the set may
     // be incomplete), merge onto the existing sidecar so we don't drop stats for
@@ -1036,21 +1097,92 @@ fn persist_repo_kb_entries(
                 },
             );
         }
-        let mut on_disk = (*entry).clone();
-        on_disk.project = None;
-        // Durable content only — recall telemetry lives in the sidecar.
-        on_disk.recall_count = 0;
-        on_disk.last_recalled = None;
-        let path = dir.join(format!("{}.json", entry.id));
-        // Skip the write when the committed content is byte-identical, so a
-        // recall-only bump (which changed nothing durable) does not rewrite the
-        // file, churn git, or trip the `.bbox/knowledge/` watcher.
-        let new_bytes = bbox_corpus_core::json_store::to_vec_pretty_newline(&on_disk)?;
-        if fs::read(&path).map(|cur| cur == new_bytes).unwrap_or(false) {
-            continue;
-        }
-        bbox_corpus_core::json_store::atomic_write_json_locked(&path, &on_disk)?;
     }
+    let checkout_dir = match bbox_corpus_core::git::git_root_for_path(project_dir) {
+        Some(root) => root,
+        None => project_dir.canonicalize().with_context(|| {
+            format!(
+                "resolving non-git knowledge transaction root at {}",
+                project_dir.display()
+            )
+        })?,
+    };
+    bbox_corpus_core::transaction::apply_planned_transaction(&checkout_dir, || {
+        use bbox_corpus_core::transaction::TransactionWrite;
+
+        let dir = repo_kb_dir(project_dir);
+        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let mut writes = Vec::new();
+        if purge {
+            let keep: BTreeSet<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+            for directory_entry in
+                fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))?
+            {
+                let path = directory_entry?.path();
+                if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                    tracing::warn!(
+                        "kb save: keeping non-UTF-8 on-disk knowledge file {}; refusing to purge",
+                        path.display()
+                    );
+                    continue;
+                };
+                if keep.contains(stem) || redirected_ids.contains(stem) {
+                    continue;
+                }
+                if !known_ids.contains(stem) {
+                    tracing::warn!(
+                        "kb save: keeping unknown on-disk knowledge file {}; id not in store \
+                         (out-of-band file or load-time rejection); refusing to purge",
+                        path.display()
+                    );
+                    continue;
+                }
+                writes.push(TransactionWrite {
+                    target: path,
+                    new_bytes: None,
+                });
+            }
+        }
+
+        for entry in entries {
+            validate_repo_knowledge_id(&entry.id)?;
+            let mut on_disk = (*entry).clone();
+            on_disk.project = None;
+            // Durable content only — recall telemetry lives in the sidecar.
+            on_disk.recall_count = 0;
+            on_disk.last_recalled = None;
+            let path = dir.join(format!("{}.json", entry.id));
+            let new_bytes = bbox_corpus_core::json_store::to_vec_pretty_newline(&on_disk)?;
+            let unchanged = match fs::symlink_metadata(&path) {
+                Ok(metadata)
+                    if metadata.file_type().is_file() && !metadata.file_type().is_symlink() =>
+                {
+                    read_live_knowledge_file(&path)? == new_bytes
+                }
+                Ok(_) => {
+                    anyhow::bail!(
+                        "refusing to overwrite non-regular or symlink knowledge file {}",
+                        path.display()
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("inspecting knowledge file {}", path.display()));
+                }
+            };
+            if !unchanged {
+                writes.push(TransactionWrite {
+                    target: path,
+                    new_bytes: Some(new_bytes),
+                });
+            }
+        }
+        Ok(writes)
+    })?;
     persist_repo_kb_stats(project_dir, &stats)?;
     Ok(())
 }
@@ -1175,6 +1307,11 @@ pub struct Knowledge {
     /// Durable project scopes observed with a repo-owned knowledge directory
     /// during the latest authorized reload or mutation.
     repo_owned_projects: BTreeSet<String>,
+    /// Successfully loaded ids by concrete carrier. Generation purge may
+    /// remove only these files, so malformed, unsafe, symlinked, or
+    /// cross-scope-shadowed records remain protected even if another scope
+    /// happens to use the same logical id.
+    repo_loaded_ids: BTreeMap<String, BTreeSet<String>>,
     /// Request-local identity and provenance for detached visibility views.
     /// Empty on the mutable durable store.
     view_metadata: BTreeMap<String, KnowledgeViewMetadata>,
@@ -1345,6 +1482,7 @@ impl Knowledge {
             repo_read: None,
             repo_write: None,
             repo_owned_projects: BTreeSet::new(),
+            repo_loaded_ids: BTreeMap::new(),
             view_metadata: BTreeMap::new(),
             path_fallback_cut: false,
         };
@@ -1503,10 +1641,24 @@ impl Knowledge {
             .iter()
             .map(|carrier| carrier.carrier_id.as_str())
             .collect::<BTreeSet<_>>();
+        // Checkout-targeted knowledge mutations are restored or removed from
+        // the mutable base view immediately after their additive transaction,
+        // so no durable redirect survives into this bulk base-carrier pass.
+        // Keep the explicit guard in the persistence contract to prevent a
+        // future retained redirect from silently becoming a base deletion.
+        let redirected_ids = BTreeSet::new();
+        let no_loaded_ids = BTreeSet::new();
         for (carrier, entries) in &by_carrier {
             let purge = loaded.contains(carrier.carrier_id.as_str());
+            let known_ids = self
+                .repo_loaded_ids
+                .get(&carrier.carrier_id)
+                .unwrap_or(&no_loaded_ids)
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
             self.with_repo_write(carrier, |root| {
-                persist_repo_kb_entries(root, entries, purge)
+                persist_repo_kb_entries(root, entries, purge, &known_ids, &redirected_ids)
             })?;
         }
         Ok(())
@@ -1581,6 +1733,7 @@ impl Knowledge {
             let mut writes = Vec::new();
             let mut stats = load_repo_kb_stats(project_dir);
             for &entry in &entries {
+                validate_repo_knowledge_id(&entry.id)?;
                 if entry.recall_count > 0 || entry.last_recalled.is_some() {
                     stats.insert(
                         entry.id.clone(),
@@ -1596,11 +1749,30 @@ impl Knowledge {
                 on_disk.last_recalled = None;
                 let path = repo_kb_dir(project_dir).join(format!("{}.json", entry.id));
                 let new_bytes = bbox_corpus_core::json_store::to_vec_pretty_newline(&on_disk)?;
-                if fs::read(&path)
-                    .map(|current| current == new_bytes)
-                    .unwrap_or(false)
-                {
-                    continue;
+                match fs::symlink_metadata(&path) {
+                    Ok(metadata)
+                        if metadata.file_type().is_file()
+                            && !metadata.file_type().is_symlink()
+                            && read_live_knowledge_file(&path)? == new_bytes =>
+                    {
+                        continue;
+                    }
+                    Ok(metadata)
+                        if metadata.file_type().is_symlink()
+                            || !metadata.file_type().is_file() =>
+                    {
+                        anyhow::bail!(
+                            "refusing to overwrite non-regular or symlink knowledge file {}",
+                            path.display()
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("inspecting knowledge file {}", path.display())
+                        });
+                    }
                 }
                 writes.push(crate::transaction::TransactionWrite {
                     target: path,
@@ -1656,9 +1828,9 @@ impl Knowledge {
     }
 
     /// Merge repo-owned project entries on top of central. Repo is authoritative
-    /// for project scope, so it wins on id collision — which also self-heals a
-    /// pre-migration central store that still carries project copies (they get
-    /// dropped from central on the next save).
+    /// only for the same durable project scope, so it replaces a pre-migration
+    /// central copy but cannot shadow a global entry or another project's
+    /// logical knowledge id.
     fn load_project_entries(&mut self) -> Result<()> {
         let carriers = self.project_carriers.clone();
         // Fresh each reload: `built_from` is load-time provenance, so a root
@@ -1671,9 +1843,10 @@ impl Knowledge {
         // dropped root or a promoted entry does not keep a stale label.
         self.store.provenance.clear();
         self.repo_owned_projects.clear();
+        self.repo_loaded_ids.clear();
         for carrier in &carriers {
             let durable_project = carrier.project.clone();
-            let (head, entries, prov, repo_owned) = self.with_repo_read(carrier, |root| {
+            let (head, entries, mut prov, repo_owned) = self.with_repo_read(carrier, |root| {
                 let (entries, provenance) = load_repo_kb_entries(root, &carrier.project)?;
                 Ok((
                     bbox_corpus_core::git::current_head(root),
@@ -1691,12 +1864,41 @@ impl Knowledge {
                     .entries
                     .retain(|entry| entry.project.as_deref() != Some(durable_project.as_str()));
             }
-            self.store.provenance.extend(prov);
             for entry in entries {
+                let loaded_id = entry.id.clone();
+                let mut accepted = false;
                 if let Some(existing) = self.store.entries.iter_mut().find(|e| e.id == entry.id) {
-                    *existing = entry;
+                    if existing.scope == Scope::Project
+                        && existing.project.as_deref() == Some(durable_project.as_str())
+                    {
+                        let id = entry.id.clone();
+                        *existing = entry;
+                        accepted = true;
+                        if let Some(provenance) = prov.remove(&id) {
+                            self.store.provenance.insert(id, provenance);
+                        }
+                    } else {
+                        tracing::warn!(
+                            id = %entry.id,
+                            project = %durable_project,
+                            existing_scope = ?existing.scope,
+                            existing_project = ?existing.project,
+                            "kb load: refusing cross-scope knowledge id shadow"
+                        );
+                    }
                 } else {
+                    let id = entry.id.clone();
                     self.store.entries.push(entry);
+                    accepted = true;
+                    if let Some(provenance) = prov.remove(&id) {
+                        self.store.provenance.insert(id, provenance);
+                    }
+                }
+                if accepted {
+                    self.repo_loaded_ids
+                        .entry(carrier.carrier_id.clone())
+                        .or_default()
+                        .insert(loaded_id);
                 }
             }
             if let Some(head) = head {
@@ -3694,6 +3896,7 @@ impl Knowledge {
             repo_read: None,
             repo_write: None,
             repo_owned_projects: BTreeSet::new(),
+            repo_loaded_ids: BTreeMap::new(),
             view_metadata,
             path_fallback_cut: true,
         }
@@ -3987,6 +4190,18 @@ mod tests {
             recall_count: 0,
             last_recalled: None,
         }
+    }
+
+    fn persist_repo_entries_for_test(
+        root: &Path,
+        entries: &[&KnowledgeEntry],
+        purge: bool,
+    ) -> Result<()> {
+        let known_ids = entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<BTreeSet<_>>();
+        persist_repo_kb_entries(root, entries, purge, &known_ids, &BTreeSet::new())
     }
 
     #[test]
@@ -5821,7 +6036,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             last_recalled: Some("2026-05-30T00:00:00Z".into()),
         };
 
-        persist_repo_kb_entries(&repo_root, &[&entry], true).unwrap();
+        persist_repo_entries_for_test(&repo_root, &[&entry], true).unwrap();
 
         // Committed file holds durable content only — no recall telemetry.
         let committed_path = repo_kb_dir(&repo_root).join("recl0001.json");
@@ -5856,7 +6071,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let before = fs::read(&committed_path).unwrap();
         entry.recall_count = 99;
         entry.last_recalled = Some("2026-05-31T00:00:00Z".into());
-        persist_repo_kb_entries(&repo_root, &[&entry], true).unwrap();
+        persist_repo_entries_for_test(&repo_root, &[&entry], true).unwrap();
         let after = fs::read(&committed_path).unwrap();
         assert_eq!(
             before, after,
@@ -5908,7 +6123,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             last_recalled: Some("2026-05-30T00:00:00Z".into()),
         };
         // Authoritative save seeds the sidecar with real stats.
-        persist_repo_kb_entries(&repo_root, &[&entry], true).unwrap();
+        persist_repo_entries_for_test(&repo_root, &[&entry], true).unwrap();
         assert!(
             fs::read_to_string(repo_kb_stats_path(&repo_root))
                 .unwrap()
@@ -5918,7 +6133,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         // Additive save with zero in-memory telemetry must preserve the stat.
         entry.recall_count = 0;
         entry.last_recalled = None;
-        persist_repo_kb_entries(&repo_root, &[&entry], false).unwrap();
+        persist_repo_entries_for_test(&repo_root, &[&entry], false).unwrap();
         let sidecar = fs::read_to_string(repo_kb_stats_path(&repo_root)).unwrap();
         assert!(
             sidecar.contains("keep0001") && sidecar.contains("\"recall_count\": 5"),
@@ -5983,6 +6198,137 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         assert!(
             kb_dir.join("committed.json").exists(),
             "committed repo file must survive a save with unloaded roots"
+        );
+    }
+
+    #[test]
+    fn authoritative_purge_keeps_unknown_and_redirected_repo_files() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let knowledge_dir = repo_kb_dir(&root);
+        fs::create_dir_all(&knowledge_dir).unwrap();
+        let unknown = knowledge_dir.join("peer-entry.json");
+        fs::write(&unknown, b"{not valid json").unwrap();
+
+        let stayer = entry("stayer", "stayer", "base", Scope::Project);
+        let redirected = entry("redirected", "redirected", "base", Scope::Project);
+        let known_ids = BTreeSet::from([stayer.id.as_str(), redirected.id.as_str()]);
+        persist_repo_kb_entries(
+            &root,
+            &[&stayer, &redirected],
+            true,
+            &known_ids,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let redirected_path = knowledge_dir.join("redirected.json");
+
+        persist_repo_kb_entries(
+            &root,
+            &[&stayer],
+            true,
+            &known_ids,
+            &BTreeSet::from([redirected.id.as_str()]),
+        )
+        .unwrap();
+
+        assert!(unknown.exists(), "unknown load-rejected bytes must survive");
+        assert!(
+            redirected_path.exists(),
+            "checkout-redirected base bytes must survive"
+        );
+    }
+
+    #[test]
+    fn repo_loader_rejects_filename_id_mismatch_and_traversal_ids() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let knowledge_dir = repo_kb_dir(&root);
+        fs::create_dir_all(&knowledge_dir).unwrap();
+        let mut unsafe_entry = entry("../escape", "unsafe", "body", Scope::Project);
+        unsafe_entry.project = None;
+        fs::write(
+            knowledge_dir.join("safe-name.json"),
+            serde_json::to_vec(&unsafe_entry).unwrap(),
+        )
+        .unwrap();
+
+        let (loaded, _) = load_repo_kb_entries(&root, root.to_string_lossy().as_ref()).unwrap();
+        assert!(loaded.is_empty(), "unsafe id must not enter the live store");
+
+        let known_ids = BTreeSet::from([unsafe_entry.id.as_str()]);
+        let error =
+            persist_repo_kb_entries(&root, &[&unsafe_entry], false, &known_ids, &BTreeSet::new())
+                .unwrap_err();
+        assert!(error.to_string().contains("confined basename"));
+        assert!(!root.join(".bbox/escape.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_loader_rejects_symlinked_knowledge_files() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("linked.json");
+        fs::write(
+            &target,
+            serde_json::to_vec(&entry("linked", "linked", "body", Scope::Project)).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(repo_kb_dir(&root)).unwrap();
+        symlink(&target, repo_kb_dir(&root).join("linked.json")).unwrap();
+
+        let (loaded, _) = load_repo_kb_entries(&root, root.to_string_lossy().as_ref()).unwrap();
+        assert!(loaded.is_empty(), "symlinked knowledge must not load");
+    }
+
+    #[test]
+    fn repo_entry_cannot_shadow_global_logical_id() {
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let project = root.to_string_lossy().into_owned();
+        fs::create_dir_all(repo_kb_dir(&root)).unwrap();
+
+        let global = entry("shared-id", "global", "global truth", Scope::Global);
+        let central_store = KnowledgeStore {
+            version: 1,
+            entries: vec![global],
+            provenance: BTreeMap::new(),
+            built_from: BTreeMap::new(),
+        };
+        let store_path = central.path().join("kb.json");
+        fs::write(
+            &store_path,
+            bbox_corpus_core::json_store::to_vec_pretty_newline(&central_store).unwrap(),
+        )
+        .unwrap();
+        let project_entry = entry("shared-id", "project", "must not shadow", Scope::Project);
+        fs::write(
+            repo_kb_dir(&root).join("shared-id.json"),
+            bbox_corpus_core::json_store::to_vec_pretty_newline(&project_entry).unwrap(),
+        )
+        .unwrap();
+        let stayer = entry("stayer", "stayer", "keeps purge active", Scope::Project);
+        fs::write(
+            repo_kb_dir(&root).join("stayer.json"),
+            bbox_corpus_core::json_store::to_vec_pretty_newline(&stayer).unwrap(),
+        )
+        .unwrap();
+
+        let mut knowledge = Knowledge::open(&store_path).unwrap();
+        knowledge.set_project_roots(vec![root.clone()]).unwrap();
+        let visible = knowledge.entry("shared-id").unwrap();
+        assert_eq!(visible.scope, Scope::Global);
+        assert_eq!(visible.content, "global truth");
+        assert_eq!(knowledge.count_project_entries(&project), 1);
+        knowledge.record_recall(&["stayer".into()]).unwrap();
+        assert!(
+            repo_kb_dir(&root).join("shared-id.json").exists(),
+            "cross-scope collision rejected at load must remain purge-protected"
         );
     }
 

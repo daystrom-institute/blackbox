@@ -113,7 +113,9 @@ Checkout gap variants are no longer retained in the host-global store. Gap
 lists and inbox views now read pinned published records plus
 session-authoritative `published|own|all` overlays.
 
-Still not implemented: response-level `built_from`. Section 6 records the
+Response-level `built_from` is also landed for knowledge and gap list, search,
+inspection, and mixed-view responses. Each response emits a compact stamp table
+and returned rows reference it by response-local id. Section 6 records the
 landed sequence.
 
 When this document and an additive primitive disagree, the contract here wins
@@ -371,9 +373,10 @@ not a repeated per-entry commit field.
   content hash. Text/list responses emit the distinct stamps used by their
   returned rows once, then point rows at them.
 
-The landed `KnowledgeStore.built_from` map is internal load-time storage only;
-it is not yet the response contract above. The index side substantially exists
-already: project-file docs are
+The `KnowledgeStore.built_from` map remains internal load-time storage rather
+than the wire contract. The response contract above is landed through
+response-local `BuiltFromTable` values and row references for both knowledge
+and gaps. The index side substantially exists already: project-file docs are
 stamped from `(repo_id, project_id, head_sha)` (`project_files.rs`
 `clean_snapshot_id` + `head_fingerprint`), so this slice mainly adds the
 knowledge view stamps and index fields.

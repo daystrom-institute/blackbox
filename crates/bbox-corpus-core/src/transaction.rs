@@ -113,6 +113,19 @@ pub fn apply_transaction(
     if writes.is_empty() {
         return Ok(None);
     }
+    apply_planned_transaction(checkout_dir, || Ok(writes))
+}
+
+/// Plan and apply one transaction while holding the checkout transaction lane.
+///
+/// Bulk read-modify-write callers must use this entry point so directory
+/// enumeration, generation-purge decisions, and old-byte capture cannot race a
+/// second daemon writer that owns the same checkout. The returned writes still
+/// flow through the ordinary crash-consistent manifest and recovery protocol.
+pub fn apply_planned_transaction(
+    checkout_dir: &Path,
+    plan: impl FnOnce() -> Result<Vec<TransactionWrite>>,
+) -> Result<Option<RepoTransactionManifest>> {
     let checkout_dir = checkout_dir
         .canonicalize()
         .with_context(|| format!("canonicalizing checkout {}", checkout_dir.display()))?;
@@ -130,6 +143,10 @@ pub fn apply_transaction(
             root.display()
         )
     })?;
+    let writes = plan()?;
+    if writes.is_empty() {
+        return Ok(None);
+    }
     ensure_unique_targets(&writes)?;
 
     let transaction_id = transaction_id();

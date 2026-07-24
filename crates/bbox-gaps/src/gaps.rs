@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -567,6 +568,67 @@ fn repo_gaps_dir(project_dir: &Path) -> PathBuf {
     project_dir.join(".bbox").join("gaps")
 }
 
+const MAX_LIVE_GAP_FILE_BYTES: usize = 2 * 1024 * 1024;
+
+fn validate_repo_gap_id(id: &str) -> Result<()> {
+    let mut components = Path::new(id).components();
+    let Some(std::path::Component::Normal(name)) = components.next() else {
+        anyhow::bail!("gap id is not a confined basename: {id:?}");
+    };
+    if components.next().is_some() || name.to_str() != Some(id) {
+        anyhow::bail!("gap id is not a confined basename: {id:?}");
+    }
+    Ok(())
+}
+
+fn validate_repo_gap_filename(path: &Path, id: &str) -> Result<()> {
+    validate_repo_gap_id(id)?;
+    let expected = format!("{id}.json");
+    if path.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
+        anyhow::bail!(
+            "repo-owned gap filename/id mismatch: {} contains id {id}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn read_live_gap_file(path: &Path) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting repo-owned gap file {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        anyhow::bail!(
+            "repo-owned gap is not a regular non-symlink file: {}",
+            path.display()
+        );
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("opening repo-owned gap file {}", path.display()))?;
+    if !file.metadata()?.file_type().is_file() {
+        anyhow::bail!("repo-owned gap is not a regular file: {}", path.display());
+    }
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take((MAX_LIVE_GAP_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_LIVE_GAP_FILE_BYTES {
+        anyhow::bail!(
+            "repo-owned gap exceeds {} bytes: {}",
+            MAX_LIVE_GAP_FILE_BYTES,
+            path.display()
+        );
+    }
+    Ok(bytes)
+}
+
 /// A project is "repo-owned" for gaps once its `.bbox/gaps/` dir exists — via a
 /// clone that carries it, `bbox_project_init`, the spool dropping a file, or the
 /// first project-scoped `bbox_gap`.
@@ -614,7 +676,7 @@ fn load_repo_gap_entries(project_dir: &Path, durable_project: &str) -> Result<Ve
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let raw = match fs::read_to_string(&path) {
+        let raw = match read_live_gap_file(&path) {
             Ok(raw) => raw,
             Err(e) => {
                 tracing::warn!("gaps load: skipping unreadable {}: {e}", path.display());
@@ -622,7 +684,7 @@ fn load_repo_gap_entries(project_dir: &Path, durable_project: &str) -> Result<Ve
                 continue;
             }
         };
-        let mut entry: GapNote = match serde_json::from_str(&raw) {
+        let mut entry: GapNote = match serde_json::from_slice(&raw) {
             Ok(entry) => entry,
             Err(e) => {
                 tracing::warn!("gaps load: skipping unparseable {}: {e}", path.display());
@@ -630,6 +692,14 @@ fn load_repo_gap_entries(project_dir: &Path, durable_project: &str) -> Result<Ve
                 continue;
             }
         };
+        if let Err(error) = validate_repo_gap_filename(&path, &entry.id) {
+            tracing::warn!(
+                "gaps load: skipping unsafe repo-owned entry {}: {error}",
+                path.display()
+            );
+            skipped += 1;
+            continue;
+        }
         entry.project = Some(durable_project.to_string());
         // Committed records never carry a write redirect — the file's
         // location IS the carrier. Clearing here also makes loading a base
@@ -677,32 +747,44 @@ fn persist_repo_gap_entries(
     known_ids: &BTreeSet<&str>,
     redirected_ids: &BTreeSet<&str>,
 ) -> Result<()> {
-    use bbox_corpus_core::transaction::TransactionWrite;
+    let checkout_dir = match bbox_corpus_core::git::git_root_for_path(project_dir) {
+        Some(root) => root,
+        None => project_dir.canonicalize().with_context(|| {
+            format!(
+                "resolving non-git gap transaction root at {}",
+                project_dir.display()
+            )
+        })?,
+    };
+    bbox_corpus_core::transaction::apply_planned_transaction(&checkout_dir, || {
+        use bbox_corpus_core::transaction::TransactionWrite;
 
-    let dir = repo_gaps_dir(project_dir);
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let mut writes = Vec::new();
-
-    if purge {
-        let keep: BTreeSet<&str> = entries.iter().map(|e| e.id.as_str()).collect();
-        for de in fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
-            let path = de?.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                if keep.contains(stem) {
+        let dir = repo_gaps_dir(project_dir);
+        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let mut writes = Vec::new();
+        if purge {
+            let keep: BTreeSet<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+            for directory_entry in
+                fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))?
+            {
+                let path = directory_entry?.path();
+                if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
                     continue;
                 }
-                if redirected_ids.contains(stem) {
-                    // Write-redirected this save, not reassigned: the base
-                    // copy stays until the worktree branch merges it forward.
+                let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                    tracing::warn!(
+                        "gaps save: keeping non-UTF-8 on-disk gap file {}; refusing to purge",
+                        path.display()
+                    );
+                    continue;
+                };
+                if keep.contains(stem) || redirected_ids.contains(stem) {
                     continue;
                 }
                 if !known_ids.contains(stem) {
                     tracing::warn!(
-                        "gaps save: keeping unknown on-disk gap file {} — id not in store \
-                         (out-of-band file or load-time parse failure); refusing to purge",
+                        "gaps save: keeping unknown on-disk gap file {}; id not in store \
+                         (out-of-band file or load-time rejection); refusing to purge",
                         path.display()
                     );
                     continue;
@@ -713,33 +795,42 @@ fn persist_repo_gap_entries(
                 });
             }
         }
-    }
 
-    for entry in entries {
-        let mut on_disk = (*entry).clone();
-        on_disk.project = None;
-        on_disk.write_dir = None;
-        on_disk.provisional_checkout_id = None;
-        let path = dir.join(format!("{}.json", entry.id));
-        let new_bytes = bbox_corpus_core::json_store::to_vec_pretty_newline(&on_disk)?;
-        if fs::read(&path).map(|cur| cur == new_bytes).unwrap_or(false) {
-            continue;
+        for entry in entries {
+            validate_repo_gap_id(&entry.id)?;
+            let mut on_disk = (*entry).clone();
+            on_disk.project = None;
+            on_disk.write_dir = None;
+            on_disk.provisional_checkout_id = None;
+            let path = dir.join(format!("{}.json", entry.id));
+            let new_bytes = bbox_corpus_core::json_store::to_vec_pretty_newline(&on_disk)?;
+            let unchanged = match fs::symlink_metadata(&path) {
+                Ok(metadata)
+                    if metadata.file_type().is_file() && !metadata.file_type().is_symlink() =>
+                {
+                    read_live_gap_file(&path)? == new_bytes
+                }
+                Ok(_) => {
+                    anyhow::bail!(
+                        "refusing to overwrite non-regular or symlink gap file {}",
+                        path.display()
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("inspecting gap file {}", path.display()));
+                }
+            };
+            if !unchanged {
+                writes.push(TransactionWrite {
+                    target: path,
+                    new_bytes: Some(new_bytes),
+                });
+            }
         }
-        writes.push(TransactionWrite {
-            target: path,
-            new_bytes: Some(new_bytes),
-        });
-    }
-    let checkout_dir = match bbox_corpus_core::git::git_root_for_path(project_dir) {
-        Some(root) => root,
-        None => project_dir.canonicalize().with_context(|| {
-            format!(
-                "resolving non-git gap transaction root at {}",
-                project_dir.display()
-            )
-        })?,
-    };
-    bbox_corpus_core::transaction::apply_transaction(&checkout_dir, writes)?;
+        Ok(writes)
+    })?;
     Ok(())
 }
 
@@ -2274,6 +2365,62 @@ mod tests {
             broken.exists(),
             "purge must keep files whose id the store does not hold"
         );
+    }
+
+    #[test]
+    fn repo_gap_loader_rejects_mismatched_and_traversal_ids() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir_all(repo_gaps_dir(&root)).unwrap();
+        let central = tempdir().unwrap();
+        let mut seed = GapStore::open(&central.path().join("gaps.json")).unwrap();
+        seed.file(&file_params(
+            "unsafe id",
+            "tooling/test-domain/unsafe-gap-id",
+        ))
+        .unwrap();
+        let mut unsafe_gap = seed.all()[0].clone();
+        unsafe_gap.id = "../escape".into();
+        unsafe_gap.project = None;
+        fs::write(
+            repo_gaps_dir(&root).join("safe-name.json"),
+            serde_json::to_vec(&unsafe_gap).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_repo_gap_entries(&root, root.to_string_lossy().as_ref()).unwrap();
+        assert!(loaded.is_empty(), "unsafe id must not enter the gap store");
+
+        let known_ids = BTreeSet::from([unsafe_gap.id.as_str()]);
+        let error =
+            persist_repo_gap_entries(&root, &[&unsafe_gap], false, &known_ids, &BTreeSet::new())
+                .unwrap_err();
+        assert!(error.to_string().contains("confined basename"));
+        assert!(!root.join(".bbox/escape.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_gap_loader_rejects_symlinked_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let outside = tempdir().unwrap();
+        let central = tempdir().unwrap();
+        let mut seed = GapStore::open(&central.path().join("gaps.json")).unwrap();
+        seed.file(&file_params("linked", "tooling/test-domain/symlink-gap"))
+            .unwrap();
+        let mut linked = seed.all()[0].clone();
+        linked.id = "gap-linked".into();
+        linked.project = None;
+        let target = outside.path().join("gap-linked.json");
+        fs::write(&target, serde_json::to_vec(&linked).unwrap()).unwrap();
+        fs::create_dir_all(repo_gaps_dir(&root)).unwrap();
+        symlink(&target, repo_gaps_dir(&root).join("gap-linked.json")).unwrap();
+
+        let loaded = load_repo_gap_entries(&root, root.to_string_lossy().as_ref()).unwrap();
+        assert!(loaded.is_empty(), "symlinked gap must not load");
     }
 
     /// Generation purge still reaps a file whose gap the store has
