@@ -227,6 +227,17 @@ impl NofollowDirectory {
     }
 
     pub fn atomic_replace(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.atomic_replace_from(name, self, bytes)
+    }
+
+    /// Atomically replace one regular-file basename through held directory
+    /// descriptors while staging the temporary file in another held directory.
+    pub fn atomic_replace_from(
+        &self,
+        name: &str,
+        temp_directory: &Self,
+        bytes: &[u8],
+    ) -> Result<()> {
         validate_relative_basename(name)?;
         #[cfg(unix)]
         {
@@ -242,7 +253,7 @@ impl NofollowDirectory {
                     .expect("code-owned temporary filename has no NUL byte");
                 let descriptor = unsafe {
                     libc::openat(
-                        self.file.as_raw_fd(),
+                        temp_directory.file.as_raw_fd(),
                         temp_name.as_ptr(),
                         libc::O_CREAT
                             | libc::O_EXCL
@@ -258,7 +269,10 @@ impl NofollowDirectory {
                         continue;
                     }
                     return Err(error).with_context(|| {
-                        format!("failed to create temporary file in {}", self.path.display())
+                        format!(
+                            "failed to create temporary file in {}",
+                            temp_directory.path.display()
+                        )
                     });
                 }
                 let mut file = unsafe { File::from_raw_fd(descriptor) };
@@ -266,13 +280,13 @@ impl NofollowDirectory {
                 drop(file);
                 if let Err(error) = write_result {
                     unsafe {
-                        libc::unlinkat(self.file.as_raw_fd(), temp_name.as_ptr(), 0);
+                        libc::unlinkat(temp_directory.file.as_raw_fd(), temp_name.as_ptr(), 0);
                     }
                     return Err(error).context("failed to write and fsync temporary file");
                 }
                 let renamed = unsafe {
                     libc::renameat(
-                        self.file.as_raw_fd(),
+                        temp_directory.file.as_raw_fd(),
                         temp_name.as_ptr(),
                         self.file.as_raw_fd(),
                         destination.as_ptr(),
@@ -281,22 +295,87 @@ impl NofollowDirectory {
                 if renamed < 0 {
                     let error = std::io::Error::last_os_error();
                     unsafe {
-                        libc::unlinkat(self.file.as_raw_fd(), temp_name.as_ptr(), 0);
+                        libc::unlinkat(temp_directory.file.as_raw_fd(), temp_name.as_ptr(), 0);
                     }
                     return Err(error).with_context(|| {
                         format!("failed to atomically replace {label}", label = name)
                     });
                 }
-                return self
-                    .file
-                    .sync_all()
-                    .with_context(|| format!("failed to fsync directory {}", self.path.display()));
+                self.file.sync_all().with_context(|| {
+                    format!("failed to fsync directory {}", self.path.display())
+                })?;
+                if self.path != temp_directory.path {
+                    temp_directory.file.sync_all().with_context(|| {
+                        format!(
+                            "failed to fsync temporary directory {}",
+                            temp_directory.path.display()
+                        )
+                    })?;
+                }
+                return Ok(());
             }
             anyhow::bail!("temporary filename retries exhausted");
         }
         #[cfg(not(unix))]
         {
-            atomic_write_bytes_from_dir_locked(&self.path.join(name), &self.path, bytes)
+            atomic_write_bytes_from_dir_locked(&self.path.join(name), &temp_directory.path, bytes)
+        }
+    }
+
+    /// Remove a regular-file basename through this held directory authority.
+    /// Missing files are reported as `false`; symlinks and non-files fail
+    /// closed.
+    pub fn remove_regular(&self, name: &str, label: &str) -> Result<bool> {
+        validate_relative_basename(name)?;
+        #[cfg(unix)]
+        {
+            use std::ffi::CString;
+            use std::os::fd::{AsRawFd, FromRawFd};
+
+            let name = CString::new(name).context("relative filename contains a NUL byte")?;
+            let descriptor = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if descriptor < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ENOENT) {
+                    return Ok(false);
+                }
+                return Err(error)
+                    .with_context(|| format!("failed to open {label} before removal"));
+            }
+            let file = unsafe { File::from_raw_fd(descriptor) };
+            if !file.metadata()?.file_type().is_file() {
+                anyhow::bail!("refusing to remove non-regular {label}");
+            }
+            drop(file);
+            if unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0) } < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("failed to remove {label}"));
+            }
+            self.file
+                .sync_all()
+                .with_context(|| format!("failed to fsync directory {}", self.path.display()))?;
+            Ok(true)
+        }
+        #[cfg(not(unix))]
+        {
+            let path = self.path.join(name);
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error).with_context(|| format!("inspecting {label}")),
+            };
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                anyhow::bail!("refusing to remove non-regular {label}");
+            }
+            fs::remove_file(&path).with_context(|| format!("removing {label}"))?;
+            self.sync_all()?;
+            Ok(true)
         }
     }
 

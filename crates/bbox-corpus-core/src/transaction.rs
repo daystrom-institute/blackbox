@@ -11,9 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::json_store::{
-    atomic_write_bytes_from_dir_locked, atomic_write_json_locked, to_vec_pretty_newline,
-};
+use crate::json_store::{NofollowDirectory, atomic_write_json_locked, to_vec_pretty_newline};
 use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -357,8 +355,8 @@ fn prepare_manifest(
     transaction_id: &str,
     writes: Vec<TransactionWrite>,
 ) -> Result<RepoTransactionManifest> {
-    fs::create_dir_all(transaction_dir.join("old"))?;
-    fs::create_dir_all(transaction_dir.join("new"))?;
+    let old_directory = NofollowDirectory::open_or_create(&transaction_dir.join("old"))?;
+    let new_directory = NofollowDirectory::open_or_create(&transaction_dir.join("new"))?;
     let mut files = Vec::with_capacity(writes.len());
     for (index, write) in writes.into_iter().enumerate() {
         let relative = write.target.strip_prefix(checkout_dir).with_context(|| {
@@ -371,26 +369,33 @@ fn prepare_manifest(
         validate_relative_path(relative)?;
         reject_symlink_components(checkout_dir, relative)?;
         let relative_path = relative.to_string_lossy().replace('\\', "/");
-        let old_bytes = match fs::read(&write.target) {
-            Ok(bytes) => Some(bytes),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => {
-                return Err(err).with_context(|| format!("reading {}", write.target.display()));
-            }
-        };
+        let old_bytes =
+            read_relative_regular_nofollow(checkout_dir, relative, "transaction target")?;
         let old_ref = old_bytes.as_ref().map(|bytes| {
             let name = format!("old/{index}");
             (name, bytes)
         });
         if let Some((name, bytes)) = &old_ref {
-            write_sync(&transaction_dir.join(name), bytes)?;
+            old_directory.atomic_replace(
+                Path::new(name)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("staged old filename is not UTF-8")?,
+                bytes,
+            )?;
         }
         let new_ref = write.new_bytes.as_ref().map(|bytes| {
             let name = format!("new/{index}");
             (name, bytes)
         });
         if let Some((name, bytes)) = &new_ref {
-            write_sync(&transaction_dir.join(name), bytes)?;
+            new_directory.atomic_replace(
+                Path::new(name)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("staged new filename is not UTF-8")?,
+                bytes,
+            )?;
         }
         files.push(RepoTransactionFile {
             relative_path,
@@ -400,8 +405,8 @@ fn prepare_manifest(
             new_sha256: write.new_bytes.as_deref().map(sha256),
         });
     }
-    sync_dir(&transaction_dir.join("old"))?;
-    sync_dir(&transaction_dir.join("new"))?;
+    old_directory.ensure_still_current()?;
+    new_directory.ensure_still_current()?;
     Ok(RepoTransactionManifest {
         version: TRANSACTION_VERSION,
         kind: TRANSACTION_KIND.to_string(),
@@ -418,29 +423,20 @@ fn apply_manifest(
 ) -> Result<()> {
     validate_manifest(manifest, &manifest.transaction_id)?;
     for file in &manifest.files {
-        let target = checkout_dir.join(&file.relative_path);
-        reject_symlink_components(checkout_dir, Path::new(&file.relative_path))?;
+        let relative = Path::new(&file.relative_path);
         if let Some(new_ref) = &file.new_ref {
-            reject_symlink_components(transaction_dir, Path::new(new_ref))?;
-            let bytes = fs::read(transaction_dir.join(new_ref))?;
+            let bytes =
+                read_relative_regular_nofollow(transaction_dir, Path::new(new_ref), "staged new")?
+                    .context("staged new bytes are missing")?;
             if sha256(&bytes) != file.new_sha256.as_deref().unwrap_or_default() {
                 anyhow::bail!(
                     "staged new bytes failed checksum for {}",
                     file.relative_path
                 );
             }
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            atomic_write_bytes_from_dir_locked(&target, transaction_dir, &bytes)?;
-            if let Some(parent) = target.parent() {
-                sync_dir(parent)?;
-            }
-        } else if target.exists() {
-            fs::remove_file(&target)?;
-            if let Some(parent) = target.parent() {
-                sync_dir(parent)?;
-            }
+            replace_relative_regular_nofollow(checkout_dir, relative, transaction_dir, &bytes)?;
+        } else {
+            remove_relative_regular_nofollow(checkout_dir, relative)?;
         }
     }
     Ok(())
@@ -452,32 +448,77 @@ fn rollback_manifest(
     manifest: &RepoTransactionManifest,
 ) -> Result<()> {
     for file in &manifest.files {
-        let target = checkout_dir.join(&file.relative_path);
-        reject_symlink_components(checkout_dir, Path::new(&file.relative_path))?;
+        let relative = Path::new(&file.relative_path);
         if let Some(old_ref) = &file.old_ref {
-            reject_symlink_components(transaction_dir, Path::new(old_ref))?;
-            let bytes = fs::read(transaction_dir.join(old_ref))?;
+            let bytes =
+                read_relative_regular_nofollow(transaction_dir, Path::new(old_ref), "staged old")?
+                    .context("staged old bytes are missing")?;
             if sha256(&bytes) != file.old_sha256.as_deref().unwrap_or_default() {
                 anyhow::bail!(
                     "staged old bytes failed checksum for {}",
                     file.relative_path
                 );
             }
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            atomic_write_bytes_from_dir_locked(&target, transaction_dir, &bytes)?;
-            if let Some(parent) = target.parent() {
-                sync_dir(parent)?;
-            }
-        } else if target.exists() {
-            fs::remove_file(&target)?;
-            if let Some(parent) = target.parent() {
-                sync_dir(parent)?;
-            }
+            replace_relative_regular_nofollow(checkout_dir, relative, transaction_dir, &bytes)?;
+        } else {
+            remove_relative_regular_nofollow(checkout_dir, relative)?;
         }
     }
     Ok(())
+}
+
+fn read_relative_regular_nofollow(
+    base: &Path,
+    relative: &Path,
+    label: &str,
+) -> Result<Option<Vec<u8>>> {
+    validate_relative_path(relative)?;
+    let parent_relative = relative.parent().unwrap_or_else(|| Path::new("."));
+    let Some(parent) = NofollowDirectory::open_existing(&base.join(parent_relative))? else {
+        return Ok(None);
+    };
+    let name = relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("transaction filename is not UTF-8")?;
+    let bytes = parent.read_regular(name, usize::MAX - 1, label)?;
+    parent.ensure_still_current()?;
+    Ok(bytes)
+}
+
+fn replace_relative_regular_nofollow(
+    checkout_dir: &Path,
+    relative: &Path,
+    transaction_dir: &Path,
+    bytes: &[u8],
+) -> Result<()> {
+    validate_relative_path(relative)?;
+    let parent_relative = relative.parent().unwrap_or_else(|| Path::new("."));
+    let parent = NofollowDirectory::open_or_create(&checkout_dir.join(parent_relative))?;
+    let staging = NofollowDirectory::open_existing(transaction_dir)?
+        .context("transaction staging directory is missing")?;
+    let name = relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("transaction filename is not UTF-8")?;
+    parent.atomic_replace_from(name, &staging, bytes)?;
+    parent.ensure_still_current()?;
+    staging.ensure_still_current()
+}
+
+fn remove_relative_regular_nofollow(checkout_dir: &Path, relative: &Path) -> Result<()> {
+    validate_relative_path(relative)?;
+    let parent_relative = relative.parent().unwrap_or_else(|| Path::new("."));
+    let Some(parent) = NofollowDirectory::open_existing(&checkout_dir.join(parent_relative))?
+    else {
+        return Ok(());
+    };
+    let name = relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("transaction filename is not UTF-8")?;
+    parent.remove_regular(name, "transaction target")?;
+    parent.ensure_still_current()
 }
 
 fn complete_transaction(
@@ -763,16 +804,6 @@ fn clear_pointer(path: &Path) -> Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err).with_context(|| format!("removing {}", path.display())),
     }
-}
-
-fn write_sync(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = File::create(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(())
 }
 
 fn sync_dir(path: &Path) -> Result<()> {

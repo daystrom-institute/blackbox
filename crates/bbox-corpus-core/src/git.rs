@@ -293,6 +293,21 @@ struct StableDirectory {
 
 #[cfg(unix)]
 impl StableDirectory {
+    fn ensure_still_current(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let reopened = open_stable_directory(&self.path, "repository authority revalidation")?;
+        let held = self.file.metadata()?;
+        let current = reopened.file.metadata()?;
+        if held.dev() != current.dev() || held.ino() != current.ino() {
+            anyhow::bail!(
+                "stable Git directory authority was replaced: {}",
+                self.path.display()
+            );
+        }
+        Ok(())
+    }
+
     fn open_directory_optional(&self, name: &str, label: &str) -> Result<Option<Self>> {
         use std::ffi::CString;
         use std::os::fd::{AsRawFd, FromRawFd};
@@ -902,6 +917,37 @@ fn open_stable_repository(discovered: HardenedWorktreeRoot) -> Result<StableRepo
 }
 
 #[cfg(unix)]
+fn resolve_and_open_stable_repository(
+    root: &Path,
+    label: &str,
+) -> Result<StableRepositoryAuthority> {
+    let discovered = resolve_hardened_worktree_root(root, label)?;
+    let expected = (
+        discovered.root.clone(),
+        discovered.git_dir.clone(),
+        discovered.common_dir.clone(),
+        discovered.objects.clone(),
+    );
+    let authority = open_stable_repository(discovered)?;
+    let confirmed = resolve_hardened_worktree_root(root, label)?;
+    if expected
+        != (
+            confirmed.root,
+            confirmed.git_dir,
+            confirmed.common_dir,
+            confirmed.objects,
+        )
+    {
+        anyhow::bail!("{label} changed while its Git authority was being acquired");
+    }
+    authority.worktree.ensure_still_current()?;
+    authority.git_dir.ensure_still_current()?;
+    authority.common_dir.ensure_still_current()?;
+    authority.objects.ensure_still_current()?;
+    Ok(authority)
+}
+
+#[cfg(unix)]
 fn open_stable_directory(path: &Path, label: &str) -> Result<StableDirectory> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -1192,17 +1238,9 @@ fn verify_commit_oid_with_alternate_unix(
     oid: &str,
     alternate_root: Option<&Path>,
 ) -> Result<VerifiedCommit> {
-    let primary = open_stable_repository(resolve_hardened_worktree_root(
-        root,
-        "exact-read repository",
-    )?)?;
+    let primary = resolve_and_open_stable_repository(root, "exact-read repository")?;
     let alternate = alternate_root
-        .map(|root| {
-            open_stable_repository(resolve_hardened_worktree_root(
-                root,
-                "explicit alternate repository",
-            )?)
-        })
+        .map(|root| resolve_and_open_stable_repository(root, "explicit alternate repository"))
         .transpose()?;
     if alternate.is_none() {
         return verify_commit_oid_in_stable_unix(primary, oid);
@@ -4206,6 +4244,22 @@ mod tests {
         fs::write(root.join(".git"), "gitdir: /outside/repository\n").unwrap();
         let authority = NofollowDirectory::open_existing(&root).unwrap().unwrap();
         assert!(open_stable_git_repository(&authority).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_directory_revalidation_rejects_a_rebound_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let authority_path = root.join("authority");
+        let held_path = root.join("held-authority");
+        fs::create_dir(&authority_path).unwrap();
+        let authority = open_stable_directory(&authority_path, "test authority").unwrap();
+
+        fs::rename(&authority_path, &held_path).unwrap();
+        fs::create_dir(&authority_path).unwrap();
+
+        assert!(authority.ensure_still_current().is_err());
     }
 
     #[test]
