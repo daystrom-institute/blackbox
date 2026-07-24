@@ -13685,7 +13685,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             failure.disposition,
-            MigrationMutationDispositionV1::RecoveredToCommittedState
+            MigrationMutationDispositionV1::RetryExactPlanRequired
         );
     }
 
