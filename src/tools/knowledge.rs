@@ -152,9 +152,7 @@ fn classify_knowledge_overlay_access_error(
     if error
         .downcast_ref::<bbox_indexing::checkout_access::CheckoutAccessError>()
         .is_some_and(|access| {
-            crate::server::knowledge_lifecycle::checkout_access_error_is_definitively_stale(
-                access.code,
-            )
+            crate::server::checkout_access_error_is_definitively_stale(access.code)
         })
     {
         return bbox_knowledge::overlay::OverlayRecomputeError::invalid_content(error);

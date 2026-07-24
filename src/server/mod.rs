@@ -29,6 +29,7 @@ pub mod workflow_capabilities;
 pub mod workflow_runtime;
 
 pub(crate) use dispatch::*;
+pub(crate) use knowledge_lifecycle::checkout_access_error_is_definitively_stale;
 pub(crate) use routes::*;
 pub use run::run;
 pub(crate) use state::*;
