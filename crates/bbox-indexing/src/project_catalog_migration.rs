@@ -4593,11 +4593,26 @@ fn verify_installed(
         InstalledMigrationVerificationV1::Installed(result) => Ok(result),
         InstalledMigrationVerificationV1::NotInstalled {
             mutation_disposition,
-        } => Err(ProjectCatalogMigrationError::new(
-            "error.project_catalog_invalid_snapshot",
-            "migration verification requires installed v2 state",
-            mutation_disposition,
-        )),
+        } => {
+            let (code, message) = if mutation_disposition
+                == ProjectCatalogMigrationMutationDispositionV1::NoDurableMutation
+            {
+                (
+                    "error.project_catalog_invalid_snapshot",
+                    "migration verification requires installed v2 state",
+                )
+            } else {
+                (
+                    "error.project_catalog_migration_incomplete",
+                    "migration recovery restored the pre-migration state",
+                )
+            };
+            Err(ProjectCatalogMigrationError::new(
+                code,
+                message,
+                mutation_disposition,
+            ))
+        }
     }
 }
 
