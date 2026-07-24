@@ -41,6 +41,7 @@ pub enum EdgeMigrationSourceStateV1 {
     Present,
     Missing,
     Corrupt { diagnostic_code: &'static str },
+    Unavailable { diagnostic_code: &'static str },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,7 +81,7 @@ pub fn capture_migration_snapshot_no_create(
 ) -> EdgeMigrationSnapshotV1 {
     match with_manifest_coordinator(|| Ok(capture_locked(edges_dir, limits))) {
         Ok(snapshot) => snapshot,
-        Err(_) => corrupt_snapshot("edge_manifest_coordinator_unavailable"),
+        Err(_) => unavailable_snapshot("edge_manifest_coordinator_unavailable"),
     }
 }
 
@@ -93,7 +94,7 @@ fn capture_locked(
     }
     match fs::symlink_metadata(edges_dir) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return missing_snapshot(),
-        Err(_) => return corrupt_snapshot("edge_manifest_root_metadata_unreadable"),
+        Err(_) => return unavailable_snapshot("edge_manifest_root_metadata_unavailable"),
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return corrupt_snapshot("edge_manifest_root_symlinked");
         }
@@ -105,7 +106,7 @@ fn capture_locked(
     let materialized = materialized_dir(edges_dir);
     match fs::symlink_metadata(&materialized) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return missing_snapshot(),
-        Err(_) => return corrupt_snapshot("edge_materialized_metadata_unreadable"),
+        Err(_) => return unavailable_snapshot("edge_materialized_metadata_unavailable"),
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return corrupt_snapshot("edge_materialized_root_symlinked");
         }
@@ -119,7 +120,8 @@ fn capture_locked(
     let index_bytes = match read_regular_bounded(&index_path, limits.max_source_file_bytes) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return missing_snapshot(),
-        Err(code) => return corrupt_snapshot(code),
+        Err(CaptureReadFailure::Corrupt(code)) => return corrupt_snapshot(code),
+        Err(CaptureReadFailure::Unavailable(code)) => return unavailable_snapshot(code),
     };
     let index: ManifestIndex = match serde_json::from_slice::<ManifestIndex>(&index_bytes) {
         Ok(index) if index.version == MANIFEST_VERSION => index,
@@ -139,17 +141,21 @@ fn capture_locked(
             return corrupt_snapshot("edge_manifest_project_id_invalid");
         }
         let relative_manifest = Path::new(&entry.manifest);
-        if !strict_relative_path(relative_manifest)
-            || path_has_symlink(&materialized, relative_manifest)
-        {
+        if !strict_relative_path(relative_manifest) {
             return corrupt_snapshot("edge_workspace_manifest_path_unsafe");
+        }
+        match path_has_symlink(&materialized, relative_manifest) {
+            Ok(true) => return corrupt_snapshot("edge_workspace_manifest_path_unsafe"),
+            Ok(false) => {}
+            Err(code) => return unavailable_snapshot(code),
         }
         let manifest_path = materialized.join(relative_manifest);
         let manifest_bytes =
             match read_regular_bounded(&manifest_path, limits.max_source_file_bytes) {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => return corrupt_snapshot("edge_workspace_manifest_missing"),
-                Err(code) => return corrupt_snapshot(code),
+                Err(CaptureReadFailure::Corrupt(code)) => return corrupt_snapshot(code),
+                Err(CaptureReadFailure::Unavailable(code)) => return unavailable_snapshot(code),
             };
         let manifest: WorkspaceManifest =
             match serde_json::from_slice::<WorkspaceManifest>(&manifest_bytes) {
@@ -251,6 +257,15 @@ fn corrupt_snapshot(code: &'static str) -> EdgeMigrationSnapshotV1 {
     snapshot
 }
 
+fn unavailable_snapshot(code: &'static str) -> EdgeMigrationSnapshotV1 {
+    let mut snapshot = empty_snapshot();
+    snapshot.state = EdgeMigrationSourceStateV1::Unavailable {
+        diagnostic_code: code,
+    };
+    snapshot.source_fingerprint_sha256 = None;
+    snapshot
+}
+
 fn empty_snapshot() -> EdgeMigrationSnapshotV1 {
     EdgeMigrationSnapshotV1 {
         version: SNAPSHOT_VERSION_V1,
@@ -334,45 +349,67 @@ fn strict_relative_path(path: &Path) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
-fn path_has_symlink(root: &Path, relative: &Path) -> bool {
+fn path_has_symlink(root: &Path, relative: &Path) -> Result<bool, &'static str> {
     let mut current = root.to_path_buf();
     for component in relative.components() {
         let Component::Normal(part) = component else {
-            return true;
+            return Ok(true);
         };
         current.push(part);
         match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => return true,
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
             Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
-            Err(_) => return true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => return Err("edge_workspace_path_metadata_unavailable"),
         }
     }
-    false
+    Ok(false)
 }
 
-fn read_regular_bounded(path: &Path, max_bytes: u64) -> Result<Option<Vec<u8>>, &'static str> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureReadFailure {
+    Corrupt(&'static str),
+    Unavailable(&'static str),
+}
+
+fn read_regular_bounded(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>, CaptureReadFailure> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err("edge_manifest_source_metadata_unreadable"),
+        Err(_) => {
+            return Err(CaptureReadFailure::Unavailable(
+                "edge_manifest_source_metadata_unavailable",
+            ));
+        }
     };
     if metadata.file_type().is_symlink() {
-        return Err("edge_manifest_source_symlinked");
+        return Err(CaptureReadFailure::Corrupt(
+            "edge_manifest_source_symlinked",
+        ));
     }
     if !metadata.is_file() {
-        return Err("edge_manifest_source_not_regular");
+        return Err(CaptureReadFailure::Corrupt(
+            "edge_manifest_source_not_regular",
+        ));
     }
     if metadata.len() > max_bytes {
-        return Err("edge_manifest_source_byte_limit");
+        return Err(CaptureReadFailure::Corrupt(
+            "edge_manifest_source_byte_limit",
+        ));
     }
-    let file = fs::File::open(path).map_err(|_| "edge_manifest_source_open_failed")?;
+    let file = fs::File::open(path)
+        .map_err(|_| CaptureReadFailure::Unavailable("edge_manifest_source_open_unavailable"))?;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(|_| "edge_manifest_source_read_failed")?;
+        .map_err(|_| CaptureReadFailure::Unavailable("edge_manifest_source_read_unavailable"))?;
     if bytes.len() as u64 > max_bytes {
-        return Err("edge_manifest_source_byte_limit");
+        return Err(CaptureReadFailure::Corrupt(
+            "edge_manifest_source_byte_limit",
+        ));
     }
     Ok(Some(bytes))
 }
@@ -494,6 +531,62 @@ mod tests {
             snapshot.state,
             EdgeMigrationSourceStateV1::Corrupt {
                 diagnostic_code: "edge_workspace_manifest_missing"
+            }
+        ));
+    }
+
+    #[test]
+    fn truncated_manifest_and_source_limit_are_distinct_corrupt_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let manifest = WorkspaceManifest {
+            version: MANIFEST_VERSION,
+            project_id: "project-a".to_string(),
+            repo_id: None,
+            canonical_path: None,
+            git_common_dir: None,
+            git_worktree_dir: None,
+            branch: None,
+            head_sha: None,
+            dirty: false,
+            dirty_fingerprint: None,
+            active_snapshot_id: None,
+            active_dirty_overlay_id: None,
+            updated_at: None,
+        };
+        WorkspaceManifest::write_to(&root, &manifest).unwrap();
+        let mut index = ManifestIndex::new();
+        index.workspaces.insert(
+            "project-a".to_string(),
+            WorkspaceIndexEntry {
+                manifest: "workspace/project-a/manifest.json".to_string(),
+                active_snapshot: None,
+                dirty_overlay: None,
+                repo_materialization: None,
+                code_source_selector: None,
+                code_source_generation: None,
+            },
+        );
+        index.write_atomic(&root).unwrap();
+        let manifest_path = materialized_dir(&root).join("workspace/project-a/manifest.json");
+        fs::write(&manifest_path, b"{truncated").unwrap();
+
+        let truncated =
+            capture_migration_snapshot_no_create(&root, EdgeMigrationSnapshotLimitsV1::default());
+        assert!(matches!(
+            truncated.state,
+            EdgeMigrationSourceStateV1::Corrupt {
+                diagnostic_code: "edge_workspace_manifest_decode_failed"
+            }
+        ));
+
+        let mut limits = EdgeMigrationSnapshotLimitsV1::default();
+        limits.max_source_file_bytes = 1;
+        let oversized = capture_migration_snapshot_no_create(&root, limits);
+        assert!(matches!(
+            oversized.state,
+            EdgeMigrationSourceStateV1::Corrupt {
+                diagnostic_code: "edge_manifest_source_byte_limit"
             }
         ));
     }

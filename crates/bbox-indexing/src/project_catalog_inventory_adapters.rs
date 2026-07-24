@@ -982,12 +982,12 @@ fn derive_publisher_pins(
             .find(|row| row.record.project_id == project_id.as_str())
             .ok_or_else(|| invalid_source("publisher_project_observation_missing"))?;
         let repository = legacy.repositories.get(&project_id);
-        let resolved_commit = repository.and_then(|repository| {
-            repository
+        let resolved_commit = match repository {
+            Some(repository) => repository
                 .resolve_commit_oid(&publisher.branch_ref)
-                .ok()
-                .flatten()
-        });
+                .map_err(|_| invalid_source("publisher_ref_resolution_unavailable"))?,
+            None => None,
+        };
         let root_relpath = legacy
             .project_roots
             .get(&project_id)
@@ -2679,6 +2679,7 @@ fn capture_required_owner_lanes(
     let edges = capture_owner_path(&paths.edge_root, |path| {
         capture_edge_migration_snapshot_no_create(path, limits.edges)
     })?;
+    ensure_owner_inventory_available(&corpus, &vectors, &edges)?;
     paths.git_cursor_root.ensure_authority()?;
 
     let durable = capture_durable_owner_snapshots(paths, limits.durable_owners, legacy)?;
@@ -2721,6 +2722,35 @@ fn capture_required_owner_lanes(
         git_common_directories,
         legacy_selectors,
     })
+}
+
+fn ensure_owner_inventory_available(
+    corpus: &CorpusOwnerMigrationSnapshotV1,
+    vectors: &VectorMigrationSnapshotV1,
+    edges: &EdgeMigrationSnapshotV1,
+) -> AdapterResult<()> {
+    for state in [
+        &corpus.index.state,
+        &corpus.code_metadata.state,
+        &corpus.git_cursors.state,
+    ] {
+        if let CorpusMigrationSourceStateV1::Unavailable { diagnostic_code } = state {
+            return Err(invalid_source(format!(
+                "corpus_owner_inventory_unavailable:{diagnostic_code}"
+            )));
+        }
+    }
+    if let VectorMigrationSourceStateV1::Unavailable { diagnostic_code } = &vectors.state {
+        return Err(invalid_source(format!(
+            "vector_owner_inventory_unavailable:{diagnostic_code}"
+        )));
+    }
+    if let EdgeMigrationSourceStateV1::Unavailable { diagnostic_code } = &edges.state {
+        return Err(invalid_source(format!(
+            "edge_owner_inventory_unavailable:{diagnostic_code}"
+        )));
+    }
+    Ok(())
 }
 
 fn capture_owner_path<T>(
@@ -2977,6 +3007,9 @@ fn corpus_source_state(
         CorpusMigrationSourceStateV1::Corrupt { diagnostic_code } => {
             direct_owner_state(source_id, "corrupt", fingerprint, Some(diagnostic_code))
         }
+        CorpusMigrationSourceStateV1::Unavailable { .. } => {
+            unreachable!("unavailable corpus owner evidence is rejected before lane projection")
+        }
     }
 }
 
@@ -2997,6 +3030,9 @@ fn vector_source_state(snapshot: &VectorMigrationSnapshotV1) -> InventorySourceS
             snapshot.source_fingerprint_sha256.as_deref(),
             Some(diagnostic_code),
         ),
+        VectorMigrationSourceStateV1::Unavailable { .. } => {
+            unreachable!("unavailable vector owner evidence is rejected before lane projection")
+        }
     }
 }
 
@@ -3017,6 +3053,9 @@ fn edge_source_state(snapshot: &EdgeMigrationSnapshotV1) -> InventorySourceState
             snapshot.source_fingerprint_sha256.as_deref(),
             Some(diagnostic_code),
         ),
+        EdgeMigrationSourceStateV1::Unavailable { .. } => {
+            unreachable!("unavailable edge owner evidence is rejected before lane projection")
+        }
     }
 }
 
@@ -5322,6 +5361,60 @@ mod tests {
                 vector_key_commitment_sha256: "e".repeat(64),
             }],
         }
+    }
+
+    fn empty_edge_snapshot() -> EdgeMigrationSnapshotV1 {
+        EdgeMigrationSnapshotV1 {
+            version: 1,
+            state: EdgeMigrationSourceStateV1::Present,
+            schema_version: 1,
+            schema_fingerprint_sha256: "f".repeat(64),
+            source_fingerprint_sha256: Some("1".repeat(64)),
+            workspace_count: 0,
+            active_selector_count: 0,
+            row_commitment_sha256: "2".repeat(64),
+            workspaces: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn unavailable_owner_capture_aborts_before_lane_projection() {
+        let mut corpus = namespace_corpus_snapshot();
+        let vectors = namespace_vector_snapshot();
+        let edges = empty_edge_snapshot();
+        corpus.git_cursors.state = CorpusMigrationSourceStateV1::Unavailable {
+            diagnostic_code: "git_cursor_read_unavailable",
+        };
+        assert_eq!(
+            ensure_owner_inventory_available(&corpus, &vectors, &edges)
+                .unwrap_err()
+                .code(),
+            "error.project_catalog_inventory_adapter_source"
+        );
+
+        let corpus = namespace_corpus_snapshot();
+        let mut vectors = namespace_vector_snapshot();
+        vectors.state = VectorMigrationSourceStateV1::Unavailable {
+            diagnostic_code: "vector_wal_read_unavailable",
+        };
+        assert_eq!(
+            ensure_owner_inventory_available(&corpus, &vectors, &edges)
+                .unwrap_err()
+                .code(),
+            "error.project_catalog_inventory_adapter_source"
+        );
+
+        let vectors = namespace_vector_snapshot();
+        let mut edges = empty_edge_snapshot();
+        edges.state = EdgeMigrationSourceStateV1::Unavailable {
+            diagnostic_code: "edge_manifest_read_unavailable",
+        };
+        assert_eq!(
+            ensure_owner_inventory_available(&corpus, &vectors, &edges)
+                .unwrap_err()
+                .code(),
+            "error.project_catalog_inventory_adapter_source"
+        );
     }
 
     fn empty_test_lane<T>(

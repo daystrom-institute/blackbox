@@ -81,7 +81,12 @@ struct MigrateArgs {
     resolution: PathBuf,
 
     /// Isolated rehearsal root. Required with --apply.
-    #[arg(long, value_name = "PATH", required_if_eq("apply", "true"))]
+    #[arg(
+        long,
+        value_name = "PATH",
+        required_if_eq("apply", "true"),
+        conflicts_with = "preflight"
+    )]
     rehearsal_root: Option<PathBuf>,
 
     /// Explicit owner-only local-path review artifact. Preflight only.
@@ -265,7 +270,7 @@ fn load_config(path: Option<PathBuf>) -> Result<config::Config, CommandFailure> 
     .map_err(|_| {
         CommandFailure::new(
             "error.project_catalog_cli_config",
-            "shared blackbox configuration could not be loaded",
+            "shared blackbox configuration is invalid or unreadable",
         )
     })
 }
@@ -370,6 +375,21 @@ mod tests {
                 "/tmp/report.json",
                 "--resolution",
                 "/tmp/resolution.json",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "blackbox",
+                "project-catalog",
+                "migrate",
+                "--preflight",
+                "--report",
+                "/tmp/report.json",
+                "--resolution",
+                "/tmp/resolution.json",
+                "--rehearsal-root",
+                "/tmp/rehearsal",
             ])
             .is_err()
         );

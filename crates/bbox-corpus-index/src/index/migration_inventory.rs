@@ -61,6 +61,7 @@ pub enum CorpusMigrationSourceStateV1 {
     Present,
     Missing,
     Corrupt { diagnostic_code: &'static str },
+    Unavailable { diagnostic_code: &'static str },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,7 +188,9 @@ fn capture_code_metadata(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return missing_code_metadata();
         }
-        Err(_) => return corrupt_code_metadata("code_index_metadata_root_unreadable"),
+        Err(_) => {
+            return unavailable_code_metadata("code_index_metadata_root_unavailable");
+        }
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return corrupt_code_metadata("code_index_metadata_root_symlinked");
         }
@@ -200,7 +203,8 @@ fn capture_code_metadata(
     let bytes = match read_regular_bounded(&path, limits.max_source_file_bytes) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return missing_code_metadata(),
-        Err(code) => return corrupt_code_metadata(code),
+        Err(CaptureReadFailure::Corrupt(code)) => return corrupt_code_metadata(code),
+        Err(CaptureReadFailure::Unavailable(code)) => return unavailable_code_metadata(code),
     };
     let metadata: BTreeMap<String, FileMeta> = match serde_json::from_slice(&bytes) {
         Ok(metadata) => metadata,
@@ -344,6 +348,14 @@ fn corrupt_code_metadata(code: &'static str) -> CodeIndexMetadataMigrationSnapsh
     snapshot
 }
 
+fn unavailable_code_metadata(code: &'static str) -> CodeIndexMetadataMigrationSnapshotV1 {
+    let mut snapshot = missing_code_metadata();
+    snapshot.state = CorpusMigrationSourceStateV1::Unavailable {
+        diagnostic_code: code,
+    };
+    snapshot
+}
+
 fn capture_index(
     index_path: &Path,
     limits: CorpusMigrationSnapshotLimitsV1,
@@ -353,7 +365,7 @@ fn capture_index(
     }
     match fs::symlink_metadata(index_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return missing_index(),
-        Err(_) => return corrupt_index("corpus_index_metadata_unreadable"),
+        Err(_) => return unavailable_index("corpus_index_metadata_unavailable"),
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return corrupt_index("corpus_index_path_symlinked");
         }
@@ -362,15 +374,18 @@ fn capture_index(
         }
         Ok(_) => {}
     }
-    if directory_has_symlink(index_path) {
-        return corrupt_index("corpus_index_entry_symlinked");
+    match directory_has_symlink(index_path) {
+        Ok(true) => return corrupt_index("corpus_index_entry_symlinked"),
+        Ok(false) => {}
+        Err(code) => return unavailable_index(code),
     }
 
     let marker_path = index_path.join(SCHEMA_VERSION_FILE);
     let marker = match read_regular_bounded(&marker_path, limits.max_source_file_bytes) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return corrupt_index("corpus_index_schema_marker_missing"),
-        Err(code) => return corrupt_index(code),
+        Err(CaptureReadFailure::Corrupt(code)) => return corrupt_index(code),
+        Err(CaptureReadFailure::Unavailable(code)) => return unavailable_index(code),
     };
     let schema_version = match String::from_utf8(marker) {
         Ok(value) if value.trim() == INDEX_SCHEMA_VERSION => value.trim().to_string(),
@@ -379,7 +394,7 @@ fn capture_index(
 
     let index = match Index::open_in_dir(index_path) {
         Ok(index) => index,
-        Err(_) => return corrupt_index("corpus_index_open_failed"),
+        Err(_) => return unavailable_index("corpus_index_open_unavailable"),
     };
     let schema = index.schema();
     let schema_bytes = match serde_json::to_vec(&schema) {
@@ -413,7 +428,7 @@ fn capture_index(
     };
     let reader = match index.reader() {
         Ok(reader) => reader,
-        Err(_) => return corrupt_index("corpus_index_reader_open_failed"),
+        Err(_) => return unavailable_index("corpus_index_reader_unavailable"),
     };
     let searcher = reader.searcher();
     let document_count = searcher.num_docs();
@@ -422,7 +437,7 @@ fn capture_index(
     }
     let addresses = match searcher.search(&AllQuery, &DocSetCollector) {
         Ok(addresses) => addresses,
-        Err(_) => return corrupt_index("corpus_index_scan_failed"),
+        Err(_) => return unavailable_index("corpus_index_scan_unavailable"),
     };
 
     let mut project_refs = BTreeMap::<(String, String), u64>::new();
@@ -431,7 +446,7 @@ fn capture_index(
     for address in addresses {
         let document: TantivyDocument = match searcher.doc(address) {
             Ok(document) => document,
-            Err(_) => return corrupt_index("corpus_index_document_decode_failed"),
+            Err(_) => return unavailable_index("corpus_index_document_unavailable"),
         };
         let entity = optional_text(&document, entity_id).unwrap_or_default();
         let project = optional_text(&document, project_id).unwrap_or_default();
@@ -556,7 +571,7 @@ fn capture_git_cursors(
     }
     match fs::symlink_metadata(git_meta_dir) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return missing_git(),
-        Err(_) => return corrupt_git("git_cursor_metadata_unreadable"),
+        Err(_) => return unavailable_git("git_cursor_metadata_unavailable"),
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return corrupt_git("git_cursor_path_symlinked");
         }
@@ -567,17 +582,17 @@ fn capture_git_cursors(
     }
     let entries = match fs::read_dir(git_meta_dir) {
         Ok(entries) => entries,
-        Err(_) => return corrupt_git("git_cursor_directory_unreadable"),
+        Err(_) => return unavailable_git("git_cursor_directory_unavailable"),
     };
     let mut paths = Vec::new();
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(_) => return corrupt_git("git_cursor_entry_unreadable"),
+            Err(_) => return unavailable_git("git_cursor_entry_unavailable"),
         };
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
-            Err(_) => return corrupt_git("git_cursor_entry_unreadable"),
+            Err(_) => return unavailable_git("git_cursor_entry_unavailable"),
         };
         if file_type.is_symlink() {
             return corrupt_git("git_cursor_entry_symlinked");
@@ -612,7 +627,8 @@ fn capture_git_cursors(
         let bytes = match read_regular_bounded(&path, limits.max_source_file_bytes) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return corrupt_git("git_cursor_source_missing"),
-            Err(code) => return corrupt_git(code),
+            Err(CaptureReadFailure::Corrupt(code)) => return corrupt_git(code),
+            Err(CaptureReadFailure::Unavailable(code)) => return unavailable_git(code),
         };
         let meta: GitIngestMetaV1 = match serde_json::from_slice(&bytes) {
             Ok(meta) => meta,
@@ -673,6 +689,14 @@ fn corrupt_index(code: &'static str) -> CorpusIndexMigrationSnapshotV1 {
     snapshot
 }
 
+fn unavailable_index(code: &'static str) -> CorpusIndexMigrationSnapshotV1 {
+    let mut snapshot = missing_index();
+    snapshot.state = CorpusMigrationSourceStateV1::Unavailable {
+        diagnostic_code: code,
+    };
+    snapshot
+}
+
 fn missing_git() -> GitCursorMigrationSnapshotV1 {
     GitCursorMigrationSnapshotV1 {
         version: SNAPSHOT_VERSION_V1,
@@ -695,6 +719,14 @@ fn git_cursor_schema_fingerprint() -> String {
 fn corrupt_git(code: &'static str) -> GitCursorMigrationSnapshotV1 {
     let mut snapshot = missing_git();
     snapshot.state = CorpusMigrationSourceStateV1::Corrupt {
+        diagnostic_code: code,
+    };
+    snapshot
+}
+
+fn unavailable_git(code: &'static str) -> GitCursorMigrationSnapshotV1 {
+    let mut snapshot = missing_git();
+    snapshot.state = CorpusMigrationSourceStateV1::Unavailable {
         diagnostic_code: code,
     };
     snapshot
@@ -771,37 +803,58 @@ fn strict_relative_path(path: &Path) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
-fn directory_has_symlink(path: &Path) -> bool {
+fn directory_has_symlink(path: &Path) -> Result<bool, &'static str> {
     let Ok(entries) = fs::read_dir(path) else {
-        return true;
+        return Err("corpus_index_directory_unavailable");
     };
-    entries
-        .filter_map(Result::ok)
-        .any(|entry| entry.file_type().map_or(true, |kind| kind.is_symlink()))
+    for entry in entries {
+        let entry = entry.map_err(|_| "corpus_index_entry_unavailable")?;
+        let kind = entry
+            .file_type()
+            .map_err(|_| "corpus_index_entry_unavailable")?;
+        if kind.is_symlink() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
-fn read_regular_bounded(path: &Path, max_bytes: u64) -> Result<Option<Vec<u8>>, &'static str> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureReadFailure {
+    Corrupt(&'static str),
+    Unavailable(&'static str),
+}
+
+fn read_regular_bounded(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>, CaptureReadFailure> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err("owner_source_metadata_unreadable"),
+        Err(_) => {
+            return Err(CaptureReadFailure::Unavailable(
+                "owner_source_metadata_unavailable",
+            ));
+        }
     };
     if metadata.file_type().is_symlink() {
-        return Err("owner_source_symlinked");
+        return Err(CaptureReadFailure::Corrupt("owner_source_symlinked"));
     }
     if !metadata.is_file() {
-        return Err("owner_source_not_regular");
+        return Err(CaptureReadFailure::Corrupt("owner_source_not_regular"));
     }
     if metadata.len() > max_bytes {
-        return Err("owner_source_byte_limit");
+        return Err(CaptureReadFailure::Corrupt("owner_source_byte_limit"));
     }
-    let file = fs::File::open(path).map_err(|_| "owner_source_open_failed")?;
+    let file = fs::File::open(path)
+        .map_err(|_| CaptureReadFailure::Unavailable("owner_source_open_unavailable"))?;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(|_| "owner_source_read_failed")?;
+        .map_err(|_| CaptureReadFailure::Unavailable("owner_source_read_unavailable"))?;
     if bytes.len() as u64 > max_bytes {
-        return Err("owner_source_byte_limit");
+        return Err(CaptureReadFailure::Corrupt("owner_source_byte_limit"));
     }
     Ok(Some(bytes))
 }
@@ -961,5 +1014,37 @@ mod tests {
             snapshot.code_metadata.rows[0].selector.as_deref(),
             Some("selector-a")
         );
+    }
+
+    #[test]
+    fn truncated_git_cursor_and_source_limit_are_distinct_corrupt_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let index = root.join("missing-index");
+        let git = root.join("git-meta");
+        fs::create_dir(&git).unwrap();
+        fs::write(git.join("project-a.json"), b"{truncated").unwrap();
+
+        let truncated = capture_owner_migration_snapshot_no_create(
+            &index,
+            &git,
+            CorpusMigrationSnapshotLimitsV1::default(),
+        );
+        assert!(matches!(
+            truncated.git_cursors.state,
+            CorpusMigrationSourceStateV1::Corrupt {
+                diagnostic_code: "git_cursor_decode_failed"
+            }
+        ));
+
+        let mut limits = CorpusMigrationSnapshotLimitsV1::default();
+        limits.max_source_file_bytes = 1;
+        let oversized = capture_owner_migration_snapshot_no_create(&index, &git, limits);
+        assert!(matches!(
+            oversized.git_cursors.state,
+            CorpusMigrationSourceStateV1::Corrupt {
+                diagnostic_code: "owner_source_byte_limit"
+            }
+        ));
     }
 }

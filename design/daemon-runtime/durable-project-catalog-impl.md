@@ -723,8 +723,11 @@ Current-state validation and GC use the same classifier. A protected legacy row
 whose project/scope ownership cannot be proved from strict v2 state refuses
 startup rather than being treated as an orphan.
 
-Every legacy publisher pin has exactly one migration disposition. A uniquely
-resolved old publisher produces `SeedG1` with project id, attachment id,
+Every legacy publisher pin with exactly one catalog owner has exactly one
+migration disposition. Ownerless or multiply-owned pins refuse attribution
+until the catalog input supplies one owner; no-content acknowledgement cannot
+authorize discarding content before that point. A uniquely resolved old
+publisher produces `SeedG1` with project id, attachment id,
 expected scope, full ref, accepted commit, generation id, canonical knowledge
 and gap file manifests, payload hashes, and pointer hash. Ambiguous or missing
 candidates require a hash-bound resolution that selects one inventoried

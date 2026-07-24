@@ -7,6 +7,7 @@ use bbox_config::config::{self, LoadOptions};
 use bbox_corpus_index::index::TranscriptIndex;
 use bbox_edge_sidecar::manifest::ManifestIndex;
 use bbox_indexing::project_catalog_migration::project_catalog_migration_store_limits;
+use bbox_indexing::project_catalog_migration_lock::ProjectCatalogMigrationLock;
 use bbox_vectors::VectorStore;
 use serde_json::Value;
 use tempfile::tempdir;
@@ -225,6 +226,7 @@ fn cli_runs_clean_preflight_apply_and_fresh_verify() {
 
     let report = rehearsal_root.join("review/report.json");
     let resolution = rehearsal_root.join("review/resolution.json");
+    let local_paths = rehearsal_root.join("review/local-paths.json");
     let preflight = success_json(&run(&[
         "project-catalog",
         "migrate",
@@ -233,6 +235,8 @@ fn cli_runs_clean_preflight_apply_and_fresh_verify() {
         report.to_str().unwrap(),
         "--resolution",
         resolution.to_str().unwrap(),
+        "--include-local-paths",
+        local_paths.to_str().unwrap(),
         "--state-dir",
         rehearsal_root.join("state").to_str().unwrap(),
         "--config",
@@ -242,7 +246,33 @@ fn cli_runs_clean_preflight_apply_and_fresh_verify() {
     assert_eq!(preflight["result"]["status"], "clean");
     assert!(report.is_file());
     assert!(resolution.is_file());
+    assert!(local_paths.is_file());
     assert_redacted(&preflight, &root);
+
+    let held =
+        ProjectCatalogMigrationLock::acquire_shared(&rehearsal_root.join("state/projects.json"))
+            .unwrap();
+    let refused = run(&[
+        "project-catalog",
+        "migrate",
+        "--apply",
+        "--report",
+        report.to_str().unwrap(),
+        "--resolution",
+        resolution.to_str().unwrap(),
+        "--rehearsal-root",
+        rehearsal_root.to_str().unwrap(),
+        "--config",
+        config_path.to_str().unwrap(),
+    ]);
+    assert!(!refused.status.success());
+    let refused: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(
+        refused["error"]["code"],
+        "error.project_catalog_lifetime_lock_busy"
+    );
+    assert_redacted(&refused, &root);
+    drop(held);
 
     let apply = success_json(&run(&[
         "project-catalog",

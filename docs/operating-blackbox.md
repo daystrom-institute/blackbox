@@ -432,6 +432,8 @@ Protect:
 - `~/.local/state/blackbox/blackbox-pins.json`
 - `~/.local/state/blackbox/blackbox-roadmap.json`
 - `~/.local/state/blackbox/projects.json`
+- `~/.local/state/blackbox/project-catalog-migration.json`
+- `~/.local/state/blackbox/project-catalog-migration-receipt.json`
 - `~/.local/state/blackbox/packets/`
 - `~/.local/state/blackbox/artifacts/`
 - `~/.local/state/blackbox/bro/`
@@ -446,6 +448,22 @@ Rebuild:
 - `~/.local/state/blackbox/git_meta/` via the next reindex
 
 The longer backup checklist lives in [Operations](operations.md).
+
+### Repairing a blocked repo-file transaction
+
+`error.repo_transaction_recovery_blocked` means an applying transaction lost
+or corrupted its manifest. Automatic recovery stops because it cannot prove a
+safe roll-forward or rollback.
+
+Before clearing anything, stop writes to that checkout and copy
+`<checkout>/.bbox/local/knowledge-transactions/` to operator-controlled backup
+storage. Inspect `pending.json`, require `state` to be `blocked`, and record its
+exact `transaction_id`. Restore each affected repo-owned corpus file from a
+known source, such as the checkout's Git state, the transaction object files,
+or an operator backup. Only after the restored files have been reviewed should
+the operator remove the exact transaction-id directory and its matching
+`pending.json`. Never clear a preparing or applying pointer, and never remove
+the transaction root as a whole.
 
 ## Troubleshooting quick map
 

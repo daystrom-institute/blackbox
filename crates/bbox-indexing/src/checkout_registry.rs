@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::json_store::{atomic_write_json_locked, with_store_lock};
@@ -86,6 +87,23 @@ impl Default for CheckoutRegistryStore {
     }
 }
 
+const MAX_RECOVERABLE_REGISTRY_BYTES: u64 = 16 * 1024 * 1024;
+
+fn recoverable_corrupt_registry_sha256(path: &Path) -> Option<[u8; 32]> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_RECOVERABLE_REGISTRY_BYTES
+    {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if serde_json::from_slice::<CheckoutRegistryStore>(&bytes).is_ok() {
+        return None;
+    }
+    Some(Sha256::digest(&bytes).into())
+}
+
 fn read_checkout_registry_store(path: &Path) -> Result<(CheckoutRegistryStore, bool)> {
     let mut store: CheckoutRegistryStore = if path.exists() {
         let raw =
@@ -116,6 +134,7 @@ pub struct CheckoutRegistry {
     store: CheckoutRegistryStore,
     store_path: PathBuf,
     needs_persist: bool,
+    recoverable_corrupt_sha256: Option<[u8; 32]>,
 }
 
 impl CheckoutRegistry {
@@ -130,6 +149,7 @@ impl CheckoutRegistry {
             store,
             store_path: store_path.to_path_buf(),
             needs_persist,
+            recoverable_corrupt_sha256: None,
         })
     }
 
@@ -141,14 +161,18 @@ impl CheckoutRegistry {
     pub fn open_recoverable(store_path: &Path) -> (Self, Option<anyhow::Error>) {
         match Self::open(store_path) {
             Ok(registry) => (registry, None),
-            Err(error) => (
-                Self {
-                    store: CheckoutRegistryStore::new(),
-                    store_path: store_path.to_path_buf(),
-                    needs_persist: true,
-                },
-                Some(error),
-            ),
+            Err(error) => {
+                let recoverable_corrupt_sha256 = recoverable_corrupt_registry_sha256(store_path);
+                (
+                    Self {
+                        store: CheckoutRegistryStore::new(),
+                        store_path: store_path.to_path_buf(),
+                        needs_persist: true,
+                        recoverable_corrupt_sha256,
+                    },
+                    Some(error),
+                )
+            }
         }
     }
 
@@ -176,11 +200,17 @@ impl CheckoutRegistry {
     ) -> Result<T> {
         let path = self.store_path.clone();
         let recovery_fallback = self.store.clone();
-        let may_replace_corrupt = self.needs_persist;
+        let recoverable_corrupt_sha256 = self.recoverable_corrupt_sha256;
         let (next, output) = with_store_lock(&path, || {
             let (mut next, needs_persist) = match read_checkout_registry_store(&path) {
                 Ok(current) => current,
-                Err(_) if may_replace_corrupt => (recovery_fallback, true),
+                Err(_)
+                    if recoverable_corrupt_sha256.is_some()
+                        && recoverable_corrupt_registry_sha256(&path)
+                            == recoverable_corrupt_sha256 =>
+                {
+                    (recovery_fallback, true)
+                }
                 Err(error) => return Err(error),
             };
             let (output, changed) = mutate(&mut next)?;
@@ -192,6 +222,7 @@ impl CheckoutRegistry {
         })?;
         self.store = next;
         self.needs_persist = false;
+        self.recoverable_corrupt_sha256 = None;
         Ok(output)
     }
 
@@ -623,6 +654,33 @@ mod tests {
         let reopened = CheckoutRegistry::open(&path).unwrap();
         assert_eq!(reopened.rows().len(), 1);
         assert_eq!(reopened.rows()[0].checkout_id, "recovered");
+    }
+
+    #[test]
+    fn recoverable_open_never_replaces_changed_or_future_registry_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("checkouts.json");
+        std::fs::write(&path, b"{\"version\":").unwrap();
+        let (mut changed, diagnostic) = CheckoutRegistry::open_recoverable(&path);
+        assert!(diagnostic.is_some());
+        std::fs::write(&path, b"{\"different\":").unwrap();
+        let changed_bytes = std::fs::read(&path).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().canonicalize().unwrap();
+
+        assert!(changed.register(row("refused", &checkout)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), changed_bytes);
+
+        let future = CheckoutRegistryStore {
+            version: 3,
+            checkouts: Vec::new(),
+        };
+        let future_bytes = serde_json::to_vec_pretty(&future).unwrap();
+        std::fs::write(&path, &future_bytes).unwrap();
+        let (mut unsupported, diagnostic) = CheckoutRegistry::open_recoverable(&path);
+        assert!(diagnostic.is_some());
+        assert!(unsupported.register(row("refused", &checkout)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), future_bytes);
     }
 
     #[test]

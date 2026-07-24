@@ -1922,7 +1922,7 @@ impl Knowledge {
             .as_nanos()
             .hash(&mut h);
         std::process::id().hash(&mut h);
-        format!("{:08x}", h.finish() as u32)
+        format!("{:016x}", h.finish())
     }
 
     fn is_expired(entry: &KnowledgeEntry) -> bool {

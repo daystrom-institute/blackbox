@@ -71,6 +71,32 @@ impl Default for StoreLimits {
     }
 }
 
+/// Producer-correctable upload failures surfaced across the store boundary.
+///
+/// Durable IO and stored-state failures remain ordinary `anyhow::Error`
+/// values. Callers can therefore distinguish request semantics without
+/// parsing messages or accidentally exposing store paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreRequestError {
+    LimitExceeded,
+    TooManyOpenUploads,
+    InvalidState,
+    InvalidInput,
+}
+
+impl std::fmt::Display for StoreRequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::LimitExceeded => "code-source input exceeds an enforced limit",
+            Self::TooManyOpenUploads => "producer has too many open uploads",
+            Self::InvalidState => "upload is not in the required state",
+            Self::InvalidInput => "code-source input is invalid",
+        })
+    }
+}
+
+impl std::error::Error for StoreRequestError {}
+
 struct SharedStoreState {
     limits: RwLock<StoreLimits>,
     mutation: Mutex<()>,
@@ -3186,10 +3212,10 @@ impl CodeSourceStore {
             .map_err(|_| anyhow!("code-source limits lock poisoned"))?
             .clone();
         if descriptor.file_count > limits.max_manifest_files {
-            bail!("manifest file count exceeds configured limit");
+            return Err(StoreRequestError::LimitExceeded.into());
         }
         if descriptor.logical_bytes > limits.max_manifest_logical_bytes {
-            bail!("manifest logical bytes exceed configured limit");
+            return Err(StoreRequestError::LimitExceeded.into());
         }
         let _guard = self.lock_mutation()?;
         let producer_dir = self.upload_producer_dir(producer_id);
@@ -3209,7 +3235,7 @@ impl CodeSourceStore {
             })
             .count();
         if open >= limits.max_open_uploads_per_producer {
-            bail!("producer already has the maximum number of open uploads");
+            return Err(StoreRequestError::TooManyOpenUploads.into());
         }
         let ordinal = self.next_ordinal(&descriptor.scope)?;
         let upload_id = Uuid::new_v4().to_string();
@@ -3247,10 +3273,10 @@ impl CodeSourceStore {
         entries: &[ManifestEntry],
     ) -> Result<()> {
         if entries.is_empty() {
-            bail!("manifest pages must not be empty");
+            return Err(StoreRequestError::InvalidInput.into());
         }
         if entries.len() > MAX_MANIFEST_PAGE_ENTRIES {
-            bail!("manifest page exceeds entry cap");
+            return Err(StoreRequestError::LimitExceeded.into());
         }
         let limits = self
             .shared
@@ -3266,21 +3292,21 @@ impl CodeSourceStore {
         let _guard = self.lock_mutation()?;
         let mut record = self.load_upload(producer_id, upload_id)?;
         if record.state != GenerationState::ReceivingManifest {
-            bail!("upload is not receiving manifest pages");
+            return Err(StoreRequestError::InvalidState.into());
         }
         let raw = serde_json::to_vec(entries)?;
         if raw.len() > bbox_code_source::MAX_MANIFEST_PAGE_BYTES {
-            bail!("manifest page exceeds byte cap");
+            return Err(StoreRequestError::LimitExceeded.into());
         }
         let digest = sha256_hex(&raw);
         if page < record.next_page {
             if record.page_digests.get(&page) == Some(&digest) {
                 return Ok(());
             }
-            bail!("manifest page replay conflicts with stored page");
+            return Err(StoreRequestError::InvalidInput.into());
         }
         if page != record.next_page {
-            bail!("manifest pages must be contiguous");
+            return Err(StoreRequestError::InvalidInput.into());
         }
         let page_file_count = entries.len() as u64;
         let page_logical_bytes = entries.iter().try_fold(0_u64, |sum, entry| {
@@ -3296,10 +3322,10 @@ impl CodeSourceStore {
             .checked_add(page_logical_bytes)
             .ok_or_else(|| anyhow!("manifest logical byte count overflow"))?;
         if received_file_count > record.descriptor.file_count {
-            bail!("manifest pages exceed the declared file count");
+            return Err(StoreRequestError::InvalidInput.into());
         }
         if received_logical_bytes > record.descriptor.logical_bytes {
-            bail!("manifest pages exceed the declared logical bytes");
+            return Err(StoreRequestError::InvalidInput.into());
         }
         if record
             .last_relative_path
@@ -3310,7 +3336,7 @@ impl CodeSourceStore {
                     .is_some_and(|entry| entry.relative_path.as_str() <= previous)
             })
         {
-            bail!("manifest entries are not strictly sorted across pages");
+            return Err(StoreRequestError::InvalidInput.into());
         }
         let path = self
             .upload_dir(producer_id, upload_id)
@@ -3337,7 +3363,7 @@ impl CodeSourceStore {
             record.state,
             GenerationState::ReceivingManifest | GenerationState::MissingBlobs
         ) {
-            bail!("upload manifest cannot be completed in its current state");
+            return Err(StoreRequestError::InvalidState.into());
         }
         let entries = self.load_upload_entries(&record)?;
         let limits = self
@@ -3357,7 +3383,7 @@ impl CodeSourceStore {
         let manifest_path = generation_dir.join("manifest.jsonl");
         if manifest_path.is_file() {
             if read_manifest_jsonl(&manifest_path)? != entries {
-                bail!("generation manifest conflicts with immutable stored manifest");
+                return Err(StoreRequestError::InvalidInput.into());
             }
         } else {
             write_manifest_jsonl(&manifest_path, &entries)?;
@@ -3366,7 +3392,7 @@ impl CodeSourceStore {
         if metadata_path.is_file() {
             let stored = read_stored_generation_v1(&metadata_path)?;
             if stored.producer_id != producer_id || stored.descriptor != record.descriptor {
-                bail!("generation identity conflicts with stored metadata");
+                return Err(StoreRequestError::InvalidInput.into());
             }
         } else {
             let stored = StoredGeneration {
@@ -3407,12 +3433,12 @@ impl CodeSourceStore {
         let _guard = self.lock_mutation()?;
         let mut record = self.load_upload(producer_id, upload_id)?;
         if record.state != GenerationState::MissingBlobs {
-            bail!("missing-blob cursor is stale for upload state");
+            return Err(StoreRequestError::InvalidState.into());
         }
         let generation = record
             .generation_id
             .as_deref()
-            .ok_or_else(|| anyhow!("manifest is not complete"))?;
+            .ok_or(StoreRequestError::InvalidState)?;
         let offset = decode_cursor(generation, cursor)?;
         let missing = read_json::<Vec<String>>(
             &self.upload_dir(producer_id, upload_id).join("missing.json"),
@@ -3443,7 +3469,7 @@ impl CodeSourceStore {
             .iter()
             .any(|entry| entry.content_sha256 == expected_hash && entry.size == expected_size)
         {
-            bail!("blob is not referenced by this upload with the declared size");
+            return Err(StoreRequestError::InvalidInput.into());
         }
         let destination = self.blob_path(expected_hash);
         if destination.is_file() {
@@ -3482,7 +3508,7 @@ impl CodeSourceStore {
             if written > expected_size {
                 drop(file);
                 let _ = fs::remove_file(&temporary);
-                bail!("blob body exceeds declared size");
+                return Err(StoreRequestError::LimitExceeded.into());
             }
             hasher.update(&buffer[..read]);
             file.write_all(&buffer[..read])?;
@@ -3490,7 +3516,7 @@ impl CodeSourceStore {
         if written != expected_size || hex::encode(hasher.finalize()) != expected_hash {
             drop(file);
             let _ = fs::remove_file(&temporary);
-            bail!("blob body hash or size mismatch");
+            return Err(StoreRequestError::InvalidInput.into());
         }
         file.sync_all()?;
         drop(file);
@@ -3525,11 +3551,11 @@ impl CodeSourceStore {
         let generation = record
             .generation_id
             .clone()
-            .ok_or_else(|| anyhow!("manifest is not complete"))?;
+            .ok_or(StoreRequestError::InvalidState)?;
         let entries = self.load_generation_entries(&record.descriptor.scope, &generation)?;
         let missing = self.missing_hashes(&entries)?;
         if !missing.is_empty() {
-            bail!("generation still has {} missing blobs", missing.len());
+            return Err(StoreRequestError::InvalidState.into());
         }
         let mut stored = self.load_generation(&record.descriptor.scope, &generation)?;
         let desired_path = self
@@ -3584,22 +3610,20 @@ impl CodeSourceStore {
         validate_sha256(hash)?;
         let record = self.load_upload(producer_id, upload_id)?;
         if record.state != GenerationState::MissingBlobs {
-            bail!("upload is not accepting blob data");
+            return Err(StoreRequestError::InvalidState.into());
         }
         let generation = record
             .generation_id
             .as_deref()
-            .ok_or_else(|| anyhow!("manifest is not complete"))?;
+            .ok_or(StoreRequestError::InvalidState)?;
         let entries = self.load_generation_entries(&record.descriptor.scope, generation)?;
         let mut sizes = entries
             .iter()
             .filter(|entry| entry.content_sha256 == hash)
             .map(|entry| entry.size);
-        let size = sizes
-            .next()
-            .ok_or_else(|| anyhow!("blob is not referenced by this upload"))?;
+        let size = sizes.next().ok_or(StoreRequestError::InvalidInput)?;
         if sizes.any(|other| other != size) {
-            bail!("manifest assigns conflicting sizes to one blob hash");
+            return Err(StoreRequestError::InvalidInput.into());
         }
         Ok(size)
     }
@@ -4875,9 +4899,10 @@ fn unique_blob_sizes(entries: &[ManifestEntry]) -> Result<BTreeMap<String, u64>>
 }
 
 fn validate_upload_id(upload_id: &str) -> Result<()> {
-    let parsed = Uuid::parse_str(upload_id).context("invalid upload id")?;
+    let parsed =
+        Uuid::parse_str(upload_id).map_err(|_| anyhow!(StoreRequestError::InvalidInput))?;
     if parsed.to_string() != upload_id {
-        bail!("upload id is not in canonical form");
+        return Err(StoreRequestError::InvalidInput.into());
     }
     Ok(())
 }
@@ -4892,11 +4917,13 @@ fn decode_cursor(generation: &str, cursor: Option<&str>) -> Result<usize> {
     };
     let (cursor_generation, offset) = cursor
         .rsplit_once(':')
-        .ok_or_else(|| anyhow!("invalid missing-blob cursor"))?;
+        .ok_or(StoreRequestError::InvalidInput)?;
     if cursor_generation != generation {
-        bail!("stale missing-blob cursor");
+        return Err(StoreRequestError::InvalidInput.into());
     }
-    offset.parse().context("invalid missing-blob cursor offset")
+    offset
+        .parse()
+        .map_err(|_| StoreRequestError::InvalidInput.into())
 }
 
 fn write_manifest_jsonl(path: &Path, entries: &[ManifestEntry]) -> Result<()> {

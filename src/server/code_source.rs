@@ -17,7 +17,7 @@ use bbox_code_source::{
 };
 use bbox_code_source_store::{
     ActivationRecord, CodeSourceStore, CollisionRetirementWorkV1, RetirementRecord, StoreLimits,
-    StoredGeneration,
+    StoreRequestError, StoredGeneration,
 };
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_catalog::ProjectId;
@@ -244,7 +244,6 @@ fn build_snapshot(
             config.paths.state_dir.join("code-sources"),
             limits,
         )?);
-        reap_upload_body_tempfiles(store.root())?;
         store
     };
     if !config.code_collection.enabled {
@@ -254,6 +253,7 @@ fn build_snapshot(
             store,
         });
     }
+    reap_upload_body_tempfiles(store.root())?;
     if config.code_collection.producers.is_empty() {
         bail!("enabled code collection requires at least one producer");
     }
@@ -993,9 +993,13 @@ fn cutback_to_local(
         bail!("collector assignment returned while local cutback was staging");
     }
     staged.begin_publication()?;
-    state
+    if let Err(error) = state
         .index_writer
-        .verify_code_selector_document_count(&staged.selector, staged.document_count)?;
+        .verify_code_selector_document_count(&staged.selector, staged.document_count)
+    {
+        schedule_unactivated_retirement(state, project_id, &staged, None)?;
+        return Err(error);
+    }
     let previous_entry = manifest.workspaces.get(project_id).cloned();
     let previous_view = state.code_read_view.read().clone();
     enqueue_previous_retirement(
@@ -1256,9 +1260,24 @@ fn activate_desired_loop(
             continue;
         }
         staged.begin_publication()?;
-        state
+        if let Err(error) = state
             .index_writer
-            .verify_code_selector_document_count(&staged.selector, staged.document_count)?;
+            .verify_code_selector_document_count(&staged.selector, staged.document_count)
+        {
+            schedule_unactivated_retirement(
+                state,
+                project_id,
+                &staged,
+                Some(desired.generation_id.clone()),
+            )?;
+            store.mark_generation_state(
+                scope,
+                &desired.generation_id,
+                GenerationState::Failed,
+                Some("staged document verification failed; inspect daemon logs".into()),
+            )?;
+            return Err(error);
+        }
         store.record_materialization(
             scope,
             &desired.generation_id,
@@ -1384,6 +1403,7 @@ fn selector_retirement_retryable(error: &anyhow::Error) -> bool {
 }
 
 const SELECTOR_RETIREMENT_RETRY_LIMIT: u32 = 8;
+const SELECTOR_RETIREMENT_REDRIVE_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn take_selector_retirement_retry(
     attempts: &mut u32,
@@ -1545,6 +1565,15 @@ fn spawn_retirement(
                             document_count = retired.document_count,
                             "retired inactive code-source selector"
                         );
+                        if let Err(error) = retired.begin_cleanup() {
+                            let _ = state.code_sources.store().record_health_failure(
+                                &record.project_id,
+                                "retirement_failed",
+                                "retirement cleanup hold expired; work remains queued",
+                            );
+                            tracing::error!(%error, "selector retirement cleanup hold expired");
+                            return;
+                        }
                         let cleanup = bbox_edge_sidecar::snapshot::with_manifest_coordinator(|| {
                             let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(
                                 &edges_dir,
@@ -1684,9 +1713,13 @@ fn spawn_retirement(
                             tracing::error!(
                                 %error,
                                 attempts = retry_attempts,
-                                "code-source selector retirement retry budget exhausted"
+                                redrive_secs = SELECTOR_RETIREMENT_REDRIVE_DELAY.as_secs(),
+                                "code-source selector retirement retry budget exhausted; scheduling in-process redrive"
                             );
-                            return;
+                            std::thread::sleep(SELECTOR_RETIREMENT_REDRIVE_DELAY);
+                            retry_attempts = 0;
+                            retry_delay = std::time::Duration::from_secs(1);
+                            continue;
                         };
                         std::thread::sleep(delay);
                     }
@@ -1859,6 +1892,10 @@ impl HttpError {
         Self::new(StatusCode::PAYLOAD_TOO_LARGE, code, message)
     }
 
+    fn too_many_requests(code: &str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::TOO_MANY_REQUESTS, code, message)
+    }
+
     fn storage(error: impl std::fmt::Display) -> Self {
         tracing::warn!(error = %error, "code-source storage operation failed");
         Self::new(
@@ -1895,6 +1932,28 @@ impl HttpError {
                     "invalid_code_source_input",
                     "code-source input violates the collection contract",
                 ),
+            };
+        }
+        if let Some(request) = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<StoreRequestError>())
+        {
+            return match request {
+                StoreRequestError::LimitExceeded => Self::too_large(
+                    "limit_exceeded",
+                    "code-source input exceeds an enforced limit",
+                ),
+                StoreRequestError::TooManyOpenUploads => Self::too_many_requests(
+                    "upload_limit_reached",
+                    "producer has too many open uploads",
+                ),
+                StoreRequestError::InvalidState => Self::unprocessable(
+                    "invalid_upload_state",
+                    "upload is not in the required state",
+                ),
+                StoreRequestError::InvalidInput => {
+                    Self::unprocessable("invalid_code_source_input", "code-source input is invalid")
+                }
             };
         }
         Self::storage(error)
@@ -2048,6 +2107,48 @@ mod tests {
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let begun: BeginUploadResponse = serde_json::from_slice(&body).unwrap();
 
+        let other_token_secret = "e".repeat(64);
+        *state.code_sources.snapshot.write() = Arc::new(CodeSourceSnapshot {
+            enabled: true,
+            auth: vec![
+                AuthEntry {
+                    token: ServiceToken::parse(token.clone()).unwrap(),
+                    grant: ProducerGrant {
+                        producer_id: "http-test-producer".into(),
+                        projects: BTreeMap::from([(
+                            descriptor.scope.clone(),
+                            "http-test-project".into(),
+                        )]),
+                    },
+                },
+                AuthEntry {
+                    token: ServiceToken::parse(other_token_secret.clone()).unwrap(),
+                    grant: ProducerGrant {
+                        producer_id: "other-http-producer".into(),
+                        projects: BTreeMap::from([(
+                            descriptor.scope.clone(),
+                            "http-test-project".into(),
+                        )]),
+                    },
+                },
+            ],
+            store: state.code_sources.store(),
+        });
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                "GET",
+                format!(
+                    "/internal/code-source/v1/uploads/{}/missing",
+                    begun.upload_id
+                ),
+                &other_token_secret,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
         let response = app
             .clone()
             .oneshot(authenticated_request(
@@ -2084,6 +2185,64 @@ mod tests {
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let missing: MissingBlobsPage = serde_json::from_slice(&body).unwrap();
         assert_eq!(missing.hashes, vec!["b".repeat(64)]);
+
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                format!(
+                    "/internal/code-source/v1/uploads/{}/finalize",
+                    begun.upload_id
+                ),
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let error: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, "invalid_upload_state");
+
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                "GET",
+                format!(
+                    "/internal/code-source/v1/uploads/{}/missing?cursor=stale",
+                    begun.upload_id
+                ),
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let error: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, "invalid_code_source_input");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!(
+                        "/internal/code-source/v1/uploads/{}/blobs/{}",
+                        begun.upload_id,
+                        "b".repeat(64)
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_LENGTH, "1")
+                    .body(Body::from("x"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let error: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, "invalid_code_source_input");
 
         let durable =
             anyhow::anyhow!("reading /private/customer/repository/code-sources/secret.json failed");
@@ -2129,6 +2288,120 @@ mod tests {
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let error: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(error.code, "unsupported_contract");
+    }
+
+    #[tokio::test]
+    async fn code_source_http_routes_preserve_auth_not_found_and_store_limit_semantics() {
+        let directory = tempfile::tempdir().unwrap();
+        let scope = PublishedScope::try_new("http-limits", ".").unwrap();
+        let (state, token) = enabled_http_state(directory.path(), &scope);
+        let app = router(state.clone()).with_state(state.clone());
+        let descriptor = empty_generation_descriptor(scope.clone(), &"c".repeat(40));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/code-source/v1/uploads")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&BeginUploadRequest {
+                            descriptor: descriptor.clone(),
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let forbidden = BeginUploadRequest {
+            descriptor: empty_generation_descriptor(
+                PublishedScope::try_new("other-http-repo", ".").unwrap(),
+                &"d".repeat(40),
+            ),
+        };
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/uploads",
+                &token,
+                Body::from(serde_json::to_vec(&forbidden).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                "GET",
+                "/internal/code-source/v1/uploads/00000000-0000-4000-8000-000000000000/missing",
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let mut limits = StoreLimits::default();
+        limits.max_manifest_files = 0;
+        state
+            .code_sources
+            .store()
+            .update_limits(limits.clone())
+            .unwrap();
+        let mut oversized = descriptor.clone();
+        oversized.file_count = 1;
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/uploads",
+                &token,
+                Body::from(
+                    serde_json::to_vec(&BeginUploadRequest {
+                        descriptor: oversized,
+                    })
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let error: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, "limit_exceeded");
+
+        limits.max_manifest_files = StoreLimits::default().max_manifest_files;
+        limits.max_open_uploads_per_producer = 1;
+        state.code_sources.store().update_limits(limits).unwrap();
+        for expected in [StatusCode::CREATED, StatusCode::TOO_MANY_REQUESTS] {
+            let response = app
+                .clone()
+                .oneshot(authenticated_request(
+                    "POST",
+                    "/internal/code-source/v1/uploads",
+                    &token,
+                    Body::from(
+                        serde_json::to_vec(&BeginUploadRequest {
+                            descriptor: descriptor.clone(),
+                        })
+                        .unwrap(),
+                    ),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::TOO_MANY_REQUESTS {
+                let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+                let error: ErrorResponse = serde_json::from_slice(&body).unwrap();
+                assert_eq!(error.code, "upload_limit_reached");
+            }
+        }
     }
 
     #[test]

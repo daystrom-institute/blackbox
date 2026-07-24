@@ -109,6 +109,7 @@ pub enum IndexWriteOp {
         selector: String,
         ack: mpsc::SyncSender<Result<u64>>,
         release: mpsc::Receiver<()>,
+        hold_state: Arc<AtomicU8>,
     },
     /// Barrier: acked once every previously-enqueued op has been applied and
     /// committed. Drained-queue semantics, not durability.
@@ -138,6 +139,7 @@ pub struct StagedIndexGeneration {
 pub struct RetiredCodeSelector {
     pub document_count: u64,
     release: Option<mpsc::SyncSender<()>>,
+    hold_state: Arc<AtomicU8>,
 }
 
 impl Drop for RetiredCodeSelector {
@@ -145,6 +147,14 @@ impl Drop for RetiredCodeSelector {
         if let Some(release) = self.release.take() {
             let _ = release.send(());
         }
+    }
+}
+
+impl RetiredCodeSelector {
+    /// Convert the bounded retirement hold into a cleanup hold. Cleanup must
+    /// fail closed if the actor released the writer lane before this call.
+    pub fn begin_cleanup(&self) -> Result<()> {
+        begin_generation_publication(&self.hold_state)
     }
 }
 
@@ -592,11 +602,13 @@ impl IndexWriterActor {
     pub fn retire_code_selector(&self, selector: String) -> Result<RetiredCodeSelector> {
         let (ack, ack_rx) = mpsc::sync_channel(1);
         let (release, release_rx) = mpsc::sync_channel(1);
+        let hold_state = Arc::new(AtomicU8::new(STAGE_HOLD_HELD));
         self.tx
             .send(IndexWriteOp::RetireCodeSelector {
                 selector,
                 ack,
                 release: release_rx,
+                hold_state: hold_state.clone(),
             })
             .map_err(|_| anyhow!("index writer actor unavailable"))?;
         let document_count = ack_rx
@@ -605,6 +617,7 @@ impl IndexWriterActor {
         Ok(RetiredCodeSelector {
             document_count,
             release: Some(release),
+            hold_state,
         })
     }
 
@@ -690,12 +703,18 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
                 selector,
                 ack,
                 release,
+                hold_state,
             } => {
                 let result = run_selector_retirement(&ctx, &selector);
                 let should_hold = result.is_ok();
                 let _ = ack.send(result);
                 if should_hold {
-                    await_stage_release(release, "selector retirement");
+                    await_generation_stage_release(
+                        release,
+                        "selector retirement",
+                        &hold_state,
+                        STAGED_GENERATION_HOLD_TIMEOUT,
+                    );
                 }
             }
             first => {
@@ -727,18 +746,6 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
         }
     }
     tracing::info!("index writer actor stopped");
-}
-
-fn await_stage_release(release: mpsc::Receiver<()>, operation: &str) {
-    if let Err(mpsc::RecvTimeoutError::Timeout) =
-        release.recv_timeout(STAGED_GENERATION_HOLD_TIMEOUT)
-    {
-        tracing::error!(
-            operation,
-            timeout_secs = STAGED_GENERATION_HOLD_TIMEOUT.as_secs(),
-            "index writer stage hold timed out; releasing the writer lane"
-        );
-    }
 }
 
 fn await_generation_stage_release(

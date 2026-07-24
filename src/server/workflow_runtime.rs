@@ -32,6 +32,10 @@ impl BlackboxServer {
             Some(raw) => match self.resolve_project_write_scope(raw) {
                 Ok((scope, _)) => Some(scope),
                 Err(error) => {
+                    // Authority failure must not fall back to the literal cwd:
+                    // that could inject pins from a different checkout scope.
+                    // Dispatch continues without ambient pins and the error is
+                    // retained in daemon diagnostics for operator repair.
                     tracing::error!(
                         project = raw,
                         %error,

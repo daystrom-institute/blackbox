@@ -428,14 +428,18 @@ projects.json
 project-attachments.json
 project-catalog-transaction.json
 project-catalog-migration.json
+project-catalog-migration-receipt.json
 project-catalog-stage/
 project-catalog-backups/
 projects.json.lock
 ```
 
-The catalog remains at `projects.json`. The attachment store, journal,
-migration marker, stage directory, and backups are siblings. The short mutation
-lock is the existing canonical `projects.json.lock` returned by
+The catalog remains at `projects.json`. The attachment store, active journal,
+migration marker, durable migration receipt, stage directory, and backups are
+siblings. The receipt is the committed migration journal copied to a fixed
+authority path before the active journal can be replaced by a regular pair
+transaction. It is not backup content and remains required after backup
+cleanup. The short mutation lock is the existing canonical `projects.json.lock` returned by
 `with_store_lock(projects_path)`, so the bridge `StorePersister`, preflight,
 regular v2 transactions, and migration transactions exclude one another.
 Path derivation is centralized and unit-tested for an arbitrary configured
@@ -554,9 +558,11 @@ Transaction order:
 8. install every mutable participant in code-owned role order, fsyncing each
    parent;
 9. verify all installed hashes, epochs, and cross-store invariants;
-10. atomically write the committed journal and fsync its parent;
-11. publish the immutable in-memory pair; and
-12. retain backups, journal, marker, and pinned immutable assets until bounded
+10. for a committed migration, atomically write its durable receipt and fsync
+    the parent;
+11. atomically write the committed active journal and fsync its parent;
+12. publish the immutable in-memory pair; and
+13. retain backups, journal, marker, and pinned immutable assets until bounded
     cleanup proves the committed state and final closeout permits removal.
 
 Phase 1 cleanup may remove only artifacts from an older committed transaction
@@ -862,7 +868,10 @@ lane aggregate is derived from that exact list. One aggregate lane hash can
 never stand in for proof that each owner was visited.
 
 Missing or corrupt owners return typed subsource/lane evidence and make the
-report `Refused`; they never collapse into an empty complete lane. Apply
+report `Refused`; they never collapse into an empty complete lane. Transient
+metadata, open, read, or owner-coordinator failures return unavailable
+evidence and abort capture without writing a durable corruption finding.
+Apply
 recaptures all lanes through the same owner APIs and requires the same
 subsource list, fingerprints, and row commitments before plan validation.
 Where an owner crate lacks a read-only, no-create strict snapshot API, P1-C
@@ -1262,8 +1271,12 @@ journal and marker GC root. Phase 1 may defer physical Tantivy, vector, and
 edge deletion, but it does not defer the authority cut. The loser is absent
 from effective selection in the exact state the later v2 runtime opens.
 
-Every legacy publisher pin yields one G1 pointer or one explicit
-`NoPublishedContentAcknowledged` disposition. G1 stores accepted commit P and
+Every legacy publisher pin with exactly one catalog owner yields one G1 pointer
+or one explicit `NoPublishedContentAcknowledged` disposition. An ownerless or
+multiply-owned pin is a hard attribution refusal: no-content acknowledgement
+cannot authorize discarding content before a unique catalog owner exists.
+After the operator repairs that ownership input, the bound pin must receive one
+of the two dispositions. G1 stores accepted commit P and
 canonical knowledge and gap file manifests, but no invented Git ancestry.
 Exact `publisher-refs.json` bytes and checksum remain rollback-pinned, and v2
 never consults them.

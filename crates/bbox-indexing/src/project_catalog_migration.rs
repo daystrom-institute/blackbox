@@ -188,6 +188,7 @@ pub struct ProjectCatalogMigrationResolvedLayoutV1 {
     pub(crate) attachments_path: PathBuf,
     pub(crate) transaction_journal_path: PathBuf,
     pub(crate) migration_marker_path: PathBuf,
+    pub(crate) migration_receipt_path: PathBuf,
     pub(crate) transaction_stage_dir: PathBuf,
     pub(crate) catalog_backup_dir: PathBuf,
     pub(crate) catalog_mutation_lock_path: PathBuf,
@@ -258,6 +259,7 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
                     attachments_path: catalog_paths.attachments_path,
                     transaction_journal_path: catalog_paths.transaction_journal_path,
                     migration_marker_path: catalog_paths.migration_marker_path,
+                    migration_receipt_path: catalog_paths.migration_receipt_path,
                     transaction_stage_dir: catalog_paths.transaction_stage_dir,
                     catalog_backup_dir: catalog_paths.catalog_backup_dir,
                     catalog_mutation_lock_path: catalog_paths.catalog_mutation_lock_path,
@@ -330,6 +332,7 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
             attachments_path: catalog_paths.attachments_path,
             transaction_journal_path: catalog_paths.transaction_journal_path,
             migration_marker_path: catalog_paths.migration_marker_path,
+            migration_receipt_path: catalog_paths.migration_receipt_path,
             transaction_stage_dir: catalog_paths.transaction_stage_dir,
             catalog_backup_dir: catalog_paths.catalog_backup_dir,
             catalog_mutation_lock_path: catalog_paths.catalog_mutation_lock_path,
@@ -383,6 +386,7 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
             &self.attachments_path,
             &self.transaction_journal_path,
             &self.migration_marker_path,
+            &self.migration_receipt_path,
             &self.catalog_mutation_lock_path,
             &self.catalog_lifetime_lock_path,
             &self.accepted_publications_anchor,
@@ -428,6 +432,7 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
             self.attachments_path.as_path(),
             self.transaction_journal_path.as_path(),
             self.migration_marker_path.as_path(),
+            self.migration_receipt_path.as_path(),
             self.transaction_stage_dir.as_path(),
             self.catalog_backup_dir.as_path(),
             self.catalog_mutation_lock_path.as_path(),
@@ -487,6 +492,7 @@ struct CatalogDerivedPathsV1 {
     attachments_path: PathBuf,
     transaction_journal_path: PathBuf,
     migration_marker_path: PathBuf,
+    migration_receipt_path: PathBuf,
     transaction_stage_dir: PathBuf,
     catalog_backup_dir: PathBuf,
     catalog_mutation_lock_path: PathBuf,
@@ -511,6 +517,7 @@ impl CatalogDerivedPathsV1 {
             "project-attachments.json"
                 | "project-catalog-transaction.json"
                 | "project-catalog-migration.json"
+                | "project-catalog-migration-receipt.json"
                 | "project-catalog-stage"
                 | "project-catalog-backups"
                 | "project-catalog-migration.lock"
@@ -528,6 +535,7 @@ impl CatalogDerivedPathsV1 {
             attachments_path: parent.join("project-attachments.json"),
             transaction_journal_path: parent.join("project-catalog-transaction.json"),
             migration_marker_path: parent.join("project-catalog-migration.json"),
+            migration_receipt_path: parent.join("project-catalog-migration-receipt.json"),
             transaction_stage_dir: parent.join("project-catalog-stage"),
             catalog_immutable_root: catalog_backup_dir.join("immutable"),
             catalog_backup_dir,

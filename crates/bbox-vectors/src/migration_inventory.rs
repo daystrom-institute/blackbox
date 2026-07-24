@@ -49,6 +49,7 @@ pub enum VectorMigrationSourceStateV1 {
     Present,
     Missing,
     Corrupt { diagnostic_code: &'static str },
+    Unavailable { diagnostic_code: &'static str },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,7 +117,7 @@ pub fn capture_migration_snapshot_no_create(
     }
     match fs::symlink_metadata(root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return missing_snapshot(),
-        Err(_) => return corrupt_snapshot("vector_root_metadata_unreadable"),
+        Err(_) => return unavailable_snapshot("vector_root_metadata_unavailable"),
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return corrupt_snapshot("vector_root_symlinked");
         }
@@ -127,17 +128,17 @@ pub fn capture_migration_snapshot_no_create(
     }
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
-        Err(_) => return corrupt_snapshot("vector_root_unreadable"),
+        Err(_) => return unavailable_snapshot("vector_root_unavailable"),
     };
     let mut partition_paths = Vec::new();
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(_) => return corrupt_snapshot("vector_partition_entry_unreadable"),
+            Err(_) => return unavailable_snapshot("vector_partition_entry_unavailable"),
         };
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
-            Err(_) => return corrupt_snapshot("vector_partition_entry_unreadable"),
+            Err(_) => return unavailable_snapshot("vector_partition_entry_unavailable"),
         };
         if file_type.is_symlink() {
             return corrupt_snapshot("vector_partition_entry_symlinked");
@@ -231,7 +232,9 @@ fn capture_partition_no_create(
         }
         Ok(_) => return capture_partition_from_wal(route, &wal_path, limits),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return corrupt_partition(route, "vector_partition_wal_metadata_unreadable"),
+        Err(_) => {
+            return unavailable_partition(route, "vector_partition_wal_metadata_unavailable");
+        }
     }
 
     let snapshot_path = path.join(SNAPSHOT_FILE);
@@ -240,7 +243,9 @@ fn capture_partition_no_create(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return corrupt_partition(route, "vector_partition_source_missing");
         }
-        Err(_) => return corrupt_partition(route, "vector_partition_snapshot_metadata_unreadable"),
+        Err(_) => {
+            return unavailable_partition(route, "vector_partition_snapshot_metadata_unavailable");
+        }
     };
     if metadata.file_type().is_symlink() {
         return corrupt_partition(route, "vector_partition_snapshot_symlinked");
@@ -253,6 +258,13 @@ fn capture_partition_no_create(
     }
     let snapshot = match read_snapshot(&snapshot_path) {
         Ok(snapshot) => snapshot,
+        Err(error)
+            if error
+                .chain()
+                .any(|cause| cause.downcast_ref::<std::io::Error>().is_some()) =>
+        {
+            return unavailable_partition(route, "vector_partition_snapshot_read_unavailable");
+        }
         Err(_) => return corrupt_partition(route, "vector_partition_snapshot_decode_failed"),
     };
     capture_partition_from_snapshot(route, snapshot)
@@ -265,7 +277,7 @@ fn capture_partition_from_wal(
 ) -> CapturedPartitionV1 {
     let file = match fs::File::open(wal_path) {
         Ok(file) => file,
-        Err(_) => return corrupt_partition(route, "vector_partition_wal_open_failed"),
+        Err(_) => return unavailable_partition(route, "vector_partition_wal_open_unavailable"),
     };
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
@@ -274,7 +286,7 @@ fn capture_partition_from_wal(
         line.clear();
         let read = match reader.read_until(b'\n', &mut line) {
             Ok(read) => read,
-            Err(_) => return corrupt_partition(route, "vector_partition_wal_read_failed"),
+            Err(_) => return unavailable_partition(route, "vector_partition_wal_read_unavailable"),
         };
         if read == 0 {
             break;
@@ -374,6 +386,22 @@ fn corrupt_partition(route: &str, code: &'static str) -> CapturedPartitionV1 {
     }
 }
 
+fn unavailable_partition(route: &str, code: &'static str) -> CapturedPartitionV1 {
+    CapturedPartitionV1 {
+        evidence: VectorPartitionMigrationSnapshotV1 {
+            route: route.to_string(),
+            state: VectorMigrationSourceStateV1::Unavailable {
+                diagnostic_code: code,
+            },
+            schema_version: None,
+            source_fingerprint_sha256: None,
+            active_key_count: 0,
+            active_key_commitment_sha256: empty_hash(PARTITION_ROW_HASH_DOMAIN),
+        },
+        active_keys: Vec::new(),
+    }
+}
+
 fn assemble_snapshot(
     captured: Vec<CapturedPartitionV1>,
     limits: VectorMigrationSnapshotLimitsV1,
@@ -391,6 +419,12 @@ fn assemble_snapshot(
             VectorMigrationSourceStateV1::Corrupt { .. }
         )
     });
+    let unavailable = captured
+        .iter()
+        .find_map(|partition| match partition.evidence.state {
+            VectorMigrationSourceStateV1::Unavailable { diagnostic_code } => Some(diagnostic_code),
+            _ => None,
+        });
     let mut all_keys = captured
         .iter()
         .flat_map(|partition| partition.active_keys.iter().cloned())
@@ -470,7 +504,9 @@ fn assemble_snapshot(
 
     VectorMigrationSnapshotV1 {
         version: SNAPSHOT_VERSION_V1,
-        state: if any_corrupt {
+        state: if let Some(diagnostic_code) = unavailable {
+            VectorMigrationSourceStateV1::Unavailable { diagnostic_code }
+        } else if any_corrupt {
             VectorMigrationSourceStateV1::Corrupt {
                 diagnostic_code: "vector_partition_corrupt",
             }
@@ -500,6 +536,15 @@ fn missing_snapshot() -> VectorMigrationSnapshotV1 {
 fn corrupt_snapshot(code: &'static str) -> VectorMigrationSnapshotV1 {
     let mut snapshot = empty_snapshot();
     snapshot.state = VectorMigrationSourceStateV1::Corrupt {
+        diagnostic_code: code,
+    };
+    snapshot.source_fingerprint_sha256 = None;
+    snapshot
+}
+
+fn unavailable_snapshot(code: &'static str) -> VectorMigrationSnapshotV1 {
+    let mut snapshot = empty_snapshot();
+    snapshot.state = VectorMigrationSourceStateV1::Unavailable {
         diagnostic_code: code,
     };
     snapshot.source_fingerprint_sha256 = None;
@@ -709,6 +754,34 @@ mod tests {
             snapshot.state,
             VectorMigrationSourceStateV1::Corrupt {
                 diagnostic_code: "vector_partition_entry_symlinked"
+            }
+        ));
+    }
+
+    #[test]
+    fn truncated_wal_and_source_limit_are_distinct_corrupt_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let partition = root.join("route-a");
+        fs::create_dir(&partition).unwrap();
+        fs::write(partition.join(WAL_FILE), b"{truncated").unwrap();
+
+        let truncated =
+            capture_migration_snapshot_no_create(&root, VectorMigrationSnapshotLimitsV1::default());
+        assert!(matches!(
+            truncated.partitions[0].state,
+            VectorMigrationSourceStateV1::Corrupt {
+                diagnostic_code: "vector_partition_wal_decode_failed"
+            }
+        ));
+
+        let mut limits = VectorMigrationSnapshotLimitsV1::default();
+        limits.max_partition_source_bytes = 1;
+        let oversized = capture_migration_snapshot_no_create(&root, limits);
+        assert!(matches!(
+            oversized.partitions[0].state,
+            VectorMigrationSourceStateV1::Corrupt {
+                diagnostic_code: "vector_partition_source_byte_limit"
             }
         ));
     }
