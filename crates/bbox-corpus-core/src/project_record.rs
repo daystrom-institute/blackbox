@@ -316,10 +316,65 @@ struct ProjectStoreView {
     projects: Vec<ProjectRecord>,
 }
 
+/// The injected project-identity snapshot of phase-2 §6.2. Daemon-runtime
+/// consumers receive this instead of reading `projects.json` from disk or
+/// taking the registry by type, so the catalog-mode runtime can feed them
+/// without v1 bytes existing at all.
+///
+/// `records` carries attached projects only (the path-bearing compatibility
+/// rows); `corpus_project_ids` carries the COMPLETE catalog project-id set,
+/// which seeds corpus identity surfaces (active-selector maps, edge
+/// registered-project sets) so remote-only collected state is never hidden
+/// by an attached-only gate. On the version-1 bridge the two views coincide.
+#[derive(Debug, Clone)]
+pub struct ProjectRecordsSnapshot {
+    pub records: std::sync::Arc<Vec<ProjectRecord>>,
+    pub corpus_project_ids: std::sync::Arc<BTreeSet<String>>,
+    pub omitted_catalog_count: u64,
+    /// Authority epoch this snapshot was derived from: the registry mutation
+    /// epoch on the bridge, the catalog epoch in catalog mode.
+    pub authority_epoch: u64,
+}
+
+impl ProjectRecordsSnapshot {
+    /// Bridge derivation: the corpus id set is exactly the record id set.
+    pub fn from_bridge_records(records: Vec<ProjectRecord>, authority_epoch: u64) -> Self {
+        let corpus_project_ids = records
+            .iter()
+            .map(|record| record.project_id.clone())
+            .collect::<BTreeSet<_>>();
+        Self {
+            records: std::sync::Arc::new(records),
+            corpus_project_ids: std::sync::Arc::new(corpus_project_ids),
+            omitted_catalog_count: 0,
+            authority_epoch,
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            records: std::sync::Arc::new(Vec::new()),
+            corpus_project_ids: std::sync::Arc::new(BTreeSet::new()),
+            omitted_catalog_count: 0,
+            authority_epoch: 0,
+        }
+    }
+}
+
+/// Source of fresh [`ProjectRecordsSnapshot`]s for long-lived consumers
+/// (index writer, providers). Implementations derive on read against their
+/// authority's epoch, so staleness is unrepresentable rather than
+/// discipline-dependent.
+pub trait ProjectRecordsProvider: Send + Sync {
+    fn records_snapshot(&self) -> ProjectRecordsSnapshot;
+}
+
 /// Load the registered project records from a `projects.json` registry
 /// file. Returns an empty list when the file does not exist. This is the
 /// thin static read used by index passes; registry mutation stays with the
-/// daemon-side `ProjectRegistry`.
+/// daemon-side `ProjectRegistry`. After the phase-2 injection refactor this
+/// has no daemon-runtime caller: runtime consumers receive
+/// [`ProjectRecordsSnapshot`]s from their authority instead.
 pub fn load_project_records(
     path: impl AsRef<std::path::Path>,
 ) -> anyhow::Result<Vec<ProjectRecord>> {

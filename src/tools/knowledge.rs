@@ -263,9 +263,9 @@ impl BlackboxServer {
         let registered_without_checkout = checkout.is_none()
             && self
                 .state
-                .projects
-                .read()
-                .list()
+                .records_provider
+                .records_snapshot()
+                .records
                 .iter()
                 .any(|record| record.canonical_path == durable_scope);
         if registered_without_checkout {
@@ -328,7 +328,7 @@ impl BlackboxServer {
                 published_scope: checkout.published_scope.clone(),
                 checkout_id: checkout.checkout_id.clone(),
             });
-        let projects = self.state.projects.read().list();
+        let projects = self.state.records_provider.records_snapshot().records;
         let prior = self
             .state
             .knowledge_overlays
@@ -820,7 +820,7 @@ impl BlackboxServer {
 
             let mut p = p;
             if p.project.is_some() {
-                let projects = server.state.projects.read().list();
+                let projects = server.state.records_provider.records_snapshot().records;
                 rescope_project_filter(&mut p, &projects);
             }
 
@@ -1418,7 +1418,9 @@ mod tests {
         ));
         let project_id = server
             .state
-            .projects
+            .project_authority
+            .bridge_registry()
+            .unwrap()
             .write()
             .register_path(&base_canon)
             .unwrap()

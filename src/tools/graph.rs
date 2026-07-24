@@ -602,7 +602,7 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_ref_size", move || {
-            let projects = server.state.projects.read().list();
+            let projects = server.state.records_provider.records_snapshot().records;
             let checkout_rows = server.state.checkout_registry.read().rows().to_vec();
             let session_checkout = server.authoritative_session_checkout();
             let broker = crate::server::checkout_access::checkout_access_broker(&server.state);
@@ -716,7 +716,7 @@ impl BlackboxServer {
                 .provider_context()
                 .with_edge_index(edge_index)
                 .with_searcher(&read_view.searcher);
-            let projects = server.state.projects.read().list();
+            let projects = server.state.records_provider.records_snapshot().records;
             let target = match mcp_tools::blame::target_identity(&p, &provider_ctx) {
                 Ok(target) => target,
                 Err(error) => return Ok(mcp_tools::blame::bad_input(error.to_string())),
@@ -790,7 +790,7 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_provenance_export", move || {
-            let projects = server.state.projects.read().list();
+            let projects = server.state.records_provider.records_snapshot().records;
             let broker = crate::server::checkout_access::checkout_access_broker(&server.state);
             let (leases, inputs) =
                 acquire_provenance_projects(&broker, &p, &projects, CheckoutAccessIntent::Write)?;
@@ -840,7 +840,7 @@ impl BlackboxServer {
                     "error.invalid_checkout_scope: authoritative checkout has no durable project scope"
                 );
             }
-            let projects = server.state.projects.read().list();
+            let projects = server.state.records_provider.records_snapshot().records;
             if !projects
                 .iter()
                 .any(|project| project.project_id == checkout.project_id)
@@ -877,7 +877,7 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_provenance_import", move || {
-            let projects = server.state.projects.read().list();
+            let projects = server.state.records_provider.records_snapshot().records;
             let broker = crate::server::checkout_access::checkout_access_broker(&server.state);
             let (leases, inputs) =
                 acquire_provenance_projects(&broker, &p, &projects, CheckoutAccessIntent::Read)?;

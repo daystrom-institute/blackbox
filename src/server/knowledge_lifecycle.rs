@@ -518,7 +518,7 @@ impl BlackboxServer {
         &self,
         recover: fn(&Path) -> Result<Option<bbox_knowledge::transaction::RepoTransactionManifest>>,
     ) -> usize {
-        let projects = self.state.projects.read().list();
+        let projects = self.state.records_provider.records_snapshot().records;
         let rows = self.state.checkout_registry.read().rows().to_vec();
         let mut recovered = 0;
         for row in rows {
@@ -615,7 +615,7 @@ impl BlackboxServer {
     pub(crate) fn reconcile_dark_knowledge_checkouts(
         &self,
     ) -> Result<KnowledgeCheckoutReconcileReport> {
-        let projects = self.state.projects.read().list();
+        let projects = self.state.records_provider.records_snapshot().records;
         let prior_rows = self.state.checkout_registry.read().rows().to_vec();
         let mut valid = BTreeSet::new();
         let mut stale = BTreeSet::new();
@@ -707,7 +707,7 @@ impl BlackboxServer {
             .map(registry_key)
             .collect::<BTreeSet<_>>();
         let mut discovery = Vec::new();
-        for project in &projects {
+        for project in projects.iter() {
             match super::checkout_access::acquire_selected_project_access(
                 &self.state.checkout_access,
                 &project.project_id,
@@ -928,7 +928,7 @@ impl BlackboxServer {
         &self,
     ) -> Result<bbox_knowledge::inventory::PersistedInventoryReport> {
         let entries = self.state.kb.read().all_entries().to_vec();
-        let projects = self.state.projects.read().list();
+        let projects = self.state.records_provider.records_snapshot().records;
         let carriers = super::repo_io::RepoIoAuthority::knowledge_base_carriers(&projects)?;
         let repo_io = super::repo_io::RepoIoAuthority::new(self.state.checkout_access.clone());
         bbox_knowledge::inventory::persist_schema_epoch_inventory_read_only(
@@ -951,10 +951,11 @@ impl BlackboxServer {
         let canonical = project_root.to_string_lossy();
         let projects = self
             .state
-            .projects
-            .read()
-            .list()
-            .into_iter()
+            .records_provider
+            .records_snapshot()
+            .records
+            .iter()
+            .cloned()
             .filter(|project| project.canonical_path == canonical)
             .collect::<Vec<_>>();
         if projects.len() != 1 {
@@ -1000,14 +1001,14 @@ impl BlackboxServer {
                 "{legacy_gaps} central path-scoped gap entries remain"
             ));
         }
-        let projects = self.state.projects.read().list();
+        let projects = self.state.records_provider.records_snapshot().records;
         if projects.is_empty() {
             blockers.push(
                 "no registered project scopes exist; refusing a vacuous path-fallback cut".into(),
             );
         }
         let mut scopes = BTreeSet::new();
-        for project in &projects {
+        for project in projects.iter() {
             match super::checkout_access::published_scope_for_project(
                 &self.state.checkout_access,
                 &project.project_id,
@@ -1171,11 +1172,10 @@ impl BlackboxServer {
         let Some(scope) = row.published_scope() else {
             return Ok(None);
         };
-        let project_ids = self
-            .state
-            .projects
-            .read()
-            .list()
+        let records = self.state.records_provider.records_snapshot().records;
+        let project_ids = records
+            .as_ref()
+            .clone()
             .into_iter()
             .map(|project| project.project_id);
         let Some(project_id) = super::checkout_access::project_id_for_published_scope(
@@ -1200,10 +1200,10 @@ impl BlackboxServer {
         let project_id = match row.project_id.clone() {
             Some(project_id) => project_id,
             None => {
-                let projects = self.state.projects.read().list();
+                let projects = self.state.records_provider.records_snapshot().records;
                 let Some(project_id) = super::checkout_access::project_id_for_published_scope(
                     &self.state.checkout_access,
-                    projects.into_iter().map(|project| project.project_id),
+                    projects.iter().map(|project| project.project_id.clone()),
                     &scope,
                 )?
                 else {
@@ -1266,7 +1266,7 @@ impl BlackboxServer {
     }
 
     fn reconcile_knowledge_scope_index(&self, scope: &PublishedScope) {
-        let projects = self.state.projects.read().list();
+        let projects = self.state.records_provider.records_snapshot().records;
         match self.authorize_publisher_classified(&projects, scope) {
             Ok(publisher) => {
                 let Some(project) = projects
@@ -1615,7 +1615,14 @@ mod tests {
         let state_dir = temp_root.join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
         let server = BlackboxServer::new(std::sync::Arc::new(SharedState::for_test(&state_dir)));
-        server.state.projects.write().register_path(&base).unwrap();
+        server
+            .state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(&base)
+            .unwrap();
         (
             temp,
             server,
@@ -1628,7 +1635,7 @@ mod tests {
     #[test]
     fn publisher_pin_is_not_persisted_when_publication_fence_is_unavailable() {
         let (_temp, server, _base, _worktree, scope) = fixture();
-        let projects = server.state.projects.read().list();
+        let projects = server.state.records_provider.records_snapshot().records;
         let lifecycle = server
             .state
             .checkout_access
@@ -1792,10 +1799,11 @@ mod tests {
             .unwrap();
         let project_id = server
             .state
-            .projects
-            .read()
-            .list()
-            .into_iter()
+            .records_provider
+            .records_snapshot()
+            .records
+            .iter()
+            .cloned()
             .find(|project| project.canonical_path == base.to_string_lossy())
             .unwrap()
             .project_id;
@@ -2309,7 +2317,14 @@ mod tests {
         )
         .unwrap();
 
-        let project = server.state.projects.read().list().pop().unwrap();
+        let project = server
+            .state
+            .records_provider
+            .records_snapshot()
+            .records
+            .last()
+            .cloned()
+            .unwrap();
         assert_eq!(
             crate::server::checkout_access::published_scope_for_project(
                 &server.state.checkout_access,
@@ -2324,7 +2339,14 @@ mod tests {
     #[test]
     fn pinned_config_scope_mismatch_fails_closed() {
         let (_temp, server, base, _worktree, scope) = fixture();
-        let project = server.state.projects.read().list().pop().unwrap();
+        let project = server
+            .state
+            .records_provider
+            .records_snapshot()
+            .records
+            .last()
+            .cloned()
+            .unwrap();
         let pin = server.authorize_publisher(std::slice::from_ref(&project), &scope);
         assert!(pin.is_ok(), "initial publisher authority: {pin:?}");
 
@@ -2351,7 +2373,14 @@ mod tests {
     #[test]
     fn missing_pinned_branch_is_invalid_authority_not_transient() {
         let (_temp, server, base, _worktree, scope) = fixture();
-        let project = server.state.projects.read().list().pop().unwrap();
+        let project = server
+            .state
+            .records_provider
+            .records_snapshot()
+            .records
+            .last()
+            .cloned()
+            .unwrap();
         let publisher = server
             .authorize_publisher(std::slice::from_ref(&project), &scope)
             .unwrap();

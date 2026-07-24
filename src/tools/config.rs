@@ -63,8 +63,7 @@ impl BlackboxServer {
                     Some(pr) => pr.to_string(),
                     None => return Self::err_text("project is required"),
                 };
-                let registry = self.state.projects.read();
-                let records = registry.list();
+                let records = self.state.records_provider.records_snapshot().records;
                 // Mirror ProjectRegistry's symlink-resolving behavior so
                 // bind accepts aliases the registry already collapsed at
                 // register time. Without this, a user who registered
@@ -106,7 +105,6 @@ impl BlackboxServer {
                         (stored, None)
                     }
                 };
-                drop(registry);
                 // Preserve any badgey_id from a prior bind so re-binding
                 // an already-active channel doesn't orphan its system
                 // BadgeyInstance. The instance lifecycle is unbind-only;

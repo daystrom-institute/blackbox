@@ -1958,10 +1958,11 @@ pub(crate) fn build_edge_index_from_shared(
     let started = std::time::Instant::now();
     let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
     let registered_project_ids: std::collections::HashSet<String> = state
-        .projects
-        .read()
-        .list()
-        .into_iter()
+        .records_provider
+        .records_snapshot()
+        .records
+        .iter()
+        .cloned()
         .map(|project| project.project_id)
         .collect();
     match bbox_edge_sidecar::manifest::try_load_manifest_index(&edges_dir) {
@@ -2288,7 +2289,7 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
 /// Re-derive repository carriers from the live registry so committed
 /// knowledge and gaps are loaded only through checkout authority.
 pub(crate) fn sync_kb_project_roots(state: &SharedState) {
-    let projects = state.projects.read().list();
+    let projects = state.records_provider.records_snapshot().records;
     let repo_io = std::sync::Arc::new(super::repo_io::RepoIoAuthority::new(
         state.checkout_access.clone(),
     ));
@@ -2347,7 +2348,7 @@ pub(crate) fn enqueue_project_knowledge_embeds(
     project_dir: &str,
 ) -> usize {
     let server = super::BlackboxServer::new(state.clone());
-    let projects = state.projects.read().list();
+    let projects = state.records_provider.records_snapshot().records;
     let matching = projects
         .iter()
         .filter(|project| project.canonical_path == project_dir)
@@ -3274,7 +3275,14 @@ mod tests {
         let root = root.canonicalize().unwrap();
 
         let server = test_server(&temp);
-        server.state.projects.write().register_path(&root).unwrap();
+        server
+            .state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(&root)
+            .unwrap();
         sync_kb_project_roots(&server.state);
 
         std::fs::write(

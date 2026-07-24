@@ -57,7 +57,7 @@ impl BlackboxServer {
                 published_scope: checkout.published_scope.clone(),
                 checkout_id: checkout.checkout_id.clone(),
             });
-        let projects = self.state.projects.read().list();
+        let projects = self.state.records_provider.records_snapshot().records;
         let prior = self
             .state
             .gap_overlays
@@ -172,7 +172,7 @@ impl BlackboxServer {
     ) -> Result<SessionGapView> {
         let session_checkout = self.authoritative_session_checkout();
         let mode = ProvisionalMode::parse(provisional, session_checkout.is_some())?;
-        let projects = self.state.projects.read().list();
+        let projects = self.state.records_provider.records_snapshot().records;
         let requested_record = requested_project
             .and_then(|raw| {
                 crate::projects::resolve_project_context(
@@ -214,7 +214,7 @@ impl BlackboxServer {
         let selected_projects = requested_record
             .as_ref()
             .map(|record| vec![record.clone()])
-            .unwrap_or_else(|| projects.clone());
+            .unwrap_or_else(|| projects.as_ref().clone());
         let mut selected_scopes = BTreeMap::<PublishedScope, ProjectRecord>::new();
         for project in selected_projects {
             match super::checkout_access::published_scope_for_project(
@@ -668,7 +668,9 @@ mod tests {
         std::fs::create_dir_all(&state_dir).expect("create state");
         let state = Arc::new(crate::server::SharedState::for_test(&state_dir));
         state
-            .projects
+            .project_authority
+            .bridge_registry()
+            .unwrap()
             .write()
             .register_path(&repo)
             .expect("register");
@@ -726,7 +728,9 @@ mod tests {
             .expect("serialize dirty gap"),
         )
         .expect("write dirty gap");
-        let project_id = state.projects.read().list()[0].project_id.clone();
+        let project_id = state.records_provider.records_snapshot().records[0]
+            .project_id
+            .clone();
         let own_checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&repo)
             .expect("mint own checkout identity");
         let own_checkout = ResolvedCheckoutScope {

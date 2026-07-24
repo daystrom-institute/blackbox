@@ -3,8 +3,10 @@
 //! `crate::<module>` paths.
 
 pub mod accepted_publication_store;
+pub mod catalog_records;
 pub mod checkout_access;
 pub mod checkout_access_v1;
+pub mod checkout_access_v2;
 pub mod checkout_registry;
 pub mod index;
 pub mod project_catalog_inventory;

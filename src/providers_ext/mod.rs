@@ -124,7 +124,9 @@ mod tests {
 
         let stores = crate::server::state::SharedState::for_test(store.path());
         stores
-            .projects
+            .project_authority
+            .bridge_registry()
+            .unwrap()
             .write()
             .register_path(project.path())
             .unwrap();
@@ -164,7 +166,9 @@ mod tests {
 
         let stores = crate::server::state::SharedState::for_test(store.path());
         stores
-            .projects
+            .project_authority
+            .bridge_registry()
+            .unwrap()
             .write()
             .register_path(registered.path())
             .unwrap();

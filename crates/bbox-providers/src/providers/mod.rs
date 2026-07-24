@@ -26,7 +26,6 @@ use bbox_artifacts::artifacts::ArtifactCatalog;
 use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 use bbox_corpus_index::index::TranscriptIndex;
 use bbox_edge_index::edge_index::Edge;
-use bbox_indexing::projects::ProjectRegistry;
 use bbox_knowledge::knowledge::Knowledge;
 use bbox_packets::Packets;
 use bbox_stores::roadmap::Roadmap;
@@ -82,7 +81,9 @@ pub struct CorpusStores<'a> {
     pub roadmap: &'a RwLock<Roadmap>,
     pub threads: &'a RwLock<Threads>,
     pub notes: &'a RwLock<Notes>,
-    pub projects: &'a RwLock<ProjectRegistry>,
+    /// Injected project authority. Providers enumerate records through it
+    /// rather than reading the registry (or `projects.json`) directly.
+    pub projects: &'a dyn bbox_corpus_core::project_record::ProjectRecordsProvider,
     pub checkout_registry: &'a RwLock<bbox_indexing::checkout_registry::CheckoutRegistry>,
     pub checkout_access: &'a bbox_indexing::checkout_access::CheckoutAccessBroker,
     pub packets: &'a RwLock<Packets>,

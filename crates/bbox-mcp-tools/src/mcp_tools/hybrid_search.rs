@@ -681,7 +681,7 @@ fn resolve_project_filter(raw: Option<&str>, ctx: &ProviderContext<'_>) -> Optio
     }
     let projects = ctx
         .stores()
-        .map(|stores| stores.projects.read().list())
+        .map(|stores| stores.projects.records_snapshot().records)
         .unwrap_or_default();
     resolve_project_filter_path(raw, &projects)
 }

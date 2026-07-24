@@ -569,7 +569,10 @@ impl BlackboxServer {
         // committed record snapshots into the worktree checkout.
         let raw_project = p.project_dir.or(item.project.clone());
         let resolved = raw_project.as_deref().and_then(|proj| {
-            crate::projects::fleet_worktree_scope_and_dir(proj, &self.state.projects.read().list())
+            crate::projects::fleet_worktree_scope_and_dir(
+                proj,
+                &self.state.records_provider.records_snapshot().records,
+            )
         });
         let (thread_project, write_dir) = match resolved {
             Some((base, worktree)) => (Some(base), Some(worktree)),

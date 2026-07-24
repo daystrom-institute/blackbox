@@ -30,7 +30,7 @@ impl BlackboxServer {
             let resolved = p.project.as_deref().and_then(|proj| {
                 crate::projects::fleet_worktree_scope_and_dir(
                     proj,
-                    &self.state.projects.read().list(),
+                    &self.state.records_provider.records_snapshot().records,
                 )
             });
             let mut threads = self.state.threads.write();
@@ -94,7 +94,7 @@ impl BlackboxServer {
             let normalized = p.project.as_deref().and_then(|proj| {
                 crate::projects::fleet_worktree_scope_and_dir(
                     proj,
-                    &self.state.projects.read().list(),
+                    &self.state.records_provider.records_snapshot().records,
                 )
                 .map(|(base, _worktree)| base)
             });
@@ -201,7 +201,9 @@ mod tests {
         let server = BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())));
         server
             .state
-            .projects
+            .project_authority
+            .bridge_registry()
+            .unwrap()
             .write()
             .register_path(&base_canon)
             .unwrap();

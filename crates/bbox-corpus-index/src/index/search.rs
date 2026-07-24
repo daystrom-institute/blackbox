@@ -1592,17 +1592,26 @@ impl TranscriptIndex {
 
     // ── Reindex ─────────────────────────────────────────────────────
 
-    pub fn reindex(&mut self, p: &ReindexParams) -> Result<String> {
+    pub fn reindex(
+        &mut self,
+        p: &ReindexParams,
+        records: &[bbox_corpus_core::project_record::ProjectRecord],
+    ) -> Result<String> {
         // New docs may have arrived; force the stats call after this to
         // recompute rather than return a stale cache.
         *self.stats_cache.lock() = None;
-        self.build_index(p.full.unwrap_or(false))
+        self.build_index(p.full.unwrap_or(false), records)
     }
 
-    pub fn build_index(&mut self, full: bool) -> Result<String> {
-        let projects =
-            bbox_corpus_core::project_record::load_project_records(&self.config.projects_path)?;
-        if !projects.is_empty() {
+    /// Access-free index build. `records` is the caller's injected project
+    /// record set: a non-empty set means registered projects exist, and those
+    /// need validated checkout roots this entry point cannot supply.
+    pub fn build_index(
+        &mut self,
+        full: bool,
+        records: &[bbox_corpus_core::project_record::ProjectRecord],
+    ) -> Result<String> {
+        if !records.is_empty() {
             anyhow::bail!(
                 "registered-project reindex requires caller-supplied validated checkout roots"
             );

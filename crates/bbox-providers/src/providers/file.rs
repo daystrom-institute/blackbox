@@ -103,7 +103,7 @@ pub fn resolve_file(ctx: &ProviderContext<'_>, path: &str) -> Result<ResolvedFil
     let stores = ctx
         .stores()
         .ok_or_else(|| anyhow!("file refs require a registered project context"))?;
-    let projects = stores.projects.read().list();
+    let projects = stores.projects.records_snapshot().records;
     if projects.is_empty() {
         bail!("file refs require at least one registered project");
     }

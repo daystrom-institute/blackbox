@@ -74,10 +74,11 @@ impl BlackboxServer {
         };
         let record = self
             .state
-            .projects
-            .read()
-            .list()
-            .into_iter()
+            .records_provider
+            .records_snapshot()
+            .records
+            .iter()
+            .cloned()
             .find(|project| project.project_id == lease.project_id())
             .ok_or_else(|| {
                 anyhow::anyhow!("validated checkout project disappeared from registry")
@@ -142,10 +143,11 @@ impl BlackboxServer {
             .ok()?;
         let record = self
             .state
-            .projects
-            .read()
-            .list()
-            .into_iter()
+            .records_provider
+            .records_snapshot()
+            .records
+            .iter()
+            .cloned()
             .find(|project| project.project_id == lease.project_id())?;
         let is_checkout_alias = lease.project_root() != Path::new(&record.canonical_path);
         self.state.checkout_access.revalidate(&lease).ok()?;
@@ -215,7 +217,9 @@ mod tests {
         let server = BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())));
         server
             .state
-            .projects
+            .project_authority
+            .bridge_registry()
+            .unwrap()
             .write()
             .register_path(&base_canon)
             .unwrap();

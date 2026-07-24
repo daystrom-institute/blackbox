@@ -14,9 +14,9 @@ impl BlackboxServer {
             .and_then(|entry| entry.project.as_deref())
             .filter(|project| {
                 self.state
-                    .projects
-                    .read()
-                    .list()
+                    .records_provider
+                    .records_snapshot()
+                    .records
                     .iter()
                     .any(|record| record.canonical_path == *project)
             })
@@ -313,7 +313,13 @@ mod tests {
         let state_dir = root.join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
         let state = Arc::new(SharedState::for_test(&state_dir));
-        state.projects.write().register_path(&project).unwrap();
+        state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(&project)
+            .unwrap();
         let server = BlackboxServer::new(state.clone());
         let scope = PublishedScope::try_new(repo_id.repo_id, ".").unwrap();
         let checkout_id = "embedding-checkout";

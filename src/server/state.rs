@@ -34,6 +34,51 @@ use crate::{
 #[cfg(test)]
 const ROSTER_BROADCAST_BUFFER: usize = 1024;
 
+/// The daemon's project authority, fixed for the process lifetime by the
+/// startup store-version probe (phase-2 §4.1). Bridge mode is today's
+/// version-1 registry plus its write-behind persister; catalog mode is the
+/// strict pair store, whose mutations commit only through the journaled
+/// pair transaction.
+pub(crate) enum ProjectAuthority {
+    Bridge {
+        registry: Arc<RwLock<ProjectRegistry>>,
+        persister: StorePersister<ProjectRegistry>,
+    },
+    Catalog {
+        store: Arc<bbox_indexing::project_catalog_store::ProjectCatalogStore>,
+    },
+}
+
+impl ProjectAuthority {
+    /// The version-1 registry for the surviving bridge-only mutators and
+    /// v1-resolve guards. Catalog mode refuses with a typed diagnostic:
+    /// each of these surfaces gains its catalog semantics in its own
+    /// phase-2 milestone, and until then the operation is unsupported
+    /// there rather than silently misrouted.
+    pub(crate) fn bridge_registry(&self) -> anyhow::Result<&Arc<RwLock<ProjectRegistry>>> {
+        match self {
+            ProjectAuthority::Bridge { registry, .. } => Ok(registry),
+            ProjectAuthority::Catalog { .. } => anyhow::bail!(
+                "error.project_catalog_lifecycle_pending: this operation still uses the \
+                 version-1 registry and is not yet available in catalog mode"
+            ),
+        }
+    }
+
+    /// The strict pair store when the catalog is the runtime authority.
+    /// Consumed by the administration milestone's catalog operations; until
+    /// those land the accessor exists so the authority's shape is complete.
+    #[allow(dead_code)]
+    pub(crate) fn catalog_store(
+        &self,
+    ) -> Option<&Arc<bbox_indexing::project_catalog_store::ProjectCatalogStore>> {
+        match self {
+            ProjectAuthority::Bridge { .. } => None,
+            ProjectAuthority::Catalog { store } => Some(store),
+        }
+    }
+}
+
 pub(crate) struct SharedState {
     pub(crate) idx: RwLock<TranscriptIndex>,
     /// Handle to the daemon's single tantivy writer actor. All production
@@ -54,8 +99,15 @@ pub(crate) struct SharedState {
     pub(crate) notes_persister: StorePersister<Notes>,
     pub(crate) pins: Arc<RwLock<Pins>>,
     pub(crate) pins_persister: StorePersister<Pins>,
-    pub(crate) projects: Arc<RwLock<ProjectRegistry>>,
-    pub(crate) projects_persister: StorePersister<ProjectRegistry>,
+    /// The runtime project authority selected by the startup store-version
+    /// probe (phase-2 §4.1). Consumers never match this directly outside
+    /// the defined seams: record enumeration goes through
+    /// `records_provider`, checkout access through the broker, and the
+    /// remaining version-1 mutators call `bridge_registry()`.
+    pub(crate) project_authority: ProjectAuthority,
+    /// Injected project-record authority handed to every runtime consumer that
+    /// only enumerates records (index writer, index selectors, providers).
+    pub(crate) records_provider: Arc<dyn bbox_corpus_core::project_record::ProjectRecordsProvider>,
     /// Host-local discovery index for scope-aware checkout overlays.
     pub(crate) checkout_registry: Arc<RwLock<bbox_indexing::checkout_registry::CheckoutRegistry>>,
     /// Bounded, path-free evidence for every checkout lease acquisition and
@@ -338,7 +390,13 @@ impl SharedState {
     }
 
     pub(crate) async fn persist_projects_durable(&self) -> anyhow::Result<()> {
-        self.projects_persister.request_durable().await
+        match &self.project_authority {
+            ProjectAuthority::Bridge { persister, .. } => persister.request_durable().await,
+            ProjectAuthority::Catalog { .. } => anyhow::bail!(
+                "no version-1 project persister exists in catalog mode; \
+                 catalog mutations commit through the pair transaction"
+            ),
+        }
     }
 
     pub(crate) fn record_signal(&self, ev: SignalEvent) {
@@ -437,7 +495,7 @@ impl SharedState {
             roadmap: self.roadmap.as_ref(),
             threads: self.threads.as_ref(),
             notes: self.notes.as_ref(),
-            projects: self.projects.as_ref(),
+            projects: self.records_provider.as_ref(),
             checkout_registry: self.checkout_registry.as_ref(),
             checkout_access: self.checkout_access.as_ref(),
             packets: &self.packets,
@@ -476,19 +534,25 @@ impl SharedState {
             ),
             checkout_access_observations.clone(),
         ));
-        let idx = TranscriptIndex::open_or_create(
+        let records_provider: Arc<dyn bbox_corpus_core::project_record::ProjectRecordsProvider> =
+            Arc::new(bbox_indexing::projects::BridgeProjectRecordsProvider::new(
+                projects_store.clone(),
+            ));
+        let idx = TranscriptIndex::open_or_create_with_code_source_store_path(
             &store_dir.join("idx"),
             Vec::new(),
             None,
             projects_path.clone(),
+            store_dir.join("code-sources"),
             store_dir.join("kb.json"),
             store_dir.join("threads.json"),
             store_dir.join("roadmap.json"),
+            records_provider.clone(),
         )
         .unwrap();
         let index_writer = crate::index::IndexWriterActor::spawn_for_with_checkout_access(
             &idx,
-            projects_store.clone(),
+            records_provider.clone(),
             checkout_access.clone(),
         );
         // Load committed `.bbox/knowledge/` for every registered project into
@@ -551,6 +615,10 @@ impl SharedState {
         if projects_needs_persist {
             projects_persister.request();
         }
+        let project_authority = ProjectAuthority::Bridge {
+            registry: projects_store,
+            persister: projects_persister,
+        };
 
         let (edge_rebuild_nudge_tx, edge_rebuild_nudge_rx) = std::sync::mpsc::sync_channel(1);
         let active_code_selectors = idx.active_code_selectors();
@@ -569,8 +637,8 @@ impl SharedState {
             notes_persister,
             pins: pins_store,
             pins_persister,
-            projects: projects_store,
-            projects_persister,
+            project_authority,
+            records_provider,
             checkout_registry,
             checkout_access_observations,
             checkout_access,

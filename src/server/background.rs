@@ -267,7 +267,7 @@ fn spawn_system_event_signal_bridge(shared: Arc<SharedState>) {
 }
 
 fn start_bbox_watcher(shared: &Arc<SharedState>) {
-    let projects = shared.projects.read().list();
+    let projects = shared.records_provider.records_snapshot().records;
     let project_carriers = projects
         .iter()
         .filter_map(|project| {

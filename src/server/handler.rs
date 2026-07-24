@@ -124,7 +124,7 @@ impl ServerHandler for BlackboxServer {
             Some(raw) => {
                 let server = self.clone();
                 let resolved = tokio::task::spawn_blocking(move || {
-                    let records = server.state.projects.read().list();
+                    let records = server.state.records_provider.records_snapshot().records;
                     crate::projects::resolve_project_context(
                         &raw,
                         &records,

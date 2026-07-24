@@ -15,7 +15,10 @@ use super::tool_edges::{ToolEdgeContext, ToolEdgeProjectAccess};
 use super::writer_actor::IndexWriterActor;
 use super::{FieldHandles, FileMetaSource, ReindexConfig};
 use crate::checkout_access::CheckoutAccessBroker;
-use crate::projects::{ProjectRecord, ProjectRegistry};
+use crate::projects::ProjectRecord;
+#[cfg(test)]
+use crate::projects::ProjectRegistry;
+use bbox_corpus_core::project_record::ProjectRecordsProvider;
 use bbox_corpus_index::transcripts::adapters::{TranscriptAdapterRegistry, TranscriptScanTarget};
 
 // At the default 120s interval this is one full refresh per day. Full
@@ -35,13 +38,13 @@ fn background_startup_delay(interval: Duration) -> Duration {
 /// Returns true if reindexing is needed (cheap — stat only, no I/O on file contents).
 pub(super) fn needs_reindex(
     config: &ReindexConfig,
-    projects: &Arc<parking_lot::RwLock<ProjectRegistry>>,
+    records_provider: &Arc<dyn ProjectRecordsProvider>,
     checkout_access: &Arc<CheckoutAccessBroker>,
 ) -> Result<bool> {
     let meta = load_meta(&config.meta_path).unwrap_or_default();
     let leased = super::writer_actor::acquire_project_leases(
         config,
-        projects,
+        records_provider,
         checkout_access,
         super::writer_actor::ProjectLeasePurpose::SpeculativeScan,
     )?;
@@ -151,7 +154,7 @@ pub(super) fn execute_reindex_pass(
     dirty: bool,
     writer: &mut IndexWriter,
     drain: &mut dyn FnMut(&mut IndexWriter),
-    projects: &Arc<parking_lot::RwLock<ProjectRegistry>>,
+    records_provider: &Arc<dyn ProjectRecordsProvider>,
     checkout_access: &Arc<CheckoutAccessBroker>,
 ) -> Result<String> {
     let edges_dir =
@@ -170,7 +173,7 @@ pub(super) fn execute_reindex_pass(
     let preserved_published_knowledge = collect_scoped_published_knowledge(index, fields)?;
     let leased = super::writer_actor::acquire_project_leases(
         config,
-        projects,
+        records_provider,
         checkout_access,
         super::writer_actor::ProjectLeasePurpose::Reindex,
     )?;
@@ -1107,12 +1110,14 @@ mod tests {
         let projects = Arc::new(parking_lot::RwLock::new(
             ProjectRegistry::open(&config.projects_path).unwrap(),
         ));
+        let records_provider: Arc<dyn ProjectRecordsProvider> =
+            Arc::new(crate::projects::BridgeProjectRecordsProvider::new(projects));
         let broker = Arc::new(CheckoutAccessBroker::new(
             Arc::new(crate::checkout_access::DenyCheckoutAccess),
             crate::checkout_access::CheckoutAccessObservations::in_memory(),
         ));
         assert!(
-            needs_reindex(&config, &projects, &broker).unwrap(),
+            needs_reindex(&config, &records_provider, &broker).unwrap(),
             "new harness session log must trigger needs_reindex"
         );
     }

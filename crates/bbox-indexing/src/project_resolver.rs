@@ -32,8 +32,8 @@ use bbox_corpus_core::project_catalog::{
 use bbox_corpus_core::project_record::ProjectRecord;
 use bbox_corpus_core::project_selector::{
     AttachedProjectContext, CatalogProjectContext, CompatibilityLane, ProjectResolution,
-    ProjectResolveError, ProjectSelectorRequest, ResolveIntent, ResolvedAttachment,
-    ResolvedProjectIdentity, SelectorClass,
+    ProjectResolveError, ProjectSelectorRequest, ResolvedAttachment, ResolvedProjectIdentity,
+    SelectorClass,
 };
 
 use crate::projects::resolve_project_context;
@@ -489,7 +489,7 @@ mod tests {
     use super::*;
     use bbox_corpus_core::identity::PublishedScope;
     use bbox_corpus_core::project_catalog::{AttachmentCapabilities, AttachmentId};
-    use bbox_corpus_core::project_selector::SessionCheckoutRef;
+    use bbox_corpus_core::project_selector::{ResolveIntent, SessionCheckoutRef};
     use std::collections::BTreeSet;
     use std::process::Command;
 

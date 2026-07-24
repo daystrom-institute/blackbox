@@ -45,7 +45,9 @@ use crate::checkout_access::{
     CheckoutAccessBroker, CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest,
     CheckoutAccessSourceLane, CheckoutAttachmentSelector, ValidatedCheckoutLease,
 };
+#[cfg(test)]
 use crate::projects::ProjectRegistry;
+use bbox_corpus_core::project_record::ProjectRecordsProvider;
 
 #[derive(Debug)]
 pub enum IndexWriterRetryableError {
@@ -124,7 +126,7 @@ pub struct IndexWriterActor {
     fields: FieldHandles,
     post_commit_hook: Arc<parking_lot::RwLock<Option<PostCommitHook>>>,
     checkout_access: Arc<CheckoutAccessBroker>,
-    projects: Arc<parking_lot::RwLock<ProjectRegistry>>,
+    records_provider: Arc<dyn ProjectRecordsProvider>,
     config: ReindexConfig,
 }
 
@@ -210,7 +212,7 @@ struct ActorCtx {
     stats_cache: StatsCache,
     post_commit_hook: Arc<parking_lot::RwLock<Option<PostCommitHook>>>,
     checkout_access: Arc<CheckoutAccessBroker>,
-    projects: Arc<parking_lot::RwLock<ProjectRegistry>>,
+    records_provider: Arc<dyn ProjectRecordsProvider>,
 }
 
 pub(super) struct LeasedProjectAccess {
@@ -248,14 +250,15 @@ pub(super) enum ProjectLeasePurpose {
 
 pub(super) fn acquire_project_leases(
     config: &ReindexConfig,
-    projects: &Arc<parking_lot::RwLock<ProjectRegistry>>,
+    records_provider: &Arc<dyn ProjectRecordsProvider>,
     broker: &Arc<CheckoutAccessBroker>,
     purpose: ProjectLeasePurpose,
 ) -> Result<Vec<LeasedProjectAccess>> {
     let collected = super::project_files::active_collected_sources(config)?;
-    let records = projects.read().list();
+    let records = records_provider.records_snapshot().records;
     records
-        .into_iter()
+        .iter()
+        .cloned()
         .map(|project| {
             let publisher_config = broker.acquire(access_request(
                 &project,
@@ -422,13 +425,16 @@ impl IndexWriterActor {
             Arc::new(authority),
             crate::checkout_access::CheckoutAccessObservations::in_memory(),
         ));
-        Self::spawn_for_with_checkout_access(idx, projects, broker)
+        let records_provider = Arc::new(crate::projects::BridgeProjectRecordsProvider::new(
+            projects.clone(),
+        ));
+        Self::spawn_for_with_checkout_access(idx, records_provider, broker)
     }
 
     /// Spawn against the daemon's single shared registry and access broker.
     pub fn spawn_for_with_checkout_access(
         idx: &TranscriptIndex,
-        projects: Arc<parking_lot::RwLock<ProjectRegistry>>,
+        records_provider: Arc<dyn ProjectRecordsProvider>,
         checkout_access: Arc<CheckoutAccessBroker>,
     ) -> Self {
         register_index_store_hooks();
@@ -438,7 +444,7 @@ impl IndexWriterActor {
             idx.reindex_config(),
             idx.reader_handle(),
             idx.stats_cache_handle(),
-            projects,
+            records_provider,
             checkout_access,
         )
     }
@@ -449,7 +455,7 @@ impl IndexWriterActor {
         config: ReindexConfig,
         reader: IndexReader,
         stats_cache: StatsCache,
-        projects: Arc<parking_lot::RwLock<ProjectRegistry>>,
+        records_provider: Arc<dyn ProjectRecordsProvider>,
         checkout_access: Arc<CheckoutAccessBroker>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<IndexWriteOp>();
@@ -462,7 +468,7 @@ impl IndexWriterActor {
             stats_cache,
             post_commit_hook: post_commit_hook.clone(),
             checkout_access: checkout_access.clone(),
-            projects: projects.clone(),
+            records_provider: records_provider.clone(),
         };
         if let Err(err) = std::thread::Builder::new()
             .name("blackbox-index-writer".into())
@@ -479,7 +485,7 @@ impl IndexWriterActor {
             fields,
             post_commit_hook,
             checkout_access,
-            projects,
+            records_provider,
             config,
         }
     }
@@ -520,7 +526,7 @@ impl IndexWriterActor {
     }
 
     pub fn needs_reindex(&self) -> Result<bool> {
-        super::reindex::needs_reindex(&self.config, &self.projects, &self.checkout_access)
+        super::reindex::needs_reindex(&self.config, &self.records_provider, &self.checkout_access)
     }
 
     pub fn verify_code_selector_document_count(&self, selector: &str, expected: u64) -> Result<()> {
@@ -1135,7 +1141,7 @@ fn run_pass(
             dirty,
             &mut writer,
             &mut drain,
-            &ctx.projects,
+            &ctx.records_provider,
             &ctx.checkout_access,
         )
     };
@@ -1444,9 +1450,12 @@ mod tests {
             observations,
         ));
         let index = test_index(&root);
+        let records_provider: Arc<dyn ProjectRecordsProvider> = Arc::new(
+            crate::projects::BridgeProjectRecordsProvider::new(projects.clone()),
+        );
         let leased = acquire_project_leases(
             &index.reindex_config(),
-            &projects,
+            &records_provider,
             &broker,
             ProjectLeasePurpose::Reindex,
         )
@@ -1489,8 +1498,13 @@ mod tests {
             observations,
         ));
         let index = test_index(&root);
-        let actor =
-            IndexWriterActor::spawn_for_with_checkout_access(&index, projects, broker.clone());
+        let records_provider: Arc<dyn ProjectRecordsProvider> =
+            Arc::new(crate::projects::BridgeProjectRecordsProvider::new(projects));
+        let actor = IndexWriterActor::spawn_for_with_checkout_access(
+            &index,
+            records_provider,
+            broker.clone(),
+        );
 
         actor.run_reindex_pass(true, true).unwrap();
         let local = broker
@@ -1518,8 +1532,13 @@ mod tests {
             observations,
         ));
         let index = test_index(&root);
-        let actor =
-            IndexWriterActor::spawn_for_with_checkout_access(&index, projects, broker.clone());
+        let records_provider: Arc<dyn ProjectRecordsProvider> =
+            Arc::new(crate::projects::BridgeProjectRecordsProvider::new(projects));
+        let actor = IndexWriterActor::spawn_for_with_checkout_access(
+            &index,
+            records_provider,
+            broker.clone(),
+        );
         let store = Arc::new(
             bbox_code_source_store::CodeSourceStore::open(
                 root.join("code-sources"),

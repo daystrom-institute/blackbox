@@ -130,7 +130,7 @@ fn knowledge_entries_are_searchable_after_reindex() {
         dir.path().join("roadmap.json"),
     )
     .unwrap();
-    index.build_index(false).unwrap();
+    index.build_index(false, &[]).unwrap();
 
     let hits = index
         .search(&SearchParams {

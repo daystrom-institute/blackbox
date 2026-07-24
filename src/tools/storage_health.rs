@@ -39,13 +39,18 @@ impl BlackboxServer {
         Self::run_blocking("bbox_storage_health", move || {
             let edges_dir = storage_health::find_edges_dir(&server.state.store_dir, None);
 
-            let registered: std::collections::HashSet<String> = {
-                let guard = server.state.projects.read();
-                guard.list().into_iter().map(|r| r.project_id).collect()
-            };
+            let registered: std::collections::HashSet<String> = server
+                .state
+                .records_provider
+                .records_snapshot()
+                .corpus_project_ids
+                .iter()
+                .cloned()
+                .collect();
 
             let project_filter: Option<String> = if let Some(ref project) = p.project {
-                let guard = server.state.projects.read();
+                let registry = server.state.project_authority.bridge_registry()?;
+                let guard = registry.read();
                 match guard.resolve(project) {
                     Ok(Some(record)) => Some(record.project_id),
                     _ => Some(project.clone()),

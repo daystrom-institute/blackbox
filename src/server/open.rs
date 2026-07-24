@@ -176,24 +176,75 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     let th_path = cfg.paths.threads_path.clone();
     let rm_path = cfg.paths.roadmap_path.clone();
     let store_dir = cfg.paths.bro_home.clone();
-    let (projects_registry, mut projects_needs_persist) =
-        ProjectRegistry::open_with_backfill_status(&projects_path)?;
-    let projects_store = Arc::new(RwLock::new(projects_registry));
+    // Store-version mode selection (phase-2 §4.1): one strict probe decides
+    // the runtime authority for the process lifetime, before any
+    // project-scoped subsystem starts. The probe fails closed on corrupt or
+    // half-pair state; nothing here repairs, migrates, or creates v2 state.
+    let store_probe =
+        bbox_indexing::project_catalog_store::probe_project_store_mode(&projects_path)
+            .map_err(|error| anyhow::anyhow!("project store probe: {error}"))?;
     let checkout_registry = Arc::new(RwLock::new(open_checkout_registry(&store_dir)));
     let checkout_access_observations =
         bbox_indexing::checkout_access::CheckoutAccessObservations::open(
             store_dir.join("checkout-access-observations.json"),
         )?;
+    // Bridge-only handles stay `Option` so catalog mode never constructs a
+    // version-1 registry or its persister.
+    let mut projects_store: Option<Arc<RwLock<ProjectRegistry>>> = None;
+    let mut catalog_store: Option<Arc<bbox_indexing::project_catalog_store::ProjectCatalogStore>> =
+        None;
+    let mut projects_needs_persist = false;
+    let (access_authority, records_provider): (
+        Arc<dyn bbox_indexing::checkout_access::CheckoutAccessAuthority>,
+        Arc<dyn bbox_corpus_core::project_record::ProjectRecordsProvider>,
+    ) = match store_probe {
+        bbox_indexing::project_catalog_store::ProjectStoreProbe::AbsentBridge
+        | bbox_indexing::project_catalog_store::ProjectStoreProbe::LegacyV1 => {
+            let (projects_registry, needs_persist) =
+                ProjectRegistry::open_with_backfill_status(&projects_path)?;
+            projects_needs_persist = needs_persist;
+            let registry = Arc::new(RwLock::new(projects_registry));
+            projects_store = Some(registry.clone());
+            (
+                Arc::new(
+                    bbox_indexing::checkout_access_v1::V1CheckoutAccessAuthority::new(
+                        registry.clone(),
+                        checkout_registry.clone(),
+                    ),
+                ),
+                Arc::new(bbox_indexing::projects::BridgeProjectRecordsProvider::new(
+                    registry,
+                )),
+            )
+        }
+        bbox_indexing::project_catalog_store::ProjectStoreProbe::CatalogV2 => {
+            // Strict pair open: validation, journal recovery, and the
+            // origin/marker binding all happen here, before routes bind.
+            let store = Arc::new(
+                bbox_indexing::project_catalog_store::ProjectCatalogStore::open_existing(
+                    &projects_path,
+                )
+                .map_err(|error| anyhow::anyhow!("catalog store open: {error}"))?,
+            );
+            tracing::info!("Project authority: durable catalog (v2)");
+            catalog_store = Some(store.clone());
+            (
+                Arc::new(
+                    bbox_indexing::checkout_access_v2::V2CatalogCheckoutAccessAuthority::new(
+                        store.clone(),
+                    ),
+                ),
+                Arc::new(bbox_indexing::catalog_records::CatalogProjectRecordsProvider::new(store)),
+            )
+        }
+    };
     let checkout_access = Arc::new(bbox_indexing::checkout_access::CheckoutAccessBroker::new(
-        Arc::new(
-            bbox_indexing::checkout_access_v1::V1CheckoutAccessAuthority::new(
-                projects_store.clone(),
-                checkout_registry.clone(),
-            ),
-        ),
+        access_authority,
         checkout_access_observations.clone(),
     ));
-    projects_needs_persist |= backfill_project_languages(&projects_store, &checkout_access);
+    if let Some(registry) = &projects_store {
+        projects_needs_persist |= backfill_project_languages(registry, &checkout_access);
+    }
 
     let mut idx = TranscriptIndex::open_or_create_with_code_source_store_path(
         &index_path,
@@ -204,6 +255,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         kb_path.clone(),
         th_path.clone(),
         rm_path.clone(),
+        records_provider.clone(),
     )?;
     // Index harness session event logs (sidecar JSONL next to the resume
     // snapshots) so harness sessions are searchable like any other provider
@@ -224,7 +276,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     // all ReindexConfig mutation — the actor clones the config at spawn.
     let index_writer = crate::index::IndexWriterActor::spawn_for_with_checkout_access(
         &idx,
-        projects_store.clone(),
+        records_provider.clone(),
         checkout_access.clone(),
     );
     tracing::info!("Project registry: {}", projects_path.display());
@@ -234,33 +286,40 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     // skipped with a warning — the alias simply never materializes, and
     // resolution fails closed by absence. Records are sorted by
     // canonical_path, so first-claim-wins is deterministic across boots.
-    projects_needs_persist |= sync_project_aliases_at_startup(&projects_store, |project| {
-        use bbox_indexing::checkout_access::{
-            CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest,
-            CheckoutAccessSourceLane, CheckoutAttachmentSelector,
-        };
-        let lease = checkout_access.acquire(CheckoutAccessRequest {
-            project_id: project.project_id.clone(),
-            attachment: CheckoutAttachmentSelector::Selected,
-            expected_scope: None,
-            kind: CheckoutAccessKind::PublisherConfigTreeRead,
-            intent: CheckoutAccessIntent::Read,
-            source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
-        })?;
-        let aliases = crate::config::load_project_at_ref(lease.project_root(), "HEAD")?
-            .project
-            .aliases
-            .into_iter()
-            .collect();
-        checkout_access.revalidate(&lease)?;
-        Ok(aliases)
-    });
+    // Catalog mode never runs the materializing alias sync: committed
+    // aliases are nominations there (D-005), reported and accepted through
+    // the explicit catalog action, never rewritten at startup.
+    if let Some(registry) = &projects_store {
+        projects_needs_persist |= sync_project_aliases_at_startup(registry, |project| {
+            use bbox_indexing::checkout_access::{
+                CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest,
+                CheckoutAccessSourceLane, CheckoutAttachmentSelector,
+            };
+            let lease = checkout_access.acquire(CheckoutAccessRequest {
+                project_id: project.project_id.clone(),
+                attachment: CheckoutAttachmentSelector::Selected,
+                expected_scope: None,
+                kind: CheckoutAccessKind::PublisherConfigTreeRead,
+                intent: CheckoutAccessIntent::Read,
+                source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+            })?;
+            let aliases = crate::config::load_project_at_ref(lease.project_root(), "HEAD")?
+                .project
+                .aliases
+                .into_iter()
+                .collect();
+            checkout_access.revalidate(&lease)?;
+            Ok(aliases)
+        });
+    }
 
     let path_fallback_cut = bbox_knowledge::inventory::path_fallback_was_cut(&cfg.paths.bro_home)?;
     let repo_io = Arc::new(super::repo_io::RepoIoAuthority::new(
         checkout_access.clone(),
     ));
-    let registered_projects = projects_store.read().list();
+    // Mode-independent record view: the bridge derives from the registry,
+    // catalog mode from the compatibility projection (attached rows only).
+    let registered_projects = records_provider.records_snapshot().records;
     let mut kb = Knowledge::open(&kb_path)?;
     kb.set_path_fallback_cut(path_fallback_cut);
     tracing::info!("Knowledge store: {}", kb_path.display());
@@ -340,12 +399,25 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     let pins_persister = StorePersister::spawn("pins", pins_store.clone(), pins_path.clone());
     tracing::info!("Pins store: {}", pins_path.display());
 
-    let projects_persister =
-        StorePersister::spawn("projects", projects_store.clone(), projects_path.clone());
-    if projects_needs_persist {
-        // Startup language backfill is synchronous setup; projects persistence is write-behind here.
-        projects_persister.request();
-    }
+    let project_authority = match (&projects_store, &catalog_store) {
+        (Some(registry), None) => {
+            let persister =
+                StorePersister::spawn("projects", registry.clone(), projects_path.clone());
+            if projects_needs_persist {
+                // Startup language backfill is synchronous setup; projects
+                // persistence is write-behind here.
+                persister.request();
+            }
+            super::state::ProjectAuthority::Bridge {
+                registry: registry.clone(),
+                persister,
+            }
+        }
+        (None, Some(store)) => super::state::ProjectAuthority::Catalog {
+            store: store.clone(),
+        },
+        _ => unreachable!("the store probe selects exactly one project authority"),
+    };
 
     let packets_dir = cfg.paths.packets_dir.clone();
     let packets_store = Packets::open(&packets_dir)?;
@@ -380,7 +452,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     let (roster_tx, _) = broadcast::channel::<bro_protocol::RosterDelta>(1024);
     let code_sources = Arc::new(super::code_source::CodeSourceRuntime::open(
         &cfg,
-        &projects_store.read().list(),
+        &records_provider.records_snapshot().records,
         checkout_access.clone(),
     )?);
     if idx.schema_was_reset() {
@@ -415,7 +487,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         &task_store,
         &roadmap_store.read(),
         &store_dir,
-        &projects_store.read(),
+        &records_provider.records_snapshot(),
     );
     let code_read_view = super::CodeReadView {
         active_selectors: idx.active_code_selectors(),
@@ -437,8 +509,8 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         notes_persister,
         pins: pins_store,
         pins_persister,
-        projects: projects_store,
-        projects_persister,
+        project_authority,
+        records_provider,
         checkout_registry,
         checkout_access_observations,
         checkout_access,
@@ -621,7 +693,7 @@ fn build_startup_edge_index(
     task_store: &TaskStore,
     roadmap_store: &Roadmap,
     store_dir: &Path,
-    projects_store: &ProjectRegistry,
+    records: &bbox_corpus_core::project_record::ProjectRecordsSnapshot,
 ) -> edge_index::EdgeIndex {
     if cfg.index.edge_index_boot_rebuild {
         edge_index::EdgeIndex::rebuild(&edge_index::EdgeStoreRefs {
@@ -632,13 +704,7 @@ fn build_startup_edge_index(
             session_brofile_rows: task_store.session_brofile_rows(),
             roadmap: roadmap_store,
             edges_dir: edge_index::edges_dir_from_bro_store(store_dir),
-            registered_project_ids: Some(
-                projects_store
-                    .list()
-                    .into_iter()
-                    .map(|project| project.project_id)
-                    .collect(),
-            ),
+            registered_project_ids: Some(records.corpus_project_ids.iter().cloned().collect()),
             include_tantivy_projection: false,
             include_observed: true,
         })

@@ -1,9 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use bbox_corpus_core::project_record::{ProjectRecordsProvider, ProjectRecordsSnapshot};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tantivy::collector::{Count, DocSetCollector, TopDocs};
@@ -185,7 +186,37 @@ pub struct TranscriptIndex {
     /// in an Arc so the IndexWriterActor can invalidate it post-commit.
     pub stats_cache: StatsCache,
     active_code_selectors: std::sync::Arc<RwLock<BTreeMap<String, String>>>,
+    /// Injected project authority. Every selector derivation reads a fresh
+    /// snapshot from it, so this index never reads `projects.json` off disk.
+    records_provider: std::sync::Arc<dyn ProjectRecordsProvider>,
     schema_was_reset: bool,
+}
+
+/// Fixed-snapshot [`ProjectRecordsProvider`] for offline and test callers that
+/// have no live authority to derive from.
+pub struct StaticProjectRecordsProvider {
+    snapshot: ProjectRecordsSnapshot,
+}
+
+impl StaticProjectRecordsProvider {
+    pub fn new(snapshot: ProjectRecordsSnapshot) -> Self {
+        Self { snapshot }
+    }
+
+    /// Test and offline construction path only: reads `projects.json` once and
+    /// freezes it. Daemon-runtime consumers take a live authority instead.
+    pub fn from_projects_path(projects_path: &Path) -> Result<Self> {
+        let records = bbox_corpus_core::project_record::load_project_records(projects_path)?;
+        Ok(Self::new(ProjectRecordsSnapshot::from_bridge_records(
+            records, 0,
+        )))
+    }
+}
+
+impl ProjectRecordsProvider for StaticProjectRecordsProvider {
+    fn records_snapshot(&self) -> ProjectRecordsSnapshot {
+        self.snapshot.clone()
+    }
 }
 
 /// Shared stats TTL cache; the writer actor clears it after every commit.
@@ -233,6 +264,10 @@ pub struct EmbeddingSourceDoc {
 }
 
 impl TranscriptIndex {
+    /// Test and offline construction path only: derives a frozen project
+    /// authority from `projects.json`. The daemon opens the index through
+    /// [`TranscriptIndex::open_or_create_with_code_source_store_path`] with a
+    /// live [`ProjectRecordsProvider`].
     pub fn open_or_create(
         index_path: &Path,
         roots: Vec<(String, PathBuf)>,
@@ -246,6 +281,9 @@ impl TranscriptIndex {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("code-sources");
+        let records_provider = std::sync::Arc::new(
+            StaticProjectRecordsProvider::from_projects_path(&projects_path)?,
+        );
         Self::open_or_create_with_code_source_store_path(
             index_path,
             roots,
@@ -255,6 +293,7 @@ impl TranscriptIndex {
             knowledge_path,
             threads_path,
             roadmap_path,
+            records_provider,
         )
     }
 
@@ -268,6 +307,7 @@ impl TranscriptIndex {
         knowledge_path: PathBuf,
         threads_path: PathBuf,
         roadmap_path: PathBuf,
+        records_provider: std::sync::Arc<dyn ProjectRecordsProvider>,
     ) -> Result<Self> {
         let schema_was_reset =
             reset_index_on_schema_mismatch(index_path, &projects_path, &code_source_store_path)?;
@@ -318,7 +358,10 @@ impl TranscriptIndex {
             harness_sessions_dir: None,
             gemini_tmp_root: None,
         };
-        let active_code_selectors = load_active_code_selectors(&config.projects_path)?;
+        let active_code_selectors = load_active_code_selectors(
+            &records_provider.records_snapshot().corpus_project_ids,
+            &config.projects_path,
+        )?;
 
         Ok(Self {
             index_path: index_path.to_path_buf(),
@@ -329,6 +372,7 @@ impl TranscriptIndex {
             config,
             stats_cache: std::sync::Arc::new(Mutex::new(None)),
             active_code_selectors: std::sync::Arc::new(RwLock::new(active_code_selectors)),
+            records_provider,
             schema_was_reset,
         })
     }
@@ -388,7 +432,10 @@ impl TranscriptIndex {
     }
 
     pub fn refresh_active_code_selectors(&self) -> Result<BTreeMap<String, String>> {
-        let selectors = load_active_code_selectors(&self.config.projects_path)?;
+        let selectors = load_active_code_selectors(
+            &self.records_provider.records_snapshot().corpus_project_ids,
+            &self.config.projects_path,
+        )?;
         self.replace_active_code_selectors(selectors.clone());
         Ok(selectors)
     }
@@ -843,18 +890,24 @@ pub fn first_u64(doc: &TantivyDocument, field: Field) -> u64 {
         .unwrap_or_default()
 }
 
-fn load_active_code_selectors(projects_path: &Path) -> Result<BTreeMap<String, String>> {
+/// Seed one local selector per corpus project, then apply the edge-manifest
+/// override for projects the corpus knows about. `projects_path` is still the
+/// key to the sidecar edges directory; the project identity set is injected.
+fn load_active_code_selectors(
+    corpus_project_ids: &BTreeSet<String>,
+    projects_path: &Path,
+) -> Result<BTreeMap<String, String>> {
     let mut selectors = BTreeMap::new();
-    for project in bbox_corpus_core::project_record::load_project_records(projects_path)? {
+    for project_id in corpus_project_ids {
         selectors.insert(
-            project.project_id.clone(),
-            bbox_code_source::local_selector(&project.project_id),
+            project_id.clone(),
+            bbox_code_source::local_selector(project_id),
         );
     }
     let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(projects_path);
     let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)?;
     for (project_id, entry) in manifest.workspaces {
-        if selectors.contains_key(&project_id)
+        if corpus_project_ids.contains(&project_id)
             && let Some(selector) = entry.code_source_selector
         {
             selectors.insert(project_id, selector);
@@ -1065,6 +1118,9 @@ mod tests {
             root.join("knowledge.json"),
             root.join("threads.json"),
             root.join("roadmap.json"),
+            std::sync::Arc::new(StaticProjectRecordsProvider::new(
+                ProjectRecordsSnapshot::empty(),
+            )),
         )
         .unwrap();
 

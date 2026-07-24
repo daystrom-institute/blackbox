@@ -337,10 +337,11 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
                     )));
                 }
                 if let Some(project) = state
-                    .projects
-                    .read()
-                    .list()
-                    .into_iter()
+                    .records_provider
+                    .records_snapshot()
+                    .records
+                    .iter()
+                    .cloned()
                     .find(|project| project.project_id == activation.project_id)
                 {
                     use bbox_indexing::checkout_access::{
@@ -482,10 +483,10 @@ fn graph_section(server: &crate::server::BlackboxServer) -> SectionReport {
 }
 
 fn projects_section(state: &crate::server::state::SharedState) -> SectionReport {
-    let records = state.projects.read().list();
+    let records = state.records_provider.records_snapshot().records;
     let mut findings = Vec::new();
     let mut present = 0usize;
-    for record in &records {
+    for record in records.iter() {
         if std::path::Path::new(&record.canonical_path).exists() {
             present += 1;
         } else {
@@ -873,7 +874,13 @@ mod tests {
         let project_root = root.join("project");
         std::fs::create_dir(&project_root).unwrap();
         let state = std::sync::Arc::new(crate::server::state::SharedState::for_test(&root));
-        let project = state.projects.write().register_path(&project_root).unwrap();
+        let project = state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(&project_root)
+            .unwrap();
         let request = |project_id: String, kind| CheckoutAccessRequest {
             project_id,
             attachment: CheckoutAttachmentSelector::Selected,

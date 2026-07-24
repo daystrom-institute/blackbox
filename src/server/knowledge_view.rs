@@ -278,7 +278,7 @@ impl BlackboxServer {
     ) -> Result<SessionKnowledgeView> {
         let session_checkout = self.authoritative_session_checkout();
         let mode = ProvisionalMode::parse(provisional, session_checkout.is_some())?;
-        let projects = self.state.projects.read().list();
+        let projects = self.state.records_provider.records_snapshot().records;
         let requested_record = requested_project
             .and_then(|raw| {
                 crate::projects::resolve_project_context(
@@ -327,7 +327,7 @@ impl BlackboxServer {
         let selected_projects = requested_record
             .as_ref()
             .map(|record| vec![record.clone()])
-            .unwrap_or_else(|| projects.clone());
+            .unwrap_or_else(|| projects.as_ref().clone());
         let mut selected_scopes = BTreeMap::<PublishedScope, ProjectRecord>::new();
         for project in selected_projects {
             match super::checkout_access::published_scope_for_project(
@@ -870,7 +870,13 @@ mod tests {
         let state_dir = temp.path().join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
         let state = Arc::new(crate::server::SharedState::for_test(&state_dir));
-        let project = state.projects.write().register_path(&base).unwrap();
+        let project = state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(&base)
+            .unwrap();
         let server = BlackboxServer::new(state.clone());
         let scope = PublishedScope::try_new(repo_id.repo_id, ".").unwrap();
 
@@ -1185,8 +1191,20 @@ mod tests {
         let state_dir = temp.path().join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
         let state = Arc::new(crate::server::SharedState::for_test(&state_dir));
-        let first_record = state.projects.write().register_path(&first).unwrap();
-        let second_record = state.projects.write().register_path(&second).unwrap();
+        let first_record = state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(&first)
+            .unwrap();
+        let second_record = state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(&second)
+            .unwrap();
         assert!(
             bbox_indexing::publisher::project_published_scope(
                 &first_record,

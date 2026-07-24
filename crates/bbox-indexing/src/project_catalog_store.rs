@@ -231,6 +231,94 @@ impl fmt::Debug for ProjectCatalogStore {
     }
 }
 
+/// Outcome of the daemon's startup store-version probe (phase-2 §4.1).
+/// The probe decides which runtime authority opens the store; it never
+/// opens, repairs, or creates anything itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectStoreProbe {
+    /// No store and no catalog-family sibling artifact: the version-1
+    /// bridge creates its store exactly as today.
+    AbsentBridge,
+    /// A version-1 `LegacyProjectStoreV1` file: bridge mode.
+    LegacyV1,
+    /// A version-2 `CatalogSnapshotV2` file: catalog mode; the strict pair
+    /// open (including origin/marker binding) happens in `open_existing`.
+    CatalogV2,
+}
+
+/// Probe the configured projects path for the runtime authority mode.
+///
+/// Fail-closed rules:
+/// - an absent catalog with ANY code-owned catalog-family sibling present
+///   (attachment snapshot, transaction journal, committed migration marker,
+///   migration receipt, migration assets, stage or backup artifacts; the
+///   two lock files excluded) is a half-pair state and refuses, so the
+///   bridge can never mint a fresh v1 store beside v2 authority state. The
+///   sibling set is the store owner's own path-role table, not a
+///   probe-local list;
+/// - unreadable, oversize, malformed, or unknown-version bytes refuse.
+pub fn probe_project_store_mode(
+    projects_path: &Path,
+) -> ProjectCatalogStoreResult<ProjectStoreProbe> {
+    let paths = ProjectCatalogPaths::derive(projects_path)?;
+    let catalog_present = paths.catalog.symlink_metadata().is_ok();
+    if !catalog_present {
+        let siblings: [(&Path, &str); 7] = [
+            (&paths.attachments, "project-attachments.json"),
+            (&paths.journal, "project-catalog-transaction.json"),
+            (&paths.migration_marker, "project-catalog-migration.json"),
+            (
+                &paths.migration_receipt,
+                "project-catalog-migration-receipt.json",
+            ),
+            (
+                &paths.migration_assets_dir,
+                "project-catalog-migration-assets",
+            ),
+            (&paths.stage_dir, "project-catalog-stage"),
+            (&paths.backup_dir, "project-catalog-backups"),
+        ];
+        for (path, role) in siblings {
+            if path.symlink_metadata().is_ok() {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_half_pair",
+                    format!(
+                        "projects store is absent but catalog-family sibling {role} exists; \
+                         refusing to select a mode over half-pair state"
+                    ),
+                ));
+            }
+        }
+        return Ok(ProjectStoreProbe::AbsentBridge);
+    }
+    let Some(raw) =
+        RealCatalogStoreIo.read_regular_nofollow(&paths.catalog, MAX_LEGACY_PROJECT_STORE_BYTES)?
+    else {
+        return Err(ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_snapshot",
+            "projects store disappeared between presence check and read",
+        ));
+    };
+    #[derive(serde::Deserialize)]
+    struct VersionProbe {
+        version: u64,
+    }
+    let probe: VersionProbe = serde_json::from_slice(&raw).map_err(|error| {
+        ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_snapshot",
+            format!("projects store version probe failed: {error}"),
+        )
+    })?;
+    match probe.version {
+        1 => Ok(ProjectStoreProbe::LegacyV1),
+        2 => Ok(ProjectStoreProbe::CatalogV2),
+        other => Err(ProjectCatalogStoreError::new(
+            "error.project_catalog_unsupported_version",
+            format!("projects store version {other} is not supported"),
+        )),
+    }
+}
+
 impl ProjectCatalogStore {
     /// Open an already initialized strict v2 pair.
     ///
@@ -5684,6 +5772,73 @@ impl ProjectCatalogTransactionOwner {
         if journal.kind == TransactionKindV1::V1Migration
             && !matches!(self.registry, ParticipantRegistry::Migration(_))
         {
+            // Runtime open over a terminal committed migration (phase-2
+            // §4.1): the committed journal is deliberately retained, so the
+            // regular owner verifies the registry-free pair subset here
+            // (installed catalog/attachment images match the journal's new
+            // hashes) and the strict open's origin/marker/journal binding
+            // check covers the rest. Full participant and code-source
+            // verification stays with the offline facade. Every
+            // non-terminal migration journal still refuses: acting on one
+            // requires the complete code-owned participant registry.
+            if journal.state == TransactionStateV1::Committed
+                && journal.outcome == Some(TransactionOutcomeV1::Committed)
+            {
+                journal.validate()?;
+                let mut catalog_bytes = None;
+                for role in [ParticipantRoleV1::Catalog, ParticipantRoleV1::Attachments] {
+                    let participant = journal
+                        .participants
+                        .iter()
+                        .find(|participant| participant.role == role)
+                        .ok_or_else(|| {
+                            ProjectCatalogStoreError::new(
+                                "error.project_catalog_invalid_journal",
+                                "committed migration journal lacks a pair participant",
+                            )
+                        })?;
+                    let target = match role {
+                        ParticipantRoleV1::Catalog => &self.paths.catalog,
+                        _ => &self.paths.attachments,
+                    };
+                    let observed = self
+                        .io
+                        .read_regular_nofollow(target, participant.role.max_bytes())?;
+                    if observed.as_deref().map(sha256).as_ref() != participant.new.sha256() {
+                        return Err(ProjectCatalogStoreError::new(
+                            "error.project_catalog_install_verification",
+                            "installed pair does not match the committed migration journal",
+                        ));
+                    }
+                    if role == ParticipantRoleV1::Catalog {
+                        catalog_bytes = observed;
+                    }
+                }
+                // The terminal journal must bind to the installed catalog:
+                // a migration journal over a fresh-origin catalog is
+                // incoherent state, not an openable root. The strict open's
+                // origin/marker verification then closes the marker chain.
+                let installed = catalog_bytes.ok_or_else(|| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_migration_incomplete",
+                        "committed migration journal has no installed catalog",
+                    )
+                })?;
+                let catalog = decode_catalog_snapshot(&installed).map_err(|error| {
+                    ProjectCatalogStoreError::new(error.code(), error.to_string())
+                })?;
+                if catalog.origin
+                    != (CatalogOriginV2::MigratedV1 {
+                        transaction_id: journal.transaction_id.clone(),
+                    })
+                {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_migration_incomplete",
+                        "committed migration journal does not bind to the catalog origin",
+                    ));
+                }
+                return Ok(());
+            }
             return Err(ProjectCatalogStoreError::new(
                 "error.project_catalog_migration_registry_required",
                 "migration recovery requires the complete code-owned participant registry",
@@ -13647,11 +13802,13 @@ mod tests {
         )
         .unwrap();
 
+        // D-029: a regular owner admits only a terminal committed migration
+        // journal that validates and binds to the installed catalog origin.
+        // This synthetic journal is terminal-shaped but not a valid
+        // migration journal, so strict validation refuses it before the
+        // origin coherence check is even reached.
         let error = ProjectCatalogStore::open_existing(path).unwrap_err();
-        assert_eq!(
-            error.code(),
-            "error.project_catalog_migration_registry_required"
-        );
+        assert_eq!(error.code(), "error.project_catalog_invalid_journal");
     }
 
     #[test]
@@ -15271,5 +15428,100 @@ mod tests {
             legacy_path_bindings: BTreeMap::new(),
         };
         validate_catalog_attachments(&catalog, &attachments).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    fn projects_path(root: &Path) -> PathBuf {
+        root.join("projects.json")
+    }
+
+    #[test]
+    fn absent_store_with_no_siblings_is_bridge() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        assert_eq!(
+            probe_project_store_mode(&projects_path(&root)).unwrap(),
+            ProjectStoreProbe::AbsentBridge
+        );
+        // Lock files are excluded from the sibling probe.
+        std::fs::write(root.join("projects.json.lock"), b"").unwrap();
+        std::fs::write(root.join("project-catalog-migration.lock"), b"").unwrap();
+        assert_eq!(
+            probe_project_store_mode(&projects_path(&root)).unwrap(),
+            ProjectStoreProbe::AbsentBridge
+        );
+    }
+
+    #[test]
+    fn absent_store_with_any_catalog_family_sibling_refuses() {
+        for sibling in [
+            "project-attachments.json",
+            "project-catalog-transaction.json",
+            "project-catalog-migration.json",
+            "project-catalog-migration-receipt.json",
+            "project-catalog-migration-assets",
+            "project-catalog-stage",
+            "project-catalog-backups",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            if sibling.ends_with(".json") {
+                std::fs::write(root.join(sibling), b"{}").unwrap();
+            } else {
+                std::fs::create_dir(root.join(sibling)).unwrap();
+            }
+            let error = probe_project_store_mode(&projects_path(&root))
+                .expect_err(&format!("sibling {sibling} must refuse"));
+            assert_eq!(error.code(), "error.project_catalog_half_pair");
+        }
+    }
+
+    #[test]
+    fn version_probe_selects_bridge_and_catalog_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = projects_path(&root);
+
+        std::fs::write(&path, br#"{"version":1,"projects":[]}"#).unwrap();
+        assert_eq!(
+            probe_project_store_mode(&path).unwrap(),
+            ProjectStoreProbe::LegacyV1
+        );
+        std::fs::remove_file(&path).unwrap();
+
+        let store = ProjectCatalogStore::initialize_empty(&path).unwrap();
+        drop(store);
+        assert_eq!(
+            probe_project_store_mode(&path).unwrap(),
+            ProjectStoreProbe::CatalogV2
+        );
+
+        // A healthy migrated store keeps its retained receipt and assets;
+        // they must not block catalog mode when the catalog is present.
+        std::fs::write(root.join("project-catalog-migration-receipt.json"), b"{}").unwrap();
+        std::fs::create_dir(root.join("project-catalog-migration-assets")).unwrap();
+        assert_eq!(
+            probe_project_store_mode(&path).unwrap(),
+            ProjectStoreProbe::CatalogV2
+        );
+    }
+
+    #[test]
+    fn unsupported_and_malformed_bytes_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = projects_path(&root);
+
+        std::fs::write(&path, br#"{"version":3}"#).unwrap();
+        let error = probe_project_store_mode(&path).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_unsupported_version");
+
+        std::fs::write(&path, b"not json").unwrap();
+        let error = probe_project_store_mode(&path).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_invalid_snapshot");
     }
 }

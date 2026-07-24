@@ -24,9 +24,10 @@ use crate::project_record::ProjectRecord;
 ///
 /// Moved here from `bbox-indexing::projects` so pure consumers can name it;
 /// `bbox-indexing` re-exports it under the original path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ResolveIntent {
     /// Retrieval scope ("which corpus do I query?"): the broad gate.
+    #[default]
     Read,
     /// Write-side aliasing (where durable state lands): the conservative
     /// managed gate.
@@ -35,11 +36,12 @@ pub enum ResolveIntent {
 
 /// The caller-class taxonomy of phase-2 §5.2, fixed at the call site and
 /// never inferred.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SelectorClass {
     /// The caller needs exactly one project (writes, administration, graph
     /// project operations, lease acquisition). Unknown or ambiguous
     /// selectors fail closed on the catalog backend.
+    #[default]
     Selection,
     /// The caller narrows a query. A selector that resolves narrows by
     /// identity; one that does not resolve keeps the surface's documented
@@ -93,18 +95,6 @@ impl ProjectSelectorRequest {
             class: SelectorClass::Filter,
             ..Self::default()
         }
-    }
-}
-
-impl Default for ResolveIntent {
-    fn default() -> Self {
-        ResolveIntent::Read
-    }
-}
-
-impl Default for SelectorClass {
-    fn default() -> Self {
-        SelectorClass::Selection
     }
 }
 

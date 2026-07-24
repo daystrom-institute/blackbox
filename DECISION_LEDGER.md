@@ -693,3 +693,36 @@ until a later entry explicitly supersedes it.
   assembly.
 - Revisit only if: a later report version makes executable plan and prediction
   fields explicitly optional and preserves the same fail-closed apply check.
+
+## D-029: A terminal committed migration journal admits the registry-free runtime open
+
+- Date: 2026-07-24
+- Phase: durable project catalog, Phase 2 (P2-B runtime path)
+- Status: accepted pending implementation review
+- Decision: `recover_locked` on a regular-registry owner verifies a
+  migration-kind journal in the terminal committed state
+  (`Committed`/`Committed`) with a registry-free pair subset: the installed
+  catalog and attachment images must match the journal's new hashes, and the
+  strict open's existing origin/marker/journal binding verification covers
+  the marker chain. Every non-terminal migration journal still refuses
+  without the complete code-owned participant registry, and full participant
+  plus code-source verification remains the offline facade's verify
+  operation.
+- Evidence:
+  - Phase 1 deliberately retains the committed migration journal as a GC
+    root, so every successfully migrated root carries one forever.
+  - The pre-existing gate refused ANY migration journal without the
+    registry, which made a bare `open_existing` on a migrated root
+    impossible; Phase 2's catalog-mode daemon open is exactly that call.
+  - `verify_origin_marker_locked` already performs the registry-free
+    marker/journal binding on every strict read, and
+    `commit_regular_pair_locked` already preserves the committed migration
+    journal before regular transactions, so the regular-owner lifecycle
+    over migrated state was otherwise designed for.
+- Rationale: A committed terminal migration requires no forward or rollback
+  action, so recovery has nothing to decide; refusing to open was Phase 1
+  fail-closed posture with no runtime consumer, not a durable invariant.
+  The registry-free subset verifies exactly the state a regular owner can
+  honestly prove and defers the rest to the offline facade.
+- Revisit only if: the migration journal retention policy changes, or a
+  later phase gives the daemon a code-owned participant registry at boot.

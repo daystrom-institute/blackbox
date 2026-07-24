@@ -334,11 +334,13 @@ mod tests {
         let server = BlackboxServer::new(Arc::new(SharedState::for_test(state_dir)));
         server
             .state
-            .projects
+            .project_authority
+            .bridge_registry()
+            .unwrap()
             .write()
             .register_path(base_canon)
             .unwrap();
-        let projects = server.state.projects.read().list();
+        let projects = server.state.records_provider.records_snapshot().records;
         let repo_io = std::sync::Arc::new(crate::server::repo_io::RepoIoAuthority::new(
             server.state.checkout_access.clone(),
         ));
@@ -623,7 +625,9 @@ mod tests {
         let server = BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())));
         server
             .state
-            .projects
+            .project_authority
+            .bridge_registry()
+            .unwrap()
             .write()
             .register_path(&base_canon)
             .unwrap();
@@ -720,7 +724,9 @@ mod tests {
         let server = BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())));
         server
             .state
-            .projects
+            .project_authority
+            .bridge_registry()
+            .unwrap()
             .write()
             .register_path(&base_canon)
             .unwrap();

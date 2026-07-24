@@ -29,7 +29,7 @@ fn spawn_config_reload_handler(shared: Arc<SharedState>) {
             let _ = sighup.recv().await;
             match config::load() {
                 Ok(new_cfg) => {
-                    let projects = shared.projects.read().list();
+                    let projects = shared.records_provider.records_snapshot().records;
                     let transitions = match shared.code_sources.reload(&new_cfg, &projects) {
                         Ok(transitions) => transitions,
                         Err(error) => {
@@ -126,7 +126,10 @@ fn persist_shutdown_state(shared: Arc<SharedState>, store_dir: PathBuf) {
     if let Err(err) = shared.roadmap_persister.flush_blocking() {
         tracing::warn!(error = %err, "roadmap persister flush on shutdown failed");
     }
-    if let Err(err) = shared.projects_persister.flush_blocking() {
+    if let crate::server::state::ProjectAuthority::Bridge { persister, .. } =
+        &shared.project_authority
+        && let Err(err) = persister.flush_blocking()
+    {
         tracing::warn!(error = %err, "projects persister flush on shutdown failed");
     }
     if let Err(err) = shared.notes_persister.flush_blocking() {

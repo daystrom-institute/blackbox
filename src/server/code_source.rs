@@ -954,10 +954,11 @@ fn cutback_to_local(
     }
     store.mark_cutback_pending(project_id, "local cutback is staging")?;
     let project = state
-        .projects
-        .read()
-        .list()
-        .into_iter()
+        .records_provider
+        .records_snapshot()
+        .records
+        .iter()
+        .cloned()
         .find(|project| project.project_id == project_id)
         .ok_or_else(|| anyhow!("registered project disappeared during local cutback"))?;
     ensure_selector_staging_available(
@@ -976,9 +977,9 @@ fn cutback_to_local(
                     bail!("local cutback timed out waiting for the index writer");
                 }
                 if !state
-                    .projects
-                    .read()
-                    .list()
+                    .records_provider
+                    .records_snapshot()
+                    .records
                     .iter()
                     .any(|project| project.project_id == project_id)
                 {
@@ -1186,10 +1187,11 @@ fn activate_desired_loop(
             None,
         )?;
         let project = state
-            .projects
-            .read()
-            .list()
-            .into_iter()
+            .records_provider
+            .records_snapshot()
+            .records
+            .iter()
+            .cloned()
             .find(|project| project.project_id == project_id)
             .ok_or_else(|| anyhow!("registered project disappeared during activation"))?;
         let entries = store.load_generation_entries(scope, &desired.generation_id)?;
@@ -2738,7 +2740,13 @@ mod tests {
         env.set("BLACKBOX_STATE_DIR", &state_dir);
 
         let state = transition_test_state(&state_dir);
-        let project = state.projects.write().register_path(&repo).unwrap();
+        let project = state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(&repo)
+            .unwrap();
         state.persist_projects_durable().await.unwrap();
         let scope = PublishedScope::try_new(recorded.repo_id, ".").unwrap();
         let producer_id = "phase1-transition-producer";

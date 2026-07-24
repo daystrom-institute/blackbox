@@ -887,6 +887,66 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
     );
     assert_eq!(reapplied.receipt.verification, applied.receipt.verification);
 
+    // Phase-2 §6.4: the applied rehearsal root IS the isolated migrated v2
+    // state the catalog runtime path opens. Prove mode selection, the
+    // bridge refusal, the strict pair open, and strict-arm resolution
+    // against it before the tamper sections below dirty the root.
+    let rehearsal_projects = rehearsal_root.join("state").join("projects.json");
+    assert_eq!(
+        bbox_indexing::project_catalog_store::probe_project_store_mode(&rehearsal_projects)
+            .unwrap(),
+        bbox_indexing::project_catalog_store::ProjectStoreProbe::CatalogV2
+    );
+    assert!(
+        bbox_indexing::projects::ProjectRegistry::open(&rehearsal_projects).is_err(),
+        "the version-1 bridge must refuse a v2 catalog store"
+    );
+    {
+        let store = bbox_indexing::project_catalog_store::ProjectCatalogStore::open_existing(
+            &rehearsal_projects,
+        )
+        .unwrap();
+        let state = store.snapshot().unwrap();
+        let engine = bbox_indexing::project_resolver::ProjectResolverEngine::v2(
+            state.catalog(),
+            state.attachments(),
+        );
+        use bbox_corpus_core::project_selector::{ProjectSelectorRequest, ResolveIntent};
+        let resolved = engine
+            .resolve(&ProjectSelectorRequest::selection(
+                fixture.winner_project.as_str(),
+                ResolveIntent::Read,
+            ))
+            .unwrap();
+        assert_eq!(
+            resolved.project_id(),
+            Some(fixture.winner_project.as_str()),
+            "exact id membership resolves against the migrated catalog"
+        );
+        let resolved = engine
+            .resolve(&ProjectSelectorRequest::selection(
+                fixture.winner_checkout.to_str().unwrap(),
+                ResolveIntent::Read,
+            ))
+            .unwrap();
+        assert_eq!(
+            resolved.project_id(),
+            Some(fixture.winner_project.as_str()),
+            "the migrated winner checkout resolves through its attachment"
+        );
+        let unknown_path = rehearsal_root.join("nowhere");
+        for raw in ["no-such-project", unknown_path.to_str().unwrap()] {
+            let error = engine
+                .resolve(&ProjectSelectorRequest::selection(raw, ResolveIntent::Read))
+                .unwrap_err();
+            assert_eq!(
+                error.code(),
+                "error.project_selector_unknown",
+                "unknown selectors fail closed on the migrated root: {raw}"
+            );
+        }
+    }
+
     fs::write(
         rehearsal_root.join("checkouts").join("invalid-entry"),
         b"not a checkout directory",

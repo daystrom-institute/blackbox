@@ -64,7 +64,7 @@ impl BlackboxServer {
         &self,
         p: &BootstrapParams,
     ) -> anyhow::Result<String> {
-        let projects = self.state.projects.read().list();
+        let projects = self.state.records_provider.records_snapshot().records;
         let scope_project = crate::projects::resolve_project_context(
             &p.project,
             &projects,
@@ -122,7 +122,7 @@ impl BlackboxServer {
                         |lease| render(lease.project_root()),
                     )?
                 } else {
-                    let projects = server.state.projects.read().list();
+                    let projects = server.state.records_provider.records_snapshot().records;
                     let project = projects
                         .iter()
                         .find(|project| project.canonical_path == durable_scope)
@@ -379,7 +379,13 @@ mod tests {
         let state_dir = root.join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
         let state = Arc::new(crate::server::SharedState::for_test(&state_dir));
-        let record = state.projects.write().register_path(&project).unwrap();
+        let record = state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(&project)
+            .unwrap();
         let scope = PublishedScope::try_new(repo_id.repo_id, ".").unwrap();
         let own_id = "own-visibility";
         let peer_id = "peer-visibility";

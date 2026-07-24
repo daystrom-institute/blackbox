@@ -90,6 +90,11 @@ pub type ProjectStore = LegacyProjectStoreV1;
 #[derive(Debug, Clone)]
 pub struct ProjectRegistry {
     store: ProjectStore,
+    /// Bumped by every `&mut self` mutator so derived snapshots
+    /// (`ProjectRecordsSnapshot`) can detect staleness on read instead of
+    /// relying on call sites to republish. Any new mutator MUST bump this;
+    /// the freshness tests assert it per mutator.
+    mutations: u64,
     // StorePersister and every fallback writer retain the registry in an Arc,
     // so this shared guard outlives every version-1 project-store write.
     _migration_lock: Arc<ProjectCatalogMigrationLock>,
@@ -116,16 +121,24 @@ impl ProjectRegistry {
         Ok((
             Self {
                 store,
+                mutations: 0,
                 _migration_lock: migration_lock,
             },
             false,
         ))
     }
 
+    /// Monotonic mutation epoch for derived-snapshot freshness. Starts at 0
+    /// per process; not persisted (snapshots are process-local derived state).
+    pub fn mutation_epoch(&self) -> u64 {
+        self.mutations
+    }
+
     /// Fill an established record's language set from a caller-authorized
     /// checkout walk. Opening the durable registry is intentionally path-free;
     /// daemon startup invokes this only while holding a LocalProjectWalk lease.
     pub fn backfill_languages(&mut self, project_id: &str, languages: BTreeSet<Language>) -> bool {
+        self.mutations += 1;
         let Some(record) = self
             .store
             .projects
@@ -142,6 +155,7 @@ impl ProjectRegistry {
     }
 
     pub fn register_path(&mut self, path: impl AsRef<Path>) -> Result<ProjectRecord> {
+        self.mutations += 1;
         let path = path.as_ref().to_path_buf();
         self.register_path_locked(&path)
     }
@@ -192,6 +206,7 @@ impl ProjectRegistry {
     }
 
     pub fn rename_project(&mut self, p: &ProjectRenameParams) -> Result<ProjectRenameResponse> {
+        self.mutations += 1;
         self.rename_project_locked(p)
     }
 
@@ -305,6 +320,7 @@ impl ProjectRegistry {
     }
 
     pub fn unregister_project(&mut self, raw: &str) -> Result<ProjectRecord> {
+        self.mutations += 1;
         let raw = raw.to_string();
         let idx = self
             .resolve_project_index(&raw)?
@@ -365,6 +381,7 @@ impl ProjectRegistry {
         selector: &str,
         declared: &BTreeSet<String>,
     ) -> Result<bool> {
+        self.mutations += 1;
         let idx = self
             .resolve_project_index(selector)?
             .with_context(|| format!("project not registered: {selector}"))?;
@@ -877,6 +894,44 @@ fn canonical_nonexistent_absolute_path(path: &Path) -> Result<PathBuf> {
     Ok(parent.join(file_name))
 }
 
+/// Bridge-mode [`ProjectRecordsProvider`]: derives snapshots from the live
+/// registry on read whenever the registry's mutation epoch has moved, so no
+/// mutation call site has to remember to republish (phase-2 §6.2).
+pub struct BridgeProjectRecordsProvider {
+    registry: Arc<parking_lot::RwLock<ProjectRegistry>>,
+    cache: parking_lot::Mutex<Option<bbox_corpus_core::project_record::ProjectRecordsSnapshot>>,
+}
+
+impl BridgeProjectRecordsProvider {
+    pub fn new(registry: Arc<parking_lot::RwLock<ProjectRegistry>>) -> Self {
+        Self {
+            registry,
+            cache: parking_lot::Mutex::new(None),
+        }
+    }
+}
+
+impl bbox_corpus_core::project_record::ProjectRecordsProvider for BridgeProjectRecordsProvider {
+    fn records_snapshot(&self) -> bbox_corpus_core::project_record::ProjectRecordsSnapshot {
+        let mut cache = self.cache.lock();
+        let registry = self.registry.read();
+        let epoch = registry.mutation_epoch();
+        if let Some(snapshot) = cache.as_ref()
+            && snapshot.authority_epoch == epoch
+        {
+            return snapshot.clone();
+        }
+        let snapshot =
+            bbox_corpus_core::project_record::ProjectRecordsSnapshot::from_bridge_records(
+                registry.list(),
+                epoch,
+            );
+        drop(registry);
+        *cache = Some(snapshot.clone());
+        snapshot
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -884,6 +939,64 @@ mod tests {
     use parking_lot::RwLock;
     use std::process::Command;
     use std::sync::Arc;
+
+    #[test]
+    fn every_mutator_bumps_the_mutation_epoch_and_the_provider_observes() {
+        use bbox_corpus_core::project_record::ProjectRecordsProvider as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = root.join("proj");
+        fs::create_dir_all(&project).unwrap();
+
+        let registry = ProjectRegistry::open(root.join("projects.json")).unwrap();
+        let registry = Arc::new(RwLock::new(registry));
+        let provider = BridgeProjectRecordsProvider::new(registry.clone());
+
+        let empty = provider.records_snapshot();
+        assert!(empty.records.is_empty());
+        assert_eq!(empty.omitted_catalog_count, 0);
+
+        let mut last_epoch = registry.read().mutation_epoch();
+        let mut assert_bumped = |registry: &Arc<RwLock<ProjectRegistry>>| {
+            let epoch = registry.read().mutation_epoch();
+            assert!(epoch > last_epoch, "mutator did not bump the epoch");
+            last_epoch = epoch;
+        };
+
+        let record = registry.write().register_path(&project).unwrap();
+        assert_bumped(&registry);
+        // The provider re-derives on read: the new record and the matching
+        // corpus id set are visible with no republish call anywhere.
+        let snapshot = provider.records_snapshot();
+        assert_eq!(snapshot.records.len(), 1);
+        assert!(snapshot.corpus_project_ids.contains(&record.project_id));
+
+        registry
+            .write()
+            .backfill_languages(&record.project_id, [Language::Rust].into_iter().collect());
+        assert_bumped(&registry);
+
+        registry
+            .write()
+            .sync_declared_aliases(&record.project_id, &BTreeSet::from(["al".to_string()]))
+            .unwrap();
+        assert_bumped(&registry);
+        assert!(
+            provider
+                .records_snapshot()
+                .records
+                .iter()
+                .any(|r| r.aliases.contains("al"))
+        );
+
+        registry
+            .write()
+            .unregister_project(&record.project_id)
+            .unwrap();
+        assert_bumped(&registry);
+        assert!(provider.records_snapshot().records.is_empty());
+    }
 
     #[test]
     fn register_git_and_plain_projects_with_stable_ids() {

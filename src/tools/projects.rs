@@ -268,14 +268,17 @@ impl BlackboxServer {
                 return Self::err_text(&format!("Error: {error}"));
             }
         };
-        let res = {
-            let mut projects = self.state.projects.write();
-            projects.register_path(&p.path).and_then(|record| {
-                projects.sync_declared_aliases(&record.project_id, &declared_aliases)?;
-                projects.resolve(&record.project_id)?.with_context(|| {
-                    format!("project vanished mid-register: {}", record.project_id)
+        let res = match self.state.project_authority.bridge_registry() {
+            Err(error) => Err(error),
+            Ok(registry) => {
+                let mut projects = registry.write();
+                projects.register_path(&p.path).and_then(|record| {
+                    projects.sync_declared_aliases(&record.project_id, &declared_aliases)?;
+                    projects.resolve(&record.project_id)?.with_context(|| {
+                        format!("project vanished mid-register: {}", record.project_id)
+                    })
                 })
-            })
+            }
         };
         drop(lifecycle);
         let record = match res {
@@ -558,9 +561,12 @@ impl BlackboxServer {
                 return Self::err_text(&format!("Error: {error}"));
             }
         };
-        let res = {
-            let mut projects = self.state.projects.write();
-            projects.rename_project(&p)
+        let res = match self.state.project_authority.bridge_registry() {
+            Err(error) => Err(error),
+            Ok(registry) => {
+                let mut projects = registry.write();
+                projects.rename_project(&p)
+            }
         };
         drop(lifecycle);
         let response = match res {
@@ -595,7 +601,7 @@ impl BlackboxServer {
                 )?;
                 // Re-point logical carriers without reloading because the
                 // in-memory mutations from migrate_rename are still live.
-                let projects = server.state.projects.read().list();
+                let projects = server.state.records_provider.records_snapshot().records;
                 let carriers =
                     crate::server::repo_io::RepoIoAuthority::knowledge_base_carriers(&projects)?;
                 server.state.kb.write().update_project_carriers(carriers);
@@ -678,9 +684,7 @@ impl BlackboxServer {
 
             let record = self
                 .state
-                .projects
-                .read()
-                .resolve(&p.project)?
+                .project_authority.bridge_registry()?.read().resolve(&p.project)?
                 .with_context(|| format!("project not registered: {}", p.project))?;
 
             let counts = project_ref_counts(&self.state, &record.canonical_path)?;
@@ -725,7 +729,8 @@ impl BlackboxServer {
                 .lifecycle_mutation_guard()
                 .map_err(anyhow::Error::new)?;
             let removed = {
-                let mut projects = self.state.projects.write();
+                let registry = self.state.project_authority.bridge_registry()?;
+                let mut projects = registry.write();
                 projects.unregister_project(&p.project)?
             };
             drop(_lifecycle);
@@ -811,7 +816,8 @@ impl BlackboxServer {
         let fs_result = tokio::task::spawn_blocking(move || {
             let record = server
                 .state
-                .projects
+                .project_authority
+                .bridge_registry()?
                 .read()
                 .resolve(&p.project)?
                 .with_context(|| format!("project not registered: {}", p.project))?;
@@ -912,7 +918,13 @@ impl BlackboxServer {
     pub(crate) fn bbox_project_list(&self) -> CallToolResult {
         Self::ok_json(
             &serde_json::to_value(ProjectListResponse {
-                projects: self.state.projects.read().list(),
+                projects: self
+                    .state
+                    .records_provider
+                    .records_snapshot()
+                    .records
+                    .as_ref()
+                    .clone(),
             })
             .unwrap_or_default(),
         )

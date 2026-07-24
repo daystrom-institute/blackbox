@@ -78,9 +78,13 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         ),
         checkout_access_observations.clone(),
     ));
+    let records_provider: Arc<dyn bbox_corpus_core::project_record::ProjectRecordsProvider> =
+        Arc::new(bbox_indexing::projects::BridgeProjectRecordsProvider::new(
+            projects.clone(),
+        ));
     let index_writer = crate::index::IndexWriterActor::spawn_for_with_checkout_access(
         &index,
-        projects.clone(),
+        records_provider.clone(),
         checkout_access.clone(),
     );
     let packets = Packets::open(tmp.path()).unwrap();
@@ -103,8 +107,11 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         notes_persister,
         pins,
         pins_persister,
-        projects,
-        projects_persister,
+        project_authority: crate::server::state::ProjectAuthority::Bridge {
+            registry: projects,
+            persister: projects_persister,
+        },
+        records_provider,
         checkout_registry,
         checkout_access_observations,
         checkout_access,

@@ -53,10 +53,11 @@ pub(crate) fn spawn_storage_gc_thread(state: Arc<SharedState>, interval: std::ti
 fn run_storage_gc_pass(state: &SharedState) -> anyhow::Result<()> {
     let edges_dir = storage_health::find_edges_dir(&state.store_dir, None);
     let registered: std::collections::HashSet<String> = state
-        .projects
-        .read()
-        .list()
-        .into_iter()
+        .records_provider
+        .records_snapshot()
+        .records
+        .iter()
+        .cloned()
         .map(|project| project.project_id)
         .collect();
     let params = storage_health::GcParams {
