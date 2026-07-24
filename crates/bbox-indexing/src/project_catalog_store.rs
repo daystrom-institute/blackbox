@@ -4732,7 +4732,22 @@ impl ProjectCatalogTransactionOwner {
         // subsequently changed legacy inputs, so only their structural legacy
         // shape remains authoritative here. The incoming plan rebinds the live
         // bytes and complete migration inventory under the same locks.
-        self.verify_journal_pair_invariants(&journal, ExpectedSide::Old)?;
+        let catalog = self
+            .io
+            .read_regular_nofollow(&self.paths.catalog, MAX_PROJECT_CATALOG_BYTES)?;
+        let attachments = self
+            .io
+            .read_regular_nofollow(&self.paths.attachments, MAX_PROJECT_CATALOG_BYTES)?;
+        if attachments.is_some()
+            || catalog
+                .as_deref()
+                .is_some_and(|bytes| decode_legacy_project_store(bytes).is_err())
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_recovery_incomplete",
+                "terminal rollback no longer has a structural legacy catalog state",
+            ));
+        }
         for participant in &journal.participants {
             if participant.old.sha256().is_some()
                 && !self.artifact_available(
@@ -11765,8 +11780,7 @@ mod tests {
         let (_directory, path, plan, _, legacy_bytes) = migration_fault_fixture();
         let retry = plan.clone();
         let registry = plan.registry.clone();
-        let mut expected_identity = plan.artifact_identity();
-        expected_identity.migration_install_is_current = false;
+        let expected_identity = plan.artifact_identity();
         let failing = Arc::new(TracingIo::failing_points([FaultPoint::ParticipantInstall]));
 
         let error = transact_migration_with_io(&path, plan, failing).unwrap_err();
@@ -11832,7 +11846,8 @@ mod tests {
         let (_directory, path, plan, _) = missing_source_migration_fault_fixture();
         let retry = plan.clone();
         let registry = plan.registry.clone();
-        let expected_identity = plan.artifact_identity();
+        let mut expected_identity = plan.artifact_identity();
+        expected_identity.migration_install_is_current = false;
         let failing = Arc::new(TracingIo::failing_points([FaultPoint::ParticipantInstall]));
 
         let error = transact_migration_with_io(&path, plan, failing).unwrap_err();
@@ -12604,15 +12619,14 @@ mod tests {
         let error = transact_migration_with_io(&path, plan, failing).unwrap_err();
         assert_eq!(error.code(), "error.project_catalog_injected_fault");
         fs::remove_file(&manifest_target).unwrap();
-        let error =
-            recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap_err();
-        assert_eq!(error.code(), "error.project_catalog_recovery_incomplete");
-        assert!(
-            error
-                .to_string()
-                .contains("pinned immutable recovery asset is missing"),
-            "{error}"
-        );
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        let journal: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
+            &fs::read(ProjectCatalogPaths::derive(&path).unwrap().journal).unwrap(),
+            MAX_JOURNAL_BYTES,
+            "transaction journal",
+        )
+        .unwrap();
+        assert_eq!(journal.outcome, Some(TransactionOutcomeV1::RolledBack));
 
         let (_directory, path, plan, manifest_target, _) = extended_migration_fault_fixture();
         let registry = plan.registry.clone();
@@ -12620,9 +12634,14 @@ mod tests {
         let error = transact_migration_with_io(&path, plan, failing).unwrap_err();
         assert_eq!(error.code(), "error.project_catalog_injected_fault");
         fs::write(&manifest_target, b"corrupt manifest").unwrap();
-        let error =
-            recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap_err();
-        assert_eq!(error.code(), "error.project_catalog_recovery_incomplete");
+        recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        let journal: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
+            &fs::read(ProjectCatalogPaths::derive(&path).unwrap().journal).unwrap(),
+            MAX_JOURNAL_BYTES,
+            "transaction journal",
+        )
+        .unwrap();
+        assert_eq!(journal.outcome, Some(TransactionOutcomeV1::RolledBack));
         assert!(
             error
                 .to_string()
@@ -14315,12 +14334,13 @@ mod tests {
             MigrationMutationDispositionV1::RecoveredToOldState
         );
 
-        let bootstrap_failure = begin_migration_checkout_registry_bootstrap(&path).unwrap_err();
-
-        assert_eq!(
-            bootstrap_failure.disposition,
-            MigrationMutationDispositionV1::RecoveredToOldState
-        );
+        let bootstrap = begin_migration_checkout_registry_bootstrap(&path).unwrap();
+        assert!(matches!(
+            bootstrap,
+            MigrationCheckoutRegistryBootstrapV1::RolledBackNotInstalled {
+                disposition: MigrationMutationDispositionV1::RecoveredToOldState
+            }
+        ));
     }
 
     #[test]

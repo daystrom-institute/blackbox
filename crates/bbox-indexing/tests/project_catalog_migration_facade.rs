@@ -1008,7 +1008,10 @@ fn absent_legacy_catalog_is_fresh_for_first_apply_but_public_verify_fails_closed
             rehearsal_layout: rehearsal.clone(),
         })
         .unwrap_err();
-    assert_eq!(rolled_back.code, "error.project_catalog_invalid_snapshot");
+    assert_eq!(
+        rolled_back.code,
+        "error.project_catalog_migration_incomplete"
+    );
     assert_eq!(
         rolled_back.mutation_disposition,
         ProjectCatalogMigrationMutationDispositionV1::RecoveredToOldState
