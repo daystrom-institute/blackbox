@@ -3876,9 +3876,32 @@ impl CodeSourceStore {
         Ok(records)
     }
 
-    pub fn complete_retirement(&self, selector: &str) -> Result<()> {
-        let _guard = self.lock_mutation()?;
+    pub fn retirement_pending(&self, selector: &str) -> Result<bool> {
         let path = self.paths.retirement_for_selector(selector)?;
+        Ok(read_retirement_record_nofollow(&path)?.is_some())
+    }
+
+    pub fn complete_retirement(&self, record: &RetirementRecord) -> Result<()> {
+        let _guard = self.lock_mutation()?;
+        validate_retirement_record(record)?;
+        let path = self.paths.retirement_for_selector(&record.selector)?;
+        let Some(queued) = read_retirement_record_nofollow(&path)? else {
+            return Ok(());
+        };
+        if queued != *record {
+            bail!("code-source retirement queue row changed before completion");
+        }
+        if let Some(generation_id) = &record.generation_id {
+            let mut generation = self.find_generation(generation_id)?;
+            let is_still_desired = self
+                .desired_generation(&generation.descriptor.scope)?
+                .is_some_and(|desired| desired.generation_id == generation_id.as_str());
+            if !is_still_desired && generation.state != GenerationState::Failed {
+                generation.state = GenerationState::Superseded;
+                generation.diagnostic = None;
+                self.save_generation_locked(&generation)?;
+            }
+        }
         remove_file_if_exists(&path)
     }
 
@@ -6490,6 +6513,78 @@ mod tests {
         );
         assert!(paths.retirement_for_selector_hash(&"A".repeat(64)).is_err());
         assert!(!paths.root().exists());
+    }
+
+    #[test]
+    fn ordinary_retirement_preserves_failed_or_requeued_desired_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = open_store(&root);
+        let descriptor = descriptor(&[]);
+        let scope = descriptor.scope.clone();
+        let upload = store.begin_upload("host-a", descriptor.clone()).unwrap();
+        store
+            .complete_manifest("host-a", &upload.upload_id)
+            .unwrap();
+        let ready = store.finalize_upload("host-a", &upload.upload_id).unwrap();
+        let retirement = RetirementRecord {
+            version: STORE_VERSION,
+            project_id: "project-a".into(),
+            selector: materialized_selector("project-a", &ready.generation_id),
+            snapshot_id: format!("collected-{}", "a".repeat(32)),
+            generation_id: Some(ready.generation_id.clone()),
+        };
+
+        store.enqueue_retirement(&retirement).unwrap();
+        store
+            .mark_generation_state(
+                &scope,
+                &ready.generation_id,
+                GenerationState::Failed,
+                Some("staged verification failed".into()),
+            )
+            .unwrap();
+        assert!(store.retirement_pending(&retirement.selector).unwrap());
+        store.complete_retirement(&retirement).unwrap();
+        let failed = store.load_generation(&scope, &ready.generation_id).unwrap();
+        assert_eq!(failed.state, GenerationState::Failed);
+        assert_eq!(
+            failed.diagnostic.as_deref(),
+            Some("staged verification failed")
+        );
+        assert!(!store.retirement_pending(&retirement.selector).unwrap());
+
+        let replay = store.finalize_upload("host-a", &upload.upload_id).unwrap();
+        assert_eq!(replay.state, GenerationState::Ready);
+        store.enqueue_retirement(&retirement).unwrap();
+        store.complete_retirement(&retirement).unwrap();
+        assert_eq!(
+            store
+                .load_generation(&scope, &ready.generation_id)
+                .unwrap()
+                .state,
+            GenerationState::Ready
+        );
+
+        let replacement = store.begin_upload("host-b", descriptor).unwrap();
+        store
+            .complete_manifest("host-b", &replacement.upload_id)
+            .unwrap();
+        store
+            .finalize_upload("host-b", &replacement.upload_id)
+            .unwrap();
+        store
+            .mark_generation_state(&scope, &ready.generation_id, GenerationState::Ready, None)
+            .unwrap();
+        store.enqueue_retirement(&retirement).unwrap();
+        store.complete_retirement(&retirement).unwrap();
+        assert_eq!(
+            store
+                .load_generation(&scope, &ready.generation_id)
+                .unwrap()
+                .state,
+            GenerationState::Superseded
+        );
     }
 
     #[test]

@@ -960,6 +960,10 @@ fn cutback_to_local(
         .into_iter()
         .find(|project| project.project_id == project_id)
         .ok_or_else(|| anyhow!("registered project disappeared during local cutback"))?;
+    ensure_selector_staging_available(
+        store.as_ref(),
+        &bbox_code_source::local_selector(project_id),
+    )?;
     let cutback_deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
     let staged = loop {
         match state
@@ -1168,6 +1172,13 @@ fn activate_desired_loop(
         if desired.state != GenerationState::Ready {
             return Ok(());
         }
+        ensure_selector_staging_available(
+            store.as_ref(),
+            &crate::index::project_files::collected_materialization_selector(
+                project_id,
+                &desired.generation_id,
+            ),
+        )?;
         store.mark_generation_state(
             scope,
             &desired.generation_id,
@@ -1264,18 +1275,25 @@ fn activate_desired_loop(
             .index_writer
             .verify_code_selector_document_count(&staged.selector, staged.document_count)
         {
-            schedule_unactivated_retirement(
+            let retirement = enqueue_unactivated_retirement(
                 state,
                 project_id,
                 &staged,
                 Some(desired.generation_id.clone()),
             )?;
-            store.mark_generation_state(
+            let mark_result = store.mark_generation_state(
                 scope,
                 &desired.generation_id,
                 GenerationState::Failed,
                 Some("staged document verification failed; inspect daemon logs".into()),
-            )?;
+            );
+            spawn_retirement(
+                state.clone(),
+                retirement,
+                None,
+                RetirementCompletion::Ordinary,
+            );
+            mark_result?;
             return Err(error);
         }
         store.record_materialization(
@@ -1444,6 +1462,17 @@ fn schedule_unactivated_retirement(
     staged: &crate::index::project_files::CollectedIndexResult,
     generation_id: Option<String>,
 ) -> Result<()> {
+    let record = enqueue_unactivated_retirement(state, project_id, staged, generation_id)?;
+    spawn_retirement(state.clone(), record, None, RetirementCompletion::Ordinary);
+    Ok(())
+}
+
+fn enqueue_unactivated_retirement(
+    state: &Arc<SharedState>,
+    project_id: &str,
+    staged: &crate::index::project_files::CollectedIndexResult,
+    generation_id: Option<String>,
+) -> Result<RetirementRecord> {
     let record = RetirementRecord {
         version: 1,
         project_id: project_id.to_string(),
@@ -1452,7 +1481,15 @@ fn schedule_unactivated_retirement(
         generation_id,
     };
     state.code_sources.store().enqueue_retirement(&record)?;
-    spawn_retirement(state.clone(), record, None, RetirementCompletion::Ordinary);
+    Ok(record)
+}
+
+fn ensure_selector_staging_available(store: &CodeSourceStore, selector: &str) -> Result<()> {
+    // The per-project activation lane is the sole runtime enqueuer for its
+    // selectors. A durable queue row therefore separates two staging epochs.
+    if store.retirement_pending(selector)? {
+        bail!("code-source selector retirement remains queued before staging");
+    }
     Ok(())
 }
 
@@ -1626,23 +1663,6 @@ fn spawn_retirement(
                             }
                         }
                         let store = state.code_sources.store();
-                        let generation_is_still_active = match store
-                            .load_activation(&record.project_id)
-                        {
-                            Ok(activation) => activation.is_some_and(|activation| {
-                                record.generation_id.as_deref()
-                                    == Some(activation.generation_id.as_str())
-                            }),
-                            Err(error) => {
-                                let _ = store.record_health_failure(
-                                    &record.project_id,
-                                    "retirement_failed",
-                                    "retirement failed; inspect daemon logs",
-                                );
-                                tracing::error!(%error, "retirement activation read failed");
-                                return;
-                            }
-                        };
                         match &completion {
                             RetirementCompletion::Collision {
                                 project_id,
@@ -1668,16 +1688,17 @@ fn spawn_retirement(
                                 }
                             }
                             RetirementCompletion::Ordinary => {
-                                if let Some(generation_id) = &record.generation_id
-                                    && !generation_is_still_active
-                                    && let Ok(generation) = store.find_generation(generation_id)
-                                {
-                                    let _ = store.mark_generation_state(
-                                        &generation.descriptor.scope,
-                                        generation_id,
-                                        GenerationState::Superseded,
-                                        None,
+                                if let Err(error) = store.complete_retirement(&record) {
+                                    let _ = store.record_health_failure(
+                                        &record.project_id,
+                                        "retirement_failed",
+                                        "retirement failed; inspect daemon logs",
                                     );
+                                    tracing::error!(
+                                        %error,
+                                        "code-source retirement completion failed"
+                                    );
+                                    return;
                                 }
                             }
                         }
@@ -1685,18 +1706,6 @@ fn spawn_retirement(
                             &record.project_id,
                             "retirement_failed",
                         );
-                        let completion_result = match &completion {
-                            RetirementCompletion::Ordinary => {
-                                store.complete_retirement(&record.selector)
-                            }
-                            RetirementCompletion::Collision {
-                                project_id: _,
-                                generation_id: _,
-                            } => Ok(()),
-                        };
-                        if let Err(error) = completion_result {
-                            tracing::warn!(%error, "completing code-source retirement record failed");
-                        }
                         drop(retired);
                         return;
                     }
@@ -2417,6 +2426,28 @@ mod tests {
         assert_eq!(observed.len(), SELECTOR_RETIREMENT_RETRY_LIMIT as usize);
         assert_eq!(observed.first(), Some(&std::time::Duration::from_secs(1)));
         assert_eq!(observed.last(), Some(&std::time::Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn queued_retirement_blocks_same_selector_restaging() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let state = SharedState::for_test(&root);
+        let store = state.code_sources.store();
+        let selector = bbox_code_source::local_selector("project-a");
+        let retirement = RetirementRecord {
+            version: 1,
+            project_id: "project-a".into(),
+            selector: selector.clone(),
+            snapshot_id: format!("collected-{}", "a".repeat(32)),
+            generation_id: None,
+        };
+        store.enqueue_retirement(&retirement).unwrap();
+
+        assert!(ensure_selector_staging_available(store.as_ref(), &selector).is_err());
+
+        store.complete_retirement(&retirement).unwrap();
+        ensure_selector_staging_available(store.as_ref(), &selector).unwrap();
     }
 
     #[test]

@@ -9211,10 +9211,7 @@ impl CatalogStoreIo for RealCatalogStoreIo {
             };
             if moved < 0 {
                 let error = std::io::Error::last_os_error();
-                if matches!(
-                    error.raw_os_error(),
-                    Some(libc::ENOENT) | Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
-                ) {
+                if error.raw_os_error() == Some(libc::ENOENT) {
                     return Ok(());
                 }
                 return Err(io_error("quarantine before removal", path, error));
@@ -9288,7 +9285,11 @@ impl CatalogStoreIo for RealCatalogStoreIo {
             };
             if removed < 0 {
                 let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ENOENT) {
+                // Cleanup owns the empty envelope, not retained evidence within it.
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOENT) | Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
+                ) {
                     return Ok(());
                 }
                 return Err(io_error("remove empty directory", path, error));
@@ -9302,6 +9303,7 @@ impl CatalogStoreIo for RealCatalogStoreIo {
             match fs::remove_dir(path) {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                // Cleanup owns the empty envelope, not retained evidence within it.
                 Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
                 Err(error) => Err(io_error("remove empty directory", path, error)),
             }
@@ -11429,6 +11431,21 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code(), "error.project_catalog_io");
+    }
+
+    #[test]
+    fn cleanup_preserves_nonempty_evidence_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let evidence = root.join("retained-evidence");
+        fs::create_dir(&evidence).unwrap();
+        fs::write(evidence.join("retained.json"), b"retained").unwrap();
+
+        RealCatalogStoreIo
+            .remove_empty_dir_nofollow(&evidence)
+            .unwrap();
+
+        assert!(evidence.join("retained.json").is_file());
     }
 
     #[test]

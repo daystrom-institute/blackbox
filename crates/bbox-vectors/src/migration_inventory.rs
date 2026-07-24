@@ -504,12 +504,12 @@ fn assemble_snapshot(
 
     VectorMigrationSnapshotV1 {
         version: SNAPSHOT_VERSION_V1,
-        state: if let Some(diagnostic_code) = unavailable {
-            VectorMigrationSourceStateV1::Unavailable { diagnostic_code }
-        } else if any_corrupt {
+        state: if any_corrupt {
             VectorMigrationSourceStateV1::Corrupt {
                 diagnostic_code: "vector_partition_corrupt",
             }
+        } else if let Some(diagnostic_code) = unavailable {
+            VectorMigrationSourceStateV1::Unavailable { diagnostic_code }
         } else {
             VectorMigrationSourceStateV1::Present
         },
@@ -782,6 +782,24 @@ mod tests {
             oversized.partitions[0].state,
             VectorMigrationSourceStateV1::Corrupt {
                 diagnostic_code: "vector_partition_source_byte_limit"
+            }
+        ));
+    }
+
+    #[test]
+    fn corruption_precedes_transient_unavailability_in_aggregate_state() {
+        let snapshot = assemble_snapshot(
+            vec![
+                unavailable_partition("route-a", "vector_partition_wal_read_unavailable"),
+                corrupt_partition("route-b", "vector_partition_wal_decode_failed"),
+            ],
+            VectorMigrationSnapshotLimitsV1::default(),
+        );
+
+        assert!(matches!(
+            snapshot.state,
+            VectorMigrationSourceStateV1::Corrupt {
+                diagnostic_code: "vector_partition_corrupt"
             }
         ));
     }
