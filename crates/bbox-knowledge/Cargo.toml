@@ -13,6 +13,7 @@ sha2 = "0.10"
 schemars = "0.8"
 dirs = "6"
 anyhow = "1"
+libc = "0.2"
 bbox-corpus-core = { path = "../bbox-corpus-core" }
 bbox-chunker = { path = "../bbox-chunker" }
 parking_lot = "0.12"

@@ -12,6 +12,7 @@ serde_json = "1"
 schemars = "0.8"
 dirs = "6"
 anyhow = "1"
+libc = "0.2"
 bbox-corpus-core = { path = "../bbox-corpus-core" }
 bbox-packets = { path = "../bbox-packets" }
 parking_lot = "0.12"
