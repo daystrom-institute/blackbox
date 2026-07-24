@@ -696,19 +696,13 @@ pub fn resolve_scope_and_checkout_dir(
 /// How a [`resolve_project_context`] caller intends to use the resolution.
 /// Preserves the deliberate read/write asymmetry of the underlying gates
 /// instead of collapsing it: retrieval may alias broadly, writes must not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResolveIntent {
-    /// Retrieval scope ("which corpus do I query?"). Uses the broad gate
-    /// ([`resolve_base_project_for_scope`]): descendants and ANY worktree of
-    /// a registered repo alias to the base project.
-    Read,
-    /// Write-side aliasing (where gap files, threads, slice edits land).
-    /// Uses the conservative managed gate ([`resolve_managed_fleet_worktree`]):
-    /// only managed worktrees (fleet/agent dispatch, in-tree linked) alias;
-    /// anything else resolves to `None` so callers keep their fail-closed
-    /// fallback.
-    Write,
-}
+///
+/// The enum itself lives in `bbox_corpus_core::project_selector` so the
+/// shared resolver's pure types can name it; this re-export preserves the
+/// established path for every existing caller. `Read` uses the broad gate
+/// ([`resolve_base_project_for_scope`]); `Write` uses the conservative
+/// managed gate ([`resolve_managed_fleet_worktree`]).
+pub use bbox_corpus_core::project_selector::ResolveIntent;
 
 /// Single entry point for project-selector resolution
 /// (design/corpus/agentic-corpus/project-taxonomy-standardization.md,

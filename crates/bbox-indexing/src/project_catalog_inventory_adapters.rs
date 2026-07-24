@@ -5555,7 +5555,10 @@ mod tests {
     fn resolvable_pin_survives_an_incomplete_git_lane_for_typed_refusal() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
-        run_git(&root, &["init", "-q"]);
+        // Pin the initial branch: this fixture later creates `main`
+        // explicitly, and a host git whose init default is already `main`
+        // (Apple Git) would otherwise collide.
+        run_git(&root, &["init", "-q", "--initial-branch", "master"]);
         write(
             &root.join(".bbox/config.toml"),
             b"[project]\nrepo_id = \"repo-one\"\n",

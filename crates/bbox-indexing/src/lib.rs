@@ -12,5 +12,6 @@ pub(crate) mod project_catalog_inventory_adapters;
 pub mod project_catalog_migration;
 pub mod project_catalog_migration_lock;
 pub mod project_catalog_store;
+pub mod project_resolver;
 pub mod projects;
 pub mod publisher;

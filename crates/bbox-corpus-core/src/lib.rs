@@ -23,6 +23,7 @@ pub mod lsp_config;
 pub mod project_catalog;
 pub mod project_catalog_snapshot;
 pub mod project_record;
+pub mod project_selector;
 pub mod query;
 pub mod search;
 pub mod template;
