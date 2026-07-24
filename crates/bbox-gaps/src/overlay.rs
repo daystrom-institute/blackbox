@@ -427,7 +427,7 @@ pub fn load_published_gap_sources_at_commit(
 
     scope.validate().context("invalid published gap scope")?;
     let verified_commit =
-        git::verify_commit_oid_with_alternate(publisher_root, publisher_commit, alternate_root)
+        verify_commit_from_repository_path(publisher_root, publisher_commit, alternate_root)
             .with_context(|| {
                 format!(
                     "verifying exact published gap commit in {}",
@@ -685,7 +685,7 @@ fn read_committed_map(
     const MAX_TOTAL_BYTES: usize = 128 * 1024 * 1024;
     const MAX_LISTING_BYTES: usize = 32 * 1024 * 1024;
 
-    let verified = git::verify_commit_oid_with_alternate(root, commit, alternate_root)
+    let verified = verify_commit_from_repository_path(root, commit, alternate_root)
         .with_context(|| format!("verifying committed gap map at {commit}"))?;
     let prefix = format!("{tree_dir}/");
     let mut files = BTreeMap::new();
@@ -721,6 +721,30 @@ fn read_committed_map(
         files.insert(filename.to_string(), bytes);
     }
     Ok(files)
+}
+
+fn verify_commit_from_repository_path(
+    root: &Path,
+    commit: &str,
+    alternate_root: Option<&Path>,
+) -> Result<git::VerifiedCommit> {
+    let repository_root = git::git_root_for_path(root)
+        .with_context(|| format!("resolving repository root for {}", root.display()))?;
+    let alternate_repository_root = alternate_root
+        .map(|alternate| {
+            git::git_root_for_path(alternate).with_context(|| {
+                format!(
+                    "resolving alternate repository root for {}",
+                    alternate.display()
+                )
+            })
+        })
+        .transpose()?;
+    git::verify_commit_oid_with_alternate(
+        &repository_root,
+        commit,
+        alternate_repository_root.as_deref(),
+    )
 }
 
 fn validate_snapshot_filename(filename: &str, label: &str) -> Result<()> {
