@@ -794,7 +794,7 @@ fn read_live_knowledge_file(path: &Path) -> Result<Vec<u8>> {
         );
     }
     let mut bytes = Vec::new();
-    file.by_ref()
+    std::io::Read::by_ref(&mut file)
         .take((MAX_LIVE_KNOWLEDGE_FILE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_LIVE_KNOWLEDGE_FILE_BYTES {
