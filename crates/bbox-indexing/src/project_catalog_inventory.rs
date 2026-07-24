@@ -7239,6 +7239,7 @@ pub(crate) mod tests {
             });
         let mut laundered_report = fixture_report(&inventory, &resolution, &laundered_post_image);
         laundered_report.status = ProjectCatalogMigrationStatusV1::ResolutionRequired;
+        laundered_report.plan_kind = ProjectCatalogMigrationPlanKindV1::AssessmentOnly;
         laundered_report.scope_conflicts = vec![ConflictReportV1 {
             conflict_id: scope_resolution_id.clone(),
             affected_record_ids: BTreeSet::from([
@@ -7404,6 +7405,7 @@ pub(crate) mod tests {
         post_image.predicted_hashes.participant_hashes.clear();
         let mut report = fixture_report(&inventory, &resolution, &post_image);
         report.status = ProjectCatalogMigrationStatusV1::ResolutionRequired;
+        report.plan_kind = ProjectCatalogMigrationPlanKindV1::AssessmentOnly;
         report.publisher_bindings[0].status = PublisherBindingReportStatusV1::ResolutionRequired;
         report.required_resolutions = vec![RequiredResolutionV1 {
             resolution_id: "resolve_pin_alpha".to_string(),
