@@ -993,7 +993,9 @@ fn absent_legacy_catalog_is_fresh_for_first_apply_but_public_verify_fails_closed
     journal.as_object_mut().unwrap().remove("outcome");
     journal.as_object_mut().unwrap().remove("committed_at");
     fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
-    fs::remove_file(&rehearsal.attachments_path).unwrap();
+    let projects_path = rehearsal_root.join("state/projects.json");
+    let attachments_path = rehearsal_root.join("state/project-attachments.json");
+    fs::remove_file(&attachments_path).unwrap();
     fs::remove_file(
         rehearsal_root
             .join("state/project-catalog-stage")
@@ -1011,8 +1013,8 @@ fn absent_legacy_catalog_is_fresh_for_first_apply_but_public_verify_fails_closed
         rolled_back.mutation_disposition,
         ProjectCatalogMigrationMutationDispositionV1::RecoveredToOldState
     );
-    assert!(!rehearsal.projects_path.exists());
-    assert!(!rehearsal.attachments_path.exists());
+    assert!(!projects_path.exists());
+    assert!(!attachments_path.exists());
 
     let reapplied =
         ProjectCatalogMigrationFacadeV1::apply_rehearsal(ProjectCatalogMigrationApplyRequestV1 {
