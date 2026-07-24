@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -45,6 +46,23 @@ use crate::checkout_access::{
     CheckoutAccessSourceLane, CheckoutAttachmentSelector, ValidatedCheckoutLease,
 };
 use crate::projects::ProjectRegistry;
+
+#[derive(Debug)]
+pub enum IndexWriterRetryableError {
+    ReindexPassInProgress,
+    VectorStoreWarming,
+}
+
+impl std::fmt::Display for IndexWriterRetryableError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ReindexPassInProgress => "an index reindex pass is already running",
+            Self::VectorStoreWarming => "the vector store is still warming up",
+        })
+    }
+}
+
+impl std::error::Error for IndexWriterRetryableError {}
 
 /// One queued index mutation.
 pub enum IndexWriteOp {
@@ -78,12 +96,14 @@ pub enum IndexWriteOp {
         store: std::sync::Arc<bbox_code_source_store::CodeSourceStore>,
         ack: mpsc::SyncSender<Result<super::project_files::CollectedIndexResult>>,
         release: mpsc::Receiver<()>,
+        hold_state: Arc<AtomicU8>,
     },
     StageLocalGeneration {
         project: Box<ProjectRecord>,
         scope: Box<bbox_corpus_core::identity::PublishedScope>,
         ack: mpsc::SyncSender<Result<super::project_files::CollectedIndexResult>>,
         release: mpsc::Receiver<()>,
+        hold_state: Arc<AtomicU8>,
     },
     RetireCodeSelector {
         selector: String,
@@ -100,6 +120,7 @@ pub enum IndexWriteOp {
 pub struct IndexWriterActor {
     tx: mpsc::Sender<IndexWriteOp>,
     reader: IndexReader,
+    fields: FieldHandles,
     post_commit_hook: Arc<parking_lot::RwLock<Option<PostCommitHook>>>,
     checkout_access: Arc<CheckoutAccessBroker>,
     projects: Arc<parking_lot::RwLock<ProjectRegistry>>,
@@ -111,6 +132,7 @@ type PostCommitHook = Arc<dyn Fn(tantivy::Searcher) + Send + Sync>;
 pub struct StagedIndexGeneration {
     result: super::project_files::CollectedIndexResult,
     release: Option<mpsc::SyncSender<()>>,
+    hold_state: Arc<AtomicU8>,
 }
 
 pub struct RetiredCodeSelector {
@@ -134,8 +156,35 @@ impl std::ops::Deref for StagedIndexGeneration {
     }
 }
 
+impl StagedIndexGeneration {
+    /// Convert the bounded staging hold into an activation hold. Once this
+    /// succeeds, the actor cannot release its writer lane on timeout until
+    /// this staged value is dropped.
+    pub fn begin_publication(&self) -> Result<()> {
+        begin_generation_publication(&self.hold_state)
+    }
+}
+
+fn begin_generation_publication(hold_state: &AtomicU8) -> Result<()> {
+    hold_state
+        .compare_exchange(
+            STAGE_HOLD_HELD,
+            STAGE_HOLD_PUBLISHING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map(|_| ())
+        .map_err(|state| match state {
+            STAGE_HOLD_EXPIRED => anyhow!("staged generation hold expired before publication"),
+            STAGE_HOLD_PUBLISHING => anyhow!("staged generation publication already began"),
+            _ => anyhow!("staged generation hold is no longer available"),
+        })
+}
+
 impl Drop for StagedIndexGeneration {
     fn drop(&mut self) {
+        self.hold_state
+            .store(STAGE_HOLD_RELEASED, Ordering::Release);
         if let Some(release) = self.release.take() {
             let _ = release.send(());
         }
@@ -324,6 +373,10 @@ fn access_request(
 /// latency; the queue itself is unbounded (ops are small).
 const MAX_BATCH_OPS: usize = 256;
 const STAGED_GENERATION_HOLD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+const STAGE_HOLD_HELD: u8 = 0;
+const STAGE_HOLD_PUBLISHING: u8 = 1;
+const STAGE_HOLD_EXPIRED: u8 = 2;
+const STAGE_HOLD_RELEASED: u8 = 3;
 
 const WRITER_HEAP_SMALL_OPS: usize = 50_000_000;
 const WRITER_HEAP_REINDEX: usize = 100_000_000;
@@ -413,6 +466,7 @@ impl IndexWriterActor {
         Self {
             tx,
             reader,
+            fields,
             post_commit_hook,
             checkout_access,
             projects,
@@ -459,6 +513,22 @@ impl IndexWriterActor {
         super::reindex::needs_reindex(&self.config, &self.projects, &self.checkout_access)
     }
 
+    pub fn verify_code_selector_document_count(&self, selector: &str, expected: u64) -> Result<()> {
+        self.reader.reload()?;
+        let searcher = self.reader.searcher();
+        let query = TermQuery::new(
+            Term::from_field_text(self.fields.code_source_selector, selector),
+            IndexRecordOption::Basic,
+        );
+        let observed = searcher.search(&query, &Count)? as u64;
+        if observed != expected {
+            anyhow::bail!(
+                "staged code-source document count changed before publication: expected {expected}, observed {observed}"
+            );
+        }
+        Ok(())
+    }
+
     pub fn stage_collected_generation(
         &self,
         project: ProjectRecord,
@@ -469,6 +539,7 @@ impl IndexWriterActor {
     ) -> Result<StagedIndexGeneration> {
         let (ack, ack_rx) = mpsc::sync_channel(1);
         let (release, release_rx) = mpsc::sync_channel(1);
+        let hold_state = Arc::new(AtomicU8::new(STAGE_HOLD_HELD));
         self.tx
             .send(IndexWriteOp::StageCollectedGeneration {
                 project: Box::new(project),
@@ -478,6 +549,7 @@ impl IndexWriterActor {
                 store,
                 ack,
                 release: release_rx,
+                hold_state: hold_state.clone(),
             })
             .map_err(|_| anyhow!("index writer actor unavailable"))?;
         let result = ack_rx
@@ -486,6 +558,7 @@ impl IndexWriterActor {
         Ok(StagedIndexGeneration {
             result,
             release: Some(release),
+            hold_state,
         })
     }
 
@@ -496,12 +569,14 @@ impl IndexWriterActor {
     ) -> Result<StagedIndexGeneration> {
         let (ack, ack_rx) = mpsc::sync_channel(1);
         let (release, release_rx) = mpsc::sync_channel(1);
+        let hold_state = Arc::new(AtomicU8::new(STAGE_HOLD_HELD));
         self.tx
             .send(IndexWriteOp::StageLocalGeneration {
                 project: Box::new(project),
                 scope: Box::new(scope),
                 ack,
                 release: release_rx,
+                hold_state: hold_state.clone(),
             })
             .map_err(|_| anyhow!("index writer actor unavailable"))?;
         let result = ack_rx
@@ -510,6 +585,7 @@ impl IndexWriterActor {
         Ok(StagedIndexGeneration {
             result,
             release: Some(release),
+            hold_state,
         })
     }
 
@@ -570,6 +646,7 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
                 store,
                 ack,
                 release,
+                hold_state,
             } => {
                 let result = run_collected_stage(
                     &ctx,
@@ -582,7 +659,12 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
                 let should_hold = result.is_ok();
                 let _ = ack.send(result);
                 if should_hold {
-                    await_stage_release(release, "collected generation");
+                    await_generation_stage_release(
+                        release,
+                        "collected generation",
+                        &hold_state,
+                        STAGED_GENERATION_HOLD_TIMEOUT,
+                    );
                 }
             }
             IndexWriteOp::StageLocalGeneration {
@@ -590,12 +672,18 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
                 scope,
                 ack,
                 release,
+                hold_state,
             } => {
                 let result = run_local_stage(&ctx, &project, &scope);
                 let should_hold = result.is_ok();
                 let _ = ack.send(result);
                 if should_hold {
-                    await_stage_release(release, "local generation");
+                    await_generation_stage_release(
+                        release,
+                        "local generation",
+                        &hold_state,
+                        STAGED_GENERATION_HOLD_TIMEOUT,
+                    );
                 }
             }
             IndexWriteOp::RetireCodeSelector {
@@ -650,6 +738,41 @@ fn await_stage_release(release: mpsc::Receiver<()>, operation: &str) {
             timeout_secs = STAGED_GENERATION_HOLD_TIMEOUT.as_secs(),
             "index writer stage hold timed out; releasing the writer lane"
         );
+    }
+}
+
+fn await_generation_stage_release(
+    release: mpsc::Receiver<()>,
+    operation: &str,
+    hold_state: &AtomicU8,
+    timeout: std::time::Duration,
+) {
+    match release.recv_timeout(timeout) {
+        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+            hold_state.store(STAGE_HOLD_RELEASED, Ordering::Release);
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            if hold_state
+                .compare_exchange(
+                    STAGE_HOLD_HELD,
+                    STAGE_HOLD_EXPIRED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                tracing::error!(
+                    operation,
+                    timeout_secs = timeout.as_secs(),
+                    "index writer stage hold timed out; publication will fail closed"
+                );
+                return;
+            }
+            if hold_state.load(Ordering::Acquire) == STAGE_HOLD_PUBLISHING {
+                let _ = release.recv();
+                hold_state.store(STAGE_HOLD_RELEASED, Ordering::Release);
+            }
+        }
     }
 }
 
@@ -894,7 +1017,7 @@ fn run_selector_retirement(ctx: &ActorCtx, selector: &str) -> Result<u64> {
         );
         let count = searcher.search(&query, &Count)?;
         let vectors = bbox_vectors::try_global()
-            .context("vector store is still warming up; retry selector retirement shortly")?;
+            .ok_or_else(|| anyhow::Error::new(IndexWriterRetryableError::VectorStoreWarming))?;
         for (_score, address) in searcher.search(&query, &TopDocs::with_limit(count))? {
             let document = searcher.doc::<tantivy::TantivyDocument>(address)?;
             if let Some(tantivy::schema::OwnedValue::Str(entity_id)) =
@@ -973,23 +1096,23 @@ fn run_pass(
             while let Ok(op) = rx.try_recv() {
                 match op {
                     IndexWriteOp::ReindexPass { ack, .. } => {
-                        let _ = ack.send(Err(anyhow!(
-                            "a reindex pass is already running; retry after it completes"
+                        let _ = ack.send(Err(anyhow::Error::new(
+                            IndexWriterRetryableError::ReindexPassInProgress,
                         )));
                     }
                     IndexWriteOp::StageCollectedGeneration { ack, .. } => {
-                        let _ = ack.send(Err(anyhow!(
-                            "a reindex pass is already running; retry collected activation"
+                        let _ = ack.send(Err(anyhow::Error::new(
+                            IndexWriterRetryableError::ReindexPassInProgress,
                         )));
                     }
                     IndexWriteOp::StageLocalGeneration { ack, .. } => {
-                        let _ = ack.send(Err(anyhow!(
-                            "a reindex pass is already running; retry local cutback"
+                        let _ = ack.send(Err(anyhow::Error::new(
+                            IndexWriterRetryableError::ReindexPassInProgress,
                         )));
                     }
                     IndexWriteOp::RetireCodeSelector { ack, .. } => {
-                        let _ = ack.send(Err(anyhow!(
-                            "a reindex pass is already running; retry selector retirement"
+                        let _ = ack.send(Err(anyhow::Error::new(
+                            IndexWriterRetryableError::ReindexPassInProgress,
                         )));
                     }
                     IndexWriteOp::Flush(ack) => pending_flushes.push(ack),
@@ -1725,5 +1848,44 @@ mod tests {
             search(&index, "florp").contains("florp"),
             "full rebuild must re-add store-backed docs"
         );
+    }
+
+    #[test]
+    fn expired_generation_hold_refuses_publication() {
+        let (_release, release_rx) = mpsc::sync_channel(1);
+        let hold_state = AtomicU8::new(STAGE_HOLD_HELD);
+
+        await_generation_stage_release(
+            release_rx,
+            "test generation",
+            &hold_state,
+            std::time::Duration::from_millis(1),
+        );
+
+        assert_eq!(hold_state.load(Ordering::Acquire), STAGE_HOLD_EXPIRED);
+        assert!(begin_generation_publication(&hold_state).is_err());
+    }
+
+    #[test]
+    fn publication_in_progress_survives_the_bounded_staging_timeout() {
+        let (release, release_rx) = mpsc::sync_channel(1);
+        let hold_state = Arc::new(AtomicU8::new(STAGE_HOLD_HELD));
+        begin_generation_publication(&hold_state).unwrap();
+        let waiting_state = hold_state.clone();
+        let waiter = std::thread::spawn(move || {
+            await_generation_stage_release(
+                release_rx,
+                "test generation",
+                &waiting_state,
+                std::time::Duration::from_millis(1),
+            );
+        });
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(!waiter.is_finished());
+
+        hold_state.store(STAGE_HOLD_RELEASED, Ordering::Release);
+        release.send(()).unwrap();
+        waiter.join().unwrap();
+        assert_eq!(hold_state.load(Ordering::Acquire), STAGE_HOLD_RELEASED);
     }
 }

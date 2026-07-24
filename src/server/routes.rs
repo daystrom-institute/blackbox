@@ -1854,7 +1854,7 @@ pub(crate) fn persist_agent_provenance_edges(
     let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
     let written = edge_index::append_explicit_edges(&edges_dir, "agents", &edges)?;
     if written > 0 {
-        rebuild_edge_index_from_shared(state, false);
+        rebuild_edge_index_from_shared(state, false)?;
     }
     Ok(())
 }
@@ -1922,7 +1922,7 @@ pub(crate) fn deactivate_artifact(
 pub(crate) fn rebuild_edge_index_from_shared(
     state: &SharedState,
     include_tantivy_projection: bool,
-) {
+) -> anyhow::Result<()> {
     if let Err(error) = bbox_edge_sidecar::snapshot::with_manifest_coordinator(|| {
         let rebuilt = build_edge_index_from_shared(state, include_tantivy_projection)?;
         let (selectors, searcher) = {
@@ -1946,7 +1946,9 @@ pub(crate) fn rebuild_edge_index_from_shared(
             &error.to_string(),
         );
         tracing::error!(%error, "edge-index rebuild manifest coordination failed");
+        return Err(error);
     }
+    Ok(())
 }
 
 pub(crate) fn build_edge_index_from_shared(
@@ -2118,17 +2120,28 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
                 let signature = edge_sidecar_signature(&edges_dir);
                 if nudged || signature != last_signature {
                     let started = std::time::Instant::now();
-                    rebuild_edge_index_from_shared(&state, false);
-                    tracing::info!(
-                        prev_docs = last_seen,
-                        new_docs = current,
-                        sidecar_files = signature.files,
-                        sidecar_bytes = signature.bytes,
-                        nudged,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "edge-index watcher: sidecars changed or store nudge, EdgeIndex rebuilt"
-                    );
-                    last_signature = signature;
+                    match rebuild_edge_index_from_shared(&state, false) {
+                        Ok(()) => {
+                            tracing::info!(
+                                prev_docs = last_seen,
+                                new_docs = current,
+                                sidecar_files = signature.files,
+                                sidecar_bytes = signature.bytes,
+                                nudged,
+                                elapsed_ms = started.elapsed().as_millis(),
+                                "edge-index watcher: sidecars changed or store nudge, EdgeIndex rebuilt"
+                            );
+                            last_signature = signature;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                nudged,
+                                elapsed_ms = started.elapsed().as_millis(),
+                                "edge-index watcher rebuild failed; retaining prior signature for retry"
+                            );
+                        }
+                    }
                 } else if current != last_seen {
                     let searcher = { state.idx.read().searcher() };
                     state.publish_code_read_searcher(searcher);
@@ -3344,7 +3357,7 @@ mod tests {
 
         let st = state.clone();
         let handle = std::thread::spawn(move || {
-            rebuild_edge_index_from_shared(&st, false);
+            rebuild_edge_index_from_shared(&st, false).unwrap();
         });
 
         // Let the rebuild acquire its store read-locks, finish computing

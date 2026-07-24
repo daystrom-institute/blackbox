@@ -33,7 +33,7 @@ impl BlackboxServer {
             // list, the literal path stays matchable as an alias so pins
             // keyed pre-rescope remain visible.
             if let Some(raw) = p.project.clone().filter(|s| !s.trim().is_empty()) {
-                let (scope, _write_dir) = server.resolve_project_write_scope(&raw);
+                let (scope, _write_dir) = server.resolve_project_write_scope(&raw)?;
                 if scope != raw {
                     p.project_alias = Some(raw);
                 }

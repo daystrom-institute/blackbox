@@ -300,14 +300,11 @@ pub fn reindex_knowledge_store_with_access(
                 continue;
             }
         };
-        if refs
+        let needs_pin_publication = refs
             .as_ref()
             .expect("publisher refs exist when project access is non-empty")
             .pinned(&scope)
-            .is_none()
-        {
-            publisher_ref_publication.stage(refs_path, pin.clone())?;
-        }
+            .is_none();
         let Some(commit) =
             bbox_corpus_core::git::resolve_commit(access.publisher_project_root, &pin.branch_ref)
         else {
@@ -360,6 +357,9 @@ pub fn reindex_knowledge_store_with_access(
                 continue;
             }
         };
+        if needs_pin_publication {
+            publisher_ref_publication.stage(refs_path, pin.clone())?;
+        }
         let scope_hash = published_scope_hash(&scope);
         refreshed_paths.insert(project.canonical_path.clone());
         refreshed_documents.extend(published.entries.into_values().map(|published_entry| {
@@ -833,6 +833,33 @@ mod tests {
         let mut writer: IndexWriter = index.writer(15_000_000).unwrap();
         let mut meta = HashMap::new();
         let refs_path = central.path().join("publisher-refs.json");
+        let mut rejected_ref_publication = PublisherRefPublicationBundle::default();
+        let rejected_docs = reindex_knowledge_store_with_access(
+            &kb_path,
+            &refs_path,
+            &[KnowledgeProjectAccess {
+                project: &project,
+                scope: &scope,
+                publisher_checkout_root: &repo_root,
+                publisher_project_root: &repo_root,
+                knowledge_project_root: central.path(),
+            }],
+            &[],
+            &BTreeSet::from([project.canonical_path.clone()]),
+            &BTreeMap::new(),
+            &mut rejected_ref_publication,
+            fields,
+            &mut writer,
+            &mut meta,
+        )
+        .unwrap();
+        assert_eq!(rejected_docs, 0);
+        rejected_ref_publication.publish().unwrap();
+        assert!(
+            !refs_path.exists(),
+            "a publisher pin must not persist before its snapshot verifies"
+        );
+
         let mut publisher_ref_publication = PublisherRefPublicationBundle::default();
         let docs = reindex_knowledge_store_with_access(
             &kb_path,

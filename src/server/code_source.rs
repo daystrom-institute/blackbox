@@ -12,8 +12,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use bbox_code_source::{
-    BeginUploadRequest, ErrorResponse, FinalizeResponse, GenerationState, GenerationStatus,
-    ManifestPage, MissingBlobsPage, validate_producer_id, validate_scope,
+    BeginUploadRequest, ContractError, ErrorResponse, FinalizeResponse, GenerationState,
+    GenerationStatus, ManifestPage, MissingBlobsPage, validate_producer_id, validate_scope,
 };
 use bbox_code_source_store::{
     ActivationRecord, CodeSourceStore, CollisionRetirementWorkV1, RetirementRecord, StoreLimits,
@@ -601,7 +601,7 @@ fn schedule_activation(state: Arc<SharedState>, scope: PublishedScope, project_i
             let _ = state.code_sources.store().record_health_failure(
                 &project_id,
                 "activation_failed",
-                &error.to_string(),
+                "activation failed; inspect daemon logs",
             );
             tracing::error!(
                 project_id = %project_id,
@@ -866,11 +866,12 @@ fn schedule_cutback(state: Arc<SharedState>, scope: PublishedScope, project_id: 
             match cutback_to_local(&state, &scope, &project_id) {
                 Ok(()) => break,
                 Err(error) => {
-                    let _ = store.mark_cutback_pending(&project_id, &error.to_string());
+                    let _ = store
+                        .mark_cutback_pending(&project_id, "cutback failed; inspect daemon logs");
                     let _ = store.record_health_failure(
                         &project_id,
                         "cutback_pending",
-                        &error.to_string(),
+                        "cutback failed; inspect daemon logs",
                     );
                     tracing::error!(
                         project_id,
@@ -953,6 +954,10 @@ fn cutback_to_local(
         schedule_unactivated_retirement(state, project_id, &staged, None)?;
         bail!("collector assignment returned while local cutback was staging");
     }
+    staged.begin_publication()?;
+    state
+        .index_writer
+        .verify_code_selector_document_count(&staged.selector, staged.document_count)?;
     let previous_entry = manifest.workspaces.get(project_id).cloned();
     let previous_view = state.code_read_view.read().clone();
     enqueue_previous_retirement(
@@ -1165,12 +1170,12 @@ fn activate_desired_loop(
                         scope,
                         &desired.generation_id,
                         GenerationState::Failed,
-                        Some(error.to_string()),
+                        Some("activation failed; inspect daemon logs".into()),
                     )?;
                     store.record_health_failure(
                         project_id,
                         "activation_failed",
-                        &error.to_string(),
+                        "activation failed; inspect daemon logs",
                     )?;
                     return Err(error);
                 }
@@ -1212,6 +1217,10 @@ fn activate_desired_loop(
             )?;
             continue;
         }
+        staged.begin_publication()?;
+        state
+            .index_writer
+            .verify_code_selector_document_count(&staged.selector, staged.document_count)?;
         store.record_materialization(
             scope,
             &desired.generation_id,
@@ -1314,16 +1323,41 @@ fn activate_desired_loop(
 }
 
 fn writer_pass_in_progress(error: &anyhow::Error) -> bool {
-    error
-        .to_string()
-        .contains("a reindex pass is already running")
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<
+                bbox_indexing::index::writer_actor::IndexWriterRetryableError,
+            >(),
+            Some(
+                bbox_indexing::index::writer_actor::IndexWriterRetryableError::ReindexPassInProgress
+            )
+        )
+    })
 }
 
 fn selector_retirement_retryable(error: &anyhow::Error) -> bool {
     writer_pass_in_progress(error)
-        || error
-            .to_string()
-            .contains("vector store is still warming up")
+        || error.chain().any(|cause| {
+            matches!(
+            cause.downcast_ref::<bbox_indexing::index::writer_actor::IndexWriterRetryableError>(),
+            Some(bbox_indexing::index::writer_actor::IndexWriterRetryableError::VectorStoreWarming)
+        )
+        })
+}
+
+const SELECTOR_RETIREMENT_RETRY_LIMIT: u32 = 8;
+
+fn take_selector_retirement_retry(
+    attempts: &mut u32,
+    delay: &mut std::time::Duration,
+) -> Option<std::time::Duration> {
+    if *attempts >= SELECTOR_RETIREMENT_RETRY_LIMIT {
+        return None;
+    }
+    *attempts += 1;
+    let current = *delay;
+    *delay = (*delay * 2).min(std::time::Duration::from_secs(30));
+    Some(current)
 }
 
 fn schedule_previous_retirement(
@@ -1432,7 +1466,7 @@ fn spawn_retirement(
                         let _ = state.code_sources.store().record_health_failure(
                             &record.project_id,
                             "retirement_failed",
-                            &error.to_string(),
+                            "retirement failed; inspect daemon logs",
                         );
                         tracing::error!(%error, "code-source retirement authority read failed");
                         return;
@@ -1441,6 +1475,8 @@ fn spawn_retirement(
             if active_selector.as_deref() == Some(record.selector.as_str()) {
                 return;
             }
+            let mut retry_attempts = 0;
+            let mut retry_delay = std::time::Duration::from_secs(1);
             loop {
                 let selector_is_active =
                     match bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir) {
@@ -1451,7 +1487,7 @@ fn spawn_retirement(
                             let _ = state.code_sources.store().record_health_failure(
                                 &record.project_id,
                                 "retirement_failed",
-                                &error.to_string(),
+                                "retirement failed; inspect daemon logs",
                             );
                             tracing::error!(%error, "code-source retirement authority read failed");
                             return;
@@ -1516,7 +1552,7 @@ fn spawn_retirement(
                                 let _ = state.code_sources.store().record_health_failure(
                                     &record.project_id,
                                     "retirement_failed",
-                                    &error.to_string(),
+                                    "retirement failed; inspect daemon logs",
                                 );
                                 tracing::error!(%error, "retired snapshot cleanup failed");
                                 return;
@@ -1534,7 +1570,7 @@ fn spawn_retirement(
                                 let _ = store.record_health_failure(
                                     &record.project_id,
                                     "retirement_failed",
-                                    &error.to_string(),
+                                    "retirement failed; inspect daemon logs",
                                 );
                                 tracing::error!(%error, "retirement activation read failed");
                                 return;
@@ -1553,7 +1589,7 @@ fn spawn_retirement(
                                     let _ = store.record_health_failure(
                                         project_id.as_str(),
                                         "retirement_failed",
-                                        &error.to_string(),
+                                        "retirement failed; inspect daemon logs",
                                     );
                                     tracing::error!(
                                         project_id = %project_id,
@@ -1598,13 +1634,29 @@ fn spawn_retirement(
                         return;
                     }
                     Err(error) if selector_retirement_retryable(&error) => {
-                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        let Some(delay) = take_selector_retirement_retry(
+                            &mut retry_attempts,
+                            &mut retry_delay,
+                        ) else {
+                            let _ = state.code_sources.store().record_health_failure(
+                                &record.project_id,
+                                "retirement_failed",
+                                "retirement retry budget exhausted; work remains queued",
+                            );
+                            tracing::error!(
+                                %error,
+                                attempts = retry_attempts,
+                                "code-source selector retirement retry budget exhausted"
+                            );
+                            return;
+                        };
+                        std::thread::sleep(delay);
                     }
                     Err(error) => {
                         let _ = state.code_sources.store().record_health_failure(
                             &record.project_id,
                             "retirement_failed",
-                            &error.to_string(),
+                            "retirement failed; inspect daemon logs",
                         );
                         tracing::error!(%error, "code-source selector retirement failed");
                         return;
@@ -1652,7 +1704,7 @@ fn spawn_selectorless_collision_retirement(
                 let _ = store.record_health_failure(
                     work.project_id.as_str(),
                     "retirement_failed",
-                    &error.to_string(),
+                    "retirement failed; inspect daemon logs",
                 );
                 tracing::error!(
                     project_id = %work.project_id,
@@ -1709,12 +1761,22 @@ fn require_scope<'a>(
 }
 
 fn status_from_generation(stored: StoredGeneration) -> GenerationStatus {
+    let diagnostic = stored.diagnostic.map(|_| {
+        match stored.state {
+            GenerationState::MissingBlobData => {
+                "retained blob data is unavailable; recollect this generation"
+            }
+            GenerationState::Failed => "generation processing failed; inspect daemon logs",
+            _ => "generation processing requires operator attention",
+        }
+        .to_string()
+    });
     GenerationStatus {
         generation_id: stored.generation_id,
         state: stored.state,
         file_count: stored.descriptor.file_count,
         logical_bytes: stored.descriptor.logical_bytes,
-        diagnostic: stored.diagnostic,
+        diagnostic,
     }
 }
 
@@ -1769,29 +1831,35 @@ impl HttpError {
     }
 
     fn from_store(error: anyhow::Error) -> Self {
-        let message = error.to_string();
         if error
             .chain()
             .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
         {
             return Self::storage(error);
         }
-        if message.contains("maximum number of open uploads") {
-            return Self::new(StatusCode::TOO_MANY_REQUESTS, "upload_limit", message);
-        }
-        if message.contains("exceeds configured limit")
-            || message.contains("exceeds entry cap")
-            || message.contains("exceeds byte cap")
+        if let Some(contract) = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ContractError>())
         {
-            return Self::too_large("limit_exceeded", message);
+            return match contract {
+                ContractError::FileTooLarge { .. }
+                | ContractError::TooManyFiles { .. }
+                | ContractError::TooManyBytes { .. } => Self::too_large(
+                    "limit_exceeded",
+                    "code-source input exceeds an enforced limit",
+                ),
+                ContractError::UnsupportedSchema(_)
+                | ContractError::WalkerPolicyMismatch { .. } => Self::unprocessable(
+                    "unsupported_contract",
+                    "code-source contract version is unsupported",
+                ),
+                _ => Self::unprocessable(
+                    "invalid_code_source_input",
+                    "code-source input violates the collection contract",
+                ),
+            };
         }
-        if message.contains("not found") {
-            return Self::new(StatusCode::NOT_FOUND, "not_found", "resource not found");
-        }
-        if message.contains("ownership mismatch") || message.contains("another producer") {
-            return Self::new(StatusCode::FORBIDDEN, "scope_forbidden", "forbidden");
-        }
-        Self::unprocessable("invalid_code_source_state", message)
+        Self::storage(error)
     }
 }
 
@@ -1814,9 +1882,12 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
 
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
     use bbox_code_source::{
-        GenerationDescriptor, SCHEMA_VERSION, WALKER_POLICY_VERSION, dirty_fingerprint,
-        generation_id as compute_generation_id, manifest_sha256, source_selector,
+        BeginUploadResponse, GenerationDescriptor, ManifestEntry, SCHEMA_VERSION,
+        WALKER_POLICY_VERSION, dirty_fingerprint, generation_id as compute_generation_id,
+        manifest_sha256, source_selector,
     };
     use bbox_code_source_store::{
         CodeSourceStorePaths, CollisionRetirementEntryV1, CollisionRetirementLifecycleStateV1,
@@ -1828,6 +1899,7 @@ mod tests {
         encode_stored_generation_v2_for_migration,
     };
     use bbox_corpus_core::project_catalog::ProjectId;
+    use tower::ServiceExt;
 
     use super::*;
 
@@ -1842,6 +1914,219 @@ mod tests {
             file_count: 0,
             logical_bytes: 0,
         }
+    }
+
+    fn enabled_http_state(
+        root: &std::path::Path,
+        scope: &PublishedScope,
+    ) -> (Arc<SharedState>, String) {
+        let state = Arc::new(SharedState::for_test(root));
+        let token_secret = "a".repeat(64);
+        let token = ServiceToken::parse(token_secret.clone()).unwrap();
+        let store = state.code_sources.store();
+        *state.code_sources.snapshot.write() = Arc::new(CodeSourceSnapshot {
+            enabled: true,
+            auth: vec![AuthEntry {
+                token,
+                grant: ProducerGrant {
+                    producer_id: "http-test-producer".into(),
+                    projects: BTreeMap::from([(scope.clone(), "http-test-project".into())]),
+                },
+            }],
+            store,
+        });
+        (state, token_secret)
+    }
+
+    fn authenticated_request(
+        method: &str,
+        uri: impl AsRef<str>,
+        token: &str,
+        body: Body,
+    ) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri.as_ref())
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn code_source_http_routes_ingest_a_manifest_without_leaking_store_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let scope = PublishedScope::try_new("http-repo", ".").unwrap();
+        let (state, token) = enabled_http_state(directory.path(), &scope);
+        let app = router(state.clone()).with_state(state);
+        let entries = vec![ManifestEntry {
+            relative_path: "src/lib.rs".into(),
+            content_sha256: "b".repeat(64),
+            size: 1,
+        }];
+        let head = "c".repeat(40);
+        let descriptor = GenerationDescriptor {
+            schema_version: SCHEMA_VERSION,
+            walker_policy_version: WALKER_POLICY_VERSION.into(),
+            scope,
+            head_commit: head.clone(),
+            dirty_fingerprint: dirty_fingerprint(&head, &entries),
+            manifest_sha256: manifest_sha256(&entries),
+            file_count: 1,
+            logical_bytes: 1,
+        };
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/uploads",
+                &token,
+                Body::from(
+                    serde_json::to_vec(&BeginUploadRequest {
+                        descriptor: descriptor.clone(),
+                    })
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let begun: BeginUploadResponse = serde_json::from_slice(&body).unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                "PUT",
+                format!(
+                    "/internal/code-source/v1/uploads/{}/manifest/0",
+                    begun.upload_id
+                ),
+                &token,
+                Body::from(
+                    serde_json::to_vec(&ManifestPage {
+                        entries: entries.clone(),
+                    })
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(authenticated_request(
+                "POST",
+                format!(
+                    "/internal/code-source/v1/uploads/{}/manifest/complete",
+                    begun.upload_id
+                ),
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let missing: MissingBlobsPage = serde_json::from_slice(&body).unwrap();
+        assert_eq!(missing.hashes, vec!["b".repeat(64)]);
+
+        let durable =
+            anyhow::anyhow!("reading /private/customer/repository/code-sources/secret.json failed");
+        let response = HttpError::from_store(durable).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let error: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, "storage_unavailable");
+        assert!(!error.message.contains("customer"));
+        assert!(!error.message.contains('/'));
+    }
+
+    #[tokio::test]
+    async fn code_source_http_route_uses_typed_contract_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let scope = PublishedScope::try_new("http-contract", ".").unwrap();
+        let (state, token) = enabled_http_state(directory.path(), &scope);
+        let app = router(state.clone()).with_state(state);
+        let request = BeginUploadRequest {
+            descriptor: GenerationDescriptor {
+                schema_version: SCHEMA_VERSION + 1,
+                walker_policy_version: WALKER_POLICY_VERSION.into(),
+                scope,
+                head_commit: "c".repeat(40),
+                dirty_fingerprint: "d".repeat(64),
+                manifest_sha256: manifest_sha256(&[]),
+                file_count: 0,
+                logical_bytes: 0,
+            },
+        };
+
+        let response = app
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/uploads",
+                &token,
+                Body::from(serde_json::to_vec(&request).unwrap()),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let error: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, "unsupported_contract");
+    }
+
+    #[test]
+    fn selector_retirement_retry_budget_is_bounded_and_exponential() {
+        let mut attempts = 0;
+        let mut delay = std::time::Duration::from_secs(1);
+        let mut observed = Vec::new();
+        while let Some(next) = take_selector_retirement_retry(&mut attempts, &mut delay) {
+            observed.push(next);
+        }
+        assert_eq!(attempts, SELECTOR_RETIREMENT_RETRY_LIMIT);
+        assert_eq!(observed.len(), SELECTOR_RETIREMENT_RETRY_LIMIT as usize);
+        assert_eq!(observed.first(), Some(&std::time::Duration::from_secs(1)));
+        assert_eq!(observed.last(), Some(&std::time::Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn cold_open_fails_closed_for_invalid_enabled_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = SharedState::for_test(directory.path());
+        let mut config = state.config.read().clone();
+        config.code_collection.enabled = true;
+        config.code_collection.producers.clear();
+
+        let missing_producer = build_snapshot(
+            &config,
+            &[],
+            Some(state.code_sources.store()),
+            &state.checkout_access,
+        )
+        .err()
+        .expect("enabled collection without producers must fail");
+        assert!(
+            missing_producer
+                .to_string()
+                .contains("requires at least one producer")
+        );
+
+        config.code_collection.max_manifest_files = 0;
+        let invalid_limits = build_snapshot(
+            &config,
+            &[],
+            Some(state.code_sources.store()),
+            &state.checkout_access,
+        )
+        .err()
+        .expect("enabled collection with zero limits must fail");
+        assert!(
+            invalid_limits
+                .to_string()
+                .contains("limits and stale warning hours must be nonzero")
+        );
     }
 
     #[test]

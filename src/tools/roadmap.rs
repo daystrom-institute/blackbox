@@ -222,7 +222,7 @@ impl BlackboxServer {
         // Durable item scope is the registered base project — a worktree
         // caller's path must not key the item to an ephemeral checkout.
         let project = match p.project {
-            Some(raw) if !raw.trim().is_empty() => Some(self.resolve_project_write_scope(&raw).0),
+            Some(raw) if !raw.trim().is_empty() => Some(self.resolve_project_write_scope(&raw)?.0),
             other => other,
         };
 

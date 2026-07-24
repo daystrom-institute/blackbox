@@ -35,16 +35,17 @@ impl BlackboxServer {
     ///   canonical path (`write_dir = None`).
     /// - Unregistered selectors pass through untouched without filesystem
     ///   probing outside checkout authority.
-    pub(crate) fn resolve_project_write_scope(&self, raw: &str) -> (String, Option<String>) {
-        self.resolve_project_write(raw)
-            .map(|resolution| {
-                let write_dir = resolution
-                    .checkout_scope
-                    .as_ref()
-                    .map(|checkout| checkout.checkout_project_dir.clone());
-                (resolution.durable_scope, write_dir)
-            })
-            .unwrap_or_else(|_| (raw.to_owned(), None))
+    pub(crate) fn resolve_project_write_scope(
+        &self,
+        raw: &str,
+    ) -> anyhow::Result<(String, Option<String>)> {
+        self.resolve_project_write(raw).map(|resolution| {
+            let write_dir = resolution
+                .checkout_scope
+                .as_ref()
+                .map(|checkout| checkout.checkout_project_dir.clone());
+            (resolution.durable_scope, write_dir)
+        })
     }
 
     /// Rich write resolution used by the dark provisional overlay. Existing

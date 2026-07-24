@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -659,7 +659,7 @@ impl CheckoutAccessBroker {
     ) -> std::result::Result<ValidatedCheckoutLease, CheckoutAccessError> {
         match result {
             Ok(candidate) => {
-                let checkout_root_handle = match File::open(&candidate.checkout_root) {
+                let checkout_root_handle = match open_directory_nofollow(&candidate.checkout_root) {
                     Ok(handle) => handle,
                     Err(_) => {
                         self.observations
@@ -675,7 +675,7 @@ impl CheckoutAccessBroker {
                         ));
                     }
                 };
-                let project_root_handle = match File::open(&candidate.project_root) {
+                let project_root_handle = match open_directory_nofollow(&candidate.project_root) {
                     Ok(handle) => handle,
                     Err(_) => {
                         self.observations
@@ -752,6 +752,20 @@ impl CheckoutAccessBroker {
             source_lane: lease.source_lane,
         };
         let candidate = self.acquire_unobserved(&request)?;
+        let current_checkout_root =
+            open_directory_nofollow(&candidate.checkout_root).map_err(|_| {
+                CheckoutAccessError::new(
+                    CheckoutAccessErrorCode::ConservativePathGateDenied,
+                    "checkout root authority changed after lease acquisition",
+                )
+            })?;
+        let current_project_root =
+            open_directory_nofollow(&candidate.project_root).map_err(|_| {
+                CheckoutAccessError::new(
+                    CheckoutAccessErrorCode::ConservativePathGateDenied,
+                    "project root authority changed after lease acquisition",
+                )
+            })?;
         if candidate.project_id != lease.project_id
             || candidate.attachment_id != lease.attachment_id
             || candidate.checkout_id != lease.checkout_id
@@ -759,6 +773,10 @@ impl CheckoutAccessBroker {
             || candidate.branch_ref != lease.branch_ref
             || candidate.checkout_root != lease.checkout_root
             || candidate.project_root != lease.project_root
+            || !same_open_file_identity(&current_checkout_root, &lease.checkout_root_handle)
+                .unwrap_or(false)
+            || !same_open_file_identity(&current_project_root, &lease.project_root_handle)
+                .unwrap_or(false)
         {
             return Err(CheckoutAccessError::new(
                 CheckoutAccessErrorCode::ConservativePathGateDenied,
@@ -888,6 +906,35 @@ impl CheckoutAccessBroker {
             .revalidate_conservative_path_gate(request, &candidate)?;
         Ok(candidate)
     }
+}
+
+#[cfg(unix)]
+fn open_directory_nofollow(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_directory_nofollow(path: &Path) -> std::io::Result<File> {
+    File::open(path)
+}
+
+#[cfg(unix)]
+fn same_open_file_identity(left: &File, right: &File) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let left = left.metadata()?;
+    let right = right.metadata()?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(not(unix))]
+fn same_open_file_identity(_left: &File, _right: &File) -> std::io::Result<bool> {
+    Ok(true)
 }
 
 fn validate_request(
@@ -1794,6 +1841,43 @@ mod tests {
         assert_eq!(
             broker.revalidate(&lease).unwrap_err().code,
             CheckoutAccessErrorCode::AttachmentInactive
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lease_revalidation_rejects_same_path_with_replaced_directory_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let root = parent.join("checkout");
+        std::fs::create_dir_all(root.join("project")).unwrap();
+        std::fs::write(root.join("project/original.txt"), b"original").unwrap();
+        let broker = CheckoutAccessBroker::new(
+            Arc::new(authority(&root, CheckoutAccessKind::LocalProjectWalk)),
+            CheckoutAccessObservations::in_memory(),
+        );
+        let lease = broker
+            .acquire(request(
+                CheckoutAccessKind::LocalProjectWalk,
+                CheckoutAccessIntent::Read,
+            ))
+            .unwrap();
+
+        let displaced = parent.join("displaced-checkout");
+        std::fs::rename(&root, &displaced).unwrap();
+        std::fs::create_dir_all(root.join("project")).unwrap();
+        std::fs::write(root.join("project/replacement.txt"), b"replacement").unwrap();
+
+        assert_eq!(
+            broker.revalidate(&lease).unwrap_err().code,
+            CheckoutAccessErrorCode::ConservativePathGateDenied
+        );
+        assert_eq!(
+            lease
+                .read_relative_file(Path::new("original.txt"))
+                .unwrap()
+                .1,
+            b"original"
         );
     }
 

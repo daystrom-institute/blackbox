@@ -35,7 +35,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use bbox_corpus_core::identity::PublishedScope;
-use bbox_corpus_core::json_store::atomic_write_json_locked;
+use bbox_corpus_core::json_store::{atomic_write_json_locked, with_store_lock};
 
 /// One registered checkout. Enough to recompute its overlay and to re-verify it
 /// against the write gate; nothing that must travel with the repo.
@@ -86,6 +86,31 @@ impl Default for CheckoutRegistryStore {
     }
 }
 
+fn read_checkout_registry_store(path: &Path) -> Result<(CheckoutRegistryStore, bool)> {
+    let mut store: CheckoutRegistryStore = if path.exists() {
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?
+    } else {
+        CheckoutRegistryStore::new()
+    };
+    let needs_persist = match store.version {
+        1 => {
+            store
+                .checkouts
+                .retain(|row| row.published_scope().is_some());
+            store.version = 2;
+            true
+        }
+        2 => false,
+        version => anyhow::bail!(
+            "unsupported checkout registry version {version} in {}",
+            path.display()
+        ),
+    };
+    Ok((store, needs_persist))
+}
+
 /// Host-local checkout registry, persisted as JSON at `store_path`.
 pub struct CheckoutRegistry {
     store: CheckoutRegistryStore,
@@ -96,32 +121,11 @@ pub struct CheckoutRegistry {
 impl CheckoutRegistry {
     /// Open the registry, reading `store_path` if present or starting empty.
     pub fn open(store_path: &Path) -> Result<Self> {
-        let mut store: CheckoutRegistryStore = if store_path.exists() {
-            let raw = std::fs::read_to_string(store_path)
-                .with_context(|| format!("reading {}", store_path.display()))?;
-            serde_json::from_str(&raw)
-                .with_context(|| format!("parsing {}", store_path.display()))?
-        } else {
-            CheckoutRegistryStore::new()
-        };
+        let (store, needs_persist) = read_checkout_registry_store(store_path)?;
         // Version 1 used checkout_id-only upsert semantics. Retain rows that
         // already carry the authority needed by the composite v2 key and drop
         // scope-less discovery hints that can never be addressed in v2. The
         // next successful mutation persists the upgraded shape.
-        let needs_persist = match store.version {
-            1 => {
-                store
-                    .checkouts
-                    .retain(|row| row.published_scope().is_some());
-                store.version = 2;
-                true
-            }
-            2 => false,
-            version => anyhow::bail!(
-                "unsupported checkout registry version {version} in {}",
-                store_path.display()
-            ),
-        };
         Ok(Self {
             store,
             store_path: store_path.to_path_buf(),
@@ -166,12 +170,29 @@ impl CheckoutRegistry {
             .filter(move |row| row.checkout_id == checkout_id)
     }
 
-    fn replace_store(&mut self, next: CheckoutRegistryStore) -> Result<()> {
-        atomic_write_json_locked(&self.store_path, &next)?;
-        sync_parent_directory(&self.store_path)?;
+    fn mutate_store<T>(
+        &mut self,
+        mutate: impl FnOnce(&mut CheckoutRegistryStore) -> Result<(T, bool)>,
+    ) -> Result<T> {
+        let path = self.store_path.clone();
+        let recovery_fallback = self.store.clone();
+        let may_replace_corrupt = self.needs_persist;
+        let (next, output) = with_store_lock(&path, || {
+            let (mut next, needs_persist) = match read_checkout_registry_store(&path) {
+                Ok(current) => current,
+                Err(_) if may_replace_corrupt => (recovery_fallback, true),
+                Err(error) => return Err(error),
+            };
+            let (output, changed) = mutate(&mut next)?;
+            if changed || needs_persist {
+                atomic_write_json_locked(&path, &next)?;
+                sync_parent_directory(&path)?;
+            }
+            Ok((next, output))
+        })?;
         self.store = next;
         self.needs_persist = false;
-        Ok(())
+        Ok(output)
     }
 
     /// Register or update one `(checkout_id, published_scope)` row. A monorepo
@@ -183,47 +204,44 @@ impl CheckoutRegistry {
                 row.checkout_id
             )
         })?;
-        let mut next = self.store.clone();
-        if let Some(existing) = next
-            .checkouts
-            .iter_mut()
-            .find(|existing| existing.matches(&row.checkout_id, &scope))
-        {
-            if *existing == row && !self.needs_persist {
-                return Ok(());
+        self.mutate_store(move |next| {
+            if let Some(existing) = next
+                .checkouts
+                .iter_mut()
+                .find(|existing| existing.matches(&row.checkout_id, &scope))
+            {
+                if *existing == row {
+                    return Ok(((), false));
+                }
+                *existing = row;
+            } else {
+                next.checkouts.push(row);
             }
-            *existing = row;
-        } else {
-            next.checkouts.push(row);
-        }
-        self.replace_store(next)
+            Ok(((), true))
+        })
     }
 
     /// Remove one scope from a checkout while retaining sibling monorepo
     /// scopes. Returns whether a row was removed.
     pub fn deregister_scope(&mut self, checkout_id: &str, scope: &PublishedScope) -> Result<bool> {
-        let mut next = self.store.clone();
-        let before = next.checkouts.len();
-        next.checkouts
-            .retain(|row| !row.matches(checkout_id, scope));
-        let removed = next.checkouts.len() != before;
-        if removed {
-            self.replace_store(next)?;
-        }
-        Ok(removed)
+        self.mutate_store(|next| {
+            let before = next.checkouts.len();
+            next.checkouts
+                .retain(|row| !row.matches(checkout_id, scope));
+            let removed = next.checkouts.len() != before;
+            Ok((removed, removed))
+        })
     }
 
     /// Explicit teardown deregistration by checkout id. Returns whether a row
     /// was removed. Persists when it removes.
     pub fn deregister(&mut self, checkout_id: &str) -> Result<bool> {
-        let mut next = self.store.clone();
-        let before = next.checkouts.len();
-        next.checkouts.retain(|r| r.checkout_id != checkout_id);
-        let removed = next.checkouts.len() != before;
-        if removed {
-            self.replace_store(next)?;
-        }
-        Ok(removed)
+        self.mutate_store(|next| {
+            let before = next.checkouts.len();
+            next.checkouts.retain(|r| r.checkout_id != checkout_id);
+            let removed = next.checkouts.len() != before;
+            Ok((removed, removed))
+        })
     }
 
     /// Reconcile the registry against ground truth: drop every row whose
@@ -237,22 +255,21 @@ impl CheckoutRegistry {
         &mut self,
         still_valid: impl Fn(&CheckoutRow) -> bool,
     ) -> Result<Vec<CheckoutRow>> {
-        let mut kept = Vec::with_capacity(self.store.checkouts.len());
-        let mut dropped = Vec::new();
-        for row in self.store.checkouts.iter().cloned() {
-            let dir = Path::new(&row.checkout_dir);
-            if dir.exists() && still_valid(&row) {
-                kept.push(row);
-            } else {
-                dropped.push(row);
+        self.mutate_store(|next| {
+            let mut kept = Vec::with_capacity(next.checkouts.len());
+            let mut dropped = Vec::new();
+            for row in next.checkouts.iter().cloned() {
+                let dir = Path::new(&row.checkout_dir);
+                if dir.exists() && still_valid(&row) {
+                    kept.push(row);
+                } else {
+                    dropped.push(row);
+                }
             }
-        }
-        if !dropped.is_empty() {
-            let mut next = self.store.clone();
+            let changed = !dropped.is_empty();
             next.checkouts = kept;
-            self.replace_store(next)?;
-        }
-        Ok(dropped)
+            Ok((dropped, changed))
+        })
     }
 }
 
@@ -409,6 +426,25 @@ mod tests {
             reg2.get("c1", &root_scope()).unwrap().checkout_dir,
             d.to_str().unwrap()
         );
+    }
+
+    #[test]
+    fn stale_registry_handles_merge_rows_under_the_canonical_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("checkouts.json");
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let first_path = first_dir.path().canonicalize().unwrap();
+        let second_path = second_dir.path().canonicalize().unwrap();
+        let mut first = CheckoutRegistry::open(&path).unwrap();
+        let mut stale = CheckoutRegistry::open(&path).unwrap();
+
+        first.register(row("c1", &first_path)).unwrap();
+        stale.register(row("c2", &second_path)).unwrap();
+
+        let reopened = CheckoutRegistry::open(&path).unwrap();
+        assert!(reopened.get("c1", &root_scope()).is_some());
+        assert!(reopened.get("c2", &root_scope()).is_some());
     }
 
     #[test]

@@ -689,7 +689,7 @@ impl BlackboxServer {
             let stats = edge_index::compact_legacy_sidecar(&edges_dir, &p.project_id, apply)?;
             let edge_index_rebuilt = apply && p.rebuild.unwrap_or(false);
             if edge_index_rebuilt {
-                crate::server::rebuild_edge_index_from_shared(&server.state, false);
+                crate::server::rebuild_edge_index_from_shared(&server.state, false)?;
             }
             Ok(serde_json::to_string_pretty(&json!({
                 "status": "ok",
@@ -906,7 +906,7 @@ impl BlackboxServer {
                 let imported = mcp_tools::provenance::publish_prepared_provenance_import(
                     prepared, &edges_dir,
                 )?;
-                server.rebuild_edge_index_from_stores();
+                server.rebuild_edge_index_from_stores()?;
                 drop(publication);
                 imported
             };

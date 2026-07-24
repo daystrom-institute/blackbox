@@ -32,7 +32,14 @@ impl BlackboxServer {
         // worktree opener's path must not scope the board to an ephemeral
         // checkout.
         let project = match p.project.clone().filter(|s| !s.trim().is_empty()) {
-            Some(raw) => self.resolve_project_write_scope(&raw).0,
+            Some(raw) => match self.resolve_project_write_scope(&raw) {
+                Ok((scope, _)) => scope,
+                Err(error) => {
+                    return Self::err_text(&format!(
+                        "whiteboard_open project authority failed: {error:#}"
+                    ));
+                }
+            },
             None => String::new(),
         };
         let domain = p.domain.clone().unwrap_or_else(|| "facilitation".into());

@@ -28,7 +28,20 @@ impl BlackboxServer {
         // durable pin scope — while the literal cwd stays matchable as an
         // alias so pins keyed to the worktree path (pre-rescope writes)
         // keep injecting for the same work.
-        let resolved = project_dir.map(|raw| self.resolve_project_write_scope(raw).0);
+        let resolved = match project_dir {
+            Some(raw) => match self.resolve_project_write_scope(raw) {
+                Ok((scope, _)) => Some(scope),
+                Err(error) => {
+                    tracing::error!(
+                        project = raw,
+                        %error,
+                        "ambient pin scope authority resolution failed"
+                    );
+                    return None;
+                }
+            },
+            None => None,
+        };
         let alias = match (project_dir, resolved.as_deref()) {
             (Some(raw), Some(scope)) if raw != scope => Some(raw),
             _ => None,

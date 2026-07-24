@@ -33,6 +33,7 @@ use bbox_corpus_core::git;
 use bbox_corpus_core::identity::{RepoIdInputs, bbox_root_relpath, resolve_recorded_repo_id};
 use bbox_corpus_core::json_store::{
     NofollowDirectory, StoreLockGuard, acquire_store_lock_nofollow, atomic_write_json_locked,
+    with_store_lock,
 };
 use bbox_corpus_core::project_catalog::{MAX_PROJECT_CATALOG_BYTES, MAX_PROJECT_CATALOG_ENTRIES};
 use bbox_corpus_core::project_record::ProjectRecord;
@@ -162,6 +163,17 @@ fn validate_publisher_ref_data(data: &PublisherRefData) -> Result<()> {
     Ok(())
 }
 
+fn read_publisher_ref_data(path: &Path) -> Result<PublisherRefData> {
+    if !path.exists() {
+        return Ok(PublisherRefData::default());
+    }
+    let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let data: PublisherRefData =
+        serde_json::from_slice(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    validate_publisher_ref_data(&data).with_context(|| format!("validating {}", path.display()))?;
+    Ok(data)
+}
+
 /// Strict migration decoder for the exact v1 publisher-ref source bytes.
 ///
 /// The legacy v1 format defaults an omitted `refs` field to an empty set.
@@ -195,17 +207,7 @@ impl PublisherRefStore {
 
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        let data = if path.exists() {
-            let raw =
-                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-            let data: PublisherRefData = serde_json::from_slice(&raw)
-                .with_context(|| format!("parsing {}", path.display()))?;
-            validate_publisher_ref_data(&data)
-                .with_context(|| format!("validating {}", path.display()))?;
-            data
-        } else {
-            PublisherRefData::default()
-        };
+        let data = read_publisher_ref_data(&path)?;
         Ok(Self { path, data })
     }
 
@@ -291,16 +293,22 @@ impl PublisherRefStore {
     /// Persist a previously prepared immutable pin. A competing different pin
     /// fails closed instead of redefining published truth.
     pub fn persist_pin_candidate(&mut self, row: &PublisherRefRow) -> Result<()> {
-        if let Some(existing) = self.pinned(&row.scope) {
-            if existing == row {
-                return Ok(());
+        let path = self.path.clone();
+        let next = with_store_lock(&path, || {
+            let mut next = read_publisher_ref_data(&path)?;
+            if let Some(existing) = next.refs.iter().find(|item| item.scope == row.scope) {
+                if existing == row {
+                    return Ok(next);
+                }
+                anyhow::bail!("publisher pin changed before prepared publication");
             }
-            anyhow::bail!("publisher pin changed before prepared publication");
-        }
-        let mut next = self.data.clone();
-        next.refs.push(row.clone());
-        next.refs.sort_by(|a, b| a.scope.cmp(&b.scope));
-        self.replace_data(next)?;
+            next.refs.push(row.clone());
+            next.refs.sort_by(|a, b| a.scope.cmp(&b.scope));
+            validate_publisher_ref_data(&next)?;
+            atomic_write_json_locked(&path, &next)?;
+            Ok(next)
+        })?;
+        self.data = next;
         Ok(())
     }
 
@@ -314,22 +322,21 @@ impl PublisherRefStore {
             scope: scope.clone(),
             branch_ref: branch_ref.to_string(),
         };
-        let mut next = self.data.clone();
-        if let Some(existing) = next.refs.iter_mut().find(|item| &item.scope == scope) {
-            *existing = row.clone();
-        } else {
-            next.refs.push(row.clone());
-            next.refs.sort_by(|a, b| a.scope.cmp(&b.scope));
-        }
-        self.replace_data(next)?;
-        Ok(row)
-    }
-
-    fn replace_data(&mut self, next: PublisherRefData) -> Result<()> {
-        validate_publisher_ref_data(&next)?;
-        atomic_write_json_locked(&self.path, &next)?;
+        let path = self.path.clone();
+        let next = with_store_lock(&path, || {
+            let mut next = read_publisher_ref_data(&path)?;
+            if let Some(existing) = next.refs.iter_mut().find(|item| &item.scope == scope) {
+                *existing = row.clone();
+            } else {
+                next.refs.push(row.clone());
+                next.refs.sort_by(|a, b| a.scope.cmp(&b.scope));
+            }
+            validate_publisher_ref_data(&next)?;
+            atomic_write_json_locked(&path, &next)?;
+            Ok(next)
+        })?;
         self.data = next;
-        Ok(())
+        Ok(row)
     }
 }
 
@@ -507,6 +514,29 @@ mod tests {
         drop(store);
         let reopened = PublisherRefStore::open(state.path().join("publisher-refs.json")).unwrap();
         assert_eq!(reopened.pinned(&scope), Some(&first));
+    }
+
+    #[test]
+    fn stale_store_handles_merge_pins_under_the_canonical_lock() {
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("publisher-refs.json");
+        let mut first = PublisherRefStore::open(&path).unwrap();
+        let mut stale = PublisherRefStore::open(&path).unwrap();
+        let first_row = PublisherRefRow {
+            scope: PublishedScope::try_new("family-a", ".").unwrap(),
+            branch_ref: "refs/heads/main".into(),
+        };
+        let second_row = PublisherRefRow {
+            scope: PublishedScope::try_new("family-b", ".").unwrap(),
+            branch_ref: "refs/heads/main".into(),
+        };
+
+        first.persist_pin_candidate(&first_row).unwrap();
+        stale.persist_pin_candidate(&second_row).unwrap();
+
+        let reopened = PublisherRefStore::open(&path).unwrap();
+        assert_eq!(reopened.pinned(&first_row.scope), Some(&first_row));
+        assert_eq!(reopened.pinned(&second_row.scope), Some(&second_row));
     }
 
     #[test]

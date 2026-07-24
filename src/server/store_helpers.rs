@@ -159,11 +159,11 @@ impl BlackboxServer {
         Ok(())
     }
 
-    pub(crate) fn rebuild_edge_index_from_stores(&self) {
+    pub(crate) fn rebuild_edge_index_from_stores(&self) -> anyhow::Result<()> {
         // Store mutations only affect structured edges. Re-projecting all
         // Tantivy docs here is a multi-GB path and can stack under concurrent
         // thread updates.
-        rebuild_edge_index_from_shared(&self.state, false);
+        rebuild_edge_index_from_shared(&self.state, false)
     }
 
     /// Soft-nag classifier for `bbox_learn`: apply the latest
