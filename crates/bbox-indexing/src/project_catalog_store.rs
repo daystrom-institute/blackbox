@@ -668,6 +668,7 @@ struct ProjectCatalogPaths {
     journal: PathBuf,
     migration_marker: PathBuf,
     migration_receipt: PathBuf,
+    migration_assets_dir: PathBuf,
     stage_dir: PathBuf,
     backup_dir: PathBuf,
     mutation_lock: PathBuf,
@@ -703,6 +704,7 @@ impl ProjectCatalogPaths {
             "project-catalog-transaction.json",
             "project-catalog-migration.json",
             "project-catalog-migration-receipt.json",
+            "project-catalog-migration-assets",
             "project-catalog-stage",
             "project-catalog-backups",
             "project-catalog-migration.lock",
@@ -720,6 +722,7 @@ impl ProjectCatalogPaths {
             journal: parent.join("project-catalog-transaction.json"),
             migration_marker: parent.join("project-catalog-migration.json"),
             migration_receipt: parent.join("project-catalog-migration-receipt.json"),
+            migration_assets_dir: parent.join("project-catalog-migration-assets"),
             stage_dir: parent.join("project-catalog-stage"),
             backup_dir: parent.join("project-catalog-backups"),
             mutation_lock: canonical_store_lock_path(projects_path),
@@ -731,6 +734,7 @@ impl ProjectCatalogPaths {
             &paths.journal,
             &paths.migration_marker,
             &paths.migration_receipt,
+            &paths.migration_assets_dir,
             &paths.stage_dir,
             &paths.backup_dir,
             &paths.mutation_lock,
@@ -738,7 +742,7 @@ impl ProjectCatalogPaths {
         ]
         .into_iter()
         .collect::<BTreeSet<_>>();
-        if unique.len() != 9 {
+        if unique.len() != 10 {
             return Err(ProjectCatalogStoreError::new(
                 "error.project_catalog_path_collision",
                 "derived project catalog paths are not unique",
@@ -853,7 +857,7 @@ impl MigrationParticipantRegistry {
             code_source_paths,
             accepted_publication_paths,
             legacy_publisher_ref_source,
-            catalog_immutable_root: paths.backup_dir.join("immutable"),
+            catalog_immutable_root: paths.migration_assets_dir.clone(),
             checkout_identity_markers: std::collections::BTreeMap::new(),
             code_source_limits,
         }
@@ -905,6 +909,7 @@ impl MigrationParticipantRegistry {
             paths.journal.clone(),
             paths.migration_marker.clone(),
             paths.migration_receipt.clone(),
+            paths.migration_assets_dir.clone(),
             paths.stage_dir.clone(),
             paths.backup_dir.clone(),
             paths.mutation_lock.clone(),
@@ -1080,6 +1085,10 @@ fn begin_migration_checkout_registry_bootstrap_with_io(
                 .read_regular_nofollow(&owner.paths.migration_marker, MAX_MARKER_BYTES)
                 .map_err(bootstrap_retry_failure)?
                 .is_some()
+            || path_exists_nofollow(&owner.paths.migration_receipt)
+                .map_err(bootstrap_retry_failure)?
+            || path_exists_nofollow(&owner.paths.migration_assets_dir)
+                .map_err(bootstrap_retry_failure)?
             || path_exists_nofollow(&owner.paths.stage_dir).map_err(bootstrap_retry_failure)?
             || path_exists_nofollow(&owner.paths.backup_dir).map_err(bootstrap_retry_failure)?
         {
@@ -3716,6 +3725,8 @@ pub(crate) fn validate_migration_plan(
         store_paths.catalog.clone(),
         store_paths.attachments.clone(),
         store_paths.migration_marker.clone(),
+        store_paths.migration_receipt.clone(),
+        store_paths.migration_assets_dir.clone(),
         store_paths.stage_dir.clone(),
         store_paths.backup_dir.clone(),
         store_paths.mutation_lock.clone(),
@@ -4852,7 +4863,7 @@ impl ProjectCatalogTransactionOwner {
 
     fn preserve_committed_migration_journal(
         &self,
-        journal: &ProjectCatalogTransactionJournalV1,
+        journal: &mut ProjectCatalogTransactionJournalV1,
     ) -> ProjectCatalogStoreResult<()> {
         journal.validate()?;
         if journal.kind != TransactionKindV1::V1Migration
@@ -4863,6 +4874,23 @@ impl ProjectCatalogTransactionOwner {
                 "error.project_catalog_migration_incomplete",
                 "only a committed migration journal can become retained migration evidence",
             ));
+        }
+        if let Some(existing_bytes) = self
+            .io
+            .read_regular_nofollow(&self.paths.migration_receipt, MAX_JOURNAL_BYTES)?
+        {
+            let existing: ProjectCatalogTransactionJournalV1 =
+                decode_bounded_json(&existing_bytes, MAX_JOURNAL_BYTES, "migration receipt")?;
+            existing.validate()?;
+            let mut expected = journal.clone();
+            expected.committed_at = existing.committed_at;
+            if existing != expected {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_artifact_collision",
+                    "durable migration receipt disagrees with the committed transaction",
+                ));
+            }
+            *journal = existing;
         }
         let bytes = encode_bounded_json(journal, MAX_JOURNAL_BYTES, "transaction journal")?;
         let hash = sha256(&bytes);
@@ -5545,7 +5573,7 @@ impl ProjectCatalogTransactionOwner {
         journal.outcome = Some(TransactionOutcomeV1::Committed);
         journal.committed_at = Some(unix_timestamp()?);
         journal.validate()?;
-        self.preserve_committed_migration_journal(&journal)?;
+        self.preserve_committed_migration_journal(&mut journal)?;
         self.write_journal(&journal, FaultPoint::CommittedJournalWrite)?;
         let state = self.verify_current_migration_state(&journal)?;
         Ok(ProjectCatalogCommit {
@@ -5756,7 +5784,7 @@ impl ProjectCatalogTransactionOwner {
                 if journal.kind == TransactionKindV1::V1Migration
                     && journal.outcome == Some(TransactionOutcomeV1::Committed)
                 {
-                    self.preserve_committed_migration_journal(&journal)?;
+                    self.preserve_committed_migration_journal(&mut journal)?;
                 }
                 self.write_journal(&journal, FaultPoint::CommittedJournalWrite)?;
                 Ok(())
@@ -9606,6 +9634,7 @@ mod tests {
             paths.journal,
             paths.migration_marker,
             paths.migration_receipt,
+            paths.migration_assets_dir,
             paths.stage_dir,
             paths.backup_dir,
             path.parent().unwrap().join("checkout"),
@@ -11339,6 +11368,10 @@ mod tests {
         assert_eq!(
             paths.migration_receipt,
             root.join("project-catalog-migration-receipt.json")
+        );
+        assert_eq!(
+            paths.migration_assets_dir,
+            root.join("project-catalog-migration-assets")
         );
         assert_eq!(paths.stage_dir, root.join("project-catalog-stage"));
         assert_eq!(paths.backup_dir, root.join("project-catalog-backups"));

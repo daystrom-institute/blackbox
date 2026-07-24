@@ -7032,7 +7032,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         assert!(!out.rendered);
         assert!(out.render_pending);
         assert_eq!(out.summary, None);
-        assert_eq!(out.id.len(), 8);
+        assert_eq!(out.id.len(), 16);
         assert!(out.message.starts_with("Created entry "));
         let stored = kb
             .store

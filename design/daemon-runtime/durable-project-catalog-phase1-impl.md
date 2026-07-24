@@ -429,21 +429,24 @@ project-attachments.json
 project-catalog-transaction.json
 project-catalog-migration.json
 project-catalog-migration-receipt.json
+project-catalog-migration-assets/
 project-catalog-stage/
 project-catalog-backups/
 projects.json.lock
 ```
 
 The catalog remains at `projects.json`. The attachment store, active journal,
-migration marker, durable migration receipt, stage directory, and backups are
-siblings. The receipt is the committed migration journal copied to a fixed
-authority path before the active journal can be replaced by a regular pair
-transaction. It is not backup content and remains required after backup
-cleanup. The short mutation lock is the existing canonical `projects.json.lock` returned by
+migration marker, durable migration receipt, retained migration assets, stage
+directory, and backups are siblings. The receipt is the committed migration
+journal copied to a fixed authority path before the active journal can be
+replaced by a regular pair transaction. Retained source backups live under the
+fixed migration-assets directory. Neither is ordinary transaction backup
+content, and both remain required after backup cleanup. The short mutation lock
+is the existing canonical `projects.json.lock` returned by
 `with_store_lock(projects_path)`, so the bridge `StorePersister`, preflight,
-regular v2 transactions, and migration transactions exclude one another.
-Path derivation is centralized and unit-tested for an arbitrary configured
-filename and parent.
+regular v2 transactions, and migration transactions exclude one another. Path
+derivation is centralized and unit-tested for an arbitrary configured filename
+and parent.
 
 The process-lifetime migration lock and `projects.json.lock` have different
 jobs:

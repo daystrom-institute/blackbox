@@ -470,6 +470,7 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
         let mut paths = vec![
             self.transaction_stage_dir.as_path(),
             self.catalog_backup_dir.as_path(),
+            self.catalog_immutable_root.as_path(),
             self.code_source_root.as_path(),
             self.accepted_publications_root.as_path(),
             self.index_root.as_path(),
@@ -518,6 +519,7 @@ impl CatalogDerivedPathsV1 {
                 | "project-catalog-transaction.json"
                 | "project-catalog-migration.json"
                 | "project-catalog-migration-receipt.json"
+                | "project-catalog-migration-assets"
                 | "project-catalog-stage"
                 | "project-catalog-backups"
                 | "project-catalog-migration.lock"
@@ -530,15 +532,14 @@ impl CatalogDerivedPathsV1 {
         }
         let accepted_publications_anchor = parent.join("accepted-publications.json");
         let accepted_publications_root = parent.join("accepted-publications");
-        let catalog_backup_dir = parent.join("project-catalog-backups");
         Ok(Self {
             attachments_path: parent.join("project-attachments.json"),
             transaction_journal_path: parent.join("project-catalog-transaction.json"),
             migration_marker_path: parent.join("project-catalog-migration.json"),
             migration_receipt_path: parent.join("project-catalog-migration-receipt.json"),
             transaction_stage_dir: parent.join("project-catalog-stage"),
-            catalog_immutable_root: catalog_backup_dir.join("immutable"),
-            catalog_backup_dir,
+            catalog_immutable_root: parent.join("project-catalog-migration-assets"),
+            catalog_backup_dir: parent.join("project-catalog-backups"),
             catalog_mutation_lock_path: canonical_store_lock_path(projects_path),
             catalog_lifetime_lock_path: project_catalog_migration_lock_path(projects_path),
             accepted_publication_pointers: accepted_publications_root.join("pointers"),

@@ -434,6 +434,7 @@ Protect:
 - `~/.local/state/blackbox/projects.json`
 - `~/.local/state/blackbox/project-catalog-migration.json`
 - `~/.local/state/blackbox/project-catalog-migration-receipt.json`
+- `~/.local/state/blackbox/project-catalog-migration-assets/`
 - `~/.local/state/blackbox/packets/`
 - `~/.local/state/blackbox/artifacts/`
 - `~/.local/state/blackbox/bro/`
