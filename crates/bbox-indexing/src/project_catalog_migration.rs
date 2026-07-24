@@ -2983,6 +2983,7 @@ fn publisher_seed_disposition(
 
 fn prepare_store_plan_parts(
     inventory: &V1ProjectCatalogInventory,
+    resolution: &ProjectCatalogMigrationResolutionV1,
     legacy_code_source: &bbox_code_source_store::MigrationLegacyInventoryV1,
     post_image: &DeterministicPostImageInputV1,
     plan_hash: &Sha256ValueV1,
@@ -4001,6 +4002,7 @@ fn prepare_closed_migration(
         canonical_plan_hash(inventory, &resolution, &post_image).map_err(inventory_error)?;
     let mut store_parts = prepare_store_plan_parts(
         inventory,
+        &resolution,
         &captured.code_source_owner_inventory,
         &post_image,
         &plan_hash,
