@@ -36,9 +36,10 @@ use bbox_corpus_core::json_store::{
 };
 use bbox_corpus_core::project_catalog::{
     AttachmentId, AttachmentSnapshotV1, AttachmentStatus, CatalogOriginV2, CatalogSnapshotV2,
-    MAX_PROJECT_CATALOG_BYTES, MAX_PROJECT_CATALOG_ENTRIES, ProjectCatalogTransactionId, ProjectId,
-    ProjectScope, decode_attachment_snapshot, decode_catalog_snapshot, decode_legacy_project_store,
-    encode_attachment_snapshot, encode_catalog_snapshot, validate_catalog_attachments,
+    MAX_LEGACY_PROJECT_STORE_BYTES, MAX_PROJECT_CATALOG_BYTES, MAX_PROJECT_CATALOG_ENTRIES,
+    ProjectCatalogTransactionId, ProjectId, ProjectScope, decode_attachment_snapshot,
+    decode_catalog_snapshot, decode_legacy_project_store, encode_attachment_snapshot,
+    encode_catalog_snapshot, validate_catalog_attachments,
 };
 use parking_lot::RwLock;
 use serde::{Deserialize, Deserializer, Serialize, de};
@@ -1012,7 +1013,7 @@ fn begin_migration_checkout_registry_bootstrap_with_io(
     else {
         let catalog_bytes = owner
             .io
-            .read_regular_nofollow(&owner.paths.catalog, MAX_PROJECT_CATALOG_BYTES)
+            .read_regular_nofollow(&owner.paths.catalog, MAX_LEGACY_PROJECT_STORE_BYTES)
             .map_err(bootstrap_retry_failure)?;
         if catalog_bytes
             .as_deref()
@@ -4708,7 +4709,7 @@ impl ProjectCatalogTransactionOwner {
     fn read_strict_pair_locked(&self) -> ProjectCatalogStoreResult<ProjectCatalogState> {
         let catalog_bytes = self
             .io
-            .read_regular_nofollow(&self.paths.catalog, MAX_PROJECT_CATALOG_BYTES)?;
+            .read_regular_nofollow(&self.paths.catalog, MAX_LEGACY_PROJECT_STORE_BYTES)?;
         let attachment_bytes = self
             .io
             .read_regular_nofollow(&self.paths.attachments, MAX_PROJECT_CATALOG_BYTES)?;
@@ -7135,7 +7136,8 @@ impl ParticipantRoleV1 {
 
     fn max_bytes(&self) -> usize {
         match self {
-            Self::Catalog | Self::Attachments => MAX_PROJECT_CATALOG_BYTES,
+            Self::Catalog => MAX_LEGACY_PROJECT_STORE_BYTES,
+            Self::Attachments => MAX_PROJECT_CATALOG_BYTES,
             Self::EffectiveSourceManifest => MAX_CODE_SOURCE_EFFECTIVE_MANIFEST_BYTES,
             Self::Activation { .. } => MAX_CODE_SOURCE_ACTIVATION_BYTES,
             Self::StoredGenerationMetadata { .. } => MAX_CODE_SOURCE_GENERATION_METADATA_BYTES,
@@ -7291,7 +7293,7 @@ impl ImmutableAssetRoleV1 {
 
     fn max_bytes(&self) -> usize {
         match self {
-            Self::LegacyProjectStoreBackup => MAX_PROJECT_CATALOG_BYTES,
+            Self::LegacyProjectStoreBackup => MAX_LEGACY_PROJECT_STORE_BYTES,
             Self::LegacyPublisherRefBackup => MAX_LEGACY_PUBLISHER_REF_SOURCE_BYTES,
             Self::AcceptedPublicationGeneration { .. } => MAX_ACCEPTED_PUBLICATION_GENERATION_BYTES,
             Self::CollectedGenerationManifest { .. } => MAX_CODE_SOURCE_COLLECTED_MANIFEST_BYTES,
@@ -8417,16 +8419,12 @@ impl RealCatalogStoreIo {
     fn read_file_unix(path: &Path, max_bytes: usize) -> ProjectCatalogStoreResult<Option<Vec<u8>>> {
         use std::os::fd::{AsRawFd, FromRawFd};
 
-        let (parent, filename) = match Self::open_parent_unix(path) {
-            Ok(value) => value,
-            Err(error)
-                if !path.parent().is_some_and(Path::exists)
-                    && error.code() == "error.project_catalog_io" =>
-            {
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
-        };
+        if let Some(parent) = path.parent()
+            && !path_exists_nofollow(parent)?
+        {
+            return Ok(None);
+        }
+        let (parent, filename) = Self::open_parent_unix(path)?;
         let descriptor = unsafe {
             libc::openat(
                 parent.as_raw_fd(),
@@ -9003,9 +9001,10 @@ mod tests {
     use bbox_corpus_core::project_catalog::{
         ATTACHMENT_VERSION_V1, AttachmentCapabilities, AttachmentId, AttachmentKind,
         AttachmentStatus, CATALOG_VERSION_V2, CheckoutAttachment, CorpusProject,
-        LegacyPathBindingId, LegacyPathBindingStatus, LegacyPathLedgerEntry, ProjectScope,
-        ScopeMigrationAttachmentProof, ScopeMigrationAuthorityProvenance, ScopeMigrationId,
-        ScopeMigrationKind, ScopeMigrationRecord,
+        LegacyPathBindingId, LegacyPathBindingStatus, LegacyPathLedgerEntry, LegacyProjectRecordV1,
+        LegacyProjectStoreV1, ProjectScope, ScopeMigrationAttachmentProof,
+        ScopeMigrationAuthorityProvenance, ScopeMigrationId, ScopeMigrationKind,
+        ScopeMigrationRecord,
     };
     use bbox_stores::store_persister::StorePersister;
 
@@ -14633,6 +14632,41 @@ mod tests {
         fs::write(&paths.journal, vec![b' '; MAX_JOURNAL_BYTES + 1]).unwrap();
         let error = ProjectCatalogStore::open_existing(path).unwrap_err();
         assert_eq!(error.code(), "error.project_catalog_byte_limit");
+    }
+
+    #[test]
+    fn oversized_valid_legacy_store_reports_migration_requirement() {
+        let (_directory, path) = projects_path();
+        let legacy = LegacyProjectStoreV1 {
+            version: 1,
+            projects: vec![LegacyProjectRecordV1 {
+                project_id: "legacy-project".into(),
+                repo_id: None,
+                canonical_path: "x".repeat(MAX_PROJECT_CATALOG_BYTES + 1),
+                registered_at: "2026-01-01T00:00:00Z".into(),
+                is_git_repo: false,
+                languages: BTreeSet::new(),
+                aliases: BTreeSet::new(),
+            }],
+        };
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        assert!(bytes.len() > MAX_PROJECT_CATALOG_BYTES);
+        assert!(bytes.len() < MAX_LEGACY_PROJECT_STORE_BYTES);
+        fs::write(&path, bytes).unwrap();
+
+        let error = ProjectCatalogStore::open_existing(path).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_legacy_store_requires_migration"
+        );
+        assert_eq!(
+            ParticipantRoleV1::Catalog.max_bytes(),
+            MAX_LEGACY_PROJECT_STORE_BYTES
+        );
+        assert_eq!(
+            ImmutableAssetRoleV1::LegacyProjectStoreBackup.max_bytes(),
+            MAX_LEGACY_PROJECT_STORE_BYTES
+        );
     }
 
     #[test]
