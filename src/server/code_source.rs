@@ -2810,6 +2810,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         let restarted = transition_test_state(&state_dir);
+        let _vector_store = bbox_vectors::install_test_global(restarted.vector_store.clone());
         install_test_assignment(&restarted, producer_id, &scope, &project.project_id);
         assert_eq!(
             restarted
