@@ -202,7 +202,7 @@ fn domain_errors_use_one_redacted_json_envelope() {
     assert!(envelope.contains_key("version"));
     assert!(envelope.contains_key("command"));
     assert!(envelope.contains_key("error"));
-    let error = envelope["error"].as_object().unwrap();
+    let error = envelope.get("error").unwrap().as_object().unwrap();
     assert_eq!(error.len(), 2);
     assert!(error.contains_key("code"));
     assert!(error.contains_key("message"));
