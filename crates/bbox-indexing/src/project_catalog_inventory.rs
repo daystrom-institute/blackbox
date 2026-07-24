@@ -512,6 +512,23 @@ pub struct PublisherPinObservationV1 {
     pub source_observation_ids: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnboundPublisherPinReasonV1 {
+    DuplicateScopeOwners,
+    OwnerlessScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnboundPublisherPinObservationV1 {
+    pub observation_id: String,
+    pub expected_scope: PublishedScope,
+    pub full_ref: String,
+    pub candidate_project_ids: BTreeSet<ProjectId>,
+    pub reason: UnboundPublisherPinReasonV1,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectScopedRefStoreKindV1 {
@@ -811,6 +828,7 @@ pub struct V1ProjectCatalogInventory {
     pub code_sources: Vec<CodeSourceObservationV1>,
     pub retained_owner_resolutions: Vec<RetainedGenerationOwnerResolutionObservationV1>,
     pub publisher_pins: Vec<PublisherPinObservationV1>,
+    pub unbound_publisher_pins: Vec<UnboundPublisherPinObservationV1>,
     pub project_scoped_refs: Vec<ProjectScopedRefObservationV1>,
     pub edge_workspaces: Vec<EdgeWorkspaceObservationV1>,
     pub git_metadata: Vec<GitMetadataObservationV1>,
@@ -1011,7 +1029,10 @@ impl V1ProjectCatalogInventory {
                 "retained owner resolutions",
                 self.retained_owner_resolutions.len(),
             ),
-            ("publisher pins", self.publisher_pins.len()),
+            (
+                "publisher pins",
+                self.publisher_pins.len() + self.unbound_publisher_pins.len(),
+            ),
             ("project refs", self.project_scoped_refs.len()),
             ("edge workspaces", self.edge_workspaces.len()),
             ("git metadata", self.git_metadata.len()),
@@ -1195,6 +1216,7 @@ impl V1ProjectCatalogInventory {
             .map(|row| row.attachment_id.clone())
             .collect::<BTreeSet<_>>();
         let mut publisher_pin_keys = BTreeSet::new();
+        let mut publisher_source_keys = BTreeSet::new();
         for pin in &self.publisher_pins {
             insert_observation(&mut observations, &pin.observation_id)?;
             ensure_known_project(&projects, &pin.project_id)?;
@@ -1223,6 +1245,37 @@ impl V1ProjectCatalogInventory {
             }
             if !publisher_pin_keys.insert(publisher_pin_key(pin)?) {
                 return Err(duplicate("publisher pin identity"));
+            }
+            if !publisher_source_keys.insert((pin.expected_scope.clone(), pin.full_ref.as_str())) {
+                return Err(duplicate("publisher source pin"));
+            }
+        }
+        for pin in &self.unbound_publisher_pins {
+            insert_observation(&mut observations, &pin.observation_id)?;
+            pin.expected_scope
+                .validate()
+                .map_err(|_| invalid("unbound publisher pin scope is invalid"))?;
+            validate_full_ref(&pin.full_ref)?;
+            for project_id in &pin.candidate_project_ids {
+                ensure_known_project(&projects, project_id)?;
+            }
+            match pin.reason {
+                UnboundPublisherPinReasonV1::DuplicateScopeOwners
+                    if pin.candidate_project_ids.len() < 2 =>
+                {
+                    return Err(invalid(
+                        "duplicate-scope publisher pin lacks multiple candidates",
+                    ));
+                }
+                UnboundPublisherPinReasonV1::OwnerlessScope
+                    if !pin.candidate_project_ids.is_empty() =>
+                {
+                    return Err(invalid("ownerless publisher pin carries candidates"));
+                }
+                _ => {}
+            }
+            if !publisher_source_keys.insert((pin.expected_scope.clone(), pin.full_ref.as_str())) {
+                return Err(duplicate("publisher source pin"));
             }
         }
 
@@ -1432,6 +1485,14 @@ impl V1ProjectCatalogInventory {
                 });
             }
         }
+        for pin in &self.unbound_publisher_pins {
+            if pin.reason == UnboundPublisherPinReasonV1::OwnerlessScope {
+                refusals.push(InventoryRefusalV1 {
+                    record_id: pin.observation_id.clone(),
+                    diagnostic_code: "publisher_scope_owner_missing".to_string(),
+                });
+            }
+        }
         for source in &self.code_sources {
             for generation in &source.generations {
                 let diagnostic_code = match &generation.descriptor {
@@ -1540,6 +1601,8 @@ impl V1ProjectCatalogInventory {
         self.retained_owner_resolutions
             .sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
         self.publisher_pins
+            .sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
+        self.unbound_publisher_pins
             .sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
         self.project_scoped_refs
             .sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
@@ -1700,7 +1763,7 @@ pub enum PublisherBindingReportStatusV1 {
 #[serde(deny_unknown_fields)]
 pub struct PublisherBindingReportV1 {
     pub pin_observation_id: String,
-    pub project_id: ProjectId,
+    pub project_id: Option<ProjectId>,
     pub expected_scope_digest: Sha256ValueV1,
     pub full_ref_digest: Sha256ValueV1,
     pub status: PublisherBindingReportStatusV1,
@@ -2112,6 +2175,100 @@ impl ProjectCatalogMigrationReportV1 {
                 return Err(invalid("report attachment row disagrees with inventory"));
             }
         }
+        let publisher_rows = self
+            .publisher_bindings
+            .iter()
+            .map(|row| (row.pin_observation_id.as_str(), row))
+            .collect::<BTreeMap<_, _>>();
+        if publisher_rows.len()
+            != inventory.publisher_pins.len() + inventory.unbound_publisher_pins.len()
+        {
+            return Err(invalid("report publisher inventory is incomplete"));
+        }
+        for pin in &inventory.publisher_pins {
+            let row = publisher_rows
+                .get(pin.observation_id.as_str())
+                .ok_or_else(|| unknown("report publisher observation"))?;
+            if row.project_id.as_ref() != Some(&pin.project_id)
+                || row.expected_scope_digest != digest_published_scope(&pin.expected_scope)?
+                || row.full_ref_digest != digest_publisher_full_ref(&pin.full_ref)?
+            {
+                return Err(invalid("report publisher row disagrees with inventory"));
+            }
+        }
+        for pin in &inventory.unbound_publisher_pins {
+            let row = publisher_rows
+                .get(pin.observation_id.as_str())
+                .ok_or_else(|| unknown("report unbound publisher observation"))?;
+            if row
+                .project_id
+                .as_ref()
+                .is_some_and(|project_id| !pin.candidate_project_ids.contains(project_id))
+                || row.expected_scope_digest != digest_published_scope(&pin.expected_scope)?
+                || row.full_ref_digest != digest_publisher_full_ref(&pin.full_ref)?
+            {
+                return Err(invalid(
+                    "report unbound publisher row disagrees with inventory",
+                ));
+            }
+        }
+        let alias_candidates = inventory
+            .legacy_projects
+            .iter()
+            .flat_map(|project| {
+                let project_id = ProjectId::parse(project.record.project_id.clone())
+                    .expect("validated inventory project id");
+                project
+                    .record
+                    .aliases
+                    .iter()
+                    .cloned()
+                    .map(move |alias| (alias, project_id.clone()))
+            })
+            .chain(
+                inventory
+                    .materialized_aliases
+                    .iter()
+                    .map(|row| (row.alias.clone(), row.project_id.clone())),
+            )
+            .fold(
+                BTreeMap::<String, BTreeSet<ProjectId>>::new(),
+                |mut owners, (alias, project_id)| {
+                    owners.entry(alias).or_default().insert(project_id);
+                    owners
+                },
+            );
+        let mut expected_alias_conflicts = alias_candidates
+            .values()
+            .filter(|owners| owners.len() > 1)
+            .map(|owners| {
+                owners
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<BTreeSet<_>>()
+            })
+            .collect::<Vec<_>>();
+        expected_alias_conflicts.sort();
+        let mut reported_alias_conflicts = self
+            .alias_conflicts
+            .iter()
+            .map(|row| {
+                (
+                    row.diagnostic_code.as_str(),
+                    row.affected_record_ids.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        reported_alias_conflicts.sort();
+        let expected_alias_conflicts = expected_alias_conflicts
+            .into_iter()
+            .map(|records| ("duplicate_materialized_alias", records))
+            .collect::<Vec<_>>();
+        if reported_alias_conflicts != expected_alias_conflicts {
+            return Err(invalid(
+                "report alias conflicts are not the exact inventory projection",
+            ));
+        }
         let path_rows = self
             .legacy_path_bindings
             .iter()
@@ -2203,14 +2360,46 @@ impl ProjectCatalogMigrationReportV1 {
         &self,
         inventory: &V1ProjectCatalogInventory,
     ) -> InventoryResult<()> {
-        let _encoded = serde_json::to_vec(self).map_err(|error| {
+        let report_value = serde_json::to_value(self).map_err(|error| {
             ProjectCatalogInventoryError::new(
                 "error.project_catalog_report_encode",
                 error.to_string(),
             )
         })?;
-        inventory.canonical_json()?;
+        let inventory_value = serde_json::to_value(inventory).map_err(|error| {
+            ProjectCatalogInventoryError::new(
+                "error.project_catalog_inventory_encode",
+                error.to_string(),
+            )
+        })?;
+        if json_contains_host_local_path(&report_value)
+            || json_contains_host_local_path(&inventory_value)
+        {
+            return Err(ProjectCatalogInventoryError::new(
+                "error.project_catalog_report_path_leak",
+                "canonical migration artifacts contain a host-local path",
+            ));
+        }
         Ok(())
+    }
+}
+
+fn json_contains_host_local_path(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(value) => {
+            value.starts_with('/')
+                || value.starts_with("\\\\")
+                || value.as_bytes().get(1).is_some_and(|byte| *byte == b':')
+                    && value
+                        .as_bytes()
+                        .first()
+                        .is_some_and(u8::is_ascii_alphabetic)
+        }
+        serde_json::Value::Array(values) => values.iter().any(json_contains_host_local_path),
+        serde_json::Value::Object(values) => values.values().any(json_contains_host_local_path),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            false
+        }
     }
 }
 
@@ -2255,6 +2444,15 @@ impl SensitiveLocalPathReportV1 {
             .iter()
             .map(|row| (row.observation_id.as_str(), row))
             .collect::<BTreeMap<_, _>>();
+        let row_ids = rows
+            .iter()
+            .map(|row| row.observation_id.as_str())
+            .collect::<BTreeSet<_>>();
+        if row_ids.len() != rows.len()
+            || row_ids != canonical.keys().copied().collect::<BTreeSet<_>>()
+        {
+            return Err(duplicate("sensitive local-path observation"));
+        }
         for row in &rows {
             let observed = canonical
                 .get(row.observation_id.as_str())
@@ -3623,7 +3821,8 @@ fn validate_publisher_disposition_set<'a>(
         .iter()
         .map(|row| Ok((publisher_disposition_key(row)?, row)))
         .collect::<InventoryResult<BTreeMap<_, _>>>()?;
-    if post_dispositions.len() != inventory.publisher_pins.len() {
+    let effective_pins = resolved_publisher_pins(inventory, resolution)?;
+    if post_dispositions.len() != effective_pins.len() {
         return Err(ProjectCatalogInventoryError::new(
             "error.project_catalog_inventory_incomplete_publisher_disposition",
             "every legacy publisher pin requires exactly one disposition",
@@ -3634,7 +3833,7 @@ fn validate_publisher_disposition_set<'a>(
         .iter()
         .map(|row| (row.pin_observation_id.as_str(), row))
         .collect::<BTreeMap<_, _>>();
-    for pin in &inventory.publisher_pins {
+    for pin in &effective_pins {
         let key = publisher_pin_key(pin)?;
         let disposition = post_dispositions
             .get(&key)
@@ -3643,7 +3842,7 @@ fn validate_publisher_disposition_set<'a>(
         let report_binding = report_bindings
             .get(pin.observation_id.as_str())
             .ok_or_else(|| unknown("publisher report binding"))?;
-        if report_binding.project_id != pin.project_id
+        if report_binding.project_id.as_ref() != Some(&pin.project_id)
             || report_binding.expected_scope_digest != digest_published_scope(&pin.expected_scope)?
             || report_binding.full_ref_digest != digest_publisher_full_ref(&pin.full_ref)?
         {
@@ -4009,6 +4208,11 @@ fn observed_scopes_for_project(
             if let Some(scope) = &pin.resolved_scope {
                 scopes.insert(scope.clone());
             }
+        }
+    }
+    for pin in &inventory.unbound_publisher_pins {
+        if pin.candidate_project_ids.contains(project_id) {
+            scopes.insert(pin.expected_scope.clone());
         }
     }
     scopes
@@ -4406,9 +4610,16 @@ fn validate_publisher_source_membership(
         .publisher_pins
         .iter()
         .map(|row| (row.expected_scope.clone(), row.full_ref.as_str()))
+        .chain(
+            inventory
+                .unbound_publisher_pins
+                .iter()
+                .map(|row| (row.expected_scope.clone(), row.full_ref.as_str())),
+        )
         .collect::<BTreeSet<_>>();
     if decoded_keys.len() != decoded.len()
-        || typed_keys.len() != inventory.publisher_pins.len()
+        || typed_keys.len()
+            != inventory.publisher_pins.len() + inventory.unbound_publisher_pins.len()
         || decoded_keys != typed_keys
     {
         return Err(invalid(
@@ -4436,6 +4647,11 @@ fn validate_publisher_source_membership(
         .iter()
         .map(|row| (row.observation_id.as_str(), row))
         .collect::<BTreeMap<_, _>>();
+    let git_lane_complete = inventory
+        .immutable_lane_evidence
+        .iter()
+        .find(|lane| lane.lane_kind == ImmutableInventoryLaneKindV1::GitMetadata)
+        .is_some_and(|lane| lane.completeness == ImmutableInventoryLaneCompletenessV1::Complete);
     for pin in &inventory.publisher_pins {
         let project = projects
             .get(&pin.project_id)
@@ -4451,7 +4667,7 @@ fn validate_publisher_source_membership(
         }
         let mut expected =
             BTreeSet::from([pin.observation_id.clone(), project.observation_id.clone()]);
-        if pin.resolved_commit.is_some() != pin.resolved_scope.is_some()
+        if pin.resolved_scope.is_some() && pin.resolved_commit.is_none()
             || pin
                 .resolved_scope
                 .as_ref()
@@ -4488,16 +4704,18 @@ fn validate_publisher_source_membership(
                         && row.resolved_refs.get(&pin.full_ref) == pin.resolved_commit.as_ref()
                 })
                 .collect::<Vec<_>>();
-            if matching_git.len() != 1 {
+            if git_lane_complete && pin.resolved_scope.is_some() && matching_git.len() != 1 {
                 return Err(invalid(
                     "publisher candidate lacks unique checkout Git ref provenance",
                 ));
             }
             expected.insert(attachment.observation_id.clone());
             expected.insert(attachment.checkout_observation_id.clone());
-            provenance_git_ids.insert(matching_git[0].observation_id.clone());
+            if let Some(matching_git) = matching_git.first() {
+                provenance_git_ids.insert(matching_git.observation_id.clone());
+            }
         }
-        if pin.resolved_commit.is_some() {
+        if git_lane_complete && pin.resolved_scope.is_some() {
             if provenance_git_ids.is_empty() {
                 provenance_git_ids.extend(
                     inventory
@@ -4521,6 +4739,19 @@ fn validate_publisher_source_membership(
         if pin.source_observation_ids != expected {
             return Err(invalid(
                 "publisher source observations are incomplete or spliced",
+            ));
+        }
+    }
+    for pin in &inventory.unbound_publisher_pins {
+        let mut actual_candidates = BTreeSet::new();
+        for project_id in projects.keys() {
+            if project_authority_scope(inventory, project_id)? == Some(&pin.expected_scope) {
+                actual_candidates.insert(project_id.clone());
+            }
+        }
+        if actual_candidates != pin.candidate_project_ids {
+            return Err(invalid(
+                "unbound publisher pin candidates are incomplete or spliced",
             ));
         }
     }
@@ -4597,6 +4828,97 @@ fn publisher_pin_key(
         digest_published_scope(&pin.expected_scope)?,
         pin.full_ref.clone(),
     ))
+}
+
+pub(crate) fn resolved_publisher_pins(
+    inventory: &V1ProjectCatalogInventory,
+    resolution: &ProjectCatalogMigrationResolutionV1,
+) -> InventoryResult<Vec<PublisherPinObservationV1>> {
+    let mut pins = inventory.publisher_pins.clone();
+    for unbound in &inventory.unbound_publisher_pins {
+        if unbound.reason != UnboundPublisherPinReasonV1::DuplicateScopeOwners {
+            continue;
+        }
+        let Some(selection) = resolution.selected_scope_owners.iter().find(|selection| {
+            if selection.scope != unbound.expected_scope {
+                return false;
+            }
+            let mut candidates = selection.losing_project_ids.clone();
+            candidates.insert(selection.owner_project_id.clone());
+            candidates == unbound.candidate_project_ids
+        }) else {
+            continue;
+        };
+        let project = inventory
+            .legacy_projects
+            .iter()
+            .find(|project| project.record.project_id == selection.owner_project_id.as_str())
+            .ok_or_else(|| unknown("selected publisher owner"))?;
+        let candidates = inventory
+            .attachment_candidates
+            .iter()
+            .filter(|attachment| {
+                attachment.project_id == selection.owner_project_id
+                    && attachment.observed_scope.as_ref() == Some(&unbound.expected_scope)
+            })
+            .collect::<Vec<_>>();
+        let candidate_attachment_ids = candidates
+            .iter()
+            .map(|attachment| attachment.attachment_id.clone())
+            .collect::<BTreeSet<_>>();
+        let resolved = candidates
+            .iter()
+            .flat_map(|attachment| {
+                inventory.git_metadata.iter().filter_map(move |git| {
+                    (git.project_id == selection.owner_project_id
+                        && git.checkout_observation_id == attachment.checkout_observation_id)
+                        .then(|| git.resolved_refs.get(&unbound.full_ref))
+                        .flatten()
+                        .map(|commit| (git.observation_id.clone(), commit.clone()))
+                })
+            })
+            .collect::<Vec<_>>();
+        let commit_set = resolved
+            .iter()
+            .map(|(_, commit)| commit.clone())
+            .collect::<BTreeSet<_>>();
+        let resolved_commit = (commit_set.len() == 1)
+            .then(|| commit_set.first().expect("one publisher commit").clone());
+        let resolved_scope = resolved_commit
+            .as_ref()
+            .map(|_| unbound.expected_scope.clone());
+        let mut source_observation_ids = BTreeSet::from([
+            unbound.observation_id.clone(),
+            project.observation_id.clone(),
+        ]);
+        if let Some(authority) = &project.committed_authority {
+            source_observation_ids.insert(authority.observation_id.clone());
+        }
+        for attachment in candidates {
+            source_observation_ids.insert(attachment.observation_id.clone());
+            source_observation_ids.insert(attachment.checkout_observation_id.clone());
+        }
+        if let Some(commit) = &resolved_commit {
+            source_observation_ids.extend(
+                resolved
+                    .iter()
+                    .filter(|(_, observed)| observed == commit)
+                    .map(|(observation_id, _)| observation_id.clone()),
+            );
+        }
+        pins.push(PublisherPinObservationV1 {
+            observation_id: unbound.observation_id.clone(),
+            project_id: selection.owner_project_id.clone(),
+            expected_scope: unbound.expected_scope.clone(),
+            full_ref: unbound.full_ref.clone(),
+            candidate_attachment_ids,
+            resolved_commit,
+            resolved_scope,
+            source_observation_ids,
+        });
+    }
+    pins.sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
+    Ok(pins)
 }
 
 fn publisher_disposition_key(
@@ -5231,6 +5553,12 @@ fn validate_mutable_source_row_coverage(
         .publisher_pins
         .iter()
         .map(|row| row.observation_id.as_str())
+        .chain(
+            inventory
+                .unbound_publisher_pins
+                .iter()
+                .map(|row| row.observation_id.as_str()),
+        )
         .collect::<BTreeSet<_>>();
     let checkout_rows = inventory
         .checkouts
@@ -5914,6 +6242,7 @@ pub(crate) mod tests {
                     "git_alpha".to_string(),
                 ]),
             }],
+            unbound_publisher_pins: Vec::new(),
             project_scoped_refs: vec![
                 ProjectScopedRefObservationV1 {
                     observation_id: "tantivy_alpha".to_string(),
@@ -6339,7 +6668,7 @@ pub(crate) mod tests {
             activation_conflicts: Vec::new(),
             publisher_bindings: vec![PublisherBindingReportV1 {
                 pin_observation_id: pin.observation_id.clone(),
-                project_id: pin.project_id.clone(),
+                project_id: Some(pin.project_id.clone()),
                 expected_scope_digest: digest_published_scope(&pin.expected_scope).unwrap(),
                 full_ref_digest: digest_publisher_full_ref(&pin.full_ref).unwrap(),
                 status: PublisherBindingReportStatusV1::SeedG1Predicted,

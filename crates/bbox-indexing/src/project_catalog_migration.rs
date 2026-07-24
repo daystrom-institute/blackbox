@@ -22,7 +22,9 @@ use bbox_config::config::Config;
 use bbox_corpus_core::git::{
     StableGitRepository, list_verified_committed_dir_bounded,
     read_verified_committed_file_bytes_bounded,
+    read_verified_committed_file_bytes_optional_bounded,
 };
+use bbox_corpus_core::identity::{PublishedScope, resolve_recorded_repo_id};
 use bbox_corpus_core::json_store::{NofollowDirectory, canonical_store_lock_path};
 use bbox_corpus_core::project_catalog::{
     AmbiguousNamespaceRecord, AmbiguousNamespaceStatus, AttachmentCapabilities, AttachmentId,
@@ -59,7 +61,8 @@ use crate::project_catalog_inventory::{
     decode_migration_report_v1, decode_migration_resolution_v1,
     deterministic_repo_history_group_ids, deterministic_repo_history_group_memberships,
     digest_path, digest_published_scope, digest_publisher_full_ref, encode_migration_report_v1,
-    encode_migration_resolution_v1, project_authority_scope, validated_quarantine_bindings,
+    encode_migration_resolution_v1, project_authority_scope, resolved_publisher_pins,
+    validated_quarantine_bindings,
 };
 use crate::project_catalog_inventory_adapters::{
     AttachmentCandidateIdentityPlanV1, AttachmentCandidateKeyV1,
@@ -1581,7 +1584,62 @@ fn assess_migration_semantics(
     }
     let mut publisher_bindings = Vec::new();
     let mut publisher_binding_conflicts = Vec::new();
-    for pin in &inventory.publisher_pins {
+    for pin in &inventory.unbound_publisher_pins {
+        if pin.reason
+            == crate::project_catalog_inventory::UnboundPublisherPinReasonV1::DuplicateScopeOwners
+            && !resolution
+                .selected_scope_owners
+                .iter()
+                .any(|selection| selection.scope == pin.expected_scope)
+        {
+            publisher_bindings.push(PublisherBindingReportV1 {
+                pin_observation_id: pin.observation_id.clone(),
+                project_id: None,
+                expected_scope_digest: digest_published_scope(&pin.expected_scope)
+                    .map_err(inventory_error)?,
+                full_ref_digest: digest_publisher_full_ref(&pin.full_ref)
+                    .map_err(inventory_error)?,
+                status: PublisherBindingReportStatusV1::ResolutionRequired,
+            });
+            publisher_binding_conflicts.push(ConflictReportV1 {
+                conflict_id: stable_conflict_id("publisher_scope_owner", &pin.observation_id)?,
+                affected_record_ids: std::iter::once(pin.observation_id.clone())
+                    .chain(pin.candidate_project_ids.iter().map(ToString::to_string))
+                    .collect(),
+                diagnostic_code: "publisher_scope_owner_ambiguous".to_string(),
+            });
+        } else if pin.reason
+            == crate::project_catalog_inventory::UnboundPublisherPinReasonV1::OwnerlessScope
+        {
+            publisher_bindings.push(PublisherBindingReportV1 {
+                pin_observation_id: pin.observation_id.clone(),
+                project_id: None,
+                expected_scope_digest: digest_published_scope(&pin.expected_scope)
+                    .map_err(inventory_error)?,
+                full_ref_digest: digest_publisher_full_ref(&pin.full_ref)
+                    .map_err(inventory_error)?,
+                status: PublisherBindingReportStatusV1::Refused,
+            });
+            publisher_binding_conflicts.push(ConflictReportV1 {
+                conflict_id: stable_conflict_id("publisher_scope_owner", &pin.observation_id)?,
+                affected_record_ids: BTreeSet::from([pin.observation_id.clone()]),
+                diagnostic_code: "publisher_scope_owner_missing".to_string(),
+            });
+        }
+    }
+    let effective_pins = resolved_publisher_pins(inventory, resolution).map_err(inventory_error)?;
+    let git_lane_complete = inventory
+        .immutable_lane_evidence
+        .iter()
+        .find(|lane| {
+            lane.lane_kind
+                == crate::project_catalog_inventory::ImmutableInventoryLaneKindV1::GitMetadata
+        })
+        .is_some_and(|lane| {
+            lane.completeness
+                == crate::project_catalog_inventory::ImmutableInventoryLaneCompletenessV1::Complete
+        });
+    for pin in &effective_pins {
         let key = (
             pin.project_id.clone(),
             pin.expected_scope.clone(),
@@ -1594,7 +1652,14 @@ fn assess_migration_semantics(
         let automatic = retained_pin_candidates == 1
             && pin.resolved_commit.is_some()
             && pin.resolved_scope.as_ref() == Some(&pin.expected_scope);
-        let status = if automatic {
+        let status = if !git_lane_complete {
+            publisher_binding_conflicts.push(ConflictReportV1 {
+                conflict_id: stable_conflict_id("publisher_git_lane", &pin.observation_id)?,
+                affected_record_ids: BTreeSet::from([pin.observation_id.clone()]),
+                diagnostic_code: "publisher_git_lane_incomplete".to_string(),
+            });
+            PublisherBindingReportStatusV1::Refused
+        } else if automatic {
             if resolution_publishers.contains_key(&key) {
                 return Err(invalid_resolution_artifact(
                     "resolution overrides an unambiguous publisher binding",
@@ -1639,7 +1704,7 @@ fn assess_migration_semantics(
         };
         publisher_bindings.push(PublisherBindingReportV1 {
             pin_observation_id: pin.observation_id.clone(),
-            project_id: pin.project_id.clone(),
+            project_id: Some(pin.project_id.clone()),
             expected_scope_digest: digest_published_scope(&pin.expected_scope)
                 .map_err(inventory_error)?,
             full_ref_digest: digest_publisher_full_ref(&pin.full_ref).map_err(inventory_error)?,
@@ -1647,7 +1712,7 @@ fn assess_migration_semantics(
         });
     }
     if resolution_publishers.keys().any(|key| {
-        !inventory.publisher_pins.iter().any(|pin| {
+        !effective_pins.iter().any(|pin| {
             pin.project_id == key.0 && pin.expected_scope == key.1 && pin.full_ref == key.2
         })
     }) {
@@ -2659,7 +2724,8 @@ fn prepare_publisher_plan(
         .collect::<BTreeMap<_, _>>();
     let mut dispositions = Vec::new();
     let mut prepared_by_project = BTreeMap::new();
-    for pin in &inventory.publisher_pins {
+    let effective_pins = resolved_publisher_pins(inventory, resolution).map_err(inventory_error)?;
+    for pin in &effective_pins {
         let key = (
             pin.project_id.clone(),
             pin.expected_scope.clone(),
@@ -2771,6 +2837,30 @@ fn prepare_publisher_generation(
         .verify_commit_oid(accepted_commit)
         .map_err(|_| planner_error("publisher accepted commit cannot be verified exactly"))?;
     let scope_root = scope.bbox_root_relpath();
+    let config_relpath = repo_relative_lane_root(scope_root, ".bbox/config.toml");
+    let config_bytes =
+        read_verified_committed_file_bytes_optional_bounded(&commit, &config_relpath, 1024 * 1024)
+            .map_err(|_| planner_error("publisher accepted commit config cannot be read exactly"))?
+            .ok_or_else(|| planner_error("publisher accepted commit does not declare its scope"))?;
+    let config_source = std::str::from_utf8(&config_bytes)
+        .map_err(|_| planner_error("publisher accepted commit config is not UTF-8"))?;
+    let config_root = repository.repository_root().join(
+        (scope_root != ".")
+            .then_some(scope_root)
+            .unwrap_or_default(),
+    );
+    let inputs =
+        bbox_config::config::repo_id_inputs_from_project_config_source(&config_root, config_source)
+            .map_err(|_| planner_error("publisher accepted commit config is invalid"))?;
+    let recorded = resolve_recorded_repo_id(&inputs)
+        .ok_or_else(|| planner_error("publisher accepted commit lacks recorded authority"))?;
+    let declared_scope = PublishedScope::try_new(recorded, scope_root)
+        .map_err(|_| planner_error("publisher accepted commit scope is invalid"))?;
+    if &declared_scope != scope {
+        return Err(planner_error(
+            "publisher accepted commit declares a different scope",
+        ));
+    }
     let knowledge_root = repo_relative_lane_root(scope_root, "knowledge");
     let gap_root = repo_relative_lane_root(scope_root, "gaps");
     let knowledge = read_publication_lane(&commit, &knowledge_root)?
@@ -3102,7 +3192,7 @@ fn prepare_store_plan_parts(
     }
 
     let (publisher_pins, publisher_dispositions) =
-        prepare_publisher_store_evidence(inventory, publisher)?;
+        prepare_publisher_store_evidence(inventory, publisher, resolution)?;
     for (project_id, prepared) in &publisher.prepared {
         participants.push(MigrationParticipantDraftV1::new(
             ParticipantRoleV1::AcceptedPublicationPointer {
@@ -3196,6 +3286,7 @@ fn resolved_generation_owner<'a>(
 fn prepare_publisher_store_evidence(
     inventory: &V1ProjectCatalogInventory,
     publisher: &PreparedPublisherPlanV1,
+    resolution: &ProjectCatalogMigrationResolutionV1,
 ) -> Result<
     (
         Vec<PublisherPinEvidenceV1>,
@@ -3203,8 +3294,8 @@ fn prepare_publisher_store_evidence(
     ),
     ProjectCatalogMigrationError,
 > {
-    let pins = inventory
-        .publisher_pins
+    let effective_pins = resolved_publisher_pins(inventory, resolution).map_err(inventory_error)?;
+    let pins = effective_pins
         .iter()
         .map(|pin| {
             Ok(PublisherPinEvidenceV1 {
@@ -5907,8 +5998,17 @@ mod tests {
             run_git(repository, &["config", "user.email", "test@example.com"]);
             run_git(repository, &["config", "user.name", "Test"]);
         }
+        fs::create_dir_all(checkout.join("services/alpha/.bbox")).unwrap();
+        fs::write(
+            checkout.join("services/alpha/.bbox/config.toml"),
+            "[project]\nrepo_id = \"acme_repo\"\n",
+        )
+        .unwrap();
         fs::write(checkout.join("tracked.txt"), "inside\n").unwrap();
-        run_git(&checkout, &["add", "tracked.txt"]);
+        run_git(
+            &checkout,
+            &["add", "tracked.txt", "services/alpha/.bbox/config.toml"],
+        );
         run_git(&checkout, &["commit", "-qm", "inside"]);
         let accepted_commit = run_git(&checkout, &["rev-parse", "HEAD"]);
         fs::write(protected.join("tracked.txt"), "outside-sentinel\n").unwrap();

@@ -69,7 +69,8 @@ use crate::project_catalog_inventory::{
     PROJECT_CATALOG_INVENTORY_VERSION_V1, ProjectScopedRefObservationV1,
     ProjectScopedRefStoreKindV1, PublisherPinObservationV1, QuarantinedGenerationObservationV1,
     RecordedAuthorityEvidenceMemberV1, RepoGroupingProofV1,
-    RetainedGenerationOwnerResolutionObservationV1, Sha256ValueV1, V1ProjectCatalogInventory,
+    RetainedGenerationOwnerResolutionObservationV1, Sha256ValueV1,
+    UnboundPublisherPinObservationV1, UnboundPublisherPinReasonV1, V1ProjectCatalogInventory,
     digest_path, mutable_source_row_set_hash,
 };
 use crate::publisher::{MigrationPublisherRefSnapshotV1, PublisherRefRow, PublisherRefStore};
@@ -829,40 +830,144 @@ fn observe_legacy_projects(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublisherPinsCaptureV1 {
+    bound: Vec<PublisherPinObservationV1>,
+    unbound: Vec<UnboundPublisherPinObservationV1>,
+}
+
+fn verified_commit_declares_scope(
+    repository: &StableGitRepository,
+    commit_oid: &str,
+    root_relpath: &str,
+    expected_scope: &PublishedScope,
+) -> bool {
+    let Ok(commit) = repository.verify_commit_oid(commit_oid) else {
+        return false;
+    };
+    let config_relpath = if root_relpath == "." || root_relpath.is_empty() {
+        ".bbox/config.toml".to_string()
+    } else {
+        format!("{root_relpath}/.bbox/config.toml")
+    };
+    let Ok(Some(bytes)) = read_verified_committed_file_bytes_optional_bounded(
+        &commit,
+        &config_relpath,
+        MAX_COMMITTED_CONFIG_BYTES,
+    ) else {
+        return false;
+    };
+    let Ok(source) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    let project_root = repository.repository_root().join(
+        (root_relpath != ".")
+            .then_some(root_relpath)
+            .unwrap_or_default(),
+    );
+    let Ok(inputs) =
+        bbox_config::config::repo_id_inputs_from_project_config_source(&project_root, source)
+    else {
+        return false;
+    };
+    let Some(repo_id) = resolve_recorded_repo_id(&inputs) else {
+        return false;
+    };
+    PublishedScope::try_new(
+        repo_id,
+        if root_relpath.is_empty() {
+            "."
+        } else {
+            root_relpath
+        },
+    )
+    .is_ok_and(|scope| &scope == expected_scope)
+}
+
 fn derive_publisher_pins(
     source: &ExactDecodedSourceV1<PublisherRefInventoryV1>,
     legacy: &LegacyProjectsCaptureV1,
     project_authority_scopes: &BTreeMap<ProjectId, PublishedScope>,
     lanes: &ImmutableInventoryLanesV1,
-) -> AdapterResult<Vec<PublisherPinObservationV1>> {
+) -> AdapterResult<PublisherPinsCaptureV1> {
     let mut rows = Vec::new();
+    let mut unbound = Vec::new();
+    let git_lane_complete = matches!(
+        lanes.git_metadata.evidence.completeness,
+        crate::project_catalog_inventory::ImmutableInventoryLaneCompletenessV1::Complete
+    );
     for publisher in &source.value.rows {
         let owners = project_authority_scopes
             .iter()
             .filter(|(_, scope)| **scope == publisher.scope)
-            .map(|(project_id, _)| project_id)
-            .collect::<Vec<_>>();
+            .map(|(project_id, _)| project_id.clone())
+            .collect::<BTreeSet<_>>();
         if owners.len() != 1 {
-            return Err(invalid_source("publisher_scope_owner_not_unique"));
+            let observation_id = stable_observation_id_v1(
+                "unbound-publisher-pin",
+                &[
+                    publisher.scope.repo_id().as_bytes(),
+                    publisher.scope.bbox_root_relpath().as_bytes(),
+                    publisher.branch_ref.as_bytes(),
+                ],
+            )?;
+            unbound.push(UnboundPublisherPinObservationV1 {
+                observation_id,
+                expected_scope: publisher.scope.clone(),
+                full_ref: publisher.branch_ref.clone(),
+                candidate_project_ids: owners.clone(),
+                reason: if owners.is_empty() {
+                    UnboundPublisherPinReasonV1::OwnerlessScope
+                } else {
+                    UnboundPublisherPinReasonV1::DuplicateScopeOwners
+                },
+            });
+            continue;
         }
-        let project_id = owners[0].clone();
+        let project_id = owners.first().expect("one publisher scope owner").clone();
         let project = legacy
             .observations
             .iter()
             .find(|row| row.record.project_id == project_id.as_str())
             .ok_or_else(|| invalid_source("publisher_project_observation_missing"))?;
-        let repository = legacy
-            .repositories
-            .get(&project_id)
-            .ok_or_else(|| invalid_source("publisher_repository_authority_missing"))?;
-        let resolved_commit = repository
-            .resolve_commit_oid(&publisher.branch_ref)
-            .map_err(|_| invalid_source("publisher_commit_invalid"))?;
-        if let Some(commit) = &resolved_commit {
+        let repository = legacy.repositories.get(&project_id);
+        let resolved_commit = repository.and_then(|repository| {
             repository
-                .verify_commit_oid(commit)
-                .map_err(|_| invalid_source("publisher_commit_invalid"))?;
-        }
+                .resolve_commit_oid(&publisher.branch_ref)
+                .ok()
+                .flatten()
+        });
+        let root_relpath = legacy
+            .project_roots
+            .get(&project_id)
+            .and_then(|root| {
+                repository.and_then(|repository| {
+                    root.as_path()
+                        .strip_prefix(repository.repository_root())
+                        .ok()
+                })
+            })
+            .and_then(|relative| relative.to_str())
+            .map(|relative| {
+                if relative.is_empty() {
+                    ".".to_string()
+                } else {
+                    relative.replace('\\', "/")
+                }
+            });
+        let resolved_scope = resolved_commit.as_ref().and_then(|commit| {
+            repository
+                .zip(root_relpath.as_deref())
+                .filter(|(repository, root_relpath)| {
+                    verified_commit_declares_scope(
+                        repository,
+                        commit,
+                        root_relpath,
+                        &publisher.scope,
+                    )
+                })
+                .map(|_| publisher.scope.clone())
+        });
         let observation_id = stable_observation_id_v1(
             "publisher-pin",
             &[
@@ -912,16 +1017,18 @@ fn derive_publisher_pins(
                         && row.resolved_refs.get(&publisher.branch_ref) == resolved_commit.as_ref()
                 })
                 .collect::<Vec<_>>();
-            if matching_git.len() != 1 {
+            if git_lane_complete && resolved_scope.is_some() && matching_git.len() != 1 {
                 return Err(invalid_source(
                     "publisher_candidate_git_provenance_not_unique",
                 ));
             }
             source_observation_ids.insert(attachment.observation_id.clone());
             source_observation_ids.insert(attachment.checkout_observation_id.clone());
-            provenance_git_ids.insert(matching_git[0].observation_id.clone());
+            if let Some(matching_git) = matching_git.first() {
+                provenance_git_ids.insert(matching_git.observation_id.clone());
+            }
         }
-        if resolved_commit.is_some() {
+        if git_lane_complete && resolved_scope.is_some() {
             if provenance_git_ids.is_empty() {
                 provenance_git_ids.extend(
                     lanes
@@ -947,13 +1054,17 @@ fn derive_publisher_pins(
             expected_scope: publisher.scope.clone(),
             full_ref: publisher.branch_ref.clone(),
             candidate_attachment_ids,
-            resolved_scope: resolved_commit.as_ref().map(|_| publisher.scope.clone()),
+            resolved_scope,
             resolved_commit,
             source_observation_ids,
         });
     }
     rows.sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
-    Ok(rows)
+    unbound.sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
+    Ok(PublisherPinsCaptureV1 {
+        bound: rows,
+        unbound,
+    })
 }
 
 struct CodeSourceInventorySnapshotV1<'a> {
@@ -2380,8 +2491,15 @@ fn capture_inventory_locked(
         &lanes,
     )?;
     let publisher_row_ids = publisher_pins
+        .bound
         .iter()
         .map(|row| row.observation_id.clone())
+        .chain(
+            publisher_pins
+                .unbound
+                .iter()
+                .map(|row| row.observation_id.clone()),
+        )
         .collect();
     mutable_source_evidence.push(exact_source_evidence(
         "publisher-ref-store",
@@ -2423,7 +2541,8 @@ fn capture_inventory_locked(
             .map(|capture| capture.observation)
             .collect(),
         retained_owner_resolutions: code_capture.retained_owner_resolutions,
-        publisher_pins,
+        publisher_pins: publisher_pins.bound,
+        unbound_publisher_pins: publisher_pins.unbound,
         project_scoped_refs: lanes.project_scoped_refs.rows,
         edge_workspaces: lanes.edge_workspaces.rows,
         git_metadata: lanes.git_metadata.rows,
@@ -3663,7 +3782,9 @@ fn capture_git_metadata_lane(
                 .map_err(|_| invalid_source("git_first_commit_unavailable"))?,
             _ => None,
         };
-        if project.record.is_git_repo && (common_directory.is_none() || first_commit.is_none()) {
+        if project.record.is_git_repo
+            && (common_directory.is_none() || head.is_some() && first_commit.is_none())
+        {
             git_probe_corrupt.get_or_insert("git_repository_evidence_unavailable");
             continue;
         }
@@ -3681,10 +3802,19 @@ fn capture_git_metadata_lane(
             if !belongs {
                 continue;
             }
+            let repository = repository
+                .ok_or_else(|| invalid_source("publisher_repository_authority_missing"))?;
             if let Some(commit) = repository
-                .ok_or_else(|| invalid_source("publisher_repository_authority_missing"))?
                 .resolve_commit_oid(&publisher.branch_ref)
                 .map_err(|_| invalid_source("publisher_ref_invalid"))?
+                .filter(|commit| {
+                    verified_commit_declares_scope(
+                        repository,
+                        commit,
+                        &attachment.base_relpath,
+                        &publisher.scope,
+                    )
+                })
             {
                 resolved_refs.insert(publisher.branch_ref.clone(), commit);
             }
@@ -4338,6 +4468,18 @@ mod tests {
                 commit_oid,
                 ..
             } if commit_oid == commit
+        ));
+        assert!(verified_commit_declares_scope(
+            &repository,
+            &commit,
+            ".",
+            &PublishedScope::try_new("family-one", ".").unwrap(),
+        ));
+        assert!(!verified_commit_declares_scope(
+            &repository,
+            &commit,
+            ".",
+            &PublishedScope::try_new("family-two", ".").unwrap(),
         ));
     }
 
@@ -5105,6 +5247,259 @@ mod tests {
                 vector_key_commitment_sha256: "e".repeat(64),
             }],
         }
+    }
+
+    fn empty_test_lane<T>(
+        lane_kind: ImmutableInventoryLaneKindV1,
+        completeness: crate::project_catalog_inventory::ImmutableInventoryLaneCompletenessV1,
+    ) -> ImmutableLaneCaptureV1<T> {
+        ImmutableLaneCaptureV1 {
+            evidence: ImmutableInventoryLaneEvidenceV1 {
+                lane_kind,
+                source_id: format!("test-{lane_kind:?}"),
+                source_state: match completeness {
+                    crate::project_catalog_inventory::ImmutableInventoryLaneCompletenessV1::Complete => {
+                        present_owner_state("test-lane")
+                    }
+                    crate::project_catalog_inventory::ImmutableInventoryLaneCompletenessV1::Missing => {
+                        InventorySourceStateV1::Missing {
+                            fingerprint: missing_source_fingerprint("test-lane"),
+                        }
+                    }
+                    crate::project_catalog_inventory::ImmutableInventoryLaneCompletenessV1::Corrupt => {
+                        direct_owner_state(
+                            "test-lane",
+                            "corrupt",
+                            None,
+                            Some("test_lane_corrupt"),
+                        )
+                    }
+                },
+                completeness,
+                row_count: 0,
+                owner_subsources: Vec::new(),
+            },
+            rows: Vec::new(),
+        }
+    }
+
+    fn empty_test_lanes(
+        git_completeness: crate::project_catalog_inventory::ImmutableInventoryLaneCompletenessV1,
+    ) -> ImmutableInventoryLanesV1 {
+        use crate::project_catalog_inventory::ImmutableInventoryLaneCompletenessV1 as Completeness;
+
+        ImmutableInventoryLanesV1 {
+            project_scoped_refs: empty_test_lane(
+                ImmutableInventoryLaneKindV1::ProjectScopedRefs,
+                Completeness::Complete,
+            ),
+            edge_workspaces: empty_test_lane(
+                ImmutableInventoryLaneKindV1::EdgeWorkspaces,
+                Completeness::Complete,
+            ),
+            git_metadata: empty_test_lane(
+                ImmutableInventoryLaneKindV1::GitMetadata,
+                git_completeness,
+            ),
+            checkouts: empty_test_lane(
+                ImmutableInventoryLaneKindV1::Checkouts,
+                Completeness::Complete,
+            ),
+            attachment_candidates: empty_test_lane(
+                ImmutableInventoryLaneKindV1::AttachmentCandidates,
+                Completeness::Complete,
+            ),
+            inventory_targets: empty_test_lane(
+                ImmutableInventoryLaneKindV1::InventoryTargets,
+                Completeness::Complete,
+            ),
+            materialized_aliases: empty_test_lane(
+                ImmutableInventoryLaneKindV1::MaterializedAliases,
+                Completeness::Complete,
+            ),
+            legacy_path_observations: empty_test_lane(
+                ImmutableInventoryLaneKindV1::LegacyPathObservations,
+                Completeness::Complete,
+            ),
+            repo_grouping_proofs: empty_test_lane(
+                ImmutableInventoryLaneKindV1::RepoGroupingProofs,
+                Completeness::Complete,
+            ),
+            legacy_namespace_clusters: empty_test_lane(
+                ImmutableInventoryLaneKindV1::LegacyNamespaceClusters,
+                Completeness::Complete,
+            ),
+        }
+    }
+
+    #[test]
+    fn publisher_pins_preserve_duplicate_and_ownerless_scope_authority() {
+        let expected_scope = PublishedScope::try_new("repo-one", ".").unwrap();
+        let source = ExactDecodedSourceV1 {
+            source: ExactSourceBytesV1::new(Vec::new()),
+            value: PublisherRefInventoryV1 {
+                rows: vec![PublisherRefRow {
+                    scope: expected_scope.clone(),
+                    branch_ref: "refs/heads/main".to_string(),
+                }],
+            },
+            was_missing: false,
+        };
+        let legacy = namespace_legacy_capture();
+        let lanes = empty_test_lanes(
+            crate::project_catalog_inventory::ImmutableInventoryLaneCompletenessV1::Complete,
+        );
+        let duplicate = derive_publisher_pins(
+            &source,
+            &legacy,
+            &BTreeMap::from([
+                (
+                    ProjectId::parse("project-a").unwrap(),
+                    expected_scope.clone(),
+                ),
+                (
+                    ProjectId::parse("project-b").unwrap(),
+                    expected_scope.clone(),
+                ),
+            ]),
+            &lanes,
+        )
+        .unwrap();
+        assert!(duplicate.bound.is_empty());
+        assert_eq!(duplicate.unbound.len(), 1);
+        assert_eq!(
+            duplicate.unbound[0].reason,
+            UnboundPublisherPinReasonV1::DuplicateScopeOwners
+        );
+        assert_eq!(duplicate.unbound[0].candidate_project_ids.len(), 2);
+
+        let ownerless = derive_publisher_pins(&source, &legacy, &BTreeMap::new(), &lanes).unwrap();
+        assert!(ownerless.bound.is_empty());
+        assert_eq!(ownerless.unbound.len(), 1);
+        assert_eq!(
+            ownerless.unbound[0].reason,
+            UnboundPublisherPinReasonV1::OwnerlessScope
+        );
+        assert!(ownerless.unbound[0].candidate_project_ids.is_empty());
+    }
+
+    #[test]
+    fn resolvable_pin_survives_an_incomplete_git_lane_for_typed_refusal() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        run_git(&root, &["init", "-q"]);
+        write(
+            &root.join(".bbox/config.toml"),
+            b"[project]\nrepo_id = \"repo-one\"\n",
+        );
+        run_git(&root, &["add", ".bbox/config.toml"]);
+        run_git(&root, &["commit", "-qm", "record authority"]);
+        run_git(&root, &["branch", "main"]);
+
+        let project_id = ProjectId::parse("project-a").unwrap();
+        let expected_scope = PublishedScope::try_new("repo-one", ".").unwrap();
+        let authorized_root = AuthorizedInventoryPath::new(&root).unwrap();
+        let repository = open_stable_git_repository(&authorized_root.authority)
+            .unwrap()
+            .unwrap();
+        let mut legacy = namespace_legacy_capture();
+        legacy.observations[0].path_status = LegacyProjectPathStatusV1::Present;
+        legacy.observations[0].committed_scope = Some(expected_scope.clone());
+        legacy
+            .published_scopes
+            .insert(project_id.clone(), expected_scope.clone());
+        legacy
+            .project_roots
+            .insert(project_id.clone(), authorized_root);
+        legacy.repositories.insert(project_id.clone(), repository);
+        let source = ExactDecodedSourceV1 {
+            source: ExactSourceBytesV1::new(Vec::new()),
+            value: PublisherRefInventoryV1 {
+                rows: vec![PublisherRefRow {
+                    scope: expected_scope,
+                    branch_ref: "refs/heads/main".to_string(),
+                }],
+            },
+            was_missing: false,
+        };
+        let captured = derive_publisher_pins(
+            &source,
+            &legacy,
+            &legacy.published_scopes,
+            &empty_test_lanes(
+                crate::project_catalog_inventory::ImmutableInventoryLaneCompletenessV1::Corrupt,
+            ),
+        )
+        .unwrap();
+        assert!(captured.unbound.is_empty());
+        assert_eq!(captured.bound.len(), 1);
+        assert!(captured.bound[0].resolved_commit.is_some());
+        assert_eq!(
+            captured.bound[0].resolved_scope.as_ref(),
+            Some(&captured.bound[0].expected_scope)
+        );
+        assert!(
+            captured.bound[0]
+                .source_observation_ids
+                .iter()
+                .all(|observation_id| !observation_id.starts_with("git-"))
+        );
+    }
+
+    #[test]
+    fn unborn_repository_preserves_git_lane_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        run_git(&root, &["init", "-q"]);
+        let authorized_root = AuthorizedInventoryPath::new(&root).unwrap();
+        let checkout = observe_checkout(&authorized_root, None).unwrap();
+        let project_id = ProjectId::parse("project-a").unwrap();
+        let mut legacy = namespace_legacy_capture();
+        legacy.observations[0].path_status = LegacyProjectPathStatusV1::Present;
+        legacy.observations[0].committed_authority = None;
+        legacy.observations[0].committed_scope = None;
+        legacy
+            .project_roots
+            .insert(project_id.clone(), authorized_root);
+        legacy.repositories.insert(
+            project_id.clone(),
+            checkout.repository.as_ref().unwrap().clone(),
+        );
+        let attachment = AttachmentCandidateObservationV1 {
+            observation_id: "attachment-unborn".to_string(),
+            attachment_id: AttachmentId::parse(format!("att_{}", "1".repeat(32))).unwrap(),
+            project_id,
+            checkout_observation_id: checkout.observation.observation_id.clone(),
+            base_relpath: ".".to_string(),
+            observed_scope: None,
+        };
+        let mut corpus = namespace_corpus_snapshot();
+        corpus.index.commit_namespaces.clear();
+        let mut vectors = namespace_vector_snapshot();
+        vectors.commit_namespaces.clear();
+        let publisher = ExactDecodedSourceV1 {
+            source: ExactSourceBytesV1::new(Vec::new()),
+            value: PublisherRefInventoryV1 { rows: Vec::new() },
+            was_missing: true,
+        };
+        let (lane, namespaces, _) = capture_git_metadata_lane(
+            &corpus,
+            &vectors,
+            &legacy,
+            &publisher,
+            &[checkout],
+            &[attachment],
+        )
+        .unwrap();
+        assert_eq!(
+            lane.evidence.completeness,
+            crate::project_catalog_inventory::ImmutableInventoryLaneCompletenessV1::Complete
+        );
+        assert_eq!(lane.rows.len(), 1);
+        assert!(lane.rows[0].common_directory_digest.is_some());
+        assert!(lane.rows[0].full_first_commit.is_none());
+        assert!(lane.rows[0].resolved_refs.is_empty());
+        assert!(namespaces.is_empty());
     }
 
     #[test]
