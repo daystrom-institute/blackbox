@@ -200,6 +200,15 @@ pub enum OverlayStatus {
     Invalid,
 }
 
+pub const MAX_CONSECUTIVE_TRANSIENT_PRESERVATIONS: u8 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransientPreservationOutcome {
+    Preserved { attempt: u8 },
+    Exhausted,
+    Superseded,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverlayRecomputeErrorKind {
     InvalidContent,
@@ -269,6 +278,7 @@ impl OverlaySnapshot {
 pub struct KnowledgeOverlayStore {
     snapshots: BTreeMap<OverlayKey, OverlaySnapshot>,
     requested_generations: BTreeMap<OverlayKey, u64>,
+    transient_preservations: BTreeMap<OverlayKey, u8>,
     next_generation: u64,
 }
 
@@ -290,8 +300,41 @@ impl KnowledgeOverlayStore {
         if self.requested_generations.get(&snapshot.key) != Some(&generation) {
             return false;
         }
+        self.transient_preservations.remove(&snapshot.key);
         self.snapshots.insert(snapshot.key.clone(), snapshot);
         true
+    }
+
+    /// Preserve one previously valid snapshot for a bounded transient window.
+    ///
+    /// A checkout that remains unreadable must not expose stale provisional
+    /// values forever. Successful or invalid publication resets the sequence;
+    /// callers replace the snapshot with an invalid empty value once this
+    /// method reports exhaustion.
+    pub fn preserve_transient_if_latest(
+        &mut self,
+        generation: u64,
+        mut snapshot: OverlaySnapshot,
+    ) -> TransientPreservationOutcome {
+        if self.requested_generations.get(&snapshot.key) != Some(&generation) {
+            return TransientPreservationOutcome::Superseded;
+        }
+        let attempt = self
+            .transient_preservations
+            .get(&snapshot.key)
+            .copied()
+            .unwrap_or_default()
+            .saturating_add(1);
+        if attempt > MAX_CONSECUTIVE_TRANSIENT_PRESERVATIONS {
+            return TransientPreservationOutcome::Exhausted;
+        }
+        self.transient_preservations
+            .insert(snapshot.key.clone(), attempt);
+        snapshot.diagnostics.push(format!(
+            "transient preservation attempt {attempt}/{MAX_CONSECUTIVE_TRANSIENT_PRESERVATIONS}"
+        ));
+        self.snapshots.insert(snapshot.key.clone(), snapshot);
+        TransientPreservationOutcome::Preserved { attempt }
     }
 
     /// Replace the complete snapshot for one checkout scope. Invalid snapshots
@@ -330,6 +373,7 @@ impl KnowledgeOverlayStore {
             checkout_id: checkout_id.to_string(),
         };
         self.requested_generations.remove(&key);
+        self.transient_preservations.remove(&key);
         self.snapshots.remove(&key)
     }
 
@@ -343,6 +387,8 @@ impl KnowledgeOverlayStore {
             .cloned()
             .collect::<Vec<_>>();
         self.requested_generations
+            .retain(|key, _| key.checkout_id != checkout_id);
+        self.transient_preservations
             .retain(|key, _| key.checkout_id != checkout_id);
         keys.into_iter()
             .filter_map(|key| self.snapshots.remove(&key))
@@ -761,25 +807,49 @@ fn read_committed_map(
     tree_dir: &str,
     alternate_root: Option<&Path>,
 ) -> Result<BTreeMap<String, Vec<u8>>> {
+    const MAX_TREE_ENTRIES: usize = 100_000;
+    const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
+    const MAX_TOTAL_BYTES: usize = 128 * 1024 * 1024;
+    const MAX_LISTING_BYTES: usize = 32 * 1024 * 1024;
+
+    let verified = git::verify_commit_oid_with_alternate(root, commit, alternate_root)
+        .with_context(|| format!("verifying committed knowledge map at {commit}"))?;
     let prefix = format!("{tree_dir}/");
     let mut files = BTreeMap::new();
-    for repo_path in
-        git::list_committed_dir_result_with_alternate(root, commit, tree_dir, alternate_root)?
-    {
+    let mut total_bytes = 0_usize;
+    for repo_path in git::list_verified_committed_dir_bounded(
+        &verified,
+        tree_dir,
+        MAX_TREE_ENTRIES,
+        MAX_LISTING_BYTES,
+    )? {
         let Some(filename) = repo_path.strip_prefix(&prefix) else {
             continue;
         };
         if filename.contains('/') || !filename.ends_with(".json") {
             continue;
         }
-        let bytes =
-            git::read_committed_file_bytes_with_alternate(root, commit, &repo_path, alternate_root)
-                .with_context(|| {
-                    format!(
-                        "reading committed knowledge file {repo_path} at {commit} in {}",
-                        root.display()
-                    )
-                })?;
+        validate_snapshot_filename(filename, "committed knowledge")?;
+        let remaining = MAX_TOTAL_BYTES
+            .checked_sub(total_bytes)
+            .context("committed knowledge map exceeds its total byte limit")?;
+        let bytes = git::read_verified_committed_file_bytes_bounded(
+            &verified,
+            &repo_path,
+            MAX_FILE_BYTES.min(remaining),
+        )
+        .with_context(|| {
+            format!(
+                "reading bounded committed knowledge file {repo_path} at {commit} in {}",
+                root.display()
+            )
+        })?;
+        total_bytes = total_bytes
+            .checked_add(bytes.len())
+            .context("committed knowledge byte count overflowed")?;
+        if total_bytes > MAX_TOTAL_BYTES {
+            anyhow::bail!("committed knowledge map exceeds its total byte limit");
+        }
         files.insert(filename.to_string(), bytes);
     }
     Ok(files)
@@ -1006,6 +1076,27 @@ mod tests {
                 "unsafe snapshot filename should be rejected: {filename}"
             );
         }
+    }
+
+    #[test]
+    fn committed_overlay_map_rejects_oversized_blobs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(root.join(".bbox/knowledge")).unwrap();
+        run(&root, &["init", "-q", "-b", "main"]);
+        run(&root, &["config", "user.email", "t@example.com"]);
+        run(&root, &["config", "user.name", "Test"]);
+        std::fs::write(
+            root.join(".bbox/knowledge/oversized.json"),
+            vec![b'x'; 2 * 1024 * 1024 + 1],
+        )
+        .unwrap();
+        run(&root, &["add", ".bbox/knowledge"]);
+        run(&root, &["commit", "-q", "-m", "oversized"]);
+        let commit = git::current_head(&root).unwrap();
+
+        let error = read_committed_map(&root, &commit, ".bbox/knowledge", None).unwrap_err();
+        assert!(error.to_string().contains("bounded committed knowledge"));
     }
 
     #[test]
@@ -1249,6 +1340,52 @@ mod tests {
                 .unwrap()
                 .diagnostics,
             ["current"]
+        );
+    }
+
+    #[test]
+    fn transient_preservation_expires_and_success_resets_the_bound() {
+        let checkout = ResolvedCheckoutScope {
+            project_id: "test-project".into(),
+            published_scope: PublishedScope::try_new("repo", ".").unwrap(),
+            checkout_id: "checkout".into(),
+            checkout_dir: "/missing".into(),
+            checkout_project_dir: "/missing".into(),
+            branch_ref: None,
+        };
+        let key = OverlayKey {
+            published_scope: checkout.published_scope.clone(),
+            checkout_id: checkout.checkout_id.clone(),
+        };
+        let prior = OverlaySnapshot {
+            snapshot_id: "prior".into(),
+            key: key.clone(),
+            stamp: None,
+            status: OverlayStatus::Valid,
+            values: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        };
+        let mut store = KnowledgeOverlayStore::default();
+        store.publish(prior.clone());
+        for attempt in 1..=MAX_CONSECUTIVE_TRANSIENT_PRESERVATIONS {
+            let generation = store.begin_refresh(key.clone());
+            assert_eq!(
+                store.preserve_transient_if_latest(generation, prior.clone()),
+                TransientPreservationOutcome::Preserved { attempt }
+            );
+        }
+        let exhausted = store.begin_refresh(key.clone());
+        assert_eq!(
+            store.preserve_transient_if_latest(exhausted, prior.clone()),
+            TransientPreservationOutcome::Exhausted
+        );
+
+        let recovered = store.begin_refresh(key.clone());
+        assert!(store.publish_if_latest(recovered, prior.clone()));
+        let after_reset = store.begin_refresh(key);
+        assert_eq!(
+            store.preserve_transient_if_latest(after_reset, prior),
+            TransientPreservationOutcome::Preserved { attempt: 1 }
         );
     }
 

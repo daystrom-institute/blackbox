@@ -1466,7 +1466,7 @@ fn canonical_or_original(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn checkout_access_error_is_definitively_stale(
+pub(crate) fn checkout_access_error_is_definitively_stale(
     code: bbox_indexing::checkout_access::CheckoutAccessErrorCode,
 ) -> bool {
     matches!(
@@ -2086,6 +2086,50 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.contains("broken.json"))
         );
+    }
+
+    #[test]
+    fn repeated_transient_refresh_eventually_invalidates_stale_overlay() {
+        let (_temp, server, _base, worktree, scope) = fixture();
+        server.reconcile_dark_knowledge_checkouts().unwrap();
+        let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&worktree).unwrap();
+        let row = server
+            .state
+            .checkout_registry
+            .read()
+            .get(&checkout_id, &scope)
+            .cloned()
+            .unwrap();
+        let checkout = server.resolve_registered_checkout(&row).unwrap().unwrap();
+        let unavailable = worktree.with_extension("unavailable");
+        std::fs::rename(&worktree, &unavailable).unwrap();
+
+        for _ in 0..bbox_knowledge::overlay::MAX_CONSECUTIVE_TRANSIENT_PRESERVATIONS {
+            assert_eq!(
+                server.refresh_dark_knowledge_overlay(&checkout),
+                KnowledgeOverlayRefreshOutcome::PreservedTransient
+            );
+        }
+        assert_eq!(
+            server.refresh_dark_knowledge_overlay(&checkout),
+            KnowledgeOverlayRefreshOutcome::Invalid
+        );
+        let invalid = server
+            .state
+            .knowledge_overlays
+            .read()
+            .get(&scope, &checkout_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(invalid.status, OverlayStatus::Invalid);
+        assert!(invalid.values.is_empty());
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("refresh limit exceeded"))
+        );
+        std::fs::rename(&unavailable, &worktree).unwrap();
     }
 
     #[test]

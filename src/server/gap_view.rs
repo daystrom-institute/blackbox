@@ -8,8 +8,8 @@ use bbox_corpus_core::project_record::{ProjectRecord, ResolvedCheckoutScope};
 use bbox_gaps::gaps::{GapStore, GapViewMetadata};
 use bbox_gaps::overlay::{
     GapOverlayKey, GapOverlayRecomputeError, GapOverlayRecomputeErrorKind, GapOverlaySnapshot,
-    GapOverlayStatus, GapOverlayValue, PublishedGapSnapshot, WorkingGapSnapshot,
-    load_published_snapshot_at_commit, recompute_overlay_result,
+    GapOverlayStatus, GapOverlayValue, GapTransientPreservationOutcome, PublishedGapSnapshot,
+    WorkingGapSnapshot, load_published_snapshot_at_commit, recompute_overlay_result,
 };
 use bbox_knowledge::overlay::ProvisionalMode;
 
@@ -110,11 +110,23 @@ impl BlackboxServer {
                         );
                         let mut preserved = prior.clone().expect("prior valid snapshot");
                         preserved.diagnostics = vec![format!("refresh degraded: {err:#}")];
-                        self.state
+                        match self
+                            .state
                             .gap_overlays
                             .write()
-                            .publish_if_latest(generation, preserved);
-                        return;
+                            .preserve_transient_if_latest(generation, preserved)
+                        {
+                            GapTransientPreservationOutcome::Preserved { .. }
+                            | GapTransientPreservationOutcome::Superseded => return,
+                            GapTransientPreservationOutcome::Exhausted => {
+                                GapOverlaySnapshot::invalid(
+                                    checkout,
+                                    format!(
+                                        "transient gap overlay refresh limit exceeded: {err:#}"
+                                    ),
+                                )
+                            }
+                        }
                     }
                     Err(err) => GapOverlaySnapshot::invalid(checkout, format!("{err:#}")),
                 }
@@ -128,11 +140,19 @@ impl BlackboxServer {
                 );
                 let mut preserved = prior.clone().expect("prior valid snapshot");
                 preserved.diagnostics = vec![format!("publisher refresh degraded: {err:#}")];
-                self.state
+                match self
+                    .state
                     .gap_overlays
                     .write()
-                    .publish_if_latest(generation, preserved);
-                return;
+                    .preserve_transient_if_latest(generation, preserved)
+                {
+                    GapTransientPreservationOutcome::Preserved { .. }
+                    | GapTransientPreservationOutcome::Superseded => return,
+                    GapTransientPreservationOutcome::Exhausted => GapOverlaySnapshot::invalid(
+                        checkout,
+                        format!("transient gap publisher refresh limit exceeded: {err:#}"),
+                    ),
+                }
             }
             Err(err) => GapOverlaySnapshot::invalid(checkout, format!("{err:#}")),
         };
@@ -551,6 +571,14 @@ fn stable_gap_overlay(
 }
 
 fn classify_gap_overlay_access_error(error: anyhow::Error) -> GapOverlayRecomputeError {
+    if error
+        .downcast_ref::<bbox_indexing::checkout_access::CheckoutAccessError>()
+        .is_some_and(|access| {
+            super::knowledge_lifecycle::checkout_access_error_is_definitively_stale(access.code)
+        })
+    {
+        return GapOverlayRecomputeError::invalid_content(error);
+    }
     match error.downcast::<GapOverlayRecomputeError>() {
         Ok(error) => error,
         Err(error) => GapOverlayRecomputeError::transient(error),
@@ -584,6 +612,25 @@ mod tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn gap_overlay_access_classification_matches_reconciliation_staleness() {
+        use bbox_indexing::checkout_access::{CheckoutAccessError, CheckoutAccessErrorCode};
+
+        let stale =
+            classify_gap_overlay_access_error(anyhow::Error::new(CheckoutAccessError::new(
+                CheckoutAccessErrorCode::CheckoutIdentityMismatch,
+                "stale checkout identity",
+            )));
+        assert_eq!(stale.kind, GapOverlayRecomputeErrorKind::InvalidContent);
+
+        let transient =
+            classify_gap_overlay_access_error(anyhow::Error::new(CheckoutAccessError::new(
+                CheckoutAccessErrorCode::LifecycleBusy,
+                "temporary lifecycle lock",
+            )));
+        assert_eq!(transient.kind, GapOverlayRecomputeErrorKind::Transient);
     }
 
     #[test]

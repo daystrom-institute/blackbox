@@ -149,6 +149,16 @@ fn stable_knowledge_overlay(
 fn classify_knowledge_overlay_access_error(
     error: anyhow::Error,
 ) -> bbox_knowledge::overlay::OverlayRecomputeError {
+    if error
+        .downcast_ref::<bbox_indexing::checkout_access::CheckoutAccessError>()
+        .is_some_and(|access| {
+            crate::server::knowledge_lifecycle::checkout_access_error_is_definitively_stale(
+                access.code,
+            )
+        })
+    {
+        return bbox_knowledge::overlay::OverlayRecomputeError::invalid_content(error);
+    }
     match error.downcast::<bbox_knowledge::overlay::OverlayRecomputeError>() {
         Ok(error) => error,
         Err(error) => bbox_knowledge::overlay::OverlayRecomputeError::transient(error),
@@ -303,7 +313,7 @@ impl BlackboxServer {
         use crate::server::KnowledgeOverlayRefreshOutcome;
         use bbox_knowledge::overlay::{
             OverlayKey, OverlayRecomputeError, OverlayRecomputeErrorKind, OverlaySnapshot,
-            OverlayStatus,
+            OverlayStatus, TransientPreservationOutcome,
         };
 
         let _refresh = self.state.knowledge_overlay_refresh.lock();
@@ -377,16 +387,25 @@ impl BlackboxServer {
                         );
                         let mut preserved = prior.clone().expect("prior valid snapshot");
                         preserved.diagnostics = vec![format!("refresh degraded: {err:#}")];
-                        let published = self
+                        match self
                             .state
                             .knowledge_overlays
                             .write()
-                            .publish_if_latest(generation, preserved);
-                        return if published {
-                            KnowledgeOverlayRefreshOutcome::PreservedTransient
-                        } else {
-                            KnowledgeOverlayRefreshOutcome::Superseded
-                        };
+                            .preserve_transient_if_latest(generation, preserved)
+                        {
+                            TransientPreservationOutcome::Preserved { .. } => {
+                                return KnowledgeOverlayRefreshOutcome::PreservedTransient;
+                            }
+                            TransientPreservationOutcome::Superseded => {
+                                return KnowledgeOverlayRefreshOutcome::Superseded;
+                            }
+                            TransientPreservationOutcome::Exhausted => OverlaySnapshot::invalid(
+                                checkout,
+                                format!(
+                                    "transient knowledge overlay refresh limit exceeded: {err:#}"
+                                ),
+                            ),
+                        }
                     }
                     Err(err) => OverlaySnapshot::invalid(checkout, format!("{err:#}")),
                 }
@@ -400,16 +419,23 @@ impl BlackboxServer {
                 );
                 let mut preserved = prior.clone().expect("prior valid snapshot");
                 preserved.diagnostics = vec![format!("publisher refresh degraded: {err:#}")];
-                let published = self
+                match self
                     .state
                     .knowledge_overlays
                     .write()
-                    .publish_if_latest(generation, preserved);
-                return if published {
-                    KnowledgeOverlayRefreshOutcome::PreservedTransient
-                } else {
-                    KnowledgeOverlayRefreshOutcome::Superseded
-                };
+                    .preserve_transient_if_latest(generation, preserved)
+                {
+                    TransientPreservationOutcome::Preserved { .. } => {
+                        return KnowledgeOverlayRefreshOutcome::PreservedTransient;
+                    }
+                    TransientPreservationOutcome::Superseded => {
+                        return KnowledgeOverlayRefreshOutcome::Superseded;
+                    }
+                    TransientPreservationOutcome::Exhausted => OverlaySnapshot::invalid(
+                        checkout,
+                        format!("transient knowledge publisher refresh limit exceeded: {err:#}"),
+                    ),
+                }
             }
             Err(err) => OverlaySnapshot::invalid(checkout, format!("{err:#}")),
         };
@@ -1059,6 +1085,26 @@ mod tests {
         assert_eq!(first_entry_id(block).as_deref(), Some("abc123"));
         assert_eq!(first_entry_id("No entries found."), None);
         assert_eq!(first_entry_id(""), None);
+    }
+
+    #[test]
+    fn overlay_access_classification_matches_reconciliation_staleness() {
+        use bbox_indexing::checkout_access::{CheckoutAccessError, CheckoutAccessErrorCode};
+        use bbox_knowledge::overlay::OverlayRecomputeErrorKind;
+
+        let stale =
+            classify_knowledge_overlay_access_error(anyhow::Error::new(CheckoutAccessError::new(
+                CheckoutAccessErrorCode::AttachmentInactive,
+                "inactive test attachment",
+            )));
+        assert_eq!(stale.kind, OverlayRecomputeErrorKind::InvalidContent);
+
+        let transient =
+            classify_knowledge_overlay_access_error(anyhow::Error::new(CheckoutAccessError::new(
+                CheckoutAccessErrorCode::ObservationUnavailable,
+                "temporary observation failure",
+            )));
+        assert_eq!(transient.kind, OverlayRecomputeErrorKind::Transient);
     }
 
     #[test]
