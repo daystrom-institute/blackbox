@@ -1985,8 +1985,9 @@ impl IntoResponse for HttpError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
+    use std::path::Path;
 
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
@@ -2004,10 +2005,45 @@ mod tests {
         encode_collision_retirement_pending_for_migration,
         encode_stored_generation_v2_for_migration,
     };
+    use bbox_config::config::CodeCollectionProducerConfig;
     use bbox_corpus_core::project_catalog::ProjectId;
+    use bbox_indexing::checkout_access::{
+        CheckoutAccessAuthority, CheckoutAccessCandidate, CheckoutAccessError,
+        CheckoutAccessErrorCode, CheckoutAccessObservations, CheckoutAttachmentStatus,
+    };
     use tower::ServiceExt;
 
     use super::*;
+
+    #[derive(Clone)]
+    struct SnapshotAuthority {
+        candidates: BTreeMap<String, CheckoutAccessCandidate>,
+    }
+
+    impl CheckoutAccessAuthority for SnapshotAuthority {
+        fn resolve(
+            &self,
+            request: &CheckoutAccessRequest,
+        ) -> std::result::Result<CheckoutAccessCandidate, CheckoutAccessError> {
+            self.candidates
+                .get(&request.project_id)
+                .cloned()
+                .ok_or_else(|| {
+                    CheckoutAccessError::new(
+                        CheckoutAccessErrorCode::AttachmentNotFound,
+                        "test project has no checkout candidate",
+                    )
+                })
+        }
+
+        fn revalidate_conservative_path_gate(
+            &self,
+            _request: &CheckoutAccessRequest,
+            _candidate: &CheckoutAccessCandidate,
+        ) -> std::result::Result<(), CheckoutAccessError> {
+            Ok(())
+        }
+    }
 
     fn empty_generation_descriptor(scope: PublishedScope, head: &str) -> GenerationDescriptor {
         GenerationDescriptor {
@@ -2020,6 +2056,112 @@ mod tests {
             file_count: 0,
             logical_bytes: 0,
         }
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn write_service_token(path: &Path, secret: char) {
+        fs::write(path, secret.to_string().repeat(64)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    fn snapshot_project(
+        root: &Path,
+        project_id: &str,
+        scope: &PublishedScope,
+    ) -> (ProjectRecord, CheckoutAccessCandidate) {
+        let project_root = root.join(project_id);
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root = project_root.canonicalize().unwrap();
+        (
+            ProjectRecord {
+                project_id: project_id.to_string(),
+                repo_id: Some(scope.repo_id().to_string()),
+                canonical_path: project_root.to_string_lossy().into_owned(),
+                registered_at: "2026-01-01T00:00:00Z".into(),
+                is_git_repo: true,
+                languages: BTreeSet::new(),
+                aliases: BTreeSet::new(),
+            },
+            CheckoutAccessCandidate {
+                project_id: project_id.to_string(),
+                attachment_id: format!("attachment-{project_id}"),
+                checkout_id: format!("checkout-{project_id}"),
+                published_scope: Some(scope.clone()),
+                branch_ref: Some("refs/heads/main".into()),
+                checkout_root: project_root.clone(),
+                project_root,
+                status: CheckoutAttachmentStatus::Active,
+                capabilities: BTreeSet::from([CheckoutAccessKind::PublisherConfigTreeRead]),
+                lifetime_guard: None,
+            },
+        )
+    }
+
+    fn snapshot_broker(candidates: Vec<CheckoutAccessCandidate>) -> CheckoutAccessBroker {
+        CheckoutAccessBroker::new(
+            Arc::new(SnapshotAuthority {
+                candidates: candidates
+                    .into_iter()
+                    .map(|candidate| (candidate.project_id.clone(), candidate))
+                    .collect(),
+            }),
+            CheckoutAccessObservations::in_memory(),
+        )
+    }
+
+    fn assert_snapshot_rejected(
+        base: &crate::config::Config,
+        producers: Vec<CodeCollectionProducerConfig>,
+        projects: &[ProjectRecord],
+        store: Arc<CodeSourceStore>,
+        broker: &CheckoutAccessBroker,
+        expected: &str,
+    ) {
+        let mut config = base.clone();
+        config.code_collection.enabled = true;
+        config.code_collection.producers = producers;
+        let error = build_snapshot(&config, projects, Some(store), broker)
+            .err()
+            .expect("invalid enabled code-source configuration must fail closed");
+        assert_eq!(error.to_string(), expected);
+    }
+
+    fn install_test_assignment(
+        state: &Arc<SharedState>,
+        producer_id: &str,
+        scope: &PublishedScope,
+        project_id: &str,
+    ) {
+        let store = state.code_sources.store();
+        *state.code_sources.snapshot.write() = Arc::new(CodeSourceSnapshot {
+            enabled: true,
+            auth: vec![AuthEntry {
+                token: ServiceToken::parse("a".repeat(64)).unwrap(),
+                grant: ProducerGrant {
+                    producer_id: producer_id.to_string(),
+                    projects: BTreeMap::from([(scope.clone(), project_id.to_string())]),
+                },
+            }],
+            store,
+        });
     }
 
     fn enabled_http_state(
@@ -2451,41 +2593,239 @@ mod tests {
     }
 
     #[test]
-    fn cold_open_fails_closed_for_invalid_enabled_configuration() {
+    fn cold_open_fails_closed_for_every_invalid_enabled_configuration() {
         let directory = tempfile::tempdir().unwrap();
-        let state = SharedState::for_test(directory.path());
-        let mut config = state.config.read().clone();
-        config.code_collection.enabled = true;
-        config.code_collection.producers.clear();
+        let root = directory.path().canonicalize().unwrap();
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_CONFIG", root.join("missing-config.toml"));
+        env.set("BLACKBOX_STATE_DIR", root.join("state"));
+        let config = crate::config::load().unwrap();
+        let store =
+            Arc::new(CodeSourceStore::open(root.join("store"), StoreLimits::default()).unwrap());
+        let scope_a = PublishedScope::try_new("repo-a", ".").unwrap();
+        let scope_b = PublishedScope::try_new("repo-b", ".").unwrap();
+        let scope_unknown = PublishedScope::try_new("repo-unknown", ".").unwrap();
+        let (project_a, candidate_a) = snapshot_project(&root, "project-a", &scope_a);
+        let (project_b, candidate_b) = snapshot_project(&root, "project-b", &scope_b);
+        let token_a = root.join("token-a");
+        let token_b = root.join("token-b");
+        write_service_token(&token_a, 'a');
+        write_service_token(&token_b, 'b');
+        let producer =
+            |producer_id: &str, token_file: &Path, scopes| CodeCollectionProducerConfig {
+                producer_id: producer_id.to_string(),
+                token_file: token_file.to_path_buf(),
+                scopes,
+            };
 
-        let missing_producer = build_snapshot(
+        let broker = snapshot_broker(Vec::new());
+        assert_snapshot_rejected(
             &config,
+            Vec::new(),
             &[],
-            Some(state.code_sources.store()),
-            &state.checkout_access,
-        )
-        .err()
-        .expect("enabled collection without producers must fail");
-        assert!(
-            missing_producer
-                .to_string()
-                .contains("requires at least one producer")
+            store.clone(),
+            &broker,
+            "enabled code collection requires at least one producer",
         );
 
-        config.code_collection.max_manifest_files = 0;
-        let invalid_limits = build_snapshot(
-            &config,
+        let mut zero_limits = config.clone();
+        zero_limits.code_collection.max_manifest_files = 0;
+        assert_snapshot_rejected(
+            &zero_limits,
+            Vec::new(),
             &[],
-            Some(state.code_sources.store()),
-            &state.checkout_access,
-        )
-        .err()
-        .expect("enabled collection with zero limits must fail");
-        assert!(
-            invalid_limits
-                .to_string()
-                .contains("limits and stale warning hours must be nonzero")
+            store.clone(),
+            &broker,
+            "code-collection limits and stale warning hours must be nonzero",
         );
+
+        let broker = snapshot_broker(vec![candidate_a.clone(), candidate_b.clone()]);
+        assert_snapshot_rejected(
+            &config,
+            vec![
+                producer("producer-a", &token_a, vec![scope_a.clone()]),
+                producer("producer-a", &token_b, vec![scope_b.clone()]),
+            ],
+            &[project_a.clone(), project_b.clone()],
+            store.clone(),
+            &broker,
+            "duplicate code-collection producer id",
+        );
+        assert_snapshot_rejected(
+            &config,
+            vec![
+                producer("producer-a", &token_a, vec![scope_a.clone()]),
+                producer("producer-b", &token_a, vec![scope_b.clone()]),
+            ],
+            &[project_a.clone(), project_b.clone()],
+            store.clone(),
+            &broker,
+            "code-collection token values must be unique",
+        );
+        assert_snapshot_rejected(
+            &config,
+            vec![producer("producer-a", &token_a, Vec::new())],
+            &[project_a.clone()],
+            store.clone(),
+            &broker,
+            "enabled code-collection producer has no scopes",
+        );
+        assert_snapshot_rejected(
+            &config,
+            vec![
+                producer("producer-a", &token_a, vec![scope_a.clone()]),
+                producer("producer-b", &token_b, vec![scope_a.clone()]),
+            ],
+            &[project_a.clone()],
+            store.clone(),
+            &broker,
+            "code-collection scope is assigned more than once",
+        );
+        assert_snapshot_rejected(
+            &config,
+            vec![producer("producer-a", &token_a, vec![scope_unknown])],
+            &[project_a.clone()],
+            store.clone(),
+            &broker,
+            "code-collection scope is not registered",
+        );
+
+        let (_, duplicate_candidate) = snapshot_project(&root, "project-b", &scope_a);
+        let duplicate_broker = snapshot_broker(vec![candidate_a, duplicate_candidate]);
+        assert_snapshot_rejected(
+            &config,
+            vec![producer("producer-a", &token_a, vec![scope_a])],
+            &[project_a, project_b],
+            store,
+            &duplicate_broker,
+            "code-collection scope resolves to multiple registered projects",
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn collected_activation_restart_and_local_cutback_preserve_read_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let state_dir = root.join("state");
+        let repo = root.join("repo");
+        let home = root.join("home");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.invalid"]);
+        git(&repo, &["config", "user.name", "Blackbox Test"]);
+        fs::write(repo.join("src/lib.rs"), "pub fn phase_one() {}\n").unwrap();
+        git(&repo, &["add", "src/lib.rs"]);
+        git(&repo, &["commit", "-q", "-m", "seed"]);
+        let recorded = crate::config::ensure_recorded_repo_id(&repo).unwrap();
+        git(&repo, &["add", ".bbox"]);
+        git(&repo, &["commit", "-q", "-m", "record repository identity"]);
+
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("HOME", &home);
+        env.set("BLACKBOX_CONFIG", root.join("missing-config.toml"));
+        env.set("BLACKBOX_STATE_DIR", &state_dir);
+
+        let state = Arc::new(SharedState::for_test(&state_dir));
+        let project = state.projects.write().register_path(&repo).unwrap();
+        state.persist_projects_durable().await.unwrap();
+        let scope = PublishedScope::try_new(recorded.repo_id, ".").unwrap();
+        let producer_id = "phase1-transition-producer";
+        install_test_assignment(&state, producer_id, &scope, &project.project_id);
+
+        let store = state.code_sources.store();
+        let descriptor = empty_generation_descriptor(scope.clone(), &"c".repeat(40));
+        let upload = store.begin_upload(producer_id, descriptor).unwrap();
+        store
+            .complete_manifest(producer_id, &upload.upload_id)
+            .unwrap();
+        let ready = store
+            .finalize_upload(producer_id, &upload.upload_id)
+            .unwrap();
+        activate_desired_loop(&state, &scope, &project.project_id).unwrap();
+        state.index_writer.flush_blocking().unwrap();
+
+        let collected_selector = crate::index::project_files::collected_materialization_selector(
+            &project.project_id,
+            &ready.generation_id,
+        );
+        assert_eq!(
+            state
+                .code_read_view
+                .read()
+                .active_selectors
+                .get(&project.project_id),
+            Some(&collected_selector)
+        );
+        assert_eq!(
+            store
+                .load_activation(&project.project_id)
+                .unwrap()
+                .as_ref()
+                .map(|activation| activation.generation_id.as_str()),
+            Some(ready.generation_id.as_str())
+        );
+
+        drop(store);
+        drop(state);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let restarted = Arc::new(SharedState::for_test(&state_dir));
+        install_test_assignment(&restarted, producer_id, &scope, &project.project_id);
+        assert_eq!(
+            restarted
+                .code_read_view
+                .read()
+                .active_selectors
+                .get(&project.project_id),
+            Some(&collected_selector),
+            "startup must rebuild read authority from the durable manifest"
+        );
+        activate_desired_loop(&restarted, &scope, &project.project_id).unwrap();
+
+        let store = restarted.code_sources.store();
+        *restarted.code_sources.snapshot.write() = Arc::new(CodeSourceSnapshot {
+            enabled: false,
+            auth: Vec::new(),
+            store: store.clone(),
+        });
+        cutback_to_local(&restarted, &scope, &project.project_id).unwrap();
+        restarted.index_writer.flush_blocking().unwrap();
+
+        let local_selector = bbox_code_source::local_selector(&project.project_id);
+        assert_eq!(
+            restarted
+                .code_read_view
+                .read()
+                .active_selectors
+                .get(&project.project_id),
+            Some(&local_selector)
+        );
+        assert!(
+            store
+                .load_activation(&project.project_id)
+                .unwrap()
+                .is_none()
+        );
+        let edges_dir = crate::edge_index::edges_dir_from_bro_store(&restarted.store_dir);
+        let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir).unwrap();
+        assert_eq!(
+            manifest
+                .workspaces
+                .get(&project.project_id)
+                .and_then(|entry| entry.code_source_selector.as_deref()),
+            Some(local_selector.as_str())
+        );
+
+        for _ in 0..500 {
+            if !store.retirement_pending(&collected_selector).unwrap() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!store.retirement_pending(&collected_selector).unwrap());
     }
 
     #[test]
