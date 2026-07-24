@@ -78,8 +78,8 @@ use crate::project_catalog_store::{
     MigrationCodeSourceSnapshotDraftV1, MigrationImmutableAssetDraftV1,
     MigrationLegacyProjectSourceDraftV1, MigrationMutationDispositionV1,
     MigrationParticipantDraftV1, MigrationParticipantRegistry, MigrationPlanDraftV1,
-    MigrationPublisherSourceDraftV1, ParticipantRoleV1, PublisherDispositionEvidenceV1,
-    PublisherPinEvidenceV1, Sha256Hex, ValidatedMigrationPlanV1,
+    MigrationPublisherSourceDraftV1, MigrationStoreOpenOutcomeV1, ParticipantRoleV1,
+    PublisherDispositionEvidenceV1, PublisherPinEvidenceV1, Sha256Hex, ValidatedMigrationPlanV1,
     begin_migration_checkout_registry_bootstrap, transact_migration_classified,
     validate_migration_plan,
 };
@@ -4635,11 +4635,11 @@ fn verify_exact_installed_review(
     resolution_bytes: &[u8],
 ) -> Result<Option<ProjectCatalogMigrationVerifyResultV1>, ProjectCatalogMigrationError> {
     match verify_installed_optional(layout)? {
-        Some(result) => {
+        InstalledMigrationVerificationV1::Installed(result) => {
             validate_exact_installed_review(&result, report_bytes, report, resolution_bytes)?;
             Ok(Some(result))
         }
-        None => Ok(None),
+        InstalledMigrationVerificationV1::NotInstalled { .. } => Ok(None),
     }
 }
 
@@ -4682,17 +4682,28 @@ fn post_commit_verification_error(
 fn verify_installed(
     layout: &ProjectCatalogMigrationResolvedLayoutV1,
 ) -> Result<ProjectCatalogMigrationVerifyResultV1, ProjectCatalogMigrationError> {
-    verify_installed_optional(layout)?.ok_or_else(|| {
-        ProjectCatalogMigrationError::no_mutation(
+    match verify_installed_optional(layout)? {
+        InstalledMigrationVerificationV1::Installed(result) => Ok(result),
+        InstalledMigrationVerificationV1::NotInstalled {
+            mutation_disposition,
+        } => Err(ProjectCatalogMigrationError::new(
             "error.project_catalog_invalid_snapshot",
             "migration verification requires installed v2 state",
-        )
-    })
+            mutation_disposition,
+        )),
+    }
+}
+
+enum InstalledMigrationVerificationV1 {
+    NotInstalled {
+        mutation_disposition: ProjectCatalogMigrationMutationDispositionV1,
+    },
+    Installed(ProjectCatalogMigrationVerifyResultV1),
 }
 
 fn verify_installed_optional(
     layout: &ProjectCatalogMigrationResolvedLayoutV1,
-) -> Result<Option<ProjectCatalogMigrationVerifyResultV1>, ProjectCatalogMigrationError> {
+) -> Result<InstalledMigrationVerificationV1, ProjectCatalogMigrationError> {
     let bootstrap =
         begin_migration_checkout_registry_bootstrap(&layout.projects_path).map_err(|failure| {
             ProjectCatalogMigrationError::new(
@@ -4702,7 +4713,17 @@ fn verify_installed_optional(
             )
         })?;
     let session = match bootstrap {
-        MigrationCheckoutRegistryBootstrapV1::FreshLegacyNotInstalled => return Ok(None),
+        MigrationCheckoutRegistryBootstrapV1::FreshLegacyNotInstalled => {
+            return Ok(InstalledMigrationVerificationV1::NotInstalled {
+                mutation_disposition:
+                    ProjectCatalogMigrationMutationDispositionV1::NoDurableMutation,
+            });
+        }
+        MigrationCheckoutRegistryBootstrapV1::RolledBackNotInstalled { disposition } => {
+            return Ok(InstalledMigrationVerificationV1::NotInstalled {
+                mutation_disposition: facade_mutation_disposition(disposition),
+            });
+        }
         MigrationCheckoutRegistryBootstrapV1::RequiresRegistry(session) => session,
     };
     let bootstrap_disposition = facade_mutation_disposition(session.disposition());
@@ -4733,6 +4754,14 @@ fn verify_installed_optional(
             facade_mutation_disposition(failure.disposition),
         )
     })?;
+    let opened = match opened {
+        MigrationStoreOpenOutcomeV1::Installed(opened) => opened,
+        MigrationStoreOpenOutcomeV1::RolledBackNotInstalled { disposition } => {
+            return Ok(InstalledMigrationVerificationV1::NotInstalled {
+                mutation_disposition: facade_mutation_disposition(disposition),
+            });
+        }
+    };
     let mutation_disposition = facade_mutation_disposition(opened.disposition);
     let store = opened.store;
     let identity = store
@@ -4745,6 +4774,20 @@ fn verify_installed_optional(
         .map_err(|error| error.with_mutation_disposition(mutation_disposition))?;
     let projections = identity_projections(&identity)
         .map_err(|error| error.with_mutation_disposition(mutation_disposition))?;
+    let observed_catalog_hash = if identity.migration_install_is_current {
+        Sha256ValueV1::parse(state.catalog_sha256().to_string())
+            .map_err(inventory_error)
+            .map_err(|error| error.with_mutation_disposition(mutation_disposition))?
+    } else {
+        projections.catalog_hash.clone()
+    };
+    let observed_attachment_hash = if identity.migration_install_is_current {
+        Sha256ValueV1::parse(state.attachments_sha256().to_string())
+            .map_err(inventory_error)
+            .map_err(|error| error.with_mutation_disposition(mutation_disposition))?
+    } else {
+        projections.attachment_hash.clone()
+    };
     let receipt = (|| {
         Ok::<_, ProjectCatalogMigrationError>(MigrationVerificationReceiptV1 {
             version: FACADE_VERSION_V1,
@@ -4760,11 +4803,9 @@ fn verify_installed_optional(
             )
             .map_err(inventory_error)?,
             expected_catalog_hash: projections.catalog_hash.clone(),
-            observed_catalog_hash: Sha256ValueV1::parse(state.catalog_sha256().to_string())
-                .map_err(inventory_error)?,
+            observed_catalog_hash,
             expected_attachment_hash: projections.attachment_hash.clone(),
-            observed_attachment_hash: Sha256ValueV1::parse(state.attachments_sha256().to_string())
-                .map_err(inventory_error)?,
+            observed_attachment_hash,
             expected_participant_hashes: projections.participant_hashes.clone(),
             observed_participant_hashes: projections.participant_hashes,
             expected_immutable_asset_hashes: projections.immutable_hashes.clone(),
@@ -4781,11 +4822,13 @@ fn verify_installed_optional(
         })
     })()
     .map_err(|error| error.with_mutation_disposition(mutation_disposition))?;
-    Ok(Some(ProjectCatalogMigrationVerifyResultV1 {
-        receipt,
-        compatibility,
-        mutation_disposition,
-    }))
+    Ok(InstalledMigrationVerificationV1::Installed(
+        ProjectCatalogMigrationVerifyResultV1 {
+            receipt,
+            compatibility,
+            mutation_disposition,
+        },
+    ))
 }
 
 fn adapter_error(
