@@ -449,7 +449,7 @@ impl ProjectCatalogStore {
                     decode_bounded_json(&marker_bytes, MAX_MARKER_BYTES, "migration marker")
                         .map_err(open_recovery_uncertain_failure)?;
                 let migration = owner
-                    .migration_journal_for_marker_locked(&marker)
+                    .committed_migration_journal_for_marker_locked(&marker)
                     .map_err(open_recovery_uncertain_failure)?;
                 verify_migration_marker_journal_binding(&marker, &marker_bytes, &migration)
                     .map_err(open_recovery_uncertain_failure)?;
@@ -505,7 +505,9 @@ impl ProjectCatalogStore {
                 active.kind == TransactionKindV1::V1Migration
                     && active.transaction_id == marker.transaction_id
             });
-        let journal = self.owner.migration_journal_for_marker_locked(&marker)?;
+        let journal = self
+            .owner
+            .committed_migration_journal_for_marker_locked(&marker)?;
         verify_migration_marker_journal_binding(&marker, &marker_bytes, &journal)?;
         self.owner.verify_current_migration_state(&journal)?;
         migration_artifact_identity_from_journal(
@@ -587,10 +589,18 @@ impl ProjectCatalogStore {
             AttachmentSnapshotV1::empty(1).map_err(contract_error)?,
         )?;
         owner.commit_regular_pair_locked(None, &empty)?;
+        let current = Arc::new(owner.read_strict_pair_locked()?);
         drop(_mutation_lock);
-        drop(exclusive);
-
-        Self::open_existing_with_io(projects_path, io)
+        let lifetime_lock = Arc::new(
+            exclusive
+                .downgrade_to_shared()
+                .map_err(|error| io_error("downgrade lifetime lock for", &paths.catalog, error))?,
+        );
+        Ok(Self {
+            owner,
+            current: RwLock::new(PublishedStoreState::Ready(current)),
+            _lifetime_lock: lifetime_lock,
+        })
     }
 }
 
@@ -1091,7 +1101,7 @@ fn begin_migration_checkout_registry_bootstrap_with_io(
             decode_bounded_json(&marker_bytes, MAX_MARKER_BYTES, "migration marker")
                 .map_err(bootstrap_retry_failure)?;
         journal = owner
-            .migration_journal_for_marker_locked(&marker)
+            .committed_migration_journal_for_marker_locked(&marker)
             .map_err(bootstrap_retry_failure)?;
         verify_migration_marker_journal_binding(&marker, &marker_bytes, &journal)
             .map_err(bootstrap_retry_failure)?;
@@ -4831,14 +4841,6 @@ impl ProjectCatalogTransactionOwner {
             && active.kind == TransactionKindV1::V1Migration
             && active.transaction_id == marker.transaction_id
         {
-            if active.state != TransactionStateV1::Committed
-                || active.outcome != Some(TransactionOutcomeV1::Committed)
-            {
-                return Err(ProjectCatalogStoreError::new(
-                    "error.project_catalog_migration_incomplete",
-                    "migration marker is bound to a non-committed active journal",
-                ));
-            }
             return Ok(active);
         }
         let name = retained_migration_journal_name(&marker.transaction_id)?;
@@ -4865,6 +4867,22 @@ impl ProjectCatalogTransactionOwner {
             return Err(ProjectCatalogStoreError::new(
                 "error.project_catalog_migration_incomplete",
                 "retained migration journal does not prove the marker transaction",
+            ));
+        }
+        Ok(journal)
+    }
+
+    fn committed_migration_journal_for_marker_locked(
+        &self,
+        marker: &ProjectCatalogMigrationMarkerV1,
+    ) -> ProjectCatalogStoreResult<ProjectCatalogTransactionJournalV1> {
+        let journal = self.migration_journal_for_marker_locked(marker)?;
+        if journal.state != TransactionStateV1::Committed
+            || journal.outcome != Some(TransactionOutcomeV1::Committed)
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_migration_incomplete",
+                "migration marker lacks committed migration evidence",
             ));
         }
         Ok(journal)

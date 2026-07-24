@@ -47,6 +47,14 @@ impl ProjectCatalogMigrationLock {
             }),
         }
     }
+
+    /// Atomically convert an exclusive initialization guard into the shared
+    /// lifetime mode used by an opened store.
+    pub fn downgrade_to_shared(self) -> Result<Self> {
+        FileExt::lock_shared(&self._file)
+            .context("failed to downgrade project catalog migration lock to shared")?;
+        Ok(self)
+    }
 }
 
 pub fn project_catalog_migration_lock_path(projects_path: &Path) -> PathBuf {
@@ -138,6 +146,30 @@ mod tests {
             root.join(PROJECT_CATALOG_MIGRATION_LOCK_FILE)
         );
         drop(exclusive);
+    }
+
+    #[test]
+    fn exclusive_guard_downgrades_without_an_unlocked_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let projects_path = root.join("projects.json");
+        let exclusive = ProjectCatalogMigrationLock::try_acquire_exclusive(&projects_path)
+            .unwrap()
+            .unwrap();
+
+        let shared = exclusive.downgrade_to_shared().unwrap();
+        let peer = ProjectCatalogMigrationLock::acquire_shared(&projects_path).unwrap();
+        assert!(
+            ProjectCatalogMigrationLock::try_acquire_exclusive(&projects_path)
+                .unwrap()
+                .is_none()
+        );
+        drop((shared, peer));
+        assert!(
+            ProjectCatalogMigrationLock::try_acquire_exclusive(&projects_path)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[cfg(unix)]
