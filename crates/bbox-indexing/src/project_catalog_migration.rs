@@ -2837,7 +2837,7 @@ fn prepare_publisher_generation(
         .verify_commit_oid(accepted_commit)
         .map_err(|_| planner_error("publisher accepted commit cannot be verified exactly"))?;
     let scope_root = scope.bbox_root_relpath();
-    let config_relpath = repo_relative_lane_root(scope_root, ".bbox/config.toml");
+    let config_relpath = repo_relative_lane_root(scope_root, "config.toml");
     let config_bytes =
         read_verified_committed_file_bytes_optional_bounded(&commit, &config_relpath, 1024 * 1024)
             .map_err(|_| planner_error("publisher accepted commit config cannot be read exactly"))?
