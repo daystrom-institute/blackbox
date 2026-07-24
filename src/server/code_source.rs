@@ -2164,6 +2164,15 @@ mod tests {
         });
     }
 
+    fn transition_test_state(state_dir: &Path) -> Arc<SharedState> {
+        let mut state = SharedState::for_test(state_dir);
+        // Production keeps the bro store below the state root while projects
+        // and edge snapshots are siblings. Restore that relationship because
+        // SharedState::for_test otherwise collapses both paths into one.
+        state.store_dir = state_dir.join("bro");
+        Arc::new(state)
+    }
+
     fn enabled_http_state(
         root: &std::path::Path,
         scope: &PublishedScope,
@@ -2728,7 +2737,7 @@ mod tests {
         env.set("BLACKBOX_CONFIG", root.join("missing-config.toml"));
         env.set("BLACKBOX_STATE_DIR", &state_dir);
 
-        let state = Arc::new(SharedState::for_test(&state_dir));
+        let state = transition_test_state(&state_dir);
         let project = state.projects.write().register_path(&repo).unwrap();
         state.persist_projects_durable().await.unwrap();
         let scope = PublishedScope::try_new(recorded.repo_id, ".").unwrap();
@@ -2800,7 +2809,7 @@ mod tests {
         drop(state);
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let restarted = Arc::new(SharedState::for_test(&state_dir));
+        let restarted = transition_test_state(&state_dir);
         install_test_assignment(&restarted, producer_id, &scope, &project.project_id);
         assert_eq!(
             restarted
