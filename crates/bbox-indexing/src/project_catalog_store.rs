@@ -4758,7 +4758,7 @@ impl ProjectCatalogTransactionOwner {
         // bytes and complete migration inventory under the same locks.
         let catalog = self
             .io
-            .read_regular_nofollow(&self.paths.catalog, MAX_PROJECT_CATALOG_BYTES)?;
+            .read_regular_nofollow(&self.paths.catalog, MAX_LEGACY_PROJECT_STORE_BYTES)?;
         let attachments = self
             .io
             .read_regular_nofollow(&self.paths.attachments, MAX_PROJECT_CATALOG_BYTES)?;
@@ -4940,10 +4940,22 @@ impl ProjectCatalogTransactionOwner {
                     "strict catalog and attachment snapshots are both missing",
                 ));
             }
-            (Some(_), None) | (None, Some(_)) => {
+            (Some(catalog), None) => {
+                if decode_legacy_project_store(&catalog).is_ok() {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_legacy_store_requires_migration",
+                        "projects.json contains the legacy v1 project store",
+                    ));
+                }
                 return Err(ProjectCatalogStoreError::new(
                     "error.project_catalog_incomplete_pair",
-                    "exactly one strict project catalog snapshot is missing",
+                    "the strict attachment snapshot is missing",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_incomplete_pair",
+                    "the strict catalog snapshot is missing",
                 ));
             }
             (Some(catalog), Some(attachments)) => (catalog, attachments),
