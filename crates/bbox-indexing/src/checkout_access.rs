@@ -1409,50 +1409,79 @@ impl CheckoutAccessObservations {
         outcome: CheckoutAccessOutcome,
     ) -> Result<u64> {
         let mut state = self.state.lock();
-        let mut next = state.clone();
-        next.sequence = next
-            .sequence
-            .checked_add(1)
-            .context("checkout access observation sequence exhausted")?;
-        let sequence = next.sequence;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if let Some(counter) = next.counters.iter_mut().find(|counter| {
-            counter.kind == kind && counter.source_lane == source_lane && counter.outcome == outcome
-        }) {
-            counter.count = counter
-                .count
-                .checked_add(1)
-                .context("checkout access counter exhausted")?;
-            counter.last_sequence = sequence;
-            counter.last_unix_secs = now;
-        } else {
-            next.counters.push(CheckoutAccessCounter {
-                kind,
-                source_lane,
-                outcome,
-                count: 1,
-                last_sequence: sequence,
-                last_unix_secs: now,
-            });
-            next.counters.sort_by_key(|counter| CounterKey {
-                kind: counter.kind,
-                source_lane: counter.source_lane,
-                outcome: counter.outcome,
-            });
-        }
-        validate_snapshot(&next)?;
-        if let Some(store_path) = &self.store_path {
+        let (next, sequence) = if let Some(store_path) = &self.store_path {
             with_store_lock(store_path, || {
+                let current = load_observation_snapshot(store_path)?;
+                let (next, sequence) = record_observation(current, kind, source_lane, outcome)?;
                 atomic_write_json_locked(store_path, &next)?;
-                sync_parent_directory(store_path)
-            })?;
-        }
+                sync_parent_directory(store_path)?;
+                Ok((next, sequence))
+            })?
+        } else {
+            record_observation(state.clone(), kind, source_lane, outcome)?
+        };
         *state = next;
         Ok(sequence)
     }
+}
+
+fn load_observation_snapshot(store_path: &Path) -> Result<CheckoutAccessObservationSnapshot> {
+    match std::fs::read_to_string(store_path) {
+        Ok(raw) => {
+            let snapshot: CheckoutAccessObservationSnapshot = serde_json::from_str(&raw)
+                .with_context(|| format!("parsing {}", store_path.display()))?;
+            validate_snapshot(&snapshot)
+                .with_context(|| format!("validating {}", store_path.display()))?;
+            Ok(snapshot)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(CheckoutAccessObservationSnapshot::default())
+        }
+        Err(error) => Err(error).with_context(|| format!("reading {}", store_path.display())),
+    }
+}
+
+fn record_observation(
+    mut next: CheckoutAccessObservationSnapshot,
+    kind: CheckoutAccessKind,
+    source_lane: CheckoutAccessSourceLane,
+    outcome: CheckoutAccessOutcome,
+) -> Result<(CheckoutAccessObservationSnapshot, u64)> {
+    next.sequence = next
+        .sequence
+        .checked_add(1)
+        .context("checkout access observation sequence exhausted")?;
+    let sequence = next.sequence;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Some(counter) = next.counters.iter_mut().find(|counter| {
+        counter.kind == kind && counter.source_lane == source_lane && counter.outcome == outcome
+    }) {
+        counter.count = counter
+            .count
+            .checked_add(1)
+            .context("checkout access counter exhausted")?;
+        counter.last_sequence = sequence;
+        counter.last_unix_secs = now;
+    } else {
+        next.counters.push(CheckoutAccessCounter {
+            kind,
+            source_lane,
+            outcome,
+            count: 1,
+            last_sequence: sequence,
+            last_unix_secs: now,
+        });
+        next.counters.sort_by_key(|counter| CounterKey {
+            kind: counter.kind,
+            source_lane: counter.source_lane,
+            outcome: counter.outcome,
+        });
+    }
+    validate_snapshot(&next)?;
+    Ok((next, sequence))
 }
 
 fn validate_snapshot(snapshot: &CheckoutAccessObservationSnapshot) -> Result<()> {
@@ -2157,5 +2186,45 @@ mod tests {
         assert!(!persisted.contains(root.to_string_lossy().as_ref()));
         assert!(!persisted.contains("project-1"));
         assert!(!persisted.contains("attachment-1"));
+    }
+
+    #[test]
+    fn stale_observation_handles_merge_under_the_store_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("checkout-access-observations.json");
+        let first = CheckoutAccessObservations::open(&path).unwrap();
+        let second = CheckoutAccessObservations::open(&path).unwrap();
+
+        first
+            .record(
+                CheckoutAccessKind::Blame,
+                CheckoutAccessSourceLane::LegacyProjectRecord,
+                CheckoutAccessOutcome::Granted,
+            )
+            .unwrap();
+        second
+            .record(
+                CheckoutAccessKind::GitHistory,
+                CheckoutAccessSourceLane::NativeAttachment,
+                CheckoutAccessOutcome::Denied,
+            )
+            .unwrap();
+
+        let merged = CheckoutAccessObservations::open(&path).unwrap().health();
+        assert_eq!(merged.sequence, 2);
+        assert_eq!(merged.counters.len(), 2);
+        assert!(
+            merged
+                .counters
+                .iter()
+                .any(|counter| counter.kind == CheckoutAccessKind::Blame)
+        );
+        assert!(
+            merged
+                .counters
+                .iter()
+                .any(|counter| counter.kind == CheckoutAccessKind::GitHistory)
+        );
     }
 }

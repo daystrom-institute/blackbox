@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bbox_corpus_core::project_record::{ProjectRecord, ResolvedCheckoutScope};
 use bbox_gaps::repo_io::{GapRepoCarrier, GapRepoRead, GapRepoWrite};
 use bbox_indexing::checkout_access::{
@@ -15,8 +15,9 @@ use bbox_knowledge::repo_io::{KnowledgeRepoCarrier, KnowledgeRepoRead, Knowledge
 use serde::{Deserialize, Serialize};
 
 const CARRIER_PREFIX: &str = "repoio-v1:";
+const MAX_CARRIER_ID_BYTES: usize = 4 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "selector", rename_all = "snake_case", deny_unknown_fields)]
 enum RepoCarrierTarget {
     Selected {
@@ -34,6 +35,9 @@ fn encode_target(target: &RepoCarrierTarget) -> Result<String> {
 }
 
 fn decode_target(carrier_id: &str) -> Result<RepoCarrierTarget> {
+    if carrier_id.len() > MAX_CARRIER_ID_BYTES {
+        bail!("repository carrier id exceeds the bounded size");
+    }
     let encoded = carrier_id
         .strip_prefix(CARRIER_PREFIX)
         .context("repository carrier id has an unsupported format")?;
@@ -284,5 +288,158 @@ impl KnowledgeRepoWrite for ConfinedKnowledgeRepoIo {
         operation: &mut dyn FnMut(&Path) -> Result<()>,
     ) -> Result<()> {
         self.with_root(carrier, operation)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use bbox_corpus_core::identity::PublishedScope;
+    use bbox_indexing::checkout_access::{
+        CheckoutAccessAuthority, CheckoutAccessCandidate, CheckoutAccessError,
+        CheckoutAccessObservations, CheckoutAttachmentStatus,
+    };
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct TestAuthority {
+        candidate: CheckoutAccessCandidate,
+    }
+
+    impl CheckoutAccessAuthority for TestAuthority {
+        fn resolve(
+            &self,
+            _request: &CheckoutAccessRequest,
+        ) -> std::result::Result<CheckoutAccessCandidate, CheckoutAccessError> {
+            Ok(self.candidate.clone())
+        }
+
+        fn revalidate_conservative_path_gate(
+            &self,
+            _request: &CheckoutAccessRequest,
+            _candidate: &CheckoutAccessCandidate,
+        ) -> std::result::Result<(), CheckoutAccessError> {
+            Ok(())
+        }
+    }
+
+    fn broker(root: &Path) -> Arc<CheckoutAccessBroker> {
+        let scope = PublishedScope::try_new("repo-1", ".").unwrap();
+        Arc::new(CheckoutAccessBroker::new(
+            Arc::new(TestAuthority {
+                candidate: CheckoutAccessCandidate {
+                    project_id: "project-1".into(),
+                    attachment_id: "attachment-1".into(),
+                    checkout_id: "checkout-1".into(),
+                    published_scope: Some(scope),
+                    branch_ref: Some("refs/heads/main".into()),
+                    checkout_root: root.to_path_buf(),
+                    project_root: root.join("project"),
+                    status: CheckoutAttachmentStatus::Active,
+                    capabilities: BTreeSet::from([
+                        CheckoutAccessKind::PublisherConfigTreeRead,
+                        CheckoutAccessKind::KnowledgeGapOverlayRead,
+                        CheckoutAccessKind::RepositoryMutation,
+                    ]),
+                    lifetime_guard: None,
+                },
+            }),
+            CheckoutAccessObservations::in_memory(),
+        ))
+    }
+
+    #[test]
+    fn repository_carrier_codec_round_trips_and_is_bounded() {
+        let targets = [
+            RepoCarrierTarget::Selected {
+                project_id: "project-1".into(),
+            },
+            RepoCarrierTarget::Checkout {
+                project_id: "project-1".into(),
+                checkout_id: "checkout-1".into(),
+            },
+        ];
+        for target in targets {
+            let encoded = encode_target(&target).unwrap();
+            assert_eq!(decode_target(&encoded).unwrap(), target);
+        }
+
+        assert!(decode_target("unsupported").is_err());
+        assert!(decode_target(&format!("{CARRIER_PREFIX}zz")).is_err());
+        assert!(
+            decode_target(&format!(
+                "{CARRIER_PREFIX}{}",
+                "0".repeat(MAX_CARRIER_ID_BYTES)
+            ))
+            .unwrap_err()
+            .to_string()
+            .contains("bounded size")
+        );
+    }
+
+    #[test]
+    fn broker_backed_authority_confines_read_and_write_callbacks() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let project = root.join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("existing.txt"), b"readable").unwrap();
+        let authority = RepoIoAuthority::new(broker(&root));
+        let carrier = KnowledgeRepoCarrier::new(
+            "project",
+            encode_target(&RepoCarrierTarget::Selected {
+                project_id: "project-1".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut read = |resolved: &Path| {
+            assert_eq!(resolved, project);
+            assert_eq!(std::fs::read(resolved.join("existing.txt"))?, b"readable");
+            Ok(())
+        };
+        KnowledgeRepoRead::with_read(&authority, &carrier, &mut read).unwrap();
+
+        let mut write = |resolved: &Path| {
+            assert_eq!(resolved, project);
+            std::fs::write(resolved.join("written.txt"), b"written")?;
+            Ok(())
+        };
+        KnowledgeRepoWrite::with_write(&authority, &carrier, &mut write).unwrap();
+        assert_eq!(
+            std::fs::read(project.join("written.txt")).unwrap(),
+            b"written"
+        );
+    }
+
+    #[test]
+    fn confined_candidate_authority_rejects_unknown_carriers() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let candidate = root.join("candidate");
+        std::fs::create_dir(&candidate).unwrap();
+        let (authority, carriers) = ConfinedKnowledgeRepoIo::new([candidate.clone()]).unwrap();
+        let mut observed = None;
+        let mut operation = |resolved: &Path| {
+            observed = Some(resolved.to_path_buf());
+            Ok(())
+        };
+        KnowledgeRepoRead::with_read(&*authority, &carriers[0], &mut operation).unwrap();
+        assert_eq!(observed, Some(candidate));
+
+        let forged = KnowledgeRepoCarrier::new("project", "candidate-forged").unwrap();
+        let mut called = false;
+        let mut forbidden = |_resolved: &Path| {
+            called = true;
+            Ok(())
+        };
+        let error = KnowledgeRepoRead::with_read(&*authority, &forged, &mut forbidden)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not confined"));
+        assert!(!called);
     }
 }

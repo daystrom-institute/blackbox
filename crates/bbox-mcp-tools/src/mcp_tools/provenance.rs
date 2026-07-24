@@ -63,7 +63,7 @@ pub fn export_provenance(edge_index: &EdgeIndex, projects: &[ProvenanceProject])
             .push(edge);
     }
 
-    let notes_ref = bbox_corpus_core::git::notes_ref("provenance");
+    let notes_ref = bbox_corpus_core::git::notes_ref("provenance")?;
     let mut notes_written = 0u64;
     // Track which roots we've already configured to avoid redundant git calls.
     let mut configured_roots: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -109,7 +109,7 @@ pub fn prepare_provenance_import(
     projects: &[ProvenanceProject],
     resolve_legacy_target: &LegacyTargetResolver<'_>,
 ) -> Result<PreparedProvenanceImport> {
-    let notes_ref = bbox_corpus_core::git::notes_ref("provenance");
+    let notes_ref = bbox_corpus_core::git::notes_ref("provenance")?;
     let mut prepared = PreparedProvenanceImport::default();
     for project in projects {
         let root = project.project_root.as_path();
@@ -129,7 +129,7 @@ pub fn prepare_provenance_import(
                 continue;
             };
             for raw_note in split_note_documents(&raw) {
-                let Ok(note) = parse_note_document(raw_note) else {
+                let Some(note) = parse_note_for_target(raw_note, &commit) else {
                     continue;
                 };
                 let edges =
@@ -143,6 +143,11 @@ pub fn prepare_provenance_import(
         }
     }
     Ok(prepared)
+}
+
+fn parse_note_for_target(raw: &str, target_commit: &str) -> Option<GitProvenanceNote> {
+    let note = parse_note_document(raw).ok()?;
+    (note.commit == target_commit).then_some(note)
 }
 
 /// Publish a previously prepared provenance import. The daemon calls this
@@ -312,6 +317,26 @@ mod tests {
             split_note_documents(&raw),
             vec!["{\"commit\":\"a\"}", "{\"commit\":\"b\"}"]
         );
+    }
+
+    #[test]
+    fn note_import_rejects_document_commit_mismatch() {
+        let note = GitProvenanceNote::new_v2(
+            "commit-a",
+            ProducedBy {
+                provider: None,
+                session_ids: Vec::new(),
+                brofiles: Vec::new(),
+                arc_thread_ids: Vec::new(),
+                trigger: None,
+            },
+            Vec::new(),
+            Vec::new(),
+        );
+        let raw = serialize_note(&note).unwrap();
+
+        assert!(parse_note_for_target(&raw, "commit-a").is_some());
+        assert!(parse_note_for_target(&raw, "commit-b").is_none());
     }
 
     #[test]

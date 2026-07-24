@@ -869,7 +869,7 @@ where
         writer,
         edges_dir,
         publication,
-        None,
+        Some(Path::new(&project.canonical_path)),
         open_bytes,
     )
 }
@@ -993,9 +993,7 @@ where
     let registry = chunker::default_registry();
     let mut chunk_entry = |entry: &bbox_code_source::ManifestEntry| {
         let relative_path = Path::new(&entry.relative_path);
-        let display_path = display_root
-            .map(|root| root.join(relative_path))
-            .unwrap_or_else(|| relative_path.to_path_buf());
+        let display_path = compatibility_display_path(display_root, relative_path);
         let bytes = open_bytes(entry)
             .with_context(|| format!("opening collected source {}", entry.relative_path))?;
         if bytes.len() as u64 != entry.size || full_hash(&bytes) != entry.content_sha256 {
@@ -1139,6 +1137,12 @@ where
         dirty_fingerprint: descriptor.dirty_fingerprint.clone(),
         worktree_dirty,
     })
+}
+
+fn compatibility_display_path(display_root: Option<&Path>, relative_path: &Path) -> PathBuf {
+    display_root
+        .map(|root| root.join(relative_path))
+        .unwrap_or_else(|| relative_path.to_path_buf())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2329,6 +2333,17 @@ mod tests {
         assert_eq!(
             first_text(&doc, fields.entity_id),
             format!("project_file:proj1234:abcd1234:{}:0", "f".repeat(64))
+        );
+    }
+
+    #[test]
+    fn collected_display_path_is_a_lexical_join_to_the_registered_root() {
+        assert_eq!(
+            compatibility_display_path(
+                Some(Path::new("/registered/project")),
+                Path::new("src/lib.rs"),
+            ),
+            PathBuf::from("/registered/project/src/lib.rs")
         );
     }
 

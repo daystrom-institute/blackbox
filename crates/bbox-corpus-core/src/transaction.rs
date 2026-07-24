@@ -46,6 +46,7 @@ struct TransactionPointer {
 enum TransactionState {
     Preparing,
     Applying,
+    Blocked,
     Closeout,
 }
 
@@ -184,10 +185,11 @@ pub fn apply_transaction(
 }
 
 /// Recover the one pending transaction for a checkout. Preparing transactions
-/// without a complete manifest touched no canonical files and are discarded.
-/// A complete manifest rolls forward idempotently when its staged new bytes are
-/// intact. If roll-forward cannot verify those bytes, recovery restores the
-/// checksummed old direction and clears the pointer at that terminal state.
+/// are always discarded because the durable Applying pointer is the commit
+/// point. An Applying manifest rolls forward idempotently when its staged new
+/// bytes are intact. If roll-forward cannot verify those bytes, recovery
+/// restores the checksummed old direction and clears the pointer at that
+/// terminal state.
 pub fn recover_pending_transaction(checkout_dir: &Path) -> Result<Option<RepoTransactionManifest>> {
     recover_pending_transaction_with_lock(checkout_dir, true)
 }
@@ -275,21 +277,42 @@ fn recover_pending_transaction_with_lock(
         cleanup_terminal_debris_best_effort(&root);
         return Ok(None);
     }
+    if matches!(pointer.state, TransactionState::Blocked) {
+        anyhow::bail!(
+            "error.repo_transaction_recovery_blocked: pending transaction requires operator repair"
+        );
+    }
     let transaction_dir = root.join(&pointer.transaction_id);
     reject_symlink_components(&root, Path::new(&pointer.transaction_id))?;
     let manifest_path = transaction_dir.join("manifest.json");
-    if !manifest_path.exists() && matches!(pointer.state, TransactionState::Preparing) {
+    if matches!(pointer.state, TransactionState::Preparing) {
         let _ = fs::remove_dir_all(&transaction_dir);
         clear_pointer(&pointer_path)?;
         cleanup_terminal_debris_best_effort(&root);
         return Ok(None);
     }
-    let manifest: RepoTransactionManifest =
-        serde_json::from_slice(&fs::read(&manifest_path).with_context(|| {
-            format!("reading transaction manifest {}", manifest_path.display())
-        })?)
-        .with_context(|| format!("parsing transaction manifest {}", manifest_path.display()))?;
-    validate_manifest(&manifest, &pointer.transaction_id)?;
+    let manifest = (|| {
+        let manifest: RepoTransactionManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).with_context(|| {
+                format!("reading transaction manifest {}", manifest_path.display())
+            })?)
+            .with_context(|| format!("parsing transaction manifest {}", manifest_path.display()))?;
+        validate_manifest(&manifest, &pointer.transaction_id)?;
+        Ok::<_, anyhow::Error>(manifest)
+    })()
+    .or_else(|error| {
+        atomic_write_json_locked(
+            &pointer_path,
+            &TransactionPointer {
+                state: TransactionState::Blocked,
+                ..pointer.clone()
+            },
+        )?;
+        sync_dir(&root)?;
+        Err(error.context(
+            "error.repo_transaction_recovery_blocked: applying transaction manifest is unavailable",
+        ))
+    })?;
     if let Err(apply_err) = apply_manifest(&checkout_dir, &transaction_dir, &manifest) {
         match rollback_manifest(&checkout_dir, &transaction_dir, &manifest) {
             Ok(()) => {
@@ -1045,6 +1068,71 @@ mod tests {
 
         assert!(recover_pending_transaction(&root).unwrap().is_none());
         assert!(!has_pending_transaction(&root));
+    }
+
+    #[test]
+    fn preparing_pointer_with_manifest_still_discards_before_commit_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let target = root.join(".bbox/knowledge/entry.json");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"old").unwrap();
+        let root_dir = transaction_root(&root);
+        let transaction_id = "preparing-with-manifest";
+        let transaction_dir = root_dir.join(transaction_id);
+        fs::create_dir_all(root_dir.join("completed")).unwrap();
+        let manifest = prepare_manifest(
+            &root,
+            &transaction_dir,
+            transaction_id,
+            vec![TransactionWrite {
+                target: target.clone(),
+                new_bytes: Some(b"new".to_vec()),
+            }],
+        )
+        .unwrap();
+        atomic_write_json_locked(&transaction_dir.join("manifest.json"), &manifest).unwrap();
+        create_claim(
+            &root_dir.join(PENDING_FILE),
+            &TransactionPointer {
+                version: TRANSACTION_VERSION,
+                transaction_id: transaction_id.into(),
+                state: TransactionState::Preparing,
+            },
+        )
+        .unwrap();
+
+        assert!(recover_pending_transaction(&root).unwrap().is_none());
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+        assert!(!transaction_dir.exists());
+        assert!(!has_pending_transaction(&root));
+    }
+
+    #[test]
+    fn applying_pointer_without_manifest_becomes_typed_blocked_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let root_dir = transaction_root(&root);
+        fs::create_dir_all(&root_dir).unwrap();
+        let pointer_path = root_dir.join(PENDING_FILE);
+        create_claim(
+            &pointer_path,
+            &TransactionPointer {
+                version: TRANSACTION_VERSION,
+                transaction_id: "missing-applying-manifest".into(),
+                state: TransactionState::Applying,
+            },
+        )
+        .unwrap();
+
+        let first = recover_pending_transaction(&root).unwrap_err().to_string();
+        assert!(first.contains("error.repo_transaction_recovery_blocked"));
+        let pointer: TransactionPointer =
+            serde_json::from_slice(&fs::read(&pointer_path).unwrap()).unwrap();
+        assert!(matches!(pointer.state, TransactionState::Blocked));
+        let second = recover_pending_transaction(&root).unwrap_err().to_string();
+        assert!(second.contains("error.repo_transaction_recovery_blocked"));
+        assert!(has_pending_transaction(&root));
     }
 
     #[test]

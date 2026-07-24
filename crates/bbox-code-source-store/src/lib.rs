@@ -3016,6 +3016,7 @@ pub struct MaintenanceStats {
     pub degraded_generations: u64,
     pub reclaimed_blobs: u64,
     pub reclaimed_bytes: u64,
+    pub reclaimed_generations: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4345,6 +4346,28 @@ impl CodeSourceStore {
                 stats.reclaimed_blobs += 1;
                 stats.reclaimed_bytes = stats.reclaimed_bytes.saturating_add(bytes);
             }
+        }
+        for generation in &generations {
+            if protected.contains(generation.generation_id()) {
+                continue;
+            }
+            let directory = self
+                .paths
+                .generation_directory(&generation.descriptor().scope, generation.generation_id())?;
+            let metadata = match fs::symlink_metadata(&directory) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if metadata.file_type().is_symlink()
+                || !metadata.file_type().is_dir()
+                || metadata.modified().unwrap_or(SystemTime::now()) > cutoff
+            {
+                continue;
+            }
+            fs::remove_dir_all(&directory)?;
+            sync_parent(&directory)?;
+            stats.reclaimed_generations = stats.reclaimed_generations.saturating_add(1);
         }
         Ok(stats)
     }
@@ -5912,12 +5935,18 @@ mod tests {
         let unprotected_paths = CodeSourceStorePaths::new(unprotected_root).unwrap();
         fs::create_dir_all(unprotected_paths.root()).unwrap();
         fs::write(unprotected_paths.anchor(), &effective).unwrap();
-        write_legacy_generation_fixture(
+        let unprotected = write_legacy_generation_fixture(
             &unprotected_paths,
             "host-unprotected",
             1,
             GenerationState::Failed,
         );
+        let unprotected_generation_dir = unprotected_paths
+            .generation_metadata(&unprotected.descriptor.scope, &unprotected.generation_id)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
         let guard = unprotected_paths.lock_migration_inventory().unwrap();
         let first = guard.snapshot_current_v2(&StoreLimits::default()).unwrap();
         let second = guard.snapshot_current_v2(&StoreLimits::default()).unwrap();
@@ -5925,13 +5954,18 @@ mod tests {
         assert!(first.effective_manifest.selections.is_empty());
         assert_eq!(first.canonical_sha256, second.canonical_sha256);
         drop(guard);
-        CodeSourceStore::open(
+        let stats = CodeSourceStore::open(
             unprotected_paths.root().to_path_buf(),
-            StoreLimits::default(),
+            StoreLimits {
+                unreferenced_blob_grace_hours: 0,
+                ..StoreLimits::default()
+            },
         )
         .unwrap()
         .gc_blobs()
         .unwrap();
+        assert_eq!(stats.reclaimed_generations, 1);
+        assert!(!unprotected_generation_dir.exists());
 
         let protected_directory = tempfile::tempdir().unwrap();
         let protected_root = protected_directory

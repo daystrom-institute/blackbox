@@ -21,6 +21,7 @@ pub const CATALOG_VERSION_V2: u32 = 2;
 pub const ATTACHMENT_VERSION_V1: u32 = 1;
 pub const LEGACY_PROJECT_STORE_VERSION_V1: u32 = 1;
 pub const MAX_PROJECT_CATALOG_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_LEGACY_PROJECT_STORE_BYTES: usize = 512 * 1024 * 1024;
 pub const MAX_PROJECT_CATALOG_ENTRIES: usize = 100_000;
 
 const MAX_PROJECT_ID_BYTES: usize = 96;
@@ -661,6 +662,11 @@ fn validate_catalog(snapshot: &CatalogSnapshotV2) -> Result<(), ProjectCatalogEr
 
     let mut published_scopes = BTreeSet::new();
     let mut accepted_aliases = BTreeMap::<&str, &ProjectId>::new();
+    let project_ids = snapshot
+        .projects
+        .keys()
+        .map(|id| id.as_str())
+        .collect::<BTreeSet<_>>();
     for (key, project) in &snapshot.projects {
         if key != &project.project_id {
             return Err(ProjectCatalogError::new(
@@ -693,7 +699,7 @@ fn validate_catalog(snapshot: &CatalogSnapshotV2) -> Result<(), ProjectCatalogEr
         }
         for alias in &project.operator_aliases {
             validate_alias(alias)?;
-            if snapshot.projects.keys().any(|id| id.as_str() == alias) {
+            if project_ids.contains(alias.as_str()) {
                 return Err(ProjectCatalogError::new(
                     "error.project_catalog_alias_collision",
                     format!("project {} has an alias colliding with a project id", key),
@@ -1486,7 +1492,7 @@ pub fn decode_attachment_snapshot(raw: &[u8]) -> Result<AttachmentSnapshotV1, Pr
 pub fn decode_legacy_project_store(
     raw: &[u8],
 ) -> Result<LegacyProjectStoreV1, ProjectCatalogError> {
-    let store: LegacyProjectStoreV1 = decode_strict(raw)?;
+    let store: LegacyProjectStoreV1 = decode_strict_bounded(raw, MAX_LEGACY_PROJECT_STORE_BYTES)?;
     store.validate()?;
     Ok(store)
 }
@@ -1526,7 +1532,14 @@ fn decode_strict<T>(raw: &[u8]) -> Result<T, ProjectCatalogError>
 where
     T: for<'de> Deserialize<'de>,
 {
-    if raw.len() > MAX_PROJECT_CATALOG_BYTES {
+    decode_strict_bounded(raw, MAX_PROJECT_CATALOG_BYTES)
+}
+
+fn decode_strict_bounded<T>(raw: &[u8], max_bytes: usize) -> Result<T, ProjectCatalogError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    if raw.len() > max_bytes {
         return Err(ProjectCatalogError::new(
             "error.project_catalog_byte_limit",
             "snapshot exceeds the byte limit",
@@ -3100,6 +3113,19 @@ mod tests {
         assert_eq!(store.projects[0].repo_id, None);
         assert!(store.projects[0].languages.is_empty());
         assert!(store.projects[0].aliases.is_empty());
+    }
+
+    #[test]
+    fn legacy_project_store_budget_exceeds_the_strict_v2_snapshot_budget() {
+        let mut raw = br#"{"version":1,"projects":[]}"#.to_vec();
+        raw.resize(MAX_PROJECT_CATALOG_BYTES + 1, b' ');
+
+        let decoded = decode_legacy_project_store(&raw).unwrap();
+        assert!(decoded.projects.is_empty());
+        assert_eq!(
+            decode_catalog_snapshot(&raw).unwrap_err().code,
+            "error.project_catalog_byte_limit"
+        );
     }
 
     #[test]

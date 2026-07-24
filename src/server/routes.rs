@@ -2292,35 +2292,34 @@ pub(crate) fn sync_kb_project_roots(state: &SharedState) {
     let repo_io = std::sync::Arc::new(super::repo_io::RepoIoAuthority::new(
         state.checkout_access.clone(),
     ));
-    let knowledge_carriers =
-        match super::repo_io::RepoIoAuthority::knowledge_base_carriers(&projects) {
-            Ok(carriers) => carriers,
-            Err(error) => {
+    match super::repo_io::RepoIoAuthority::knowledge_base_carriers(&projects) {
+        Ok(knowledge_carriers) => {
+            if let Err(error) = state.kb.write().configure_repo_io(
+                repo_io.clone(),
+                repo_io.clone(),
+                knowledge_carriers,
+            ) {
                 tracing::warn!("knowledge repository-carrier sync failed: {error:#}");
-                return;
             }
-        };
-    let gap_carriers = match super::repo_io::RepoIoAuthority::gap_base_carriers(&projects) {
-        Ok(carriers) => carriers,
+        }
+        Err(error) => {
+            tracing::warn!("knowledge repository-carrier sync failed: {error:#}");
+        }
+    }
+    match super::repo_io::RepoIoAuthority::gap_base_carriers(&projects) {
+        Ok(gap_carriers) => {
+            if let Err(error) =
+                state
+                    .gaps
+                    .write()
+                    .configure_repo_io(repo_io.clone(), repo_io, gap_carriers)
+            {
+                tracing::warn!("gap repository-carrier sync failed: {error:#}");
+            }
+        }
         Err(error) => {
             tracing::warn!("gap repository-carrier sync failed: {error:#}");
-            return;
         }
-    };
-    if let Err(error) =
-        state
-            .kb
-            .write()
-            .configure_repo_io(repo_io.clone(), repo_io.clone(), knowledge_carriers)
-    {
-        tracing::warn!("knowledge repository-carrier sync failed: {error:#}");
-    }
-    if let Err(error) = state
-        .gaps
-        .write()
-        .configure_repo_io(repo_io.clone(), repo_io, gap_carriers)
-    {
-        tracing::warn!("gap repository-carrier sync failed: {error:#}");
     }
 }
 

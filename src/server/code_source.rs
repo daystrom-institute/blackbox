@@ -34,6 +34,9 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use super::SharedState;
 
+const UPLOAD_BODY_TEMP_PREFIX: &str = ".upload-body-";
+const UPLOAD_BODY_TEMP_SUFFIX: &str = ".tmp";
+
 #[derive(Clone)]
 pub(crate) struct ProducerGrant {
     producer_id: String,
@@ -237,10 +240,12 @@ fn build_snapshot(
     let store = if let Some(store) = existing_store {
         store
     } else {
-        Arc::new(CodeSourceStore::open(
+        let store = Arc::new(CodeSourceStore::open(
             config.paths.state_dir.join("code-sources"),
             limits,
-        )?)
+        )?);
+        reap_upload_body_tempfiles(store.root())?;
+        store
     };
     if !config.code_collection.enabled {
         return Ok(CodeSourceSnapshot {
@@ -493,7 +498,11 @@ async fn put_blob(
         ));
     }
 
-    let temporary = tempfile::NamedTempFile::new_in(store.root()).map_err(HttpError::storage)?;
+    let temporary = tempfile::Builder::new()
+        .prefix(UPLOAD_BODY_TEMP_PREFIX)
+        .suffix(UPLOAD_BODY_TEMP_SUFFIX)
+        .tempfile_in(store.root())
+        .map_err(HttpError::storage)?;
     let mut file = tokio::fs::File::from_std(temporary.reopen().map_err(HttpError::storage)?);
     let mut stream = body.into_data_stream();
     let mut written = 0_u64;
@@ -526,6 +535,32 @@ async fn put_blob(
     blocking(move || store.install_blob(&producer_id, &upload_id, &hash, expected_size, file))
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn reap_upload_body_tempfiles(store_root: &std::path::Path) -> Result<u64> {
+    let mut reaped = 0_u64;
+    for entry in std::fs::read_dir(store_root)
+        .with_context(|| format!("reading code-source store root {}", store_root.display()))?
+    {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with(UPLOAD_BODY_TEMP_PREFIX) || !name.ends_with(UPLOAD_BODY_TEMP_SUFFIX) {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            continue;
+        }
+        std::fs::remove_file(entry.path())?;
+        reaped = reaped.saturating_add(1);
+    }
+    if reaped > 0 {
+        let directory = std::fs::File::open(store_root)?;
+        directory.sync_all()?;
+    }
+    Ok(reaped)
 }
 
 async fn finalize_upload(
@@ -826,11 +861,14 @@ pub(crate) fn spawn_store_maintenance(state: &Arc<SharedState>) -> Result<()> {
                     Err(error) => tracing::warn!(%error, "code-source upload expiry failed"),
                 }
                 match store.gc_blobs() {
-                    Ok(stats) if stats.reclaimed_blobs > 0 => tracing::info!(
-                        blobs = stats.reclaimed_blobs,
-                        bytes = stats.reclaimed_bytes,
-                        "code-source blob GC reclaimed unreferenced data"
-                    ),
+                    Ok(stats) if stats.reclaimed_blobs > 0 || stats.reclaimed_generations > 0 => {
+                        tracing::info!(
+                            blobs = stats.reclaimed_blobs,
+                            bytes = stats.reclaimed_bytes,
+                            generations = stats.reclaimed_generations,
+                            "code-source GC reclaimed unreferenced data"
+                        )
+                    }
                     Ok(_) => {}
                     Err(error) => tracing::warn!(%error, "code-source blob GC failed"),
                 }
@@ -1951,6 +1989,22 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(body)
             .unwrap()
+    }
+
+    #[test]
+    fn startup_reaps_only_owned_upload_body_tempfiles() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let owned = root.join(format!(
+            "{UPLOAD_BODY_TEMP_PREFIX}crash{UPLOAD_BODY_TEMP_SUFFIX}"
+        ));
+        let unrelated = root.join(".unrelated.tmp");
+        fs::write(&owned, b"orphan").unwrap();
+        fs::write(&unrelated, b"keep").unwrap();
+
+        assert_eq!(reap_upload_body_tempfiles(&root).unwrap(), 1);
+        assert!(!owned.exists());
+        assert_eq!(fs::read(unrelated).unwrap(), b"keep");
     }
 
     #[tokio::test]

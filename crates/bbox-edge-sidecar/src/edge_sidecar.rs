@@ -449,6 +449,8 @@ pub fn compact_legacy_sidecar(
     project_id: &str,
     apply: bool,
 ) -> Result<EdgeSidecarCompactionStats> {
+    let project_id = bbox_corpus_core::project_catalog::ProjectId::parse(project_id.to_owned())
+        .context("validating edge sidecar project id")?;
     let path = edges_dir.join(format!("{project_id}.jsonl"));
     let mut stats = EdgeSidecarCompactionStats {
         project_id: project_id.to_string(),
@@ -1002,5 +1004,22 @@ mod project_catalog_snapshot_tests {
                 ..
             } if literal_selector == "/repo/worktree"
         ));
+    }
+
+    #[test]
+    fn legacy_compaction_rejects_project_id_path_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let edges = root.join("edges");
+        std::fs::create_dir(&edges).unwrap();
+        let outside = root.join("escape.jsonl");
+        std::fs::write(&outside, b"sentinel\n").unwrap();
+
+        let error = compact_legacy_sidecar(&edges, "../escape", true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("validating edge sidecar project id"));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"sentinel\n");
     }
 }

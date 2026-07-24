@@ -80,7 +80,13 @@ impl std::error::Error for McpToolError {}
 pub(crate) fn tool_error_has_code(error: &anyhow::Error, code: &str) -> bool {
     error
         .downcast_ref::<McpToolError>()
-        .is_some_and(|tool_error| tool_error.message.contains(code))
+        .is_some_and(|tool_error| {
+            let message = tool_error.message.trim();
+            let code_end = message
+                .find(|character: char| character == ':' || character.is_ascii_whitespace())
+                .unwrap_or(message.len());
+            &message[..code_end] == code
+        })
 }
 
 impl McpClient {
@@ -113,6 +119,7 @@ impl McpClient {
         });
         let (init_response, session_id) =
             post_json_rpc(&client, &mcp_url, None, &initialize).await?;
+        ensure_json_rpc_response_id(&init_response, 1, "initialize")?;
         ensure_json_rpc_success(&init_response, "initialize")?;
 
         Ok(Self {
@@ -157,6 +164,7 @@ impl McpClient {
             &tool_call,
         )
         .await?;
+        ensure_json_rpc_response_id(&response, id, "tools/call")?;
         Ok(response)
     }
 }
@@ -242,6 +250,17 @@ fn ensure_json_rpc_success(value: &Value, method: &str) -> anyhow::Result<()> {
             "MCP {method} response had no result: {}",
             pretty_json(value)?
         );
+    }
+    Ok(())
+}
+
+fn ensure_json_rpc_response_id(value: &Value, expected: u64, method: &str) -> anyhow::Result<()> {
+    let observed = value
+        .get("id")
+        .and_then(Value::as_u64)
+        .with_context(|| format!("MCP {method} response had no numeric id"))?;
+    if observed != expected {
+        bail!("MCP {method} response id mismatch: expected {expected}, observed {observed}");
     }
     Ok(())
 }
@@ -377,5 +396,24 @@ mod tests {
         });
         let error = tool_response_json(&response).unwrap_err();
         assert!(tool_error_has_code(&error, "error.stale_generation"));
+        assert!(!tool_error_has_code(&error, "stale_generation"));
+        assert!(!tool_error_has_code(&error, "error.stale"));
+    }
+
+    #[test]
+    fn rejects_missing_or_mismatched_json_rpc_response_ids() {
+        let missing = json!({"jsonrpc": "2.0", "result": {}});
+        assert!(
+            ensure_json_rpc_response_id(&missing, 7, "tools/call")
+                .unwrap_err()
+                .to_string()
+                .contains("had no numeric id")
+        );
+
+        let mismatched = json!({"jsonrpc": "2.0", "id": 8, "result": {}});
+        let error = ensure_json_rpc_response_id(&mismatched, 7, "tools/call")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expected 7, observed 8"));
     }
 }

@@ -849,7 +849,7 @@ impl BlackboxServer {
                     "error.project_not_registered: authoritative checkout project is absent from the registry"
                 );
             }
-            let notes_ref = git::notes_ref("provenance");
+            let notes_ref = git::notes_ref("provenance")?;
             let page = mcp_tools::provenance_plan::export_plan_page(
                 &p,
                 checkout.published_scope.clone(),
@@ -913,7 +913,7 @@ impl BlackboxServer {
             Ok(serde_json::to_string_pretty(&json!({
                 "status": "ok",
                 "edges_imported": edges_imported,
-                "notes_ref": git::notes_ref("provenance"),
+                "notes_ref": git::notes_ref("provenance")?,
             }))?)
         })
         .await

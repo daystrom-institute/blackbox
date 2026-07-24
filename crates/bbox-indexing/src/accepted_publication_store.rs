@@ -1606,7 +1606,6 @@ pub(crate) enum VerifiedAcceptedPublicationSelectionV1 {
 #[derive(Debug, Clone)]
 pub(crate) struct VerifiedAcceptedPublicationV1 {
     pub(crate) selection: VerifiedAcceptedPublicationSelectionV1,
-    pub(crate) pointer: AcceptedPublicationPointerV1,
     pub(crate) generation_id: AcceptedPublicationGenerationId,
     pub(crate) generation: AcceptedPublicationGenerationV1,
     pub(crate) generation_bytes: Vec<u8>,
@@ -1666,7 +1665,6 @@ fn verify_selected_from_pointer_locked(
         return Ok(VerifiedAcceptedPublicationV1 {
             selection: VerifiedAcceptedPublicationSelectionV1::Current,
             generation_id: pointer.accepted_generation.clone(),
-            pointer,
             generation,
             generation_bytes,
         });
@@ -1690,7 +1688,6 @@ fn verify_selected_from_pointer_locked(
     Ok(VerifiedAcceptedPublicationV1 {
         selection: VerifiedAcceptedPublicationSelectionV1::Prior,
         generation_id: prior.accepted_generation.clone(),
-        pointer,
         generation,
         generation_bytes,
     })

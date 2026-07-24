@@ -5,7 +5,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use crate::json_store::NofollowDirectory;
@@ -2392,8 +2392,10 @@ static NOTES_NAMESPACE_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLo
 /// Install the config-resolved git-notes namespace. Idempotent; first set wins.
 /// Called by the daemon at startup so corpus-core need not depend on the root
 /// crate's config loader.
-pub fn set_notes_namespace(namespace: String) {
+pub fn set_notes_namespace(namespace: String) -> Result<()> {
+    validate_notes_ref_component(&namespace, "namespace")?;
     let _ = NOTES_NAMESPACE_OVERRIDE.set(namespace);
+    Ok(())
 }
 
 pub fn notes_namespace() -> String {
@@ -2415,8 +2417,27 @@ pub const NOTE_DOCUMENT_SEPARATOR: &str = "--bbox-note-separator--";
 /// Kind `provenance` is used today. `knowledge` is reserved for v2
 /// cross-machine knowledge serialization, and future kinds should remain under
 /// this namespace instead of adding parallel `refs/notes/bbox-*` roots.
-pub fn notes_ref(kind: &str) -> String {
-    format!("refs/notes/{}/{}", notes_namespace(), kind)
+pub fn notes_ref(kind: &str) -> Result<String> {
+    let namespace = notes_namespace();
+    validate_notes_ref_component(&namespace, "namespace")?;
+    validate_notes_ref_component(kind, "kind")?;
+    Ok(format!("refs/notes/{namespace}/{kind}"))
+}
+
+fn validate_notes_ref_component(value: &str, role: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || matches!(value, "." | "..")
+        || value.starts_with('-')
+        || value.ends_with('.')
+        || value.contains("..")
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!("invalid git notes {role}");
+    }
+    Ok(())
 }
 
 pub fn write_note(root: &Path, notes_ref: &str, commit: &str, body: &str) -> Result<()> {
@@ -4185,5 +4206,27 @@ mod tests {
         fs::write(root.join(".git"), "gitdir: /outside/repository\n").unwrap();
         let authority = NofollowDirectory::open_existing(&root).unwrap().unwrap();
         assert!(open_stable_git_repository(&authority).is_err());
+    }
+
+    #[test]
+    fn git_notes_ref_components_are_structurally_confined() {
+        for accepted in ["bbox", "team.notes", "team_notes", "team-notes"] {
+            assert!(validate_notes_ref_component(accepted, "namespace").is_ok());
+        }
+        for rejected in [
+            "",
+            ".",
+            "..",
+            "-bbox",
+            "bbox/",
+            "bbox..notes",
+            "bbox.",
+            "bbox notes",
+        ] {
+            assert!(
+                validate_notes_ref_component(rejected, "namespace").is_err(),
+                "accepted {rejected:?}"
+            );
+        }
     }
 }
