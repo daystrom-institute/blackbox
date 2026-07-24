@@ -2033,8 +2033,11 @@ mod tests {
             .unwrap();
         assert_eq!(prior.status, OverlayStatus::Valid);
 
-        let unavailable = worktree.with_extension("unavailable");
-        std::fs::rename(&worktree, &unavailable).unwrap();
+        let lifecycle = server
+            .state
+            .checkout_access
+            .lifecycle_mutation_guard()
+            .unwrap();
         assert_eq!(
             server.refresh_dark_knowledge_overlay(&checkout),
             KnowledgeOverlayRefreshOutcome::PreservedTransient
@@ -2055,7 +2058,7 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.contains("refresh degraded"))
         );
-        std::fs::rename(&unavailable, &worktree).unwrap();
+        drop(lifecycle);
         let degraded_view = server
             .session_knowledge_view(Some(base.to_str().unwrap()), Some("all"))
             .unwrap();
@@ -2101,8 +2104,11 @@ mod tests {
             .cloned()
             .unwrap();
         let checkout = server.resolve_registered_checkout(&row).unwrap().unwrap();
-        let unavailable = worktree.with_extension("unavailable");
-        std::fs::rename(&worktree, &unavailable).unwrap();
+        let lifecycle = server
+            .state
+            .checkout_access
+            .lifecycle_mutation_guard()
+            .unwrap();
 
         for _ in 0..bbox_knowledge::overlay::MAX_CONSECUTIVE_TRANSIENT_PRESERVATIONS {
             assert_eq!(
@@ -2129,7 +2135,7 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.contains("refresh limit exceeded"))
         );
-        std::fs::rename(&unavailable, &worktree).unwrap();
+        drop(lifecycle);
     }
 
     #[test]
