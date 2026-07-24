@@ -13981,8 +13981,8 @@ mod tests {
 
         let failure = transact_migration_classified_with_io(
             &path,
-            plan,
-            Arc::new(TracingIo::failing_points([FaultPoint::StageWrite])),
+            plan.clone(),
+            Arc::new(TracingIo::failing_points([FaultPoint::ImmutableAssetWrite])),
         )
         .unwrap_err();
 
@@ -13993,6 +13993,26 @@ mod tests {
         assert!(paths.stage_dir.is_dir());
         assert!(paths.backup_dir.is_dir());
         assert!(!paths.journal.exists());
+        for participant in &plan.journal.participants {
+            for (root, image) in [
+                (&paths.stage_dir, &participant.new),
+                (&paths.backup_dir, &participant.old),
+            ] {
+                if let ExpectedImageV1::Present { artifact_name, .. } = image {
+                    assert!(!root.join(artifact_name.as_str()).exists());
+                }
+            }
+        }
+        assert!(fs::read_dir(&paths.stage_dir).unwrap().next().is_none());
+        assert!(fs::read_dir(&paths.backup_dir).unwrap().next().is_none());
+        for asset in &plan.journal.immutable_assets {
+            assert!(
+                !plan
+                    .registry
+                    .immutable_target(&asset.role, &asset.validated_name)
+                    .exists()
+            );
+        }
     }
 
     #[test]
