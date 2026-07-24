@@ -274,6 +274,30 @@ fn cli_runs_clean_preflight_apply_and_fresh_verify() {
     assert_redacted(&refused, &root);
     drop(held);
 
+    let projects_path = rehearsal_root.join("state/projects.json");
+    let projects_before = fs::read(&projects_path).unwrap();
+    let mut drifted_projects = projects_before.clone();
+    drifted_projects.push(b'\n');
+    fs::write(&projects_path, &drifted_projects).unwrap();
+    let drifted = run(&[
+        "project-catalog",
+        "migrate",
+        "--apply",
+        "--report",
+        report.to_str().unwrap(),
+        "--resolution",
+        resolution.to_str().unwrap(),
+        "--rehearsal-root",
+        rehearsal_root.to_str().unwrap(),
+        "--config",
+        config_path.to_str().unwrap(),
+    ]);
+    assert!(!drifted.status.success());
+    let drifted: Value = serde_json::from_slice(&drifted.stdout).unwrap();
+    assert_ne!(drifted["error"]["code"], Value::Null);
+    assert_redacted(&drifted, &root);
+    fs::write(&projects_path, projects_before).unwrap();
+
     let apply = success_json(&run(&[
         "project-catalog",
         "migrate",
