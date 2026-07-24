@@ -915,6 +915,11 @@ fn absent_legacy_catalog_is_fresh_for_first_apply_but_public_verify_fails_closed
     let rehearsal_root = root.join("empty-rehearsal");
     fs::create_dir_all(&rehearsal_root).unwrap();
     initialize_empty_owner_state(&rehearsal_root);
+    CodeSourceStore::open(
+        rehearsal_root.join("state/code-sources"),
+        project_catalog_migration_store_limits(&config),
+    )
+    .unwrap();
     let rehearsal =
         ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(&rehearsal_root, &config)
             .unwrap();
