@@ -52,6 +52,7 @@ Build and install the binaries you changed:
 
 ```bash
 cargo build --release
+install -m 755 target/release/blackbox ~/.local/bin/blackbox
 install -m 755 target/release/blackboxd ~/.local/bin/blackboxd
 install -m 755 target/release/blackboxd ~/.local/bin/blackboxd-dev
 install -m 755 target/release/bro ~/.local/bin/bro
@@ -63,6 +64,31 @@ systemctl --user restart blackbox.service
 
 Restart `blackbox-dev.service` only if you updated the dev daemon too.
 Prod and dev intentionally use different installed binary paths.
+
+### Rehearse the project-catalog migration offline
+
+The `blackbox project-catalog` commands do not contact or restart the daemon.
+In Phase 1, apply accepts only an explicit isolated rehearsal root and refuses
+the configured live state:
+
+```bash
+blackbox project-catalog migrate --preflight \
+  --state-dir /path/to/rehearsal/state \
+  --report /path/to/rehearsal/review/report.json \
+  --resolution /path/to/rehearsal/review/resolution.json
+
+blackbox project-catalog migrate --apply \
+  --report /path/to/rehearsal/review/report.json \
+  --resolution /path/to/rehearsal/review/resolution.json \
+  --rehearsal-root /path/to/rehearsal
+
+blackbox project-catalog verify --root /path/to/rehearsal
+```
+
+Use `--config`, `--state-dir`, or `--projects-path` when the source bundle does
+not come from the normal daemon configuration. Preflight is read-only except
+for the explicit review artifacts. `--include-local-paths` is preflight-only
+and writes a separate owner-sensitive report.
 
 `fleetd` is one binary for both instances (see "The fleet supervisor"
 below); restart it only when you actually changed it, because restarting it
@@ -445,6 +471,7 @@ secrets, replay), see [System events](system-events.md).
 
 | Path | Contents |
 |---|---|
+| `~/.local/bin/blackbox` | Offline administration CLI |
 | `~/.local/bin/blackboxd` | Production daemon binary |
 | `~/.local/bin/blackboxd-dev` | Dev daemon binary |
 | `~/.local/bin/bro` | Terminal TUI client |

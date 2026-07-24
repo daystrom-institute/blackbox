@@ -64,6 +64,7 @@
 
         apps = {
           default = mkProductApp "blackboxd";
+          blackbox = mkProductApp "blackbox";
           blackboxd = mkProductApp "blackboxd";
           bro = mkProductApp "bro";
           dev-home = flake-utils.lib.mkApp { drv = bbx-dev-home; };
@@ -98,7 +99,7 @@
           shellHook = ''
             export BBOX_DEV_REPO_ROOT="$(pwd)"
             echo "blackbox dev shell loaded"
-            echo "consumer outputs: nix build .#blackbox | nix run .#blackboxd | nix run .#bro"
+            echo "consumer outputs: nix build .#blackbox | nix run .#blackbox | nix run .#blackboxd | nix run .#bro"
             echo "isolated agent harness: nix run .#dev-home -- init"
           '';
         };

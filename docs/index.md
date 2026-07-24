@@ -8,10 +8,11 @@ work through `bro`. The point is not another search box. The point is that a
 fresh agent can answer "where did this come from?", "what already decided this?",
 and "which task is still alive?" without guessing from memory.
 
-The crate is `blackbox`. It produces four binaries:
+The workspace produces five operator-facing binaries:
 
 | Binary | Purpose |
 |---|---|
+| `blackbox` | Offline administration CLI. Phase 1 permits project-catalog apply only inside an explicit rehearsal root. |
 | `blackboxd` | HTTP-MCP daemon. Run one long-lived user service per host. |
 | `bro` | Terminal TUI for tailing live orchestration activity |
 | `bro-slack` | Slack sidecar bridge. Translates Slack events into the daemon's webhook pipeline. |

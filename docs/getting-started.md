@@ -16,6 +16,7 @@ Copilot, and Vibe.
 git clone https://github.com/invidious9000/transcript-search.git
 cd transcript-search
 cargo build --release
+install -m 755 target/release/blackbox  ~/.local/bin/blackbox
 install -m 755 target/release/blackboxd ~/.local/bin/blackboxd
 install -m 755 target/release/blackboxd ~/.local/bin/blackboxd-dev
 install -m 755 target/release/bro       ~/.local/bin/bro

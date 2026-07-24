@@ -73,6 +73,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 name = "blackboxd"
 path = "src/main.rs"
 
+[[bin]]
+name = "blackbox"
+path = "src/bin/blackbox.rs"
+
 # `bro` now lives in its own crate (crates/bro-cli) — §7 thin-client extraction.
 
 [dependencies]

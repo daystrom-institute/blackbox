@@ -63,12 +63,13 @@ repos. Don't waste backup space on them.
 ### Binaries - reinstall, don't back up
 
 ```
+~/.local/bin/blackbox
 ~/.local/bin/blackboxd
 ~/.local/bin/blackboxd-dev
 ~/.local/bin/bro
 ```
 
-Built from source: `cargo build --release && install -m 755 target/release/{blackboxd,bro} ~/.local/bin/ && install -d ~/.local/share/blackbox/memories && cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/`.
+Built from source: `cargo build --release && install -m 755 target/release/{blackbox,blackboxd,bro} ~/.local/bin/ && install -d ~/.local/share/blackbox/memories && cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/`.
 
 ## Configuration
 
@@ -167,6 +168,7 @@ old inode until systemd restarts it.
 ```
 ~/.local/
 ├── bin/
+│   ├── blackbox                # offline administration CLI
 │   ├── blackboxd               # prod daemon binary
 │   ├── blackboxd-dev           # dev daemon binary
 │   └── bro                     # terminal TUI client
@@ -236,6 +238,7 @@ bbox_embed_status()                      # confirm no embedding errors
 
 ```bash
 cargo build --release
+install -m 755 target/release/blackbox ~/.local/bin/blackbox
 install -m 755 target/release/blackboxd ~/.local/bin/blackboxd
 install -m 755 target/release/blackboxd ~/.local/bin/blackboxd-dev
 install -m 755 target/release/bro ~/.local/bin/bro

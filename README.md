@@ -12,7 +12,9 @@ multi-lane tail TUI. Backed by [tantivy](https://github.com/quickwit-oss/tantivy
 Voyage `voyage-code-3` (1024d) is the default embedding provider; Ollama
 `nomic-embed-text` (768d) supported as a local fallback.
 
-The crate is `blackbox`. It produces two binaries:
+The crate is `blackbox`. Its primary binaries are:
+
+- **`blackbox`** - offline administration CLI, including isolated project-catalog migration rehearsals
 - **`blackboxd`** - HTTP-MCP daemon (one long-lived user service, shared across all CLIs on the host)
 - **`bro`** - terminal TUI for tailing live orchestration activity
 
@@ -33,6 +35,7 @@ Five steps. After step 5 every agent CLI on your host is talking to the same dae
 git clone https://github.com/invidious9000/transcript-search.git
 cd transcript-search
 cargo build --release
+install -m 755 target/release/blackbox     ~/.local/bin/blackbox
 install -m 755 target/release/blackboxd    ~/.local/bin/blackboxd
 install -m 755 target/release/blackboxd    ~/.local/bin/blackboxd-dev
 install -m 755 target/release/bro          ~/.local/bin/bro
@@ -46,7 +49,7 @@ dispatch through it, and `cargo test` exercises it (the allocator scoring tests
 expect it on `PATH` or `BRO_HARNESS_BIN`). Verify a complete install with:
 
 ```bash
-for b in blackboxd blackboxd-dev bro bro-harness; do command -v "$b" || echo "MISSING: $b"; done
+for b in blackbox blackboxd blackboxd-dev bro bro-harness; do command -v "$b" || echo "MISSING: $b"; done
 ```
 
 `~/.local/bin` is on `bro`'s resolution path by default (`BRO_EXTRA_PATH`), so a
@@ -92,7 +95,7 @@ This sample unit listens on `127.0.0.1:7265/mcp` with MCP name `blackbox-dev`, w
 
 ### 2b. Build or develop with Nix, and contributor setup
 
-Nix flake outputs (`nix build .#blackbox`, `nix run .#blackboxd|.#bro`,
+Nix flake outputs (`nix build .#blackbox`, `nix run .#blackbox|.#blackboxd|.#bro`,
 `nix develop .`/`.#dev-agent`, `nix flake check`, `nix fmt`), the fully isolated
 dev-agent world, and build-performance guidance (per-worktree target isolation +
 `sccache` via `fleet.json` `project_dispatch`) now live in

@@ -127,6 +127,7 @@ The root flake separates product outputs from contributor tooling:
 
 ```bash
 nix build .#blackbox
+nix run .#blackbox
 nix run .#blackboxd
 nix run .#bro
 nix develop .
@@ -135,7 +136,7 @@ nix fmt
 ```
 
 - `packages.blackbox` / `packages.default`: build the crate for consumers
-- `apps.blackboxd` / `apps.bro`: run the shipped binaries without a local Rust toolchain
+- `apps.blackbox` / `apps.blackboxd` / `apps.bro`: run the shipped binaries without a local Rust toolchain
 - `checks.default`: validates the packaged build path that consumers use
 - `formatter`: `nix fmt` formats the flake with `nixpkgs-fmt`
 - `devShells.default`: contributor shell with Rust/Nix tooling
