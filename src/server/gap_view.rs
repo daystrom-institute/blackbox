@@ -209,10 +209,29 @@ impl BlackboxServer {
             has_legacy_compatibility_rows = true;
         }
 
-        let selected_projects = requested_record
-            .as_ref()
-            .map(|record| vec![record.clone()])
-            .unwrap_or_else(|| projects.as_ref().clone());
+        // Catalog-mode scoped views (phase-2 §10 item 2): the selector
+        // already resolved through the engine above; serving accepted
+        // published gap content for a catalog project is the phase-5
+        // catalog-keyed view wiring. Until then a scoped list returns its
+        // typed empty outcome with a diagnostic and acquires no lease.
+        let catalog_scoped_view =
+            explicit_managed_scope && !self.state.project_authority.is_bridge();
+        if catalog_scoped_view {
+            let record = requested_record.as_ref().expect("scoped view has a record");
+            diagnostics.push(format!(
+                "catalog project {} resolved; published gap views for catalog \
+                 projects land with the phase-5 catalog-keyed view wiring",
+                record.project_id
+            ));
+        }
+        let selected_projects = if catalog_scoped_view {
+            Vec::new()
+        } else {
+            requested_record
+                .as_ref()
+                .map(|record| vec![record.clone()])
+                .unwrap_or_else(|| projects.as_ref().clone())
+        };
         let mut selected_scopes = BTreeMap::<PublishedScope, ProjectRecord>::new();
         for project in selected_projects {
             match super::checkout_access::published_scope_for_project(

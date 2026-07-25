@@ -1029,6 +1029,12 @@ fn run_selector_retirement(ctx: &ActorCtx, selector: &str) -> Result<u64> {
             IndexRecordOption::Basic,
         );
         let count = searcher.search(&query, &Count)?;
+        if count == 0 {
+            // Nothing indexed under the selector (fresh or empty index).
+            // TopDocs panics on a zero limit, so the sweep short-circuits
+            // exactly like the other selector search sites.
+            return Ok(0);
+        }
         let vectors = bbox_vectors::try_global()
             .ok_or_else(|| anyhow::Error::new(IndexWriterRetryableError::VectorStoreWarming))?;
         for (_score, address) in searcher.search(&query, &TopDocs::with_limit(count))? {
@@ -1674,6 +1680,22 @@ mod tests {
             IndexRecordOption::Basic,
         );
         searcher.search(&query, &Count).unwrap()
+    }
+
+    /// Selector retirement on an index with zero documents under the
+    /// selector must short-circuit to a zero count: tantivy's `TopDocs`
+    /// panics on a zero limit, and the panic previously took the whole
+    /// retirement ack with it (surfaced by the phase-2 catalog bootsmoke
+    /// on a fresh throwaway index).
+    #[test]
+    fn selector_retirement_on_an_empty_index_returns_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = test_index(dir.path());
+        let actor = IndexWriterActor::spawn_for(&index);
+        let retired = actor
+            .retire_code_selector("local:00000000".into())
+            .expect("empty-index retirement completes");
+        assert_eq!(retired.document_count, 0);
     }
 
     #[test]

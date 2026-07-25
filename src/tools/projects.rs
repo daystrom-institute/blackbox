@@ -46,6 +46,17 @@ struct PreparedProjectArtifact {
     value: Value,
 }
 
+/// True when a lease acquisition failed only because the resolved
+/// attachment does not record the requested capability (phase-2 §9.1
+/// enrichment degradation; only the catalog authority can produce it).
+fn capability_denied(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<bbox_indexing::checkout_access::CheckoutAccessError>()
+        .is_some_and(|error| {
+            error.code == bbox_indexing::checkout_access::CheckoutAccessErrorCode::CapabilityDenied
+        })
+}
+
 // The registration path invokes this helper only from its surrounding
 // `spawn_blocking` phase. Keeping the filesystem read here preserves the
 // prepare-then-publish boundary while making the blocking-pool contract explicit.
@@ -356,107 +367,143 @@ impl BlackboxServer {
     /// kb registration, and the transcript-edge backfill, all behind the
     /// same capability leases in both authority modes. Blocking work: call
     /// from the blocking pool only.
+    ///
+    /// Capability semantics: a catalog attachment records what its checkout
+    /// shape supports; a step whose capability is not recorded is skipped
+    /// and reported, never a registration failure.
     fn run_post_register_pipeline(
         &self,
         record: crate::projects::ProjectRecord,
     ) -> anyhow::Result<serde_json::Value> {
         let server = self.clone();
+        // Capability-gated enrichment (phase-2 §9.1): an attachment that
+        // does not record a step's capability skips that step. The
+        // version-1 authority records no capability bits and never denies,
+        // so bridge-mode enrichment is unchanged; catalog attachments
+        // enrich to exactly what their observed checkout shape supports.
+        let mut skipped_enrichment: Vec<&'static str> = Vec::new();
         {
-            let migration_lease = crate::server::checkout_access::acquire_selected_project_access(
+            match crate::server::checkout_access::acquire_selected_project_access(
                 &server.state.checkout_access,
                 &record.project_id,
                 CheckoutAccessKind::RepositoryMutation,
                 CheckoutAccessIntent::Write,
-            )?;
-            let migration_publication = server
-                .state
-                .checkout_access
-                .publication_guard(&migration_lease)
-                .map_err(anyhow::Error::new)?;
-            orchestration::mcp::migrate_project_mcp_path(migration_lease.project_root())?;
-            drop(migration_publication);
-            let artifact_lease = crate::server::checkout_access::acquire_selected_project_access(
+            ) {
+                Ok(migration_lease) => {
+                    let migration_publication = server
+                        .state
+                        .checkout_access
+                        .publication_guard(&migration_lease)
+                        .map_err(anyhow::Error::new)?;
+                    orchestration::mcp::migrate_project_mcp_path(migration_lease.project_root())?;
+                    drop(migration_publication);
+                }
+                Err(error) if capability_denied(&error) => {
+                    skipped_enrichment.push("mcp_migration");
+                }
+                Err(error) => return Err(error),
+            }
+            let mut project_config_loaded = false;
+            match crate::server::checkout_access::acquire_selected_project_access(
                 &server.state.checkout_access,
                 &record.project_id,
                 CheckoutAccessKind::ArtifactWatchDiscovery,
                 CheckoutAccessIntent::Read,
-            )?;
-            let project_config = config::load_project(artifact_lease.project_root())?;
-            if project_config.mcp.enabled == Some(false) {
-                tracing::info!(
-                    "Project MCP is disabled via {}",
-                    artifact_lease
-                        .project_root()
-                        .join(".bbox/config.toml")
-                        .display()
-                );
-            }
-            let prepared_artifacts = if project_config.artifacts.auto_discover != Some(false) {
-                prepare_project_artifacts(artifact_lease.project_root())?
-            } else {
-                Vec::new()
-            };
-            let artifact_publication = server
-                .state
-                .checkout_access
-                .publication_guard(&artifact_lease)
-                .map_err(anyhow::Error::new)?;
-            let installed = publish_project_artifacts(
-                prepared_artifacts,
-                &record.project_id,
-                &server.state.artifacts.read(),
-            );
-            if !installed.is_empty() {
-                tracing::info!(
-                    "Installed {} project artifact(s) for {}",
-                    installed.len(),
-                    record.project_id
-                );
-            }
-            drop(artifact_publication);
-            let project_config_loaded = true;
-            let edges_dir = edge_index::edges_dir_from_bro_store(&server.state.store_dir);
-            let provenance_lease = crate::server::checkout_access::acquire_selected_project_access(
-                &server.state.checkout_access,
-                &record.project_id,
-                CheckoutAccessKind::ProvenanceNoteIo,
-                CheckoutAccessIntent::Read,
-            )?;
-            let provenance_project = mcp_tools::provenance::ProvenanceProject {
-                project_id: record.project_id.clone(),
-                project_root: provenance_lease.project_root().to_path_buf(),
-            };
-            let resolve_legacy_target =
-                |project_id: &str,
-                 root: &Path,
-                 absolute_path: &Path,
-                 byte_range: Option<(u64, u64)>| {
-                    if project_id != record.project_id {
-                        anyhow::bail!(
-                            "error.project_mismatch: provenance target belongs to another project"
+            ) {
+                Ok(artifact_lease) => {
+                    let project_config = config::load_project(artifact_lease.project_root())?;
+                    project_config_loaded = true;
+                    if project_config.mcp.enabled == Some(false) {
+                        tracing::info!(
+                            "Project MCP is disabled via {}",
+                            artifact_lease
+                                .project_root()
+                                .join(".bbox/config.toml")
+                                .display()
                         );
                     }
-                    bbox_indexing::index::resolve_current_project_chunk_entity(
-                        &record,
-                        root,
-                        absolute_path,
-                        byte_range,
-                    )
+                    let prepared_artifacts =
+                        if project_config.artifacts.auto_discover != Some(false) {
+                            prepare_project_artifacts(artifact_lease.project_root())?
+                        } else {
+                            Vec::new()
+                        };
+                    let artifact_publication = server
+                        .state
+                        .checkout_access
+                        .publication_guard(&artifact_lease)
+                        .map_err(anyhow::Error::new)?;
+                    let installed = publish_project_artifacts(
+                        prepared_artifacts,
+                        &record.project_id,
+                        &server.state.artifacts.read(),
+                    );
+                    if !installed.is_empty() {
+                        tracing::info!(
+                            "Installed {} project artifact(s) for {}",
+                            installed.len(),
+                            record.project_id
+                        );
+                    }
+                    drop(artifact_publication);
+                }
+                Err(error) if capability_denied(&error) => {
+                    skipped_enrichment.push("artifact_discovery");
+                }
+                Err(error) => return Err(error),
+            }
+            let edges_dir = edge_index::edges_dir_from_bro_store(&server.state.store_dir);
+            let provenance_lease =
+                match crate::server::checkout_access::acquire_selected_project_access(
+                    &server.state.checkout_access,
+                    &record.project_id,
+                    CheckoutAccessKind::ProvenanceNoteIo,
+                    CheckoutAccessIntent::Read,
+                ) {
+                    Ok(lease) => Some(lease),
+                    Err(error) if capability_denied(&error) => {
+                        skipped_enrichment.push("provenance_import");
+                        None
+                    }
+                    Err(error) => return Err(error),
                 };
-            let prepared_provenance = mcp_tools::provenance::prepare_provenance_import(
-                std::slice::from_ref(&provenance_project),
-                &resolve_legacy_target,
-            )?;
-            let provenance_publication = server
-                .state
-                .checkout_access
-                .publication_guard(&provenance_lease)
-                .map_err(anyhow::Error::new)?;
-            mcp_tools::provenance::publish_prepared_provenance_import(
-                prepared_provenance,
-                &edges_dir,
-            )?;
-            drop(provenance_publication);
+            if let Some(provenance_lease) = provenance_lease {
+                let provenance_project = mcp_tools::provenance::ProvenanceProject {
+                    project_id: record.project_id.clone(),
+                    project_root: provenance_lease.project_root().to_path_buf(),
+                };
+                let resolve_legacy_target =
+                    |project_id: &str,
+                     root: &Path,
+                     absolute_path: &Path,
+                     byte_range: Option<(u64, u64)>| {
+                        if project_id != record.project_id {
+                            anyhow::bail!(
+                                "error.project_mismatch: provenance target belongs to another project"
+                            );
+                        }
+                        bbox_indexing::index::resolve_current_project_chunk_entity(
+                            &record,
+                            root,
+                            absolute_path,
+                            byte_range,
+                        )
+                    };
+                let prepared_provenance = mcp_tools::provenance::prepare_provenance_import(
+                    std::slice::from_ref(&provenance_project),
+                    &resolve_legacy_target,
+                )?;
+                let provenance_publication = server
+                    .state
+                    .checkout_access
+                    .publication_guard(&provenance_lease)
+                    .map_err(anyhow::Error::new)?;
+                mcp_tools::provenance::publish_prepared_provenance_import(
+                    prepared_provenance,
+                    &edges_dir,
+                )?;
+                drop(provenance_publication);
+            }
             // Register with the live .bbox/ watcher so future file changes
             // are picked up without a daemon restart.
             if let Ok(mut guard) = server.state.bbox_watcher.lock() {
@@ -547,6 +594,7 @@ impl BlackboxServer {
             let response = json!({
                 "record": record,
                 "project_config_loaded": project_config_loaded,
+                "skipped_enrichment": skipped_enrichment,
                 "indexing": {
                     "status": "scheduled",
                     "mode": "background",
