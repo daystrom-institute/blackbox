@@ -17,6 +17,7 @@ use bbox_stores::store_persister::StoreSnapshot;
 use bbox_corpus_core::query::{QueryAtom, QueryNode, parse_query};
 
 use crate::repo_io::{KnowledgeRepoCarrier, KnowledgeRepoRead, KnowledgeRepoWrite};
+use bbox_corpus_core::project_selector::project_scope_matches;
 
 // ── MCP parameter structs ─────────────────────────────────────────
 //
@@ -62,6 +63,11 @@ pub struct LearnParams {
     /// Update existing entry by ID
     #[serde(default)]
     pub id: Option<String>,
+    /// Internal, not part of the MCP schema: the resolving authority's
+    /// project id. Set by the daemon adapter from the resolver, never
+    /// accepted from the wire, so identity cannot be caller-asserted.
+    #[serde(skip)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema, Default)]
@@ -90,6 +96,11 @@ pub struct RememberParams {
     /// ISO 8601 expiry
     #[serde(default)]
     pub expires_at: Option<String>,
+    /// Internal, not part of the MCP schema: the resolving authority's
+    /// project id. Set by the daemon adapter from the resolver, never
+    /// accepted from the wire, so identity cannot be caller-asserted.
+    #[serde(skip)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
@@ -129,6 +140,10 @@ pub struct KnowledgeListParams {
     /// visible alongside the base project's entries.
     #[serde(skip)]
     pub project_alias: Option<String>,
+    /// Project id from the resolver. When both this and a row carry an
+    /// id, the id decides and the path predicate is not consulted.
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -250,6 +265,11 @@ pub struct DecideParams {
     /// Render into provider markdown files (default: true)
     #[serde(default)]
     pub render: Option<bool>,
+    /// Internal, not part of the MCP schema: the resolving authority's
+    /// project id. Set by the daemon adapter from the resolver, never
+    /// accepted from the wire, so identity cannot be caller-asserted.
+    #[serde(skip)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -441,6 +461,10 @@ pub struct KnowledgeEntry {
     pub scope: Scope,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Resolving authority's project id, stamped on write. Absent on rows
+    /// written before the catalog cut: those stay on the path lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     #[serde(default)]
     pub providers: Vec<String>,
     pub priority: Priority,
@@ -2438,6 +2462,7 @@ impl Knowledge {
             category,
             scope,
             project: p.project.clone(),
+            project_id: p.project_id.clone(),
             providers,
             priority,
             weight,
@@ -2544,6 +2569,7 @@ impl Knowledge {
             category,
             scope,
             project: p.project.clone(),
+            project_id: p.project_id.clone(),
             providers: Vec::new(),
             priority: Priority::Standard,
             weight: 100,
@@ -2683,6 +2709,7 @@ impl Knowledge {
             category: Category::Decision,
             scope,
             project: p.project.clone(),
+            project_id: p.project_id.clone(),
             providers: Vec::new(),
             priority,
             weight: 100,
@@ -2808,6 +2835,7 @@ impl Knowledge {
         let scope_filter = p.scope.as_deref();
         let project_filter = p.project.as_deref();
         let project_alias_filter = p.project_alias.as_deref();
+        let project_id_filter = p.project_id.as_deref();
         let provider_filter = p.provider.as_deref();
         let status_filter = p.status.as_deref().unwrap_or("active");
         let approval_filter = p.approval.as_deref();
@@ -2856,17 +2884,20 @@ impl Knowledge {
                         }
                     }
                 }
-                if let Some(p) = project_filter {
-                    match &e.project {
-                        Some(ep) => {
-                            let alias_hit =
-                                project_alias_filter.is_some_and(|alias| ep.contains(alias));
-                            if !ep.contains(p) && !alias_hit {
-                                return None;
+                // Dual-read (plan §8.2): ids on both sides decide, whatever the
+                // paths say; either side missing an id keeps the path predicate.
+                if let Some(p) = project_filter
+                    && !project_scope_matches(e.project_id.as_deref(), project_id_filter, || {
+                        match &e.project {
+                            Some(ep) => {
+                                ep.contains(p)
+                                    || project_alias_filter.is_some_and(|alias| ep.contains(alias))
                             }
+                            None => false,
                         }
-                        None => return None,
-                    }
+                    })
+                {
+                    return None;
                 }
                 if let Some(prov) = provider_filter {
                     if !e.providers.is_empty() && !e.providers.iter().any(|p| p == prov) {
@@ -4136,6 +4167,7 @@ mod tests {
             category: Category::Memory,
             scope: Scope::Project,
             project: Some("/tmp/proj".into()),
+            project_id: None,
             providers: vec![],
             priority: Priority::Standard,
             weight: 100,
@@ -4172,6 +4204,7 @@ mod tests {
             category: Category::Memory,
             scope,
             project: None,
+            project_id: None,
             providers: vec![],
             priority: Priority::Standard,
             weight: 100,
@@ -5157,6 +5190,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             category: Category::Memory,
             scope: Scope::Global,
             project: None,
+            project_id: None,
             providers: vec![],
             priority: Priority::Standard,
             weight: 100,
@@ -5351,6 +5385,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                     title: None,
                     scope: None,
                     project: None,
+                    project_id: None,
                     priority: None,
                     render: None,
                 },
@@ -5372,6 +5407,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                     title: None,
                     scope: None,
                     project: None,
+                    project_id: None,
                     priority: None,
                     render: None,
                 },
@@ -5391,6 +5427,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                     title: None,
                     scope: None,
                     project: None,
+                    project_id: None,
                     priority: None,
                     render: None,
                 },
@@ -5419,6 +5456,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                     title: None,
                     scope: None,
                     project: None,
+                    project_id: None,
                     priority: None,
                     render: None,
                 },
@@ -5448,6 +5486,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                     title: None,
                     scope: Some("project".into()),
                     project: Some(project.clone()),
+                    project_id: None,
                     priority: None,
                     render: None,
                 },
@@ -5467,6 +5506,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                     title: None,
                     scope: Some("project".into()),
                     project: Some(project.clone()),
+                    project_id: None,
                     priority: None,
                     render: None,
                 },
@@ -5530,6 +5570,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             category: Category::Convention,
             scope: Scope::Project,
             project: None,
+            project_id: None,
             providers: Vec::new(),
             priority: Priority::Standard,
             weight: 100,
@@ -5594,6 +5635,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                 title: Some("checkout mutation updated".into()),
                 scope: Some("project".into()),
                 project: Some(durable_project.clone()),
+                project_id: None,
                 providers: None,
                 priority: None,
                 weight: None,
@@ -5689,6 +5731,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                     title: Some("test before push".into()),
                     scope: Some("project".into()),
                     project: Some(proj.clone()),
+                    project_id: None,
                     providers: None,
                     priority: None,
                     weight: None,
@@ -5778,6 +5821,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                     title: Some("tls backend".into()),
                     scope: Some("project".into()),
                     project: Some(worktree_root.to_string_lossy().into_owned()),
+                    project_id: None,
                     providers: None,
                     priority: None,
                     weight: None,
@@ -5841,6 +5885,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                     title: Some("test before push".into()),
                     scope: Some("project".into()),
                     project: Some(proj.clone()),
+                    project_id: None,
                     providers: None,
                     priority: None,
                     weight: None,
@@ -5880,6 +5925,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                     title: Some("fd over find".into()),
                     scope: Some("global".into()),
                     project: None,
+                    project_id: None,
                     providers: None,
                     priority: None,
                     weight: None,
@@ -5923,6 +5969,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                     title: Some("legacy project rule".into()),
                     scope: Some("project".into()),
                     project: Some(proj.clone()),
+                    project_id: None,
                     providers: None,
                     priority: None,
                     weight: None,
@@ -6017,6 +6064,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             category: Category::Convention,
             scope: Scope::Project,
             project: Some(repo_root.to_string_lossy().to_string()),
+            project_id: None,
             providers: vec![],
             priority: Priority::Standard,
             weight: 100,
@@ -6104,6 +6152,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             category: Category::Convention,
             scope: Scope::Project,
             project: Some(repo_root.to_string_lossy().to_string()),
+            project_id: None,
             providers: vec![],
             priority: Priority::Standard,
             weight: 100,
@@ -6184,6 +6233,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                 title: Some("g".into()),
                 scope: Some("global".into()),
                 project: None,
+                project_id: None,
                 providers: None,
                 priority: None,
                 weight: None,
@@ -6356,6 +6406,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                 category: Category::Convention,
                 scope: Scope::Project,
                 project: Some(proj.clone()),
+                project_id: None,
                 providers: vec![],
                 priority: Priority::Standard,
                 weight: 100,
@@ -6420,6 +6471,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             category: Category::Convention,
             scope: Scope::Project,
             project: None,
+            project_id: None,
             providers: vec![],
             priority: Priority::Standard,
             weight: 100,
@@ -6550,6 +6602,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                     title: Some("new title".into()),
                     scope: Some("project".into()),
                     project: Some("/tmp/proj".into()),
+                    project_id: None,
                     providers: None,
                     priority: None,
                     weight: None,
@@ -6588,6 +6641,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                     title: Some("same title".into()),
                     scope: Some("global".into()),
                     project: None,
+                    project_id: None,
                     providers: None,
                     priority: None,
                     weight: None,
@@ -6618,6 +6672,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                     title: Some("same title".into()),
                     scope: Some("project".into()),
                     project: Some("/tmp/proj".into()),
+                    project_id: None,
                     providers: None,
                     priority: Some("standard".into()),
                     weight: Some(100),
@@ -6644,6 +6699,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             category: Category::Convention,
             scope: Scope::Project,
             project: Some(project.into()),
+            project_id: None,
             providers: vec![],
             priority: Priority::Standard,
             weight: 10,
@@ -6680,6 +6736,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                 category: Category::Convention,
                 scope: Scope::Project,
                 project: Some(project.into()),
+                project_id: None,
                 providers: vec![],
                 priority: Priority::Standard,
                 weight,
@@ -6741,6 +6798,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             category: Category::Memory,
             scope: Scope::Project,
             project: Some(project.into()),
+            project_id: None,
             providers: vec![],
             priority: Priority::Standard,
             weight: 100,
@@ -6789,6 +6847,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             category: Category::Memory,
             scope: Scope::Project,
             project: Some(project.into()),
+            project_id: None,
             providers: vec![],
             priority: Priority::Standard,
             weight: 100,
@@ -6832,6 +6891,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             category: Category::Convention,
             scope: Scope::Global,
             project: None,
+            project_id: None,
             providers: vec![],
             priority: Priority::Standard,
             weight: 10,
@@ -6859,6 +6919,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             category: Category::Convention,
             scope: Scope::Global,
             project: None,
+            project_id: None,
             providers: vec!["claude".into()],
             priority: Priority::Standard,
             weight: 20,
@@ -6922,6 +6983,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             category: Category::Memory,
             scope: Scope::Project,
             project: Some(project.into()),
+            project_id: None,
             providers: vec![],
             priority: Priority::Standard,
             weight: 100,
@@ -7018,6 +7080,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                     title: None,
                     scope: Some("project".into()),
                     project: Some("/tmp/proj".into()),
+                    project_id: None,
                     providers: None,
                     priority: None,
                     weight: None,
@@ -7209,6 +7272,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             category: Category::Convention,
             scope: Scope::Project,
             project: None,
+            project_id: None,
             providers: vec![],
             priority: Priority::Standard,
             weight: 100,
@@ -7316,5 +7380,113 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         // Dropping the root clears the label.
         kb.set_project_roots(vec![]).unwrap();
         assert_eq!(kb.provenance_of("e1"), EntryProvenance::Unknown);
+    }
+
+    // ── Dual-read (plan §8.2) ────────────────────────────────────────────
+
+    fn dual_read_entry(id: &str, project: &str, project_id: Option<&str>) -> KnowledgeEntry {
+        let mut row = entry(id, "dual read", "dual read content", Scope::Project);
+        row.project = Some(project.into());
+        row.project_id = project_id.map(str::to_string);
+        row
+    }
+
+    #[test]
+    fn knowledge_row_without_project_id_decodes_and_round_trips() {
+        let legacy = serde_json::json!({
+            "id": "kb000001",
+            "title": "t",
+            "content": "c",
+            "category": "memory",
+            "scope": "project",
+            "project": "/repo/old",
+            "priority": "standard",
+            "status": "active",
+            "approval": "user_confirmed",
+            "source": "test",
+            "created_at": "2026-07-24T00:00:00Z",
+            "updated_at": "2026-07-24T00:00:00Z"
+        });
+        let row: KnowledgeEntry = serde_json::from_value(legacy).unwrap();
+        assert_eq!(row.project_id, None);
+        assert!(
+            serde_json::to_value(&row)
+                .unwrap()
+                .get("project_id")
+                .is_none()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kb.json");
+        let mut kb = Knowledge::open(&path).unwrap();
+        kb.store.entries.push(row);
+        kb.save().unwrap();
+        let reopened = Knowledge::open(&path).unwrap();
+        assert_eq!(reopened.store.entries.len(), 1);
+        assert_eq!(reopened.store.entries[0].project_id, None);
+    }
+
+    #[test]
+    fn knowledge_project_id_match_wins_over_a_different_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut kb = Knowledge::open(&dir.path().join("kb.json")).unwrap();
+        kb.store
+            .entries
+            .push(dual_read_entry("kbaaaaaa", "/repo/old", Some("abc12345")));
+
+        let out = kb
+            .list(&KnowledgeListParams {
+                project: Some("/repo/relocated".into()),
+                project_id: Some("abc12345".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(out.contains("kbaaaaaa"), "id arm must match: {out}");
+    }
+
+    #[test]
+    fn knowledge_without_ids_falls_back_to_the_exact_path_arm() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut kb = Knowledge::open(&dir.path().join("kb.json")).unwrap();
+        kb.store
+            .entries
+            .push(dual_read_entry("kbbbbbbb", "/repo/old", None));
+
+        let miss = kb
+            .list(&KnowledgeListParams {
+                project: Some("/repo/relocated".into()),
+                project_id: Some("abc12345".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!miss.contains("kbbbbbbb"), "path arm must decide: {miss}");
+
+        let hit = kb
+            .list(&KnowledgeListParams {
+                project: Some("/repo/old".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(hit.contains("kbbbbbbb"), "path arm must match: {hit}");
+    }
+
+    #[test]
+    fn knowledge_mismatched_ids_hide_the_row_at_the_same_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut kb = Knowledge::open(&dir.path().join("kb.json")).unwrap();
+        kb.store
+            .entries
+            .push(dual_read_entry("kbcccccc", "/repo/old", Some("abc12345")));
+
+        // Same path key, different ids: the id decides against the row, so a
+        // path reused after a retire-and-add cannot leak the old rows.
+        let out = kb
+            .list(&KnowledgeListParams {
+                project: Some("/repo/old".into()),
+                project_id: Some("def67890".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!out.contains("kbcccccc"), "id mismatch must hide: {out}");
     }
 }

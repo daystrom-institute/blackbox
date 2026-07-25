@@ -557,6 +557,7 @@ mod tests {
             name: Some("thread embeddings".into()),
             topic: "embed inline thread notes".into(),
             project: "/repo/blackbox".into(),
+            project_id: None,
             record_dir: None,
             status: ThreadStatus::Active,
             kind: Some(ThreadKind::WorkItem),

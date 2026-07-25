@@ -49,6 +49,34 @@ pub enum SelectorClass {
     Filter,
 }
 
+/// Dual-read resolution (phase-2 plan §8.2), in one place.
+///
+/// When BOTH the stored row and the query carry a project id, the ids decide:
+/// equal is a match, unequal is not, whatever the two path keys say. When
+/// either side has no id, the owner store's existing path predicate decides,
+/// byte for byte as before ids existed.
+///
+/// Why the id decides rather than falling through to the path: on the
+/// version-1 bridge ids are path-derived, so the same path always yields the
+/// same eight-hex and "both ids present but unequal with a matching path" is
+/// unrepresentable, which keeps bridge parity unconditional. Under the catalog
+/// ids are minted at random, so reusing a path after a retire-and-add mints a
+/// different id; falling through would leak the retired project's rows into
+/// the new project's queries, which is the cross-project bleed the identity
+/// cut exists to prevent. The plan's "no read path drops a row it would have
+/// matched before" holds because the only droppable case cannot occur in
+/// pre-catalog state.
+pub fn project_scope_matches(
+    row_project_id: Option<&str>,
+    query_project_id: Option<&str>,
+    path_matches: impl FnOnce() -> bool,
+) -> bool {
+    match (row_project_id, query_project_id) {
+        (Some(row), Some(query)) => row == query,
+        _ => path_matches(),
+    }
+}
+
 /// Session-authoritative checkout identity supplied by the daemon when a
 /// request runs inside a pinned session checkout. Used only by the final
 /// legacy fallback arm and by attachment selection; never trusted from

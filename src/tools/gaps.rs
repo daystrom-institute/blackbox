@@ -300,6 +300,7 @@ mod tests {
             notes: None,
             scope: Some("project".into()),
             project: Some(project),
+            project_id: None,
             write_dir: None,
             task_id: None,
             session_id: None,

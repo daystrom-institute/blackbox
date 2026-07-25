@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::store_persister::StoreSnapshot;
+use bbox_corpus_core::project_selector::project_scope_matches;
 
 // ── Item model ─────────────────────────────────────────────────────
 
@@ -157,6 +158,10 @@ pub struct RoadmapItem {
     pub scope: String, // "global" or "project"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Resolving authority's project id, stamped on write. Absent on rows
+    /// written before the catalog cut: those stay on the path lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -359,6 +364,7 @@ impl Roadmap {
         priority: RoadmapPriority,
         scope: String,
         project: Option<String>,
+        project_id: Option<String>,
         actor: Option<String>,
     ) -> Result<&RoadmapItem> {
         let now = Self::now_iso();
@@ -372,6 +378,7 @@ impl Roadmap {
             priority,
             scope,
             project,
+            project_id,
             created_at: now.clone(),
             updated_at: now,
             transitions: Vec::new(),
@@ -461,6 +468,7 @@ impl Roadmap {
         status: Option<&str>,
         category: Option<&str>,
         project: Option<&str>,
+        project_id: Option<&str>,
     ) -> Vec<&RoadmapItem> {
         self.store
             .items
@@ -491,11 +499,12 @@ impl Roadmap {
                     if i.scope == "global" {
                         return true;
                     }
-                    if let Some(ref ip) = i.project {
-                        if !ip.contains(p) {
-                            return false;
-                        }
-                    }
+                    // Dual-read (plan §8.2): ids on both sides decide, whatever
+                    // the paths say; either side missing an id keeps the path
+                    // predicate.
+                    return project_scope_matches(i.project_id.as_deref(), project_id, || {
+                        i.project.as_deref().is_none_or(|ip| ip.contains(p))
+                    });
                 }
                 true
             })
@@ -1129,6 +1138,7 @@ mod tests {
                 RoadmapPriority::High,
                 "project".to_string(),
                 Some(root.to_string_lossy().into_owned()),
+                None,
                 Some("test".to_string()),
             )
             .unwrap()
@@ -1156,6 +1166,7 @@ mod tests {
             priority: RoadmapPriority::High,
             scope: "global".to_string(),
             project: None,
+            project_id: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-02T00:00:00Z".to_string(),
             transitions: vec![RoadmapTransition {
@@ -1229,5 +1240,105 @@ mod tests {
             !out.contains("Test item"),
             "delivered item should be excluded from default template"
         );
+    }
+
+    // ── Dual-read (plan §8.2) ────────────────────────────────────────────
+
+    fn dual_read_item(id: &str, project: &str, project_id: Option<&str>) -> RoadmapItem {
+        RoadmapItem {
+            id: id.into(),
+            title: "dual read item".into(),
+            body: "body".into(),
+            status: RoadmapStatus::Proposed,
+            category: RoadmapCategory::Refactor,
+            priority: RoadmapPriority::Medium,
+            scope: "project".into(),
+            project: Some(project.into()),
+            project_id: project_id.map(str::to_string),
+            created_at: "2026-07-24T00:00:00Z".into(),
+            updated_at: "2026-07-24T00:00:00Z".into(),
+            transitions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn roadmap_row_without_project_id_decodes_and_round_trips() {
+        let legacy = serde_json::json!({
+            "id": "rm-legacy",
+            "title": "t",
+            "body": "b",
+            "status": "proposed",
+            "category": "refactor",
+            "priority": "medium",
+            "scope": "project",
+            "project": "/repo/old",
+            "created_at": "2026-07-24T00:00:00Z",
+            "updated_at": "2026-07-24T00:00:00Z"
+        });
+        let item: RoadmapItem = serde_json::from_value(legacy).unwrap();
+        assert_eq!(item.project_id, None);
+        assert!(
+            serde_json::to_value(&item)
+                .unwrap()
+                .get("project_id")
+                .is_none()
+        );
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("roadmap.json");
+        let mut roadmap = Roadmap::open(&path).unwrap();
+        roadmap.store.items.push(item);
+        std::fs::write(
+            &path,
+            serde_json::to_string(&roadmap.snapshot().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let reopened = Roadmap::open(&path).unwrap();
+        assert_eq!(reopened.store.items.len(), 1);
+        assert_eq!(reopened.store.items[0].project_id, None);
+    }
+
+    #[test]
+    fn roadmap_project_id_match_wins_over_a_different_path() {
+        let dir = tempdir().unwrap();
+        let mut roadmap = Roadmap::open(&dir.path().join("roadmap.json")).unwrap();
+        roadmap
+            .store
+            .items
+            .push(dual_read_item("rm-aaaaaaaa", "/repo/old", Some("abc12345")));
+
+        let hits = roadmap.list(None, None, Some("/repo/relocated"), Some("abc12345"));
+        assert_eq!(hits.len(), 1, "id arm must match");
+    }
+
+    #[test]
+    fn roadmap_without_ids_falls_back_to_the_exact_path_arm() {
+        let dir = tempdir().unwrap();
+        let mut roadmap = Roadmap::open(&dir.path().join("roadmap.json")).unwrap();
+        roadmap
+            .store
+            .items
+            .push(dual_read_item("rm-bbbbbbbb", "/repo/old", None));
+
+        let miss = roadmap.list(None, None, Some("/repo/relocated"), Some("abc12345"));
+        assert!(miss.is_empty(), "path arm must decide");
+
+        let hit = roadmap.list(None, None, Some("/repo/old"), None);
+        assert_eq!(hit.len(), 1, "path arm must match");
+    }
+
+    #[test]
+    fn roadmap_mismatched_ids_hide_the_row_at_the_same_path() {
+        let dir = tempdir().unwrap();
+        let mut roadmap = Roadmap::open(&dir.path().join("roadmap.json")).unwrap();
+        roadmap
+            .store
+            .items
+            .push(dual_read_item("rm-cccccccc", "/repo/old", Some("abc12345")));
+
+        // Same path key, different ids: the id decides against the row, so a
+        // path reused after a retire-and-add cannot leak the old rows.
+        let hits = roadmap.list(None, None, Some("/repo/old"), Some("def67890"));
+        assert!(hits.is_empty(), "id mismatch must hide");
     }
 }

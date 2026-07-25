@@ -130,8 +130,11 @@ impl BlackboxServer {
 
     fn handle_mcp_surface_describe(&self, p: &McpSurfaceParams) -> anyhow::Result<String> {
         let packets = self.state.packets.read();
-        let loaded =
-            packets.load_latest_by_domain(surface::SURFACE_ROUTING_DOMAIN, p.project.as_deref());
+        let loaded = packets.load_latest_by_domain(
+            surface::SURFACE_ROUTING_DOMAIN,
+            p.project.as_deref(),
+            None,
+        );
         let packet = loaded?.ok_or_else(|| {
             anyhow::anyhow!(
                 "no mcp-surface/routing packet found{}",
@@ -219,6 +222,7 @@ mod tests {
                 prefix_inference: Some(Default::default()),
                 scope: Some(scope.to_string()),
                 project: project.map(|s| s.to_string()),
+                project_id: None,
                 source_ids: None,
                 rank_lookup_key: None,
                 rank_table: None,

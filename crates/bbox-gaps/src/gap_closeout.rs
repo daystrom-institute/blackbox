@@ -152,6 +152,7 @@ mod tests {
                 notes: None,
                 scope: Some("global".into()),
                 project: None,
+                project_id: None,
                 write_dir: None,
                 task_id: None,
                 session_id: None,

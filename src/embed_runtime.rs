@@ -1686,6 +1686,7 @@ pub(crate) fn maybe_detect_knowledge_contradiction(
             source.id, entry_b.id, cosine
         );
         if let Err(err) = state.notes.write().create(&NoteParams {
+            project_id: None,
             kind: "surprise".into(),
             body,
             task_id: None,
@@ -2077,6 +2078,7 @@ mod tests {
                 id: None,
                 topic: Some("status coverage thread".into()),
                 project: Some("/repo".into()),
+                project_id: None,
                 session_id: None,
                 provider: None,
                 session_name: None,

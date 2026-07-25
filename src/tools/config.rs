@@ -218,6 +218,7 @@ impl BlackboxServer {
             authoring_session_id: p.authoring_session_id,
             version: 1,
             project_dir: p.project_dir,
+            project_id: None,
             posted_at: util::now_iso(),
         };
         match self.state.slack_proposal_links.record(link) {

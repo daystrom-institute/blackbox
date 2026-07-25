@@ -247,6 +247,7 @@ impl BlackboxServer {
                 scope,
                 project,
                 None,
+                None,
             )?
             .clone()
         };
@@ -329,6 +330,7 @@ impl BlackboxServer {
             p.status.as_deref(),
             p.category.as_deref(),
             p.project.as_deref(),
+            None,
         );
         let th = self.state.threads.read();
         let limit = p.limit.unwrap_or(50).min(500);
@@ -583,6 +585,7 @@ impl BlackboxServer {
             topic: Some(thread_topic),
             kind: Some("work_item".into()),
             project: thread_project,
+            project_id: None,
             handoff_doc: Some(thread_note),
             name: None,
             id: None,

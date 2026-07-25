@@ -232,6 +232,7 @@ mod tests {
                 task_id: None,
                 session_id: None,
                 project: Some(wt.clone()),
+                project_id: None,
                 thread_id: None,
                 provider: None,
                 bro: None,

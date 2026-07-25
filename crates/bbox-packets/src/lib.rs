@@ -22,6 +22,7 @@ use anyhow::{Context, Result};
 pub use apply::*;
 pub use ast::*;
 pub use audit::*;
+use bbox_corpus_core::project_selector::project_scope_matches;
 use coerce::*;
 pub use compile::*;
 pub use events::*;
@@ -110,6 +111,10 @@ pub struct Packet {
     pub scope: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Resolving authority's project id, stamped on write. Absent on rows
+    /// written before the catalog cut: those stay on the path lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
 
     /// Lookup: role-name → rank. Augments the entity at eval time when
     /// `rank_lookup_key` resolves to a string present in this table.
@@ -568,6 +573,7 @@ impl Packets {
         &self,
         domain: &str,
         project: Option<&str>,
+        project_id: Option<&str>,
     ) -> Result<Option<Packet>> {
         let all = self.list_all()?;
 
@@ -584,7 +590,13 @@ impl Packets {
         // If project specified, look for project-scoped packet first
         if let Some(proj) = project {
             for packet in &matches {
-                if packet.scope == "project" && packet.project.as_deref() == Some(proj) {
+                // Dual-read (plan §8.2): ids on both sides decide, whatever the
+                // paths say; either side missing an id keeps the path predicate.
+                if packet.scope == "project"
+                    && project_scope_matches(packet.project_id.as_deref(), project_id, || {
+                        packet.project.as_deref() == Some(proj)
+                    })
+                {
                     return Ok(Some((*packet).clone()));
                 }
             }
@@ -850,6 +862,7 @@ impl Packets {
             domain: p.domain.clone(),
             scope: scope.to_string(),
             project: p.project.clone(),
+            project_id: p.project_id.clone(),
             rank_table,
             threshold_table,
             rank_lookup_key: p
@@ -1252,6 +1265,7 @@ mod store_tests {
             source_ids: None,
             scope: Some("global".into()),
             project: None,
+            project_id: None,
         };
         let msg1 = store.compile(&p1).unwrap();
         // Slight delay so created_at differs reliably.

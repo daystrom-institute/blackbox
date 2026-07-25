@@ -1360,6 +1360,7 @@ mod tests {
             category: bbox_knowledge::knowledge::Category::Memory,
             scope: bbox_knowledge::knowledge::Scope::Global,
             project: None,
+            project_id: None,
             providers: Vec::new(),
             priority: bbox_knowledge::knowledge::Priority::Standard,
             weight: 100,

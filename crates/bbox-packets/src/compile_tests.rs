@@ -21,6 +21,7 @@ fn compile_params(domain: &str, rules: serde_json::Value) -> CompileParams {
         source_ids: None,
         scope: Some("global".into()),
         project: None,
+        project_id: None,
     }
 }
 
@@ -78,6 +79,7 @@ fn packet_list_helpers_match_and_summarize() {
             domain: domain.to_string(),
             scope: "global".to_string(),
             project: None,
+            project_id: None,
             rank_table: BTreeMap::new(),
             threshold_table: BTreeMap::new(),
             rank_lookup_key: default_rank_lookup_key(),
@@ -196,6 +198,7 @@ fn compile_infers_classification_from_id_prefix() {
         source_ids: None,
         scope: Some("global".into()),
         project: None,
+        project_id: None,
     };
     store.compile(&params).unwrap();
 
@@ -226,6 +229,7 @@ fn compile_rejects_classification_not_in_lattice() {
         source_ids: None,
         scope: Some("global".into()),
         project: None,
+        project_id: None,
     };
     let err = store.compile(&params).unwrap_err().to_string();
     assert!(err.contains("not in packet lattice"), "got: {err}");
@@ -255,6 +259,7 @@ fn compile_auth_domain_lattice() {
         source_ids: None,
         scope: Some("global".into()),
         project: None,
+        project_id: None,
     };
     store.compile(&params).unwrap();
 
@@ -708,4 +713,136 @@ fn gc_sweeps_orphaned_lock_files() {
         })
         .count();
     assert_eq!(remaining, 0);
+}
+
+// ── Dual-read (plan §8.2) ────────────────────────────────────────────────
+
+fn project_scoped_params(domain: &str, project: &str, project_id: Option<&str>) -> CompileParams {
+    let mut params = compile_params(
+        domain,
+        json!([
+            {
+                "id": "always_allow",
+                "antecedent": {"op": "Eq", "field": "method", "value": "GET"},
+                "consequent": "ALLOW",
+                "confidence": 1.0
+            }
+        ]),
+    );
+    params.scope = Some("project".into());
+    params.project = Some(project.into());
+    params.project_id = project_id.map(str::to_string);
+    params
+}
+
+#[test]
+fn packet_row_without_project_id_decodes_and_round_trips() {
+    let legacy = json!({
+        "id": "pk-legacy",
+        "domain": "dual-read",
+        "scope": "project",
+        "project": "/repo/old",
+        "rules": [],
+        "created_at": "2026-07-24T00:00:00Z",
+        "updated_at": "2026-07-24T00:00:00Z",
+        "source_ids": []
+    });
+    let packet: Packet = serde_json::from_value(legacy).unwrap();
+    assert_eq!(packet.project_id, None);
+    assert!(
+        serde_json::to_value(&packet)
+            .unwrap()
+            .get("project_id")
+            .is_none()
+    );
+
+    let (_dir, store) = tmp_packets();
+    let compiled = store
+        .compile(&project_scoped_params("dual-read", "/repo/old", None))
+        .unwrap();
+    assert!(compiled.contains("dual-read"));
+    let loaded = store
+        .load_latest_by_domain("dual-read", Some("/repo/old"), None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.project_id, None);
+    assert_eq!(loaded.project.as_deref(), Some("/repo/old"));
+}
+
+#[test]
+fn packet_project_id_match_wins_over_a_different_path() {
+    let (_dir, store) = tmp_packets();
+    store
+        .compile(&project_scoped_params(
+            "dual-read-id",
+            "/repo/old",
+            Some("abc12345"),
+        ))
+        .unwrap();
+
+    let loaded = store
+        .load_latest_by_domain("dual-read-id", Some("/repo/relocated"), Some("abc12345"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.project_id.as_deref(), Some("abc12345"));
+    assert_eq!(loaded.scope, "project");
+}
+
+#[test]
+fn packet_without_ids_falls_back_to_the_exact_path_arm() {
+    let (_dir, store) = tmp_packets();
+    store
+        .compile(&project_scoped_params("dual-read-path", "/repo/old", None))
+        .unwrap();
+
+    // Exact path still selects the project-scoped packet.
+    let hit = store
+        .load_latest_by_domain("dual-read-path", Some("/repo/old"), None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(hit.scope, "project");
+
+    // A different path with an id the row does not carry cannot select it
+    // through the id arm; with no global packet to fall back to, the newest
+    // matching packet is returned by the documented last-resort arm.
+    let other = store
+        .load_latest_by_domain("dual-read-path", Some("/repo/relocated"), Some("abc12345"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(other.project.as_deref(), Some("/repo/old"));
+    assert_eq!(other.project_id, None);
+}
+
+#[test]
+fn packet_mismatched_ids_hide_the_row_at_the_same_path() {
+    let (_dir, store) = tmp_packets();
+    store
+        .compile(&project_scoped_params(
+            "dual-read-mismatch",
+            "/repo/old",
+            Some("abc12345"),
+        ))
+        .unwrap();
+
+    // Same path key, different ids: the id decides against the project-scoped
+    // packet, so the lookup falls past it instead of leaking a retired
+    // project's packet into the new project's resolution.
+    let loaded = store
+        .load_latest_by_domain("dual-read-mismatch", Some("/repo/old"), Some("def67890"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        loaded.project_id.as_deref(),
+        Some("abc12345"),
+        "only the documented last-resort arm may return it"
+    );
+    assert!(
+        !store
+            .load_latest_by_domain("dual-read-mismatch", Some("/repo/old"), Some("def67890"))
+            .unwrap()
+            .into_iter()
+            .any(|packet| packet.scope == "project"
+                && packet.project_id.as_deref() == Some("def67890")),
+        "no packet may be attributed to the mismatched id"
+    );
 }

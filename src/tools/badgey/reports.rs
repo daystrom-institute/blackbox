@@ -314,6 +314,7 @@ impl BlackboxServer {
                         task_id: Some(inner.id.clone()),
                         session_id: Some(inner.session_id.clone()),
                         project: inner.cwd.clone(),
+                        project_id: None,
                         thread_id: None,
                         provider: Some(inner.provider.as_str().to_string()),
                         bro: inner.bro_label.clone(),

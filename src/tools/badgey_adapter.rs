@@ -96,6 +96,7 @@ pub(crate) fn restore_badgey_registry_from_notes(state: &Arc<SharedState>) {
                 task_id: None,
                 session_id: None,
                 project: Some(scope.project_id),
+                project_id: None,
                 thread_id: Some(thread_id),
                 provider: Some(provider.as_str().to_string()),
                 bro: Some("badgey".to_string()),

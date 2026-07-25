@@ -250,6 +250,7 @@ mod tests {
             authoring_session_id: None,
             version: 1,
             project_dir: "/repo/x".into(),
+            project_id: None,
             posted_at: util::now_iso(),
         };
         server.state.slack_proposal_links.record(link).unwrap();
@@ -295,6 +296,7 @@ mod tests {
             authoring_session_id: None,
             version: 1,
             project_dir: "/repo/x".into(),
+            project_id: None,
             posted_at: util::now_iso(),
         };
         server.state.slack_proposal_links.record(link).unwrap();

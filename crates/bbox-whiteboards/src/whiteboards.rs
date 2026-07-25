@@ -243,6 +243,10 @@ pub struct Board {
     /// similar. Used for inbox surfacing.
     pub topic: String,
     pub project: String,
+    /// Resolving authority's project id, stamped on write. Absent on rows
+    /// written before the catalog cut: those stay on the path lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     pub created_at: String,
     pub phase: Phase,
     pub phase_history: Vec<PhaseEvent>,
@@ -855,6 +859,7 @@ impl WhiteboardRegistry {
         id: &str,
         topic: &str,
         project: &str,
+        project_id: Option<&str>,
         arc_thread_id: Option<&str>,
         opener: &str,
     ) -> Result<()> {
@@ -867,6 +872,7 @@ impl WhiteboardRegistry {
             id: id.to_string(),
             topic: topic.to_string(),
             project: project.to_string(),
+            project_id: project_id.map(str::to_string),
             created_at: now.clone(),
             phase: Phase::Blind,
             phase_history: vec![PhaseEvent {
@@ -1582,7 +1588,7 @@ mod tests {
     #[test]
     fn open_register_post_is_idempotent_register() {
         let r = fresh_registry();
-        r.open("b1", "topic", "/proj", None, "alice").unwrap();
+        r.open("b1", "topic", "/proj", None, None, "alice").unwrap();
         r.register("b1", "alice", Role::Facilitator, "ops").unwrap();
         // Idempotent re-registration is OK.
         r.register("b1", "alice", Role::Facilitator, "ops").unwrap();
@@ -1593,7 +1599,7 @@ mod tests {
     #[test]
     fn post_only_in_blind() {
         let r = fresh_registry();
-        r.open("b1", "topic", "/proj", None, "alice").unwrap();
+        r.open("b1", "topic", "/proj", None, None, "alice").unwrap();
         r.register("b1", "alice", Role::Facilitator, "ops").unwrap();
         r.register("b1", "bob", Role::Specialist, "security")
             .unwrap();
@@ -1632,7 +1638,7 @@ mod tests {
     #[test]
     fn transition_validates_role_and_sequence() {
         let r = fresh_registry();
-        r.open("b1", "topic", "/proj", None, "alice").unwrap();
+        r.open("b1", "topic", "/proj", None, None, "alice").unwrap();
         r.register("b1", "alice", Role::Facilitator, "ops").unwrap();
         r.register("b1", "bob", Role::Specialist, "security")
             .unwrap();
@@ -1643,7 +1649,7 @@ mod tests {
         r.transition("b1", "alice", Phase::Read, None).unwrap();
         r.transition("b1", "alice", Phase::Debate, None).unwrap();
         // But not blind → debate (illegal skip).
-        r.open("b2", "t", "/p", None, "a").unwrap();
+        r.open("b2", "t", "/p", None, None, "a").unwrap();
         r.register("b2", "a", Role::Facilitator, "ops").unwrap();
         let err = r.transition("b2", "a", Phase::Debate, None).unwrap_err();
         assert!(err.to_string().contains("illegal phase transition"));
@@ -1652,7 +1658,7 @@ mod tests {
     #[test]
     fn archive_requires_resolve_unless_forced() {
         let r = fresh_registry();
-        r.open("b1", "topic", "/proj", None, "alice").unwrap();
+        r.open("b1", "topic", "/proj", None, None, "alice").unwrap();
         r.register("b1", "alice", Role::Facilitator, "ops").unwrap();
         r.register("b1", "bob", Role::Specialist, "security")
             .unwrap();
@@ -1774,7 +1780,7 @@ mod tests {
     #[test]
     fn apply_action_enforces_same_phase_rules_as_tools() {
         let r = fresh_registry();
-        r.open("b1", "topic", "/proj", None, "alice").unwrap();
+        r.open("b1", "topic", "/proj", None, None, "alice").unwrap();
         r.register("b1", "alice", Role::Facilitator, "ops").unwrap();
         r.register("b1", "bob", Role::Specialist, "security")
             .unwrap();
@@ -1853,7 +1859,7 @@ mod tests {
     #[test]
     fn archive_from_resolve_needs_no_force() {
         let r = fresh_registry();
-        r.open("b1", "topic", "/proj", None, "alice").unwrap();
+        r.open("b1", "topic", "/proj", None, None, "alice").unwrap();
         r.register("b1", "alice", Role::Facilitator, "ops").unwrap();
         r.transition("b1", "alice", Phase::Read, None).unwrap();
         r.transition("b1", "alice", Phase::Validate, None).unwrap();
@@ -1869,7 +1875,7 @@ mod tests {
     #[test]
     fn ready_for_transition_blind_when_all_specialists_posted() {
         let r = fresh_registry();
-        r.open("b1", "topic", "/proj", None, "alice").unwrap();
+        r.open("b1", "topic", "/proj", None, None, "alice").unwrap();
         r.register("b1", "alice", Role::Facilitator, "ops").unwrap();
         r.register("b1", "s1", Role::Specialist, "security")
             .unwrap();
@@ -1909,7 +1915,7 @@ mod tests {
     #[test]
     fn vote_replace_semantics() {
         let r = fresh_registry();
-        r.open("b1", "topic", "/proj", None, "f").unwrap();
+        r.open("b1", "topic", "/proj", None, None, "f").unwrap();
         r.register("b1", "f", Role::Facilitator, "ops").unwrap();
         r.register("b1", "s", Role::Specialist, "security").unwrap();
         r.post(
@@ -1944,7 +1950,7 @@ mod tests {
     #[test]
     fn detect_severity_disagreement() {
         let r = fresh_registry();
-        r.open("b1", "topic", "/proj", None, "f").unwrap();
+        r.open("b1", "topic", "/proj", None, None, "f").unwrap();
         r.register("b1", "f", Role::Facilitator, "ops").unwrap();
         r.register("b1", "s1", Role::Specialist, "x").unwrap();
         r.register("b1", "s2", Role::Specialist, "y").unwrap();
@@ -1986,7 +1992,7 @@ mod tests {
     #[test]
     fn cannot_annotate_own_post() {
         let r = fresh_registry();
-        r.open("b1", "topic", "/proj", None, "f").unwrap();
+        r.open("b1", "topic", "/proj", None, None, "f").unwrap();
         r.register("b1", "f", Role::Facilitator, "ops").unwrap();
         r.register("b1", "s", Role::Specialist, "x").unwrap();
         r.post(
@@ -2021,7 +2027,7 @@ mod tests {
     #[test]
     fn post_owner_can_resolve_external_challenge_on_own_post() {
         let r = fresh_registry();
-        r.open("b1", "topic", "/proj", None, "f").unwrap();
+        r.open("b1", "topic", "/proj", None, None, "f").unwrap();
         r.register("b1", "f", Role::Facilitator, "ops").unwrap();
         r.register("b1", "owner", Role::Specialist, "x").unwrap();
         r.register("b1", "reviewer", Role::Specialist, "y").unwrap();
@@ -2068,7 +2074,7 @@ mod tests {
     #[test]
     fn agent_cannot_resolve_own_challenge() {
         let r = fresh_registry();
-        r.open("b1", "topic", "/proj", None, "f").unwrap();
+        r.open("b1", "topic", "/proj", None, None, "f").unwrap();
         r.register("b1", "f", Role::Facilitator, "ops").unwrap();
         r.register("b1", "owner", Role::Specialist, "x").unwrap();
         r.register("b1", "reviewer", Role::Specialist, "y").unwrap();
@@ -2115,7 +2121,7 @@ mod tests {
     #[test]
     fn template_scope_exposes_phase_and_counts() {
         let r = fresh_registry();
-        r.open("b1", "topic", "/proj", None, "f").unwrap();
+        r.open("b1", "topic", "/proj", None, None, "f").unwrap();
         r.register("b1", "f", Role::Facilitator, "ops").unwrap();
         r.register("b1", "s", Role::Specialist, "x").unwrap();
         r.post(
@@ -2143,7 +2149,7 @@ mod tests {
     /// validator `v`, advanced to the validate phase.
     fn board_in_validate() -> WhiteboardRegistry {
         let r = fresh_registry();
-        r.open("b1", "topic", "/proj", None, "fac").unwrap();
+        r.open("b1", "topic", "/proj", None, None, "fac").unwrap();
         r.register("b1", "fac", Role::Facilitator, "ops").unwrap();
         r.register("b1", "v", Role::Specialist, "validator")
             .unwrap();
@@ -2340,5 +2346,50 @@ mod tests {
         r.transition("b1", "fac", Phase::Resolve, None).unwrap();
         let arc = r.get("b1").unwrap();
         assert_eq!(arc.read().phase, Phase::Resolve);
+    }
+
+    #[test]
+    fn board_without_project_id_decodes_and_round_trips() {
+        let legacy = serde_json::json!({
+            "id": "b-legacy",
+            "topic": "t",
+            "project": "/repo/old",
+            "created_at": "2026-07-24T00:00:00Z",
+            "phase": "blind",
+            "phase_history": [],
+            "agents": {},
+            "posts": [],
+            "annotations": [],
+            "votes": []
+        });
+        let board: Board = serde_json::from_value(legacy).unwrap();
+        assert_eq!(board.project_id, None);
+        assert!(
+            serde_json::to_value(&board)
+                .unwrap()
+                .get("project_id")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn opened_board_carries_the_stamped_project_id() {
+        let r = WhiteboardRegistry::new();
+        r.open(
+            "b-stamped",
+            "topic",
+            "/repo/x",
+            Some("abc12345"),
+            None,
+            "alice",
+        )
+        .unwrap();
+
+        let board = r.get("b-stamped").unwrap();
+        assert_eq!(board.read().project_id.as_deref(), Some("abc12345"));
+        // A board opened without a stamped id stays on the path lane.
+        r.open("b-legacy-open", "topic", "/repo/x", None, None, "alice")
+            .unwrap();
+        assert_eq!(r.get("b-legacy-open").unwrap().read().project_id, None);
     }
 }

@@ -193,6 +193,7 @@ fn attached_supervision_poll_value_bounds_note_and_tail_sizes() {
                 task_id: Some("task-primary".into()),
                 session_id: None,
                 project: None,
+                project_id: None,
                 thread_id: None,
                 provider: None,
                 bro: None,

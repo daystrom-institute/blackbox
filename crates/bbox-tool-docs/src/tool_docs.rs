@@ -1877,6 +1877,7 @@ pub fn sync_into_knowledge(kb: &mut bbox_knowledge::knowledge::Knowledge) -> Res
         category: Category::Tool,
         scope: Scope::Global,
         project: None,
+        project_id: None,
         providers: Vec::new(),
         priority: Priority::Standard,
         weight: 100,

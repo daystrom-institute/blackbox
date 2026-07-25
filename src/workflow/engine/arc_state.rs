@@ -18,6 +18,7 @@ impl WorkflowRunner<'_> {
                 self.compiled.spec.name, self.compiled.spec.version
             )),
             project: self.project_dir.clone(),
+            project_id: None,
             session_id: None,
             provider: None,
             session_name: None,
@@ -108,6 +109,7 @@ impl WorkflowRunner<'_> {
             task_id: None,
             session_id: None,
             project: self.project_dir.clone(),
+            project_id: None,
             thread_id: Some(thread_id.to_string()),
             provider: None,
             bro: None,

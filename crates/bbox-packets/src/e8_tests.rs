@@ -206,6 +206,7 @@ fn e8_auth_packet() -> Packet {
         domain: "e8-auth-matrix".into(),
         scope: "global".into(),
         project: None,
+        project_id: None,
         rank_table,
         threshold_table,
         rank_lookup_key: "role".into(),

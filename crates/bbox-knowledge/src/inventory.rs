@@ -777,6 +777,7 @@ mod tests {
             category: Category::Convention,
             scope: Scope::Project,
             project: project.map(str::to_string),
+            project_id: None,
             providers: vec![],
             priority: Priority::Standard,
             weight: 100,

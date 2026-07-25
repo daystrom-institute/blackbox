@@ -70,6 +70,10 @@ pub struct SlackProposalLink {
     /// channel-binding at post time so consumers don't need a second
     /// lookup.
     pub project_dir: String,
+    /// Resolving authority's project id, stamped on write. Absent on rows
+    /// written before the catalog cut: those stay on the path lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     /// ISO8601 UTC post time.
     pub posted_at: String,
 }
@@ -358,6 +362,7 @@ mod tests {
             authoring_session_id: session.map(str::to_string),
             version: 1,
             project_dir: "/repo/x".into(),
+            project_id: None,
             posted_at: "2026-05-07T06:00:00Z".into(),
         }
     }
@@ -455,6 +460,7 @@ mod tests {
             authoring_session_id: None,
             version: 1,
             project_dir: "/repo/alpha".into(),
+            project_id: None,
             posted_at: "2026-05-07T06:00:00Z".into(),
         };
         let chan_b_link = SlackProposalLink {
@@ -466,6 +472,7 @@ mod tests {
             authoring_session_id: None,
             version: 1,
             project_dir: "/repo/beta".into(),
+            project_id: None,
             posted_at: "2026-05-07T06:00:00Z".into(),
         };
         store.record(chan_a_link).unwrap();
@@ -533,6 +540,7 @@ mod tests {
             authoring_session_id: None,
             version: 1,
             project_dir: "/repo/other".into(),
+            project_id: None,
             posted_at: "2026-05-07T06:00:00Z".into(),
         };
         store.record(other).unwrap();
@@ -564,6 +572,7 @@ mod tests {
             authoring_session_id: None,
             version: 1,
             project_dir: "/repo/a".into(),
+            project_id: None,
             posted_at: "2026-05-07T06:00:00Z".into(),
         };
         let b = SlackProposalLink {
@@ -575,6 +584,7 @@ mod tests {
             authoring_session_id: None,
             version: 1,
             project_dir: "/repo/b".into(),
+            project_id: None,
             posted_at: "2026-05-07T06:00:00Z".into(),
         };
         store.record(a).unwrap();
@@ -593,5 +603,35 @@ mod tests {
                 .proposal_id,
             "prop-b"
         );
+    }
+
+    #[test]
+    fn proposal_link_without_project_id_decodes_and_round_trips() {
+        let legacy = serde_json::json!({
+            "team_id": "T01",
+            "channel_id": "C01",
+            "msg_ts": "ts-legacy",
+            "proposal_id": "p1",
+            "instance_id": "bg-1",
+            "version": 1,
+            "project_dir": "/repo/old",
+            "posted_at": "2026-07-24T00:00:00Z"
+        });
+        let link: SlackProposalLink = serde_json::from_value(legacy).unwrap();
+        assert_eq!(link.project_id, None);
+        assert!(
+            serde_json::to_value(&link)
+                .unwrap()
+                .get("project_id")
+                .is_none()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SlackProposalLinks::open(dir.path()).unwrap();
+        store.record(link).unwrap();
+        let reopened = SlackProposalLinks::open(dir.path()).unwrap();
+        let found = reopened.lookup_by_msg("T01", "C01", "ts-legacy").unwrap();
+        assert_eq!(found.project_id, None);
+        assert_eq!(found.project_dir, "/repo/old");
     }
 }

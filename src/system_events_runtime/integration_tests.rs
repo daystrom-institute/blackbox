@@ -493,6 +493,7 @@ async fn system_events_whiteboard_transition_emits_phase_changed() {
             "Phase 6 test board",
             "",
             None,
+            None,
             "facilitator-agent",
         )
         .expect("open board");

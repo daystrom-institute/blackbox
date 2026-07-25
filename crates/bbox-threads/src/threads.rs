@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
+use bbox_corpus_core::project_selector::project_scope_matches;
 use bbox_stores::store_persister::StoreSnapshot;
 
 // ── embed-sink hook ────────────────────────────────────────────────
@@ -78,6 +79,11 @@ pub struct ThreadParams {
     /// Thread origin marker (e.g. "workflow"). Optional for normal/manual threads.
     #[serde(default)]
     pub origin: Option<String>,
+    /// Internal, not part of the MCP schema: the resolving authority's
+    /// project id. Set by the daemon adapter from the resolver, never
+    /// accepted from the wire, so identity cannot be caller-asserted.
+    #[serde(skip)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
@@ -101,6 +107,10 @@ pub struct ThreadListParams {
     /// scaffolding does not dominate normal continuity scans.
     #[serde(default)]
     pub include_workflows: Option<bool>,
+    /// Project id from the resolver. When both this and a row carry an
+    /// id, the id decides and the path predicate is not consulted.
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 // ── Schema ─────────────────────────────────────────────────────────
@@ -193,6 +203,10 @@ pub struct Thread {
     pub name: Option<String>,
     pub topic: String,
     pub project: String,
+    /// Resolving authority's project id, stamped on write. Absent on rows
+    /// written before the catalog cut: those stay on the path lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     /// Directory the committed `.bbox/record/` snapshot is written into. When a
     /// project-scoped thread is opened from a managed fleet worktree, `project`
     /// holds the registered base (durable scope) while this holds the worktree
@@ -550,6 +564,7 @@ impl Threads {
             name: p.name.clone(),
             topic: topic.to_string(),
             project: project.to_string(),
+            project_id: p.project_id.clone(),
             record_dir: write_dir.map(str::to_string),
             status: ThreadStatus::Open,
             kind,
@@ -1009,6 +1024,7 @@ impl Threads {
     pub fn thread_list(&self, p: &ThreadListParams) -> Result<String> {
         let status_filter = p.status.as_deref();
         let project_filter = p.project.as_deref();
+        let project_id_filter = p.project_id.as_deref();
         let name_filter = p.name.as_deref();
         let min_idle_days = p.min_idle_days;
         let include_resolved = p.include_resolved.unwrap_or(false);
@@ -1048,11 +1064,15 @@ impl Threads {
                 }
             }
 
-            // Project filter
-            if let Some(pf) = project_filter {
-                if !thread.project.to_lowercase().contains(&pf.to_lowercase()) {
-                    continue;
-                }
+            // Project filter. Dual-read (plan §8.2): ids on both sides decide,
+            // whatever the paths say; either side missing an id keeps the path
+            // predicate.
+            if let Some(pf) = project_filter
+                && !project_scope_matches(thread.project_id.as_deref(), project_id_filter, || {
+                    thread.project.to_lowercase().contains(&pf.to_lowercase())
+                })
+            {
+                continue;
             }
 
             // Name filter
@@ -1262,6 +1282,7 @@ mod tests {
             action: action.into(),
             topic: None,
             project: None,
+            project_id: None,
             name: None,
             id: None,
             session_id: None,
@@ -1296,6 +1317,7 @@ mod tests {
                 action: "open".into(),
                 topic: Some("persister-backed thread".into()),
                 project: Some(root.to_string_lossy().into_owned()),
+                project_id: None,
                 name: Some("persisted".into()),
                 id: None,
                 session_id: None,
@@ -1319,6 +1341,7 @@ mod tests {
             .thread_list(&ThreadListParams {
                 status: None,
                 project: Some(root.to_string_lossy().into_owned()),
+                project_id: None,
                 name: None,
                 min_idle_days: None,
                 include_resolved: None,
@@ -1691,6 +1714,7 @@ mod tests {
                 action: "open".into(),
                 topic: Some("new work".into()),
                 project: Some("/repo/x".into()),
+                project_id: None,
                 name: Some("fresh".into()),
                 id: None,
                 session_id: None,
@@ -1714,6 +1738,7 @@ mod tests {
                 name: None,
                 topic: None,
                 project: None,
+                project_id: None,
                 session_id: None,
                 provider: None,
                 session_name: None,
@@ -1732,6 +1757,7 @@ mod tests {
             .thread_list(&ThreadListParams {
                 status: Some("active".into()),
                 project: None,
+                project_id: None,
                 name: None,
                 min_idle_days: None,
                 include_resolved: None,
@@ -1754,6 +1780,7 @@ mod tests {
                 action: "open".into(),
                 topic: Some("old work".into()),
                 project: Some("/repo/x".into()),
+                project_id: None,
                 name: Some("aged".into()),
                 id: None,
                 session_id: None,
@@ -1776,6 +1803,7 @@ mod tests {
             .thread_list(&ThreadListParams {
                 status: None,
                 project: None,
+                project_id: None,
                 name: None,
                 min_idle_days: Some(7),
                 include_resolved: None,
@@ -1797,6 +1825,7 @@ mod tests {
                 action: "open".into(),
                 topic: Some("manual work".into()),
                 project: Some("/repo/x".into()),
+                project_id: None,
                 name: Some("manual".into()),
                 id: None,
                 session_id: None,
@@ -1817,6 +1846,7 @@ mod tests {
                 action: "open".into(),
                 topic: Some("workflow arc: hidden".into()),
                 project: Some("/repo/x".into()),
+                project_id: None,
                 name: Some("wf-hidden".into()),
                 id: None,
                 session_id: None,
@@ -1837,6 +1867,7 @@ mod tests {
             .thread_list(&ThreadListParams {
                 status: Some("open".into()),
                 project: Some("/repo/x".into()),
+                project_id: None,
                 name: None,
                 min_idle_days: None,
                 include_resolved: None,
@@ -1851,6 +1882,7 @@ mod tests {
             .thread_list(&ThreadListParams {
                 status: Some("open".into()),
                 project: Some("/repo/x".into()),
+                project_id: None,
                 name: None,
                 min_idle_days: None,
                 include_resolved: None,
@@ -1860,5 +1892,137 @@ mod tests {
             .unwrap();
         assert!(explicit_out.contains("manual work"));
         assert!(explicit_out.contains("workflow arc: hidden"));
+    }
+
+    // ── Dual-read (plan §8.2) ────────────────────────────────────────────
+
+    fn dual_read_thread(id: &str, project: &str, project_id: Option<&str>) -> Thread {
+        Thread {
+            id: id.into(),
+            name: None,
+            topic: "dual read topic".into(),
+            project: project.into(),
+            project_id: project_id.map(str::to_string),
+            record_dir: None,
+            status: ThreadStatus::Open,
+            kind: None,
+            origin: None,
+            sessions: Vec::new(),
+            handoff_doc: None,
+            notes: Vec::new(),
+            edges: Vec::new(),
+            promoted_to: None,
+            created_at: "2026-07-24T00:00:00Z".into(),
+            last_activity: "2026-07-24T00:00:00Z".into(),
+            resolved_at: None,
+        }
+    }
+
+    #[test]
+    fn thread_row_without_project_id_decodes_and_round_trips() {
+        let legacy = serde_json::json!({
+            "id": "thread-legacy",
+            "topic": "t",
+            "project": "/repo/old",
+            "status": "open",
+            "sessions": [],
+            "created_at": "2026-07-24T00:00:00Z",
+            "last_activity": "2026-07-24T00:00:00Z"
+        });
+        let thread: Thread = serde_json::from_value(legacy).unwrap();
+        assert_eq!(thread.project_id, None);
+        assert!(
+            serde_json::to_value(&thread)
+                .unwrap()
+                .get("project_id")
+                .is_none()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.json");
+        let mut threads = Threads::open(&path).unwrap();
+        threads.store.threads.push(thread);
+        std::fs::write(&path, serde_json::to_string(&threads.store).unwrap()).unwrap();
+        let reopened = Threads::open(&path).unwrap();
+        assert_eq!(reopened.store.threads.len(), 1);
+        assert_eq!(reopened.store.threads[0].project_id, None);
+    }
+
+    #[test]
+    fn thread_project_id_match_wins_over_a_different_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut threads = Threads::open(&dir.path().join("threads.json")).unwrap();
+        threads.store.threads.push(dual_read_thread(
+            "thread-aaaaaaaa",
+            "/repo/old",
+            Some("abc12345"),
+        ));
+
+        let out = threads
+            .thread_list(&ThreadListParams {
+                project: Some("/repo/relocated".into()),
+                project_id: Some("abc12345".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(out.contains("thread-aaaaaaaa"), "id arm must match: {out}");
+    }
+
+    #[test]
+    fn thread_without_ids_falls_back_to_the_exact_path_arm() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut threads = Threads::open(&dir.path().join("threads.json")).unwrap();
+        threads
+            .store
+            .threads
+            .push(dual_read_thread("thread-bbbbbbbb", "/repo/old", None));
+
+        let miss = threads
+            .thread_list(&ThreadListParams {
+                project: Some("/repo/relocated".into()),
+                project_id: Some("abc12345".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            !miss.contains("thread-bbbbbbbb"),
+            "path arm must decide: {miss}"
+        );
+
+        let hit = threads
+            .thread_list(&ThreadListParams {
+                project: Some("/repo/old".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            hit.contains("thread-bbbbbbbb"),
+            "path arm must match: {hit}"
+        );
+    }
+
+    #[test]
+    fn thread_mismatched_ids_hide_the_row_at_the_same_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut threads = Threads::open(&dir.path().join("threads.json")).unwrap();
+        threads.store.threads.push(dual_read_thread(
+            "thread-cccccccc",
+            "/repo/old",
+            Some("abc12345"),
+        ));
+
+        // Same path key, different ids: the id decides against the row, so a
+        // path reused after a retire-and-add cannot leak the old rows.
+        let out = threads
+            .thread_list(&ThreadListParams {
+                project: Some("/repo/old".into()),
+                project_id: Some("def67890".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            !out.contains("thread-cccccccc"),
+            "id mismatch must hide: {out}"
+        );
     }
 }

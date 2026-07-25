@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
+use bbox_corpus_core::project_selector::project_scope_matches;
 use bbox_stores::store_persister::StoreSnapshot;
 
 const NOTE_ID_PREFIX: &str = "note-";
@@ -65,6 +66,11 @@ pub struct NoteParams {
     /// Named bro instance
     #[serde(default)]
     pub bro: Option<String>,
+    /// Internal, not part of the MCP schema: the resolving authority's
+    /// project id. Set by the daemon adapter from the resolver, never
+    /// accepted from the wire, so identity cannot be caller-asserted.
+    #[serde(skip)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
@@ -114,6 +120,10 @@ pub struct NoteListParams {
     /// or multi-line `dispute` rationales).
     #[serde(default)]
     pub full: Option<bool>,
+    /// Project id from the resolver. When both this and a row carry an
+    /// id, the id decides and the path predicate is not consulted.
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -235,6 +245,10 @@ pub struct Note {
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Resolving authority's project id, stamped on write. Absent on rows
+    /// written before the catalog cut: those stay on the path lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -390,6 +404,7 @@ impl Notes {
             task_id: p.task_id.clone(),
             session_id: p.session_id.clone(),
             project: p.project.clone(),
+            project_id: p.project_id.clone(),
             thread_id: p.thread_id.clone(),
             provider: p.provider.clone(),
             bro: p.bro.clone(),
@@ -515,6 +530,7 @@ impl Notes {
         let id_filter = p.id.as_deref().map(str::to_ascii_lowercase);
         let query_lower = p.query.as_deref().map(|s| s.to_lowercase());
         let project_lower = p.project.as_deref().map(|s| s.to_lowercase());
+        let project_id_filter = p.project_id.as_deref();
 
         let mut results: Vec<&Note> = self
             .store
@@ -559,11 +575,18 @@ impl Notes {
                         return false;
                     }
                 }
-                if let Some(pl) = &project_lower {
-                    let nproj = n.project.as_deref().unwrap_or("").to_lowercase();
-                    if !nproj.contains(pl) {
-                        return false;
-                    }
+                // Dual-read (plan §8.2): ids on both sides decide, whatever the
+                // paths say; either side missing an id keeps the path predicate.
+                if let Some(pl) = &project_lower
+                    && !project_scope_matches(n.project_id.as_deref(), project_id_filter, || {
+                        n.project
+                            .as_deref()
+                            .unwrap_or("")
+                            .to_lowercase()
+                            .contains(pl)
+                    })
+                {
+                    return false;
                 }
                 if let Some(q) = &query_lower {
                     if !n.body.to_lowercase().contains(q) {
@@ -670,6 +693,7 @@ mod tests {
                 body: "persisted through actor".into(),
                 session_id: None,
                 project: None,
+                project_id: None,
                 task_id: None,
                 thread_id: None,
                 provider: None,
@@ -718,6 +742,7 @@ mod tests {
                 body: "read before ack".into(),
                 session_id: None,
                 project: None,
+                project_id: None,
                 task_id: None,
                 thread_id: None,
                 provider: None,
@@ -747,6 +772,7 @@ mod tests {
                 id: None,
                 kind: None,
                 project: None,
+                project_id: None,
                 session_id: None,
                 task_id: None,
                 thread_id: None,
@@ -774,6 +800,7 @@ mod tests {
                 body: "brief conflates schemas".into(),
                 session_id: Some("sess-abc".into()),
                 project: Some("/repo/x".into()),
+                project_id: None,
                 task_id: None,
                 thread_id: None,
                 provider: Some("claude".into()),
@@ -787,6 +814,7 @@ mod tests {
                 id: None,
                 kind: Some("dispute".into()),
                 project: None,
+                project_id: None,
                 session_id: None,
                 task_id: None,
                 thread_id: None,
@@ -812,6 +840,7 @@ mod tests {
                 body: "target body".into(),
                 session_id: None,
                 project: None,
+                project_id: None,
                 task_id: None,
                 thread_id: None,
                 provider: None,
@@ -825,6 +854,7 @@ mod tests {
                 body: "other body".into(),
                 session_id: None,
                 project: None,
+                project_id: None,
                 task_id: None,
                 thread_id: None,
                 provider: None,
@@ -848,6 +878,7 @@ mod tests {
                 id: Some(target_id.clone()),
                 kind: None,
                 project: None,
+                project_id: None,
                 session_id: None,
                 task_id: None,
                 thread_id: None,
@@ -869,6 +900,7 @@ mod tests {
                 id: Some(bare_id),
                 kind: None,
                 project: None,
+                project_id: None,
                 session_id: None,
                 task_id: None,
                 thread_id: None,
@@ -888,6 +920,7 @@ mod tests {
                 id: None,
                 kind: None,
                 project: None,
+                project_id: None,
                 session_id: None,
                 task_id: None,
                 thread_id: None,
@@ -912,6 +945,7 @@ mod tests {
                 body: "x".into(),
                 session_id: None,
                 project: None,
+                project_id: None,
                 task_id: None,
                 thread_id: None,
                 provider: None,
@@ -930,6 +964,7 @@ mod tests {
                 body: "  ".into(),
                 session_id: None,
                 project: None,
+                project_id: None,
                 task_id: None,
                 thread_id: None,
                 provider: None,
@@ -948,6 +983,7 @@ mod tests {
                 body: "expected N, found M".into(),
                 session_id: None,
                 project: None,
+                project_id: None,
                 task_id: None,
                 thread_id: None,
                 provider: None,
@@ -980,6 +1016,7 @@ mod tests {
                 id: None,
                 kind: None,
                 project: None,
+                project_id: None,
                 session_id: None,
                 task_id: None,
                 thread_id: None,
@@ -1009,6 +1046,7 @@ mod tests {
                 id: None,
                 kind: None,
                 project: None,
+                project_id: None,
                 session_id: None,
                 task_id: None,
                 thread_id: None,
@@ -1031,6 +1069,7 @@ mod tests {
                 id: None,
                 kind: None,
                 project: None,
+                project_id: None,
                 session_id: None,
                 task_id: None,
                 thread_id: None,
@@ -1055,6 +1094,7 @@ mod tests {
                 body: "task complete".into(),
                 session_id: None,
                 project: None,
+                project_id: None,
                 task_id: None,
                 thread_id: None,
                 provider: None,
@@ -1088,6 +1128,7 @@ mod tests {
                     body: body.into(),
                     session_id: None,
                     project: None,
+                    project_id: None,
                     task_id: None,
                     thread_id: None,
                     provider: None,
@@ -1135,6 +1176,7 @@ mod tests {
                 body: "keep unresolved on error".into(),
                 session_id: None,
                 project: None,
+                project_id: None,
                 task_id: None,
                 thread_id: None,
                 provider: None,
@@ -1185,6 +1227,7 @@ mod tests {
                     body: body.into(),
                     session_id: None,
                     project: None,
+                    project_id: None,
                     task_id: None,
                     thread_id: None,
                     provider: None,
@@ -1229,6 +1272,7 @@ mod tests {
                     body: body.into(),
                     session_id: None,
                     project: None,
+                    project_id: None,
                     task_id: None,
                     thread_id: None,
                     provider: None,
@@ -1294,6 +1338,7 @@ mod tests {
                 body,
                 session_id: None,
                 project: None,
+                project_id: None,
                 task_id: None,
                 thread_id: None,
                 provider: None,
@@ -1306,6 +1351,7 @@ mod tests {
                 id: None,
                 kind: None,
                 project: None,
+                project_id: None,
                 session_id: None,
                 task_id: None,
                 thread_id: None,
@@ -1331,6 +1377,7 @@ mod tests {
                 body: body.clone(),
                 session_id: None,
                 project: None,
+                project_id: None,
                 task_id: None,
                 thread_id: None,
                 provider: None,
@@ -1343,6 +1390,7 @@ mod tests {
                 id: None,
                 kind: None,
                 project: None,
+                project_id: None,
                 session_id: None,
                 task_id: None,
                 thread_id: None,
@@ -1363,6 +1411,7 @@ mod tests {
                 id: None,
                 kind: None,
                 project: None,
+                project_id: None,
                 session_id: None,
                 task_id: None,
                 thread_id: None,
@@ -1394,6 +1443,7 @@ mod tests {
                 body: "repo uses bb:managed markers".into(),
                 session_id: None,
                 project: Some("/repo/x".into()),
+                project_id: None,
                 task_id: None,
                 thread_id: None,
                 provider: None,
@@ -1404,5 +1454,131 @@ mod tests {
         let notes = Notes::open(&path).unwrap();
         assert_eq!(notes.store.notes.len(), 1);
         assert_eq!(notes.store.notes[0].kind, NoteKind::Learned);
+    }
+
+    // ── Dual-read (plan §8.2) ────────────────────────────────────────────
+
+    fn dual_read_note(id: &str, project: &str, project_id: Option<&str>) -> Note {
+        Note {
+            id: id.into(),
+            kind: NoteKind::Learned,
+            body: "dual read body".into(),
+            task_id: None,
+            session_id: None,
+            project: Some(project.into()),
+            project_id: project_id.map(str::to_string),
+            thread_id: None,
+            provider: None,
+            bro: None,
+            resolution: NoteResolution::Unresolved,
+            resolution_note: None,
+            created_at: "2026-07-24T00:00:00Z".into(),
+            updated_at: "2026-07-24T00:00:00Z".into(),
+            resolved_at: None,
+        }
+    }
+
+    #[test]
+    fn note_row_without_project_id_decodes_and_round_trips() {
+        let legacy = serde_json::json!({
+            "id": "note-legacy",
+            "kind": "learned",
+            "body": "b",
+            "project": "/repo/old",
+            "created_at": "2026-07-24T00:00:00Z",
+            "updated_at": "2026-07-24T00:00:00Z"
+        });
+        let note: Note = serde_json::from_value(legacy).unwrap();
+        assert_eq!(note.project_id, None);
+        assert!(
+            serde_json::to_value(&note)
+                .unwrap()
+                .get("project_id")
+                .is_none()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.json");
+        let mut notes = Notes::open(&path).unwrap();
+        notes.store.notes.push(note);
+        std::fs::write(&path, serde_json::to_string(&notes.store).unwrap()).unwrap();
+        let reopened = Notes::open(&path).unwrap();
+        assert_eq!(reopened.store.notes.len(), 1);
+        assert_eq!(reopened.store.notes[0].project_id, None);
+    }
+
+    #[test]
+    fn note_project_id_match_wins_over_a_different_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut notes = Notes::open(&dir.path().join("notes.json")).unwrap();
+        notes.store.notes.push(dual_read_note(
+            "note-aaaaaaaa",
+            "/repo/old",
+            Some("abc12345"),
+        ));
+
+        let out = notes
+            .list(&NoteListParams {
+                project: Some("/repo/relocated".into()),
+                project_id: Some("abc12345".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(out.contains("note-aaaaaaaa"), "id arm must match: {out}");
+    }
+
+    #[test]
+    fn note_without_ids_falls_back_to_the_exact_path_arm() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut notes = Notes::open(&dir.path().join("notes.json")).unwrap();
+        notes
+            .store
+            .notes
+            .push(dual_read_note("note-bbbbbbbb", "/repo/old", None));
+
+        let miss = notes
+            .list(&NoteListParams {
+                project: Some("/repo/relocated".into()),
+                project_id: Some("abc12345".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            !miss.contains("note-bbbbbbbb"),
+            "path arm must decide: {miss}"
+        );
+
+        let hit = notes
+            .list(&NoteListParams {
+                project: Some("/repo/old".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(hit.contains("note-bbbbbbbb"), "path arm must match: {hit}");
+    }
+
+    #[test]
+    fn note_mismatched_ids_hide_the_row_at_the_same_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut notes = Notes::open(&dir.path().join("notes.json")).unwrap();
+        notes.store.notes.push(dual_read_note(
+            "note-cccccccc",
+            "/repo/old",
+            Some("abc12345"),
+        ));
+
+        // Same path key, different ids: the id decides against the row, so a
+        // path reused after a retire-and-add cannot leak the old rows.
+        let out = notes
+            .list(&NoteListParams {
+                project: Some("/repo/old".into()),
+                project_id: Some("def67890".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            !out.contains("note-cccccccc"),
+            "id mismatch must hide: {out}"
+        );
     }
 }

@@ -3231,6 +3231,7 @@ mod tests {
             category: crate::knowledge::Category::Memory,
             scope: crate::knowledge::Scope::Project,
             project: None,
+            project_id: None,
             providers: Vec::new(),
             priority: crate::knowledge::Priority::Standard,
             weight: 100,

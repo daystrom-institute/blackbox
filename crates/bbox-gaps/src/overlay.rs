@@ -843,6 +843,7 @@ mod tests {
             superseded_by: None,
             resolution: GapResolution::Unresolved,
             project: None,
+            project_id: None,
             write_dir: None,
             provisional_checkout_id: None,
             task_id: None,

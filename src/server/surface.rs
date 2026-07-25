@@ -147,7 +147,7 @@ pub fn evaluate_tool_surface(
     entity: Value,
     project: Option<&str>,
 ) -> ToolSurfaceDecision {
-    match packets.load_latest_by_domain(SURFACE_ROUTING_DOMAIN, project) {
+    match packets.load_latest_by_domain(SURFACE_ROUTING_DOMAIN, project, None) {
         Ok(Some(packet)) => match apply_with(&packet, &entity, packets) {
             Some(prediction) => match ToolSurfaceVerdict::parse(&prediction.consequent) {
                 Ok(verdict) => {
@@ -509,6 +509,7 @@ mod tests {
                 prefix_inference: Some(Default::default()),
                 scope: Some(scope.to_string()),
                 project: project.map(|s| s.to_string()),
+                project_id: None,
                 source_ids: None,
                 rank_lookup_key: None,
                 rank_table: None,
@@ -627,6 +628,7 @@ mod tests {
                 prefix_inference: Some(Default::default()),
                 scope: Some("global".into()),
                 project: None,
+                project_id: None,
                 source_ids: None,
                 rank_lookup_key: None,
                 rank_table: None,
@@ -653,6 +655,7 @@ mod tests {
                 prefix_inference: Some(Default::default()),
                 scope: Some("global".into()),
                 project: None,
+                project_id: None,
                 source_ids: None,
                 rank_lookup_key: None,
                 rank_table: None,
@@ -770,6 +773,7 @@ mod tests {
                 prefix_inference: Some(Default::default()),
                 scope: Some("global".into()),
                 project: None,
+                project_id: None,
                 source_ids: None,
                 rank_lookup_key: None,
                 rank_table: None,
@@ -1449,6 +1453,7 @@ mod cache_tests {
                 prefix_inference: Some(Default::default()),
                 scope: Some("global".to_string()),
                 project: None,
+                project_id: None,
                 source_ids: None,
                 rank_lookup_key: None,
                 rank_table: None,

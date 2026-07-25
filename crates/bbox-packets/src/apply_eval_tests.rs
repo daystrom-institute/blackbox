@@ -443,6 +443,7 @@ fn apply_tool_all_mode_returns_aggregate() {
         source_ids: None,
         scope: Some("global".into()),
         project: None,
+        project_id: None,
     };
     store.compile(&params).unwrap();
     let all = store.list_all().unwrap();

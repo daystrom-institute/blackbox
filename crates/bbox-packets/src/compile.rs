@@ -104,6 +104,11 @@ pub struct CompileParams {
     /// Project path for project-scoped packets
     #[serde(default)]
     pub project: Option<String>,
+    /// Internal, not part of the MCP schema: the resolving authority's
+    /// project id. Set by the daemon adapter from the resolver, never
+    /// accepted from the wire, so identity cannot be caller-asserted.
+    #[serde(skip)]
+    pub project_id: Option<String>,
 }
 
 #[cfg(test)]

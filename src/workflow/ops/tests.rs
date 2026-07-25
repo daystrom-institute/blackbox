@@ -1387,6 +1387,7 @@ async fn tier0_contradiction_without_arc_surfaces_surprise_note() {
                 category: knowledge::Category::Memory,
                 scope: knowledge::Scope::Global,
                 project: None,
+                project_id: None,
                 providers: Vec::new(),
                 priority: knowledge::Priority::Standard,
                 weight: 100,

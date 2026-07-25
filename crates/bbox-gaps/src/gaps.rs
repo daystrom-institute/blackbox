@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::repo_io::{GapRepoCarrier, GapRepoRead, GapRepoWrite};
+use bbox_corpus_core::project_selector::project_scope_matches;
 
 pub const GAP_NOTE_TYPE: &str = "blackbox.gap_note.v1";
 
@@ -180,6 +181,10 @@ pub struct GapNote {
     //    scope, exactly like knowledge entries omit `project`). ──
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Resolving authority's project id, stamped on write. Absent on rows
+    /// written before the catalog cut: those stay on the path lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     /// Transient logical write-carrier id. A managed checkout carries the
     /// repo-owned gap file while `project` remains the durable base scope.
     /// Never retained in the central store or committed record; the checkout
@@ -354,6 +359,7 @@ impl GapNote {
             superseded_by: None,
             resolution: GapResolution::Unresolved,
             project: None,
+            project_id: None,
             write_dir: None,
             provisional_checkout_id: None,
             task_id: None,
@@ -439,6 +445,11 @@ pub struct GapFileParams {
     /// exists (recurrence tally). Default false → dedupes to the existing gap.
     #[serde(default)]
     pub allow_recurrence: Option<bool>,
+    /// Internal, not part of the MCP schema: the resolving authority's
+    /// project id. Set by the daemon adapter from the resolver, never
+    /// accepted from the wire, so identity cannot be caller-asserted.
+    #[serde(skip)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
@@ -480,6 +491,10 @@ pub struct GapListParams {
     /// Emit machine-readable JSON records instead of the rendered text view.
     #[serde(default)]
     pub json: Option<bool>,
+    /// Project id from the resolver. When both this and a row carry an
+    /// id, the id decides and the path predicate is not consulted.
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1401,6 +1416,7 @@ impl GapStore {
             superseded_by: None,
             resolution: GapResolution::Unresolved,
             project,
+            project_id: p.project_id.clone(),
             write_dir,
             provisional_checkout_id: None,
             task_id: p.task_id.clone(),
@@ -1844,6 +1860,7 @@ impl GapStore {
         });
         let query_lower = p.query.as_deref().map(|s| s.to_lowercase());
         let project_lower = p.project.as_deref().map(|s| s.to_lowercase());
+        let project_id_filter = p.project_id.as_deref();
         let dedupe_lower = p.dedupe_key.as_deref().map(|s| s.to_lowercase());
 
         let mut out: Vec<GapNote> = self
@@ -1893,11 +1910,18 @@ impl GapStore {
                         return false;
                     }
                 }
-                if let Some(pl) = &project_lower {
-                    let proj = g.project.as_deref().unwrap_or("").to_lowercase();
-                    if !proj.contains(pl) {
-                        return false;
-                    }
+                // Dual-read (plan §8.2): ids on both sides decide, whatever the
+                // paths say; either side missing an id keeps the path predicate.
+                if let Some(pl) = &project_lower
+                    && !project_scope_matches(g.project_id.as_deref(), project_id_filter, || {
+                        g.project
+                            .as_deref()
+                            .unwrap_or("")
+                            .to_lowercase()
+                            .contains(pl)
+                    })
+                {
+                    return false;
                 }
                 if let Some(q) = &query_lower {
                     let hay = format!(
@@ -2105,6 +2129,7 @@ mod tests {
             notes: None,
             scope: Some("global".into()),
             project: None,
+            project_id: None,
             write_dir: None,
             task_id: None,
             session_id: None,
@@ -3009,6 +3034,135 @@ mod tests {
             store.all().is_empty(),
             "inbox/ files are spool-owned, not durable gaps"
         );
+    }
+
+    // ── Dual-read (plan §8.2) ────────────────────────────────────────────
+
+    fn dual_read_gap(id: &str, project: &str, project_id: Option<&str>) -> GapNote {
+        GapNote {
+            id: id.into(),
+            title: "dual read gap".into(),
+            gap_kind: GapKind::Tooling,
+            domain: "dual-read".into(),
+            wanted_capability: "identity-first visibility".into(),
+            missing_primitive: None,
+            fallback_used: None,
+            evidence: Vec::new(),
+            impact: GapImpact::Medium,
+            blocking_level: BlockingLevel::None,
+            dedupe_key: format!("dual-read-{id}"),
+            suggested_owner: None,
+            notes: None,
+            supersedes: None,
+            superseded_by: None,
+            resolution: GapResolution::Unresolved,
+            project: Some(project.into()),
+            project_id: project_id.map(str::to_string),
+            write_dir: None,
+            provisional_checkout_id: None,
+            task_id: None,
+            session_id: None,
+            provider: None,
+            bro: None,
+            thread_id: None,
+            created_at: "2026-07-24T00:00:00Z".into(),
+            updated_at: "2026-07-24T00:00:00Z".into(),
+            resolved_at: None,
+            resolution_note: None,
+        }
+    }
+
+    #[test]
+    fn gap_row_without_project_id_decodes_and_round_trips() {
+        let legacy = serde_json::json!({
+            "id": "gap-legacy1",
+            "title": "t",
+            "gap_kind": "tooling",
+            "domain": "d",
+            "wanted_capability": "w",
+            "impact": "medium",
+            "blocking_level": "none",
+            "dedupe_key": "k",
+            "resolution": "unresolved",
+            "project": "/repo/old",
+            "created_at": "2026-07-24T00:00:00Z"
+        });
+        let gap: GapNote = serde_json::from_value(legacy).unwrap();
+        assert_eq!(gap.project_id, None);
+        assert!(
+            serde_json::to_value(&gap)
+                .unwrap()
+                .get("project_id")
+                .is_none()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gaps.json");
+        let mut store = GapStore::open(&path).unwrap();
+        store.data.gaps.push(gap);
+        std::fs::write(&path, serde_json::to_string(&store.data).unwrap()).unwrap();
+        let reopened = GapStore::open(&path).unwrap();
+        assert_eq!(reopened.data.gaps.len(), 1);
+        assert_eq!(reopened.data.gaps[0].project_id, None);
+    }
+
+    #[test]
+    fn gap_project_id_match_wins_over_a_different_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = GapStore::open(&dir.path().join("gaps.json")).unwrap();
+        store
+            .data
+            .gaps
+            .push(dual_read_gap("gap-aaaaaaaa", "/repo/old", Some("abc12345")));
+
+        let hits = store.query(&GapListParams {
+            project: Some("/repo/relocated".into()),
+            project_id: Some("abc12345".into()),
+            ..Default::default()
+        });
+        assert_eq!(hits.len(), 1, "id arm must match: {hits:?}");
+    }
+
+    #[test]
+    fn gap_without_ids_falls_back_to_the_exact_path_arm() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = GapStore::open(&dir.path().join("gaps.json")).unwrap();
+        store
+            .data
+            .gaps
+            .push(dual_read_gap("gap-bbbbbbbb", "/repo/old", None));
+
+        let miss = store.query(&GapListParams {
+            project: Some("/repo/relocated".into()),
+            project_id: Some("abc12345".into()),
+            ..Default::default()
+        });
+        assert!(miss.is_empty(), "path arm must decide: {miss:?}");
+
+        let hit = store.query(&GapListParams {
+            project: Some("/repo/old".into()),
+            ..Default::default()
+        });
+        assert_eq!(hit.len(), 1, "path arm must match");
+    }
+
+    #[test]
+    fn gap_mismatched_ids_hide_the_row_at_the_same_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = GapStore::open(&dir.path().join("gaps.json")).unwrap();
+        store
+            .data
+            .gaps
+            .push(dual_read_gap("gap-cccccccc", "/repo/old", Some("abc12345")));
+
+        // Same path key, different ids: the id decides against the row, so a
+        // path reused after a retire-and-add cannot leak the old rows.
+        let hits = store.query(&GapListParams {
+            project: Some("/repo/old".into()),
+            project_id: Some("def67890".into()),
+            ..Default::default()
+        });
+        assert!(hits.is_empty(), "id mismatch must hide: {hits:?}");
     }
 }
 

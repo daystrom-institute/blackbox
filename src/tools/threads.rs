@@ -138,6 +138,7 @@ mod tests {
             action: action.into(),
             topic: None,
             project: None,
+            project_id: None,
             name: None,
             id: None,
             session_id: None,
@@ -158,6 +159,7 @@ mod tests {
         ThreadListParams {
             status: None,
             project: None,
+            project_id: None,
             name: None,
             min_idle_days: None,
             include_resolved: Some(true),

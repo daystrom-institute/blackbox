@@ -47,6 +47,7 @@ impl BlackboxServer {
             &p.board_id,
             &p.topic,
             &project,
+            None,
             p.arc_thread_id.as_deref(),
             &p.opened_by,
         ) {

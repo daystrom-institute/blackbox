@@ -7,6 +7,7 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
 use crate::store_persister::StoreSnapshot;
+use bbox_corpus_core::project_selector::project_scope_matches;
 use bbox_util::util;
 
 #[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
@@ -41,6 +42,11 @@ pub struct PinParams {
     #[serde(skip)]
     #[schemars(skip)]
     pub project_alias: Option<String>,
+    /// Internal, not part of the MCP schema: the resolving authority's
+    /// project id. Set by the daemon adapter from the resolver, never
+    /// accepted from the wire, so identity cannot be caller-asserted.
+    #[serde(skip)]
+    pub project_id: Option<String>,
 }
 
 #[derive(
@@ -75,6 +81,10 @@ pub struct Pin {
     pub target: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Resolving authority's project id, stamped on write. Absent on rows
+    /// written before the catalog cut: those stay on the path lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
     pub created_at: String,
@@ -258,6 +268,7 @@ impl Pins {
             scope,
             target: target.to_string(),
             project: p.project.clone(),
+            project_id: p.project_id.clone(),
             expires_at: p.expires_at.clone(),
             created_at: now.clone(),
             updated_at: now,
@@ -286,10 +297,16 @@ impl Pins {
                 None => true,
             })
             .filter(|pin| match p.project.as_deref() {
-                Some(project) => {
-                    pin.project.as_deref() == Some(project)
-                        || (pin.project.is_some() && pin.project == p.project_alias)
-                }
+                // Dual-read (plan §8.2): ids on both sides decide, whatever the
+                // paths say; either side missing an id keeps the path predicate.
+                Some(project) => project_scope_matches(
+                    pin.project_id.as_deref(),
+                    p.project_id.as_deref(),
+                    || {
+                        pin.project.as_deref() == Some(project)
+                            || (pin.project.is_some() && pin.project == p.project_alias)
+                    },
+                ),
                 None => true,
             })
             .collect();
@@ -432,6 +449,7 @@ mod tests {
                 scope: Some("bro".into()),
                 target: Some("executor".into()),
                 project: Some("/repo/x".into()),
+                project_id: None,
                 expires_at: None,
                 project_alias: None,
             })
@@ -473,6 +491,7 @@ mod tests {
                 scope: Some(scope.into()),
                 target: Some(target.into()),
                 project: Some("/repo/x".into()),
+                project_id: None,
                 expires_at: None,
                 project_alias: None,
             })
@@ -511,6 +530,7 @@ mod tests {
             scope: Some("bro".into()),
             target: Some("executor".into()),
             project: Some("/repo/x".into()),
+            project_id: None,
             expires_at: None,
             project_alias: None,
         })
@@ -569,6 +589,7 @@ mod tests {
             scope: Some("bro".into()),
             target: Some("executor".into()),
             project: None,
+            project_id: None,
             expires_at: None,
             project_alias: None,
         })
@@ -665,6 +686,7 @@ mod tests {
                 scope: Some("bro".into()),
                 target: Some("executor".into()),
                 project: Some("/repo/x".into()),
+                project_id: None,
                 expires_at: None,
                 project_alias: None,
             })
@@ -698,5 +720,121 @@ mod tests {
             rendered.contains("additional pin(s) not shown"),
             "truncation footer missing pin-count suffix: {rendered}"
         );
+    }
+
+    // ── Dual-read (plan §8.2) ────────────────────────────────────────────
+
+    fn dual_read_pin(project: &str, project_id: Option<&str>) -> Pin {
+        Pin {
+            id: format!("pin-{project_id:?}"),
+            title: "t".into(),
+            content: "c".into(),
+            scope: PinScope::Bro,
+            target: "executor".into(),
+            project: Some(project.into()),
+            project_id: project_id.map(str::to_string),
+            expires_at: None,
+            created_at: "2026-07-24T00:00:00Z".into(),
+            updated_at: "2026-07-24T00:00:00Z".into(),
+        }
+    }
+
+    fn dual_read_query(project: &str, project_id: Option<&str>) -> PinParams {
+        PinParams {
+            action: "list".into(),
+            id: None,
+            content: None,
+            title: None,
+            scope: None,
+            target: None,
+            project: Some(project.into()),
+            project_id: project_id.map(str::to_string),
+            expires_at: None,
+            project_alias: None,
+        }
+    }
+
+    #[test]
+    fn pin_row_without_project_id_decodes_and_round_trips() {
+        let legacy = serde_json::json!({
+            "id": "pin-legacy",
+            "title": "t",
+            "content": "c",
+            "scope": "bro",
+            "target": "executor",
+            "project": "/repo/old",
+            "created_at": "2026-07-24T00:00:00Z",
+            "updated_at": "2026-07-24T00:00:00Z"
+        });
+        let pin: Pin = serde_json::from_value(legacy).unwrap();
+        assert_eq!(pin.project_id, None);
+        let reserialized = serde_json::to_value(&pin).unwrap();
+        assert!(reserialized.get("project_id").is_none());
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let mut pins = Pins::open(&path).unwrap();
+        pins.store.pins.push(pin);
+        std::fs::write(
+            &path,
+            serde_json::to_string(&pins.snapshot().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let reopened = Pins::open(&path).unwrap();
+        assert_eq!(reopened.store.pins.len(), 1);
+        assert_eq!(reopened.store.pins[0].project_id, None);
+    }
+
+    #[test]
+    fn pin_project_id_match_wins_over_a_different_path() {
+        let dir = tempdir().unwrap();
+        let mut pins = Pins::open(&dir.path().join("pins.json")).unwrap();
+        pins.store
+            .pins
+            .push(dual_read_pin("/repo/old", Some("abc12345")));
+
+        let out = pins
+            .pin(&dual_read_query("/repo/relocated", Some("abc12345")))
+            .unwrap();
+        assert!(out.contains("executor"), "id arm must match: {out}");
+    }
+
+    #[test]
+    fn pin_without_ids_falls_back_to_the_exact_path_arm() {
+        let dir = tempdir().unwrap();
+        let mut pins = Pins::open(&dir.path().join("pins.json")).unwrap();
+        pins.store.pins.push(dual_read_pin("/repo/old", None));
+
+        // No id on the row: an id-only query with a different path cannot see it.
+        let miss = pins
+            .pin(&dual_read_query("/repo/relocated", Some("abc12345")))
+            .unwrap();
+        assert!(!miss.contains("executor"), "path arm must decide: {miss}");
+        // The exact path still matches, exactly as before ids existed.
+        let hit = pins.pin(&dual_read_query("/repo/old", None)).unwrap();
+        assert!(hit.contains("executor"), "path arm must match: {hit}");
+        // A row id with no query id also falls back to the path arm.
+        pins.store.pins.clear();
+        pins.store
+            .pins
+            .push(dual_read_pin("/repo/old", Some("abc12345")));
+        let row_id_only = pins.pin(&dual_read_query("/repo/old", None)).unwrap();
+        assert!(row_id_only.contains("executor"));
+    }
+
+    #[test]
+    fn pin_mismatched_ids_hide_the_row_at_the_same_path() {
+        let dir = tempdir().unwrap();
+        let mut pins = Pins::open(&dir.path().join("pins.json")).unwrap();
+        pins.store
+            .pins
+            .push(dual_read_pin("/repo/old", Some("abc12345")));
+
+        // Same path key, different ids: the id decides against the row, so a
+        // path reused after a retire-and-add cannot leak the old rows.
+        let out = pins
+            .pin(&dual_read_query("/repo/old", Some("def67890")))
+            .unwrap();
+        assert!(!out.contains("executor"), "id mismatch must hide: {out}");
     }
 }

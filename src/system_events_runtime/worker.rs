@@ -408,6 +408,7 @@ fn write_blocked_note(
         task_id: None,
         session_id: None,
         project: project.map(|p| p.to_string()),
+        project_id: None,
         thread_id: None,
         provider: None,
         bro: None,

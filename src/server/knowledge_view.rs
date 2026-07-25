@@ -779,6 +779,7 @@ mod tests {
             category: Category::Memory,
             scope: Scope::Project,
             project: None,
+            project_id: None,
             providers: Vec::new(),
             priority: Priority::Standard,
             weight: 100,
