@@ -376,7 +376,15 @@ else is parity:
 4. resolver-lane telemetry counters appear in doctor/health (additive
    observability, same pattern as the Phase 0 checkout-access counters);
 5. typed error payloads may carry an additional stable `code` where today's
-   failure is an anyhow string, with the human-visible message preserved.
+   failure is an anyhow string, with the human-visible message preserved;
+6. per D-031, surfaces whose bespoke resolvers matched only exact
+   id/path/alias (B1 corpus-search filters, the B4 slack-bind matcher, the
+   B6 storage-tool resolvers) now resolve worktree and descendant paths to
+   the base project through the engine's broad Read gate, exactly like every
+   canonical-spine surface. The former exact-only misses were the documented
+   invisible-worktree defect class (gap-72fd5932's silent-empty-results
+   trap), not a preserved semantic; the literal lanes themselves are
+   unchanged.
 
 Explicitly not changed on bridge mode: the unregistered-write pass-through of
 `resolve_project_write`, the substring filter lanes, the hybrid-search hash
@@ -597,7 +605,14 @@ receipt/assets) boots catalog mode normally.
 
 The daemon never rewrites, migrates, or "repairs" project state at startup in
 either mode. Recovery of an interrupted pair transaction is the store owner's
-journal recovery inside `open_existing`, unchanged.
+journal recovery inside `open_existing`, unchanged, with one bounded
+refinement recorded as D-029: a migration-kind journal in the terminal
+committed state is verified registry-free (installed pair images against the
+journal's new hashes plus the existing origin/marker binding), because every
+successfully migrated root retains its committed journal as a GC root and a
+bare `open_existing` on such a root is exactly the catalog-mode daemon open.
+Non-terminal migration journals still refuse without the complete code-owned
+participant registry.
 
 ### 6.2 Catalog-backed compatibility projection at runtime
 
@@ -1382,8 +1397,15 @@ The Phase 1 ten-step protocol is unchanged (build, `which stablesign`,
 stable-sign the exact binaries, unused isolated port,
 `scripts/dev-isolated-daemon.sh`, listening log with throwaway paths, HTTP
 probes, MCP initialize, milestone assertion, graceful shutdown and Trash).
-Catalog-mode smokes additionally stable-sign and use the exact `blackbox`
-CLI to produce the isolated migrated root first. Do not copy, replace,
+Catalog-mode smokes additionally produce the isolated migrated root first
+and verify it with the stable-signed `blackbox` CLI. Per D-030, the root is
+materialized by the ignored facade-driving producer test (byte-identical to
+the production apply ceremony) rather than by CLI preflight/apply against a
+synthetic layout: the CLI preflight source is config-shaped by design, and a
+synthetic config-shaped fixture cannot supply live publisher git evidence
+(`publisher_git_evidence_missing`). The CLI preflight/apply envelopes were
+live-smoked against real state in P1-D; the smoke's CLI role here is
+`verify --root` on the produced root. Do not copy, replace,
 sign, restart, or signal the production or persistent dev service; any
 future need for the persistent dev instance requires the read-only scope
 check and explicit operator approval.

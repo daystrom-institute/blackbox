@@ -726,3 +726,63 @@ until a later entry explicitly supersedes it.
   honestly prove and defers the rest to the offline facade.
 - Revisit only if: the migration journal retention policy changes, or a
   later phase gives the daemon a code-owned participant registry at boot.
+
+## D-030: The catalog-mode smoke root is produced by the facade-driving test, verified by the CLI
+
+- Date: 2026-07-25
+- Phase: durable project catalog, Phase 2 (P2-B..P2-E bootsmokes)
+- Status: accepted pending implementation review
+- Decision: catalog-mode live bootsmokes materialize the isolated migrated
+  root by running the ignored producer test
+  (`produce_migrated_smoke_fixture_from_env_root` in
+  `crates/bbox-indexing/tests/project_catalog_migration_facade.rs`), which
+  drives the byte-identical facade ceremony production uses
+  (assessment, scope-owner resolution, quarantine, preflight, apply into a
+  rehearsal root). The stable-signed `blackbox` CLI then runs
+  `verify --root` on the produced root, and the stable-signed daemon boots
+  on it. The plan's original section 12 wording had the CLI produce the
+  root via preflight/apply.
+- Evidence:
+  - The CLI preflight source layout is config-shaped by design; a synthetic
+    config-shaped fixture has no real publisher git history and fails
+    preflight with `publisher_git_evidence_missing`, so a CLI-produced
+    smoke root would require a live prior host, exactly what an isolated
+    smoke must not depend on.
+  - The CLI preflight/apply envelopes were live-smoked against real state
+    in P1-D, so the smoke's CLI coverage duty here is verification, not
+    production.
+- Rationale: the smoke's purpose is proving the daemon boots and serves
+  catalog mode on faithfully migrated bytes; the facade test produces those
+  bytes through the same owner code paths, and shifting the CLI's smoke
+  role to `verify --root` keeps every artifact exercised without a
+  synthetic-evidence back door.
+- Revisit only if: preflight gains a fixture-evidence mode, or the smoke
+  gains access to a real pre-migration host state.
+
+## D-031: Bespoke exact-only filter resolvers adopt the engine's broad Read gate
+
+- Date: 2026-07-25
+- Phase: durable project catalog, Phase 2 (P2-E caller conversion)
+- Status: accepted pending implementation review
+- Decision: converting B1 (corpus-search filters), B4 (slack channel
+  binding), and B6 (storage tools) to the shared resolver engine gives
+  their selectors the canonical-spine Read semantics: worktree and
+  descendant paths of a registered project now resolve to the base project
+  id instead of missing. The plan's section 4.3 parity list gains this as
+  deliberate change 6. Literal substring/pass-through lanes are unchanged,
+  and no unresolved selector manufactures identity outside the tagged
+  eight-hex and path-hash compatibility lanes.
+- Evidence:
+  - The exact-only misses were the documented defect class: a worktree path
+    reaching the hash lane derives a foreign id and silently returns empty
+    results (gap-72fd5932; crates/bbox-corpus-index/AGENTS.md warns the
+    ordering is load-bearing).
+  - The 2026-06 taxonomy consolidation already declared
+    `resolve_project_context` the single entry point for project-like
+    input; the bespoke matchers predate it.
+- Rationale: preserving an exact-only miss as "parity" would freeze a trap
+  the plan retires B1-B8 to eliminate; the engine's Read gate is the
+  documented resolution semantic for every other read surface.
+- Revisit only if: a surface is found whose consumers depend on worktree
+  paths NOT aliasing to the base (none known; dispatch execution targets
+  are out of scope by section 3).
