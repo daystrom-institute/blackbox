@@ -331,3 +331,137 @@ fn cli_runs_clean_preflight_apply_and_fresh_verify() {
     assert_eq!(verify["result"]["omitted_catalog_count"], 0);
     assert_redacted(&verify, &root);
 }
+
+#[test]
+fn admin_subcommands_round_trip_on_an_isolated_v2_store() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let projects_path = root.join("projects.json");
+    // An initialized empty v2 store is the administered substrate; the
+    // exclusive lifetime lock is free because no daemon shares this root.
+    drop(
+        bbox_indexing::project_catalog_store::ProjectCatalogStore::initialize_empty(&projects_path)
+            .unwrap(),
+    );
+    let projects = projects_path.to_str().unwrap();
+
+    // Published add with an initial alias.
+    let added = success_json(&run(&[
+        "project-catalog",
+        "add",
+        "--projects-path",
+        projects,
+        "--repo-id",
+        "clifamily",
+        "--relpath",
+        ".",
+        "--display-name",
+        "cli remote",
+        "--alias",
+        "cli-alias",
+        "--created-at",
+        "2026-07-24T00:00:00Z",
+    ]));
+    let project_id = added["result"]["project_id"].as_str().unwrap().to_string();
+    assert!(project_id.starts_with("p_"));
+
+    // Legacy-local add.
+    let local = success_json(&run(&[
+        "project-catalog",
+        "add",
+        "--projects-path",
+        projects,
+        "--legacy-local",
+        "--display-name",
+        "cli local",
+        "--created-at",
+        "2026-07-24T00:00:01Z",
+    ]));
+    let local_id = local["result"]["project_id"].as_str().unwrap().to_string();
+
+    // List shows both, including the remote-only published project.
+    let listed = success_json(&run(&[
+        "project-catalog",
+        "list",
+        "--projects-path",
+        projects,
+    ]));
+    let projects_json = listed["result"]["projects"].as_array().unwrap();
+    assert_eq!(projects_json.len(), 2);
+    assert_redacted(&listed, &root);
+
+    // Get returns the catalog record.
+    let fetched = success_json(&run(&[
+        "project-catalog",
+        "get",
+        "--projects-path",
+        projects,
+        "--project",
+        &project_id,
+    ]));
+    assert_eq!(
+        fetched["result"]["project"]["scope"]["repo_id"]
+            .as_str()
+            .unwrap(),
+        "clifamily"
+    );
+
+    // Attested relpath move on the remote-only project.
+    let migrated = success_json(&run(&[
+        "project-catalog",
+        "scope-migrate",
+        "--projects-path",
+        projects,
+        "--operator-attested",
+        "--project",
+        &project_id,
+        "--expected-old-repo",
+        "clifamily",
+        "--expected-old-relpath",
+        ".",
+        "--new-repo",
+        "clifamily",
+        "--new-relpath",
+        "svc/api",
+        "--kind",
+        "relpath-move",
+        "--acknowledge-unattached-scope-migration",
+        "--reason",
+        "relocating the remote-only service root",
+        "--migrated-at",
+        "2026-07-24T00:00:02Z",
+    ]));
+    assert!(
+        migrated["result"]["scope_migration_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("sm_")
+    );
+
+    // Retire inventories, then removes when clean; the legacy-local
+    // project survives untouched.
+    let retired = success_json(&run(&[
+        "project-catalog",
+        "retire",
+        "--projects-path",
+        projects,
+        "--project",
+        &project_id,
+        "--execute",
+        "--config",
+        root.join("missing-config.toml").to_str().unwrap(),
+    ]));
+    assert_eq!(retired["result"]["removed"], serde_json::Value::Bool(true));
+    let listed = success_json(&run(&[
+        "project-catalog",
+        "list",
+        "--projects-path",
+        projects,
+    ]));
+    let remaining = listed["result"]["projects"].as_array().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(
+        remaining[0]["project_id"].as_str().unwrap(),
+        local_id.as_str()
+    );
+}
