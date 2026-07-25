@@ -52,6 +52,8 @@ pub enum ContractError {
     TooManyFiles { actual: u64, limit: u64 },
     #[error("manifest declares {actual} logical bytes, limit is {limit}")]
     TooManyBytes { actual: u64, limit: u64 },
+    #[error("invalid source uri")]
+    InvalidSourceUri,
     #[error("manifest file count does not match descriptor")]
     FileCountMismatch,
     #[error("manifest logical byte count does not match descriptor")]
@@ -499,6 +501,128 @@ pub fn source_entry_key(selector: &str, relative_path: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+const SOURCE_URI_PREFIX: &str = "bbox://project/";
+
+/// Bounded defense-in-depth check on the `source_uri` codec's own boundary:
+/// non-empty, and free of `/`, `%`, and control bytes, so a `project_id`
+/// this codec embeds unencoded can never be mistaken for a path separator
+/// or a percent-escape by a reader, and never smuggles a raw control byte
+/// into a rendered URI. This is intentionally not `ProjectId::parse`'s full
+/// charset (this crate does not depend on the catalog crate's id type):
+/// callers that hold a real `ProjectId` already satisfy this bound, and
+/// callers that don't still get a safe URI shape out of this codec.
+fn valid_source_uri_project_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte != b'/' && byte != b'%' && !byte.is_ascii_control())
+}
+
+/// Render the stable, machine-facing `source_uri` for a project-relative
+/// path (durable-project-catalog governing section 10.2, Phase 3 plan
+/// section 5). Validates the relative path first, then percent-encodes each
+/// `/`-delimited segment's UTF-8 bytes: ASCII alphanumerics and `- . _ ~`
+/// pass through unencoded, everything else becomes `%XX` with uppercase hex.
+/// No Unicode normalization is applied. `project_id` is embedded unencoded
+/// (its own catalog-level charset already excludes `/`, `%`, and control
+/// bytes) and must be non-empty and slash-free.
+pub fn encode_source_uri(project_id: &str, relative_path: &str) -> Result<String, ContractError> {
+    if !valid_source_uri_project_id(project_id) {
+        return Err(ContractError::InvalidSourceUri);
+    }
+    validate_relative_path(relative_path)?;
+    let mut encoded = String::with_capacity(relative_path.len());
+    for (index, segment) in relative_path.split('/').enumerate() {
+        if index > 0 {
+            encoded.push('/');
+        }
+        percent_encode_segment(segment, &mut encoded);
+    }
+    Ok(format!("{SOURCE_URI_PREFIX}{project_id}/{encoded}"))
+}
+
+/// Parse a `source_uri` rendered by [`encode_source_uri`] back into
+/// `(project_id, relative_path)`. Decodes each segment's percent-escapes
+/// exactly once, rejects an escape that decodes to `/` or `\`, then requires
+/// canonical re-encoding equality: any non-canonical encoding (wrong case,
+/// an unnecessarily escaped unreserved character, or a lowercase hex digit)
+/// fails closed here rather than being silently normalized. The decoded
+/// relative path is validated the same way `encode_source_uri` validates
+/// its input.
+pub fn decode_source_uri(uri: &str) -> Result<(String, String), ContractError> {
+    let rest = uri
+        .strip_prefix(SOURCE_URI_PREFIX)
+        .ok_or(ContractError::InvalidSourceUri)?;
+    let (project_id, encoded_path) = rest
+        .split_once('/')
+        .ok_or(ContractError::InvalidSourceUri)?;
+    if !valid_source_uri_project_id(project_id) {
+        return Err(ContractError::InvalidSourceUri);
+    }
+    let mut segments = Vec::new();
+    for encoded_segment in encoded_path.split('/') {
+        let decoded_segment =
+            percent_decode_segment(encoded_segment).ok_or(ContractError::InvalidSourceUri)?;
+        if decoded_segment.contains('/') || decoded_segment.contains('\\') {
+            return Err(ContractError::InvalidSourceUri);
+        }
+        segments.push(decoded_segment);
+    }
+    let decoded_path = segments.join("/");
+    validate_relative_path(&decoded_path)?;
+    let re_encoded = encode_source_uri(project_id, &decoded_path)?;
+    if re_encoded != uri {
+        return Err(ContractError::InvalidSourceUri);
+    }
+    Ok((project_id.to_string(), decoded_path))
+}
+
+fn percent_encode_segment(segment: &str, out: &mut String) {
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(hex_digit_upper(byte >> 4));
+            out.push(hex_digit_upper(byte & 0x0f));
+        }
+    }
+}
+
+fn hex_digit_upper(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        _ => (b'A' + (nibble - 10)) as char,
+    }
+}
+
+fn percent_decode_segment(segment: &str) -> Option<String> {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = hex_digit_value(*bytes.get(index + 1)?)?;
+            let low = hex_digit_value(*bytes.get(index + 2)?)?;
+            out.push((high << 4) | low);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_digit_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
 fn put_scope(hasher: &mut Sha256, scope: &PublishedScope) {
     put_field(hasher, scope.repo_id().as_bytes());
     put_field(hasher, scope.bbox_root_relpath().as_bytes());
@@ -602,6 +726,80 @@ mod tests {
         assert!(validate_relative_path(&format!("{}.rs", "a".repeat(256))).is_err());
         assert!(validate_relative_path(&format!("{}.rs", "a".repeat(4096))).is_err());
         assert!(validate_relative_path("src/main.rs").is_ok());
+    }
+
+    #[test]
+    fn source_uri_round_trips_reserved_and_non_ascii_names() {
+        for relative_path in [
+            "src/main.rs",
+            "has space/file.rs",
+            "100% done.md",
+            "notes#1.md",
+            "query?.txt",
+            "café/日本語.md",
+            "a-b_c.d~e.rs",
+        ] {
+            let uri = encode_source_uri("project-a", relative_path).unwrap();
+            let (project_id, decoded) = decode_source_uri(&uri).unwrap();
+            assert_eq!(project_id, "project-a");
+            assert_eq!(decoded, relative_path, "round trip for {relative_path:?}");
+            // Encoding is deterministic: encoding the decoded path again
+            // reproduces the exact same URI byte for byte.
+            assert_eq!(encode_source_uri("project-a", &decoded).unwrap(), uri);
+        }
+    }
+
+    #[test]
+    fn source_uri_uses_uppercase_hex_and_leaves_slashes_and_unreserved_bytes_alone() {
+        let uri = encode_source_uri("p", "a b/c#d").unwrap();
+        assert_eq!(uri, "bbox://project/p/a%20b/c%23d");
+    }
+
+    #[test]
+    fn source_uri_decode_rejects_non_canonical_and_traversal_encodings() {
+        for invalid in [
+            // Lowercase hex: not the canonical uppercase form this codec emits.
+            "bbox://project/p/a%2fb",
+            // Over-encoding an unreserved ASCII byte that should be literal.
+            "bbox://project/p/%61",
+            // Encoded slash: must not be reinterpreted as a path separator.
+            "bbox://project/p/a%2Fb",
+            // Encoded backslash.
+            "bbox://project/p/a%5Cb",
+            // Percent-encoded traversal.
+            "bbox://project/p/%2E%2E",
+            "bbox://project/p/..",
+            "bbox://project/p/.",
+            "bbox://project/p/",
+            "bbox://project/p",
+            "bbox://project//a",
+            "bbox://project/p/a%",
+            "bbox://project/p/a%2",
+            "bbox://project/p/a%gg",
+            "not-a-source-uri",
+            "",
+        ] {
+            assert!(
+                decode_source_uri(invalid).is_err(),
+                "{invalid} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn source_uri_rejects_empty_or_slash_bearing_project_id() {
+        assert!(encode_source_uri("", "a.rs").is_err());
+        assert!(encode_source_uri("a/b", "a.rs").is_err());
+        assert!(decode_source_uri("bbox://project//a.rs").is_err());
+    }
+
+    #[test]
+    fn source_uri_rejects_a_project_id_containing_percent_or_control_bytes() {
+        assert!(encode_source_uri("a%b", "a.rs").is_err());
+        assert!(encode_source_uri("a\nb", "a.rs").is_err());
+        assert!(encode_source_uri("a\0b", "a.rs").is_err());
+        assert!(decode_source_uri("bbox://project/a%25b/a.rs").is_err());
+        assert!(decode_source_uri("bbox://project/a\nb/a.rs").is_err());
     }
 
     #[test]

@@ -857,3 +857,34 @@ until a later entry explicitly supersedes it.
 - Revisit only if: publisher freshness reporting shows bind-then-detach
   interleavings occurring in practice, or Phase 6 retires the v1 lane and
   the synthetic-id residual with it.
+
+## D-034: The bridge identity marker is identity provenance, not a scope variant
+
+- Date: 2026-07-25
+- Phase: durable project catalog, Phase 3 (P3-A substrate)
+- Status: accepted after milestone review (two-round adjudication)
+- Decision: `CodeProjectIdentity` carries a typed
+  `IdentityOrigin { Catalog, Bridge }` provenance field, and the Phase 3
+  plan's "typed BridgeLegacy marker" is realized as that field rather than
+  as a third `ProjectScope` variant. The bridge constructor keeps
+  `scope = LegacyLocal` as a placeholder. The collected-staging refusal
+  keys on `origin == Catalog && scope == LegacyLocal`; bridge identities
+  always proceed.
+- Evidence:
+  - `ProjectScope` serializes into catalog bytes; a bridge-only variant
+    could leak into `CatalogSnapshotV2` unless `validate_catalog` also
+    rejected it at every boundary.
+  - `ProjectRecord` carries no `PublishedScope`, so a scope-shaped marker
+    would collapse every bridge identity into the catalog LegacyLocal
+    refusal, wholesale breaking bridge collected staging, which runs on
+    lease/grant-table authority through Phase 3.
+  - The milestone reviewer confirmed the origin-keyed predicate preserves
+    the plan section 6 item 1 refusal exactly (a catalog LegacyLocal
+    project can never hold a producer grant) while bridge staging
+    proceeds.
+- Rationale: identity provenance is bridge-lane metadata, not durable
+  catalog vocabulary; keying the refusal on provenance plus scope yields
+  the intended refusal set without contaminating catalog serialization.
+- Revisit only if: Phase 6 retires the bridge lane, at which point
+  `IdentityOrigin::Bridge` and the placeholder scope can be deleted with
+  it.

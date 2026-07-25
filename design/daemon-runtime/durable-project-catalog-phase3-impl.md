@@ -465,8 +465,12 @@ Ownership: `bbox-corpus-core`, `bbox-code-source`, `bbox-indexing`
    `bbox-corpus-core` (new module `code_project_identity.rs`), with
    constructors from a catalog project plus its history record and from a
    bridge `ProjectRecord` (v1 arm derives `scope` from the record's published
-   scope when present, else a typed `BridgeLegacy` marker documented as
-   bridge-only; it never fabricates a `PublishedScope`). The v1 arm's
+   scope when present; otherwise the identity keeps a placeholder
+   `LegacyLocal` scope and the typed marker is realized as an
+   `IdentityOrigin { Catalog, Bridge }` provenance field on the identity
+   itself, so the P3-B collected-staging refusal keys on origin `Catalog`
+   plus scope `LegacyLocal` while bridge identities proceed on lease
+   authority; it never fabricates a `PublishedScope` (D-034)). The v1 arm's
    `display_name` is the record's first alias when one exists, else the
    project id, and never a path component: `ProjectRecord` has no
    display-name field, and a basename fallback would reintroduce a

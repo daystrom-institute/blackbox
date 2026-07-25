@@ -427,6 +427,7 @@ pub fn promote_project(
                                 authority: RepoHistoryAuthority::Recorded(authority),
                                 primary_namespace: primary,
                                 compatibility_namespaces: Default::default(),
+                                materialization: Default::default(),
                             },
                         );
                         id
@@ -996,6 +997,7 @@ fn insert_new_project(
                     authority: RepoHistoryAuthority::LocalProject(project_id.clone()),
                     primary_namespace: namespace,
                     compatibility_namespaces: Default::default(),
+                    materialization: Default::default(),
                 },
             );
             (ProjectScope::LegacyLocal, Some(history_id))
@@ -1023,6 +1025,7 @@ fn insert_new_project(
                             authority: RepoHistoryAuthority::Recorded(authority),
                             primary_namespace: primary,
                             compatibility_namespaces: Default::default(),
+                            materialization: Default::default(),
                         },
                     );
                     id
@@ -1450,7 +1453,9 @@ pub fn retire_project(
     evidence: &RetireEvidence,
     execute: bool,
 ) -> AdminResult<(RetireInventory, Option<ProjectCatalogCommit>)> {
-    use bbox_corpus_core::project_catalog::{LegacyPathBindingStatus, RepoHistoryAuthority};
+    use bbox_corpus_core::project_catalog::{
+        LegacyPathBindingStatus, RepoHistoryAuthority, RepoHistoryMaterialization,
+    };
 
     let state = store.snapshot()?;
     if state.epoch() != expected_epoch {
@@ -1480,6 +1485,43 @@ pub fn retire_project(
     let mut blocking = blocking;
     if active_attachments > 0 {
         blocking.insert("active_attachments".into(), active_attachments);
+    }
+    // Retire refuses to delete ANY history record whose materialization is
+    // Ready (Phase 3 plan section 5), regardless of authority kind. The
+    // invariant is deletion-site-wide: it is layered on top of whatever
+    // condition the transact closure below uses to decide a history record
+    // is eligible for removal, not hardcoded to one authority kind. Today
+    // that eligibility (`deletion_eligible` below) is exactly "LocalProject
+    // authority, unreferenced by any other project": the transact closure's
+    // one and only history-record deletion path. A Recorded- or
+    // LegacyNamespace-authority record is never deleted by retire at all
+    // (durable/shared repo identity outlives any single project's
+    // retirement), so it can never reach this guard regardless of
+    // materialization; `deletion_eligible` reflects that structurally
+    // instead of special-casing it. This also structurally protects
+    // validate_catalog's dangling-authority check, since a
+    // LocalProject-authority record requires its owning project to still
+    // exist.
+    let history_generation_referenced = state
+        .catalog()
+        .projects
+        .get(project_id)
+        .and_then(|project| project.repo_history.as_ref())
+        .and_then(|history_id| {
+            let history = state.catalog().repo_histories.get(history_id)?;
+            let still_referenced = state.catalog().projects.values().any(|other| {
+                other.project_id != *project_id && other.repo_history.as_ref() == Some(history_id)
+            });
+            let deletion_eligible = !still_referenced
+                && matches!(&history.authority, RepoHistoryAuthority::LocalProject(owner) if owner == project_id);
+            let ready = matches!(
+                history.materialization,
+                RepoHistoryMaterialization::Ready { .. }
+            );
+            (deletion_eligible && ready).then_some(1_u64)
+        });
+    if let Some(count) = history_generation_referenced {
+        blocking.insert("history_generation_referenced".into(), count);
     }
     let inventory = RetireInventory {
         blocking: blocking.clone(),
@@ -1522,6 +1564,11 @@ pub fn retire_project(
             ));
         };
         if let Some(history_id) = &project.repo_history {
+            // The blocking check above already refused this whole retire if
+            // this exact deletion-eligibility condition held with a Ready
+            // materialization; a Recorded/LegacyNamespace-authority record
+            // never satisfies `local_only` and so is never removed here
+            // regardless of materialization or reference count.
             let still_referenced = catalog
                 .projects
                 .values()
@@ -2389,6 +2436,191 @@ mod tests {
         assert!(!state.catalog().projects.contains_key(&published_id));
         // The local project and its history survive untouched.
         assert!(state.catalog().projects.contains_key(&local_id));
+    }
+
+    #[test]
+    fn retire_refuses_to_delete_a_ready_materialized_local_history() {
+        use bbox_corpus_core::project_catalog::{
+            RepoHistoryGenerationId, RepoHistoryMaterialization,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = ProjectCatalogStore::initialize_empty(root.join("projects.json")).unwrap();
+
+        let (local_id, _) = catalog_add(
+            &store,
+            current_epoch(&store),
+            &CatalogAddKind::LegacyLocal,
+            "local project",
+            &[],
+            "2026-07-24T00:00:00Z",
+        )
+        .unwrap();
+        let state = store.snapshot().unwrap();
+        let history_id = state
+            .catalog()
+            .projects
+            .get(&local_id)
+            .unwrap()
+            .repo_history
+            .clone()
+            .unwrap();
+
+        // Materialize the history record directly (simulating the P3-D
+        // materializer's catalog transaction, which does not exist yet in
+        // this milestone).
+        let epoch = current_epoch(&store);
+        store
+            .transact(epoch, |catalog, _| {
+                catalog
+                    .repo_histories
+                    .get_mut(&history_id)
+                    .unwrap()
+                    .materialization = RepoHistoryMaterialization::Ready {
+                    generation_id: RepoHistoryGenerationId::parse(format!(
+                        "rhg_{}",
+                        "a".repeat(64)
+                    ))
+                    .unwrap(),
+                };
+                Ok(())
+            })
+            .unwrap();
+
+        let (inventory, commit) = retire_project(
+            &store,
+            current_epoch(&store),
+            &local_id,
+            &RetireEvidence::default(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            inventory.blocking.get("history_generation_referenced"),
+            Some(&1)
+        );
+        assert!(commit.is_none());
+
+        let error = retire_project(
+            &store,
+            current_epoch(&store),
+            &local_id,
+            &RetireEvidence::default(),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_admin_retire_blocked");
+        let state = store.snapshot().unwrap();
+        assert!(
+            state.catalog().projects.contains_key(&local_id),
+            "the project must survive a refused retire"
+        );
+
+        // Once the history reverts to NotBuilt, retire proceeds and removes
+        // the now-unreferenced local history record exactly as before.
+        let epoch = current_epoch(&store);
+        store
+            .transact(epoch, |catalog, _| {
+                catalog
+                    .repo_histories
+                    .get_mut(&history_id)
+                    .unwrap()
+                    .materialization = RepoHistoryMaterialization::NotBuilt;
+                Ok(())
+            })
+            .unwrap();
+        let (_, commit) = retire_project(
+            &store,
+            current_epoch(&store),
+            &local_id,
+            &RetireEvidence::default(),
+            true,
+        )
+        .unwrap();
+        assert!(commit.is_some());
+        let state = store.snapshot().unwrap();
+        assert!(!state.catalog().projects.contains_key(&local_id));
+        assert!(!state.catalog().repo_histories.contains_key(&history_id));
+    }
+
+    #[test]
+    fn retire_never_touches_a_ready_materialized_non_local_history() {
+        use bbox_corpus_core::project_catalog::{
+            RepoHistoryGenerationId, RepoHistoryMaterialization,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = ProjectCatalogStore::initialize_empty(root.join("projects.json")).unwrap();
+
+        let scope = PublishedScope::try_new("retire-non-local-family", ".").unwrap();
+        let (published_id, _) = catalog_add(
+            &store,
+            current_epoch(&store),
+            &CatalogAddKind::Published(scope.clone()),
+            "published project",
+            &[],
+            "2026-07-25T00:00:00Z",
+        )
+        .unwrap();
+        let state = store.snapshot().unwrap();
+        let history_id = state
+            .catalog()
+            .projects
+            .get(&published_id)
+            .unwrap()
+            .repo_history
+            .clone()
+            .unwrap();
+
+        // Materialize the Recorded-authority history record. The transact
+        // closure's deletion site only ever removes a LocalProject-authority
+        // record (see the comment there), so this record must never be
+        // touched by retire regardless of materialization: there is no
+        // deletion path that could reach it, hence nothing for the blocking
+        // guard to refuse.
+        let epoch = current_epoch(&store);
+        store
+            .transact(epoch, |catalog, _| {
+                catalog
+                    .repo_histories
+                    .get_mut(&history_id)
+                    .unwrap()
+                    .materialization = RepoHistoryMaterialization::Ready {
+                    generation_id: RepoHistoryGenerationId::parse(format!(
+                        "rhg_{}",
+                        "b".repeat(64)
+                    ))
+                    .unwrap(),
+                };
+                Ok(())
+            })
+            .unwrap();
+
+        let (inventory, commit) = retire_project(
+            &store,
+            current_epoch(&store),
+            &published_id,
+            &RetireEvidence::default(),
+            true,
+        )
+        .unwrap();
+        assert!(
+            !inventory
+                .blocking
+                .contains_key("history_generation_referenced"),
+            "a Recorded-authority history record is never a deletion candidate, \
+             so a Ready materialization cannot block retire: {:?}",
+            inventory.blocking
+        );
+        assert!(commit.is_some());
+        let state = store.snapshot().unwrap();
+        assert!(!state.catalog().projects.contains_key(&published_id));
+        assert!(
+            state.catalog().repo_histories.contains_key(&history_id),
+            "retire structurally cannot delete a non-LocalProject-authority history record"
+        );
     }
 
     #[test]

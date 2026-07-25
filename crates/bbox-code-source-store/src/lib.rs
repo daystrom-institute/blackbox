@@ -4830,17 +4830,33 @@ fn validate_snapshot_id(snapshot_id: &str) -> Result<()> {
 
 fn validate_migration_snapshot_id(snapshot_id: &str) -> Result<()> {
     validate_snapshot_id(snapshot_id)?;
-    let Some(hash) = snapshot_id.strip_prefix("collected-") else {
-        bail!("invalid collected snapshot id");
-    };
-    if hash.len() != 32
-        || !hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        bail!("invalid collected snapshot id");
+    if let Some(hash) = snapshot_id.strip_prefix("collected-") {
+        if hash.len() != 32
+            || !hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            bail!("invalid collected snapshot id");
+        }
+        return Ok(());
     }
-    Ok(())
+    // Phase 3 plan section 4.6: a LegacyLocal project whose history record
+    // selects the non-head-bound derivation uses this shape instead of the
+    // collected one. Same 32-hex width as the collected shape above
+    // (legacy_local_snapshot_id matches nongit_snapshot_id/
+    // collected_snapshot_id's [..16]-byte convention, not the head-bound
+    // family's 16-hex suffix).
+    if let Some(hash) = snapshot_id.strip_prefix("legacylocal-") {
+        if hash.len() != 32
+            || !hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            bail!("invalid legacy-local snapshot id");
+        }
+        return Ok(());
+    }
+    bail!("invalid migration snapshot id");
 }
 
 fn validate_optional_diagnostic(diagnostic: Option<&str>) -> Result<()> {
@@ -5771,6 +5787,28 @@ mod tests {
             bytes.push(b'\n');
         }
         bytes
+    }
+
+    #[test]
+    fn migration_snapshot_id_accepts_collected_and_legacylocal_shapes() {
+        assert!(validate_migration_snapshot_id(&format!("collected-{}", "a".repeat(32))).is_ok());
+        assert!(validate_migration_snapshot_id(&format!("legacylocal-{}", "a".repeat(32))).is_ok());
+        for invalid in [
+            format!("collected-{}", "a".repeat(31)),
+            format!("collected-{}", "A".repeat(32)),
+            format!("legacylocal-{}", "a".repeat(31)),
+            format!("legacylocal-{}", "a".repeat(16)),
+            format!("legacylocal-{}", "A".repeat(32)),
+            "head-abc123-0011223344556677".to_string(),
+            "nongit-0011223344556677".to_string(),
+            "unknown-prefix".to_string(),
+            String::new(),
+        ] {
+            assert!(
+                validate_migration_snapshot_id(&invalid).is_err(),
+                "{invalid} should be rejected"
+            );
+        }
     }
 
     #[test]

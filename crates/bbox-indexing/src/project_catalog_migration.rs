@@ -32,11 +32,12 @@ use bbox_corpus_core::project_catalog::{
     CheckoutAttachment, CommitNamespace, CorpusProject, LegacyPathBindingId,
     LegacyPathBindingStatus, LegacyPathLedgerEntry, LegacyPathRelationship,
     MAX_PROJECT_CATALOG_ENTRIES, ProjectCatalogTransactionId, ProjectId, ProjectScope,
-    RecordedRepoAuthority, RepoHistoryAuthority, RepoHistoryId, RepoHistoryRecord,
-    encode_attachment_snapshot, encode_catalog_snapshot, validate_catalog_attachments,
+    RecordedRepoAuthority, RepoHistoryAuthority, RepoHistoryId, RepoHistoryMaterialization,
+    RepoHistoryQuarantineMaterialization, RepoHistoryRecord, encode_attachment_snapshot,
+    encode_catalog_snapshot, validate_catalog_attachments,
 };
 use bbox_corpus_core::project_record::ProjectRecord;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::accepted_publication_store::{
     AcceptedGapSourceV1, AcceptedKnowledgeSourceV1, AcceptedPublicationBuildInputV1,
@@ -46,8 +47,9 @@ use crate::accepted_publication_store::{
 use crate::project_catalog_inventory::{
     AttachmentMigrationReportRowV1, AttachmentPostImageInputV1, CheckoutIdentityActionV1,
     ConflictReportV1, DeterministicPostImageInputV1, DeterministicRepoHistoryGroupV1,
-    InventorySourceStateV1, LegacyPathBindingPostImageInputV1, LegacyPathBindingReportV1,
-    LegacyPathBindingStatusV1, LegacyPathRelationshipV1, MAX_PROJECT_CATALOG_REPORT_BYTES,
+    ImmutableInventoryOwnerKindV1, InventorySourceStateV1, LegacyCommitNamespaceInventoryV1,
+    LegacyPathBindingPostImageInputV1, LegacyPathBindingReportV1, LegacyPathBindingStatusV1,
+    LegacyPathRelationshipV1, MAX_PROJECT_CATALOG_REPORT_BYTES,
     MAX_PROJECT_CATALOG_RESOLUTION_BYTES, MigrationRefusalOriginV1, MigrationRefusalReportV1,
     MissingPathReportV1, MutableInventorySourceKindV1, PlannedRepoHistoryIdentityV1,
     PredictedAssetV1, PredictedPostImageHashesV1, ProjectCatalogMigrationPlanKindV1,
@@ -2258,6 +2260,10 @@ fn build_base_post_images(
                 authority,
                 primary_namespace: group.planned_primary_namespace.clone(),
                 compatibility_namespaces: group.planned_compatibility_namespaces.clone(),
+                // Phase 1 never reads commit-document bodies or creates
+                // history generations; the v1 importer emits this field
+                // explicitly as typed NotBuilt (Phase 3 plan section 4.1).
+                materialization: RepoHistoryMaterialization::NotBuilt,
             },
         );
     }
@@ -2379,6 +2385,9 @@ fn build_base_post_images(
                 namespace,
                 candidate_repo_history_ids: candidates,
                 status: AmbiguousNamespaceStatus::Quarantined,
+                // Same emission rule as repo_histories above: explicit typed
+                // NotBuilt, not a relied-upon serde default.
+                materialization: RepoHistoryQuarantineMaterialization::NotBuilt,
             },
         );
     }
@@ -3792,6 +3801,7 @@ impl ClosedMigrationIntegrationV1 for CurrentClosedMigrationIntegrationV1 {
                 facade_mutation_disposition(failure.disposition),
             )
         })?;
+        git_meta_backup_copy_if_needed(layout).map_err(post_commit_verification_error)?;
         let verified = verify_installed(layout).map_err(post_commit_verification_error)?;
         if verified.receipt.predicted_marker_hash != predicted_marker_hash {
             return Err(ProjectCatalogMigrationError::new(
@@ -3814,6 +3824,93 @@ impl ClosedMigrationIntegrationV1 for CurrentClosedMigrationIntegrationV1 {
         layout: &ProjectCatalogMigrationResolvedLayoutV1,
     ) -> Result<ProjectCatalogMigrationVerifyResultV1, ProjectCatalogMigrationError> {
         verify_installed(layout)
+    }
+}
+
+/// Versioned canonical-JSON namespace-inventory asset persisted through the
+/// migration facade's existing immutable-asset mechanism (Phase 3 plan
+/// section 4.2, governing section 11). Phase 1 computed but never persisted
+/// `V1ProjectCatalogInventory.legacy_commit_namespaces`; this asset is the
+/// durable proof surface the pre-replacement materializer proves observed
+/// namespace sets against, so its hash is bound in
+/// `predicted_immutable_asset_hashes` and verified by the receipt exactly
+/// like every other immutable asset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyCommitNamespaceInventoryAssetV1 {
+    pub version: u32,
+    pub inventory_hash: Sha256ValueV1,
+    pub source_index_fingerprint: Sha256ValueV1,
+    pub rows: Vec<LegacyCommitNamespaceInventoryV1>,
+}
+
+const LEGACY_COMMIT_NAMESPACE_INVENTORY_ASSET_VERSION_V1: u32 = 1;
+const LEGACY_COMMIT_NAMESPACE_SOURCE_FINGERPRINT_DOMAIN: &[u8] =
+    b"blackbox.project-catalog.legacy-commit-namespace-source.v1\0";
+
+impl LegacyCommitNamespaceInventoryAssetV1 {
+    fn from_inventory(
+        inventory: &V1ProjectCatalogInventory,
+    ) -> Result<Self, ProjectCatalogMigrationError> {
+        let mut rows = inventory.legacy_commit_namespaces.clone();
+        rows.sort_by(|left, right| left.namespace.cmp(&right.namespace));
+        Ok(Self {
+            version: LEGACY_COMMIT_NAMESPACE_INVENTORY_ASSET_VERSION_V1,
+            inventory_hash: inventory.inventory_hash().map_err(inventory_error)?,
+            source_index_fingerprint: legacy_commit_namespace_source_fingerprint(inventory),
+            rows,
+        })
+    }
+
+    fn canonical_json(&self) -> Result<Vec<u8>, ProjectCatalogMigrationError> {
+        serde_json::to_vec(self)
+            .map_err(|_| planner_error("legacy commit namespace inventory asset cannot be encoded"))
+    }
+}
+
+/// Folds the captured tantivy and vector source states the namespace rows
+/// were counted from (the "git-metadata" lane's owner subsources), so the
+/// materializer can detect drift against a re-derived inventory. Absent
+/// owner evidence folds in as an empty field rather than failing: the asset
+/// is still emitted (possibly with zero rows) when the source index was not
+/// present at capture time.
+fn legacy_commit_namespace_source_fingerprint(
+    inventory: &V1ProjectCatalogInventory,
+) -> Sha256ValueV1 {
+    let tantivy = git_metadata_owner_fingerprint(inventory, ImmutableInventoryOwnerKindV1::Tantivy);
+    let vectors =
+        git_metadata_owner_fingerprint(inventory, ImmutableInventoryOwnerKindV1::VectorMetadata);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(LEGACY_COMMIT_NAMESPACE_SOURCE_FINGERPRINT_DOMAIN);
+    for fingerprint in [tantivy, vectors] {
+        let value = fingerprint
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_default();
+        bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+    Sha256ValueV1::digest(&bytes)
+}
+
+fn git_metadata_owner_fingerprint(
+    inventory: &V1ProjectCatalogInventory,
+    owner_kind: ImmutableInventoryOwnerKindV1,
+) -> Option<Sha256ValueV1> {
+    inventory
+        .immutable_lane_evidence
+        .iter()
+        .find(|lane| lane.source_id == "git-metadata")?
+        .owner_subsources
+        .iter()
+        .find(|owner| owner.owner_kind == owner_kind)
+        .map(|owner| source_state_fingerprint(&owner.source_state).clone())
+}
+
+fn source_state_fingerprint(state: &InventorySourceStateV1) -> &Sha256ValueV1 {
+    match state {
+        InventorySourceStateV1::Present { fingerprint, .. }
+        | InventorySourceStateV1::Missing { fingerprint }
+        | InventorySourceStateV1::Corrupt { fingerprint, .. } => fingerprint,
     }
 }
 
@@ -4024,6 +4121,14 @@ fn prepare_closed_migration(
         captured.publisher_ref_source_was_missing,
     )?;
     store_parts.immutable_assets.extend(source_assets);
+    let namespace_inventory_asset =
+        LegacyCommitNamespaceInventoryAssetV1::from_inventory(inventory)?;
+    store_parts
+        .immutable_assets
+        .push(MigrationImmutableAssetDraftV1::new(
+            ImmutableAssetRoleV1::LegacyCommitNamespaceInventory,
+            namespace_inventory_asset.canonical_json()?,
+        ));
     predicted.participant_hashes = store_parts
         .participants
         .iter()
@@ -4726,6 +4831,153 @@ enum InstalledMigrationVerificationV1 {
     Installed(ProjectCatalogMigrationVerifyResultV1),
 }
 
+const GIT_META_BACKUP_DIRNAME: &str = "git_meta";
+const GIT_META_BACKUP_STAGING_DIRNAME: &str = "git_meta.tmp";
+const GIT_META_BACKUP_HASH_KEY: &str = "backup-git_meta";
+const GIT_META_BACKUP_DOMAIN: &[u8] = b"blackbox.project-catalog.git-meta-backup.v1\0";
+const MAX_GIT_META_BACKUP_FILES: usize = MAX_PROJECT_CATALOG_ENTRIES;
+const MAX_GIT_META_BACKUP_FILE_BYTES: usize = 4096;
+
+fn git_meta_backup_error(detail: impl Into<String>) -> ProjectCatalogMigrationError {
+    ProjectCatalogMigrationError::new(
+        "error.project_catalog_migration_git_meta_backup",
+        detail.into(),
+        ProjectCatalogMigrationMutationDispositionV1::RecoveredToCommittedState,
+    )
+}
+
+fn sorted_regular_basenames(path: &Path) -> Result<Vec<String>, ProjectCatalogMigrationError> {
+    let mut names = Vec::new();
+    for entry in
+        std::fs::read_dir(path).map_err(|error| git_meta_backup_error(error.to_string()))?
+    {
+        let entry = entry.map_err(|error| git_meta_backup_error(error.to_string()))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| git_meta_backup_error(error.to_string()))?;
+        if !file_type.is_file() {
+            return Err(git_meta_backup_error(
+                "git meta directory contains a non-regular entry",
+            ));
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| git_meta_backup_error("git meta directory has a non-utf8 entry"))?;
+        if names.len() >= MAX_GIT_META_BACKUP_FILES {
+            return Err(git_meta_backup_error(
+                "git meta directory exceeds its row limit",
+            ));
+        }
+        names.push(name);
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// One-time, idempotent copy of the legacy per-project Git cursor directory
+/// into the migration backup root (governing section 11's cursor-file
+/// backup promise, Phase 3 plan section 4.2). Never overwrites an existing
+/// backup: the backup must reflect the state captured at the migration that
+/// created it, not whatever the live directory has drifted to by a later
+/// retry or reverification. A no-op when the live directory never existed
+/// (a store that never walked Git history).
+///
+/// Copies into a sibling staging directory first, then atomically renames it
+/// onto the final `git_meta` destination: `git_meta_backup_hash` (and any
+/// other reader) only ever observes either no destination at all, or a
+/// COMPLETE one, never a partial one written mid-copy. A leftover staging
+/// directory from a crashed prior attempt is removed unconditionally before
+/// staging fresh, so a retry always promotes a freshly-written, complete
+/// copy rather than resuming (or exposing) a partial one.
+fn git_meta_backup_copy_if_needed(
+    layout: &ProjectCatalogMigrationResolvedLayoutV1,
+) -> Result<(), ProjectCatalogMigrationError> {
+    let destination_root = layout.catalog_backup_dir.join(GIT_META_BACKUP_DIRNAME);
+    if NofollowDirectory::open_existing(&destination_root)
+        .map_err(|error| git_meta_backup_error(error.to_string()))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let Some(source) = NofollowDirectory::open_existing(&layout.git_meta_root)
+        .map_err(|error| git_meta_backup_error(error.to_string()))?
+    else {
+        return Ok(());
+    };
+    let names = sorted_regular_basenames(&layout.git_meta_root)?;
+
+    let staging_root = layout
+        .catalog_backup_dir
+        .join(GIT_META_BACKUP_STAGING_DIRNAME);
+    match std::fs::remove_dir_all(&staging_root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(git_meta_backup_error(error.to_string())),
+    }
+    let staging = NofollowDirectory::open_or_create(&staging_root)
+        .map_err(|error| git_meta_backup_error(error.to_string()))?;
+    for name in &names {
+        let bytes = source
+            .read_regular(name, MAX_GIT_META_BACKUP_FILE_BYTES, "git meta cursor file")
+            .map_err(|error| git_meta_backup_error(error.to_string()))?
+            .ok_or_else(|| {
+                git_meta_backup_error("git meta cursor file disappeared during backup")
+            })?;
+        staging
+            .atomic_replace(name, &bytes)
+            .map_err(|error| git_meta_backup_error(error.to_string()))?;
+    }
+    staging
+        .sync_all()
+        .map_err(|error| git_meta_backup_error(error.to_string()))?;
+    source
+        .ensure_still_current()
+        .map_err(|error| git_meta_backup_error(error.to_string()))?;
+    // The atomic promotion: a crash on either side of this rename leaves the
+    // world in a state the next retry (or a fresh copy attempt) handles
+    // correctly: either the staging directory alone (cleaned up and
+    // rebuilt above) or the complete destination alone (caught by the
+    // existence guard at the top).
+    std::fs::rename(&staging_root, &destination_root)
+        .map_err(|error| git_meta_backup_error(error.to_string()))?;
+    Ok(())
+}
+
+/// Read-only hash of whatever is currently at the git-meta backup
+/// destination, `None` when no backup was ever made. Hashes the STORED
+/// backup copy rather than the live `git_meta_root`, so repeated `verify()`
+/// calls stay stable across Git activity that happens after migration.
+fn git_meta_backup_hash(
+    layout: &ProjectCatalogMigrationResolvedLayoutV1,
+) -> Result<Option<Sha256ValueV1>, ProjectCatalogMigrationError> {
+    let destination_root = layout.catalog_backup_dir.join(GIT_META_BACKUP_DIRNAME);
+    let Some(directory) = NofollowDirectory::open_existing(&destination_root)
+        .map_err(|error| git_meta_backup_error(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let names = sorted_regular_basenames(&destination_root)?;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(GIT_META_BACKUP_DOMAIN);
+    for name in &names {
+        let contents = directory
+            .read_regular(name, MAX_GIT_META_BACKUP_FILE_BYTES, "git meta cursor file")
+            .map_err(|error| git_meta_backup_error(error.to_string()))?
+            .ok_or_else(|| {
+                git_meta_backup_error("git meta backup file disappeared during hashing")
+            })?;
+        bytes.extend_from_slice(&(name.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.extend_from_slice(&(contents.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(&contents);
+    }
+    directory
+        .ensure_still_current()
+        .map_err(|error| git_meta_backup_error(error.to_string()))?;
+    Ok(Some(Sha256ValueV1::digest(&bytes)))
+}
+
 fn verify_installed_optional(
     layout: &ProjectCatalogMigrationResolvedLayoutV1,
 ) -> Result<InstalledMigrationVerificationV1, ProjectCatalogMigrationError> {
@@ -4813,7 +5065,13 @@ fn verify_installed_optional(
     } else {
         projections.attachment_hash.clone()
     };
+    let git_meta_backup_hash_value = git_meta_backup_hash(layout)
+        .map_err(|error| error.with_mutation_disposition(mutation_disposition))?;
     let receipt = (|| {
+        let mut backup_hashes = projections.backup_hashes;
+        if let Some(hash) = git_meta_backup_hash_value {
+            backup_hashes.insert(GIT_META_BACKUP_HASH_KEY.to_string(), hash);
+        }
         Ok::<_, ProjectCatalogMigrationError>(MigrationVerificationReceiptV1 {
             version: FACADE_VERSION_V1,
             transaction_id: identity.transaction_id,
@@ -4837,7 +5095,7 @@ fn verify_installed_optional(
             observed_immutable_asset_hashes: projections.immutable_hashes,
             predicted_marker_hash: projections.marker_hash,
             observed_marker_hash: projections.observed_marker_hash,
-            backup_hashes: projections.backup_hashes,
+            backup_hashes,
             epoch: identity.epoch,
             checkout_action_count: identity.checkout_action_count,
             publisher_pin_count: identity.publisher_pin_count,
@@ -5506,6 +5764,66 @@ mod tests {
                 .into_iter()
                 .all(|path| path.starts_with(&rehearsal))
         );
+    }
+
+    #[test]
+    fn git_meta_backup_is_idempotent_content_addressed_and_absence_safe() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let config = test_config(&root);
+        let rehearsal = root.join("rehearsal");
+        let layout =
+            ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(&rehearsal, &config)
+                .unwrap();
+
+        // No git_meta directory at all: a no-op copy and a None hash.
+        assert!(git_meta_backup_copy_if_needed(&layout).is_ok());
+        assert_eq!(git_meta_backup_hash(&layout).unwrap(), None);
+
+        fs::create_dir_all(&layout.git_meta_root).unwrap();
+        fs::write(layout.git_meta_root.join("project-a"), b"sha-one").unwrap();
+        fs::write(layout.git_meta_root.join("project-b"), b"sha-two").unwrap();
+
+        // Simulate a crash mid-copy: a leftover staging directory holding
+        // only a subset of files (and, for project-a, stale content a real
+        // copy would never have written). The partial staging directory
+        // must never be visible as a backup: the hash reader only looks at
+        // the final `git_meta` name, which does not exist yet.
+        let staging_dir = layout.catalog_backup_dir.join("git_meta.tmp");
+        fs::create_dir_all(&staging_dir).unwrap();
+        fs::write(staging_dir.join("project-a"), b"stale-partial-content").unwrap();
+        let backup_dir = layout.catalog_backup_dir.join("git_meta");
+        assert!(!backup_dir.exists(), "no backup exists yet");
+        assert_eq!(
+            git_meta_backup_hash(&layout).unwrap(),
+            None,
+            "a partial temp dir must never be read as the hashed backup"
+        );
+
+        git_meta_backup_copy_if_needed(&layout).unwrap();
+        assert!(
+            !staging_dir.exists(),
+            "the staging directory is consumed by the atomic rename"
+        );
+        assert_eq!(
+            fs::read(backup_dir.join("project-a")).unwrap(),
+            b"sha-one",
+            "the retry discards the stale partial content and writes a fresh, complete copy"
+        );
+        assert_eq!(fs::read(backup_dir.join("project-b")).unwrap(), b"sha-two");
+        let first_hash = git_meta_backup_hash(&layout).unwrap().unwrap();
+
+        // Live drift after the backup was made must not change the
+        // read-only hash: it hashes the STORED backup, not the live
+        // directory.
+        fs::write(layout.git_meta_root.join("project-c"), b"sha-three").unwrap();
+        assert_eq!(git_meta_backup_hash(&layout).unwrap().unwrap(), first_hash);
+
+        // A second copy call is a no-op: the backup already exists, so the
+        // live drift is never copied in.
+        git_meta_backup_copy_if_needed(&layout).unwrap();
+        assert!(!backup_dir.join("project-c").exists());
+        assert_eq!(git_meta_backup_hash(&layout).unwrap().unwrap(), first_hash);
     }
 
     #[test]

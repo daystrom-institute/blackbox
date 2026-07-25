@@ -147,6 +147,28 @@ fn validate_minted_id(
     Ok(())
 }
 
+/// Validate a content-addressed id shape: `prefix` plus 64 lowercase hex
+/// characters (a SHA-256 digest). Distinct from [`validate_minted_id`]'s
+/// 32-character random-mint shape: these ids are derived elsewhere from
+/// generation content, never randomly minted here (Phase 3 plan section 5).
+fn validate_content_addressed_id(
+    value: &str,
+    prefix: &'static str,
+    kind: &'static str,
+) -> Result<(), ProjectCatalogError> {
+    let Some(hex) = value.strip_prefix(prefix) else {
+        return Err(invalid_id(kind));
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(invalid_id(kind));
+    }
+    Ok(())
+}
+
 macro_rules! parsed_string_type {
     ($name:ident, $validator:expr) => {
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
@@ -205,6 +227,12 @@ parsed_string_type!(LegacyPathBindingId, |value: &str| {
 });
 parsed_string_type!(ProjectCatalogTransactionId, |value: &str| {
     validate_minted_id(value, "pct_", "project_catalog_transaction_id")
+});
+parsed_string_type!(RepoHistoryGenerationId, |value: &str| {
+    validate_content_addressed_id(value, "rhg_", "repo_history_generation_id")
+});
+parsed_string_type!(RepoHistoryQuarantineGenerationId, |value: &str| {
+    validate_content_addressed_id(value, "rhq_", "repo_history_quarantine_generation_id")
 });
 
 fn random_id(prefix: &str) -> String {
@@ -335,6 +363,35 @@ pub enum RepoHistoryAuthority {
     LegacyNamespace(CommitNamespace),
 }
 
+/// Whether a repo-history record's immutable commit/vector generation has
+/// been built (Phase 3 plan section 4.1). Ships `#[serde(default)]` so v2
+/// catalog bytes written before this field decode unchanged as `NotBuilt`.
+/// The v1 importer (Phase 3) writes this field explicitly rather than
+/// relying on the default; `NotBuilt` here still means "the importer has not
+/// materialized history," identical in meaning to a defaulted value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RepoHistoryMaterialization {
+    #[default]
+    NotBuilt,
+    Ready {
+        generation_id: RepoHistoryGenerationId,
+    },
+}
+
+/// Quarantine-side counterpart of [`RepoHistoryMaterialization`], scoped to
+/// [`AmbiguousNamespaceRecord`] and keyed by
+/// [`RepoHistoryQuarantineGenerationId`] instead.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RepoHistoryQuarantineMaterialization {
+    #[default]
+    NotBuilt,
+    Ready {
+        generation_id: RepoHistoryQuarantineGenerationId,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RepoHistoryRecord {
@@ -343,6 +400,8 @@ pub struct RepoHistoryRecord {
     pub primary_namespace: CommitNamespace,
     #[serde(deserialize_with = "deserialize_unique_btree_set")]
     pub compatibility_namespaces: BTreeSet<CommitNamespace>,
+    #[serde(default)]
+    pub materialization: RepoHistoryMaterialization,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -358,6 +417,8 @@ pub struct AmbiguousNamespaceRecord {
     #[serde(deserialize_with = "deserialize_unique_btree_set")]
     pub candidate_repo_history_ids: BTreeSet<RepoHistoryId>,
     pub status: AmbiguousNamespaceStatus,
+    #[serde(default)]
+    pub materialization: RepoHistoryQuarantineMaterialization,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -821,6 +882,14 @@ fn validate_catalog(snapshot: &CatalogSnapshotV2) -> Result<(), ProjectCatalogEr
                 ),
             ));
         }
+        if let RepoHistoryMaterialization::Ready { generation_id } = &history.materialization
+            && RepoHistoryGenerationId::parse(generation_id.as_str()).is_err()
+        {
+            return Err(ProjectCatalogError::new(
+                "error.project_catalog_invalid_history_generation",
+                format!("repo history {} has an invalid generation id", key),
+            ));
+        }
     }
 
     for project in snapshot.projects.values() {
@@ -880,6 +949,15 @@ fn validate_catalog(snapshot: &CatalogSnapshotV2) -> Result<(), ProjectCatalogEr
             return Err(ProjectCatalogError::new(
                 "error.project_catalog_invalid_ambiguity",
                 format!("ambiguous namespace {} has invalid candidates", key),
+            ));
+        }
+        if let RepoHistoryQuarantineMaterialization::Ready { generation_id } =
+            &ambiguous.materialization
+            && RepoHistoryQuarantineGenerationId::parse(generation_id.as_str()).is_err()
+        {
+            return Err(ProjectCatalogError::new(
+                "error.project_catalog_invalid_history_generation",
+                format!("ambiguous namespace {} has an invalid generation id", key),
             ));
         }
     }
@@ -2059,6 +2137,7 @@ mod tests {
             ),
             primary_namespace: CommitNamespace::parse("namespace-one").unwrap(),
             compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
         };
         let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
         catalog.repo_histories.insert(wrong_history_key, history);
@@ -2072,6 +2151,7 @@ mod tests {
             namespace: CommitNamespace::parse("ambiguous-namespace").unwrap(),
             candidate_repo_history_ids: BTreeSet::new(),
             status: AmbiguousNamespaceStatus::Quarantined,
+            materialization: RepoHistoryQuarantineMaterialization::NotBuilt,
         };
         let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
         catalog
@@ -2157,6 +2237,7 @@ mod tests {
             primary_namespace: CommitNamespace::parse("local_33333333333333333333333333333333")
                 .unwrap(),
             compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
         };
         let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
         catalog.repo_histories.insert(history_id, history);
@@ -2176,12 +2257,14 @@ mod tests {
             authority: RepoHistoryAuthority::Recorded(authority.clone()),
             primary_namespace: CommitNamespace::parse("namespace-one").unwrap(),
             compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
         };
         let second = RepoHistoryRecord {
             repo_history_id: second_id.clone(),
             authority: RepoHistoryAuthority::Recorded(authority),
             primary_namespace: CommitNamespace::parse("namespace-two").unwrap(),
             compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
         };
         let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
         catalog.repo_histories.insert(first_id, first);
@@ -2204,6 +2287,7 @@ mod tests {
             ),
             primary_namespace: shared.clone(),
             compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
         };
         let second = RepoHistoryRecord {
             repo_history_id: second_id.clone(),
@@ -2212,6 +2296,7 @@ mod tests {
             ),
             primary_namespace: CommitNamespace::parse("namespace-two").unwrap(),
             compatibility_namespaces: BTreeSet::from([shared]),
+            materialization: RepoHistoryMaterialization::NotBuilt,
         };
         let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
         catalog.repo_histories.insert(first_id, first);
@@ -2230,6 +2315,7 @@ mod tests {
             ),
             primary_namespace: namespace.clone(),
             compatibility_namespaces: BTreeSet::from([namespace]),
+            materialization: RepoHistoryMaterialization::NotBuilt,
         };
         let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
         catalog.repo_histories.insert(history_id, history);
@@ -2250,12 +2336,14 @@ mod tests {
             ),
             primary_namespace: CommitNamespace::parse("namespace-one").unwrap(),
             compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
         };
         let namespace = CommitNamespace::parse("ambiguous-namespace").unwrap();
         let ambiguous = AmbiguousNamespaceRecord {
             namespace: namespace.clone(),
             candidate_repo_history_ids: BTreeSet::from([present_id.clone(), missing_id]),
             status: AmbiguousNamespaceStatus::Quarantined,
+            materialization: RepoHistoryQuarantineMaterialization::NotBuilt,
         };
         let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
         catalog.repo_histories.insert(present_id, history);
@@ -2278,6 +2366,7 @@ mod tests {
             ),
             primary_namespace: namespace.clone(),
             compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
         };
         let second = RepoHistoryRecord {
             repo_history_id: second_id.clone(),
@@ -2286,11 +2375,13 @@ mod tests {
             ),
             primary_namespace: CommitNamespace::parse("namespace-two").unwrap(),
             compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
         };
         let ambiguous = AmbiguousNamespaceRecord {
             namespace: namespace.clone(),
             candidate_repo_history_ids: BTreeSet::from([first_id.clone(), second_id.clone()]),
             status: AmbiguousNamespaceStatus::Quarantined,
+            materialization: RepoHistoryQuarantineMaterialization::NotBuilt,
         };
         let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
         catalog.repo_histories.insert(first_id, first);
@@ -2315,6 +2406,7 @@ mod tests {
             primary_namespace: CommitNamespace::parse("local_33333333333333333333333333333333")
                 .unwrap(),
             compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
         };
         let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
         catalog.projects.insert(owner.project_id.clone(), owner);
@@ -2338,6 +2430,7 @@ mod tests {
             ),
             primary_namespace: CommitNamespace::parse("legacy-one").unwrap(),
             compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
         };
         let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
         catalog
@@ -2364,6 +2457,7 @@ mod tests {
             ),
             primary_namespace: CommitNamespace::parse("legacy-one").unwrap(),
             compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
         };
         let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
         catalog
@@ -2384,6 +2478,7 @@ mod tests {
             authority: RepoHistoryAuthority::LocalProject(owner.project_id.clone()),
             primary_namespace: CommitNamespace::parse("legacy-one").unwrap(),
             compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
         };
         let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
         catalog.projects.insert(owner.project_id.clone(), owner);
@@ -2405,6 +2500,7 @@ mod tests {
             primary_namespace: CommitNamespace::parse("local_55555555555555555555555555555555")
                 .unwrap(),
             compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
         };
         let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
         catalog
@@ -2431,6 +2527,7 @@ mod tests {
             ),
             primary_namespace: CommitNamespace::parse("legacy-one").unwrap(),
             compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
         };
         let migration = ScopeMigrationRecord {
             scope_migration_id: migration_id.clone(),
@@ -2851,6 +2948,7 @@ mod tests {
             ),
             primary_namespace: CommitNamespace::parse("deadbeef").unwrap(),
             compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
         };
         let migration = ScopeMigrationRecord {
             scope_migration_id: migration_id.clone(),
@@ -2919,6 +3017,7 @@ mod tests {
             ),
             primary_namespace: CommitNamespace::parse("deadbeef").unwrap(),
             compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
         };
         let promotion = ScopeMigrationRecord {
             scope_migration_id: promotion_id.clone(),
@@ -3046,6 +3145,7 @@ mod tests {
             ),
             primary_namespace: CommitNamespace::parse("legacy-one").unwrap(),
             compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
         };
         let mut catalog = catalog_with(project.clone());
         catalog.repo_histories.insert(history_id, history);
@@ -3105,6 +3205,7 @@ mod tests {
             ),
             primary_namespace: CommitNamespace::parse("deadbeef").unwrap(),
             compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
         };
         let mut catalog = catalog_with(project.clone());
         catalog.repo_histories.insert(history_id, history);
@@ -3179,5 +3280,212 @@ mod tests {
         let encoded = serde_json::to_value(&store).unwrap();
         let expected: Value = serde_json::from_slice(raw).unwrap();
         assert_eq!(encoded, expected);
+    }
+
+    #[test]
+    fn generation_id_shapes_accept_only_their_own_prefix_and_64_lowercase_hex() {
+        assert!(RepoHistoryGenerationId::parse(format!("rhg_{}", "a".repeat(64))).is_ok());
+        assert!(
+            RepoHistoryQuarantineGenerationId::parse(format!("rhq_{}", "a".repeat(64))).is_ok()
+        );
+        for invalid in [
+            format!("rhg_{}", "a".repeat(63)),
+            format!("rhg_{}", "a".repeat(65)),
+            format!("rhg_{}", "A".repeat(64)),
+            format!("rhq_{}", "a".repeat(64)),
+            "rhg_".to_string(),
+            String::new(),
+        ] {
+            assert!(RepoHistoryGenerationId::parse(invalid).is_err());
+        }
+        for invalid in [
+            format!("rhq_{}", "a".repeat(63)),
+            format!("rhg_{}", "a".repeat(64)),
+            String::new(),
+        ] {
+            assert!(RepoHistoryQuarantineGenerationId::parse(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn repo_history_and_ambiguous_materialization_default_to_not_built_from_legacy_bytes() {
+        let history_a = RepoHistoryRecord {
+            repo_history_id: RepoHistoryId::parse("rh_11111111111111111111111111111111").unwrap(),
+            authority: RepoHistoryAuthority::Recorded(
+                RecordedRepoAuthority::parse("repo-a").unwrap(),
+            ),
+            primary_namespace: CommitNamespace::parse("namespace-a").unwrap(),
+            compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
+        };
+        let history_b = RepoHistoryRecord {
+            repo_history_id: RepoHistoryId::parse("rh_22222222222222222222222222222222").unwrap(),
+            authority: RepoHistoryAuthority::Recorded(
+                RecordedRepoAuthority::parse("repo-b").unwrap(),
+            ),
+            primary_namespace: CommitNamespace::parse("namespace-b").unwrap(),
+            compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
+        };
+        let ambiguous = AmbiguousNamespaceRecord {
+            namespace: CommitNamespace::parse("shared-namespace").unwrap(),
+            candidate_repo_history_ids: BTreeSet::from([
+                history_a.repo_history_id.clone(),
+                history_b.repo_history_id.clone(),
+            ]),
+            status: AmbiguousNamespaceStatus::Quarantined,
+            materialization: RepoHistoryQuarantineMaterialization::NotBuilt,
+        };
+        let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
+        catalog
+            .repo_histories
+            .insert(history_a.repo_history_id.clone(), history_a);
+        catalog
+            .repo_histories
+            .insert(history_b.repo_history_id.clone(), history_b);
+        catalog
+            .ambiguous_namespaces
+            .insert(ambiguous.namespace.clone(), ambiguous);
+        catalog.validate().unwrap();
+        let encoded = encode_catalog_snapshot(&catalog).unwrap();
+
+        // Simulate pre-Phase-3 bytes: strip the materialization field from
+        // both record kinds and confirm strict decode still succeeds,
+        // defaulting to NotBuilt (deny_unknown_fields stays intact for every
+        // other field).
+        let mut value: Value = serde_json::from_slice(&encoded).unwrap();
+        for history in value["repo_histories"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+        {
+            history.as_object_mut().unwrap().remove("materialization");
+        }
+        for ambiguous in value["ambiguous_namespaces"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+        {
+            ambiguous.as_object_mut().unwrap().remove("materialization");
+        }
+        let stripped = serde_json::to_vec(&value).unwrap();
+        let decoded = decode_catalog_snapshot(&stripped).unwrap();
+        for history in decoded.repo_histories.values() {
+            assert_eq!(
+                history.materialization,
+                RepoHistoryMaterialization::NotBuilt
+            );
+        }
+        for ambiguous in decoded.ambiguous_namespaces.values() {
+            assert_eq!(
+                ambiguous.materialization,
+                RepoHistoryQuarantineMaterialization::NotBuilt
+            );
+        }
+    }
+
+    #[test]
+    fn ready_repo_history_generation_id_must_satisfy_validate_catalog() {
+        let repo_history_id = RepoHistoryId::parse("rh_11111111111111111111111111111111").unwrap();
+        let mut history = RepoHistoryRecord {
+            repo_history_id: repo_history_id.clone(),
+            authority: RepoHistoryAuthority::Recorded(
+                RecordedRepoAuthority::parse("repo-a").unwrap(),
+            ),
+            primary_namespace: CommitNamespace::parse("namespace-a").unwrap(),
+            compatibility_namespaces: BTreeSet::new(),
+            // Constructed directly (not through `parse`) to exercise the
+            // validate_catalog defense-in-depth clause itself, independent
+            // of the type-level guarantee `parse` already provides.
+            materialization: RepoHistoryMaterialization::Ready {
+                generation_id: RepoHistoryGenerationId(String::from("not-a-valid-shape")),
+            },
+        };
+        let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
+        catalog
+            .repo_histories
+            .insert(repo_history_id.clone(), history.clone());
+        assert_eq!(
+            catalog.validate().unwrap_err().code(),
+            "error.project_catalog_invalid_history_generation"
+        );
+
+        history.materialization = RepoHistoryMaterialization::Ready {
+            generation_id: RepoHistoryGenerationId::parse(format!("rhg_{}", "a".repeat(64)))
+                .unwrap(),
+        };
+        catalog.repo_histories.insert(repo_history_id, history);
+        catalog.validate().unwrap();
+    }
+
+    #[test]
+    fn ready_ambiguous_generation_id_must_satisfy_validate_catalog_and_candidate_rules() {
+        let history_a = RepoHistoryRecord {
+            repo_history_id: RepoHistoryId::parse("rh_11111111111111111111111111111111").unwrap(),
+            authority: RepoHistoryAuthority::Recorded(
+                RecordedRepoAuthority::parse("repo-a").unwrap(),
+            ),
+            primary_namespace: CommitNamespace::parse("namespace-a").unwrap(),
+            compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
+        };
+        let history_b = RepoHistoryRecord {
+            repo_history_id: RepoHistoryId::parse("rh_22222222222222222222222222222222").unwrap(),
+            authority: RepoHistoryAuthority::Recorded(
+                RecordedRepoAuthority::parse("repo-b").unwrap(),
+            ),
+            primary_namespace: CommitNamespace::parse("namespace-b").unwrap(),
+            compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
+        };
+        let mut ambiguous = AmbiguousNamespaceRecord {
+            namespace: CommitNamespace::parse("shared-namespace").unwrap(),
+            candidate_repo_history_ids: BTreeSet::from([
+                history_a.repo_history_id.clone(),
+                history_b.repo_history_id.clone(),
+            ]),
+            status: AmbiguousNamespaceStatus::Quarantined,
+            materialization: RepoHistoryQuarantineMaterialization::Ready {
+                generation_id: RepoHistoryQuarantineGenerationId(String::from("bad")),
+            },
+        };
+        let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
+        catalog
+            .repo_histories
+            .insert(history_a.repo_history_id.clone(), history_a);
+        catalog
+            .repo_histories
+            .insert(history_b.repo_history_id.clone(), history_b);
+        catalog
+            .ambiguous_namespaces
+            .insert(ambiguous.namespace.clone(), ambiguous.clone());
+        assert_eq!(
+            catalog.validate().unwrap_err().code(),
+            "error.project_catalog_invalid_history_generation"
+        );
+
+        // A Ready ambiguous record still has to satisfy the ordinary
+        // candidate rules (at least two existing candidates): dropping to
+        // one candidate fails the pre-existing check, not a new one.
+        ambiguous.materialization = RepoHistoryQuarantineMaterialization::Ready {
+            generation_id: RepoHistoryQuarantineGenerationId::parse(format!(
+                "rhq_{}",
+                "a".repeat(64)
+            ))
+            .unwrap(),
+        };
+        ambiguous.candidate_repo_history_ids = BTreeSet::from([ambiguous
+            .candidate_repo_history_ids
+            .iter()
+            .next()
+            .unwrap()
+            .clone()]);
+        catalog
+            .ambiguous_namespaces
+            .insert(ambiguous.namespace.clone(), ambiguous);
+        assert_eq!(
+            catalog.validate().unwrap_err().code(),
+            "error.project_catalog_invalid_ambiguity"
+        );
     }
 }

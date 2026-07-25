@@ -61,8 +61,12 @@ const JOURNAL_VERSION: u32 = 1;
 const MIGRATION_MARKER_VERSION: u32 = 1;
 const MAX_MIGRATION_PARTICIPANTS: usize =
     MAX_MIGRATION_INVENTORY_GENERATIONS + MAX_PROJECT_CATALOG_ENTRIES * 3 + 4;
+// The fixed margin covers the singleton immutable assets that exist at most
+// once per migration regardless of generation/publisher counts:
+// LegacyProjectStoreBackup, LegacyPublisherRefBackup, and (Phase 3)
+// LegacyCommitNamespaceInventory.
 const MAX_MIGRATION_IMMUTABLE_ASSETS: usize =
-    MAX_MIGRATION_INVENTORY_GENERATIONS + MAX_PUBLISHER_REF_ROWS + 2;
+    MAX_MIGRATION_INVENTORY_GENERATIONS + MAX_PUBLISHER_REF_ROWS + 3;
 const MAX_MIGRATION_CHECKOUT_ACTIONS: usize = MAX_PROJECT_CATALOG_ENTRIES;
 const MAX_MIGRATION_PUBLISHER_PINS: usize = MAX_PUBLISHER_REF_ROWS;
 // Publisher rows have their own aggregate serialized budget. All other
@@ -82,6 +86,7 @@ const MAX_CODE_SOURCE_GENERATION_METADATA_BYTES: usize = 64 * 1024;
 const MAX_CODE_SOURCE_COLLISION_RETIREMENT_BYTES: usize = 64 * 1024;
 const MAX_CODE_SOURCE_COLLECTED_MANIFEST_BYTES: usize = 512 * 1024 * 1024;
 const MAX_LEGACY_PUBLISHER_REF_SOURCE_BYTES: usize = MAX_PROJECT_CATALOG_BYTES;
+const MAX_LEGACY_COMMIT_NAMESPACE_INVENTORY_ASSET_BYTES: usize = MAX_PROJECT_CATALOG_BYTES;
 
 pub type ProjectCatalogStoreResult<T> = Result<T, ProjectCatalogStoreError>;
 
@@ -1083,7 +1088,8 @@ impl MigrationParticipantRegistry {
     ) -> PathBuf {
         match role {
             ImmutableAssetRoleV1::LegacyProjectStoreBackup
-            | ImmutableAssetRoleV1::LegacyPublisherRefBackup => {
+            | ImmutableAssetRoleV1::LegacyPublisherRefBackup
+            | ImmutableAssetRoleV1::LegacyCommitNamespaceInventory => {
                 self.catalog_immutable_root.join(validated_name.as_str())
             }
             ImmutableAssetRoleV1::AcceptedPublicationGeneration {
@@ -7789,6 +7795,11 @@ enum TransactionOutcomeV1 {
 pub(crate) enum ImmutableAssetRoleV1 {
     LegacyProjectStoreBackup,
     LegacyPublisherRefBackup,
+    /// Singleton asset closing the Phase 1 proof gap (Phase 3 plan
+    /// section 4.2): the persisted `LegacyCommitNamespaceInventoryV1` rows
+    /// the materializer later proves observed namespaces against. At most
+    /// one per migration, like the two backups above.
+    LegacyCommitNamespaceInventory,
     AcceptedPublicationGeneration {
         project_id: ProjectId,
         generation_id: AcceptedPublicationGenerationId,
@@ -7809,6 +7820,9 @@ impl ImmutableAssetRoleV1 {
         match self {
             Self::LegacyProjectStoreBackup => MAX_LEGACY_PROJECT_STORE_BYTES,
             Self::LegacyPublisherRefBackup => MAX_LEGACY_PUBLISHER_REF_SOURCE_BYTES,
+            Self::LegacyCommitNamespaceInventory => {
+                MAX_LEGACY_COMMIT_NAMESPACE_INVENTORY_ASSET_BYTES
+            }
             Self::AcceptedPublicationGeneration { .. } => MAX_ACCEPTED_PUBLICATION_GENERATION_BYTES,
             Self::CollectedGenerationManifest { .. } => MAX_CODE_SOURCE_COLLECTED_MANIFEST_BYTES,
         }
@@ -7818,6 +7832,7 @@ impl ImmutableAssetRoleV1 {
         match self {
             Self::LegacyProjectStoreBackup
             | Self::LegacyPublisherRefBackup
+            | Self::LegacyCommitNamespaceInventory
             | Self::AcceptedPublicationGeneration { .. } => ImmutableAssetModeV1::Installable,
             Self::CollectedGenerationManifest { .. } => ImmutableAssetModeV1::PinnedExisting,
         }
@@ -7831,12 +7846,15 @@ fn immutable_target_name(
 ) -> ProjectCatalogStoreResult<ValidatedBasename> {
     match role {
         ImmutableAssetRoleV1::LegacyProjectStoreBackup
-        | ImmutableAssetRoleV1::LegacyPublisherRefBackup => ValidatedBasename::parse(format!(
-            "{}.{}.{}.immutable",
-            transaction_id,
-            role.artifact_token(),
-            hash
-        )),
+        | ImmutableAssetRoleV1::LegacyPublisherRefBackup
+        | ImmutableAssetRoleV1::LegacyCommitNamespaceInventory => {
+            ValidatedBasename::parse(format!(
+                "{}.{}.{}.immutable",
+                transaction_id,
+                role.artifact_token(),
+                hash
+            ))
+        }
         ImmutableAssetRoleV1::AcceptedPublicationGeneration { generation_id, .. } => {
             ValidatedBasename::parse(format!("{generation_id}.json"))
         }

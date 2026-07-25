@@ -80,6 +80,69 @@ pub fn collected_snapshot_id(project_id: &str, generation_id: &str) -> String {
     format!("collected-{}", hex::encode(&hasher.finalize()[..16]))
 }
 
+/// Local code-snapshot id for a `LegacyLocal` project whose history record
+/// selects [`LegacyLocalSnapshotDerivation::LegacyLocal`] (durable-project-catalog
+/// governing section 10.1; Phase 3 plan section 4.6). Unlike
+/// `clean_snapshot_id`, this identity is never head-bound: a `LegacyLocal`
+/// project's random or absent commit namespace carries no cross-host repo
+/// identity to bind against, so the manifest digest alone is the source of
+/// truth. `manifest_digest` is the caller-computed hash over the sorted
+/// normalized relative path, content hash, and supported-file metadata for
+/// the complete local generation (the same complete manifest purge and full
+/// rebuild already converge on).
+pub fn legacy_local_snapshot_id(project_id: &str, manifest_digest: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"bbox-legacy-local-snapshot-v1");
+    hasher.update(project_id.as_bytes());
+    hasher.update(manifest_digest.as_bytes());
+    hasher.update(current_materialization_version().as_bytes());
+    // 32 lowercase hex (16 bytes), matching the existing non-head-bound
+    // snapshot-id shape: nongit_snapshot_id and collected_snapshot_id both
+    // slice `[..16]`. This id is definitionally not part of the head-bound
+    // family (clean_snapshot_id's 16-hex suffix), so it takes the other
+    // sibling functions' width, not that one.
+    format!("legacylocal-{}", hex::encode(&hasher.finalize()[..16]))
+}
+
+/// Which local code-snapshot derivation a project's resolved history record
+/// selects (Phase 3 plan section 4.6). Computed from catalog record shape
+/// alone, never from a creation-lane notion the catalog does not store, so
+/// the same project always re-derives the same answer regardless of who
+/// asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyLocalSnapshotDerivation {
+    /// No repo history record at all (a non-Git `LegacyLocal` project), or a
+    /// history record whose authority is `LocalProject` (a v2-created
+    /// attached Git `LegacyLocal` project under its independent random
+    /// namespace): use [`legacy_local_snapshot_id`].
+    LegacyLocal,
+    /// A history record whose authority is `Recorded` or `LegacyNamespace`
+    /// (a migrated Git `LegacyLocal` project carrying an imported legacy
+    /// namespace): keep the existing head-bound `clean_snapshot_id`
+    /// derivation under that namespace, preserving its established ref
+    /// shape and commit joins.
+    HeadBound,
+}
+
+/// Select the derivation for a `LegacyLocal` project from its resolved
+/// history record. Bridge local staging is unaffected by this helper: it
+/// keeps head-bound clean snapshots unconditionally and never calls it.
+pub fn legacy_local_snapshot_derivation(
+    repo_history: Option<&bbox_corpus_core::project_catalog::RepoHistoryRecord>,
+) -> LegacyLocalSnapshotDerivation {
+    use bbox_corpus_core::project_catalog::RepoHistoryAuthority;
+
+    match repo_history {
+        None => LegacyLocalSnapshotDerivation::LegacyLocal,
+        Some(record) => match &record.authority {
+            RepoHistoryAuthority::LocalProject(_) => LegacyLocalSnapshotDerivation::LegacyLocal,
+            RepoHistoryAuthority::Recorded(_) | RepoHistoryAuthority::LegacyNamespace(_) => {
+                LegacyLocalSnapshotDerivation::HeadBound
+            }
+        },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn activate_collected_snapshot(
     edges_dir: &Path,
@@ -958,6 +1021,92 @@ mod tests {
         let a = nongit_snapshot_id("proj1", "fp-a");
         let b = nongit_snapshot_id("proj1", "fp-b");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn legacy_local_snapshot_id_is_deterministic_and_never_head_bound() {
+        let a = legacy_local_snapshot_id("proj1", "digest-a");
+        let b = legacy_local_snapshot_id("proj1", "digest-a");
+        assert_eq!(a, b);
+        assert!(a.starts_with("legacylocal-"));
+        assert!(!a.contains("head-"));
+        // 32 lowercase hex, matching nongit_snapshot_id/collected_snapshot_id's
+        // width, not clean_snapshot_id's 16-hex head-bound suffix.
+        let hex = a.strip_prefix("legacylocal-").unwrap();
+        assert_eq!(hex.len(), 32);
+        assert!(
+            hex.bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+    }
+
+    #[test]
+    fn legacy_local_snapshot_id_differs_by_project_and_by_digest() {
+        let a = legacy_local_snapshot_id("proj1", "digest-a");
+        let b = legacy_local_snapshot_id("proj1", "digest-b");
+        let c = legacy_local_snapshot_id("proj2", "digest-a");
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn legacy_local_snapshot_derivation_selects_by_record_shape() {
+        use bbox_corpus_core::project_catalog::{
+            CommitNamespace, RecordedRepoAuthority, RepoHistoryAuthority, RepoHistoryId,
+            RepoHistoryMaterialization, RepoHistoryRecord,
+        };
+
+        assert_eq!(
+            legacy_local_snapshot_derivation(None),
+            LegacyLocalSnapshotDerivation::LegacyLocal,
+            "a project with no history record at all (non-Git LegacyLocal) uses legacylocal"
+        );
+
+        let local = RepoHistoryRecord {
+            repo_history_id: RepoHistoryId::mint(),
+            authority: RepoHistoryAuthority::LocalProject(
+                bbox_corpus_core::project_catalog::ProjectId::parse("p_local").unwrap(),
+            ),
+            primary_namespace: CommitNamespace::parse("local_abc").unwrap(),
+            compatibility_namespaces: Default::default(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
+        };
+        assert_eq!(
+            legacy_local_snapshot_derivation(Some(&local)),
+            LegacyLocalSnapshotDerivation::LegacyLocal,
+            "LocalProject authority under its own random namespace uses legacylocal"
+        );
+
+        let imported = RepoHistoryRecord {
+            repo_history_id: RepoHistoryId::mint(),
+            authority: RepoHistoryAuthority::LegacyNamespace(
+                CommitNamespace::parse("legacy-namespace").unwrap(),
+            ),
+            primary_namespace: CommitNamespace::parse("legacy-namespace").unwrap(),
+            compatibility_namespaces: Default::default(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
+        };
+        assert_eq!(
+            legacy_local_snapshot_derivation(Some(&imported)),
+            LegacyLocalSnapshotDerivation::HeadBound,
+            "an imported legacy namespace keeps the head-bound derivation"
+        );
+
+        let recorded = RepoHistoryRecord {
+            repo_history_id: RepoHistoryId::mint(),
+            authority: RepoHistoryAuthority::Recorded(
+                RecordedRepoAuthority::parse("repo-a").unwrap(),
+            ),
+            primary_namespace: CommitNamespace::parse("repo-a").unwrap(),
+            compatibility_namespaces: Default::default(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
+        };
+        assert_eq!(
+            legacy_local_snapshot_derivation(Some(&recorded)),
+            LegacyLocalSnapshotDerivation::HeadBound,
+            "Recorded authority never applies to a real LegacyLocal project, but the helper \
+             still resolves it as head-bound rather than fabricating a legacylocal answer"
+        );
     }
 
     #[test]

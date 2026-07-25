@@ -627,6 +627,59 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
     assert_eq!(verified.receipt(), &applied.receipt.verification);
     assert_eq!(verified.compatibility().records().len(), 3);
     assert_eq!(verified.compatibility().omitted_catalog_count(), 0);
+
+    // Phase 3 plan section 5 (P3-A): the namespace-inventory asset and the
+    // git_meta backup are unconditional parts of every migration from here
+    // on. Hash-binding of the asset is already covered by the
+    // expected/observed immutable-asset-hash equality asserted above; these
+    // checks additionally prove the asset's actual presence and shape, and
+    // that the cursor-file backup was materialized.
+    assert!(
+        applied
+            .receipt
+            .verification
+            .backup_hashes
+            .contains_key("backup-git_meta"),
+        "git_meta backup must be recorded in the verification receipt: {:?}",
+        applied.receipt.verification.backup_hashes
+    );
+    let immutable_assets_dir = rehearsal_root.join("state/project-catalog-migration-assets");
+    let namespace_asset_rows: Vec<serde_json::Value> = fs::read_dir(&immutable_assets_dir)
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            let bytes = fs::read(&path).ok()?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            let object = value.as_object()?;
+            let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+            keys.sort();
+            (keys
+                == [
+                    "inventory_hash",
+                    "rows",
+                    "source_index_fingerprint",
+                    "version",
+                ])
+            .then(|| object.get("rows").unwrap().clone())
+        })
+        .collect();
+    assert_eq!(
+        namespace_asset_rows.len(),
+        1,
+        "exactly one legacy commit namespace inventory asset must be installed"
+    );
+    assert_eq!(
+        namespace_asset_rows[0].as_array().unwrap().len(),
+        0,
+        "the fixture has no legacy commit namespace evidence, so the asset carries zero rows"
+    );
+    assert!(
+        rehearsal_root
+            .join("state/project-catalog-backups/git_meta")
+            .is_dir(),
+        "git_meta backup directory must be materialized under the backup root"
+    );
+
     let executable_report = decode_migration_report_v1(&fs::read(&report_path).unwrap()).unwrap();
     for (project_id, checkout, registered_at) in [
         (
