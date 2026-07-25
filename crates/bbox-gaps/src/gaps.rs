@@ -1254,6 +1254,24 @@ impl GapStore {
         format!("gap-{:08x}", h.finish() as u32)
     }
 
+    /// Re-key central rows on project rename (phase-2 §8.4): the same
+    /// coverage knowledge/threads/notes/pins already had; repo-owned gap
+    /// files travel with their checkout and are not touched here.
+    pub fn rename_project_refs(
+        &mut self,
+        old_project: &str,
+        new_project: &str,
+    ) -> anyhow::Result<usize> {
+        let mut updated = 0usize;
+        for gap in &mut self.data.gaps {
+            if gap.project.as_deref() == Some(old_project) {
+                gap.project = Some(new_project.to_string());
+                updated += 1;
+            }
+        }
+        Ok(updated)
+    }
+
     /// Immutable slice of all stored gaps — used by cross-store aggregators
     /// (inbox) that can't go through the MCP layer.
     pub fn all(&self) -> &[GapNote] {

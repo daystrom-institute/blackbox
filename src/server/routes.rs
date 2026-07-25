@@ -2270,6 +2270,26 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
         .iter()
         .filter(|spec| spec.default_project_dir.as_deref() == Some(project))
         .count();
+    let gaps = state
+        .gaps
+        .read()
+        .all()
+        .iter()
+        .filter(|gap| gap.project.as_deref() == Some(project))
+        .count();
+    let roadmap = state
+        .roadmap
+        .read()
+        .all_items()
+        .iter()
+        .filter(|item| item.project.as_deref() == Some(project))
+        .count();
+    let webhooks = state
+        .webhooks
+        .list()
+        .iter()
+        .filter(|spec| spec.default_project_dir.as_deref() == Some(project))
+        .count();
 
     Ok(json!({
         "knowledge": knowledge,
@@ -2283,6 +2303,9 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
         "whiteboards": whiteboards,
         "pollers": pollers,
         "crons": crons,
+        "gaps": gaps,
+        "roadmap": roadmap,
+        "webhooks": webhooks,
     }))
 }
 
@@ -2514,6 +2537,26 @@ pub(crate) fn migrate_project_refs(
         state.crons.track_handle(&spec.name, handle);
     }
 
+    // Phase-2 §8.4 coverage fixes: gaps and roadmap rows previously
+    // orphaned silently on rename, and webhooks kept a stale execution
+    // target. Same write-behind persistence discipline as their siblings.
+    let gaps = state
+        .gaps
+        .write()
+        .rename_project_refs(old_project, new_project)?;
+    let roadmap = state
+        .roadmap
+        .write()
+        .rename_project_refs(old_project, new_project)?;
+    if roadmap > 0 {
+        state.roadmap_persister.request();
+    }
+    let webhook_specs = state.webhooks.rename_project_refs(old_project, new_project);
+    let webhook_count = webhook_specs.len();
+    for spec in webhook_specs {
+        persist_named_json(&state.store_dir.join("webhooks"), &spec.name, &spec)?;
+    }
+
     Ok(json!({
         "knowledge": knowledge,
         "threads": threads,
@@ -2526,6 +2569,9 @@ pub(crate) fn migrate_project_refs(
         "whiteboards": whiteboards,
         "pollers": poller_count,
         "crons": cron_count,
+        "gaps": gaps,
+        "roadmap": roadmap,
+        "webhooks": webhook_count,
     }))
 }
 

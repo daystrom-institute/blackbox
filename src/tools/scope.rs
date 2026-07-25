@@ -21,6 +21,10 @@ use crate::server::BlackboxServer;
 
 pub(crate) struct ProjectWriteResolution {
     pub(crate) durable_scope: String,
+    /// Stable project identity for dual-read stamping (phase-2 §8.1): the
+    /// resolved record's id when the write scope resolved to a registered
+    /// project, `None` on the unregistered pass-through lane.
+    pub(crate) project_id: Option<String>,
     pub(crate) checkout_scope: Option<ResolvedCheckoutScope>,
 }
 
@@ -67,6 +71,7 @@ impl BlackboxServer {
             Err(error) if error.code == CheckoutAccessErrorCode::AttachmentNotFound => {
                 return Ok(ProjectWriteResolution {
                     durable_scope: raw.to_owned(),
+                    project_id: None,
                     checkout_scope: None,
                 });
             }
@@ -119,7 +124,23 @@ impl BlackboxServer {
         }
         Ok(ProjectWriteResolution {
             durable_scope: record.canonical_path,
+            project_id: Some(record.project_id),
             checkout_scope,
+        })
+    }
+
+    /// Tuple wrapper variant that also carries the resolved project id for
+    /// dual-read stamping (phase-2 §8.1).
+    pub(crate) fn resolve_project_write_scope_with_id(
+        &self,
+        raw: &str,
+    ) -> anyhow::Result<(String, Option<String>, Option<String>)> {
+        self.resolve_project_write(raw).map(|resolution| {
+            let write_dir = resolution
+                .checkout_scope
+                .as_ref()
+                .map(|checkout| checkout.checkout_project_dir.clone());
+            (resolution.durable_scope, resolution.project_id, write_dir)
         })
     }
 

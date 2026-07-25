@@ -96,6 +96,21 @@ impl WebhookRegistry {
         Self::default()
     }
 
+    /// Execution-target relocation on project rename (phase-2 §8.3/8.4):
+    /// the same rewrite pollers and crons already receive, closing the
+    /// silent key/target divergence webhooks previously had.
+    pub fn rename_project_refs(&self, old_project: &str, new_project: &str) -> Vec<WebhookSpec> {
+        let mut updated = Vec::new();
+        let mut by_name = self.by_name.write();
+        for spec in by_name.values_mut() {
+            if spec.default_project_dir.as_deref() == Some(old_project) {
+                spec.default_project_dir = Some(new_project.to_string());
+                updated.push(spec.clone());
+            }
+        }
+        updated
+    }
+
     pub fn install(&self, spec: WebhookSpec) {
         self.by_name.write().insert(spec.name.clone(), spec);
     }

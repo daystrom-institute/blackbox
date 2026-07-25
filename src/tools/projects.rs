@@ -1379,6 +1379,51 @@ mod tests {
             })
             .unwrap();
 
+        server
+            .state
+            .gaps
+            .write()
+            .file(&crate::gaps::GapFileParams {
+                title: "project gap".into(),
+                gap_kind: "tooling".into(),
+                domain: "rename-coverage".into(),
+                wanted_capability: "gap rows must follow a project rename".into(),
+                dedupe_key: "tooling/rename-coverage/follow".into(),
+                impact: None,
+                blocking_level: None,
+                missing_primitive: None,
+                fallback_used: None,
+                evidence: None,
+                suggested_owner: None,
+                notes: None,
+                scope: Some("project".into()),
+                project: Some(old_project.clone()),
+                project_id: None,
+                write_dir: None,
+                task_id: None,
+                session_id: None,
+                provider: None,
+                bro: None,
+                thread_id: None,
+                allow_recurrence: None,
+            })
+            .unwrap();
+        server
+            .state
+            .roadmap
+            .write()
+            .create(
+                "project roadmap item".into(),
+                "must follow rename".into(),
+                crate::roadmap::RoadmapCategory::Feature,
+                crate::roadmap::RoadmapPriority::Medium,
+                "project".into(),
+                Some(old_project.clone()),
+                None,
+                None,
+            )
+            .unwrap();
+
         let renamed = server
             .bbox_project_rename(Parameters(ProjectRenameParams {
                 project: registered.project_id.clone(),
@@ -1405,6 +1450,9 @@ mod tests {
         assert_eq!(payload["migrated_refs"]["threads"], 1);
         assert_eq!(payload["migrated_refs"]["notes"], 1);
         assert_eq!(payload["migrated_refs"]["pins"], 1);
+        assert_eq!(payload["migrated_refs"]["gaps"], 1);
+        assert_eq!(payload["migrated_refs"]["roadmap"], 1);
+        assert_eq!(payload["migrated_refs"]["webhooks"], 0);
 
         assert_eq!(
             server.state.kb.read().all_entries()[0].project.as_deref(),
@@ -1419,5 +1467,17 @@ mod tests {
             Some(new_project.as_str())
         );
         assert_eq!(server.state.pins.read().project_ref_count(&new_project), 1);
+        assert_eq!(
+            server.state.gaps.read().all()[0].project.as_deref(),
+            Some(new_project.as_str()),
+            "gap rows follow the rename instead of orphaning"
+        );
+        assert_eq!(
+            server.state.roadmap.read().all_items()[0]
+                .project
+                .as_deref(),
+            Some(new_project.as_str()),
+            "roadmap items follow the rename instead of orphaning"
+        );
     }
 }

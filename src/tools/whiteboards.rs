@@ -31,23 +31,24 @@ impl BlackboxServer {
         // Boards key by the registered base project (inbox scoping) — a
         // worktree opener's path must not scope the board to an ephemeral
         // checkout.
-        let project = match p.project.clone().filter(|s| !s.trim().is_empty()) {
-            Some(raw) => match self.resolve_project_write_scope(&raw) {
-                Ok((scope, _)) => scope,
-                Err(error) => {
-                    return Self::err_text(&format!(
-                        "whiteboard_open project authority failed: {error:#}"
-                    ));
-                }
-            },
-            None => String::new(),
-        };
+        let (project, resolved_project_id) =
+            match p.project.clone().filter(|s| !s.trim().is_empty()) {
+                Some(raw) => match self.resolve_project_write_scope_with_id(&raw) {
+                    Ok((scope, resolved_project_id, _write_dir)) => (scope, resolved_project_id),
+                    Err(error) => {
+                        return Self::err_text(&format!(
+                            "whiteboard_open project authority failed: {error:#}"
+                        ));
+                    }
+                },
+                None => (String::new(), None),
+            };
         let domain = p.domain.clone().unwrap_or_else(|| "facilitation".into());
         if let Err(e) = self.state.whiteboards.open(
             &p.board_id,
             &p.topic,
             &project,
-            None,
+            resolved_project_id.as_deref(),
             p.arc_thread_id.as_deref(),
             &p.opened_by,
         ) {

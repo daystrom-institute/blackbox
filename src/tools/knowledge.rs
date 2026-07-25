@@ -236,6 +236,7 @@ impl BlackboxServer {
     fn prepare_knowledge_write(
         &self,
         project: &mut Option<String>,
+        project_id: &mut Option<String>,
     ) -> anyhow::Result<(
         Option<bbox_knowledge::repo_io::KnowledgeRepoCarrier>,
         Option<bbox_corpus_core::project_record::ResolvedCheckoutScope>,
@@ -245,6 +246,9 @@ impl BlackboxServer {
         };
         let resolution = self.resolve_project_write(&raw)?;
         let durable_scope = resolution.durable_scope;
+        // Dual-read stamping (phase-2 §8.1): new rows carry the resolved
+        // stable id beside the path key; the unregistered lane stays None.
+        *project_id = resolution.project_id;
         let checkout = resolution.checkout_scope;
         let write_carrier = checkout
             .as_ref()
@@ -579,7 +583,8 @@ impl BlackboxServer {
                 }
                 None => None,
             };
-            let (write_dir, checkout) = server.prepare_knowledge_write(&mut p.project)?;
+            let (write_dir, checkout) =
+                server.prepare_knowledge_write(&mut p.project, &mut p.project_id)?;
             if let Some(update) = &update
                 && (update.carrier.as_ref() != write_dir.as_ref()
                     || update.checkout.as_ref().map(|scope| &scope.checkout_id)
@@ -678,7 +683,8 @@ impl BlackboxServer {
         let server = self.clone();
         let write_result = tokio::task::spawn_blocking(move || {
             let mut p = p;
-            let (write_dir, checkout) = server.prepare_knowledge_write(&mut p.project)?;
+            let (write_dir, checkout) =
+                server.prepare_knowledge_write(&mut p.project, &mut p.project_id)?;
             let mut kb = server.state.kb.write();
             let result = kb.remember_result_with_write_dir(
                 &p,
@@ -736,7 +742,7 @@ impl BlackboxServer {
         let server = self.clone();
         let write_result = tokio::task::spawn_blocking(move || {
             let mut p = p;
-            let (write_dir, checkout) = server.prepare_knowledge_write(&mut p.project)?;
+            let (write_dir, checkout) = server.prepare_knowledge_write(&mut p.project, &mut p.project_id)?;
             let superseded = match p.supersedes.as_deref() {
                 Some(old_ref) => {
                     let existing = server.prepare_existing_knowledge_mutation(old_ref)?;
@@ -1365,7 +1371,9 @@ mod tests {
             .path_fallback_cut
             .store(true, std::sync::atomic::Ordering::Release);
         let mut project = Some(project.to_string_lossy().into_owned());
-        let err = server.prepare_knowledge_write(&mut project).unwrap_err();
+        let err = server
+            .prepare_knowledge_write(&mut project, &mut None)
+            .unwrap_err();
         assert!(err.to_string().contains("project writes require"));
     }
 

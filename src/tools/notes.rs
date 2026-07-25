@@ -25,7 +25,9 @@ impl BlackboxServer {
         let create_result = tokio::task::spawn_blocking(move || {
             let mut p = p;
             if let Some(raw) = p.project.clone().filter(|s| !s.trim().is_empty()) {
-                let (scope, _write_dir) = server.resolve_project_write_scope(&raw)?;
+                let (scope, resolved_project_id, _write_dir) =
+                    server.resolve_project_write_scope_with_id(&raw)?;
+                p.project_id = resolved_project_id;
                 p.project = Some(scope);
             }
             server.state.notes.write().create(&p)

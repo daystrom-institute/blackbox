@@ -356,6 +356,23 @@ impl Roadmap {
             .find(|i| i.title.to_lowercase() == query.to_lowercase())
     }
 
+    /// Re-key items on project rename (phase-2 §8.4), closing the silent
+    /// orphaning rename previously left behind.
+    pub fn rename_project_refs(
+        &mut self,
+        old_project: &str,
+        new_project: &str,
+    ) -> anyhow::Result<usize> {
+        let mut updated = 0usize;
+        for item in &mut self.store.items {
+            if item.project.as_deref() == Some(old_project) {
+                item.project = Some(new_project.to_string());
+                updated += 1;
+            }
+        }
+        Ok(updated)
+    }
+
     pub fn create(
         &mut self,
         title: String,

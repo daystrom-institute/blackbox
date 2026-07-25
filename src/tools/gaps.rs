@@ -20,10 +20,12 @@ impl BlackboxServer {
     ) -> anyhow::Result<(
         String,
         Option<String>,
+        Option<String>,
         Option<bbox_corpus_core::project_record::ResolvedCheckoutScope>,
     )> {
         let resolution = self.resolve_project_write(raw)?;
         let durable_scope = resolution.durable_scope;
+        let resolved_project_id = resolution.project_id;
         let checkout = resolution.checkout_scope;
         let write_dir = checkout
             .as_ref()
@@ -43,7 +45,7 @@ impl BlackboxServer {
         if let Some(checkout) = checkout.as_ref() {
             self.register_dark_knowledge_checkout(checkout)?;
         }
-        Ok((durable_scope, write_dir, checkout))
+        Ok((durable_scope, resolved_project_id, write_dir, checkout))
     }
 
     fn guard_unscoped_gap_mutation(
@@ -95,8 +97,10 @@ impl BlackboxServer {
                         .map(|checkout| checkout.checkout_project_dir.clone())
                 });
             if let Some(raw) = raw_project {
-                let (project, write_dir, resolved_checkout) = server.resolve_gap_project(&raw)?;
+                let (project, resolved_project_id, write_dir, resolved_checkout) =
+                    server.resolve_gap_project(&raw)?;
                 p.project = Some(project);
+                p.project_id = resolved_project_id;
                 p.write_dir = write_dir;
                 checkout = resolved_checkout;
             }
@@ -210,7 +214,8 @@ impl BlackboxServer {
                 });
             server.guard_unscoped_gap_mutation(&p.id, raw_project.is_some())?;
             if let Some(raw) = raw_project {
-                let (project, write_dir, resolved_checkout) = server.resolve_gap_project(&raw)?;
+                let (project, _resolved_project_id, write_dir, resolved_checkout) =
+                    server.resolve_gap_project(&raw)?;
                 p.project = Some(project);
                 p.write_dir = write_dir;
                 checkout = resolved_checkout;
@@ -247,7 +252,8 @@ impl BlackboxServer {
                 });
             server.guard_unscoped_gap_mutation(&p.id, raw_project.is_some())?;
             if let Some(raw) = raw_project {
-                let (project, write_dir, resolved_checkout) = server.resolve_gap_project(&raw)?;
+                let (project, _resolved_project_id, write_dir, resolved_checkout) =
+                    server.resolve_gap_project(&raw)?;
                 p.project = Some(project);
                 p.write_dir = write_dir;
                 checkout = resolved_checkout;
