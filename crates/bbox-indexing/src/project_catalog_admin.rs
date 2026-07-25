@@ -856,6 +856,314 @@ pub fn bind_publisher_attachment(
     })
 }
 
+/// Explicit operator catalog creation (plan §7.2): a published project by
+/// authoritative scope (unowned required) or a legacy-local project. This
+/// is the surface behind the offline `add` subcommand; producer traffic
+/// and configuration reload never create projects.
+#[derive(Debug, Clone)]
+pub enum CatalogAddKind {
+    Published(PublishedScope),
+    LegacyLocal,
+}
+
+pub fn catalog_add(
+    store: &ProjectCatalogStore,
+    expected_epoch: u64,
+    kind: &CatalogAddKind,
+    display_name: &str,
+    operator_aliases: &[String],
+    created_at: &str,
+) -> AdminResult<(ProjectId, ProjectCatalogCommit)> {
+    use bbox_corpus_core::project_catalog::{
+        CommitNamespace, CorpusProject, RecordedRepoAuthority, RepoHistoryAuthority, RepoHistoryId,
+        RepoHistoryRecord,
+    };
+
+    let kind = kind.clone();
+    let display_name = display_name.to_string();
+    let aliases: Vec<String> = operator_aliases.to_vec();
+    let created_at = created_at.to_string();
+    let minted = std::sync::Mutex::new(None::<ProjectId>);
+    let commit = store.transact(expected_epoch, |catalog, _attachments| {
+        let project_id = ProjectId::mint(catalog)
+            .map_err(|error| admin_error(error.code(), error.to_string()))?;
+        if let CatalogAddKind::Published(scope) = &kind
+            && catalog
+                .projects
+                .values()
+                .any(|p| matches!(&p.scope, ProjectScope::Published(s) if s == scope))
+        {
+            return Err(admin_error(
+                "error.project_catalog_admin_scope_owned",
+                "the scope is already owned by a catalog project",
+            ));
+        }
+        for alias in &aliases {
+            let taken = catalog.projects.values().any(|p| {
+                p.operator_aliases.contains(alias) || p.project_id.as_str() == alias
+            });
+            if taken {
+                return Err(admin_error(
+                    "error.project_catalog_admin_alias_conflict",
+                    format!("alias {alias} collides with an id or accepted alias"),
+                ));
+            }
+        }
+        let (scope, repo_history) = match &kind {
+            CatalogAddKind::LegacyLocal => {
+                // A legacy-local record gets a server-minted local history
+                // with an independent random namespace (governing §5.1).
+                let history_id = RepoHistoryId::mint();
+                let namespace = CommitNamespace::mint_local(catalog)
+                    .map_err(|error| admin_error(error.code(), error.to_string()))?;
+                catalog.repo_histories.insert(
+                    history_id.clone(),
+                    RepoHistoryRecord {
+                        repo_history_id: history_id.clone(),
+                        authority: RepoHistoryAuthority::LocalProject(project_id.clone()),
+                        primary_namespace: namespace,
+                        compatibility_namespaces: Default::default(),
+                    },
+                );
+                (ProjectScope::LegacyLocal, Some(history_id))
+            }
+            CatalogAddKind::Published(scope) => {
+                let authority = RecordedRepoAuthority::parse(scope.repo_id())
+                    .map_err(|error| admin_error(error.code(), error.to_string()))?;
+                let existing = catalog
+                    .repo_histories
+                    .iter()
+                    .find(|(_, record)| {
+                        matches!(&record.authority, RepoHistoryAuthority::Recorded(a) if a.as_str() == scope.repo_id())
+                    })
+                    .map(|(id, _)| id.clone());
+                let history_id = match existing {
+                    Some(id) => id,
+                    None => {
+                        let id = RepoHistoryId::mint();
+                        let primary = CommitNamespace::parse(scope.repo_id())
+                            .map_err(|error| admin_error(error.code(), error.to_string()))?;
+                        catalog.repo_histories.insert(
+                            id.clone(),
+                            RepoHistoryRecord {
+                                repo_history_id: id.clone(),
+                                authority: RepoHistoryAuthority::Recorded(authority),
+                                primary_namespace: primary,
+                                compatibility_namespaces: Default::default(),
+                            },
+                        );
+                        id
+                    }
+                };
+                (ProjectScope::Published(scope.clone()), Some(history_id))
+            }
+        };
+        catalog.projects.insert(
+            project_id.clone(),
+            CorpusProject {
+                project_id: project_id.clone(),
+                scope,
+                operator_aliases: aliases.iter().cloned().collect(),
+                nominated_aliases: Default::default(),
+                display_name: display_name.clone(),
+                created_at: created_at.clone(),
+                registered_at_compat: None,
+                repo_history,
+                languages: Default::default(),
+            },
+        );
+        *minted.lock().unwrap() = Some(project_id);
+        Ok(())
+    })?;
+    let project_id = minted
+        .into_inner()
+        .unwrap()
+        .expect("committed transaction minted an id");
+    Ok((project_id, commit))
+}
+
+/// Accept or reject one nominated alias (plan §7.6, D-005): an explicit
+/// local catalog-authority action. Acceptance enforces uniqueness against
+/// every id and accepted alias; a missing nomination refuses so a stale
+/// command cannot silently accept something else.
+pub fn alias_decide(
+    store: &ProjectCatalogStore,
+    expected_epoch: u64,
+    project_id: &ProjectId,
+    alias: &str,
+    accept: bool,
+) -> AdminResult<ProjectCatalogCommit> {
+    let project_id = project_id.clone();
+    let alias = alias.to_string();
+    store.transact(expected_epoch, move |catalog, _attachments| {
+        if accept {
+            let taken = catalog
+                .projects
+                .values()
+                .any(|p| p.operator_aliases.contains(&alias) || p.project_id.as_str() == alias);
+            if taken {
+                return Err(admin_error(
+                    "error.project_catalog_admin_alias_conflict",
+                    format!("alias {alias} collides with an id or accepted alias"),
+                ));
+            }
+        }
+        let Some(project) = catalog.projects.get_mut(&project_id) else {
+            return Err(admin_error(
+                "error.project_catalog_admin_unknown_project",
+                format!("project {project_id} is not in the catalog"),
+            ));
+        };
+        if !project.nominated_aliases.remove(&alias) {
+            return Err(admin_error(
+                "error.project_catalog_admin_unknown_nomination",
+                format!("alias {alias} is not a pending nomination"),
+            ));
+        }
+        if accept {
+            project.operator_aliases.insert(alias.clone());
+        }
+        Ok(())
+    })
+}
+
+/// External reference classes the retire inventory counts, probed by the
+/// offline caller (plan §7.8). Every class must be zero before execute;
+/// detached attachment rows, the project's own audit chain, and stale
+/// mapped bindings do not block and are removed with the project.
+#[derive(Debug, Clone, Default)]
+pub struct RetireEvidence {
+    pub external_reference_counts: std::collections::BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RetireInventory {
+    pub blocking: std::collections::BTreeMap<String, u64>,
+    pub removable_attachments: u64,
+    pub removable_migrations: u64,
+    pub removable_bindings: u64,
+}
+
+/// Inventory (always) and optionally execute the removal of one fully
+/// discharged project. Execute removes, in one pair transaction, the
+/// project, its now-unreferenced local history record, its scope-migration
+/// records with their proofs, all its attachment rows, and its mapped
+/// path bindings; strict cross-validation forbids leaving any behind.
+pub fn retire_project(
+    store: &ProjectCatalogStore,
+    expected_epoch: u64,
+    project_id: &ProjectId,
+    evidence: &RetireEvidence,
+    execute: bool,
+) -> AdminResult<(RetireInventory, Option<ProjectCatalogCommit>)> {
+    use bbox_corpus_core::project_catalog::{LegacyPathBindingStatus, RepoHistoryAuthority};
+
+    let state = store.snapshot()?;
+    if state.epoch() != expected_epoch {
+        return Err(admin_error(
+            "error.project_catalog_stale_epoch",
+            "expected epoch does not match the current catalog epoch",
+        ));
+    }
+    if !state.catalog().projects.contains_key(project_id) {
+        return Err(admin_error(
+            "error.project_catalog_admin_unknown_project",
+            format!("project {project_id} is not in the catalog"),
+        ));
+    }
+    let blocking: std::collections::BTreeMap<String, u64> = evidence
+        .external_reference_counts
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .map(|(class, count)| (class.clone(), *count))
+        .collect();
+    let active_attachments = state
+        .attachments()
+        .attachments
+        .values()
+        .filter(|row| row.status == AttachmentStatus::Attached && &row.project_id == project_id)
+        .count() as u64;
+    let mut blocking = blocking;
+    if active_attachments > 0 {
+        blocking.insert("active_attachments".into(), active_attachments);
+    }
+    let inventory = RetireInventory {
+        blocking: blocking.clone(),
+        removable_attachments: state
+            .attachments()
+            .attachments
+            .values()
+            .filter(|row| &row.project_id == project_id)
+            .count() as u64,
+        removable_migrations: state
+            .catalog()
+            .scope_migrations
+            .values()
+            .filter(|record| &record.project_id == project_id)
+            .count() as u64,
+        removable_bindings: state
+            .attachments()
+            .legacy_path_bindings
+            .values()
+            .filter(|entry| {
+                matches!(&entry.status, LegacyPathBindingStatus::Mapped { project_id: p, .. } if p == project_id)
+            })
+            .count() as u64,
+    };
+    if !execute {
+        return Ok((inventory, None));
+    }
+    if !blocking.is_empty() {
+        return Err(admin_error(
+            "error.project_catalog_admin_retire_blocked",
+            format!("nonzero reference classes remain: {blocking:?}"),
+        ));
+    }
+    let project_id = project_id.clone();
+    let commit = store.transact(expected_epoch, move |catalog, attachments| {
+        let Some(project) = catalog.projects.remove(&project_id) else {
+            return Err(admin_error(
+                "error.project_catalog_admin_unknown_project",
+                "project vanished between inventory and execute",
+            ));
+        };
+        if let Some(history_id) = &project.repo_history {
+            let still_referenced = catalog
+                .projects
+                .values()
+                .any(|other| other.repo_history.as_ref() == Some(history_id));
+            let local_only = catalog
+                .repo_histories
+                .get(history_id)
+                .is_some_and(|record| {
+                    matches!(&record.authority, RepoHistoryAuthority::LocalProject(p) if p == &project_id)
+                });
+            if !still_referenced && local_only {
+                catalog.repo_histories.remove(history_id);
+            }
+        }
+        let removed_migrations: Vec<_> = catalog
+            .scope_migrations
+            .iter()
+            .filter(|(_, record)| record.project_id == project_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &removed_migrations {
+            catalog.scope_migrations.remove(id);
+            attachments.scope_migration_proofs.remove(id);
+        }
+        attachments
+            .attachments
+            .retain(|_, row| row.project_id != project_id);
+        attachments.default_attachments.remove(&project_id);
+        attachments.legacy_path_bindings.retain(|_, entry| {
+            !matches!(&entry.status, LegacyPathBindingStatus::Mapped { project_id: p, .. } if p == &project_id)
+        });
+        Ok(())
+    })?;
+    Ok((inventory, Some(commit)))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1387,6 +1695,257 @@ mod tests {
             &history.authority,
             RepoHistoryAuthority::Recorded(a) if a.as_str() == "authfamilytwo"
         ));
+    }
+
+    #[test]
+    fn catalog_add_alias_lifecycle_and_retire_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = ProjectCatalogStore::initialize_empty(root.join("projects.json")).unwrap();
+
+        // Remote-shaped published add with an initial alias.
+        let scope = PublishedScope::try_new("remotefamily", ".").unwrap();
+        let (published_id, _) = catalog_add(
+            &store,
+            current_epoch(&store),
+            &CatalogAddKind::Published(scope.clone()),
+            "remote project",
+            &["remote-alias".to_string()],
+            "2026-07-24T00:00:00Z",
+        )
+        .unwrap();
+        // The same scope cannot be added twice.
+        let error = catalog_add(
+            &store,
+            current_epoch(&store),
+            &CatalogAddKind::Published(scope.clone()),
+            "dup",
+            &[],
+            "2026-07-24T00:00:01Z",
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_admin_scope_owned");
+
+        // Legacy-local add mints a local history record.
+        let (local_id, _) = catalog_add(
+            &store,
+            current_epoch(&store),
+            &CatalogAddKind::LegacyLocal,
+            "local project",
+            &[],
+            "2026-07-24T00:00:02Z",
+        )
+        .unwrap();
+        let state = store.snapshot().unwrap();
+        let local = state.catalog().projects.get(&local_id).unwrap();
+        let history = state
+            .catalog()
+            .repo_histories
+            .get(local.repo_history.as_ref().unwrap())
+            .unwrap();
+        assert!(history.primary_namespace.as_str().starts_with("local_"));
+
+        // Alias nomination lifecycle: nominate by direct mutation (the
+        // register-time ingestion is the tool layer), then accept.
+        let epoch = current_epoch(&store);
+        store
+            .transact(epoch, |catalog, _| {
+                catalog
+                    .projects
+                    .get_mut(&local_id)
+                    .unwrap()
+                    .nominated_aliases
+                    .insert("nominated".into());
+                Ok(())
+            })
+            .unwrap();
+        // Accepting a colliding alias refuses and keeps the nomination.
+        let epoch = current_epoch(&store);
+        store
+            .transact(epoch, |catalog, _| {
+                catalog
+                    .projects
+                    .get_mut(&local_id)
+                    .unwrap()
+                    .nominated_aliases
+                    .insert("remote-alias".into());
+                Ok(())
+            })
+            .unwrap();
+        let error = alias_decide(
+            &store,
+            current_epoch(&store),
+            &local_id,
+            "remote-alias",
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_admin_alias_conflict");
+        alias_decide(
+            &store,
+            current_epoch(&store),
+            &local_id,
+            "remote-alias",
+            false,
+        )
+        .unwrap();
+        alias_decide(&store, current_epoch(&store), &local_id, "nominated", true).unwrap();
+        let state = store.snapshot().unwrap();
+        let local = state.catalog().projects.get(&local_id).unwrap();
+        assert!(local.operator_aliases.contains("nominated"));
+        assert!(local.nominated_aliases.is_empty());
+        // Deciding a nomination that does not exist refuses.
+        let error =
+            alias_decide(&store, current_epoch(&store), &local_id, "ghost", true).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_admin_unknown_nomination"
+        );
+
+        // Retire: blocked by probed external references, then clean.
+        let mut evidence = RetireEvidence::default();
+        evidence
+            .external_reference_counts
+            .insert("knowledge_rows".into(), 2);
+        let (inventory, commit) = retire_project(
+            &store,
+            current_epoch(&store),
+            &published_id,
+            &evidence,
+            false,
+        )
+        .unwrap();
+        assert_eq!(inventory.blocking.get("knowledge_rows"), Some(&2));
+        assert!(commit.is_none());
+        let error = retire_project(
+            &store,
+            current_epoch(&store),
+            &published_id,
+            &evidence,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_admin_retire_blocked");
+
+        let (_, commit) = retire_project(
+            &store,
+            current_epoch(&store),
+            &published_id,
+            &RetireEvidence::default(),
+            true,
+        )
+        .unwrap();
+        assert!(commit.is_some());
+        let state = store.snapshot().unwrap();
+        assert!(!state.catalog().projects.contains_key(&published_id));
+        // The local project and its history survive untouched.
+        assert!(state.catalog().projects.contains_key(&local_id));
+    }
+
+    #[test]
+    fn retire_removes_the_audit_chain_attachments_and_bindings_together() {
+        use bbox_corpus_core::project_catalog::ScopeMigrationKind;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("checkout/apps/web")).unwrap();
+        let store = store_with_projects(&root);
+        let project_id = ProjectId::parse(PROJECT).unwrap();
+
+        let receipt = attach_checkout(
+            &store,
+            current_epoch(&store),
+            &project_id,
+            &probe(&root.join("checkout")),
+        )
+        .unwrap();
+        let old_scope = PublishedScope::try_new("retirefamily", ".").unwrap();
+        let evidence = PromotionEvidence {
+            attachment_scopes: [(receipt.attachment_id.clone(), Some(old_scope.clone()))]
+                .into_iter()
+                .collect(),
+            code_bridge_generation: None,
+            publication_bridge_generation: None,
+            operator_invocation: "test:promote".into(),
+            operator_reason: None,
+            proved_at: "2026-07-24T00:00:03Z".into(),
+        };
+        promote_project(
+            &store,
+            current_epoch(&store),
+            &project_id,
+            &receipt.attachment_id,
+            &old_scope,
+            &evidence,
+        )
+        .unwrap();
+        let new_scope = PublishedScope::try_new("retirefamily", "apps/web").unwrap();
+        let request = ScopeMigrationRequest {
+            project_id: project_id.clone(),
+            expected_old_scope: old_scope.clone(),
+            new_scope: new_scope.clone(),
+            kind: ScopeMigrationKind::RelpathMove,
+            designated_attachment: receipt.attachment_id.clone(),
+            acknowledge_repo_authority_change: false,
+            attachment_probes: [(
+                receipt.attachment_id.clone(),
+                MigrationAttachmentProbe {
+                    resolved_scope: Some(new_scope.clone()),
+                    new_project_root_relpath: "apps/web".into(),
+                    new_checkout_project_dir: root
+                        .join("checkout/apps/web")
+                        .to_str()
+                        .unwrap()
+                        .into(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            code_bridge_generation: None,
+            publication_bridge_generation: None,
+            operator_invocation: "test:migrate".into(),
+            operator_reason: None,
+            migrated_at: "2026-07-24T00:00:05Z".into(),
+        };
+        scope_migrate_attached(&store, current_epoch(&store), &request, false)
+            .unwrap()
+            .unwrap();
+
+        // Active attachment blocks execute.
+        let error = retire_project(
+            &store,
+            current_epoch(&store),
+            &project_id,
+            &RetireEvidence::default(),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_admin_retire_blocked");
+
+        detach_attachment(
+            &store,
+            current_epoch(&store),
+            &receipt.attachment_id,
+            "2026-07-24T00:00:06Z",
+        )
+        .unwrap();
+        let (inventory, commit) = retire_project(
+            &store,
+            current_epoch(&store),
+            &project_id,
+            &RetireEvidence::default(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(inventory.removable_migrations, 2);
+        assert_eq!(inventory.removable_attachments, 1);
+        assert_eq!(inventory.removable_bindings, 1);
+        assert!(commit.is_some());
+        let state = store.snapshot().unwrap();
+        assert!(!state.catalog().projects.contains_key(&project_id));
+        assert!(state.catalog().scope_migrations.is_empty());
+        assert!(state.attachments().scope_migration_proofs.is_empty());
+        assert!(state.attachments().attachments.is_empty());
+        assert!(state.attachments().legacy_path_bindings.is_empty());
     }
 
     #[test]
