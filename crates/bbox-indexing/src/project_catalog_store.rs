@@ -132,7 +132,7 @@ pub struct ProjectCatalogStoreError {
 }
 
 impl ProjectCatalogStoreError {
-    fn new(code: &'static str, detail: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, detail: impl Into<String>) -> Self {
         let detail = detail
             .into()
             .chars()
@@ -15426,6 +15426,7 @@ mod tests {
             attachments: BTreeMap::new(),
             scope_migration_proofs: BTreeMap::new(),
             legacy_path_bindings: BTreeMap::new(),
+            default_attachments: BTreeMap::new(),
         };
         validate_catalog_attachments(&catalog, &attachments).unwrap();
     }

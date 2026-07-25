@@ -565,6 +565,13 @@ pub struct AttachmentSnapshotV1 {
     pub attachments: BTreeMap<AttachmentId, CheckoutAttachment>,
     pub scope_migration_proofs: BTreeMap<ScopeMigrationId, ScopeMigrationAttachmentProof>,
     pub legacy_path_bindings: BTreeMap<LegacyPathBindingId, LegacyPathLedgerEntry>,
+    /// Operator-selected default local-source attachment per project
+    /// (phase-2 §7.3): consulted by path operations when no session pin or
+    /// explicit attachment selector is present. Host-local attachment data,
+    /// never catalog data. Additive with a serde default so Phase 1
+    /// snapshots decode unchanged.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub default_attachments: BTreeMap<ProjectId, AttachmentId>,
 }
 
 impl AttachmentSnapshotV1 {
@@ -575,6 +582,7 @@ impl AttachmentSnapshotV1 {
             attachments: BTreeMap::new(),
             scope_migration_proofs: BTreeMap::new(),
             legacy_path_bindings: BTreeMap::new(),
+            default_attachments: BTreeMap::new(),
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -1021,6 +1029,26 @@ fn validate_attachments(snapshot: &AttachmentSnapshotV1) -> Result<(), ProjectCa
             "error.project_attachments_unsupported_version",
             "attachment snapshot version is unsupported",
         ));
+    }
+    for (project_id, attachment_id) in &snapshot.default_attachments {
+        let Some(attachment) = snapshot.attachments.get(attachment_id) else {
+            return Err(ProjectCatalogError::new(
+                "error.project_attachments_dangling_default",
+                format!("default attachment {attachment_id} is not in the store"),
+            ));
+        };
+        if &attachment.project_id != project_id {
+            return Err(ProjectCatalogError::new(
+                "error.project_attachments_default_project_mismatch",
+                format!("default attachment {attachment_id} belongs to another project"),
+            ));
+        }
+        if attachment.status != AttachmentStatus::Attached {
+            return Err(ProjectCatalogError::new(
+                "error.project_attachments_default_detached",
+                format!("default attachment {attachment_id} is not active"),
+            ));
+        }
     }
     if snapshot.epoch == 0 {
         return Err(ProjectCatalogError::new(

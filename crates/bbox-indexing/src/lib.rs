@@ -9,6 +9,7 @@ pub mod checkout_access_v1;
 pub mod checkout_access_v2;
 pub mod checkout_registry;
 pub mod index;
+pub mod project_catalog_admin;
 pub mod project_catalog_inventory;
 pub(crate) mod project_catalog_inventory_adapters;
 pub mod project_catalog_migration;

@@ -2674,6 +2674,7 @@ fn build_base_post_images(
         attachments: attachment_snapshot_rows,
         scope_migration_proofs: BTreeMap::new(),
         legacy_path_bindings,
+        default_attachments: BTreeMap::new(),
     };
     validate_catalog_attachments(&catalog, &attachments)
         .map_err(|_| planner_error("catalog and attachment post-images are inconsistent"))?;
