@@ -1693,6 +1693,57 @@ fn verify_selected_from_pointer_locked(
     })
 }
 
+/// Phase-2 §7.7: rebind the publisher attachment only. The pointer's full
+/// ref, accepted commit, accepted scope, generation id, hashes, and prior
+/// pointer are untouched, so the strict pointer/generation startup
+/// agreement holds identically before and after; ref and commit changes
+/// are exclusively the later atomic advance path. Rebinding a pointer
+/// whose selected generation does not verify refuses instead of moving a
+/// broken binding.
+pub(crate) fn rebind_pointer_attachment_locked(
+    paths: &AcceptedPublicationStorePaths,
+    guard: &AcceptedPublicationLockGuard,
+    project_id: &ProjectId,
+    new_attachment: &AttachmentId,
+    expected_scope: Option<&PublishedScope>,
+    limits: &AcceptedPublicationLimits,
+) -> AcceptedPublicationStoreResult<AcceptedPublicationPointerV1> {
+    ensure_matching_guard(paths, guard)?;
+    limits.validate()?;
+    let pointer_bytes = read_pointer_locked(paths, project_id, limits.max_pointer_bytes)?;
+    let verified =
+        verify_selected_from_pointer_locked(paths, project_id, pointer_bytes.clone(), limits)?;
+    if verified.selection != VerifiedAcceptedPublicationSelectionV1::Current {
+        return Err(invalid_generation(
+            "rebinding requires the current accepted generation to verify",
+        ));
+    }
+    let mut pointer = decode_pointer_v1(&pointer_bytes, limits)?;
+    if let Some(expected) = expected_scope
+        && &pointer.accepted_scope != expected
+    {
+        // Refuse before any mutation: a scope-mismatched binding must
+        // never be installed, and nothing here needs restoring.
+        return Err(invalid_pointer(
+            "the expected scope disagrees with the pointer's accepted scope",
+        ));
+    }
+    pointer.attachment_id = new_attachment.clone();
+    let encoded = encode_pointer_v1(&pointer, limits)?;
+    let directory = NofollowDirectory::open_existing(paths.pointers())
+        .map_err(accepted_io_error)?
+        .ok_or_else(|| {
+            AcceptedPublicationStoreError::new(
+                "error.accepted_publication_missing",
+                "accepted-publication pointer directory is missing",
+            )
+        })?;
+    directory
+        .atomic_replace(&format!("{project_id}.json"), &encoded)
+        .map_err(accepted_io_error)?;
+    Ok(pointer)
+}
+
 fn read_pointer_locked(
     paths: &AcceptedPublicationStorePaths,
     project_id: &ProjectId,
@@ -2274,6 +2325,64 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn rebind_changes_attachment_only_and_selected_generation_survives() {
+        let directory = tempfile::tempdir().unwrap();
+        let projects_path = directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("projects.json");
+        let paths = AcceptedPublicationStorePaths::derive(&projects_path).unwrap();
+        let prepared = prepared();
+        install_prepared(&paths, &prepared);
+        let guard = acquire_accepted_publication_lock(&paths).unwrap();
+        let limits = AcceptedPublicationLimits::default();
+
+        let before = verify_selected_locked(&paths, &guard, &project_id(), &limits).unwrap();
+        let new_attachment = AttachmentId::parse("att_0000000000000000000000000000f001").unwrap();
+        assert_ne!(prepared.pointer.attachment_id, new_attachment);
+
+        let rebound = rebind_pointer_attachment_locked(
+            &paths,
+            &guard,
+            &project_id(),
+            &new_attachment,
+            Some(&prepared.pointer.accepted_scope),
+            &limits,
+        )
+        .unwrap();
+        let scope_mismatch = PublishedScope::try_new("wrongfamily", ".").unwrap();
+        let error = rebind_pointer_attachment_locked(
+            &paths,
+            &guard,
+            &project_id(),
+            &new_attachment,
+            Some(&scope_mismatch),
+            &limits,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "error.accepted_publication_invalid_pointer");
+        assert_eq!(rebound.attachment_id, new_attachment);
+        assert_eq!(rebound.full_ref, prepared.pointer.full_ref);
+        assert_eq!(rebound.accepted_commit, prepared.pointer.accepted_commit);
+        assert_eq!(
+            rebound.accepted_generation,
+            prepared.pointer.accepted_generation
+        );
+        assert_eq!(rebound.generation_hash, prepared.pointer.generation_hash);
+
+        // The phase-2 regression requirement: after rebinding, strict
+        // selected verification serves the exact same accepted generation.
+        let after = verify_selected_locked(&paths, &guard, &project_id(), &limits).unwrap();
+        assert_eq!(
+            after.selection,
+            VerifiedAcceptedPublicationSelectionV1::Current
+        );
+        assert_eq!(after.generation_id, before.generation_id);
+        assert_eq!(after.generation_bytes, before.generation_bytes);
     }
 
     #[test]

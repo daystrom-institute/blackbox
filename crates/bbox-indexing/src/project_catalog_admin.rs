@@ -769,6 +769,93 @@ fn apply_scope_migration(
     Ok(())
 }
 
+/// Daemon-probed publisher-bind evidence: the tool layer proved the new
+/// attachment's object database contains the pointer's accepted commit
+/// (the containment a later advance and overlay recomputation need).
+#[derive(Debug, Clone)]
+pub struct PublisherBindProbe {
+    pub accepted_commit_present: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublisherBindReceipt {
+    pub attachment_id: AttachmentId,
+}
+
+/// Rebind the publisher attachment for one project (plan §7.7): the
+/// pointer's ref, commit, scope, generation, and payloads never change
+/// here; ref/commit changes are exclusively the later advance path. The
+/// catalog side validates the attachment; the pointer store enforces the
+/// pointer/generation agreement before and after.
+pub fn bind_publisher_attachment(
+    store: &ProjectCatalogStore,
+    projects_path: &std::path::Path,
+    project_id: &ProjectId,
+    new_attachment: &AttachmentId,
+    probe: &PublisherBindProbe,
+) -> AdminResult<PublisherBindReceipt> {
+    use crate::accepted_publication_store::{
+        AcceptedPublicationLimits, AcceptedPublicationStorePaths,
+        acquire_accepted_publication_lock, rebind_pointer_attachment_locked,
+    };
+
+    if !probe.accepted_commit_present {
+        return Err(admin_error(
+            "error.project_catalog_admin_commit_not_present",
+            "the new attachment's object database does not contain the accepted \
+             commit; fetch it before rebinding",
+        ));
+    }
+    let state = store.snapshot()?;
+    let Some(row) = state.attachments().attachments.get(new_attachment) else {
+        return Err(admin_error(
+            "error.project_catalog_admin_unknown_attachment",
+            format!("attachment {new_attachment} is not in the store"),
+        ));
+    };
+    if &row.project_id != project_id {
+        return Err(admin_error(
+            "error.project_catalog_admin_attachment_project_mismatch",
+            "the publisher binding must name an attachment of the same project",
+        ));
+    }
+    if row.status != AttachmentStatus::Attached {
+        return Err(admin_error(
+            "error.project_catalog_admin_attachment_detached",
+            "a detached attachment cannot carry the publisher binding",
+        ));
+    }
+    let attachment_scope = row.validated_scope.clone();
+
+    let paths = AcceptedPublicationStorePaths::derive(projects_path)
+        .map_err(|error| admin_error(error.code(), "publication paths are invalid"))?;
+    let guard = acquire_accepted_publication_lock(&paths)
+        .map_err(|error| admin_error(error.code(), "publication store is locked"))?;
+    // Read-validate-rebind under the publication lock; no catalog lock is
+    // held here (the catalog read above used a pinned snapshot).
+    let Some(attachment_scope) = attachment_scope else {
+        return Err(admin_error(
+            "error.project_catalog_admin_scope_required",
+            "a scope-less attachment cannot carry the publisher binding",
+        ));
+    };
+    let limits = AcceptedPublicationLimits::default();
+    // The store refuses before mutating when the expected scope disagrees
+    // with the pointer's accepted scope, so no restore path exists.
+    let rebound = rebind_pointer_attachment_locked(
+        &paths,
+        &guard,
+        project_id,
+        new_attachment,
+        Some(&attachment_scope),
+        &limits,
+    )
+    .map_err(|error| admin_error(error.code(), error.to_string()))?;
+    Ok(PublisherBindReceipt {
+        attachment_id: rebound.attachment_id,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
