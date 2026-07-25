@@ -486,6 +486,289 @@ pub fn promote_project(
     })
 }
 
+/// Probed relocation facts for one active attachment during a scope
+/// migration: the committed scope its config now resolves, and the
+/// relocated directories for a relpath move (unchanged values for a
+/// recorded-authority change).
+#[derive(Debug, Clone)]
+pub struct MigrationAttachmentProbe {
+    pub resolved_scope: Option<PublishedScope>,
+    pub new_project_root_relpath: String,
+    pub new_checkout_project_dir: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScopeMigrationRequest {
+    pub project_id: ProjectId,
+    pub expected_old_scope: PublishedScope,
+    pub new_scope: PublishedScope,
+    pub kind: bbox_corpus_core::project_catalog::ScopeMigrationKind,
+    pub designated_attachment: AttachmentId,
+    /// Operator authority flag for a recorded-authority change. Agents pass
+    /// it through from operator input and never default or infer it
+    /// (D-004, RX-V1 discipline); the tool layer owns that rule, this op
+    /// only enforces presence.
+    pub acknowledge_repo_authority_change: bool,
+    pub attachment_probes: std::collections::BTreeMap<AttachmentId, MigrationAttachmentProbe>,
+    pub code_bridge_generation: Option<String>,
+    pub publication_bridge_generation: Option<String>,
+    pub operator_invocation: String,
+    pub operator_reason: Option<String>,
+    pub migrated_at: String,
+}
+
+/// Attachment-proved scope migration (plan §7.5, governing §7.2): relpath
+/// moves and recorded-authority changes for a published project, in one
+/// pair transaction that rewrites the catalog scope, revalidates and
+/// relocates the active attachments, appends the host-local path bindings,
+/// and inserts the path-free migration record with its matching proof.
+/// `dry_run` validates the complete mutation against snapshot clones and
+/// commits nothing.
+pub fn scope_migrate_attached(
+    store: &ProjectCatalogStore,
+    expected_epoch: u64,
+    request: &ScopeMigrationRequest,
+    dry_run: bool,
+) -> AdminResult<Option<ScopeTransitionReceipt>> {
+    let new_epoch = expected_epoch.checked_add(1).ok_or_else(|| {
+        admin_error(
+            "error.project_catalog_admin_epoch_overflow",
+            "catalog epoch cannot be incremented",
+        )
+    })?;
+    let migration_id = bbox_corpus_core::project_catalog::ScopeMigrationId::mint();
+    if dry_run {
+        let state = store.snapshot()?;
+        if state.epoch() != expected_epoch {
+            return Err(admin_error(
+                "error.project_catalog_stale_epoch",
+                "expected epoch does not match the current catalog epoch",
+            ));
+        }
+        let mut catalog = (**state.catalog()).clone();
+        let mut attachments = (**state.attachments()).clone();
+        apply_scope_migration(
+            &mut catalog,
+            &mut attachments,
+            request,
+            &migration_id,
+            new_epoch,
+        )?;
+        return Ok(None);
+    }
+    let receipt_id = migration_id.clone();
+    let request = request.clone();
+    let commit = store.transact(expected_epoch, move |catalog, attachments| {
+        apply_scope_migration(catalog, attachments, &request, &receipt_id, new_epoch)
+    })?;
+    Ok(Some(ScopeTransitionReceipt {
+        scope_migration_id: migration_id,
+        commit,
+    }))
+}
+
+fn apply_scope_migration(
+    catalog: &mut bbox_corpus_core::project_catalog::CatalogSnapshotV2,
+    attachments: &mut bbox_corpus_core::project_catalog::AttachmentSnapshotV1,
+    request: &ScopeMigrationRequest,
+    migration_id: &bbox_corpus_core::project_catalog::ScopeMigrationId,
+    new_epoch: u64,
+) -> AdminResult<()> {
+    use bbox_corpus_core::project_catalog::{
+        LegacyPathBindingId, LegacyPathBindingStatus, LegacyPathLedgerEntry,
+        LegacyPathRelationship, RecordedRepoAuthority, RepoHistoryAuthority,
+        ScopeMigrationAttachmentProof, ScopeMigrationAuthorityProvenance, ScopeMigrationKind,
+        ScopeMigrationRecord,
+    };
+
+    let Some(project) = catalog.projects.get(&request.project_id) else {
+        return Err(admin_error(
+            "error.project_catalog_admin_unknown_project",
+            format!("project {} is not in the catalog", request.project_id),
+        ));
+    };
+    let ProjectScope::Published(current) = &project.scope else {
+        return Err(admin_error(
+            "error.project_catalog_admin_not_published",
+            "scope migration applies only to a published project; promotion is \
+             the legacy-local surface",
+        ));
+    };
+    if current != &request.expected_old_scope {
+        return Err(admin_error(
+            "error.project_catalog_admin_scope_mismatch",
+            "the project no longer carries the expected old scope",
+        ));
+    }
+    match request.kind {
+        ScopeMigrationKind::RelpathMove => {
+            if request.new_scope.repo_id() != current.repo_id()
+                || request.new_scope.bbox_root_relpath() == current.bbox_root_relpath()
+            {
+                return Err(admin_error(
+                    "error.project_catalog_admin_migration_shape",
+                    "a relpath move keeps the repository and changes the relpath",
+                ));
+            }
+        }
+        ScopeMigrationKind::RepoAuthorityChange => {
+            if request.new_scope.repo_id() == current.repo_id()
+                || request.new_scope.bbox_root_relpath() != current.bbox_root_relpath()
+            {
+                return Err(admin_error(
+                    "error.project_catalog_admin_migration_shape",
+                    "an authority change keeps the relpath and changes the repository",
+                ));
+            }
+            if !request.acknowledge_repo_authority_change {
+                return Err(admin_error(
+                    "error.project_catalog_admin_acknowledgement_required",
+                    "a recorded-authority change requires the explicit operator \
+                     acknowledgement flag",
+                ));
+            }
+        }
+        ScopeMigrationKind::Promotion => {
+            return Err(admin_error(
+                "error.project_catalog_admin_migration_shape",
+                "promotion has its own surface; scope migration accepts relpath \
+                 moves and recorded-authority changes",
+            ));
+        }
+    }
+    if catalog.projects.values().any(|other| {
+        other.project_id != request.project_id
+            && matches!(&other.scope, ProjectScope::Published(s) if s == &request.new_scope)
+    }) {
+        return Err(admin_error(
+            "error.project_catalog_admin_scope_owned",
+            "the target scope is already owned; use the offline survivor workflow",
+        ));
+    }
+
+    let active_ids: Vec<AttachmentId> = attachments
+        .attachments
+        .values()
+        .filter(|row| {
+            row.status == AttachmentStatus::Attached && row.project_id == request.project_id
+        })
+        .map(|row| row.attachment_id.clone())
+        .collect();
+    if !active_ids.contains(&request.designated_attachment) {
+        return Err(admin_error(
+            "error.project_catalog_admin_unknown_attachment",
+            "the designated attachment is not an active attachment of this project",
+        ));
+    }
+    for id in &active_ids {
+        match request.attachment_probes.get(id) {
+            Some(probe) if probe.resolved_scope.as_ref() == Some(&request.new_scope) => {}
+            _ => {
+                return Err(admin_error(
+                    "error.project_catalog_admin_migration_ambiguous",
+                    format!(
+                        "attachment {id} does not prove the new scope; detach or \
+                         repair it first"
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Repo-history transition: a relpath move keeps the record untouched;
+    // an authority change re-records authority while preserving the
+    // established primary namespace and every compatibility namespace
+    // (identity stability is the invariant; the migration record itself is
+    // the durable note of the former authority).
+    if request.kind == ScopeMigrationKind::RepoAuthorityChange
+        && let Some(history_id) = catalog
+            .projects
+            .get(&request.project_id)
+            .and_then(|p| p.repo_history.clone())
+    {
+        let authority = RecordedRepoAuthority::parse(request.new_scope.repo_id())
+            .map_err(|error| admin_error(error.code(), error.to_string()))?;
+        if let Some(record) = catalog.repo_histories.get_mut(&history_id) {
+            record.authority = RepoHistoryAuthority::Recorded(authority);
+        }
+    }
+
+    let project = catalog
+        .projects
+        .get_mut(&request.project_id)
+        .expect("checked above");
+    project.scope = ProjectScope::Published(request.new_scope.clone());
+
+    let mut designated_checkout_id = String::new();
+    for id in &active_ids {
+        let row = attachments
+            .attachments
+            .get_mut(id)
+            .expect("active id enumerated above");
+        let probe = request
+            .attachment_probes
+            .get(id)
+            .expect("probe presence checked above");
+        let historical_path = row.checkout_project_dir.clone();
+        row.validated_scope = Some(request.new_scope.clone());
+        row.project_root_relpath = probe.new_project_root_relpath.clone();
+        row.checkout_project_dir = probe.new_checkout_project_dir.clone();
+        if id == &request.designated_attachment {
+            designated_checkout_id = row.checkout_id.clone();
+        }
+        if historical_path != probe.new_checkout_project_dir {
+            // Append-only host-local binding so path-only legacy rows keep
+            // resolving after relocation (plan §8.4).
+            let binding_id = LegacyPathBindingId::mint();
+            attachments.legacy_path_bindings.insert(
+                binding_id.clone(),
+                LegacyPathLedgerEntry {
+                    legacy_path_binding_id: binding_id,
+                    historical_path,
+                    source_store: "attachment-relocation".into(),
+                    source_row_id: id.as_str().to_string(),
+                    inventory_epoch: new_epoch,
+                    status: LegacyPathBindingStatus::Mapped {
+                        project_id: request.project_id.clone(),
+                        relationship: LegacyPathRelationship::Root,
+                    },
+                },
+            );
+        }
+    }
+
+    catalog.scope_migrations.insert(
+        migration_id.clone(),
+        ScopeMigrationRecord {
+            scope_migration_id: migration_id.clone(),
+            project_id: request.project_id.clone(),
+            catalog_epoch: new_epoch,
+            authority_provenance: ScopeMigrationAuthorityProvenance::AttachmentProved,
+            operator_invocation: request.operator_invocation.clone(),
+            operator_reason: request.operator_reason.clone(),
+            old_scope: ProjectScope::Published(request.expected_old_scope.clone()),
+            new_scope: ProjectScope::Published(request.new_scope.clone()),
+            kind: request.kind.clone(),
+            migrated_at: request.migrated_at.clone(),
+            code_bridge_generation: request.code_bridge_generation.clone(),
+            publication_bridge_generation: request.publication_bridge_generation.clone(),
+            pending_capabilities: Default::default(),
+        },
+    );
+    attachments.scope_migration_proofs.insert(
+        migration_id.clone(),
+        ScopeMigrationAttachmentProof {
+            scope_migration_id: migration_id.clone(),
+            attachment_id: request.designated_attachment.clone(),
+            checkout_id: designated_checkout_id,
+            old_scope: ProjectScope::Published(request.expected_old_scope.clone()),
+            new_scope: ProjectScope::Published(request.new_scope.clone()),
+            proved_at: request.migrated_at.clone(),
+        },
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -803,6 +1086,220 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code(), "error.project_catalog_admin_scope_owned");
+    }
+
+    #[test]
+    fn relpath_move_relocates_attachments_and_appends_bindings() {
+        use bbox_corpus_core::project_catalog::ScopeMigrationKind;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("checkout/apps/web")).unwrap();
+        let store = store_with_projects(&root);
+        let project_id = ProjectId::parse(PROJECT).unwrap();
+
+        // Promote first so the project is published at relpath ".".
+        let receipt = attach_checkout(
+            &store,
+            current_epoch(&store),
+            &project_id,
+            &probe(&root.join("checkout")),
+        )
+        .unwrap();
+        let old_scope = PublishedScope::try_new("movefamily", ".").unwrap();
+        let evidence = PromotionEvidence {
+            attachment_scopes: [(receipt.attachment_id.clone(), Some(old_scope.clone()))]
+                .into_iter()
+                .collect(),
+            code_bridge_generation: None,
+            publication_bridge_generation: None,
+            operator_invocation: "test:promote".into(),
+            operator_reason: None,
+            proved_at: "2026-07-24T00:00:03Z".into(),
+        };
+        promote_project(
+            &store,
+            current_epoch(&store),
+            &project_id,
+            &receipt.attachment_id,
+            &old_scope,
+            &evidence,
+        )
+        .unwrap();
+
+        let new_scope = PublishedScope::try_new("movefamily", "apps/web").unwrap();
+        let new_dir = root.join("checkout/apps/web");
+        let request = ScopeMigrationRequest {
+            project_id: project_id.clone(),
+            expected_old_scope: old_scope.clone(),
+            new_scope: new_scope.clone(),
+            kind: ScopeMigrationKind::RelpathMove,
+            designated_attachment: receipt.attachment_id.clone(),
+            acknowledge_repo_authority_change: false,
+            attachment_probes: [(
+                receipt.attachment_id.clone(),
+                MigrationAttachmentProbe {
+                    resolved_scope: Some(new_scope.clone()),
+                    new_project_root_relpath: "apps/web".into(),
+                    new_checkout_project_dir: new_dir.to_str().unwrap().into(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            code_bridge_generation: None,
+            publication_bridge_generation: None,
+            operator_invocation: "test:migrate".into(),
+            operator_reason: None,
+            migrated_at: "2026-07-24T00:00:05Z".into(),
+        };
+
+        // Dry run validates and commits nothing.
+        let epoch_before = current_epoch(&store);
+        let dry = scope_migrate_attached(&store, epoch_before, &request, true).unwrap();
+        assert!(dry.is_none());
+        assert_eq!(current_epoch(&store), epoch_before);
+
+        let receipt2 = scope_migrate_attached(&store, epoch_before, &request, false)
+            .unwrap()
+            .expect("live run returns a receipt");
+        let state = store.snapshot().unwrap();
+        let project = state.catalog().projects.get(&project_id).unwrap();
+        assert_eq!(project.scope, ProjectScope::Published(new_scope.clone()));
+        let row = state
+            .attachments()
+            .attachments
+            .get(&receipt.attachment_id)
+            .unwrap();
+        assert_eq!(row.project_root_relpath, "apps/web");
+        assert_eq!(row.validated_scope.as_ref(), Some(&new_scope));
+        assert_eq!(
+            state.attachments().legacy_path_bindings.len(),
+            1,
+            "relocation appends exactly one historical binding"
+        );
+        let binding = state
+            .attachments()
+            .legacy_path_bindings
+            .values()
+            .next()
+            .unwrap();
+        assert_eq!(
+            binding.historical_path,
+            root.join("checkout").to_str().unwrap()
+        );
+        assert!(
+            state
+                .catalog()
+                .scope_migrations
+                .contains_key(&receipt2.scope_migration_id)
+        );
+        assert!(
+            state
+                .attachments()
+                .scope_migration_proofs
+                .contains_key(&receipt2.scope_migration_id)
+        );
+    }
+
+    #[test]
+    fn authority_change_requires_acknowledgement_and_shape_gates_hold() {
+        use bbox_corpus_core::project_catalog::ScopeMigrationKind;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("checkout")).unwrap();
+        let store = store_with_projects(&root);
+        let project_id = ProjectId::parse(PROJECT).unwrap();
+        let receipt = attach_checkout(
+            &store,
+            current_epoch(&store),
+            &project_id,
+            &probe(&root.join("checkout")),
+        )
+        .unwrap();
+        let old_scope = PublishedScope::try_new("authfamilyone", ".").unwrap();
+        let evidence = PromotionEvidence {
+            attachment_scopes: [(receipt.attachment_id.clone(), Some(old_scope.clone()))]
+                .into_iter()
+                .collect(),
+            code_bridge_generation: None,
+            publication_bridge_generation: None,
+            operator_invocation: "test:promote".into(),
+            operator_reason: None,
+            proved_at: "2026-07-24T00:00:03Z".into(),
+        };
+        promote_project(
+            &store,
+            current_epoch(&store),
+            &project_id,
+            &receipt.attachment_id,
+            &old_scope,
+            &evidence,
+        )
+        .unwrap();
+
+        let new_scope = PublishedScope::try_new("authfamilytwo", ".").unwrap();
+        let mut request = ScopeMigrationRequest {
+            project_id: project_id.clone(),
+            expected_old_scope: old_scope.clone(),
+            new_scope: new_scope.clone(),
+            kind: ScopeMigrationKind::RepoAuthorityChange,
+            designated_attachment: receipt.attachment_id.clone(),
+            acknowledge_repo_authority_change: false,
+            attachment_probes: [(
+                receipt.attachment_id.clone(),
+                MigrationAttachmentProbe {
+                    resolved_scope: Some(new_scope.clone()),
+                    new_project_root_relpath: ".".into(),
+                    new_checkout_project_dir: root.join("checkout").to_str().unwrap().into(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            code_bridge_generation: None,
+            publication_bridge_generation: None,
+            operator_invocation: "test:migrate".into(),
+            operator_reason: None,
+            migrated_at: "2026-07-24T00:00:06Z".into(),
+        };
+
+        // Missing acknowledgement refuses (operator authority, D-004).
+        let error =
+            scope_migrate_attached(&store, current_epoch(&store), &request, false).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_admin_acknowledgement_required"
+        );
+
+        // Wrong shape refuses: an authority change may not change relpath.
+        request.acknowledge_repo_authority_change = true;
+        let mut wrong = request.clone();
+        wrong.new_scope = PublishedScope::try_new("authfamilytwo", "sub").unwrap();
+        let error =
+            scope_migrate_attached(&store, current_epoch(&store), &wrong, false).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_admin_migration_shape");
+
+        // The acknowledged, well-shaped change lands and preserves the
+        // established primary namespace while re-recording authority.
+        scope_migrate_attached(&store, current_epoch(&store), &request, false)
+            .unwrap()
+            .unwrap();
+        let state = store.snapshot().unwrap();
+        let project = state.catalog().projects.get(&project_id).unwrap();
+        assert_eq!(project.scope, ProjectScope::Published(new_scope));
+        let history = state
+            .catalog()
+            .repo_histories
+            .get(project.repo_history.as_ref().unwrap())
+            .unwrap();
+        assert_eq!(
+            history.primary_namespace.as_str(),
+            "authfamilyone",
+            "the established primary namespace never changes"
+        );
+        use bbox_corpus_core::project_catalog::RepoHistoryAuthority;
+        assert!(matches!(
+            &history.authority,
+            RepoHistoryAuthority::Recorded(a) if a.as_str() == "authfamilytwo"
+        ));
     }
 
     #[test]
