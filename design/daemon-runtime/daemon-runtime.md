@@ -28,3 +28,4 @@ all of that work.
 - [Durable corpus project catalog implementation plan](durable-project-catalog-impl.md)
 - [Durable project catalog Phase 1 implementation plan](durable-project-catalog-phase1-impl.md)
 - [Durable project catalog Phase 2 implementation plan](durable-project-catalog-phase2-impl.md)
+- [Durable project catalog Phase 3 implementation plan](durable-project-catalog-phase3-impl.md)

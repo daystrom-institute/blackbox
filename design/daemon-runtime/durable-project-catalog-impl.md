@@ -240,11 +240,14 @@ in the marker and journal, avoiding a hash cycle through the catalog
 post-image. Marker loss is therefore distinguishable from a store that was
 born at v2.
 
-Phase 1 migration writes history and ambiguous-namespace materialization as
-typed `NotBuilt`; it does not read commit-document bodies or create history
-generations. Phase 3's pre-replacement materializer is the sole owner that
-creates immutable history/quarantine generations and advances those catalog
-fields to `Ready` through the regular catalog transaction. A fresh v2 history
+The `materialization` fields ship with Phase 3, serde-defaulted to `NotBuilt`
+for catalog bytes written before them; from Phase 3 onward the v1 importer
+writes both forms explicitly as typed `NotBuilt` (reconciliation recorded in
+the Phase 3 plan, section 4.1). Phase 1 does not read commit-document bodies
+or create history generations. Phase 3's pre-replacement materializer owns
+the single creation path that creates immutable history/quarantine
+generations and advances those catalog fields to `Ready` through the regular
+catalog transaction; the Phase 3 live history refresh reuses that same path. A fresh v2 history
 may remain `NotBuilt` until its first successful build. At the Phase 6 cut,
 however, startup refuses when the migration inventory proved materialized
 legacy commit documents for a catalog or ambiguous namespace whose field is
@@ -1309,10 +1312,12 @@ history build references the repo-history generation. Vector tombstoning is
 driven by the repo-history generation, never by one project's code selector.
 
 Phase 3's pre-replacement history materializer, reused by the Phase 6
-path-free-rebuild subcommand, is the sole creation owner for
-`RepoHistoryGeneration` and `RepoHistoryQuarantineGeneration`. Phase 1 import
-only records namespace ownership/ambiguity and the complete legacy index
-inventory needed to prove what the later materializer must find.
+path-free-rebuild subcommand and by the Phase 3 live history refresh, owns
+the single creation path for `RepoHistoryGeneration` and
+`RepoHistoryQuarantineGeneration`; no other code constructs those
+generations. Phase 1 import only records namespace ownership/ambiguity and
+the complete legacy index inventory needed to prove what the later
+materializer must find.
 
 Every history generation is a complete, self-contained snapshot, never a
 cursor delta. It stores the exact commit documents and vector inputs for its

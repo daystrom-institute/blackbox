@@ -242,12 +242,15 @@ Non-Git `LegacyLocal` projects create no commit history.
 `RepoHistoryRecord.materialization` is exactly `NotBuilt` or
 `Ready { generation_id: RepoHistoryGenerationId }`.
 `AmbiguousNamespaceRecord.materialization` is exactly `NotBuilt` or
-`Ready { generation_id: RepoHistoryQuarantineGenerationId }`. Phase 1
-migration post-images always write both forms as `NotBuilt`: the importer
-inventories namespace ownership and complete commit/vector commitments but
-does not copy commit-document bodies or create history assets. Phase 3 is the
-sole creation owner and advances these fields through the regular catalog
-transaction only after strict generation verification.
+`Ready { generation_id: RepoHistoryQuarantineGenerationId }`. As built,
+Phase 1 shipped both records without the `materialization` field; the field
+lands in Phase 3 with a serde default of `NotBuilt`, and the importer emits
+it explicitly from that point (reconciliation: Phase 3 plan section 4.1).
+The importer inventories namespace ownership and complete commit/vector
+commitments but does not copy commit-document bodies or create history
+assets. Phase 3 owns the single creation path and advances these fields
+through the regular catalog transaction only after strict generation
+verification.
 
 `ScopeMigrationRecord` is the path-free logical audit and compatibility bridge
 defined by governing section 7.2. It lives inside the catalog snapshot, keyed
