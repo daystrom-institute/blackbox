@@ -874,104 +874,13 @@ pub fn catalog_add(
     operator_aliases: &[String],
     created_at: &str,
 ) -> AdminResult<(ProjectId, ProjectCatalogCommit)> {
-    use bbox_corpus_core::project_catalog::{
-        CommitNamespace, CorpusProject, RecordedRepoAuthority, RepoHistoryAuthority, RepoHistoryId,
-        RepoHistoryRecord,
-    };
-
     let kind = kind.clone();
     let display_name = display_name.to_string();
     let aliases: Vec<String> = operator_aliases.to_vec();
     let created_at = created_at.to_string();
     let minted = std::sync::Mutex::new(None::<ProjectId>);
     let commit = store.transact(expected_epoch, |catalog, _attachments| {
-        let project_id = ProjectId::mint(catalog)
-            .map_err(|error| admin_error(error.code(), error.to_string()))?;
-        if let CatalogAddKind::Published(scope) = &kind
-            && catalog
-                .projects
-                .values()
-                .any(|p| matches!(&p.scope, ProjectScope::Published(s) if s == scope))
-        {
-            return Err(admin_error(
-                "error.project_catalog_admin_scope_owned",
-                "the scope is already owned by a catalog project",
-            ));
-        }
-        for alias in &aliases {
-            let taken = catalog.projects.values().any(|p| {
-                p.operator_aliases.contains(alias) || p.project_id.as_str() == alias
-            });
-            if taken {
-                return Err(admin_error(
-                    "error.project_catalog_admin_alias_conflict",
-                    format!("alias {alias} collides with an id or accepted alias"),
-                ));
-            }
-        }
-        let (scope, repo_history) = match &kind {
-            CatalogAddKind::LegacyLocal => {
-                // A legacy-local record gets a server-minted local history
-                // with an independent random namespace (governing §5.1).
-                let history_id = RepoHistoryId::mint();
-                let namespace = CommitNamespace::mint_local(catalog)
-                    .map_err(|error| admin_error(error.code(), error.to_string()))?;
-                catalog.repo_histories.insert(
-                    history_id.clone(),
-                    RepoHistoryRecord {
-                        repo_history_id: history_id.clone(),
-                        authority: RepoHistoryAuthority::LocalProject(project_id.clone()),
-                        primary_namespace: namespace,
-                        compatibility_namespaces: Default::default(),
-                    },
-                );
-                (ProjectScope::LegacyLocal, Some(history_id))
-            }
-            CatalogAddKind::Published(scope) => {
-                let authority = RecordedRepoAuthority::parse(scope.repo_id())
-                    .map_err(|error| admin_error(error.code(), error.to_string()))?;
-                let existing = catalog
-                    .repo_histories
-                    .iter()
-                    .find(|(_, record)| {
-                        matches!(&record.authority, RepoHistoryAuthority::Recorded(a) if a.as_str() == scope.repo_id())
-                    })
-                    .map(|(id, _)| id.clone());
-                let history_id = match existing {
-                    Some(id) => id,
-                    None => {
-                        let id = RepoHistoryId::mint();
-                        let primary = CommitNamespace::parse(scope.repo_id())
-                            .map_err(|error| admin_error(error.code(), error.to_string()))?;
-                        catalog.repo_histories.insert(
-                            id.clone(),
-                            RepoHistoryRecord {
-                                repo_history_id: id.clone(),
-                                authority: RepoHistoryAuthority::Recorded(authority),
-                                primary_namespace: primary,
-                                compatibility_namespaces: Default::default(),
-                            },
-                        );
-                        id
-                    }
-                };
-                (ProjectScope::Published(scope.clone()), Some(history_id))
-            }
-        };
-        catalog.projects.insert(
-            project_id.clone(),
-            CorpusProject {
-                project_id: project_id.clone(),
-                scope,
-                operator_aliases: aliases.iter().cloned().collect(),
-                nominated_aliases: Default::default(),
-                display_name: display_name.clone(),
-                created_at: created_at.clone(),
-                registered_at_compat: None,
-                repo_history,
-                languages: Default::default(),
-            },
-        );
+        let project_id = insert_new_project(catalog, &kind, &display_name, &aliases, &created_at)?;
         *minted.lock().unwrap() = Some(project_id);
         Ok(())
     })?;
@@ -980,6 +889,440 @@ pub fn catalog_add(
         .unwrap()
         .expect("committed transaction minted an id");
     Ok((project_id, commit))
+}
+
+/// Insert one new catalog project with its repo-history record: the shared
+/// creation body of [`catalog_add`] and [`register_composite`]. Enforces
+/// scope ownership and alias uniqueness before minting.
+fn insert_new_project(
+    catalog: &mut bbox_corpus_core::project_catalog::CatalogSnapshotV2,
+    kind: &CatalogAddKind,
+    display_name: &str,
+    aliases: &[String],
+    created_at: &str,
+) -> AdminResult<ProjectId> {
+    use bbox_corpus_core::project_catalog::{
+        CommitNamespace, CorpusProject, RecordedRepoAuthority, RepoHistoryAuthority, RepoHistoryId,
+        RepoHistoryRecord,
+    };
+
+    let project_id =
+        ProjectId::mint(catalog).map_err(|error| admin_error(error.code(), error.to_string()))?;
+    if let CatalogAddKind::Published(scope) = kind
+        && catalog
+            .projects
+            .values()
+            .any(|p| matches!(&p.scope, ProjectScope::Published(s) if s == scope))
+    {
+        return Err(admin_error(
+            "error.project_catalog_admin_scope_owned",
+            "the scope is already owned by a catalog project",
+        ));
+    }
+    for alias in aliases {
+        let taken = catalog
+            .projects
+            .values()
+            .any(|p| p.operator_aliases.contains(alias) || p.project_id.as_str() == alias);
+        if taken {
+            return Err(admin_error(
+                "error.project_catalog_admin_alias_conflict",
+                format!("alias {alias} collides with an id or accepted alias"),
+            ));
+        }
+    }
+    let (scope, repo_history) = match kind {
+        CatalogAddKind::LegacyLocal => {
+            // A legacy-local record gets a server-minted local history
+            // with an independent random namespace (governing §5.1).
+            let history_id = RepoHistoryId::mint();
+            let namespace = CommitNamespace::mint_local(catalog)
+                .map_err(|error| admin_error(error.code(), error.to_string()))?;
+            catalog.repo_histories.insert(
+                history_id.clone(),
+                RepoHistoryRecord {
+                    repo_history_id: history_id.clone(),
+                    authority: RepoHistoryAuthority::LocalProject(project_id.clone()),
+                    primary_namespace: namespace,
+                    compatibility_namespaces: Default::default(),
+                },
+            );
+            (ProjectScope::LegacyLocal, Some(history_id))
+        }
+        CatalogAddKind::Published(scope) => {
+            let authority = RecordedRepoAuthority::parse(scope.repo_id())
+                .map_err(|error| admin_error(error.code(), error.to_string()))?;
+            let existing = catalog
+                .repo_histories
+                .iter()
+                .find(|(_, record)| {
+                    matches!(&record.authority, RepoHistoryAuthority::Recorded(a) if a.as_str() == scope.repo_id())
+                })
+                .map(|(id, _)| id.clone());
+            let history_id = match existing {
+                Some(id) => id,
+                None => {
+                    let id = RepoHistoryId::mint();
+                    let primary = CommitNamespace::parse(scope.repo_id())
+                        .map_err(|error| admin_error(error.code(), error.to_string()))?;
+                    catalog.repo_histories.insert(
+                        id.clone(),
+                        RepoHistoryRecord {
+                            repo_history_id: id.clone(),
+                            authority: RepoHistoryAuthority::Recorded(authority),
+                            primary_namespace: primary,
+                            compatibility_namespaces: Default::default(),
+                        },
+                    );
+                    id
+                }
+            };
+            (ProjectScope::Published(scope.clone()), Some(history_id))
+        }
+    };
+    catalog.projects.insert(
+        project_id.clone(),
+        CorpusProject {
+            project_id: project_id.clone(),
+            scope,
+            operator_aliases: aliases.iter().cloned().collect(),
+            nominated_aliases: Default::default(),
+            display_name: display_name.to_string(),
+            created_at: created_at.to_string(),
+            registered_at_compat: None,
+            repo_history,
+            languages: Default::default(),
+        },
+    );
+    Ok(project_id)
+}
+
+/// Outcome of the register compatibility composite (plan §9.1).
+#[derive(Debug, Clone)]
+pub struct RegisterCompositeReceipt {
+    pub project_id: ProjectId,
+    pub attachment_id: AttachmentId,
+    /// True when this call minted the project (`Published` on a newly
+    /// recorded scope, `LegacyLocal` otherwise).
+    pub created_project: bool,
+    /// True when the checkout was already attached (scope+attachment
+    /// idempotency); no bytes moved and `commit` is `None`.
+    pub already_attached: bool,
+    pub commit: Option<ProjectCatalogCommit>,
+}
+
+/// The `bbox_project_register` catalog composite (plan §9.1, governing
+/// §7.2): find by validated scope and active attachment, create `Published`
+/// on a newly recorded scope or `LegacyLocal` for unrecorded checkouts, and
+/// attach — all in one pair transaction. Newly committed authority on a
+/// `LegacyLocal` attachment refuses with the exact promotion handoff; an
+/// attached checkout resolving a different scope refuses with the exact
+/// scope-migration dry-run handoff. Neither refusal creates a second
+/// project. Idempotent re-registration commits nothing.
+pub fn register_composite(
+    store: &ProjectCatalogStore,
+    expected_epoch: u64,
+    probe: &AttachProbe,
+    display_name: &str,
+    created_at: &str,
+) -> AdminResult<RegisterCompositeReceipt> {
+    // Idempotency fast path against the same epoch the caller pinned: an
+    // agreeing active attachment for this (checkout, relpath) means there
+    // is nothing to write. Anything else falls through to the transaction,
+    // whose epoch CAS refuses staleness.
+    let state = store.snapshot()?;
+    if state.epoch() == expected_epoch
+        && let Some(existing) = find_active_attachment(state.attachments(), probe)
+    {
+        let owner = state
+            .catalog()
+            .projects
+            .get(&existing.project_id)
+            .cloned()
+            .ok_or_else(|| {
+                admin_error(
+                    "error.project_catalog_admin_unknown_project",
+                    "active attachment references a project absent from the catalog",
+                )
+            })?;
+        check_register_scope_agreement(&owner, probe)?;
+        return Ok(RegisterCompositeReceipt {
+            project_id: owner.project_id.clone(),
+            attachment_id: existing.attachment_id.clone(),
+            created_project: false,
+            already_attached: true,
+            commit: None,
+        });
+    }
+    drop(state);
+
+    let probe = probe.clone();
+    let display_name = display_name.to_string();
+    let created_at = created_at.to_string();
+    let minted = std::sync::Mutex::new(None::<(ProjectId, AttachmentId, bool)>);
+    let commit = store.transact(expected_epoch, |catalog, attachments| {
+        if let Some(existing) = find_active_attachment(attachments, &probe) {
+            // The fast path above covered the caller's snapshot; reaching
+            // this arm means the attachment landed concurrently. Apply the
+            // same agreement rules so the outcome is deterministic.
+            let owner = catalog.projects.get(&existing.project_id).ok_or_else(|| {
+                admin_error(
+                    "error.project_catalog_admin_unknown_project",
+                    "active attachment references a project absent from the catalog",
+                )
+            })?;
+            check_register_scope_agreement(owner, &probe)?;
+            *minted.lock().unwrap() = Some((
+                owner.project_id.clone(),
+                existing.attachment_id.clone(),
+                false,
+            ));
+            return Ok(());
+        }
+        let (project_id, created_project) = match &probe.validated_scope {
+            Some(scope) => {
+                let owner = catalog
+                    .projects
+                    .values()
+                    .find(|p| matches!(&p.scope, ProjectScope::Published(s) if s == scope))
+                    .map(|p| p.project_id.clone());
+                match owner {
+                    Some(project_id) => (project_id, false),
+                    None => (
+                        insert_new_project(
+                            catalog,
+                            &CatalogAddKind::Published(scope.clone()),
+                            &display_name,
+                            &[],
+                            &created_at,
+                        )?,
+                        true,
+                    ),
+                }
+            }
+            None => (
+                insert_new_project(
+                    catalog,
+                    &CatalogAddKind::LegacyLocal,
+                    &display_name,
+                    &[],
+                    &created_at,
+                )?,
+                true,
+            ),
+        };
+        let attachment_id = AttachmentId::mint();
+        attachments.attachments.insert(
+            attachment_id.clone(),
+            CheckoutAttachment {
+                attachment_id: attachment_id.clone(),
+                project_id: project_id.clone(),
+                checkout_id: probe.checkout_id.clone(),
+                checkout_dir: probe.checkout_dir.clone(),
+                checkout_project_dir: probe.checkout_project_dir.clone(),
+                project_root_relpath: probe.project_root_relpath.clone(),
+                kind: probe.kind.clone(),
+                validated_scope: probe.validated_scope.clone(),
+                computed_repo_hint: probe.computed_repo_hint.clone(),
+                branch_ref: probe.branch_ref.clone(),
+                capabilities: probe.capabilities.clone(),
+                status: AttachmentStatus::Attached,
+                attached_at: probe.attached_at.clone(),
+                detached_at: None,
+            },
+        );
+        *minted.lock().unwrap() = Some((project_id, attachment_id, created_project));
+        Ok(())
+    })?;
+    let (project_id, attachment_id, created_project) = minted
+        .into_inner()
+        .unwrap()
+        .expect("committed transaction recorded its outcome");
+    Ok(RegisterCompositeReceipt {
+        project_id,
+        attachment_id,
+        created_project,
+        already_attached: false,
+        commit: Some(commit),
+    })
+}
+
+/// The active attachment covering the probe's `(checkout_id, relpath)`
+/// pair, if any. Cross-project exclusivity of that pair makes the match
+/// unique.
+fn find_active_attachment<'s>(
+    attachments: &'s bbox_corpus_core::project_catalog::AttachmentSnapshotV1,
+    probe: &AttachProbe,
+) -> Option<&'s CheckoutAttachment> {
+    attachments.attachments.values().find(|row| {
+        row.status == AttachmentStatus::Attached
+            && row.checkout_id == probe.checkout_id
+            && row.project_root_relpath == probe.project_root_relpath
+    })
+}
+
+/// Register agreement between an attached checkout's current probe and its
+/// owning project: same published scope is idempotent, a different scope is
+/// the exact scope-migration handoff, newly committed authority on a
+/// `LegacyLocal` project is the exact promotion handoff, and lost authority
+/// against a `Published` project refuses.
+fn check_register_scope_agreement(
+    owner: &bbox_corpus_core::project_catalog::CorpusProject,
+    probe: &AttachProbe,
+) -> AdminResult<()> {
+    match (&owner.scope, &probe.validated_scope) {
+        (ProjectScope::Published(current), Some(probed)) if current == probed => Ok(()),
+        (ProjectScope::Published(current), Some(probed)) => Err(admin_error(
+            "error.project_catalog_scope_migration_required",
+            format!(
+                "project {} is attached here under scope {}:{} but the checkout now \
+                 resolves {}:{}; run bbox_project_scope_migrate {{ project_id: \"{}\", \
+                 dry_run: true }} first",
+                owner.project_id,
+                current.repo_id(),
+                current.bbox_root_relpath(),
+                probed.repo_id(),
+                probed.bbox_root_relpath(),
+                owner.project_id,
+            ),
+        )),
+        (ProjectScope::Published(_), None) => Err(admin_error(
+            "error.project_catalog_admin_scope_required",
+            "the checkout no longer resolves committed recorded authority for its \
+             published project",
+        )),
+        (ProjectScope::LegacyLocal, None) => Ok(()),
+        (ProjectScope::LegacyLocal, Some(probed)) => Err(admin_error(
+            "error.project_catalog_scope_promotion_required",
+            format!(
+                "project {} is legacy-local and this checkout now records committed \
+                 authority for {}:{}; run bbox_project_promote {{ project_id: \"{}\" }}",
+                owner.project_id,
+                probed.repo_id(),
+                probed.bbox_root_relpath(),
+                owner.project_id,
+            ),
+        )),
+    }
+}
+
+/// Probed facts for a same-scope attachment relocation (plan §9.1 rename):
+/// the checkout-id marker read at the NEW path (path existence and inode
+/// reuse never prove sameness), the relocated directories, and the
+/// committed scope the moved checkout resolves.
+#[derive(Debug, Clone)]
+pub struct RelocationProbe {
+    pub checkout_id: String,
+    pub new_checkout_dir: String,
+    pub new_checkout_project_dir: String,
+    pub resolved_scope: Option<PublishedScope>,
+}
+
+/// Relocate one active attachment to a moved checkout path (plan §9.1):
+/// same checkout identity, same validated scope, same relpath; one pair
+/// transaction updating the attachment path fields and appending the §8.4
+/// host-local ledger row. Relpath moves and repo rebinds refuse with the
+/// scope-migration pointer; catalog-mode rename never rewrites owner-store
+/// rows.
+pub fn relocate_attachment(
+    store: &ProjectCatalogStore,
+    expected_epoch: u64,
+    attachment_id: &AttachmentId,
+    probe: &RelocationProbe,
+) -> AdminResult<ProjectCatalogCommit> {
+    use bbox_corpus_core::project_catalog::{
+        LegacyPathBindingId, LegacyPathBindingStatus, LegacyPathLedgerEntry, LegacyPathRelationship,
+    };
+    let new_epoch = expected_epoch.checked_add(1).ok_or_else(|| {
+        admin_error(
+            "error.project_catalog_admin_epoch_overflow",
+            "catalog epoch cannot be incremented",
+        )
+    })?;
+    let attachment_id = attachment_id.clone();
+    let probe = probe.clone();
+    store.transact(expected_epoch, move |catalog, attachments| {
+        let Some(row) = attachments.attachments.get(&attachment_id) else {
+            return Err(admin_error(
+                "error.project_catalog_admin_unknown_attachment",
+                format!("attachment {attachment_id} is not in the store"),
+            ));
+        };
+        if row.status != AttachmentStatus::Attached {
+            return Err(admin_error(
+                "error.project_catalog_admin_attachment_detached",
+                "a detached attachment cannot relocate; attach the new path instead",
+            ));
+        }
+        if row.checkout_id != probe.checkout_id {
+            return Err(admin_error(
+                "error.project_catalog_admin_checkout_identity_mismatch",
+                "the moved path carries a different checkout identity; detach and \
+                 re-attach instead of renaming",
+            ));
+        }
+        let Some(owner) = catalog.projects.get(&row.project_id) else {
+            return Err(admin_error(
+                "error.project_catalog_admin_unknown_project",
+                "attachment references a project absent from the catalog",
+            ));
+        };
+        match (&owner.scope, &probe.resolved_scope) {
+            (ProjectScope::Published(current), Some(probed)) if current == probed => {}
+            (ProjectScope::LegacyLocal, None) => {}
+            _ => {
+                return Err(admin_error(
+                    "error.project_catalog_admin_scope_mismatch",
+                    "rename keeps the validated scope; a relpath move or repo rebind \
+                     goes through bbox_project_scope_migrate",
+                ));
+            }
+        }
+        let expected_project_dir = if row.project_root_relpath == "." {
+            probe.new_checkout_dir.clone()
+        } else {
+            format!("{}/{}", probe.new_checkout_dir, row.project_root_relpath)
+        };
+        if probe.new_checkout_project_dir != expected_project_dir {
+            return Err(admin_error(
+                "error.project_catalog_admin_scope_mismatch",
+                "rename keeps the project's relpath inside the checkout; a relpath \
+                 move goes through bbox_project_scope_migrate",
+            ));
+        }
+        let historical_path = row.checkout_project_dir.clone();
+        if historical_path == probe.new_checkout_project_dir {
+            return Err(admin_error(
+                "error.project_catalog_admin_relocation_noop",
+                "the attachment already records this path",
+            ));
+        }
+        let project_id = row.project_id.clone();
+        let row = attachments
+            .attachments
+            .get_mut(&attachment_id)
+            .expect("presence checked above");
+        row.checkout_dir = probe.new_checkout_dir.clone();
+        row.checkout_project_dir = probe.new_checkout_project_dir.clone();
+        // Append-only host-local binding so path-only legacy rows keep
+        // resolving after relocation (plan §8.4).
+        let binding_id = LegacyPathBindingId::mint();
+        attachments.legacy_path_bindings.insert(
+            binding_id.clone(),
+            LegacyPathLedgerEntry {
+                legacy_path_binding_id: binding_id,
+                historical_path,
+                source_store: "attachment-relocation".into(),
+                source_row_id: attachment_id.as_str().to_string(),
+                inventory_epoch: new_epoch,
+                status: LegacyPathBindingStatus::Mapped {
+                    project_id,
+                    relationship: LegacyPathRelationship::Root,
+                },
+            },
+        );
+        Ok(())
+    })
 }
 
 /// Accept or reject one nominated alias (plan §7.6, D-005): an explicit
@@ -2256,5 +2599,263 @@ mod tests {
             error.code(),
             "error.project_catalog_admin_promotion_required"
         );
+    }
+
+    #[test]
+    fn register_composite_creates_finds_and_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("checkout")).unwrap();
+        let store = store_with_projects(&root);
+
+        // Unrecorded checkout: mints a LegacyLocal project and attaches it
+        // in one commit.
+        let local_probe = probe(&root.join("checkout"));
+        let receipt = register_composite(
+            &store,
+            current_epoch(&store),
+            &local_probe,
+            "local project",
+            "2026-07-25T00:00:00Z",
+        )
+        .unwrap();
+        assert!(receipt.created_project);
+        assert!(!receipt.already_attached);
+        assert!(receipt.commit.is_some());
+        let state = store.snapshot().unwrap();
+        let created = state.catalog().projects.get(&receipt.project_id).unwrap();
+        assert_eq!(created.scope, ProjectScope::LegacyLocal);
+        assert!(created.repo_history.is_some(), "local history minted");
+        assert_eq!(
+            state
+                .attachments()
+                .attachments
+                .get(&receipt.attachment_id)
+                .unwrap()
+                .status,
+            AttachmentStatus::Attached
+        );
+
+        // Same checkout again: idempotent, no commit, same identities.
+        let epoch_before = current_epoch(&store);
+        let again = register_composite(
+            &store,
+            epoch_before,
+            &local_probe,
+            "local project",
+            "2026-07-25T00:00:01Z",
+        )
+        .unwrap();
+        assert!(again.already_attached);
+        assert!(again.commit.is_none());
+        assert_eq!(again.project_id, receipt.project_id);
+        assert_eq!(again.attachment_id, receipt.attachment_id);
+        assert_eq!(current_epoch(&store), epoch_before, "no epoch bump");
+
+        // The same checkout now recording committed authority: the exact
+        // promotion handoff naming the project, and no second project.
+        let mut promoted = local_probe.clone();
+        promoted.validated_scope = Some(PublishedScope::try_new("regfamily", ".").unwrap());
+        let error = register_composite(
+            &store,
+            current_epoch(&store),
+            &promoted,
+            "local project",
+            "2026-07-25T00:00:02Z",
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_scope_promotion_required"
+        );
+        assert!(error.to_string().contains(receipt.project_id.as_str()));
+        let count_before = store.snapshot().unwrap().catalog().projects.len();
+
+        // A fresh checkout with a newly recorded scope: mints a Published
+        // project and attaches.
+        std::fs::create_dir_all(root.join("pub")).unwrap();
+        let mut pub_probe = probe(&root.join("pub"));
+        pub_probe.checkout_id = "feed00000000000000000000000000c1".into();
+        pub_probe.validated_scope = Some(PublishedScope::try_new("regfamily", ".").unwrap());
+        let published = register_composite(
+            &store,
+            current_epoch(&store),
+            &pub_probe,
+            "published project",
+            "2026-07-25T00:00:03Z",
+        )
+        .unwrap();
+        assert!(published.created_project);
+        let state = store.snapshot().unwrap();
+        assert_eq!(
+            state.catalog().projects.len(),
+            count_before + 1,
+            "exactly one new project"
+        );
+        assert!(matches!(
+            &state
+                .catalog()
+                .projects
+                .get(&published.project_id)
+                .unwrap()
+                .scope,
+            ProjectScope::Published(s) if s.repo_id() == "regfamily"
+        ));
+
+        // A second fresh checkout proving the SAME scope finds the existing
+        // project instead of creating another.
+        std::fs::create_dir_all(root.join("pub2")).unwrap();
+        let mut second = probe(&root.join("pub2"));
+        second.checkout_id = "feed00000000000000000000000000c2".into();
+        second.validated_scope = Some(PublishedScope::try_new("regfamily", ".").unwrap());
+        let found = register_composite(
+            &store,
+            current_epoch(&store),
+            &second,
+            "published project",
+            "2026-07-25T00:00:04Z",
+        )
+        .unwrap();
+        assert!(!found.created_project);
+        assert_eq!(found.project_id, published.project_id);
+        assert_ne!(found.attachment_id, published.attachment_id);
+
+        // That attached checkout later resolving a DIFFERENT scope gets the
+        // exact scope-migration handoff and no new project.
+        let mut moved = second.clone();
+        moved.validated_scope = Some(PublishedScope::try_new("regfamily", "apps/web").unwrap());
+        let error = register_composite(
+            &store,
+            current_epoch(&store),
+            &moved,
+            "published project",
+            "2026-07-25T00:00:05Z",
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_scope_migration_required"
+        );
+        assert!(error.to_string().contains("bbox_project_scope_migrate"));
+        assert!(error.to_string().contains(published.project_id.as_str()));
+    }
+
+    #[test]
+    fn relocate_attachment_moves_paths_and_appends_ledger() {
+        use bbox_corpus_core::project_catalog::LegacyPathBindingStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("old")).unwrap();
+        let store = store_with_projects(&root);
+        let project_id = ProjectId::parse(PROJECT).unwrap();
+        let receipt = attach_checkout(
+            &store,
+            current_epoch(&store),
+            &project_id,
+            &probe(&root.join("old")),
+        )
+        .unwrap();
+        let old_dir = root.join("old").to_str().unwrap().to_string();
+        let new_dir = root.join("new").to_str().unwrap().to_string();
+
+        // Same checkout identity, same (absent) scope: the row relocates
+        // and exactly one Mapped ledger entry records the historical path.
+        relocate_attachment(
+            &store,
+            current_epoch(&store),
+            &receipt.attachment_id,
+            &RelocationProbe {
+                checkout_id: CHECKOUT.into(),
+                new_checkout_dir: new_dir.clone(),
+                new_checkout_project_dir: new_dir.clone(),
+                resolved_scope: None,
+            },
+        )
+        .unwrap();
+        let state = store.snapshot().unwrap();
+        let row = state
+            .attachments()
+            .attachments
+            .get(&receipt.attachment_id)
+            .unwrap();
+        assert_eq!(row.checkout_dir, new_dir);
+        assert_eq!(row.checkout_project_dir, new_dir);
+        let bindings: Vec<_> = state
+            .attachments()
+            .legacy_path_bindings
+            .values()
+            .filter(|entry| entry.historical_path == old_dir)
+            .collect();
+        assert_eq!(bindings.len(), 1, "exactly one historical binding");
+        assert!(matches!(
+            &bindings[0].status,
+            LegacyPathBindingStatus::Mapped { project_id: p, .. } if p == &project_id
+        ));
+
+        // A different checkout identity at the new path refuses: path
+        // existence and inode reuse never prove sameness.
+        let error = relocate_attachment(
+            &store,
+            current_epoch(&store),
+            &receipt.attachment_id,
+            &RelocationProbe {
+                checkout_id: "feed00000000000000000000000000ff".into(),
+                new_checkout_dir: root.join("other").to_str().unwrap().into(),
+                new_checkout_project_dir: root.join("other").to_str().unwrap().into(),
+                resolved_scope: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_admin_checkout_identity_mismatch"
+        );
+
+        // A resolved scope on a legacy-local project refuses toward the
+        // explicit surfaces.
+        let error = relocate_attachment(
+            &store,
+            current_epoch(&store),
+            &receipt.attachment_id,
+            &RelocationProbe {
+                checkout_id: CHECKOUT.into(),
+                new_checkout_dir: root.join("scoped").to_str().unwrap().into(),
+                new_checkout_project_dir: root.join("scoped").to_str().unwrap().into(),
+                resolved_scope: Some(PublishedScope::try_new("relofamily", ".").unwrap()),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_admin_scope_mismatch");
+
+        // A project-dir that breaks the recorded relpath refuses with the
+        // scope-migration pointer.
+        let error = relocate_attachment(
+            &store,
+            current_epoch(&store),
+            &receipt.attachment_id,
+            &RelocationProbe {
+                checkout_id: CHECKOUT.into(),
+                new_checkout_dir: root.join("moved").to_str().unwrap().into(),
+                new_checkout_project_dir: root.join("moved/sub").to_str().unwrap().into(),
+                resolved_scope: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_admin_scope_mismatch");
+
+        // Relocating to the recorded path is a typed no-op refusal.
+        let error = relocate_attachment(
+            &store,
+            current_epoch(&store),
+            &receipt.attachment_id,
+            &RelocationProbe {
+                checkout_id: CHECKOUT.into(),
+                new_checkout_dir: new_dir.clone(),
+                new_checkout_project_dir: new_dir,
+                resolved_scope: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_admin_relocation_noop");
     }
 }

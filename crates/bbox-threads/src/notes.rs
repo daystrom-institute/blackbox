@@ -124,6 +124,14 @@ pub struct NoteListParams {
     /// id, the id decides and the path predicate is not consulted.
     #[serde(default)]
     pub project_id: Option<String>,
+    /// Internal, not part of the MCP schema: historical path keys the
+    /// host-local `LegacyPathBinding` ledger maps to this query's project
+    /// (plan §8.2 catalog-mode arm), so path-only rows written before
+    /// attachment relocation stay visible. Empty on the bridge, which has no
+    /// ledger. Set by the daemon adapter, never accepted from the wire.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub project_ledger_paths: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -531,6 +539,11 @@ impl Notes {
         let query_lower = p.query.as_deref().map(|s| s.to_lowercase());
         let project_lower = p.project.as_deref().map(|s| s.to_lowercase());
         let project_id_filter = p.project_id.as_deref();
+        let ledger_lower: Vec<String> = p
+            .project_ledger_paths
+            .iter()
+            .map(|path| path.to_lowercase())
+            .collect();
 
         let mut results: Vec<&Note> = self
             .store
@@ -577,13 +590,15 @@ impl Notes {
                 }
                 // Dual-read (plan §8.2): ids on both sides decide, whatever the
                 // paths say; either side missing an id keeps the path predicate.
+                // The ledger arm is catalog-mode only and matches a path-only
+                // row still keyed under a historical path of this project.
                 if let Some(pl) = &project_lower
                     && !project_scope_matches(n.project_id.as_deref(), project_id_filter, || {
-                        n.project
-                            .as_deref()
-                            .unwrap_or("")
-                            .to_lowercase()
-                            .contains(pl)
+                        let row_project = n.project.as_deref().unwrap_or("").to_lowercase();
+                        row_project.contains(pl)
+                            || ledger_lower
+                                .iter()
+                                .any(|historical| row_project.contains(historical.as_str()))
                     })
                 {
                     return false;
@@ -773,6 +788,7 @@ mod tests {
                 kind: None,
                 project: None,
                 project_id: None,
+                project_ledger_paths: Vec::new(),
                 session_id: None,
                 task_id: None,
                 thread_id: None,
@@ -815,6 +831,7 @@ mod tests {
                 kind: Some("dispute".into()),
                 project: None,
                 project_id: None,
+                project_ledger_paths: Vec::new(),
                 session_id: None,
                 task_id: None,
                 thread_id: None,
@@ -879,6 +896,7 @@ mod tests {
                 kind: None,
                 project: None,
                 project_id: None,
+                project_ledger_paths: Vec::new(),
                 session_id: None,
                 task_id: None,
                 thread_id: None,
@@ -901,6 +919,7 @@ mod tests {
                 kind: None,
                 project: None,
                 project_id: None,
+                project_ledger_paths: Vec::new(),
                 session_id: None,
                 task_id: None,
                 thread_id: None,
@@ -921,6 +940,7 @@ mod tests {
                 kind: None,
                 project: None,
                 project_id: None,
+                project_ledger_paths: Vec::new(),
                 session_id: None,
                 task_id: None,
                 thread_id: None,
@@ -1017,6 +1037,7 @@ mod tests {
                 kind: None,
                 project: None,
                 project_id: None,
+                project_ledger_paths: Vec::new(),
                 session_id: None,
                 task_id: None,
                 thread_id: None,
@@ -1047,6 +1068,7 @@ mod tests {
                 kind: None,
                 project: None,
                 project_id: None,
+                project_ledger_paths: Vec::new(),
                 session_id: None,
                 task_id: None,
                 thread_id: None,
@@ -1070,6 +1092,7 @@ mod tests {
                 kind: None,
                 project: None,
                 project_id: None,
+                project_ledger_paths: Vec::new(),
                 session_id: None,
                 task_id: None,
                 thread_id: None,
@@ -1352,6 +1375,7 @@ mod tests {
                 kind: None,
                 project: None,
                 project_id: None,
+                project_ledger_paths: Vec::new(),
                 session_id: None,
                 task_id: None,
                 thread_id: None,
@@ -1391,6 +1415,7 @@ mod tests {
                 kind: None,
                 project: None,
                 project_id: None,
+                project_ledger_paths: Vec::new(),
                 session_id: None,
                 task_id: None,
                 thread_id: None,
@@ -1412,6 +1437,7 @@ mod tests {
                 kind: None,
                 project: None,
                 project_id: None,
+                project_ledger_paths: Vec::new(),
                 session_id: None,
                 task_id: None,
                 thread_id: None,
@@ -1579,6 +1605,43 @@ mod tests {
         assert!(
             !out.contains("note-cccccccc"),
             "id mismatch must hide: {out}"
+        );
+    }
+
+    #[test]
+    fn note_ledger_paths_match_a_path_only_row_under_a_historical_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut notes = Notes::open(&dir.path().join("notes.json")).unwrap();
+        notes
+            .store
+            .notes
+            .push(dual_read_note("note-dddddddd", "/repo/old", None));
+
+        // Catalog-mode ledger arm: the relocated project queries by its
+        // current key, and the ledger's historical key still reaches the row.
+        let hit = notes
+            .list(&NoteListParams {
+                project: Some("/repo/relocated".into()),
+                project_ledger_paths: vec!["/repo/old".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            hit.contains("note-dddddddd"),
+            "ledger arm must match: {hit}"
+        );
+
+        // Bridge mode carries no ledger paths, so the historical row stays
+        // invisible to the relocated key.
+        let miss = notes
+            .list(&NoteListParams {
+                project: Some("/repo/relocated".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            !miss.contains("note-dddddddd"),
+            "no ledger path must not match: {miss}"
         );
     }
 }

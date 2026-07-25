@@ -175,30 +175,52 @@ pub struct SessionsListParams {
     pub limit: Option<u64>,
 }
 
-impl TranscriptIndex {
-    /// Resolve a project FILTER value to the base project_id stamped on
-    /// transcript/tool_call docs at ingest (gap-72fd5932). Accepts a
-    /// project_id, a registered alias, or any path inside a registered
-    /// checkout/worktree. `None` when no registered project matches —
-    /// callers keep the literal substring lane.
-    pub fn base_project_filter_id(&self, raw: &str) -> Option<String> {
-        let records =
-            bbox_corpus_core::project_record::load_project_records(&self.config.projects_path)
-                .ok()?;
-        if let Some(record) = records
-            .iter()
-            .find(|record| record.project_id == raw || record.canonical_path == raw)
-        {
-            return Some(record.project_id.clone());
-        }
-        let mut aliased = records.iter().filter(|record| record.aliases.contains(raw));
-        if let Some(record) = aliased.next() {
-            // Ambiguous alias claims fail closed to the substring lane.
-            return aliased.next().is_none().then(|| record.project_id.clone());
-        }
-        None
-    }
+/// Pre-resolved project FILTER value for the corpus-search surfaces.
+///
+/// Selector resolution lives above this crate: the index engine never
+/// reads project records off disk to interpret a filter, and the
+/// dependency direction forbids calling the resolver engine from here.
+/// Daemon surfaces resolve once at the tool boundary and thread the
+/// result down; index-side callers with no resolver construct the
+/// unresolved form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectFilterInput {
+    /// Base project id term lane over the `base_project_id` stamp
+    /// (gap-72fd5932). `None` when the selector resolved to no registered
+    /// project; an unresolved selector must never manufacture an id.
+    pub project_id: Option<String>,
+    /// Literal substring lane over the `project` field, verbatim as the
+    /// caller supplied it. Never dropped: unregistered projects and ad hoc
+    /// path filters have nothing else.
+    pub literal: String,
+}
 
+impl ProjectFilterInput {
+    /// Filter with the substring lane only, for callers that cannot reach a
+    /// resolver (index-side probes and tests). Identical in effect to a
+    /// daemon filter whose selector resolved to nothing.
+    pub fn unresolved(literal: impl Into<String>) -> Self {
+        Self {
+            project_id: None,
+            literal: literal.into(),
+        }
+    }
+}
+
+/// A supplied pre-resolved filter wins; a caller that supplies none keeps
+/// the raw selector's literal substring semantics. The term lane fires
+/// only for a caller-resolved id.
+fn effective_project_filter(
+    supplied: Option<&ProjectFilterInput>,
+    raw: Option<&str>,
+) -> Option<ProjectFilterInput> {
+    match supplied {
+        Some(filter) => Some(filter.clone()),
+        None => raw.map(ProjectFilterInput::unresolved),
+    }
+}
+
+impl TranscriptIndex {
     fn session_ids_for_base_project(&self, project_id: &str) -> Result<HashSet<String>> {
         let searcher = self.reader.searcher();
         let query = TermQuery::new(
@@ -228,23 +250,25 @@ impl TranscriptIndex {
     /// Project filter as an OR of the legacy substring lane (literal cwd in
     /// the `project` field) and an exact term on the stamped
     /// `base_project_id`, so a base-project selector matches sessions from
-    /// every checkout/worktree (gap-72fd5932).
+    /// every checkout/worktree (gap-72fd5932). Both lanes come from the
+    /// caller-supplied filter: the id lane is present only when the caller
+    /// resolved one.
     fn push_project_filter_clause(
         &self,
         clauses: &mut Vec<(Occur, Box<dyn tantivy::query::Query>)>,
-        project: &str,
+        filter: &ProjectFilterInput,
     ) {
         let mut lanes: Vec<(Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
         let mut pqp = QueryParser::for_index(&self.index, vec![self.fields.project]);
         pqp.set_conjunction_by_default();
-        if let Ok(pq) = pqp.parse_query(project) {
+        if let Ok(pq) = pqp.parse_query(&filter.literal) {
             lanes.push((Occur::Should, pq));
         }
-        if let Some(base_id) = self.base_project_filter_id(project) {
+        if let Some(base_id) = filter.project_id.as_deref() {
             lanes.push((
                 Occur::Should,
                 Box::new(TermQuery::new(
-                    Term::from_field_text(self.fields.base_project_id, &base_id),
+                    Term::from_field_text(self.fields.base_project_id, base_id),
                     IndexRecordOption::Basic,
                 )),
             ));
@@ -270,12 +294,28 @@ impl TranscriptIndex {
         self.search_with_active_selectors_and_searcher(p, active_selectors, &searcher)
     }
 
+    /// Literal-lane entry point for callers with no project resolver
+    /// (index-side probes and tests). Daemon surfaces resolve the raw
+    /// `project` selector first and call
+    /// [`Self::search_with_project_filter`]: the `base_project_id` term
+    /// lane only fires for a caller-resolved id.
     pub fn search_with_active_selectors_and_searcher(
         &self,
         p: &SearchParams,
         active_selectors: &BTreeMap<String, String>,
         searcher: &tantivy::Searcher,
     ) -> Result<String> {
+        self.search_with_project_filter(p, None, active_selectors, searcher)
+    }
+
+    pub fn search_with_project_filter(
+        &self,
+        p: &SearchParams,
+        project_filter: Option<&ProjectFilterInput>,
+        active_selectors: &BTreeMap<String, String>,
+        searcher: &tantivy::Searcher,
+    ) -> Result<String> {
+        let project_filter = effective_project_filter(project_filter, p.project.as_deref());
         let raw_query = p.query.as_str();
         let mode = TranscriptSearchMode::parse_optional(p.mode.as_deref())?;
         let query_str = match mode {
@@ -343,8 +383,8 @@ impl TranscriptIndex {
             ));
         }
 
-        if let Some(project) = p.project.as_deref() {
-            self.push_project_filter_clause(&mut clauses, project);
+        if let Some(filter) = project_filter.as_ref() {
+            self.push_project_filter_clause(&mut clauses, filter);
         }
 
         // Transcript search is a static corpus surface and carries no
@@ -665,7 +705,15 @@ impl TranscriptIndex {
     /// auto-wraps the claim in quotes for phrase matching unless it
     /// already contains quoted segments, and returns citation-shaped
     /// output sorted oldest-first so the earliest mention surfaces first.
-    pub fn cite(&self, p: &CiteParams) -> Result<String> {
+    ///
+    /// `project_filter` carries the caller-resolved project selector;
+    /// `None` keeps the raw selector on the literal substring lane.
+    pub fn cite(
+        &self,
+        p: &CiteParams,
+        project_filter: Option<&ProjectFilterInput>,
+    ) -> Result<String> {
+        let project_filter = effective_project_filter(project_filter, p.project.as_deref());
         let limit = p.limit.unwrap_or(5).min(20) as usize;
         let role = p.role.as_deref().unwrap_or("user");
 
@@ -709,8 +757,8 @@ impl TranscriptIndex {
             ));
         }
 
-        if let Some(project) = p.project.as_deref() {
-            self.push_project_filter_clause(&mut clauses, project);
+        if let Some(filter) = project_filter.as_ref() {
+            self.push_project_filter_clause(&mut clauses, filter);
         }
 
         let query = BooleanQuery::new(clauses);
@@ -1307,29 +1355,40 @@ impl TranscriptIndex {
 
     // ── Sessions List ───────────────────────────────────────────────
 
-    pub fn sessions_list(&self, p: &SessionsListParams) -> Result<String> {
+    /// `project_filter` carries the caller-resolved project selector;
+    /// `None` keeps the raw selector on the literal substring lane.
+    pub fn sessions_list(
+        &self,
+        p: &SessionsListParams,
+        project_filter: Option<&ProjectFilterInput>,
+    ) -> Result<String> {
         let account_filter = p.account.as_deref();
-        let project_filter = p.project.as_deref();
+        let resolved_filter = effective_project_filter(project_filter, p.project.as_deref());
+        let project_filter = resolved_filter.as_ref();
         let name_filter = p.name.as_deref();
         let limit = p.limit.unwrap_or(30).min(100) as usize;
         let offset = p.offset.unwrap_or(0) as usize;
 
-        // Base-project lane for the project filter (gap-72fd5932): resolve
-        // candidate sessions from already-stamped transcript documents. This
-        // keeps list/search parity without reopening session cwd paths or
-        // probing Git from a read-only corpus query.
-        let filter_base_id = project_filter.and_then(|pf| self.base_project_filter_id(pf));
+        // Base-project lane for the project filter (gap-72fd5932): match
+        // candidate sessions against already-stamped transcript documents.
+        // This keeps list/search parity without reopening session cwd paths
+        // or probing Git from a read-only corpus query.
+        let filter_base_id = project_filter.and_then(|filter| filter.project_id.clone());
         let base_session_ids = filter_base_id
             .as_deref()
             .map(|project_id| self.session_ids_for_base_project(project_id))
             .transpose()?
             .unwrap_or_default();
-        let project_matches = |pf: &str, session_cwd: &str, session_id: &str| -> bool {
-            if session_cwd.to_lowercase().contains(&pf.to_lowercase()) {
-                return true;
-            }
-            filter_base_id.is_some() && base_session_ids.contains(session_id)
-        };
+        let project_matches =
+            |filter: &ProjectFilterInput, session_cwd: &str, session_id: &str| -> bool {
+                if session_cwd
+                    .to_lowercase()
+                    .contains(&filter.literal.to_lowercase())
+                {
+                    return true;
+                }
+                filter_base_id.is_some() && base_session_ids.contains(session_id)
+            };
 
         // Load session name maps
         let claude_names = load_claude_session_names(&self.config.roots);

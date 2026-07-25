@@ -17,13 +17,17 @@
   resolution per-doc, and do not move it to query time: per-candidate git
   probes at query time is precisely what the gap rejected.
 - The project filter is OR(legacy substring lane over `project`, exact term
-  on `base_project_id`), with the filter value resolved through
-  alias/id/path first. **Never drop the substring lane** — unregistered
+  on `base_project_id`). **Never drop the substring lane** — unregistered
   projects and ad hoc path filters have nothing else.
-- `bbox_sessions_list` is METADATA-backed, not doc-backed: it resolves
-  candidate session cwds through the same gate at query time, memoized per
-  distinct cwd. If session metadata ever gets stamped at write time, that
-  memo can go.
+- Selector resolution does NOT live in this crate: callers hand search,
+  cite, and sessions_list a `ProjectFilterInput { project_id, literal }`
+  resolved at the daemon tool boundary, and the id lane fires only when
+  the caller resolved one. Never read project records off disk here to
+  interpret a filter: the dependency direction forbids reaching the
+  resolver engine, which is why resolution moved up.
+- `bbox_sessions_list` is METADATA-backed, not doc-backed: it matches
+  candidate session cwds against the stamped documents at query time. If
+  session metadata ever gets stamped at write time, that lane can go.
 
 ## Filters generally
 

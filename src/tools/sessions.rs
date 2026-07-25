@@ -165,7 +165,13 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_sessions_list", move || {
-            server.state.idx.read().sessions_list(&p)
+            let project_filter =
+                crate::tools::transcripts::corpus_project_filter(&server, p.project.as_deref());
+            server
+                .state
+                .idx
+                .read()
+                .sessions_list(&p, project_filter.as_ref())
         })
         .await
     }

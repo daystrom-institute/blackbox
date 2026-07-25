@@ -513,6 +513,9 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         records_provider,
         checkout_registry,
         checkout_access_observations,
+        resolver_compat: crate::server::resolver_compat::ResolverCompatObservations::open(
+            store_dir.join("resolver-compat-observations.json"),
+        ),
         checkout_access,
         // Publisher refs define authority and cannot be reconstructed from
         // checkout discovery without silently moving published truth. Keep

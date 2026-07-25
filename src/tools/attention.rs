@@ -36,6 +36,15 @@ impl BlackboxServer {
                 let (scope, resolved_project_id, _write_dir) =
                     server.resolve_project_write_scope_with_id(&raw)?;
                 p.project_id = resolved_project_id;
+                // Catalog-mode ledger arm (plan §8.2): a listing sees path-only
+                // pins still keyed under one of this project's historical
+                // paths. Writes never consult it, so only `list` pays the
+                // ledger read. Empty in bridge mode.
+                if p.action == "list"
+                    && let Some(project_id) = p.project_id.as_deref()
+                {
+                    p.project_ledger_paths = server.ledger_historical_paths(project_id);
+                }
                 if scope != raw {
                     p.project_alias = Some(raw);
                 }

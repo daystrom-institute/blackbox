@@ -89,9 +89,8 @@ impl<'a> ProjectResolverEngine<'a> {
 
     /// Resolve for a path operation: exactly one attachment or a typed
     /// refusal. Selection is: explicit `attachment_id`, then the session
-    /// checkout, then a single active attachment. (The operator-selected
-    /// default attachment joins this ladder with the administration
-    /// milestone.)
+    /// checkout, then the operator-selected default attachment, then a
+    /// single active attachment (plan §5.6/§7.3 ladder).
     pub fn resolve_attached(
         &self,
         req: &ProjectSelectorRequest,
@@ -468,6 +467,22 @@ fn v2_select_attachment(
                 attachment,
             ));
         }
+    }
+    // Operator-selected default attachment (§7.3): host-local selection used
+    // when no session pin or explicit selector applies. Snapshot validation
+    // guarantees the default row exists, belongs to this project, and is
+    // active; the active-set lookup keeps the arm fail-closed anyway.
+    if let Some(default_id) = attachments.default_attachments.get(&parsed)
+        && let Some(attachment) = active
+            .iter()
+            .find(|attachment| &attachment.attachment_id == default_id)
+    {
+        return Ok(v2_attached_context(
+            catalog,
+            attachments,
+            project,
+            attachment,
+        ));
     }
     match active.as_slice() {
         [] => Err(ProjectResolveError::attachment_required(project_id)),
@@ -1107,6 +1122,47 @@ mod tests {
         req.attachment_id = Some("att_0000000000000000000000000000a001".to_string());
         let err = engine.resolve_attached(&req).expect_err("cross-project id");
         assert_eq!(err.code(), "error.project_attachment_required");
+
+        // Operator-selected default resolves the multi-attachment project
+        // when neither an explicit id nor a session pin applies (§7.3).
+        let mut fx_default = v2_fixture(&root);
+        fx_default.attachments.default_attachments.insert(
+            ProjectId::parse("p_000000000000000000000000000multi").unwrap(),
+            AttachmentId::parse("att_0000000000000000000000000000b002").unwrap(),
+        );
+        fx_default.attachments.validate().unwrap();
+        let engine = ProjectResolverEngine::v2(&fx_default.catalog, &fx_default.attachments);
+        let ctx = engine
+            .resolve_attached(&selection(
+                "p_000000000000000000000000000multi",
+                ResolveIntent::Read,
+            ))
+            .unwrap();
+        let ResolvedAttachment::Catalog { attachment_id, .. } = &ctx.attachment else {
+            panic!("catalog attachment expected");
+        };
+        assert_eq!(attachment_id, "att_0000000000000000000000000000b002");
+
+        // The session pin outranks the operator default.
+        let mut req = selection("p_000000000000000000000000000multi", ResolveIntent::Read);
+        req.session = Some(SessionCheckoutRef {
+            checkout_id: Some("feed00000000000000000000000000b1".to_string()),
+            checkout_project_dir: None,
+        });
+        let ctx = engine.resolve_attached(&req).unwrap();
+        let ResolvedAttachment::Catalog { attachment_id, .. } = &ctx.attachment else {
+            panic!("catalog attachment expected");
+        };
+        assert_eq!(attachment_id, "att_0000000000000000000000000000b001");
+
+        // An explicit attachment id outranks the operator default.
+        let mut req = selection("p_000000000000000000000000000multi", ResolveIntent::Read);
+        req.attachment_id = Some("att_0000000000000000000000000000b001".to_string());
+        let ctx = engine.resolve_attached(&req).unwrap();
+        let ResolvedAttachment::Catalog { attachment_id, .. } = &ctx.attachment else {
+            panic!("catalog attachment expected");
+        };
+        assert_eq!(attachment_id, "att_0000000000000000000000000000b001");
     }
 
     #[test]

@@ -114,6 +114,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         records_provider,
         checkout_registry,
         checkout_access_observations,
+        resolver_compat: crate::server::resolver_compat::ResolverCompatObservations::in_memory(),
         checkout_access,
         publisher_refs: RwLock::new(
             bbox_indexing::publisher::PublisherRefStore::open(

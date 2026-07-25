@@ -1,4 +1,4 @@
-use crate::index::{CiteParams, ContextParams, SearchParams};
+use crate::index::{CiteParams, ContextParams, ProjectFilterInput, SearchParams};
 use crate::mcp_tools;
 use crate::mcp_tools::discover_seed::DiscoverSeedParams;
 use crate::mcp_tools::hybrid_search::HybridSearchParams;
@@ -23,6 +23,24 @@ struct CorpusSearchParams {
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::transcripts_tools()
+}
+
+/// Filter-class boundary for the corpus-search family (`bbox_search`,
+/// `bbox_cite`, `bbox_sessions_list`, `work_tool_calls`): resolve the raw
+/// selector once here and hand the index engine a typed filter. The
+/// literal travels unchanged so the substring lane keeps its semantics;
+/// the `base_project_id` term lane fires only when the selector resolved
+/// to a registered project.
+pub(crate) fn corpus_project_filter(
+    server: &BlackboxServer,
+    raw: Option<&str>,
+) -> Option<ProjectFilterInput> {
+    raw.map(|literal| ProjectFilterInput {
+        project_id: server
+            .resolve_project_filter(literal)
+            .and_then(|resolution| resolution.project_id().map(str::to_owned)),
+        literal: literal.to_string(),
+    })
 }
 
 #[tool_router(router = transcripts_tools)]
@@ -92,16 +110,14 @@ impl BlackboxServer {
                     .run_reindex_pass(false, true)
                     .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
+            let project_filter = corpus_project_filter(&server, p.project.as_deref());
             let read_view = server.state.code_read_view.read().clone();
-            server
-                .state
-                .idx
-                .read()
-                .search_with_active_selectors_and_searcher(
-                    &p,
-                    &read_view.active_selectors,
-                    &read_view.searcher,
-                )
+            server.state.idx.read().search_with_project_filter(
+                &p,
+                project_filter.as_ref(),
+                &read_view.active_selectors,
+                &read_view.searcher,
+            )
         })
         .await
     }
@@ -116,6 +132,9 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking_with_structured("bbox_hybrid_search", move || {
+            let mut p = p;
+            p.resolved_project_id =
+                server.resolve_hybrid_project_filter("bbox_hybrid_search", p.project.as_deref());
             // Fast path: read-lock the index to check emptiness. Only escalate
             // to a write lock if we actually need to build_index. The previous
             // unconditional write lock blocked every search behind the
@@ -159,6 +178,9 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking_with_structured("bbox_discover_seed_entities", move || {
+            let mut p = p;
+            p.resolved_project_id = server
+                .resolve_hybrid_project_filter("bbox_discover_seed_entities", p.project.as_deref());
             if server.state.idx.read().is_empty() {
                 server
                     .state
@@ -193,7 +215,11 @@ impl BlackboxServer {
     )]
     pub(crate) async fn bbox_cite(&self, Parameters(p): Parameters<CiteParams>) -> CallToolResult {
         let server = self.clone();
-        Self::run_blocking("bbox_cite", move || server.state.idx.read().cite(&p)).await
+        Self::run_blocking("bbox_cite", move || {
+            let project_filter = corpus_project_filter(&server, p.project.as_deref());
+            server.state.idx.read().cite(&p, project_filter.as_ref())
+        })
+        .await
     }
 
     #[tool(

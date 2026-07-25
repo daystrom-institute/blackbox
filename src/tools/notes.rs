@@ -67,12 +67,14 @@ impl BlackboxServer {
             // Worktree filter paths map to the registered base (where notes
             // are keyed); substring filters pass through untouched.
             let mut p = p;
-            if let Some(base) = p
-                .project
-                .as_deref()
-                .and_then(|raw| self.rescope_project_filter_value(raw))
-            {
-                p.project = Some(base);
+            if let Some(raw) = p.project.clone() {
+                // Catalog-mode ledger arm (plan §8.2): path-only notes still
+                // keyed under one of this project's historical paths stay
+                // visible after relocation. Empty in bridge mode.
+                p.project_ledger_paths = self.filter_ledger_paths(&raw);
+                if let Some(base) = self.rescope_project_filter_value(&raw) {
+                    p.project = Some(base);
+                }
             }
             self.state.notes.read().list(&p)
         })

@@ -27,7 +27,31 @@ impl BlackboxServer {
         &self,
         Parameters(p): Parameters<orchestration::mcp::McpToolParams>,
     ) -> CallToolResult {
-        Self::run("bro_mcp", || orchestration::mcp::handle(&p))
+        Self::run("bro_mcp", || {
+            let mut p = p;
+            if let Some(raw) = p.project.clone() {
+                // Selection-class engine resolution (phase-2 §9.2 B5): a
+                // resolving selector rewrites to the durable store key; the
+                // version-1 arm keeps raw-path storage for unregistered
+                // dirs (tagged compatibility), the catalog arm fails closed.
+                match self.resolve_project_selection(&raw) {
+                    Ok(resolution) => match resolution.store_key() {
+                        Some(key) => p.project = Some(key.to_owned()),
+                        None => anyhow::bail!(
+                            "error.project_attachment_required: project '{raw}' has no active checkout attachment to carry MCP project scope"
+                        ),
+                    },
+                    Err(_) if self.state.project_authority.is_bridge() => {
+                        self.state.resolver_compat.record(
+                            "bro_mcp",
+                            crate::server::resolver_compat::CompatLane::UnregisteredWritePassThrough,
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            orchestration::mcp::handle(&p)
+        })
     }
 
     #[tool(
@@ -63,15 +87,10 @@ impl BlackboxServer {
                     Some(pr) => pr.to_string(),
                     None => return Self::err_text("project is required"),
                 };
-                let records = self.state.records_provider.records_snapshot().records;
-                // Mirror ProjectRegistry's symlink-resolving behavior so
-                // bind accepts aliases the registry already collapsed at
-                // register time. Without this, a user who registered
-                // `/repo/foo` (resolved target) but binds the symlink
-                // `/home/me/foo` would see project_id=None and miss
-                // rename/preflight scoping later. Refuse paths that
-                // exist on disk but are non-directories (file, etc.)
-                // — those would silently bind nonsense.
+                // Refuse paths that exist on disk but are non-directories
+                // (file, etc.) — those would silently bind nonsense. The
+                // canonical form also keeps unregistered-path storage
+                // symlink-stable on the version-1 lane below.
                 let canonical_input = match entity_ref::canonical_input_path(&project_input) {
                     Ok(p) => Some(p.to_string_lossy().into_owned()),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -81,16 +100,32 @@ impl BlackboxServer {
                         ));
                     }
                 };
-                let resolved = records.iter().find(|r| {
-                    r.canonical_path == project_input
-                        || r.project_id == project_input
-                        || canonical_input
-                            .as_deref()
-                            .is_some_and(|c| c == r.canonical_path)
-                });
-                let (project_dir, project_id) = match resolved {
-                    Some(rec) => (rec.canonical_path.clone(), Some(rec.project_id.clone())),
-                    None => {
+                // Selection-class engine resolution (phase-2 §9.2 B4). The
+                // symlink-collapsed form feeds the engine so a caller who
+                // binds the symlink of a registered target still resolves.
+                let resolution = self.resolve_project_selection(
+                    canonical_input.as_deref().unwrap_or(&project_input),
+                );
+                let (project_dir, project_id) = match resolution {
+                    Ok(resolution) => match resolution.store_key() {
+                        Some(key) => (key.to_owned(), resolution.project_id().map(str::to_owned)),
+                        // Catalog identity with no attachment (remote-only):
+                        // the binding store needs a host dir for
+                        // rename/preflight scoping, so this refuses until
+                        // the catalog-keyed view phase.
+                        None => {
+                            return Self::err_text(&format!(
+                                "error.project_attachment_required: project '{project_input}' has no active checkout attachment to scope the channel binding"
+                            ));
+                        }
+                    },
+                    Err(_) if self.state.project_authority.is_bridge() => {
+                        // Version-1 compatibility lane: unregistered
+                        // absolute paths are stored literally (tagged).
+                        self.state.resolver_compat.record(
+                            "bro_slack_bind",
+                            crate::server::resolver_compat::CompatLane::UnregisteredWritePassThrough,
+                        );
                         let path_buf = std::path::PathBuf::from(&project_input);
                         if !path_buf.is_absolute() {
                             return Self::err_text(&format!(
@@ -103,6 +138,9 @@ impl BlackboxServer {
                         // it doesn't exist yet on disk.
                         let stored = canonical_input.unwrap_or_else(|| project_input.clone());
                         (stored, None)
+                    }
+                    Err(error) => {
+                        return Self::err_text(&format!("bind failed: {error}"));
                     }
                 };
                 // Preserve any badgey_id from a prior bind so re-binding

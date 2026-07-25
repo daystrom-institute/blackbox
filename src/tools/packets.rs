@@ -29,6 +29,19 @@ impl BlackboxServer {
         // (fsync) under packets.read() — run on the blocking pool.
         let server = self.clone();
         Self::run_blocking("bbox_compile", move || {
+            // Phase-2 §9.2 B7: project-scoped packets resolve their scope
+            // through the shared engine at write time, stamping the durable
+            // key plus the stable id for dual-read; misses keep the caller's
+            // literal scope with no id, exactly like the other owner stores.
+            let mut p = p;
+            if let Some(raw) = p.project.clone()
+                && let Some(resolution) = server.resolve_project_filter(&raw)
+                && let bbox_corpus_core::project_selector::ProjectResolution::Attached(ctx) =
+                    resolution
+            {
+                p.project = Some(ctx.store_key.clone());
+                p.project_id = Some(ctx.project.project_id().to_owned());
+            }
             server.state.packets.read().compile(&p)
         })
         .await

@@ -146,8 +146,9 @@ pub fn evaluate_tool_surface(
     packets: &Packets,
     entity: Value,
     project: Option<&str>,
+    project_id: Option<&str>,
 ) -> ToolSurfaceDecision {
-    match packets.load_latest_by_domain(SURFACE_ROUTING_DOMAIN, project, None) {
+    match packets.load_latest_by_domain(SURFACE_ROUTING_DOMAIN, project, project_id) {
         Ok(Some(packet)) => match apply_with(&packet, &entity, packets) {
             Some(prediction) => match ToolSurfaceVerdict::parse(&prediction.consequent) {
                 Ok(verdict) => {
@@ -191,7 +192,9 @@ pub fn dispatch_surface_filters(
 ) -> Option<McpFilters> {
     let surface = surface?;
     let entity = build_surface_entity(surface, project);
-    let decision = evaluate_tool_surface(packets, entity, project);
+    // Dispatch project values are execution-target data (plan §3), not
+    // catalog selectors; the id-matching arm stays empty on this path.
+    let decision = evaluate_tool_surface(packets, entity, project, None);
     if decision.is_deny() {
         return Some(McpFilters {
             allow: Vec::new(),
@@ -391,7 +394,10 @@ pub(crate) fn cached_surface_entry(
     let entity = build_surface_entity(surface, project);
     let decision = {
         let packets = state.packets.read();
-        evaluate_tool_surface(&packets, entity, project)
+        // The session pin is one string (path, or a bare id for an
+        // attachment-less catalog identity); the dedicated id-matching arm
+        // joins this cache with the phase-5 catalog-keyed view wiring.
+        evaluate_tool_surface(&packets, entity, project, None)
     };
     let visible = visible_tool_set(&decision, &universe());
     let entry = std::sync::Arc::new(SurfaceCacheEntry {
@@ -692,7 +698,7 @@ mod tests {
 
         let check = |surface: &str, expect_visible: &[&str], expect_hidden: &[&str]| {
             let entity = build_surface_entity(surface, None);
-            let decision = evaluate_tool_surface(&packets, entity, None);
+            let decision = evaluate_tool_surface(&packets, entity, None, None);
             for tool in expect_visible {
                 assert!(
                     tool_visible(tool, &decision, &universe),
@@ -818,7 +824,7 @@ mod tests {
             .collect();
 
         let entity = build_surface_entity("interactive", None);
-        let decision = evaluate_tool_surface(&packets, entity, None);
+        let decision = evaluate_tool_surface(&packets, entity, None, None);
         for tool in visible {
             assert!(
                 tool_visible(tool, &decision, &universe),
@@ -957,7 +963,7 @@ mod tests {
     fn test_no_packet_passthrough() {
         let (_tmp, packets) = tmp_packets();
         let entity = serde_json::json!({ "surface": "default" });
-        let decision = evaluate_tool_surface(&packets, entity, None::<&str>);
+        let decision = evaluate_tool_surface(&packets, entity, None::<&str>, None);
         assert!(!decision.is_deny());
     }
 
@@ -979,7 +985,7 @@ mod tests {
         );
 
         let entity = serde_json::json!({ "surface": "readonly" });
-        let decision = evaluate_tool_surface(&packets, entity, None::<&str>);
+        let decision = evaluate_tool_surface(&packets, entity, None::<&str>, None);
 
         assert!(!decision.is_deny());
         let universe = vec![
@@ -1013,7 +1019,7 @@ mod tests {
         );
 
         let entity = serde_json::json!({ "surface": "unknown" });
-        let decision = evaluate_tool_surface(&packets, entity, None::<&str>);
+        let decision = evaluate_tool_surface(&packets, entity, None::<&str>, None);
         assert!(decision.is_deny());
     }
 
@@ -1031,7 +1037,7 @@ mod tests {
         compile_surface_packet(&packets, vec![bad_rule], "global", None);
 
         let entity = serde_json::json!({ "surface": "default" });
-        let decision = evaluate_tool_surface(&packets, entity, None::<&str>);
+        let decision = evaluate_tool_surface(&packets, entity, None::<&str>, None);
         assert!(decision.is_deny());
     }
 
@@ -1111,7 +1117,7 @@ mod tests {
         );
 
         let entity = serde_json::json!({ "surface": "default" });
-        let decision = evaluate_tool_surface(&packets, entity, Some(project_path));
+        let decision = evaluate_tool_surface(&packets, entity, Some(project_path), None);
         assert!(!decision.is_deny());
 
         let universe = vec![
@@ -1124,7 +1130,7 @@ mod tests {
         assert!(!tool_visible("bbox_forget", &decision, &universe));
 
         let entity_global = serde_json::json!({ "surface": "default" });
-        let decision_global = evaluate_tool_surface(&packets, entity_global, None::<&str>);
+        let decision_global = evaluate_tool_surface(&packets, entity_global, None::<&str>, None);
         assert!(!decision_global.is_deny());
         assert!(!tool_visible("bbox_stats", &decision_global, &universe));
     }
@@ -1348,7 +1354,7 @@ mod tests {
 
         let entity_locked = serde_json::json!({"surface": "locked"});
         let decision =
-            evaluate_tool_surface(&srv.state.packets.read(), entity_locked, None::<&str>);
+            evaluate_tool_surface(&srv.state.packets.read(), entity_locked, None::<&str>, None);
         assert!(decision.is_deny(), "locked surface should deny");
         if let ToolSurfaceVerdict::Deny { reason } = &decision.verdict {
             assert_eq!(reason.as_deref(), Some("locked out"));

@@ -200,6 +200,7 @@ pub(crate) fn run(server: &crate::server::BlackboxServer) -> anyhow::Result<Doct
     ];
     let checkout_access = state.checkout_access_observations.health();
     sections.push(checkout_access_section(&checkout_access));
+    sections.push(resolver_compat_section(state));
     sections.extend([
         memories_section(state),
         knowledge_section(state),
@@ -248,6 +249,31 @@ fn checkout_access_section(
     }
     SectionReport {
         section: "checkout_access",
+        findings,
+    }
+}
+
+/// Resolver compatibility-lane counters (phase-2 §9.2): the per-surface
+/// observations the Phase 6 compatibility cut consumes.
+fn resolver_compat_section(state: &crate::server::state::SharedState) -> SectionReport {
+    let snapshot = state.resolver_compat.snapshot();
+    let mut findings = Vec::new();
+    if snapshot.sequence == 0 {
+        findings.push(Finding::info(
+            "no resolver compatibility lane has fired yet",
+        ));
+    } else {
+        for (surface, lanes) in &snapshot.surfaces {
+            for (lane, counter) in lanes {
+                findings.push(Finding::info(format!(
+                    "{surface}: {lane} fired {} time(s), last at unix {}",
+                    counter.count, counter.last_unix_secs,
+                )));
+            }
+        }
+    }
+    SectionReport {
+        section: "resolver_compat",
         findings,
     }
 }
@@ -847,6 +873,7 @@ mod tests {
                 "graph",
                 "projects",
                 "checkout_access",
+                "resolver_compat",
                 "memories",
                 "knowledge",
                 "attention"

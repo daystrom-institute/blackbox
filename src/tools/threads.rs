@@ -25,14 +25,12 @@ impl BlackboxServer {
             // When the agent passes a managed fleet worktree as `project`, key the
             // thread to its registered base (durable scope) but write the committed
             // `.bbox/record/` snapshot into the worktree so it travels with the
-            // agent's branch. Resolution lives here (the adapter holds the project
-            // registry); the threads store stays registry-free.
-            let resolved = p.project.as_deref().and_then(|proj| {
-                crate::projects::fleet_worktree_scope_and_dir(
-                    proj,
-                    &self.state.records_provider.records_snapshot().records,
-                )
-            });
+            // agent's branch. Resolution rides the shared engine (phase-2
+            // §9.2); the threads store stays registry-free.
+            let resolved = p
+                .project
+                .as_deref()
+                .and_then(|proj| self.resolve_worktree_scope_and_dir(proj));
             let mut threads = self.state.threads.write();
             match resolved {
                 Some((base, worktree)) => {
@@ -91,21 +89,17 @@ impl BlackboxServer {
             // Normalize a managed fleet worktree project filter to its registered
             // base so list-before-open (create etiquette) sees base-keyed threads
             // from inside a worktree and doesn't drive duplicate opens.
-            let normalized = p.project.as_deref().and_then(|proj| {
-                crate::projects::fleet_worktree_scope_and_dir(
-                    proj,
-                    &self.state.records_provider.records_snapshot().records,
-                )
-                .map(|(base, _worktree)| base)
-            });
-            match normalized {
-                Some(base) => {
-                    let mut p = p.clone();
+            let mut p = p;
+            if let Some(raw) = p.project.clone() {
+                // Catalog-mode ledger arm (plan §8.2): path-only threads still
+                // keyed under one of this project's historical paths stay
+                // visible after relocation. Empty in bridge mode.
+                p.project_ledger_paths = self.filter_ledger_paths(&raw);
+                if let Some((base, _worktree)) = self.resolve_worktree_scope_and_dir(&raw) {
                     p.project = Some(base);
-                    self.state.threads.read().thread_list(&p)
                 }
-                None => self.state.threads.read().thread_list(&p),
             }
+            self.state.threads.read().thread_list(&p)
         })
     }
 }
@@ -160,6 +154,7 @@ mod tests {
             status: None,
             project: None,
             project_id: None,
+            project_ledger_paths: Vec::new(),
             name: None,
             min_idle_days: None,
             include_resolved: Some(true),

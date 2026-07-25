@@ -1529,12 +1529,14 @@ mod tests {
         assert!(result.contains("/tmp/repo/src/lib.rs"), "{result}");
     }
 
-    /// gap-72fd5932 contract: transcript docs stamped with base_project_id
-    /// at ingest are reachable through the project filter by project_id and
-    /// registered alias, even when their literal cwd (the `project` field)
-    /// is an out-of-tree worktree path the substring lane cannot match.
+    /// gap-72fd5932 plus the phase-2 B1 retirement: the two filter lanes
+    /// are driven entirely by the caller-supplied `ProjectFilterInput`.
+    /// Docs stamped with base_project_id are reachable by resolved id even
+    /// when their literal cwd is an out-of-tree worktree path the substring
+    /// lane cannot match, the literal lane still stands on its own, and a
+    /// registered record on disk never resolves an id inside this crate.
     #[test]
-    fn project_filter_matches_stamped_base_project_by_id_and_alias() {
+    fn project_filter_lanes_follow_the_supplied_filter_input() {
         let dir = tempfile::tempdir().unwrap();
         let projects_path = dir.path().join("projects.json");
         std::fs::write(
@@ -1588,23 +1590,55 @@ mod tests {
         writer.commit().unwrap();
         index.reader_reload_for_test();
 
+        let probe = |filter: ProjectFilterInput| {
+            index
+                .search_with_project_filter(
+                    &SearchParams {
+                        query: "stamping probe".into(),
+                        mode: None,
+                        account: None,
+                        project: Some(filter.literal.clone()),
+                        role: None,
+                        include_subagents: None,
+                        limit: Some(10),
+                        exclude_self: None,
+                    },
+                    Some(&filter),
+                    &index.active_code_selectors(),
+                    &index.searcher(),
+                )
+                .unwrap()
+        };
+
+        // Resolved id: both checkouts of the base project, nothing else.
         for selector in ["feedbeef", "blackbox"] {
-            let result = index
-                .search(&SearchParams {
-                    query: "stamping probe".into(),
-                    mode: None,
-                    account: None,
-                    project: Some(selector.into()),
-                    role: None,
-                    include_subagents: None,
-                    limit: Some(10),
-                    exclude_self: None,
-                })
-                .unwrap();
+            let result = probe(ProjectFilterInput {
+                project_id: Some("feedbeef".into()),
+                literal: selector.into(),
+            });
             assert!(result.contains("wt-session"), "{selector}: {result}");
             assert!(result.contains("base-session"), "{selector}: {result}");
             assert!(!result.contains("other-session"), "{selector}: {result}");
         }
+
+        // Literal only: the substring lane matches the base checkout's cwd
+        // and nothing the stamp would have added.
+        let literal_only = probe(ProjectFilterInput::unresolved("/tmp/registered-base"));
+        assert!(literal_only.contains("base-session"), "{literal_only}");
+        assert!(!literal_only.contains("wt-session"), "{literal_only}");
+        assert!(!literal_only.contains("other-session"), "{literal_only}");
+
+        // The record on disk is registered, but resolution is the caller's
+        // job: an unresolved selector never manufactures an id here, so the
+        // stamped worktree session stays out of reach.
+        let unresolved_id = probe(ProjectFilterInput::unresolved("feedbeef"));
+        assert!(
+            unresolved_id.contains("No results found"),
+            "{unresolved_id}"
+        );
+        let unregistered = probe(ProjectFilterInput::unresolved("somewhere"));
+        assert!(unregistered.contains("other-session"), "{unregistered}");
+        assert!(!unregistered.contains("wt-session"), "{unregistered}");
     }
 
     /// CN-D3 contract: project_file docs carry symbol_kind, parent_kind,
@@ -1778,8 +1812,8 @@ pub mod tool_edges;
 
 pub use helpers::find_session_file;
 pub use search::{
-    CiteParams, ContextParams, HybridBm25Hit, MessagesParams, ReindexParams, SearchParams,
-    SessionParams, SessionsListParams, TopicsParams,
+    CiteParams, ContextParams, HybridBm25Hit, MessagesParams, ProjectFilterInput, ReindexParams,
+    SearchParams, SessionParams, SessionsListParams, TopicsParams,
 };
 
 pub fn resolve_current_project_chunk_entity(

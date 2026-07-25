@@ -36,6 +36,11 @@ pub struct DiscoverSeedParams {
     /// parameter — see that tool's docs.
     #[serde(default)]
     pub project: Option<String>,
+    /// Pre-resolved project filter id installed by the daemon boundary
+    /// (phase-2 §9.2 B2); same contract as
+    /// `HybridSearchParams::resolved_project_id`.
+    #[serde(skip)]
+    pub resolved_project_id: Option<String>,
     /// Knowledge visibility: published, own, or all. Defaults to own only
     /// when the MCP session has authoritative checkout context.
     #[serde(default)]
@@ -92,6 +97,7 @@ pub fn discover_seed_entities(
             vector_weight: p.vector_weight,
             query_vector: p.query_vector.clone(),
             project: p.project.clone(),
+            resolved_project_id: p.resolved_project_id.clone(),
             provisional: p.provisional.clone(),
             rerank_cap: None,
             rerank: None,

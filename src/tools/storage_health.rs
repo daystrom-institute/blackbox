@@ -48,16 +48,25 @@ impl BlackboxServer {
                 .cloned()
                 .collect();
 
-            let project_filter: Option<String> = if let Some(ref project) = p.project {
-                let registry = server.state.project_authority.bridge_registry()?;
-                let guard = registry.read();
-                match guard.resolve(project) {
-                    Ok(Some(record)) => Some(record.project_id),
-                    _ => Some(project.clone()),
+            // Filter-class engine resolution (phase-2 §9.2 B6): a resolving
+            // selector narrows by identity; a miss keeps the literal
+            // pass-through (tagged v1 compatibility, and the catalog-mode
+            // literal-filter semantics).
+            let project_filter: Option<String> = p.project.as_ref().map(|project| {
+                match server
+                    .resolve_project_filter(project)
+                    .and_then(|resolution| resolution.project_id().map(str::to_owned))
+                {
+                    Some(project_id) => project_id,
+                    None => {
+                        server.state.resolver_compat.record(
+                            "bbox_storage_health",
+                            crate::server::resolver_compat::CompatLane::UnregisteredLiteralFilter,
+                        );
+                        project.clone()
+                    }
                 }
-            } else {
-                None
-            };
+            });
 
             let include_files = p.include_files.unwrap_or(false);
             let report = storage_health::scan_storage_health(

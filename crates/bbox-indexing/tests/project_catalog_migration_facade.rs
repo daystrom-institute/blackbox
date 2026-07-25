@@ -965,6 +965,260 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
         verify_error.mutation_disposition,
         ProjectCatalogMigrationMutationDispositionV1::RecoveredToCommittedState
     );
+
+    // ── Phase-2 §10 exit-gate acceptance on the migrated root ──────────
+    //
+    // Regular admin transactions over the migrated pair (D-029 lifecycle)
+    // shape the two §10 fixtures the migration itself cannot express:
+    // detaching the loser makes it the remote-only published project with
+    // an active collected generation and zero active attachments, and a
+    // second worktree-kind attachment on the winner makes it the
+    // two-attachment project. Every mutation is a §7.10 admin round trip
+    // on the same root.
+    {
+        use bbox_corpus_core::project_selector::{
+            ProjectResolution, ProjectSelectorRequest, ResolveIntent, SessionCheckoutRef,
+        };
+        use bbox_indexing::project_catalog_admin;
+
+        let store = bbox_indexing::project_catalog_store::ProjectCatalogStore::open_existing(
+            &rehearsal_projects,
+        )
+        .unwrap();
+        let epoch = |store: &bbox_indexing::project_catalog_store::ProjectCatalogStore| {
+            store.snapshot().unwrap().epoch()
+        };
+
+        // Accepted alias for the remote-only project (the collision winner:
+        // published scope plus an active collected generation): nominate
+        // through a regular transaction (the tool layer's ingestion path),
+        // accept through the D-005 lifecycle op.
+        let remote = fixture.collision_winner_project.clone();
+        store
+            .transact(epoch(&store), |catalog, _| {
+                catalog
+                    .projects
+                    .get_mut(&remote)
+                    .unwrap()
+                    .nominated_aliases
+                    .insert("remote-alias".to_string());
+                Ok(())
+            })
+            .unwrap();
+        project_catalog_admin::alias_decide(
+            &store,
+            epoch(&store),
+            &fixture.collision_winner_project,
+            "remote-alias",
+            true,
+        )
+        .unwrap();
+        // A duplicate nomination for an alias someone else accepted fails
+        // closed at acceptance (§10 item 4, duplicate aliases).
+        let winner = fixture.winner_project.clone();
+        store
+            .transact(epoch(&store), |catalog, _| {
+                catalog
+                    .projects
+                    .get_mut(&winner)
+                    .unwrap()
+                    .nominated_aliases
+                    .insert("remote-alias".to_string());
+                Ok(())
+            })
+            .unwrap();
+        let conflict = project_catalog_admin::alias_decide(
+            &store,
+            epoch(&store),
+            &fixture.winner_project,
+            "remote-alias",
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(
+            conflict.code(),
+            "error.project_catalog_admin_alias_conflict"
+        );
+
+        // Detach the collision winner's only attachment: remote-only shape
+        // with its collected generation retained (detach preserves logical
+        // state).
+        let state = store.snapshot().unwrap();
+        let remote_attachment = state
+            .attachments()
+            .attachments
+            .values()
+            .find(|row| {
+                row.project_id == fixture.collision_winner_project
+                    && row.status == AttachmentStatus::Attached
+            })
+            .unwrap()
+            .attachment_id
+            .clone();
+        drop(state);
+        project_catalog_admin::detach_attachment(
+            &store,
+            epoch(&store),
+            &remote_attachment,
+            "2026-07-25T00:00:00Z",
+        )
+        .unwrap();
+
+        // Attach a second, worktree-kind checkout to the winner: the
+        // two-attachment project. The probe is daemon-supplied data by
+        // contract; committed authority equals the winner's scope.
+        let second_dir = rehearsal_root.join("checkouts").join("winner-worktree");
+        fs::create_dir_all(&second_dir).unwrap();
+        let second_probe = project_catalog_admin::AttachProbe {
+            checkout_id: "feed000000000000000000000000e001".into(),
+            checkout_dir: second_dir.to_str().unwrap().into(),
+            checkout_project_dir: second_dir.to_str().unwrap().into(),
+            project_root_relpath: ".".into(),
+            kind: AttachmentKind::Worktree,
+            validated_scope: Some(fixture.scope.clone()),
+            computed_repo_hint: None,
+            branch_ref: None,
+            capabilities: bbox_corpus_core::project_catalog::AttachmentCapabilities {
+                local_code_source: true,
+                ..Default::default()
+            },
+            attached_at: "2026-07-25T00:00:01Z".into(),
+        };
+        let second = project_catalog_admin::attach_checkout(
+            &store,
+            epoch(&store),
+            &fixture.winner_project,
+            &second_probe,
+        )
+        .unwrap();
+
+        let state = store.snapshot().unwrap();
+        let engine = bbox_indexing::project_resolver::ProjectResolverEngine::v2(
+            state.catalog(),
+            state.attachments(),
+        );
+
+        // §10 item 2: id, accepted alias, and explicit typed scope resolve
+        // the remote-only project to a catalog context. The engine is pure
+        // over the pinned snapshot: zero lease acquisitions by
+        // construction (the live smoke asserts the counters).
+        for selector in [fixture.collision_winner_project.as_str(), "remote-alias"] {
+            let outcome = engine
+                .resolve(&ProjectSelectorRequest::selection(
+                    selector,
+                    ResolveIntent::Read,
+                ))
+                .unwrap();
+            assert!(
+                matches!(outcome, ProjectResolution::Catalog(_)),
+                "remote-only selector {selector} stops at the catalog context"
+            );
+            assert_eq!(
+                outcome.project_id(),
+                Some(fixture.collision_winner_project.as_str())
+            );
+            assert_eq!(outcome.store_key(), None);
+        }
+        let mut scoped = ProjectSelectorRequest::selection("", ResolveIntent::Read);
+        scoped.selector = None;
+        scoped.scope = Some(fixture.collision_scope.clone());
+        let outcome = engine.resolve(&scoped).unwrap();
+        assert_eq!(
+            outcome.project_id(),
+            Some(fixture.collision_winner_project.as_str())
+        );
+
+        // A path operation on the remote-only project needs an attachment.
+        let error = engine
+            .resolve_attached(&ProjectSelectorRequest::selection(
+                fixture.collision_winner_project.as_str(),
+                ResolveIntent::Read,
+            ))
+            .unwrap_err();
+        assert_eq!(error.code(), "error.project_attachment_required");
+
+        // §10 item 3: the two-attachment project requires a session pin,
+        // explicit attachment id, or configured default, and each ladder
+        // rung selects exactly one attachment.
+        let ambiguous = engine
+            .resolve_attached(&ProjectSelectorRequest::selection(
+                fixture.winner_project.as_str(),
+                ResolveIntent::Read,
+            ))
+            .unwrap_err();
+        assert_eq!(ambiguous.code(), "error.project_attachment_ambiguous");
+        let mut explicit =
+            ProjectSelectorRequest::selection(fixture.winner_project.as_str(), ResolveIntent::Read);
+        explicit.attachment_id = Some(second.attachment_id.as_str().to_string());
+        assert!(engine.resolve_attached(&explicit).is_ok());
+        let base_checkout_id = state
+            .attachments()
+            .attachments
+            .values()
+            .find(|row| {
+                row.project_id == fixture.winner_project
+                    && row.attachment_id != second.attachment_id
+            })
+            .unwrap()
+            .checkout_id
+            .clone();
+        let mut pinned =
+            ProjectSelectorRequest::selection(fixture.winner_project.as_str(), ResolveIntent::Read);
+        pinned.session = Some(SessionCheckoutRef {
+            checkout_id: Some(base_checkout_id),
+            checkout_project_dir: None,
+        });
+        let via_pin = engine.resolve_attached(&pinned).unwrap();
+        assert_eq!(
+            via_pin.store_key,
+            fixture.winner_checkout.to_str().unwrap(),
+            "the session pin selects the base attachment and keys to base"
+        );
+        drop(state);
+
+        // Configured default: the operator-selected attachment resolves the
+        // ladder when no pin or explicit id applies.
+        project_catalog_admin::set_default_attachment(
+            &store,
+            epoch(&store),
+            &fixture.winner_project,
+            Some(&second.attachment_id),
+        )
+        .unwrap();
+        let state = store.snapshot().unwrap();
+        let engine = bbox_indexing::project_resolver::ProjectResolverEngine::v2(
+            state.catalog(),
+            state.attachments(),
+        );
+        let via_default = engine
+            .resolve_attached(&ProjectSelectorRequest::selection(
+                fixture.winner_project.as_str(),
+                ResolveIntent::Read,
+            ))
+            .unwrap();
+        let bbox_corpus_core::project_selector::ResolvedAttachment::Catalog {
+            attachment_id, ..
+        } = &via_default.attachment
+        else {
+            panic!("catalog attachment expected");
+        };
+        assert_eq!(attachment_id, second.attachment_id.as_str());
+
+        // §10 item 4 residue: unknown ids and absolute paths still fail
+        // closed after the mutations, and no operation manufactured an
+        // identity (catalog membership is unchanged except by admin ops).
+        let unknown_path = rehearsal_root.join("still-nowhere");
+        for raw in [
+            "p_00000000000000000000000000nothere",
+            unknown_path.to_str().unwrap(),
+        ] {
+            let error = engine
+                .resolve(&ProjectSelectorRequest::selection(raw, ResolveIntent::Read))
+                .unwrap_err();
+            assert_eq!(error.code(), "error.project_selector_unknown");
+        }
+        assert_eq!(state.catalog().projects.len(), 3);
+    }
 }
 
 #[test]

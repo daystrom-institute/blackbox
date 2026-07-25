@@ -279,18 +279,16 @@ impl BlackboxServer {
         let session_checkout = self.authoritative_session_checkout();
         let mode = ProvisionalMode::parse(provisional, session_checkout.is_some())?;
         let projects = self.state.records_provider.records_snapshot().records;
+        // Filter-class engine resolution (phase-2 §9.2): a miss keeps the
+        // lenient unmanaged-scope view semantics; a hit joins the records
+        // projection by identity.
         let requested_record = requested_project
-            .and_then(|raw| {
-                crate::projects::resolve_project_context(
-                    raw,
-                    &projects,
-                    crate::projects::ResolveIntent::Read,
-                )
-            })
-            .and_then(|ctx| {
+            .and_then(|raw| self.resolve_project_filter(raw))
+            .and_then(|resolution| resolution.project_id().map(str::to_owned))
+            .and_then(|project_id| {
                 projects
                     .iter()
-                    .find(|record| record.project_id == ctx.project_id)
+                    .find(|record| record.project_id == project_id)
                     .cloned()
             });
         let explicit_managed_scope = requested_record.is_some();

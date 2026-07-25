@@ -191,37 +191,41 @@ fn log_tool_err(tool: &'static str, start: std::time::Instant, err: &anyhow::Err
 /// worktree (scoped to the worktree path) stay visible too. Non-path filters
 /// (substring matches like "transcript-search") and unregistered paths are
 /// left untouched.
-fn rescope_project_filter(
-    p: &mut KnowledgeListParams,
-    projects: &[crate::projects::ProjectRecord],
-) {
+fn rescope_project_filter(server: &crate::server::BlackboxServer, p: &mut KnowledgeListParams) {
+    use bbox_corpus_core::project_selector::{ProjectResolution, ResolvedAttachment};
     let Some(raw) = p.project.as_deref() else {
         return;
     };
-    if raw.starts_with('/') {
-        // Path arm: worktree/subdir → registered base, worktree checkout
-        // recorded so entries written from inside it stay visible.
-        let Some(ctx) = crate::projects::resolve_project_context(
-            raw,
-            projects,
-            crate::projects::ResolveIntent::Read,
-        ) else {
-            return;
-        };
-        if let Some(checkout) = ctx.checkout {
-            p.project_alias = Some(checkout.checkout_dir);
-        }
-        p.project = Some(ctx.host_root);
-    } else if let Some(ctx) = crate::projects::resolve_project_context(
-        raw,
-        projects,
-        crate::projects::ResolveIntent::Read,
-    ) {
-        // Selector arm: a project_id or registered alias rewrites to the
-        // base canonical path (entries key by path). Non-matching values
-        // keep their substring-filter semantics untouched.
-        p.project = Some(ctx.host_root);
+    // Filter-class engine resolution (phase-2 §9.2): a selector that
+    // resolves rewrites to the durable store key (worktree/subdir/alias/id →
+    // registered base); one that does not keeps its substring-filter
+    // semantics untouched. A worktree checkout is recorded in
+    // `project_alias` so entries written from inside it stay visible.
+    let Some(resolution) = server.resolve_project_filter(raw) else {
+        return;
+    };
+    // Catalog-mode ledger arm (plan §8.2): path-only entries still keyed under
+    // one of this project's historical paths stay visible after attachment
+    // relocation stopped rewriting them. Empty in bridge mode.
+    if let Some(project_id) = resolution.project_id() {
+        p.project_ledger_paths = server.ledger_historical_paths(project_id);
     }
+    let ProjectResolution::Attached(ctx) = resolution else {
+        return;
+    };
+    // The alias dir is where checkout-local rows land: the v1 checkout root,
+    // or the catalog attachment's own project dir under the key-to-base rule.
+    let checkout_dir = match &ctx.attachment {
+        ResolvedAttachment::V1Compat { checkout_dir, .. } => checkout_dir.clone(),
+        ResolvedAttachment::Catalog {
+            checkout_project_dir,
+            ..
+        } => checkout_project_dir.clone(),
+    };
+    if checkout_dir != ctx.store_key {
+        p.project_alias = Some(checkout_dir);
+    }
+    p.project = Some(ctx.store_key);
 }
 
 impl BlackboxServer {
@@ -826,8 +830,7 @@ impl BlackboxServer {
 
             let mut p = p;
             if p.project.is_some() {
-                let projects = server.state.records_provider.records_snapshot().records;
-                rescope_project_filter(&mut p, &projects);
+                rescope_project_filter(&server, &mut p);
             }
 
             let mut view = server.session_knowledge_view(
@@ -1249,16 +1252,27 @@ mod tests {
         )
     }
 
-    fn record_for(path: &std::path::Path) -> crate::projects::ProjectRecord {
-        crate::projects::ProjectRecord {
-            project_id: "feedbeef".into(),
-            repo_id: None,
-            canonical_path: path.to_string_lossy().into_owned(),
-            registered_at: "2026-01-01T00:00:00Z".into(),
-            is_git_repo: true,
-            languages: Default::default(),
-            aliases: Default::default(),
-        }
+    /// Test server whose bridge registry carries the base repo, so the
+    /// engine-backed rescoper resolves against real registered records.
+    fn server_with_registered(
+        state_root: &std::path::Path,
+        base: &std::path::Path,
+    ) -> (
+        crate::server::BlackboxServer,
+        crate::projects::ProjectRecord,
+    ) {
+        let server = crate::server::BlackboxServer::new(std::sync::Arc::new(
+            crate::server::state::SharedState::for_test(state_root),
+        ));
+        let record = server
+            .state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(base)
+            .unwrap();
+        (server, record)
     }
 
     #[test]
@@ -1266,13 +1280,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let tmp_root = tmp.path().canonicalize().unwrap();
         let (base, worktree) = init_repo_with_worktree(&tmp_root);
-        let projects = vec![record_for(&base)];
+        let (server, _record) = server_with_registered(&tmp_root, &base);
 
         let mut p = KnowledgeListParams {
             project: Some(worktree.to_string_lossy().into_owned()),
             ..Default::default()
         };
-        rescope_project_filter(&mut p, &projects);
+        rescope_project_filter(&server, &mut p);
         assert_eq!(p.project.as_deref(), Some(base.to_str().unwrap()));
         assert_eq!(p.project_alias.as_deref(), Some(worktree.to_str().unwrap()));
 
@@ -1284,7 +1298,7 @@ mod tests {
             project: Some(subdir.to_string_lossy().into_owned()),
             ..Default::default()
         };
-        rescope_project_filter(&mut p, &projects);
+        rescope_project_filter(&server, &mut p);
         assert_eq!(p.project.as_deref(), Some(base.to_str().unwrap()));
         assert_eq!(p.project_alias, None);
     }
@@ -1294,14 +1308,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let tmp_root = tmp.path().canonicalize().unwrap();
         let (base, _worktree) = init_repo_with_worktree(&tmp_root);
-        let projects = vec![record_for(&base)];
+        let (server, _record) = server_with_registered(&tmp_root, &base);
 
         // Substring filter (not an absolute path) is untouched.
         let mut p = KnowledgeListParams {
             project: Some("transcript-search".into()),
             ..Default::default()
         };
-        rescope_project_filter(&mut p, &projects);
+        rescope_project_filter(&server, &mut p);
         assert_eq!(p.project.as_deref(), Some("transcript-search"));
         assert_eq!(p.project_alias, None);
 
@@ -1312,7 +1326,7 @@ mod tests {
             project: Some(stranger.to_string_lossy().into_owned()),
             ..Default::default()
         };
-        rescope_project_filter(&mut p, &projects);
+        rescope_project_filter(&server, &mut p);
         assert_eq!(p.project.as_deref(), Some(stranger.to_str().unwrap()));
         assert_eq!(p.project_alias, None);
     }
@@ -1322,25 +1336,36 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let tmp_root = tmp.path().canonicalize().unwrap();
         let (base, _worktree) = init_repo_with_worktree(&tmp_root);
-        let mut record = record_for(&base);
-        record.aliases = ["blackbox".to_string()].into();
-        let projects = vec![record];
+        let (server, record) = server_with_registered(&tmp_root, &base);
+        // Declared aliases materialize through the same registry sync the
+        // register adapter runs.
+        server
+            .state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .sync_declared_aliases(
+                &record.project_id,
+                &["blackbox".to_string()].into_iter().collect(),
+            )
+            .unwrap();
 
         // A registered alias rewrites to the base canonical path.
         let mut p = KnowledgeListParams {
             project: Some("blackbox".into()),
             ..Default::default()
         };
-        rescope_project_filter(&mut p, &projects);
+        rescope_project_filter(&server, &mut p);
         assert_eq!(p.project.as_deref(), Some(base.to_str().unwrap()));
         assert_eq!(p.project_alias, None);
 
         // A project_id selector rewrites the same way.
         let mut p = KnowledgeListParams {
-            project: Some("feedbeef".into()),
+            project: Some(record.project_id.clone()),
             ..Default::default()
         };
-        rescope_project_filter(&mut p, &projects);
+        rescope_project_filter(&server, &mut p);
         assert_eq!(p.project.as_deref(), Some(base.to_str().unwrap()));
     }
 

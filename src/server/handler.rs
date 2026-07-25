@@ -116,22 +116,39 @@ impl ServerHandler for BlackboxServer {
             } else {
                 ("default", None)
             };
-        // Resolve the project selector (alias / id / path) to the base
-        // canonical path packets are scoped by, falling back to the literal
-        // value for parity with bbox_mcp_surface. Blocking fs (canonicalize
-        // / git probes) → blocking pool.
+        // Resolve the project selector (alias / id / path) through the
+        // shared engine (phase-2 §9.2, Filter class) to the base canonical
+        // path packets are scoped by, keeping the literal on a miss for
+        // parity with bbox_mcp_surface. A catalog-mode identity with no
+        // attachment pins the stable project id: identity without a host
+        // path. Blocking fs (canonicalize / git probes) → blocking pool.
         let project = match project_raw.clone() {
             Some(raw) => {
                 let server = self.clone();
                 let resolved = tokio::task::spawn_blocking(move || {
-                    let records = server.state.records_provider.records_snapshot().records;
-                    crate::projects::resolve_project_context(
-                        &raw,
-                        &records,
-                        crate::projects::ResolveIntent::Read,
-                    )
-                    .map(|ctx| ctx.host_root)
-                    .unwrap_or(raw)
+                    match server.resolve_project_filter(&raw) {
+                        Some(resolution) => match resolution
+                            .store_key()
+                            .or(resolution.project_id())
+                            .map(str::to_owned)
+                        {
+                            Some(resolved) => resolved,
+                            None => {
+                                server.state.resolver_compat.record(
+                                    "mcp_wire_head",
+                                    crate::server::resolver_compat::CompatLane::UnregisteredLiteralFilter,
+                                );
+                                raw
+                            }
+                        },
+                        None => {
+                            server.state.resolver_compat.record(
+                                "mcp_wire_head",
+                                crate::server::resolver_compat::CompatLane::UnregisteredLiteralFilter,
+                            );
+                            raw
+                        }
+                    }
                 })
                 .await
                 .map_err(|e| {

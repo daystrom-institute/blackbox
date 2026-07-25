@@ -246,13 +246,44 @@ fn init_project_path(project_dir: &Path, force: bool) -> anyhow::Result<ProjectI
 impl BlackboxServer {
     #[tool(
         name = "bbox_project_register",
-        description = "Register a project directory and schedule background agentic-corpus indexing. The path must be an absolute directory path (file paths and missing paths are rejected). Re-registering the same canonical path is idempotent — returns the existing record without modifying registered_at. project_id is derived from canonicalized realpath and is per-machine; repo_id derives from first commit SHA with remote fallback. Use bbox_project_list to inspect registered projects."
+        description = "Register a project directory and schedule background agentic-corpus indexing. The path must be an absolute directory path (file paths and missing paths are rejected). Re-registering the same canonical path is idempotent — returns the existing record without modifying registered_at. project_id is derived from canonicalized realpath and is per-machine; repo_id derives from first commit SHA with remote fallback. In catalog mode this is the find-or-create composite: the checkout attaches to the project owning its committed scope (or a new Published/LegacyLocal project is minted), config-declared aliases become pending nominations, and a scope disagreement returns the exact promotion or scope-migration handoff instead of a second project. Use bbox_project_list to inspect registered projects."
     )]
     pub(crate) async fn bbox_project_register(
         &self,
         Parameters(p): Parameters<ProjectRegisterParams>,
     ) -> CallToolResult {
         let start = std::time::Instant::now();
+        // Catalog arm (plan §9.1): the compatibility composite. Probing,
+        // find-or-create, attach, and nomination ingestion run on the
+        // blocking pool; the enrichment pipeline is shared with the bridge
+        // arm behind the same capability leases.
+        if let Some(store) = self.state.project_authority.catalog_store().cloned() {
+            let server = self.clone();
+            let result: anyhow::Result<String> = tokio::task::spawn_blocking(move || {
+                let (record, catalog_summary) = server.register_catalog_arm(&store, &p.path)?;
+                server.state.nudge_edge_index_rebuild();
+                let mut response = server.run_post_register_pipeline(record)?;
+                if let Some(map) = response.as_object_mut() {
+                    map.insert("catalog".into(), catalog_summary);
+                }
+                Ok(serde_json::to_string_pretty(&response)?)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("blocking task failed: {e}"))
+            .and_then(std::convert::identity);
+            return match result {
+                Ok(text) => {
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    tracing::info!(target: "blackbox::tool", tool = "bbox_project_register", elapsed_ms = ms, bytes = text.len(), "ok");
+                    Self::ok_text(&text)
+                }
+                Err(e) => {
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    tracing::warn!(target: "blackbox::tool", tool = "bbox_project_register", elapsed_ms = ms, error = %e, "err");
+                    Self::err_text(&format!("Error: {e:#}"))
+                }
+            };
+        }
         // Phase 1: register + alias materialization + persist — light lock
         // ops + async I/O on the runtime. Declared aliases come from the
         // repo's committed `.bbox/config.toml` and sync under the same write
@@ -299,8 +330,39 @@ impl BlackboxServer {
         // provenance import, watcher, kb sync) on the blocking pool.
         let server = self.clone();
         let result: anyhow::Result<String> = tokio::task::spawn_blocking(move || {
-            let migration_lease =
-                crate::server::checkout_access::acquire_selected_project_access(
+            let response = server.run_post_register_pipeline(record)?;
+            Ok(serde_json::to_string_pretty(&response)?)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("blocking task failed: {e}"))
+        .and_then(std::convert::identity);
+
+        match result {
+            Ok(text) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::info!(target: "blackbox::tool", tool = "bbox_project_register", elapsed_ms = ms, bytes = text.len(), "ok");
+                Self::ok_text(&text)
+            }
+            Err(e) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::warn!(target: "blackbox::tool", tool = "bbox_project_register", elapsed_ms = ms, error = %e, "err");
+                Self::err_text(&format!("Error: {e:#}"))
+            }
+        }
+    }
+
+    /// The post-register enrichment pipeline (plan §9.1): MCP migration,
+    /// project config + artifact discovery, provenance import, watcher and
+    /// kb registration, and the transcript-edge backfill, all behind the
+    /// same capability leases in both authority modes. Blocking work: call
+    /// from the blocking pool only.
+    fn run_post_register_pipeline(
+        &self,
+        record: crate::projects::ProjectRecord,
+    ) -> anyhow::Result<serde_json::Value> {
+        let server = self.clone();
+        {
+            let migration_lease = crate::server::checkout_access::acquire_selected_project_access(
                 &server.state.checkout_access,
                 &record.project_id,
                 CheckoutAccessKind::RepositoryMutation,
@@ -313,8 +375,7 @@ impl BlackboxServer {
                 .map_err(anyhow::Error::new)?;
             orchestration::mcp::migrate_project_mcp_path(migration_lease.project_root())?;
             drop(migration_publication);
-            let artifact_lease =
-                crate::server::checkout_access::acquire_selected_project_access(
+            let artifact_lease = crate::server::checkout_access::acquire_selected_project_access(
                 &server.state.checkout_access,
                 &record.project_id,
                 CheckoutAccessKind::ArtifactWatchDiscovery,
@@ -355,8 +416,7 @@ impl BlackboxServer {
             drop(artifact_publication);
             let project_config_loaded = true;
             let edges_dir = edge_index::edges_dir_from_bro_store(&server.state.store_dir);
-            let provenance_lease =
-                crate::server::checkout_access::acquire_selected_project_access(
+            let provenance_lease = crate::server::checkout_access::acquire_selected_project_access(
                 &server.state.checkout_access,
                 &record.project_id,
                 CheckoutAccessKind::ProvenanceNoteIo,
@@ -401,15 +461,11 @@ impl BlackboxServer {
             // are picked up without a daemon restart.
             if let Ok(mut guard) = server.state.bbox_watcher.lock() {
                 if let Some(w) = guard.as_mut() {
-                    match crate::watcher::ArtifactWatchCarrier::selected(
-                        record.project_id.clone(),
-                    ) {
+                    match crate::watcher::ArtifactWatchCarrier::selected(record.project_id.clone())
+                    {
                         Ok(carrier) => {
                             if let Err(e) = w.watch_project(carrier) {
-                                tracing::warn!(
-                                    "watcher add project {}: {e:#}",
-                                    record.project_id
-                                );
+                                tracing::warn!("watcher add project {}: {e:#}", record.project_id);
                             }
                         }
                         Err(e) => {
@@ -497,23 +553,7 @@ impl BlackboxServer {
                     "detail": "project registration is durable; project-file indexing and edge projection are picked up by the background reindexer after this response, and embeddings across all routes (docs/code/notes/visual:*) then converge automatically via the background residue sweeper — no manual bbox_reembed is required"
                 },
             });
-            Ok(serde_json::to_string_pretty(&response)?)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("blocking task failed: {e}"))
-        .and_then(std::convert::identity);
-
-        match result {
-            Ok(text) => {
-                let ms = start.elapsed().as_secs_f64() * 1000.0;
-                tracing::info!(target: "blackbox::tool", tool = "bbox_project_register", elapsed_ms = ms, bytes = text.len(), "ok");
-                Self::ok_text(&text)
-            }
-            Err(e) => {
-                let ms = start.elapsed().as_secs_f64() * 1000.0;
-                tracing::warn!(target: "blackbox::tool", tool = "bbox_project_register", elapsed_ms = ms, error = %e, "err");
-                Self::err_text(&format!("Error: {e:#}"))
-            }
+            Ok(response)
         }
     }
 
@@ -525,6 +565,7 @@ impl BlackboxServer {
         &self,
         Parameters(p): Parameters<ProjectInitParams>,
     ) -> CallToolResult {
+        let server = self.clone();
         Self::run_blocking("bbox_project_init", move || {
             let path = Path::new(&p.path);
             if !path.is_absolute() {
@@ -534,12 +575,27 @@ impl BlackboxServer {
                 anyhow::bail!("project path does not exist: {}", p.path);
             }
             let result = init_project_path(path, p.force)?;
+            // Catalog arm (plan §9.1): init stays a filesystem initializer;
+            // newly recorded authority inside a checkout attached to a
+            // legacy-local project reports promotion as the next action.
+            let next_action = server
+                .state
+                .project_authority
+                .catalog_store()
+                .and_then(|store| {
+                    server.init_catalog_next_action(
+                        store,
+                        &result.canonical,
+                        result.repo_id_recorded,
+                    )
+                });
             Ok(serde_json::to_string_pretty(&json!({
                 "project": result.canonical,
                 "created": result.created,
                 "skipped": result.skipped,
                 "repo_id": result.repo_id,
                 "repo_id_recorded": result.repo_id_recorded,
+                "next_action": next_action,
             }))?)
         })
         .await
@@ -547,13 +603,35 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_rename",
-        description = "Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, pins, packets, Slack channel bindings, live teams, whiteboards, pollers, and crons, then reindexes project files."
+        description = "Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, pins, packets, Slack channel bindings, live teams, whiteboards, pollers, and crons, then reindexes project files. In catalog mode rename is attachment relocation: the moved checkout must carry the same checkout-id marker and resolve the same scope, the ledger records the historical path, owner-store rows are never rewritten, and move_on_disk is refused (move first, then rename)."
     )]
     pub(crate) async fn bbox_project_rename(
         &self,
         Parameters(p): Parameters<ProjectRenameParams>,
     ) -> CallToolResult {
         let start = std::time::Instant::now();
+        // Catalog arm (plan §9.1): rename is attachment relocation with a
+        // ledger append; owner-store rows are never rewritten.
+        if let Some(store) = self.state.project_authority.catalog_store().cloned() {
+            let server = self.clone();
+            let result: anyhow::Result<String> =
+                tokio::task::spawn_blocking(move || server.rename_catalog_arm(&store, &p))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("blocking task failed: {e}"))
+                    .and_then(std::convert::identity);
+            return match result {
+                Ok(text) => {
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    tracing::info!(target: "blackbox::tool", tool = "bbox_project_rename", elapsed_ms = ms, bytes = text.len(), "ok");
+                    Self::ok_text(&text)
+                }
+                Err(e) => {
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    tracing::warn!(target: "blackbox::tool", tool = "bbox_project_rename", elapsed_ms = ms, error = %e, "err");
+                    Self::err_text(&format!("Error: {e:#}"))
+                }
+            };
+        }
         // Phase 1: rename in registry + async persist.
         let lifecycle = match self.state.checkout_access.lifecycle_mutation_guard() {
             Ok(guard) => guard,
@@ -671,13 +749,35 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_unregister",
-        description = "Unregister a project root from the bbox project registry. Accepts project (project_id, registered canonical_path, or absolute path). Removes the registry entry only; does NOT delete project-scoped state (knowledge, threads, notes, pins, packets, Slack bindings, teams, whiteboards, pollers, crons) keyed on the project_id, which is derived from the canonical realpath and is stable across unregister+re-register. By default refuses when refs still exist and returns the counts; pass force=true to orphan them, or bbox_project_rename to migrate first. dry_run=true previews counts without mutating the registry."
+        description = "Unregister a project root from the bbox project registry. Accepts project (project_id, registered canonical_path, or absolute path). Removes the registry entry only; does NOT delete project-scoped state (knowledge, threads, notes, pins, packets, Slack bindings, teams, whiteboards, pollers, crons) keyed on the project_id, which is derived from the canonical realpath and is stable across unregister+re-register. By default refuses when refs still exist and returns the counts; pass force=true to orphan them, or bbox_project_rename to migrate first. dry_run=true previews counts without mutating the registry. In catalog mode unregister is detach: the attachment is marked detached with census deregistration scoped to its checkout and scope pair, every logical store keeps its rows, and catalog deletion is the offline project-catalog retire surface."
     )]
     pub(crate) async fn bbox_project_unregister(
         &self,
         Parameters(p): Parameters<ProjectUnregisterParams>,
     ) -> CallToolResult {
         let start = std::time::Instant::now();
+        // Catalog arm (plan §9.1): unregister is detach; logical state
+        // stays and catalog deletion is the offline retire surface.
+        if let Some(store) = self.state.project_authority.catalog_store().cloned() {
+            let server = self.clone();
+            let result: anyhow::Result<String> =
+                tokio::task::spawn_blocking(move || server.unregister_catalog_arm(&store, &p))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("blocking task failed: {e}"))
+                    .and_then(std::convert::identity);
+            return match result {
+                Ok(text) => {
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    tracing::info!(target: "blackbox::tool", tool = "bbox_project_unregister", elapsed_ms = ms, bytes = text.len(), "ok");
+                    Self::ok_text(&text)
+                }
+                Err(e) => {
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    tracing::warn!(target: "blackbox::tool", tool = "bbox_project_unregister", elapsed_ms = ms, error = %e, "err");
+                    Self::err_text(&format!("Error: {e:#}"))
+                }
+            };
+        }
         let result: anyhow::Result<String> = async {
             let force = p.force.unwrap_or(false);
             let dry_run = p.dry_run.unwrap_or(false);
@@ -814,12 +914,19 @@ impl BlackboxServer {
         let server = self.clone();
         // Phase 1: fs + store work on the blocking pool.
         let fs_result = tokio::task::spawn_blocking(move || {
+            // Selection-class engine resolution (phase-2 §9.1): eject gains
+            // no catalog semantics beyond resolving through the shared
+            // resolver; the projection row supplies the record shape in
+            // both modes.
+            let resolved_id = server.validate_project_selection(&p.project)?;
             let record = server
                 .state
-                .project_authority
-                .bridge_registry()?
-                .read()
-                .resolve(&p.project)?
+                .records_provider
+                .records_snapshot()
+                .records
+                .iter()
+                .find(|record| record.project_id == resolved_id)
+                .cloned()
                 .with_context(|| format!("project not registered: {}", p.project))?;
             let dir = record.canonical_path.clone();
             let dry_run = p.dry_run.unwrap_or(false);

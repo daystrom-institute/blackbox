@@ -78,15 +78,21 @@ impl BlackboxServer {
             let Some(ref project) = p.project else {
                 anyhow::bail!("apply mode requires a project parameter");
             };
+            // Filter-class engine resolution (phase-2 §9.2 B6): resolution
+            // narrows by identity, and apply still requires the resolved or
+            // literal id to name a registered corpus project.
             let project_id = {
-                let registry = server.state.project_authority.bridge_registry()?;
-                let guard = registry.read();
-                match guard.resolve(project) {
-                    Ok(Some(record)) if registered.contains(&record.project_id) => {
-                        record.project_id
-                    }
+                let resolved = server
+                    .resolve_project_filter(project)
+                    .and_then(|resolution| resolution.project_id().map(str::to_owned));
+                match resolved {
+                    Some(id) if registered.contains(&id) => id,
                     _ => {
                         if registered.contains(project) {
+                            server.state.resolver_compat.record(
+                                "bbox_storage_migration",
+                                crate::server::resolver_compat::CompatLane::UnregisteredLiteralFilter,
+                            );
                             project.clone()
                         } else {
                             anyhow::bail!(

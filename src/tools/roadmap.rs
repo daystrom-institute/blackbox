@@ -329,12 +329,22 @@ impl BlackboxServer {
     }
 
     fn roadmap_list(&self, p: RoadmapSearchParams) -> anyhow::Result<String> {
+        // Catalog-mode ledger arm (plan §8.2): path-only items still keyed
+        // under one of this project's historical paths stay visible after
+        // relocation. Resolved before the store guard is taken; empty in
+        // bridge mode.
+        let ledger_paths = p
+            .project
+            .as_deref()
+            .map(|raw| self.filter_ledger_paths(raw))
+            .unwrap_or_default();
         let rm = self.state.roadmap.read();
         let items = rm.list(
             p.status.as_deref(),
             p.category.as_deref(),
             p.project.as_deref(),
             None,
+            &ledger_paths,
         );
         let th = self.state.threads.read();
         let limit = p.limit.unwrap_or(50).min(500);
@@ -574,12 +584,9 @@ impl BlackboxServer {
         // project_dir keys the thread to its registered base while the
         // committed record snapshots into the worktree checkout.
         let raw_project = p.project_dir.or(item.project.clone());
-        let resolved = raw_project.as_deref().and_then(|proj| {
-            crate::projects::fleet_worktree_scope_and_dir(
-                proj,
-                &self.state.records_provider.records_snapshot().records,
-            )
-        });
+        let resolved = raw_project
+            .as_deref()
+            .and_then(|proj| self.resolve_worktree_scope_and_dir(proj));
         let (thread_project, write_dir) = match resolved {
             Some((base, worktree)) => (Some(base), Some(worktree)),
             None => (raw_project, None),

@@ -64,18 +64,11 @@ impl BlackboxServer {
         &self,
         p: &BootstrapParams,
     ) -> anyhow::Result<String> {
-        let projects = self.state.records_provider.records_snapshot().records;
-        let scope_project = crate::projects::resolve_project_context(
-            &p.project,
-            &projects,
-            crate::projects::ResolveIntent::Read,
-        )
-        .and_then(|context| {
-            projects
-                .iter()
-                .find(|project| project.project_id == context.project_id)
-                .map(|project| project.canonical_path.clone())
-        });
+        // Filter-class engine resolution (phase-2 §9.2): bootstrap tolerates
+        // an unrecognized selector by proceeding unscoped, exactly as before.
+        let scope_project = self
+            .resolve_project_filter(&p.project)
+            .and_then(|resolution| resolution.store_key().map(str::to_owned));
         let view = self.session_knowledge_view(Some(&p.project), None)?;
         let output = view
             .knowledge

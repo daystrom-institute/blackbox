@@ -12,6 +12,7 @@ mod mcp;
 mod open;
 pub mod progress;
 pub(crate) mod repo_io;
+pub(crate) mod resolver_compat;
 pub mod response;
 mod restore;
 pub mod routes;

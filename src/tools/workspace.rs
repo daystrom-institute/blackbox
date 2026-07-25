@@ -12,7 +12,7 @@ use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, TermQuery};
 use tantivy::schema::IndexRecordOption;
 
-use crate::index::TranscriptIndex;
+use crate::index::{ProjectFilterInput, TranscriptIndex};
 use crate::knowledge::KnowledgeListParams;
 use crate::notes::{NoteListParams, NoteParams};
 use crate::orchestration::providers::dispatch_path_env;
@@ -443,7 +443,11 @@ pub struct WorkGitCommitParams {
 
 // ── Tool implementations ──────────────────────────────────────────────
 
-fn impl_work_tool_calls(idx: &TranscriptIndex, p: &WorkToolCallsParams) -> anyhow::Result<String> {
+fn impl_work_tool_calls(
+    idx: &TranscriptIndex,
+    p: &WorkToolCallsParams,
+    project_filter: Option<&ProjectFilterInput>,
+) -> anyhow::Result<String> {
     let searcher = idx.searcher();
     let fields = idx.field_handles();
 
@@ -524,18 +528,21 @@ fn impl_work_tool_calls(idx: &TranscriptIndex, p: &WorkToolCallsParams) -> anyho
                 .contains(target.as_str())
         });
     }
-    if let Some(ref project) = p.project {
-        // Substring on the literal cwd OR exact match on the stamped base
-        // project (gap-72fd5932) — a base-project selector matches calls
-        // made from every checkout/worktree of the project.
-        let filter_base = idx.base_project_filter_id(project);
+    // Substring on the literal cwd OR exact match on the stamped base
+    // project (gap-72fd5932): a base-project selector matches calls made
+    // from every checkout/worktree of the project. Resolution happens at
+    // the tool boundary; an unresolved selector keeps the substring lane.
+    let project_filter = project_filter
+        .cloned()
+        .or_else(|| p.project.as_deref().map(ProjectFilterInput::unresolved));
+    if let Some(filter) = project_filter.as_ref() {
+        let filter_base = filter.project_id.as_deref();
         rows.retain(|r| {
             r["project"]
                 .as_str()
                 .unwrap_or("")
-                .contains(project.as_str())
-                || (filter_base.is_some()
-                    && r["base_project_id"].as_str() == filter_base.as_deref())
+                .contains(filter.literal.as_str())
+                || (filter_base.is_some() && r["base_project_id"].as_str() == filter_base)
         });
     }
     if let Some(ref since) = p.since {
@@ -625,6 +632,7 @@ pub(crate) fn impl_work_smart_read(
         kind: None,
         project: None,
         project_id: None,
+        project_ledger_paths: Vec::new(),
         task_id: None,
         session_id: None,
         thread_id: None,
@@ -994,7 +1002,9 @@ impl BlackboxServer {
                     .run_reindex_pass(false, true)
                     .map_err(|e| anyhow::anyhow!("auto-index failed: {e}"))?;
             }
-            impl_work_tool_calls(&server.state.idx.read(), &p)
+            let project_filter =
+                crate::tools::transcripts::corpus_project_filter(&server, p.project.as_deref());
+            impl_work_tool_calls(&server.state.idx.read(), &p, project_filter.as_ref())
         })
         .await
     }
@@ -1315,7 +1325,7 @@ mod tests {
             limit: None,
         };
 
-        let result = impl_work_tool_calls(&idx, &p).unwrap();
+        let result = impl_work_tool_calls(&idx, &p, None).unwrap();
         assert!(result.contains("No tool-call documents found"));
     }
 

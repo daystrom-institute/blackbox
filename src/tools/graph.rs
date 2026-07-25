@@ -95,6 +95,26 @@ fn acquire_scope_discovery(
         .map_err(checkout_access_error)
 }
 
+/// Selection-class boundary validation through the shared engine (phase-2
+/// §9.2 B3). The bridge arm preserves the legacy error vocabulary for
+/// unknown selectors; the catalog arm surfaces the §5.4 typed codes.
+fn validate_explicit_project_selection(
+    server: &crate::server::BlackboxServer,
+    raw: &str,
+) -> Result<()> {
+    match server.resolve_project_selection(raw) {
+        Ok(_) => Ok(()),
+        Err(_) if server.state.project_authority.is_bridge() => {
+            bail!("error.project_not_registered: requested project id is not registered")
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Internal slice matcher over records the handler boundary has already
+/// validated through the shared engine (phase-2 §9.2): see
+/// `validate_explicit_project_selection` at each explicit-project entry
+/// point.
 fn unique_project(projects: &[ProjectRecord], project_id: &str) -> Result<ProjectRecord> {
     let mut matches = projects
         .iter()
@@ -684,6 +704,18 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_edge_compact", move || {
+            // §9.2 B3: raw sidecar ids stay a tagged v1 compatibility lane;
+            // the catalog arm fails closed on ids the catalog does not know.
+            if server.state.project_authority.is_bridge() {
+                if server.resolve_project_selection(&p.project_id).is_err() {
+                    server.state.resolver_compat.record(
+                        "bbox_edge_compact",
+                        crate::server::resolver_compat::CompatLane::RawSidecarId,
+                    );
+                }
+            } else {
+                server.validate_project_selection(&p.project_id)?;
+            }
             let edges_dir = edge_index::edges_dir_from_bro_store(&server.state.store_dir);
             let apply = p.apply.unwrap_or(false);
             let stats = edge_index::compact_legacy_sidecar(&edges_dir, &p.project_id, apply)?;
@@ -729,6 +761,7 @@ impl BlackboxServer {
                     line,
                     byte_offset,
                 } => {
+                    validate_explicit_project_selection(&server, &project_id)?;
                     let acquired =
                         acquire_project_file(&broker, &project_id, &indexed_path_hint, &projects)?;
                     (acquired, line, Some(byte_offset))
@@ -790,6 +823,9 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_provenance_export", move || {
+            if let Some(project_id) = p.project_id.as_deref() {
+                validate_explicit_project_selection(&server, project_id)?;
+            }
             let projects = server.state.records_provider.records_snapshot().records;
             let broker = crate::server::checkout_access::checkout_access_broker(&server.state);
             let (leases, inputs) =
@@ -877,6 +913,9 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_provenance_import", move || {
+            if let Some(project_id) = p.project_id.as_deref() {
+                validate_explicit_project_selection(&server, project_id)?;
+            }
             let projects = server.state.records_provider.records_snapshot().records;
             let broker = crate::server::checkout_access::checkout_access_broker(&server.state);
             let (leases, inputs) =

@@ -111,6 +111,14 @@ pub struct ThreadListParams {
     /// id, the id decides and the path predicate is not consulted.
     #[serde(default)]
     pub project_id: Option<String>,
+    /// Internal, not part of the MCP schema: historical path keys the
+    /// host-local `LegacyPathBinding` ledger maps to this query's project
+    /// (plan §8.2 catalog-mode arm), so path-only rows written before
+    /// attachment relocation stay visible. Empty on the bridge, which has no
+    /// ledger. Set by the daemon adapter, never accepted from the wire.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub project_ledger_paths: Vec<String>,
 }
 
 // ── Schema ─────────────────────────────────────────────────────────
@@ -1025,6 +1033,11 @@ impl Threads {
         let status_filter = p.status.as_deref();
         let project_filter = p.project.as_deref();
         let project_id_filter = p.project_id.as_deref();
+        let ledger_lower: Vec<String> = p
+            .project_ledger_paths
+            .iter()
+            .map(|path| path.to_lowercase())
+            .collect();
         let name_filter = p.name.as_deref();
         let min_idle_days = p.min_idle_days;
         let include_resolved = p.include_resolved.unwrap_or(false);
@@ -1066,10 +1079,16 @@ impl Threads {
 
             // Project filter. Dual-read (plan §8.2): ids on both sides decide,
             // whatever the paths say; either side missing an id keeps the path
-            // predicate.
+            // predicate. The ledger arm is catalog-mode only and matches a
+            // path-only row still keyed under a historical path of this
+            // project.
             if let Some(pf) = project_filter
                 && !project_scope_matches(thread.project_id.as_deref(), project_id_filter, || {
-                    thread.project.to_lowercase().contains(&pf.to_lowercase())
+                    let row_project = thread.project.to_lowercase();
+                    row_project.contains(&pf.to_lowercase())
+                        || ledger_lower
+                            .iter()
+                            .any(|historical| row_project.contains(historical.as_str()))
                 })
             {
                 continue;
@@ -1342,6 +1361,7 @@ mod tests {
                 status: None,
                 project: Some(root.to_string_lossy().into_owned()),
                 project_id: None,
+                project_ledger_paths: Vec::new(),
                 name: None,
                 min_idle_days: None,
                 include_resolved: None,
@@ -1758,6 +1778,7 @@ mod tests {
                 status: Some("active".into()),
                 project: None,
                 project_id: None,
+                project_ledger_paths: Vec::new(),
                 name: None,
                 min_idle_days: None,
                 include_resolved: None,
@@ -1804,6 +1825,7 @@ mod tests {
                 status: None,
                 project: None,
                 project_id: None,
+                project_ledger_paths: Vec::new(),
                 name: None,
                 min_idle_days: Some(7),
                 include_resolved: None,
@@ -1868,6 +1890,7 @@ mod tests {
                 status: Some("open".into()),
                 project: Some("/repo/x".into()),
                 project_id: None,
+                project_ledger_paths: Vec::new(),
                 name: None,
                 min_idle_days: None,
                 include_resolved: None,
@@ -1883,6 +1906,7 @@ mod tests {
                 status: Some("open".into()),
                 project: Some("/repo/x".into()),
                 project_id: None,
+                project_ledger_paths: Vec::new(),
                 name: None,
                 min_idle_days: None,
                 include_resolved: None,
@@ -2023,6 +2047,43 @@ mod tests {
         assert!(
             !out.contains("thread-cccccccc"),
             "id mismatch must hide: {out}"
+        );
+    }
+
+    #[test]
+    fn thread_ledger_paths_match_a_path_only_row_under_a_historical_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut threads = Threads::open(&dir.path().join("threads.json")).unwrap();
+        threads
+            .store
+            .threads
+            .push(dual_read_thread("thread-dddddddd", "/repo/old", None));
+
+        // Catalog-mode ledger arm: the relocated project queries by its
+        // current key, and the ledger's historical key still reaches the row.
+        let hit = threads
+            .thread_list(&ThreadListParams {
+                project: Some("/repo/relocated".into()),
+                project_ledger_paths: vec!["/repo/old".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            hit.contains("thread-dddddddd"),
+            "ledger arm must match: {hit}"
+        );
+
+        // Bridge mode carries no ledger paths, so the historical row stays
+        // invisible to the relocated key.
+        let miss = threads
+            .thread_list(&ThreadListParams {
+                project: Some("/repo/relocated".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            !miss.contains("thread-dddddddd"),
+            "no ledger path must not match: {miss}"
         );
     }
 }

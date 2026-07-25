@@ -7488,9 +7488,12 @@ mod tests {
             ("knowledge", include_str!("../tools/knowledge.rs")),
             ("threads", include_str!("../tools/threads.rs")),
         ] {
+            // Param-shaped matches only: the resolver attachment view's
+            // `checkout_project_dir` field (phase-2 §9.2) is internal data,
+            // not a wire param the pin glob could set.
             assert!(
-                !src.contains("project_dir"),
-                "src/tools/{name}.rs now mentions project_dir; re-check pin:*.project_dir glob safety"
+                !src.contains("\"project_dir\"") && !src.contains("project_dir: Option<String>"),
+                "src/tools/{name}.rs now carries a project_dir param; re-check pin:*.project_dir glob safety"
             );
             assert!(
                 !src.contains("\"cwd\"") && !src.contains("cwd: Option<String>"),

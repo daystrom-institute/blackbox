@@ -36,26 +36,73 @@ impl BlackboxServer {
         &self,
         Parameters(p): Parameters<McpSurfaceParams>,
     ) -> CallToolResult {
-        Self::run("bbox_mcp_surface", || match p.action.as_str() {
-            "replay" => self.handle_mcp_surface_replay(&p),
-            "list" => self.handle_mcp_surface_list(),
-            "describe" => self.handle_mcp_surface_describe(&p),
-            _ => Err(anyhow::anyhow!(
-                "unknown action '{}'. Valid actions: replay, list, describe",
-                p.action
-            )),
+        Self::run("bbox_mcp_surface", || {
+            // Filter-class engine resolution (phase-2 §9.2 B8), aligned
+            // with the `/mcp?project=` wire head: a resolving selector
+            // rewrites to the packet scope key (store key, or the stable
+            // project id for an attachment-less catalog identity); a miss
+            // keeps the literal. The resolved id additionally feeds the
+            // packet store's dual-read arm.
+            let mut p = p;
+            let mut resolved_project_id = None;
+            if let Some(raw) = p.project.clone() {
+                p.project = Some(match self.resolve_project_filter(&raw) {
+                    Some(resolution) => {
+                        resolved_project_id = resolution.project_id().map(str::to_owned);
+                        match resolution
+                            .store_key()
+                            .or(resolution.project_id())
+                            .map(str::to_owned)
+                        {
+                            Some(resolved) => resolved,
+                            None => {
+                                self.state.resolver_compat.record(
+                                    "bbox_mcp_surface",
+                                    crate::server::resolver_compat::CompatLane::UnregisteredLiteralFilter,
+                                );
+                                raw
+                            }
+                        }
+                    }
+                    None => {
+                        self.state.resolver_compat.record(
+                            "bbox_mcp_surface",
+                            crate::server::resolver_compat::CompatLane::UnregisteredLiteralFilter,
+                        );
+                        raw
+                    }
+                });
+            }
+            let resolved_project_id = resolved_project_id.as_deref();
+            match p.action.as_str() {
+                "replay" => self.handle_mcp_surface_replay(&p, resolved_project_id),
+                "list" => self.handle_mcp_surface_list(),
+                "describe" => self.handle_mcp_surface_describe(&p, resolved_project_id),
+                _ => Err(anyhow::anyhow!(
+                    "unknown action '{}'. Valid actions: replay, list, describe",
+                    p.action
+                )),
+            }
         })
     }
 }
 
 impl BlackboxServer {
-    fn handle_mcp_surface_replay(&self, p: &McpSurfaceParams) -> anyhow::Result<String> {
+    fn handle_mcp_surface_replay(
+        &self,
+        p: &McpSurfaceParams,
+        resolved_project_id: Option<&str>,
+    ) -> anyhow::Result<String> {
         let surface = p.surface.as_deref().unwrap_or("default");
         let entity = surface::build_surface_entity(surface, p.project.as_deref());
 
         let packets = self.state.packets.read();
-        let decision =
-            surface::evaluate_tool_surface(&packets, entity.clone(), p.project.as_deref());
+        let decision = surface::evaluate_tool_surface(
+            &packets,
+            entity.clone(),
+            p.project.as_deref(),
+            resolved_project_id,
+        );
         drop(packets);
 
         let tool_universe: Vec<String> = self
@@ -128,12 +175,16 @@ impl BlackboxServer {
         }))?)
     }
 
-    fn handle_mcp_surface_describe(&self, p: &McpSurfaceParams) -> anyhow::Result<String> {
+    fn handle_mcp_surface_describe(
+        &self,
+        p: &McpSurfaceParams,
+        resolved_project_id: Option<&str>,
+    ) -> anyhow::Result<String> {
         let packets = self.state.packets.read();
         let loaded = packets.load_latest_by_domain(
             surface::SURFACE_ROUTING_DOMAIN,
             p.project.as_deref(),
-            None,
+            resolved_project_id,
         );
         let packet = loaded?.ok_or_else(|| {
             anyhow::anyhow!(
@@ -177,7 +228,12 @@ impl BlackboxServer {
         let selected = p.surface.as_deref().unwrap_or("default");
         let entity = surface::build_surface_entity(selected, p.project.as_deref());
         let packets_guard = self.state.packets.read();
-        let decision = surface::evaluate_tool_surface(&packets_guard, entity, p.project.as_deref());
+        let decision = surface::evaluate_tool_surface(
+            &packets_guard,
+            entity,
+            p.project.as_deref(),
+            resolved_project_id,
+        );
         drop(packets_guard);
 
         let verdict_summary = match &decision.verdict {
@@ -292,11 +348,14 @@ mod tests {
         drop(packets);
 
         let result = server
-            .handle_mcp_surface_replay(&McpSurfaceParams {
-                action: "replay".to_string(),
-                surface: Some("readonly".to_string()),
-                project: None,
-            })
+            .handle_mcp_surface_replay(
+                &McpSurfaceParams {
+                    action: "replay".to_string(),
+                    surface: Some("readonly".to_string()),
+                    project: None,
+                },
+                None,
+            )
             .unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -336,11 +395,14 @@ mod tests {
         drop(packets);
 
         let result = server
-            .handle_mcp_surface_replay(&McpSurfaceParams {
-                action: "replay".to_string(),
-                surface: Some("unknown".to_string()),
-                project: None,
-            })
+            .handle_mcp_surface_replay(
+                &McpSurfaceParams {
+                    action: "replay".to_string(),
+                    surface: Some("unknown".to_string()),
+                    project: None,
+                },
+                None,
+            )
             .unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -381,11 +443,14 @@ mod tests {
         drop(packets);
 
         let result = server
-            .handle_mcp_surface_replay(&McpSurfaceParams {
-                action: "replay".to_string(),
-                surface: Some("default".to_string()),
-                project: Some(project_path.to_string()),
-            })
+            .handle_mcp_surface_replay(
+                &McpSurfaceParams {
+                    action: "replay".to_string(),
+                    surface: Some("default".to_string()),
+                    project: Some(project_path.to_string()),
+                },
+                None,
+            )
             .unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -403,11 +468,14 @@ mod tests {
         );
 
         let result_global = server
-            .handle_mcp_surface_replay(&McpSurfaceParams {
-                action: "replay".to_string(),
-                surface: Some("default".to_string()),
-                project: None,
-            })
+            .handle_mcp_surface_replay(
+                &McpSurfaceParams {
+                    action: "replay".to_string(),
+                    surface: Some("default".to_string()),
+                    project: None,
+                },
+                None,
+            )
             .unwrap();
 
         let parsed_global: serde_json::Value = serde_json::from_str(&result_global).unwrap();
@@ -485,11 +553,14 @@ mod tests {
         drop(packets);
 
         let result = server
-            .handle_mcp_surface_describe(&McpSurfaceParams {
-                action: "describe".to_string(),
-                surface: Some("readonly".to_string()),
-                project: None,
-            })
+            .handle_mcp_surface_describe(
+                &McpSurfaceParams {
+                    action: "describe".to_string(),
+                    surface: Some("readonly".to_string()),
+                    project: None,
+                },
+                None,
+            )
             .unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -509,11 +580,14 @@ mod tests {
     fn test_describe_no_packet_returns_error() {
         let (_tmp, server) = make_server();
 
-        let result = server.handle_mcp_surface_describe(&McpSurfaceParams {
-            action: "describe".to_string(),
-            surface: Some("readonly".to_string()),
-            project: None,
-        });
+        let result = server.handle_mcp_surface_describe(
+            &McpSurfaceParams {
+                action: "describe".to_string(),
+                surface: Some("readonly".to_string()),
+                project: None,
+            },
+            None,
+        );
 
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();

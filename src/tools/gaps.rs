@@ -129,11 +129,14 @@ impl BlackboxServer {
             let requested_project = p.project.clone();
             let view =
                 self.session_gap_view(requested_project.as_deref(), p.provisional.as_deref())?;
-            if let Some(base) = requested_project
-                .as_deref()
-                .and_then(|raw| self.rescope_project_filter_value(raw))
-            {
-                p.project = Some(base);
+            if let Some(raw) = requested_project.as_deref() {
+                // Catalog-mode ledger arm (plan §8.2): path-only gaps still
+                // keyed under one of this project's historical paths stay
+                // visible after relocation. Empty in bridge mode.
+                p.project_ledger_paths = self.filter_ledger_paths(raw);
+                if let Some(base) = self.rescope_project_filter_value(raw) {
+                    p.project = Some(base);
+                }
             }
             let mut used_stamp_refs = Vec::<String>::new();
             let rows = view

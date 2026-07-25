@@ -65,10 +65,15 @@ impl ProjectAuthority {
         }
     }
 
+    /// True when the version-1 registry is the runtime authority. The
+    /// compatibility lanes (unregistered-write pass-through, literal filter
+    /// fallbacks) exist only on this arm; catalog mode fails closed instead.
+    pub(crate) fn is_bridge(&self) -> bool {
+        matches!(self, ProjectAuthority::Bridge { .. })
+    }
+
     /// The strict pair store when the catalog is the runtime authority.
-    /// Consumed by the administration milestone's catalog operations; until
-    /// those land the accessor exists so the authority's shape is complete.
-    #[allow(dead_code)]
+    /// Consumed by the administration tools' catalog operations.
     pub(crate) fn catalog_store(
         &self,
     ) -> Option<&Arc<bbox_indexing::project_catalog_store::ProjectCatalogStore>> {
@@ -115,6 +120,9 @@ pub(crate) struct SharedState {
     /// remain owned by the consumer being migrated.
     pub(crate) checkout_access_observations:
         bbox_indexing::checkout_access::CheckoutAccessObservations,
+    /// Per-surface resolver compatibility-lane counters (phase-2 §9.2):
+    /// the observations the Phase 6 compatibility cut consumes.
+    pub(crate) resolver_compat: crate::server::resolver_compat::ResolverCompatObservations,
     /// Single daemon-owned checkout authority. Every checkout consumer reuses
     /// this broker so counters and authority state cannot diverge per call.
     pub(crate) checkout_access: Arc<bbox_indexing::checkout_access::CheckoutAccessBroker>,
@@ -641,6 +649,9 @@ impl SharedState {
             records_provider,
             checkout_registry,
             checkout_access_observations,
+            resolver_compat: crate::server::resolver_compat::ResolverCompatObservations::open(
+                store_dir.join("resolver-compat-observations.json"),
+            ),
             checkout_access,
             publisher_refs: RwLock::new(
                 bbox_indexing::publisher::PublisherRefStore::open(

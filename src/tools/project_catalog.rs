@@ -1071,6 +1071,303 @@ fn commit_present_in_checkout(accepted_commit: &str, checkout_project_dir: &Path
     bbox_corpus_core::git::verify_commit_oid_with_alternate(&root, accepted_commit, None).is_ok()
 }
 
+// ── Lifecycle catalog arms (plan §9.1) ─────────────────────────────────
+//
+// The five compatibility lifecycle tools dispatch here in catalog mode. They
+// carry no expected_catalog_epoch (version-1 wire compatibility), so each
+// arm pins the epoch from its own snapshot read; a concurrent admin mutation
+// surfaces as the store's stale-epoch refusal, never a silent retry.
+
+impl BlackboxServer {
+    /// `bbox_project_register` catalog composite: probe, find-or-create by
+    /// validated scope + active attachment, attach in one pair transaction,
+    /// then ingest alias nominations. Returns the registered projection row
+    /// for the shared enrichment pipeline.
+    pub(crate) fn register_catalog_arm(
+        &self,
+        store: &Arc<ProjectCatalogStore>,
+        path: &str,
+    ) -> anyhow::Result<(
+        bbox_corpus_core::project_record::ProjectRecord,
+        serde_json::Value,
+    )> {
+        let probe = probe_checkout(path)?;
+        let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&probe.checkout_dir)?;
+        let display_name = probe
+            .checkout_project_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| probe.checkout_project_dir.to_string_lossy().into_owned());
+        let attach_probe = project_catalog_admin::AttachProbe {
+            checkout_id,
+            checkout_dir: probe.checkout_dir.to_string_lossy().into_owned(),
+            checkout_project_dir: probe.checkout_project_dir.to_string_lossy().into_owned(),
+            project_root_relpath: probe.project_root_relpath.clone(),
+            kind: probe.kind.clone(),
+            validated_scope: probe.validated_scope.clone(),
+            computed_repo_hint: None,
+            branch_ref: probe.branch_ref.clone(),
+            capabilities: probe.capabilities.clone(),
+            attached_at: now_rfc3339(),
+        };
+        let epoch = store
+            .snapshot()
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            .epoch();
+        let receipt = project_catalog_admin::register_composite(
+            &store,
+            epoch,
+            &attach_probe,
+            &display_name,
+            &now_rfc3339(),
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        // Nomination ingestion (plan §7.6): a refused or empty nomination
+        // set never fails the registration that already committed.
+        let nomination_epoch = receipt
+            .commit
+            .as_ref()
+            .map(|commit| commit.epoch)
+            .unwrap_or(epoch);
+        let nominated = ingest_alias_nominations(
+            store,
+            nomination_epoch,
+            &receipt.project_id,
+            &probe.declared_aliases,
+        );
+        let record = self
+            .state
+            .records_provider
+            .records_snapshot()
+            .records
+            .iter()
+            .find(|record| record.project_id == receipt.project_id.as_str())
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "registered attachment did not surface in the compatibility projection"
+                )
+            })?;
+        let summary = json!({
+            "project_id": receipt.project_id.as_str(),
+            "attachment_id": receipt.attachment_id.as_str(),
+            "created_project": receipt.created_project,
+            "already_attached": receipt.already_attached,
+            "epoch": nominated.epoch.or(receipt.commit.as_ref().map(|c| c.epoch)),
+            "nominated_aliases": nominated.recorded,
+        });
+        Ok((record, summary))
+    }
+
+    /// `bbox_project_rename` catalog arm: attachment relocation. Same
+    /// checkout identity (marker-proved), same validated scope, same
+    /// relpath; one pair transaction updates the attachment paths and
+    /// appends the §8.4 ledger row. No owner-store rows are rewritten.
+    pub(crate) fn rename_catalog_arm(
+        &self,
+        store: &Arc<ProjectCatalogStore>,
+        p: &bbox_indexing::projects::ProjectRenameParams,
+    ) -> anyhow::Result<String> {
+        if p.move_on_disk.unwrap_or(false) {
+            anyhow::bail!(
+                "error.project_catalog_admin_unsupported: catalog-mode rename records a \
+                 relocation after the checkout has moved; move the directory first and \
+                 re-run without move_on_disk"
+            );
+        }
+        let dry_run = p.dry_run.unwrap_or(false);
+        // Resolve the existing attachment through the shared engine: the
+        // selector may be the OLD path, the project id, or an alias.
+        let state = store
+            .snapshot()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let engine = ProjectResolverEngine::v2(state.catalog(), state.attachments());
+        let resolved = engine
+            .resolve_attached(&ProjectSelectorRequest::selection(
+                p.project.clone(),
+                bbox_corpus_core::project_selector::ResolveIntent::Write,
+            ))
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let bbox_corpus_core::project_selector::ResolvedAttachment::Catalog {
+            attachment_id, ..
+        } = &resolved.attachment
+        else {
+            anyhow::bail!("error.project_selector_unknown: {}", p.project);
+        };
+        let attachment_id = parse_attachment_id(attachment_id)?;
+        let row = state
+            .attachments()
+            .attachments
+            .get(&attachment_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("resolved attachment vanished from the snapshot"))?;
+        let owner_scope = state
+            .catalog()
+            .projects
+            .get(&row.project_id)
+            .map(|project| project.scope.clone())
+            .ok_or_else(|| anyhow::anyhow!("attachment references an unknown project"))?;
+        let epoch = state.epoch();
+        drop(state);
+
+        // Probe the NEW path. Sameness is the durable checkout-id marker,
+        // read (never minted) at the moved location: path existence and
+        // inode reuse never prove sameness.
+        let new_probe = probe_checkout(&p.new_path)?;
+        let marker = new_probe.checkout_dir.join(".bbox/local/checkout-id");
+        let moved_checkout_id = bbox_corpus_core::identity::read_checkout_id(&marker)
+            .ok()
+            .flatten();
+        let Some(moved_checkout_id) = moved_checkout_id else {
+            let instruction = match owner_scope {
+                ProjectScope::LegacyLocal => {
+                    "the moved directory carries no checkout identity marker; run \
+                     bbox_project_init at the new path to establish identity, or detach \
+                     the old attachment and re-attach the new path explicitly"
+                }
+                ProjectScope::Published(_) => {
+                    "the moved directory carries no checkout identity marker; detach the \
+                     old attachment and re-attach the new path explicitly"
+                }
+            };
+            anyhow::bail!("error.project_catalog_admin_checkout_identity_missing: {instruction}");
+        };
+        let relocation = project_catalog_admin::RelocationProbe {
+            checkout_id: moved_checkout_id,
+            new_checkout_dir: new_probe.checkout_dir.to_string_lossy().into_owned(),
+            new_checkout_project_dir: new_probe
+                .checkout_project_dir
+                .to_string_lossy()
+                .into_owned(),
+            resolved_scope: new_probe.validated_scope.clone(),
+        };
+        if dry_run {
+            // Read-only agreement report; the apply path revalidates inside
+            // the transaction.
+            let identity_matches = relocation.checkout_id == row.checkout_id;
+            return Ok(serde_json::to_string_pretty(&json!({
+                "status": "dry_run",
+                "project_id": row.project_id.as_str(),
+                "attachment_id": attachment_id.as_str(),
+                "old_checkout_project_dir": row.checkout_project_dir,
+                "new_checkout_project_dir": relocation.new_checkout_project_dir,
+                "checkout_identity_matches": identity_matches,
+                "owner_store_rows_rewritten": false,
+            }))?);
+        }
+        let commit =
+            project_catalog_admin::relocate_attachment(&store, epoch, &attachment_id, &relocation)
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+        Ok(serde_json::to_string_pretty(&json!({
+            "status": "ok",
+            "project_id": row.project_id.as_str(),
+            "attachment_id": attachment_id.as_str(),
+            "old_checkout_project_dir": row.checkout_project_dir,
+            "new_checkout_project_dir": relocation.new_checkout_project_dir,
+            "ledger_binding_appended": true,
+            "owner_store_rows_rewritten": false,
+            "epoch": commit.epoch,
+            "catalog_sha256": commit.catalog_sha256,
+            "attachments_sha256": commit.attachments_sha256,
+        }))?)
+    }
+
+    /// `bbox_project_unregister` catalog arm: unregister is detach. Logical
+    /// state stays untouched; catalog deletion is the offline retire
+    /// surface.
+    pub(crate) fn unregister_catalog_arm(
+        &self,
+        store: &Arc<ProjectCatalogStore>,
+        p: &bbox_indexing::projects::ProjectUnregisterParams,
+    ) -> anyhow::Result<String> {
+        let dry_run = p.dry_run.unwrap_or(false);
+        let state = store
+            .snapshot()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let engine = ProjectResolverEngine::v2(state.catalog(), state.attachments());
+        let resolved = engine
+            .resolve_attached(&ProjectSelectorRequest::selection(
+                p.project.clone(),
+                bbox_corpus_core::project_selector::ResolveIntent::Write,
+            ))
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let bbox_corpus_core::project_selector::ResolvedAttachment::Catalog {
+            attachment_id, ..
+        } = &resolved.attachment
+        else {
+            anyhow::bail!("error.project_selector_unknown: {}", p.project);
+        };
+        let attachment_id = parse_attachment_id(attachment_id)?;
+        let row = state
+            .attachments()
+            .attachments
+            .get(&attachment_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("resolved attachment vanished from the snapshot"))?;
+        let epoch = state.epoch();
+        drop(state);
+        if dry_run {
+            return Ok(serde_json::to_string_pretty(&json!({
+                "status": "dry_run",
+                "project_id": row.project_id.as_str(),
+                "attachment_id": attachment_id.as_str(),
+                "would_detach": true,
+                "logical_state": "preserved",
+                "catalog_deletion": "blackbox project-catalog retire",
+            }))?);
+        }
+        let commit =
+            project_catalog_admin::detach_attachment(&store, epoch, &attachment_id, &now_rfc3339())
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let census_removed = self.deregister_detached_pair(&row);
+        Ok(serde_json::to_string_pretty(&json!({
+            "status": "ok",
+            "project_id": row.project_id.as_str(),
+            "attachment_id": attachment_id.as_str(),
+            "detached": true,
+            "census_row_removed": census_removed,
+            "logical_state": "preserved",
+            "catalog_deletion": "blackbox project-catalog retire",
+            "epoch": commit.epoch,
+        }))?)
+    }
+
+    /// `bbox_project_init` catalog follow-up: when init newly records repo
+    /// authority inside a checkout attached to a `LegacyLocal` project,
+    /// promotion is the required next action (plan §9.1).
+    pub(crate) fn init_catalog_next_action(
+        &self,
+        store: &Arc<ProjectCatalogStore>,
+        canonical_path: &str,
+        repo_id_recorded: bool,
+    ) -> Option<serde_json::Value> {
+        if !repo_id_recorded {
+            return None;
+        }
+        let state = store.snapshot().ok()?;
+        let engine = ProjectResolverEngine::v2(state.catalog(), state.attachments());
+        let resolved = engine
+            .resolve_attached(&ProjectSelectorRequest::selection(
+                canonical_path.to_string(),
+                bbox_corpus_core::project_selector::ResolveIntent::Read,
+            ))
+            .ok()?;
+        let project_id = resolved.project.project_id().to_owned();
+        let owner = state
+            .catalog()
+            .projects
+            .get(&ProjectId::parse(&project_id).ok()?)?;
+        matches!(owner.scope, ProjectScope::LegacyLocal).then(|| {
+            json!({
+                "action": "promotion_required",
+                "project_id": project_id,
+                "detail": "this checkout now records repo authority for a legacy-local \
+                           project; run bbox_project_promote to publish it",
+            })
+        })
+    }
+}
+
 #[cfg(test)]
 // Test fixtures build throwaway checkout directories directly; the handler
 // bodies keep routing their filesystem work through the blocking pool.

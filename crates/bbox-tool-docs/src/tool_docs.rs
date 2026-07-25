@@ -348,7 +348,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_project_register",
         category: ToolCategory::Projects,
-        summary: "Register a project directory and schedule background agentic-corpus indexing. The path must be an absolute directory path (file paths and missing paths are rejected). Re-registering the same canonical path is idempotent — returns the existing record without modifying registered_at. project_id is derived from canonicalized realpath and is per-machine; repo_id derives from first commit SHA with remote fallback. Use bbox_project_list to inspect registered projects.",
+        summary: "Register a project directory and schedule background agentic-corpus indexing. The path must be an absolute directory path (file paths and missing paths are rejected). Re-registering the same canonical path is idempotent — returns the existing record without modifying registered_at. project_id is derived from canonicalized realpath and is per-machine; repo_id derives from first commit SHA with remote fallback. In catalog mode this is the find-or-create composite: the checkout attaches to the project owning its committed scope (or a new Published/LegacyLocal project is minted), config-declared aliases become pending nominations, and a scope disagreement returns the exact promotion or scope-migration handoff instead of a second project. Use bbox_project_list to inspect registered projects.",
         when_to_use: "Use before S2+ needs a repo root. Symlink aliases collapse to one `project_id`; git repos also get `repo_id`.",
         example: None,
     },
@@ -362,7 +362,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_project_rename",
         category: ToolCategory::Projects,
-        summary: "Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, pins, packets, Slack channel bindings, live teams, whiteboards, pollers, and crons, then reindexes project files.",
+        summary: "Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, pins, packets, Slack channel bindings, live teams, whiteboards, pollers, and crons, then reindexes project files. In catalog mode rename is attachment relocation: the moved checkout must carry the same checkout-id marker and resolve the same scope, the ledger records the historical path, owner-store rows are never rewritten, and move_on_disk is refused (move first, then rename).",
         when_to_use: "Use after renaming a repo directory, or with `move_on_disk=true` to let bbox move the directory first. Prefer `dry_run=true` before changing several project names so the affected state counts are visible.",
         example: Some(
             r#"bbox_project_rename(project="d723917f", new_path="/home/me/repos/blackbox", dry_run=true)"#,
@@ -385,7 +385,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_project_unregister",
         category: ToolCategory::Projects,
-        summary: "Unregister a project root from the bbox project registry. Accepts project (project_id, registered canonical_path, or absolute path). Removes the registry entry only; does NOT delete project-scoped state (knowledge, threads, notes, pins, packets, Slack bindings, teams, whiteboards, pollers, crons) keyed on the project_id, which is derived from the canonical realpath and is stable across unregister+re-register. By default refuses when refs still exist and returns the counts; pass force=true to orphan them, or bbox_project_rename to migrate first. dry_run=true previews counts without mutating the registry.",
+        summary: "Unregister a project root from the bbox project registry. Accepts project (project_id, registered canonical_path, or absolute path). Removes the registry entry only; does NOT delete project-scoped state (knowledge, threads, notes, pins, packets, Slack bindings, teams, whiteboards, pollers, crons) keyed on the project_id, which is derived from the canonical realpath and is stable across unregister+re-register. By default refuses when refs still exist and returns the counts; pass force=true to orphan them, or bbox_project_rename to migrate first. dry_run=true previews counts without mutating the registry. In catalog mode unregister is detach: the attachment is marked detached with census deregistration scoped to its checkout and scope pair, every logical store keeps its rows, and catalog deletion is the offline project-catalog retire surface.",
         when_to_use: "Use to drop a stale or accidentally-registered project root without hand-editing projects.json. Prefer `dry_run=true` first to see what is still attached, then `bbox_project_rename` to migrate or `force=true` to accept orphaning.",
         example: Some(
             r#"bbox_project_unregister(project="/home/me/repos/dead-project", dry_run=true)"#,

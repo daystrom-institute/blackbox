@@ -47,6 +47,14 @@ pub struct PinParams {
     /// accepted from the wire, so identity cannot be caller-asserted.
     #[serde(skip)]
     pub project_id: Option<String>,
+    /// Internal, not part of the MCP schema: historical path keys the
+    /// host-local `LegacyPathBinding` ledger maps to this query's project
+    /// (plan §8.2 catalog-mode arm), so path-only rows written before
+    /// attachment relocation stay visible on `list`. Empty on the bridge,
+    /// which has no ledger.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub project_ledger_paths: Vec<String>,
 }
 
 #[derive(
@@ -299,12 +307,17 @@ impl Pins {
             .filter(|pin| match p.project.as_deref() {
                 // Dual-read (plan §8.2): ids on both sides decide, whatever the
                 // paths say; either side missing an id keeps the path predicate.
+                // The ledger arm is catalog-mode only and matches a path-only
+                // row still keyed under a historical path of this project.
                 Some(project) => project_scope_matches(
                     pin.project_id.as_deref(),
                     p.project_id.as_deref(),
                     || {
                         pin.project.as_deref() == Some(project)
                             || (pin.project.is_some() && pin.project == p.project_alias)
+                            || p.project_ledger_paths.iter().any(|historical| {
+                                pin.project.as_deref() == Some(historical.as_str())
+                            })
                     },
                 ),
                 None => true,
@@ -450,6 +463,7 @@ mod tests {
                 target: Some("executor".into()),
                 project: Some("/repo/x".into()),
                 project_id: None,
+                project_ledger_paths: Vec::new(),
                 expires_at: None,
                 project_alias: None,
             })
@@ -492,6 +506,7 @@ mod tests {
                 target: Some(target.into()),
                 project: Some("/repo/x".into()),
                 project_id: None,
+                project_ledger_paths: Vec::new(),
                 expires_at: None,
                 project_alias: None,
             })
@@ -531,6 +546,7 @@ mod tests {
             target: Some("executor".into()),
             project: Some("/repo/x".into()),
             project_id: None,
+            project_ledger_paths: Vec::new(),
             expires_at: None,
             project_alias: None,
         })
@@ -590,6 +606,7 @@ mod tests {
             target: Some("executor".into()),
             project: None,
             project_id: None,
+            project_ledger_paths: Vec::new(),
             expires_at: None,
             project_alias: None,
         })
@@ -687,6 +704,7 @@ mod tests {
                 target: Some("executor".into()),
                 project: Some("/repo/x".into()),
                 project_id: None,
+                project_ledger_paths: Vec::new(),
                 expires_at: None,
                 project_alias: None,
             })
@@ -749,6 +767,7 @@ mod tests {
             target: None,
             project: Some(project.into()),
             project_id: project_id.map(str::to_string),
+            project_ledger_paths: Vec::new(),
             expires_at: None,
             project_alias: None,
         }
@@ -836,5 +855,27 @@ mod tests {
             .pin(&dual_read_query("/repo/old", Some("def67890")))
             .unwrap();
         assert!(!out.contains("executor"), "id mismatch must hide: {out}");
+    }
+
+    #[test]
+    fn pin_ledger_paths_match_a_path_only_row_under_a_historical_path() {
+        let dir = tempdir().unwrap();
+        let mut pins = Pins::open(&dir.path().join("pins.json")).unwrap();
+        pins.store.pins.push(dual_read_pin("/repo/old", None));
+
+        // Catalog-mode ledger arm: the relocated project queries by its
+        // current key, and the ledger's historical key still reaches the row.
+        let mut query = dual_read_query("/repo/relocated", None);
+        query.project_ledger_paths = vec!["/repo/old".into()];
+        let hit = pins.pin(&query).unwrap();
+        assert!(hit.contains("executor"), "ledger arm must match: {hit}");
+
+        // Bridge mode carries no ledger paths, so the historical row stays
+        // invisible to the relocated key.
+        let miss = pins.pin(&dual_read_query("/repo/relocated", None)).unwrap();
+        assert!(
+            !miss.contains("executor"),
+            "no ledger path must not match: {miss}"
+        );
     }
 }

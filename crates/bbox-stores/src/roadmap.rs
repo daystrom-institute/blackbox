@@ -479,13 +479,17 @@ impl Roadmap {
             .collect()
     }
 
-    /// List items with optional filters.
+    /// List items with optional filters. `project_ledger_paths` carries the
+    /// catalog-mode ledger arm of plan §8.2: historical path keys the
+    /// host-local `LegacyPathBinding` ledger maps to the query's project.
+    /// Empty on the bridge, which has no ledger.
     pub fn list(
         &self,
         status: Option<&str>,
         category: Option<&str>,
         project: Option<&str>,
         project_id: Option<&str>,
+        project_ledger_paths: &[String],
     ) -> Vec<&RoadmapItem> {
         self.store
             .items
@@ -518,9 +522,17 @@ impl Roadmap {
                     }
                     // Dual-read (plan §8.2): ids on both sides decide, whatever
                     // the paths say; either side missing an id keeps the path
-                    // predicate.
+                    // predicate. The ledger arm is catalog-mode only and
+                    // matches a path-only row still keyed under a historical
+                    // path of this project; an item carrying no project key
+                    // stays matched as before.
                     return project_scope_matches(i.project_id.as_deref(), project_id, || {
-                        i.project.as_deref().is_none_or(|ip| ip.contains(p))
+                        i.project.as_deref().is_none_or(|ip| {
+                            ip.contains(p)
+                                || project_ledger_paths
+                                    .iter()
+                                    .any(|historical| ip.contains(historical.as_str()))
+                        })
                     });
                 }
                 true
@@ -1324,7 +1336,7 @@ mod tests {
             .items
             .push(dual_read_item("rm-aaaaaaaa", "/repo/old", Some("abc12345")));
 
-        let hits = roadmap.list(None, None, Some("/repo/relocated"), Some("abc12345"));
+        let hits = roadmap.list(None, None, Some("/repo/relocated"), Some("abc12345"), &[]);
         assert_eq!(hits.len(), 1, "id arm must match");
     }
 
@@ -1337,10 +1349,10 @@ mod tests {
             .items
             .push(dual_read_item("rm-bbbbbbbb", "/repo/old", None));
 
-        let miss = roadmap.list(None, None, Some("/repo/relocated"), Some("abc12345"));
+        let miss = roadmap.list(None, None, Some("/repo/relocated"), Some("abc12345"), &[]);
         assert!(miss.is_empty(), "path arm must decide");
 
-        let hit = roadmap.list(None, None, Some("/repo/old"), None);
+        let hit = roadmap.list(None, None, Some("/repo/old"), None, &[]);
         assert_eq!(hit.len(), 1, "path arm must match");
     }
 
@@ -1355,7 +1367,28 @@ mod tests {
 
         // Same path key, different ids: the id decides against the row, so a
         // path reused after a retire-and-add cannot leak the old rows.
-        let hits = roadmap.list(None, None, Some("/repo/old"), Some("def67890"));
+        let hits = roadmap.list(None, None, Some("/repo/old"), Some("def67890"), &[]);
         assert!(hits.is_empty(), "id mismatch must hide");
+    }
+
+    #[test]
+    fn roadmap_ledger_paths_match_a_path_only_row_under_a_historical_path() {
+        let dir = tempdir().unwrap();
+        let mut roadmap = Roadmap::open(&dir.path().join("roadmap.json")).unwrap();
+        roadmap
+            .store
+            .items
+            .push(dual_read_item("rm-dddddddd", "/repo/old", None));
+
+        // Catalog-mode ledger arm: the relocated project queries by its
+        // current key, and the ledger's historical key still reaches the row.
+        let ledger = vec!["/repo/old".to_string()];
+        let hit = roadmap.list(None, None, Some("/repo/relocated"), None, &ledger);
+        assert_eq!(hit.len(), 1, "ledger arm must match");
+
+        // Bridge mode carries no ledger paths, so the historical row stays
+        // invisible to the relocated key.
+        let miss = roadmap.list(None, None, Some("/repo/relocated"), None, &[]);
+        assert!(miss.is_empty(), "no ledger path must not match");
     }
 }
