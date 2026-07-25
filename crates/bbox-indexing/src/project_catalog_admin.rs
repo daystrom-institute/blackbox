@@ -1164,6 +1164,161 @@ pub fn retire_project(
     Ok((inventory, Some(commit)))
 }
 
+/// Operator-attested unattached scope migration (plan §7.5, governing
+/// §7.2): the offline CLI channel for a project with zero active
+/// attachments. Refuses when any active attachment exists (the online
+/// attachment-proved channel owns that case), requires the explicit
+/// unattached acknowledgement and a bounded reason (strict validation
+/// makes an attested record without a reason unrepresentable), writes the
+/// `OperatorAttested` record with no proof row, and never relocates
+/// attachment rows because none are active.
+pub fn scope_migrate_attested(
+    store: &ProjectCatalogStore,
+    expected_epoch: u64,
+    request: &ScopeMigrationRequest,
+    acknowledge_unattached_scope_migration: bool,
+) -> AdminResult<ScopeTransitionReceipt> {
+    use bbox_corpus_core::project_catalog::{
+        RecordedRepoAuthority, RepoHistoryAuthority, ScopeMigrationAuthorityProvenance,
+        ScopeMigrationId, ScopeMigrationKind, ScopeMigrationRecord,
+    };
+
+    if !acknowledge_unattached_scope_migration {
+        return Err(admin_error(
+            "error.project_catalog_admin_acknowledgement_required",
+            "unattached scope migration requires the explicit operator \
+             acknowledgement flag",
+        ));
+    }
+    if request.operator_reason.is_none() {
+        return Err(admin_error(
+            "error.project_catalog_admin_reason_required",
+            "operator-attested migration requires a bounded reason",
+        ));
+    }
+    let new_epoch = expected_epoch.checked_add(1).ok_or_else(|| {
+        admin_error(
+            "error.project_catalog_admin_epoch_overflow",
+            "catalog epoch cannot be incremented",
+        )
+    })?;
+    let migration_id = ScopeMigrationId::mint();
+    let receipt_id = migration_id.clone();
+    let request = request.clone();
+    let commit = store.transact(expected_epoch, move |catalog, attachments| {
+        if attachments.attachments.values().any(|row| {
+            row.status == AttachmentStatus::Attached && row.project_id == request.project_id
+        }) {
+            return Err(admin_error(
+                "error.project_catalog_admin_attachments_active",
+                "active attachments exist; use the attachment-proved channel",
+            ));
+        }
+        let Some(project) = catalog.projects.get(&request.project_id) else {
+            return Err(admin_error(
+                "error.project_catalog_admin_unknown_project",
+                format!("project {} is not in the catalog", request.project_id),
+            ));
+        };
+        let ProjectScope::Published(current) = &project.scope else {
+            return Err(admin_error(
+                "error.project_catalog_admin_not_published",
+                "scope migration applies only to a published project",
+            ));
+        };
+        if current != &request.expected_old_scope {
+            return Err(admin_error(
+                "error.project_catalog_admin_scope_mismatch",
+                "the project no longer carries the expected old scope",
+            ));
+        }
+        match request.kind {
+            ScopeMigrationKind::RelpathMove => {
+                if request.new_scope.repo_id() != current.repo_id()
+                    || request.new_scope.bbox_root_relpath() == current.bbox_root_relpath()
+                {
+                    return Err(admin_error(
+                        "error.project_catalog_admin_migration_shape",
+                        "a relpath move keeps the repository and changes the relpath",
+                    ));
+                }
+            }
+            ScopeMigrationKind::RepoAuthorityChange => {
+                if request.new_scope.repo_id() == current.repo_id()
+                    || request.new_scope.bbox_root_relpath() != current.bbox_root_relpath()
+                {
+                    return Err(admin_error(
+                        "error.project_catalog_admin_migration_shape",
+                        "an authority change keeps the relpath and changes the repository",
+                    ));
+                }
+                if !request.acknowledge_repo_authority_change {
+                    return Err(admin_error(
+                        "error.project_catalog_admin_acknowledgement_required",
+                        "a recorded-authority change requires its explicit operator \
+                         acknowledgement flag",
+                    ));
+                }
+            }
+            ScopeMigrationKind::Promotion => {
+                return Err(admin_error(
+                    "error.project_catalog_admin_migration_shape",
+                    "promotion is attachment-proved only and never operator-attested",
+                ));
+            }
+        }
+        if catalog.projects.values().any(|other| {
+            other.project_id != request.project_id
+                && matches!(&other.scope, ProjectScope::Published(s) if s == &request.new_scope)
+        }) {
+            return Err(admin_error(
+                "error.project_catalog_admin_scope_owned",
+                "the target scope is already owned; use the offline survivor workflow",
+            ));
+        }
+        if request.kind == ScopeMigrationKind::RepoAuthorityChange
+            && let Some(history_id) = catalog
+                .projects
+                .get(&request.project_id)
+                .and_then(|p| p.repo_history.clone())
+        {
+            let authority = RecordedRepoAuthority::parse(request.new_scope.repo_id())
+                .map_err(|error| admin_error(error.code(), error.to_string()))?;
+            if let Some(record) = catalog.repo_histories.get_mut(&history_id) {
+                record.authority = RepoHistoryAuthority::Recorded(authority);
+            }
+        }
+        let project = catalog
+            .projects
+            .get_mut(&request.project_id)
+            .expect("checked above");
+        project.scope = ProjectScope::Published(request.new_scope.clone());
+        catalog.scope_migrations.insert(
+            receipt_id.clone(),
+            ScopeMigrationRecord {
+                scope_migration_id: receipt_id.clone(),
+                project_id: request.project_id.clone(),
+                catalog_epoch: new_epoch,
+                authority_provenance: ScopeMigrationAuthorityProvenance::OperatorAttested,
+                operator_invocation: request.operator_invocation.clone(),
+                operator_reason: request.operator_reason.clone(),
+                old_scope: ProjectScope::Published(request.expected_old_scope.clone()),
+                new_scope: ProjectScope::Published(request.new_scope.clone()),
+                kind: request.kind.clone(),
+                migrated_at: request.migrated_at.clone(),
+                code_bridge_generation: request.code_bridge_generation.clone(),
+                publication_bridge_generation: request.publication_bridge_generation.clone(),
+                pending_capabilities: Default::default(),
+            },
+        );
+        Ok(())
+    })?;
+    Ok(ScopeTransitionReceipt {
+        scope_migration_id: migration_id,
+        commit,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1946,6 +2101,99 @@ mod tests {
         assert!(state.attachments().scope_migration_proofs.is_empty());
         assert!(state.attachments().attachments.is_empty());
         assert!(state.attachments().legacy_path_bindings.is_empty());
+    }
+
+    #[test]
+    fn attested_migration_requires_zero_attachments_flags_and_reason() {
+        use bbox_corpus_core::project_catalog::{
+            ScopeMigrationAuthorityProvenance, ScopeMigrationKind,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = ProjectCatalogStore::initialize_empty(root.join("projects.json")).unwrap();
+        let old_scope = PublishedScope::try_new("attestfamily", ".").unwrap();
+        let (project_id, _) = catalog_add(
+            &store,
+            current_epoch(&store),
+            &CatalogAddKind::Published(old_scope.clone()),
+            "remote",
+            &[],
+            "2026-07-24T00:00:00Z",
+        )
+        .unwrap();
+
+        let new_scope = PublishedScope::try_new("attestfamily", "svc/api").unwrap();
+        let mut request = ScopeMigrationRequest {
+            project_id: project_id.clone(),
+            expected_old_scope: old_scope.clone(),
+            new_scope: new_scope.clone(),
+            kind: ScopeMigrationKind::RelpathMove,
+            designated_attachment: AttachmentId::mint(),
+            acknowledge_repo_authority_change: false,
+            attachment_probes: Default::default(),
+            code_bridge_generation: None,
+            publication_bridge_generation: None,
+            operator_invocation: "cli:scope-migrate --operator-attested".into(),
+            operator_reason: None,
+            migrated_at: "2026-07-24T00:00:01Z".into(),
+        };
+
+        // Acknowledgement and reason are both mandatory.
+        let error =
+            scope_migrate_attested(&store, current_epoch(&store), &request, false).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_admin_acknowledgement_required"
+        );
+        let error =
+            scope_migrate_attested(&store, current_epoch(&store), &request, true).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_admin_reason_required");
+
+        request.operator_reason = Some("relocating the remote-only service root".into());
+        let receipt =
+            scope_migrate_attested(&store, current_epoch(&store), &request, true).unwrap();
+        let state = store.snapshot().unwrap();
+        let record = state
+            .catalog()
+            .scope_migrations
+            .get(&receipt.scope_migration_id)
+            .unwrap();
+        assert_eq!(
+            record.authority_provenance,
+            ScopeMigrationAuthorityProvenance::OperatorAttested
+        );
+        assert!(
+            state.attachments().scope_migration_proofs.is_empty(),
+            "operator-attested records carry no proof row"
+        );
+
+        // With an active attachment present, the attested channel refuses.
+        let (legacy_id, _) = catalog_add(
+            &store,
+            current_epoch(&store),
+            &CatalogAddKind::LegacyLocal,
+            "attached",
+            &[],
+            "2026-07-24T00:00:02Z",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("co")).unwrap();
+        attach_checkout(
+            &store,
+            current_epoch(&store),
+            &legacy_id,
+            &probe(&root.join("co")),
+        )
+        .unwrap();
+        let mut attached_request = request.clone();
+        attached_request.project_id = legacy_id;
+        attached_request.expected_old_scope = new_scope.clone();
+        let error = scope_migrate_attested(&store, current_epoch(&store), &attached_request, true)
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_admin_attachments_active"
+        );
     }
 
     #[test]
