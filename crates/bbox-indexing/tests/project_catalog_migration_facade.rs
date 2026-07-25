@@ -1098,3 +1098,113 @@ fn absent_legacy_catalog_is_fresh_for_first_apply_but_public_verify_fails_closed
         .unwrap();
     assert_eq!(reverified.receipt(), &reapplied.receipt.verification);
 }
+
+/// Not a test: the smoke-fixture producer for the phase-2 live bootsmokes
+/// (phase-2 plan section 12). Ignored by default; the bootsmoke driver
+/// invokes it explicitly with `BBOX_SMOKE_FIXTURE_ROOT` set to materialize
+/// the pre-migration fixture state at that root plus a summary file, and
+/// then drives the exact stablesigned `blackbox` CLI through preflight,
+/// resolution, and rehearsal apply itself.
+#[test]
+#[ignore = "smoke-fixture producer; invoked explicitly by the live bootsmoke driver"]
+fn produce_migrated_smoke_fixture_from_env_root() {
+    let Some(root) = std::env::var_os("BBOX_SMOKE_FIXTURE_ROOT") else {
+        eprintln!("BBOX_SMOKE_FIXTURE_ROOT is not set; nothing to produce");
+        return;
+    };
+    let root = PathBuf::from(root).canonicalize().unwrap();
+    let config = config(&root);
+    let rehearsal_root = root.join("rehearsal");
+    fs::create_dir_all(&rehearsal_root).unwrap();
+    let fixture = prepare_rehearsal(&rehearsal_root, &config);
+    let review = rehearsal_root.join("review");
+    fs::create_dir_all(&review).unwrap();
+    // Drive the exact P1-C rehearsal ceremony through the public facade
+    // (the byte-identical engine behind the CLI envelope): assessment,
+    // scope-owner resolution, collected quarantine, clean preflight, apply.
+    let rehearsal =
+        ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(&rehearsal_root, &config)
+            .unwrap();
+    let protected_root = root.join("protected");
+    fs::create_dir_all(&protected_root).unwrap();
+    let protected = ProjectCatalogMigrationResolvedLayoutV1::from_config(
+        &config,
+        ProjectCatalogMigrationLayoutOverridesV1 {
+            projects_path: Some(protected_root.join("projects.json")),
+            state_dir: Some(protected_root),
+        },
+    )
+    .unwrap();
+    let report_path = review.join("report.json");
+    let resolution_path = review.join("resolution.json");
+    let preflight = |report: &PathBuf, resolution: &PathBuf| {
+        ProjectCatalogMigrationFacadeV1::preflight(ProjectCatalogMigrationPreflightRequestV1 {
+            layout: rehearsal.clone(),
+            report_path: report.clone(),
+            resolution_path: resolution.clone(),
+            sensitive_report_path: None,
+        })
+        .unwrap()
+    };
+    preflight(&report_path, &resolution_path);
+    let report = decode_migration_report_v1(&fs::read(&report_path).unwrap()).unwrap();
+    let mut resolution =
+        decode_migration_resolution_v1(&fs::read(&resolution_path).unwrap()).unwrap();
+    resolution.selected_scope_owners.push(SelectedScopeOwnerV1 {
+        resolution_id: report.scope_conflicts[0].conflict_id.clone(),
+        scope: fixture.collision_scope.clone(),
+        owner_project_id: fixture.collision_winner_project.clone(),
+        losing_project_ids: [fixture.loser_project.clone()].into_iter().collect(),
+        owned_aliases: Default::default(),
+    });
+    fs::write(
+        &resolution_path,
+        encode_migration_resolution_v1(&resolution).unwrap(),
+    )
+    .unwrap();
+    preflight(&report_path, &resolution_path);
+    let report = decode_migration_report_v1(&fs::read(&report_path).unwrap()).unwrap();
+    resolution.quarantine_collected.push(QuarantineCollectedV1 {
+        resolution_id: report.activation_conflicts[0].conflict_id.clone(),
+        project_id: fixture.loser_project.clone(),
+        generation_id: fixture.loser_generation.clone(),
+    });
+    fs::write(
+        &resolution_path,
+        encode_migration_resolution_v1(&resolution).unwrap(),
+    )
+    .unwrap();
+    let clean = preflight(&report_path, &resolution_path);
+    assert_eq!(
+        clean.receipt.status,
+        ProjectCatalogMigrationStatusV1::Clean,
+        "smoke fixture preflight must be clean"
+    );
+    ProjectCatalogMigrationFacadeV1::apply_rehearsal(ProjectCatalogMigrationApplyRequestV1 {
+        rehearsal_layout: rehearsal,
+        protected_layout: protected,
+        report_path,
+        resolution_path,
+    })
+    .unwrap();
+    let summary = serde_json::json!({
+        "config_path": root.join("config.toml"),
+        "rehearsal_root": rehearsal_root,
+        "projects_path": rehearsal_root.join("state/projects.json"),
+        "winner_project": fixture.winner_project.as_str(),
+        "winner_checkout": fixture.winner_checkout,
+        "collision_winner_project": fixture.collision_winner_project.as_str(),
+        "loser_project": fixture.loser_project.as_str(),
+        "loser_generation": fixture.loser_generation,
+        "collision_scope": {
+            "repo_id": fixture.collision_scope.repo_id(),
+            "bbox_root_relpath": fixture.collision_scope.bbox_root_relpath(),
+        },
+    });
+    fs::write(
+        root.join("smoke-fixture-summary.json"),
+        serde_json::to_vec_pretty(&summary).unwrap(),
+    )
+    .unwrap();
+    eprintln!("smoke fixture produced at {}", root.display());
+}
