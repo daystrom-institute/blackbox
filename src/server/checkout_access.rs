@@ -33,17 +33,39 @@ pub(crate) fn project_id_for_published_scope(
 ) -> Result<Option<String>> {
     let mut matched = None;
     for project_id in project_ids {
-        let lease = broker
-            .acquire(CheckoutAccessRequest {
-                project_id: project_id.clone(),
-                attachment: CheckoutAttachmentSelector::Selected,
-                expected_scope: None,
-                kind: CheckoutAccessKind::PublisherConfigTreeRead,
-                intent: CheckoutAccessIntent::Read,
-                source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
-            })
-            .map_err(anyhow::Error::new)
-            .with_context(|| format!("discovering published scope for project {project_id}"))?;
+        // One unhealthy project must not poison the whole scope lookup
+        // (review): a project whose checkout is gone, detached, or lacking
+        // the discovery capability is simply not the publisher; continue.
+        let lease = match broker.acquire(CheckoutAccessRequest {
+            project_id: project_id.clone(),
+            attachment: CheckoutAttachmentSelector::Selected,
+            expected_scope: None,
+            kind: CheckoutAccessKind::PublisherConfigTreeRead,
+            intent: CheckoutAccessIntent::Read,
+            source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+        }) {
+            Ok(lease) => lease,
+            Err(error)
+                if matches!(
+                    error.code,
+                    bbox_indexing::checkout_access::CheckoutAccessErrorCode::AttachmentNotFound
+                        | bbox_indexing::checkout_access::CheckoutAccessErrorCode::AttachmentInactive
+                        | bbox_indexing::checkout_access::CheckoutAccessErrorCode::CapabilityDenied
+                ) =>
+            {
+                tracing::debug!(
+                    project_id = %project_id,
+                    error_code = %error.code.as_str(),
+                    "scope discovery skipped an unavailable project"
+                );
+                continue;
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error)).with_context(|| {
+                    format!("discovering published scope for project {project_id}")
+                });
+            }
+        };
         let is_match = lease.published_scope() == Some(expected_scope);
         broker.revalidate(&lease).map_err(anyhow::Error::new)?;
         if !is_match {

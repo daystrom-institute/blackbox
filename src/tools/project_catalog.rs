@@ -474,6 +474,20 @@ impl BlackboxServer {
                 .default_attachments
                 .get(&project_id)
                 .map(|id| id.as_str().to_string());
+            // Pending nominations carry the exact offline acceptance
+            // command (plan §7.6): alias acceptance is CLI-only authority
+            // (D-005). The CLI validates the epoch itself under the
+            // exclusive lifetime lock, so the command needs no epoch flag.
+            let alias_accept_commands: Vec<String> = project
+                .nominated_aliases
+                .iter()
+                .map(|alias| {
+                    format!(
+                        "blackbox project-catalog alias accept --project {} --alias {}",
+                        project.project_id, alias
+                    )
+                })
+                .collect();
             Ok(serde_json::to_string_pretty(&json!({
                 "epoch": state.epoch(),
                 "project": {
@@ -484,6 +498,7 @@ impl BlackboxServer {
                     "nominated_aliases": project.nominated_aliases,
                     "repo_history": project.repo_history.as_ref().map(|id| id.as_str()),
                 },
+                "alias_accept_commands": alias_accept_commands,
                 "host_local_attachments": attachments,
                 "default_attachment": default_attachment,
             }))?)
@@ -503,7 +518,7 @@ impl BlackboxServer {
             return Self::err_text(&catalog_inactive());
         };
         Self::run_blocking("bbox_project_attach", move || {
-            let _audit_reason = bounded_audit_reason(&p.audit_reason)?;
+            let audit_reason = bounded_audit_reason(&p.audit_reason)?;
             let probe = probe_checkout(&p.path)?;
             let project_id = resolve_project_selection(&store, &p.project)?;
             let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&probe.checkout_dir)?;
@@ -540,10 +555,22 @@ impl BlackboxServer {
                 &probe.declared_aliases,
             );
 
+            // The bounded reason is `operator_invocation`-class data: it is
+            // audited in the log line and the response, never duplicated into
+            // a parallel audit store (plan §7.1, D-012).
+            tracing::info!(
+                tool = "bbox_project_attach",
+                project_id = %project_id,
+                attachment_id = %receipt.attachment_id,
+                audit_reason = %audit_reason,
+                "catalog administration mutation"
+            );
+
             Ok(serde_json::to_string_pretty(&json!({
                 "status": "ok",
                 "project_id": project_id.as_str(),
                 "attachment_id": receipt.attachment_id.as_str(),
+                "audit_reason": audit_reason,
                 "kind": attach_probe.kind,
                 "checkout_project_dir": attach_probe.checkout_project_dir,
                 "project_root_relpath": attach_probe.project_root_relpath,
@@ -569,7 +596,7 @@ impl BlackboxServer {
         };
         let server = self.clone();
         Self::run_blocking("bbox_project_detach", move || {
-            let _audit_reason = bounded_audit_reason(&p.audit_reason)?;
+            let audit_reason = bounded_audit_reason(&p.audit_reason)?;
             let attachment_id = parse_attachment_id(&p.attachment_id)?;
             // Read the row before the transaction: detach clears the
             // capability bits and the pair keys are needed afterwards.
@@ -589,11 +616,20 @@ impl BlackboxServer {
 
             let census_removed = server.deregister_detached_pair(&row);
 
+            tracing::info!(
+                tool = "bbox_project_detach",
+                project_id = %row.project_id,
+                attachment_id = %attachment_id,
+                audit_reason = %audit_reason,
+                "catalog administration mutation"
+            );
+
             Ok(serde_json::to_string_pretty(&json!({
                 "status": "ok",
                 "attachment_id": attachment_id.as_str(),
                 "project_id": row.project_id.as_str(),
                 "checkout_id": row.checkout_id,
+                "audit_reason": audit_reason,
                 "census_row_removed": census_removed,
                 "epoch": commit.epoch,
                 "catalog_sha256": commit.catalog_sha256,
@@ -615,7 +651,7 @@ impl BlackboxServer {
             return Self::err_text(&catalog_inactive());
         };
         Self::run_blocking("bbox_project_default_attachment", move || {
-            let _audit_reason = bounded_audit_reason(&p.audit_reason)?;
+            let audit_reason = bounded_audit_reason(&p.audit_reason)?;
             let project_id = resolve_project_selection(&store, &p.project)?;
             let selection = p
                 .attachment_id
@@ -629,10 +665,18 @@ impl BlackboxServer {
                 selection.as_ref(),
             )
             .map_err(|error| anyhow::anyhow!("{error}"))?;
+            tracing::info!(
+                tool = "bbox_project_default_attachment",
+                project_id = %project_id,
+                attachment_id = selection.as_ref().map(|id| id.as_str()).unwrap_or("cleared"),
+                audit_reason = %audit_reason,
+                "catalog administration mutation"
+            );
             Ok(serde_json::to_string_pretty(&json!({
                 "status": "ok",
                 "project_id": project_id.as_str(),
                 "default_attachment": selection.as_ref().map(|id| id.as_str()),
+                "audit_reason": audit_reason,
                 "epoch": commit.epoch,
                 "catalog_sha256": commit.catalog_sha256,
                 "attachments_sha256": commit.attachments_sha256,
@@ -790,7 +834,7 @@ impl BlackboxServer {
         };
         let (projects_path, _state_dir) = self.catalog_paths();
         Self::run_blocking("bbox_project_publisher_bind", move || {
-            let _audit_reason = bounded_audit_reason(&p.audit_reason)?;
+            let audit_reason = bounded_audit_reason(&p.audit_reason)?;
             let project_id = parse_project_id(&p.project_id)?;
             let attachment_id = parse_attachment_id(&p.attachment_id)?;
             let state = store.snapshot().map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -819,19 +863,37 @@ impl BlackboxServer {
                     Path::new(&row.checkout_project_dir),
                 ),
             };
+            // The domain op revalidates the epoch and the attachment's
+            // Attached status inside the publication-lock critical section
+            // (real CAS); the snapshot above only shapes the early typed
+            // refusals and the probe.
             let receipt = project_catalog_admin::bind_publisher_attachment(
                 &store,
                 &projects_path,
+                p.expected_catalog_epoch,
                 &project_id,
                 &attachment_id,
                 &probe,
             )
             .map_err(|error| anyhow::anyhow!("{error}"))?;
+            // Receipt carries the pointer content hash (plan §7.7) read
+            // back from the just-rebound pointer file.
+            let pointer_sha256 =
+                pointer_content_sha256(&projects_path, &project_id);
+            tracing::info!(
+                tool = "bbox_project_publisher_bind",
+                project_id = %project_id,
+                attachment_id = %receipt.attachment_id,
+                audit_reason = %audit_reason,
+                "catalog administration mutation"
+            );
             Ok(serde_json::to_string_pretty(&json!({
                 "status": "ok",
                 "project_id": project_id.as_str(),
                 "attachment_id": receipt.attachment_id.as_str(),
-                "epoch": state.epoch(),
+                "audit_reason": audit_reason,
+                "epoch": receipt.catalog_epoch,
+                "pointer_sha256": pointer_sha256,
             }))?)
         })
         .await
@@ -1061,6 +1123,18 @@ fn accepted_commit_for(
         return Ok(None);
     };
     read_json_field(&pointer, "accepted_commit")
+}
+
+/// Content hash of the project's accepted-publication pointer file, for the
+/// publisher-bind receipt (plan §7.7). `None` when the pointer is absent.
+// Reached only from the tools' `run_blocking` closures, never inline on a
+// tokio worker.
+#[allow(clippy::disallowed_methods)]
+fn pointer_content_sha256(projects_path: &Path, project_id: &ProjectId) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let pointer = accepted_publication_pointer(projects_path, project_id)?;
+    let bytes = std::fs::read(pointer).ok()?;
+    Some(hex::encode(Sha256::digest(&bytes)))
 }
 
 /// Containment check for the publisher rebind: the pointer's accepted commit

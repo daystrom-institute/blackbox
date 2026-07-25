@@ -1,13 +1,19 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use bbox_code_source_store::CodeSourceStore;
+use bbox_code_source_store::{
+    CodeSourceStore, MigrationEffectiveSourceManifestV1, MigrationEffectiveSourceSelectionV1,
+    encode_migration_effective_source_manifest_v1,
+};
 use bbox_config::config::{self, LoadOptions};
+use bbox_corpus_core::identity::PublishedScope;
+use bbox_corpus_core::project_catalog::ProjectId;
 use bbox_corpus_index::index::TranscriptIndex;
 use bbox_edge_sidecar::manifest::ManifestIndex;
 use bbox_indexing::project_catalog_migration::project_catalog_migration_store_limits;
 use bbox_indexing::project_catalog_migration_lock::ProjectCatalogMigrationLock;
+use bbox_indexing::project_catalog_store::ProjectCatalogStore;
 use bbox_vectors::VectorStore;
 use serde_json::Value;
 use tempfile::tempdir;
@@ -91,6 +97,56 @@ fn run(args: &[&str]) -> Output {
         .env_remove("BLACKBOX_STATE_DIR")
         .env_remove("TRANSCRIPT_SEARCH_INDEX_PATH");
     command.output().unwrap()
+}
+
+/// Run one offline command with the corpus index pinned inside the test's own
+/// root. The index is the single retire-probe input that does not derive from
+/// `state_dir`, so leaving it unset would let the probe read the host's real
+/// index instead of this test's isolated state.
+fn run_with_isolated_index(args: &[&str], index_path: &Path) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_blackbox"));
+    command
+        .args(args)
+        .env_remove("BLACKBOX_CONFIG")
+        .env_remove("BLACKBOX_STATE_DIR")
+        .env("TRANSCRIPT_SEARCH_INDEX_PATH", index_path);
+    command.output().unwrap()
+}
+
+/// An isolated state root holding an initialized empty v2 catalog store plus
+/// the configuration file every offline command resolves its evidence roots
+/// from. Returns the state dir, the projects path, the config path, and the
+/// isolated corpus index path.
+fn isolated_state_root(root: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let state = root.join("state");
+    fs::create_dir_all(&state).unwrap();
+    let projects_path = state.join("projects.json");
+    drop(ProjectCatalogStore::initialize_empty(&projects_path).unwrap());
+    let config_path = root.join("config.toml");
+    write(
+        &config_path,
+        format!("[paths]\nstate_dir = {state:?}\n").as_bytes(),
+    );
+    (state, projects_path, config_path, root.join("index"))
+}
+
+/// Add one published catalog project and return its minted id.
+fn add_published_project(projects: &str, repo_id: &str, relpath: &str, created_at: &str) -> String {
+    let added = success_json(&run(&[
+        "project-catalog",
+        "add",
+        "--projects-path",
+        projects,
+        "--repo-id",
+        repo_id,
+        "--relpath",
+        relpath,
+        "--display-name",
+        "offline evidence fixture",
+        "--created-at",
+        created_at,
+    ]));
+    added["result"]["project_id"].as_str().unwrap().to_string()
 }
 
 fn success_json(output: &Output) -> Value {
@@ -336,14 +392,11 @@ fn cli_runs_clean_preflight_apply_and_fresh_verify() {
 fn admin_subcommands_round_trip_on_an_isolated_v2_store() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
-    let projects_path = root.join("projects.json");
     // An initialized empty v2 store is the administered substrate; the
     // exclusive lifetime lock is free because no daemon shares this root.
-    drop(
-        bbox_indexing::project_catalog_store::ProjectCatalogStore::initialize_empty(&projects_path)
-            .unwrap(),
-    );
+    let (_state, projects_path, config_path, index_path) = isolated_state_root(&root);
     let projects = projects_path.to_str().unwrap();
+    let config = config_path.to_str().unwrap();
 
     // Published add with an initial alias.
     let added = success_json(&run(&[
@@ -430,6 +483,8 @@ fn admin_subcommands_round_trip_on_an_isolated_v2_store() {
         "relocating the remote-only service root",
         "--migrated-at",
         "2026-07-24T00:00:02Z",
+        "--config",
+        config,
     ]));
     assert!(
         migrated["result"]["scope_migration_id"]
@@ -438,20 +493,57 @@ fn admin_subcommands_round_trip_on_an_isolated_v2_store() {
             .starts_with("sm_")
     );
 
+    // An explicitly named configuration file that does not exist is a typed
+    // refusal, not a silent fall back to the default roots: every evidence
+    // class would otherwise be probed against the wrong state.
+    let missing_config = root.join("missing-config.toml");
+    let refused = run_with_isolated_index(
+        &[
+            "project-catalog",
+            "retire",
+            "--projects-path",
+            projects,
+            "--project",
+            &project_id,
+            "--execute",
+            "--config",
+            missing_config.to_str().unwrap(),
+        ],
+        &index_path,
+    );
+    assert!(!refused.status.success());
+    let refused: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(refused["error"]["code"], "error.project_catalog_cli_config");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing-config.toml")
+    );
+
     // Retire inventories, then removes when clean; the legacy-local
     // project survives untouched.
-    let retired = success_json(&run(&[
-        "project-catalog",
-        "retire",
-        "--projects-path",
-        projects,
-        "--project",
-        &project_id,
-        "--execute",
-        "--config",
-        root.join("missing-config.toml").to_str().unwrap(),
-    ]));
+    let retired = success_json(&run_with_isolated_index(
+        &[
+            "project-catalog",
+            "retire",
+            "--projects-path",
+            projects,
+            "--project",
+            &project_id,
+            "--execute",
+            "--config",
+            config,
+        ],
+        &index_path,
+    ));
     assert_eq!(retired["result"]["removed"], serde_json::Value::Bool(true));
+    assert!(
+        retired["result"]["unprobeable_reference_classes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     let listed = success_json(&run(&[
         "project-catalog",
         "list",
@@ -463,5 +555,242 @@ fn admin_subcommands_round_trip_on_an_isolated_v2_store() {
     assert_eq!(
         remaining[0]["project_id"].as_str().unwrap(),
         local_id.as_str()
+    );
+}
+
+#[test]
+fn attested_scope_migration_records_both_bridge_generations() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (state, projects_path, config_path, _index_path) = isolated_state_root(&root);
+    let projects = projects_path.to_str().unwrap();
+    let project_id = add_published_project(projects, "bridgefamily", ".", "2026-07-24T00:00:00Z");
+
+    // An active collected generation and an accepted publication pointer.
+    // The offline channel must carry both onto the migration record exactly
+    // as the attachment-proved channel does.
+    let code_generation = "a".repeat(64);
+    let publication_generation = "b".repeat(64);
+    write(
+        &state.join(format!("code-sources/activations/{project_id}.json")),
+        format!(r#"{{"generation_id":"{code_generation}"}}"#).as_bytes(),
+    );
+    write(
+        &state.join(format!("accepted-publications/pointers/{project_id}.json")),
+        format!(r#"{{"accepted_generation":"{publication_generation}"}}"#).as_bytes(),
+    );
+
+    success_json(&run(&[
+        "project-catalog",
+        "scope-migrate",
+        "--projects-path",
+        projects,
+        "--operator-attested",
+        "--project",
+        &project_id,
+        "--expected-old-repo",
+        "bridgefamily",
+        "--expected-old-relpath",
+        ".",
+        "--new-repo",
+        "bridgefamily",
+        "--new-relpath",
+        "svc/api",
+        "--kind",
+        "relpath-move",
+        "--acknowledge-unattached-scope-migration",
+        "--reason",
+        "relocating a project that still holds bridge generations",
+        "--migrated-at",
+        "2026-07-24T00:00:01Z",
+        "--config",
+        config_path.to_str().unwrap(),
+    ]));
+
+    let store = ProjectCatalogStore::open_existing(&projects_path).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let record = snapshot
+        .catalog()
+        .scope_migrations
+        .values()
+        .find(|record| record.project_id.as_str() == project_id)
+        .expect("the attested migration wrote its record");
+    assert_eq!(
+        record.code_bridge_generation.as_deref(),
+        Some(code_generation.as_str())
+    );
+    assert_eq!(
+        record.publication_bridge_generation.as_deref(),
+        Some(publication_generation.as_str())
+    );
+}
+
+#[test]
+fn retire_refuses_on_a_producer_assignment() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (state, projects_path, config_path, index_path) = isolated_state_root(&root);
+    let projects = projects_path.to_str().unwrap();
+    let config = config_path.to_str().unwrap();
+    let project_id = add_published_project(projects, "producerfamily", ".", "2026-07-24T00:00:00Z");
+
+    // A producer assignment lives in the effective source manifest, which no
+    // path-shaped probe reaches: it must be decoded to be counted.
+    let generation = "c".repeat(64);
+    let manifest = MigrationEffectiveSourceManifestV1 {
+        version: 1,
+        selections: vec![MigrationEffectiveSourceSelectionV1 {
+            project_id: ProjectId::parse(project_id.clone()).unwrap(),
+            published_scope: PublishedScope::try_new("producerfamily", ".").unwrap(),
+            generation_id: generation.clone(),
+            selector: format!("collected:{project_id}:{generation}:m{}", "0".repeat(16)),
+        }],
+    };
+    write(
+        &state.join("code-sources/effective-source-manifest.json"),
+        &encode_migration_effective_source_manifest_v1(&manifest).unwrap(),
+    );
+
+    let reported = success_json(&run_with_isolated_index(
+        &[
+            "project-catalog",
+            "retire",
+            "--projects-path",
+            projects,
+            "--project",
+            &project_id,
+            "--config",
+            config,
+        ],
+        &index_path,
+    ));
+    assert_eq!(reported["result"]["blocking"]["producer_assignments"], 1);
+    assert!(
+        reported["result"]["unprobeable_reference_classes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let probed = reported["result"]["probed_reference_classes"]
+        .as_array()
+        .unwrap();
+    for class in [
+        "producer_assignments",
+        "artifact_rows",
+        "edge_sidecar_rows",
+        "index_entity_refs",
+        "vector_entity_refs",
+    ] {
+        assert!(
+            probed.iter().any(|value| value.as_str() == Some(class)),
+            "{class}"
+        );
+    }
+
+    let refused = run_with_isolated_index(
+        &[
+            "project-catalog",
+            "retire",
+            "--projects-path",
+            projects,
+            "--project",
+            &project_id,
+            "--execute",
+            "--config",
+            config,
+        ],
+        &index_path,
+    );
+    assert!(!refused.status.success());
+    let refused: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(
+        refused["error"]["code"],
+        "error.project_catalog_admin_retire_blocked"
+    );
+}
+
+#[test]
+fn retire_probes_generations_under_a_previously_owned_scope() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (state, projects_path, config_path, index_path) = isolated_state_root(&root);
+    let projects = projects_path.to_str().unwrap();
+    let config = config_path.to_str().unwrap();
+    let project_id = add_published_project(projects, "scopefamily", ".", "2026-07-24T00:00:00Z");
+
+    success_json(&run(&[
+        "project-catalog",
+        "scope-migrate",
+        "--projects-path",
+        projects,
+        "--operator-attested",
+        "--project",
+        &project_id,
+        "--expected-old-repo",
+        "scopefamily",
+        "--expected-old-relpath",
+        ".",
+        "--new-repo",
+        "scopefamily",
+        "--new-relpath",
+        "svc/api",
+        "--kind",
+        "relpath-move",
+        "--acknowledge-unattached-scope-migration",
+        "--reason",
+        "relocating before the retained generation is discharged",
+        "--migrated-at",
+        "2026-07-24T00:00:01Z",
+        "--config",
+        config,
+    ]));
+
+    // The retained generation sits under the scope the project owned BEFORE
+    // the migration. A probe that only reads the current scope hash reports
+    // zero and lets --execute destroy a still-referenced project.
+    let old_scope = PublishedScope::try_new("scopefamily", ".").unwrap();
+    fs::create_dir_all(
+        state
+            .join("code-sources/scopes")
+            .join(bbox_code_source::scope_hash(&old_scope))
+            .join("generations")
+            .join("d".repeat(64)),
+    )
+    .unwrap();
+
+    let reported = success_json(&run_with_isolated_index(
+        &[
+            "project-catalog",
+            "retire",
+            "--projects-path",
+            projects,
+            "--project",
+            &project_id,
+            "--config",
+            config,
+        ],
+        &index_path,
+    ));
+    assert_eq!(reported["result"]["blocking"]["code_source_generations"], 1);
+
+    let refused = run_with_isolated_index(
+        &[
+            "project-catalog",
+            "retire",
+            "--projects-path",
+            projects,
+            "--project",
+            &project_id,
+            "--execute",
+            "--config",
+            config,
+        ],
+        &index_path,
+    );
+    assert!(!refused.status.success());
+    let refused: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(
+        refused["error"]["code"],
+        "error.project_catalog_admin_retire_blocked"
     );
 }

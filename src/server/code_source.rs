@@ -967,10 +967,11 @@ fn cutback_to_local(
     )?;
     let cutback_deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
     let staged = loop {
-        match state
-            .index_writer
-            .stage_local_generation(project.clone(), scope.clone())
-        {
+        match state.index_writer.stage_local_generation(
+            project.clone(),
+            scope.clone(),
+            store.clone(),
+        ) {
             Ok(staged) => break staged,
             Err(error) if writer_pass_in_progress(&error) => {
                 if std::time::Instant::now() >= cutback_deadline {

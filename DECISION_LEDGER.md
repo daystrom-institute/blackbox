@@ -786,3 +786,35 @@ until a later entry explicitly supersedes it.
 - Revisit only if: a surface is found whose consumers depend on worktree
   paths NOT aliasing to the base (none known; dispatch execution targets
   are out of scope by section 3).
+
+## D-032: The version-1 any-read grant is a sanctioned bridge lane; v2 enforces recorded capabilities
+
+- Date: 2026-07-25
+- Phase: durable project catalog, Phase 2 (closing review, finding M9)
+- Status: accepted pending implementation review
+- Decision: the capability asymmetry between the two authorities is
+  deliberate for the bridge window. The version-1 authority grants every
+  Read-intent kind on any resolvable path (it records no capability bits
+  and has nothing to enforce); the catalog authority enforces the
+  capability bits recorded at attach or migration time for every kind,
+  with `PublisherConfigTreeRead` and `KnowledgeGapOverlayRead` both riding
+  `repo_knowledge`, and additionally verifies the live checkout (marker
+  match plus canonical-dir identity) at resolve and revalidation time.
+  Surfaces that must behave identically across modes do so by degrading
+  per capability (post-register enrichment, scoped views), never by
+  weakening the catalog gate to the v1 grant.
+- Evidence:
+  - The v1 lane cannot deny what it never recorded; back-deriving bits for
+    version-1 records would manufacture authority from path shape, exactly
+    what the catalog design forbids.
+  - The Phase 6 cut criteria consume compatibility observations;
+    capability-grant asymmetry is visible there through the catalog-mode
+    degradations (skipped enrichment steps, per-checkout diagnostics), not
+    through v1-side counters.
+- Rationale: attach-time capability derivation is the catalog's authority
+  model; the bridge window tolerates the broader v1 grant because every
+  v1 read still routes through path-resolution authority, and the strict
+  gate arrives with the mode, not with a flag.
+- Revisit only if: the observation window shows catalog-mode capability
+  denials for surfaces operators expect to work (a derivation gap at
+  attach time), or Phase 6 needs per-kind grant telemetry on the bridge.

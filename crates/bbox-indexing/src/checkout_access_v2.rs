@@ -24,7 +24,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bbox_corpus_core::project_catalog::{
-    AttachmentCapabilities, AttachmentId, AttachmentStatus, ProjectId,
+    AttachmentCapabilities, AttachmentId, AttachmentKind, AttachmentStatus, CheckoutAttachment,
+    ProjectId,
 };
 use bbox_corpus_core::project_selector::{
     ProjectSelectorRequest, ResolvedAttachment, SelectorClass,
@@ -115,22 +116,53 @@ fn resolve_candidate(
                     "project is not in the catalog",
                 ));
             }
-            let mut active = attachments.attachments.values().filter(|row| {
-                row.status == AttachmentStatus::Attached && row.project_id == project_id
-            });
-            let Some(first) = active.next() else {
+            // Selection ladder for path operations without an explicit
+            // selector (plan §7.3, review M1): the operator-selected
+            // default, then a single active attachment, then the unique
+            // active `Base` attachment (the §5.3 key-to-base rule applied
+            // to lease selection: index and overlay lanes act on the
+            // durable base checkout). Session pins ride the engine and
+            // arrive here as explicit `AttachmentId` selectors.
+            let active: Vec<&CheckoutAttachment> = attachments
+                .attachments
+                .values()
+                .filter(|row| {
+                    row.status == AttachmentStatus::Attached && row.project_id == project_id
+                })
+                .collect();
+            if active.is_empty() {
                 return Err(access_error(
                     CheckoutAccessErrorCode::AttachmentNotFound,
                     "project has no active attachment",
                 ));
-            };
-            if active.next().is_some() {
-                return Err(access_error(
-                    CheckoutAccessErrorCode::SelectorMismatch,
-                    "project has multiple active attachments; select one explicitly",
-                ));
             }
-            first
+            let default = attachments
+                .default_attachments
+                .get(&project_id)
+                .and_then(|selected| {
+                    active
+                        .iter()
+                        .find(|row| &row.attachment_id == selected)
+                        .copied()
+                });
+            let single = (active.len() == 1).then(|| active[0]);
+            let unique_base = || {
+                let mut bases = active.iter().filter(|row| row.kind == AttachmentKind::Base);
+                match (bases.next(), bases.next()) {
+                    (Some(base), None) => Some(*base),
+                    _ => None,
+                }
+            };
+            match default.or(single).or_else(unique_base) {
+                Some(row) => row,
+                None => {
+                    return Err(access_error(
+                        CheckoutAccessErrorCode::SelectorMismatch,
+                        "project has multiple active attachments and no default or \
+                         unique base; select one explicitly",
+                    ));
+                }
+            }
         }
         CheckoutAttachmentSelector::AttachmentId(raw) => {
             let id = AttachmentId::parse(raw.as_str()).map_err(|_| {
@@ -239,6 +271,7 @@ fn resolve_candidate(
             "attachment does not record the required capability",
         ));
     }
+    verify_live_checkout(attachment)?;
 
     Ok(CheckoutAccessCandidate {
         project_id: attachment.project_id.as_str().to_string(),
@@ -252,6 +285,53 @@ fn resolve_candidate(
         capabilities: BTreeSet::from([request.kind]),
         lifetime_guard: None,
     })
+}
+
+/// Live checkout verification at lease resolution and revalidation
+/// (plan §6.3, governing §5.2, review H1): the recorded attachment must
+/// still name the same on-disk checkout. Both recorded directories must
+/// canonicalize to themselves (the catalog-mode conservative gate: the
+/// attachment IS the aliasing authority, so a moved or replaced directory
+/// denies rather than re-resolving), and the durable checkout-id marker
+/// must match the recorded identity exactly. Path existence and inode
+/// reuse never prove sameness; every v2 attachment minted its marker at
+/// attach time, so a missing or divergent marker is identity loss and
+/// fails closed for every intent.
+fn verify_live_checkout(
+    attachment: &CheckoutAttachment,
+) -> std::result::Result<(), CheckoutAccessError> {
+    let recorded_checkout = Path::new(&attachment.checkout_dir);
+    let checkout_root = canonical_directory(recorded_checkout)?;
+    if checkout_root != recorded_checkout {
+        return Err(access_error(
+            CheckoutAccessErrorCode::ConservativePathGateDenied,
+            "recorded checkout dir no longer canonicalizes to itself",
+        ));
+    }
+    let recorded_project = Path::new(&attachment.checkout_project_dir);
+    let project_root = canonical_directory(recorded_project)?;
+    if project_root != recorded_project {
+        return Err(access_error(
+            CheckoutAccessErrorCode::ConservativePathGateDenied,
+            "recorded project dir no longer canonicalizes to itself",
+        ));
+    }
+    let marker = checkout_root.join(".bbox/local/checkout-id");
+    match bbox_corpus_core::identity::read_checkout_id(&marker) {
+        Ok(Some(found)) if found == attachment.checkout_id => Ok(()),
+        Ok(Some(_)) => Err(access_error(
+            CheckoutAccessErrorCode::CheckoutIdentityMismatch,
+            "checkout identity marker names a different checkout",
+        )),
+        Ok(None) => Err(access_error(
+            CheckoutAccessErrorCode::CheckoutIdentityMismatch,
+            "checkout identity marker is missing",
+        )),
+        Err(_) => Err(access_error(
+            CheckoutAccessErrorCode::CheckoutIdentityMismatch,
+            "checkout identity marker is unreadable",
+        )),
+    }
 }
 
 fn parse_project_id(raw: &str) -> std::result::Result<ProjectId, CheckoutAccessError> {
@@ -339,6 +419,14 @@ mod tests {
         let store = ProjectCatalogStore::initialize_empty(&projects_path).unwrap();
         let checkout_dir = root.join("checkout");
         std::fs::create_dir_all(checkout_dir.join("sub")).unwrap();
+        // Every v2 attachment minted its durable identity at attach time;
+        // live verification reads it back on each lease.
+        std::fs::create_dir_all(checkout_dir.join(".bbox/local")).unwrap();
+        std::fs::write(
+            checkout_dir.join(".bbox/local/checkout-id"),
+            format!("{CHECKOUT}\n"),
+        )
+        .unwrap();
         let epoch = store.snapshot().unwrap().epoch();
         store
             .transact(epoch, |catalog: &mut CatalogSnapshotV2, attachments| {
@@ -556,5 +644,121 @@ mod tests {
             .revalidate_conservative_path_gate(&req, &candidate)
             .unwrap_err();
         assert_eq!(err.code, CheckoutAccessErrorCode::AttachmentNotFound);
+    }
+
+    /// Review H1: the live checkout must still prove the recorded identity
+    /// at resolve and revalidation time. A rewritten marker (same inode
+    /// directory) and a missing marker both fail closed.
+    #[test]
+    fn live_checkout_verification_denies_marker_drift_and_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = store_with_fixture(&root);
+        let authority = V2CatalogCheckoutAccessAuthority::new(store);
+        let req = request(
+            CheckoutAttachmentSelector::Selected,
+            CheckoutAccessSourceLane::LegacyProjectRecord,
+            CheckoutAccessKind::LocalProjectWalk,
+        );
+        let candidate = authority.resolve(&req).unwrap();
+
+        // Marker rewritten in place: resolve and revalidate both deny.
+        let marker = root.join("checkout/.bbox/local/checkout-id");
+        std::fs::write(&marker, "feed0000000000000000000000000bad\n").unwrap();
+        let err = authority.resolve(&req).unwrap_err();
+        assert_eq!(err.code, CheckoutAccessErrorCode::CheckoutIdentityMismatch);
+        let err = authority
+            .revalidate_conservative_path_gate(&req, &candidate)
+            .unwrap_err();
+        assert_eq!(err.code, CheckoutAccessErrorCode::CheckoutIdentityMismatch);
+
+        // Marker removed: identity loss, still fails closed.
+        std::fs::remove_file(&marker).unwrap();
+        let err = authority.resolve(&req).unwrap_err();
+        assert_eq!(err.code, CheckoutAccessErrorCode::CheckoutIdentityMismatch);
+    }
+
+    /// Review M1: the `Selected` ladder resolves the operator default, then
+    /// a single active attachment, then the unique active base; only a
+    /// topology with none of those refuses.
+    #[test]
+    fn selected_ladder_default_then_single_then_unique_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = store_with_fixture(&root);
+
+        // Add a worktree-kind attachment with its own live checkout.
+        const WT_ATTACHMENT: &str = "att_0000000000000000000000000000a002";
+        const WT_CHECKOUT: &str = "feed00000000000000000000000000a2";
+        let wt_dir = root.join("worktree");
+        std::fs::create_dir_all(wt_dir.join(".bbox/local")).unwrap();
+        std::fs::write(
+            wt_dir.join(".bbox/local/checkout-id"),
+            format!("{WT_CHECKOUT}\n"),
+        )
+        .unwrap();
+        let epoch = store.snapshot().unwrap().epoch();
+        store
+            .transact(epoch, |_, attachments| {
+                let base = attachments
+                    .attachments
+                    .get(&AttachmentId::parse(ATTACHMENT).unwrap())
+                    .unwrap()
+                    .clone();
+                attachments.attachments.insert(
+                    AttachmentId::parse(WT_ATTACHMENT).unwrap(),
+                    CheckoutAttachment {
+                        attachment_id: AttachmentId::parse(WT_ATTACHMENT).unwrap(),
+                        checkout_id: WT_CHECKOUT.into(),
+                        checkout_dir: wt_dir.to_str().unwrap().into(),
+                        checkout_project_dir: wt_dir.to_str().unwrap().into(),
+                        kind: AttachmentKind::Worktree,
+                        ..base
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        let authority = V2CatalogCheckoutAccessAuthority::new(store.clone());
+        let req = request(
+            CheckoutAttachmentSelector::Selected,
+            CheckoutAccessSourceLane::LegacyProjectRecord,
+            CheckoutAccessKind::LocalProjectWalk,
+        );
+
+        // Base + worktree with no default: the unique base wins (the
+        // key-to-base rule applied to lease selection).
+        let candidate = authority.resolve(&req).unwrap();
+        assert_eq!(candidate.attachment_id, ATTACHMENT);
+
+        // An operator default outranks the base rung.
+        let epoch = store.snapshot().unwrap().epoch();
+        store
+            .transact(epoch, |_, attachments| {
+                attachments.default_attachments.insert(
+                    ProjectId::parse(PROJECT).unwrap(),
+                    AttachmentId::parse(WT_ATTACHMENT).unwrap(),
+                );
+                Ok(())
+            })
+            .unwrap();
+        let candidate = authority.resolve(&req).unwrap();
+        assert_eq!(candidate.attachment_id, WT_ATTACHMENT);
+
+        // Two worktrees, no base, no default: fail closed.
+        let epoch = store.snapshot().unwrap().epoch();
+        store
+            .transact(epoch, |_, attachments| {
+                attachments.default_attachments.clear();
+                let row = attachments
+                    .attachments
+                    .get_mut(&AttachmentId::parse(ATTACHMENT).unwrap())
+                    .unwrap();
+                row.kind = AttachmentKind::Worktree;
+                Ok(())
+            })
+            .unwrap();
+        let err = authority.resolve(&req).unwrap_err();
+        assert_eq!(err.code, CheckoutAccessErrorCode::SelectorMismatch);
     }
 }

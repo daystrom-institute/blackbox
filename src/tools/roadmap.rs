@@ -338,12 +338,19 @@ impl BlackboxServer {
             .as_deref()
             .map(|raw| self.filter_ledger_paths(raw))
             .unwrap_or_default();
+        // Query-side ids come from the resolver (§8.2): a resolving project
+        // filter arms the id arm so stamped rows match whatever path they
+        // were keyed under.
+        let query_project_id = p.project.as_deref().and_then(|raw| {
+            self.resolve_project_filter(raw)
+                .and_then(|resolution| resolution.project_id().map(str::to_owned))
+        });
         let rm = self.state.roadmap.read();
         let items = rm.list(
             p.status.as_deref(),
             p.category.as_deref(),
             p.project.as_deref(),
-            None,
+            query_project_id.as_deref(),
             &ledger_paths,
         );
         let th = self.state.threads.read();

@@ -157,10 +157,19 @@ impl BlackboxServer {
             Err(err) => GapOverlaySnapshot::invalid(checkout, format!("{err:#}")),
         };
         let _publication_is_held = publication_guard.as_ref();
-        self.state
+        // Mirror the knowledge twin: a superseded publication is a normal
+        // race with a newer refresh, but it must be visible, not discarded.
+        if !self
+            .state
             .gap_overlays
             .write()
-            .publish_if_latest(generation, snapshot);
+            .publish_if_latest(generation, snapshot)
+        {
+            tracing::debug!(
+                generation,
+                "gap overlay refresh superseded by a newer requested generation"
+            );
+        }
     }
 
     /// Materialize pinned published gap records plus the selected provisional

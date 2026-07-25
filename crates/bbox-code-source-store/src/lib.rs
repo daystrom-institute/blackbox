@@ -1426,6 +1426,14 @@ fn walk_json_files_lexically(
                 .to_str()
                 .map(str::to_string)
                 .ok_or_else(|| anyhow!("{label} directory contains a non-utf8 entry"))?;
+            // A crash between `atomic_write`'s staging write and its rename
+            // leaves a `<key>.<uuid>.tmp` orphan beside the canonical rows;
+            // it is debris, not corruption, and must not hard-fail every
+            // subsequent walk (the M8 defect family). Any OTHER
+            // non-canonical name still fails closed.
+            if name.ends_with(".tmp") {
+                continue;
+            }
             let stem = name
                 .strip_suffix(".json")
                 .ok_or_else(|| anyhow!("{label} filename is not canonical"))?;
@@ -3588,9 +3596,22 @@ impl CodeSourceStore {
                 && previous.generation_id != stored.generation_id
                 && !self.generation_is_activated(&previous.generation_id)?
             {
-                previous.state = GenerationState::Superseded;
-                previous.diagnostic = None;
-                self.save_generation_locked(&previous)?;
+                // Generation metadata is only rewritable while its immutable
+                // manifest survives. Writing metadata for a reclaimed
+                // generation would recreate the directory without the
+                // manifest, and that manifest-less row is retention-protected
+                // as the newest superseded generation forever after.
+                if self
+                    .paths
+                    .generation_manifest(&previous.descriptor.scope, &previous.generation_id)?
+                    .is_file()
+                {
+                    previous.state = GenerationState::Superseded;
+                    previous.diagnostic = None;
+                    self.save_generation_locked(&previous)?;
+                } else {
+                    tracing_reclaimed_desired_generation(&previous.generation_id);
+                }
             }
             atomic_write_json(&desired_path, &stored)?;
         }
@@ -3778,7 +3799,7 @@ impl CodeSourceStore {
         let mut records: Vec<ActivationRecord> = Vec::new();
         for entry in fs::read_dir(self.root().join("activations"))? {
             let entry = entry?;
-            if entry.file_type()?.is_file() {
+            if entry.file_type()?.is_file() && is_canonical_record_file(&entry) {
                 records.push(read_activation_v1(&entry.path())?);
             }
         }
@@ -3846,7 +3867,7 @@ impl CodeSourceStore {
         let mut records: Vec<CodeSourceHealthRecord> = Vec::new();
         for entry in fs::read_dir(self.root().join("health"))? {
             let entry = entry?;
-            if entry.file_type()?.is_file() {
+            if entry.file_type()?.is_file() && is_canonical_record_file(&entry) {
                 records.push(read_json(&entry.path())?);
             }
         }
@@ -3869,7 +3890,7 @@ impl CodeSourceStore {
         let mut records = Vec::new();
         for entry in fs::read_dir(self.root().join("retirements"))? {
             let entry = entry?;
-            if entry.file_type()?.is_file() {
+            if entry.file_type()?.is_file() && is_canonical_record_file(&entry) {
                 records.push(read_json(&entry.path())?);
             }
         }
@@ -4213,6 +4234,28 @@ impl CodeSourceStore {
         Ok(Some(read_stored_generation_v1(&path)?))
     }
 
+    /// Generation ids named by a `desired/<scope>.json` pointer.
+    ///
+    /// A desired pointer is a GC root whatever state its generation carries.
+    /// Reclaiming a still-desired generation leaves the pointer dangling, and
+    /// the next publication then resurrects that generation's metadata without
+    /// its immutable manifest.
+    fn desired_generation_ids(&self) -> Result<BTreeSet<String>> {
+        let mut ids = BTreeSet::new();
+        for entry in fs::read_dir(self.root().join("desired"))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() || !is_canonical_record_file(&entry) {
+                continue;
+            }
+            ids.insert(
+                read_mixed_stored_generation(&entry.path())?
+                    .generation_id()
+                    .to_string(),
+            );
+        }
+        Ok(ids)
+    }
+
     pub fn expire_uploads(&self, max_idle_secs: u64) -> Result<u64> {
         let _guard = self.lock_mutation()?;
         let cutoff = now_unix_secs().saturating_sub(max_idle_secs);
@@ -4453,6 +4496,7 @@ impl CodeSourceStore {
         retained_generations: usize,
         catalog_scopes: &BTreeSet<PublishedScope>,
     ) -> Result<BTreeSet<String>> {
+        let desired_roots = self.desired_generation_ids()?;
         let mut authority_scopes = catalog_scopes.clone();
         let mut effective_roots = BTreeMap::new();
         let mut has_current_anchor = false;
@@ -4477,7 +4521,7 @@ impl CodeSourceStore {
         let mut activations = Vec::new();
         for activation in fs::read_dir(self.root().join("activations"))? {
             let activation = activation?;
-            if activation.file_type()?.is_file() {
+            if activation.file_type()?.is_file() && is_canonical_record_file(&activation) {
                 let activation = read_mixed_activation(&activation.path())?;
                 if let Some(scope) = activation.published_scope() {
                     authority_scopes.insert(scope.clone());
@@ -4521,22 +4565,26 @@ impl CodeSourceStore {
                     }
                 })
                 .collect::<Result<Vec<_>>>()?;
-            return protected_generation_ids_from_records(
+            let mut protected = protected_generation_ids_from_records(
                 &legacy_generations,
                 &legacy_activations,
                 &collision_lifecycle,
                 retained_generations,
-            );
+            )?;
+            protected.extend(desired_roots);
+            return Ok(protected);
         }
 
-        mixed_protected_generation_ids_from_records(
+        let mut protected = mixed_protected_generation_ids_from_records(
             generations,
             &activations,
             &collision_lifecycle,
             retained_generations,
             &authority_scopes,
             &effective_roots,
-        )
+        )?;
+        protected.extend(desired_roots);
+        Ok(protected)
     }
 
     fn collision_retirement_pending_records_for_gc(
@@ -4601,7 +4649,7 @@ impl CodeSourceStore {
     fn activation_project_for_generation(&self, generation_id: &str) -> Result<Option<String>> {
         for entry in fs::read_dir(self.root().join("activations"))? {
             let entry = entry?;
-            if !entry.file_type()?.is_file() {
+            if !entry.file_type()?.is_file() || !is_canonical_record_file(&entry) {
                 continue;
             }
             let activation = read_mixed_activation(&entry.path())?;
@@ -5612,6 +5660,18 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     sync_parent(path)
 }
 
+/// True for the store's canonical `<key>.json` record files.
+///
+/// [`atomic_write`] stages `<key>.<uuid>.tmp` beside its destination, so a
+/// crash between create and rename leaves debris that record enumeration must
+/// skip instead of parsing as a record.
+fn is_canonical_record_file(entry: &fs::DirEntry) -> bool {
+    entry
+        .file_name()
+        .to_str()
+        .is_some_and(|name| name.ends_with(".json"))
+}
+
 fn remove_file_if_exists(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => sync_parent(path),
@@ -5673,6 +5733,11 @@ fn read_mixed_activation(path: &Path) -> Result<MixedActivationRecord> {
 }
 
 fn tracing_rename_race(_error: &std::io::Error) {}
+
+/// Observation hook for a desired pointer whose generation was already
+/// reclaimed. The pointer is repointed at the new generation by the caller;
+/// the reclaimed generation stays reclaimed.
+fn tracing_reclaimed_desired_generation(_generation_id: &str) {}
 
 #[cfg(test)]
 mod tests {
@@ -7818,6 +7883,17 @@ mod tests {
                 None,
             )
             .unwrap();
+        // A collision-retired generation has left the producer lane: its
+        // scope's desired pointer no longer names it (a still-desired
+        // generation is a GC root whatever its state, per the M8 guard).
+        // This test exercises the COLLISION record's lifecycle gate alone.
+        std::fs::remove_file(
+            store
+                .root()
+                .join("desired")
+                .join(format!("{}.json", scope_hash(&descriptor.scope))),
+        )
+        .unwrap();
 
         let project_id = ProjectId::parse("project-a").unwrap();
         let selector = materialized_selector(project_id.as_str(), &stored.generation_id);
@@ -8225,5 +8301,232 @@ mod tests {
         limits.unreferenced_blob_grace_hours = 0;
         store.update_limits(limits).unwrap();
         assert_eq!(store.gc_blobs().unwrap().reclaimed_blobs, 1);
+    }
+
+    #[test]
+    fn gc_keeps_a_failed_generation_named_by_the_desired_pointer() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let mut limits = StoreLimits::default();
+        limits.retained_generations = 0;
+        limits.unreferenced_blob_grace_hours = 0;
+        let store = CodeSourceStore::open(root.join("code-sources"), limits).unwrap();
+        let bytes = b"desired generation";
+        let hash = sha256_hex(bytes);
+        let entries = vec![ManifestEntry {
+            relative_path: "src/lib.rs".into(),
+            content_sha256: hash.clone(),
+            size: bytes.len() as u64,
+        }];
+        let descriptor = descriptor(&entries);
+        let scope = descriptor.scope.clone();
+        let upload = store.begin_upload("host-a", descriptor).unwrap();
+        store
+            .put_manifest_page("host-a", &upload.upload_id, 0, &entries)
+            .unwrap();
+        store
+            .complete_manifest("host-a", &upload.upload_id)
+            .unwrap();
+        store
+            .install_blob(
+                "host-a",
+                &upload.upload_id,
+                &hash,
+                bytes.len() as u64,
+                &bytes[..],
+            )
+            .unwrap();
+        let ready = store.finalize_upload("host-a", &upload.upload_id).unwrap();
+        store
+            .mark_generation_state(
+                &scope,
+                &ready.generation_id,
+                GenerationState::Failed,
+                Some("staged activation failed".into()),
+            )
+            .unwrap();
+
+        let stats = store.gc_blobs().unwrap();
+
+        assert_eq!(stats.reclaimed_generations, 0);
+        assert_eq!(stats.reclaimed_blobs, 0);
+        assert!(store.blob_path(&hash).is_file());
+        assert!(
+            store
+                .paths
+                .generation_manifest(&scope, &ready.generation_id)
+                .unwrap()
+                .is_file()
+        );
+        assert_eq!(
+            store
+                .load_generation(&scope, &ready.generation_id)
+                .unwrap()
+                .state,
+            GenerationState::Failed
+        );
+        assert_eq!(
+            store
+                .desired_generation(&scope)
+                .unwrap()
+                .unwrap()
+                .generation_id,
+            ready.generation_id
+        );
+    }
+
+    #[test]
+    fn finalize_does_not_resurrect_a_reclaimed_desired_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = open_store(&root);
+        let bytes = b"reclaimed generation";
+        let hash = sha256_hex(bytes);
+        let entries = vec![ManifestEntry {
+            relative_path: "src/lib.rs".into(),
+            content_sha256: hash.clone(),
+            size: bytes.len() as u64,
+        }];
+        let descriptor = descriptor(&entries);
+        let scope = descriptor.scope.clone();
+        let upload = store.begin_upload("host-a", descriptor.clone()).unwrap();
+        store
+            .put_manifest_page("host-a", &upload.upload_id, 0, &entries)
+            .unwrap();
+        store
+            .complete_manifest("host-a", &upload.upload_id)
+            .unwrap();
+        store
+            .install_blob(
+                "host-a",
+                &upload.upload_id,
+                &hash,
+                bytes.len() as u64,
+                &bytes[..],
+            )
+            .unwrap();
+        let reclaimed = store.finalize_upload("host-a", &upload.upload_id).unwrap();
+        let reclaimed_directory = store
+            .paths
+            .generation_directory(&scope, &reclaimed.generation_id)
+            .unwrap();
+        fs::remove_dir_all(&reclaimed_directory).unwrap();
+
+        let replacement = store.begin_upload("host-b", descriptor).unwrap();
+        store
+            .put_manifest_page("host-b", &replacement.upload_id, 0, &entries)
+            .unwrap();
+        store
+            .complete_manifest("host-b", &replacement.upload_id)
+            .unwrap();
+        let published = store
+            .finalize_upload("host-b", &replacement.upload_id)
+            .unwrap();
+
+        assert!(!reclaimed_directory.exists());
+        assert_eq!(published.state, GenerationState::Ready);
+        assert_eq!(
+            store
+                .desired_generation(&scope)
+                .unwrap()
+                .unwrap()
+                .generation_id,
+            published.generation_id
+        );
+        store.gc_blobs().unwrap();
+        store.scrub_retained().unwrap();
+        assert!(store.blob_path(&hash).is_file());
+    }
+
+    #[test]
+    fn record_enumeration_skips_crash_orphaned_temp_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = open_store(&root);
+        let bytes = b"activated generation";
+        let hash = sha256_hex(bytes);
+        let entries = vec![ManifestEntry {
+            relative_path: "src/lib.rs".into(),
+            content_sha256: hash.clone(),
+            size: bytes.len() as u64,
+        }];
+        let descriptor = descriptor(&entries);
+        let upload = store.begin_upload("host-a", descriptor.clone()).unwrap();
+        store
+            .put_manifest_page("host-a", &upload.upload_id, 0, &entries)
+            .unwrap();
+        store
+            .complete_manifest("host-a", &upload.upload_id)
+            .unwrap();
+        store
+            .install_blob(
+                "host-a",
+                &upload.upload_id,
+                &hash,
+                bytes.len() as u64,
+                &bytes[..],
+            )
+            .unwrap();
+        let ready = store.finalize_upload("host-a", &upload.upload_id).unwrap();
+        store
+            .record_materialization(&descriptor.scope, &ready.generation_id, 1, "c".repeat(64))
+            .unwrap();
+        store
+            .save_activation(&ActivationRecord {
+                version: STORE_VERSION,
+                project_id: "project-a".into(),
+                generation_id: ready.generation_id.clone(),
+                selector: materialized_selector("project-a", &ready.generation_id),
+                snapshot_id: "snapshot-a".into(),
+                document_count: 1,
+                entity_inventory_sha256: "c".repeat(64),
+                current_chunk_targets: BTreeMap::new(),
+                activated_unix_secs: now_unix_secs(),
+                cutback_pending: false,
+                diagnostic: None,
+            })
+            .unwrap();
+        store
+            .mark_generation_state(
+                &descriptor.scope,
+                &ready.generation_id,
+                GenerationState::Active,
+                None,
+            )
+            .unwrap();
+        store
+            .record_health_failure("project-a", "missing_blob_data", "one blob failed")
+            .unwrap();
+        store
+            .enqueue_retirement(&RetirementRecord {
+                version: STORE_VERSION,
+                project_id: "project-a".into(),
+                selector: materialized_selector("project-a", &ready.generation_id),
+                snapshot_id: format!("collected-{}", "a".repeat(32)),
+                generation_id: Some(ready.generation_id.clone()),
+            })
+            .unwrap();
+        for relative in [
+            "activations",
+            "health",
+            "retirements",
+            "desired",
+            "collision-retirements",
+        ] {
+            fs::write(
+                store
+                    .root()
+                    .join(relative)
+                    .join(format!("orphan.{}.tmp", Uuid::new_v4())),
+                b"{\"version\":",
+            )
+            .unwrap();
+        }
+
+        assert_eq!(store.activation_records().unwrap().len(), 1);
+        assert_eq!(store.health_records().unwrap().len(), 1);
+        assert_eq!(store.retirement_records().unwrap().len(), 1);
+        store.gc_blobs().unwrap();
+        assert!(store.blob_path(&hash).is_file());
     }
 }

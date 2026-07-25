@@ -1360,9 +1360,14 @@ four-step producer re-scope live drill (Phase 6).
 ## 11. Concurrency and security rules
 
 - The resolver is pure over pinned snapshots (`Arc<ProjectCatalogState>` or
-  a registry snapshot); it takes no locks and performs no filesystem I/O.
-  Path canonicalization for selector input happens in the daemon wrappers on
-  blocking-safe paths, exactly as today.
+  a registry snapshot) and takes no locks, with one bounded, deliberate
+  exception recorded during P2-E: the path arms canonicalize the selector
+  input (and the v1 backend's extracted legacy internals keep their
+  existing probes), because every caller hands the engine raw user paths
+  and a split canonicalization contract across a dozen wrappers proved a
+  drift hazard. Engine calls therefore stay on blocking-safe paths exactly
+  like the wrappers they serve; no other filesystem access is permitted in
+  the engine.
 - Admin operations probe filesystems before `transact` and revalidate inside
   the closure; no lock is held across Git, filesystem walking, or operator
   wait. Lock order remains: process-lifetime migration lock,

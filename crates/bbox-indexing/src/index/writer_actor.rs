@@ -103,6 +103,7 @@ pub enum IndexWriteOp {
     StageLocalGeneration {
         project: Box<ProjectRecord>,
         scope: Box<bbox_corpus_core::identity::PublishedScope>,
+        store: std::sync::Arc<bbox_code_source_store::CodeSourceStore>,
         ack: mpsc::SyncSender<Result<super::project_files::CollectedIndexResult>>,
         release: mpsc::Receiver<()>,
         hold_state: Arc<AtomicU8>,
@@ -582,6 +583,7 @@ impl IndexWriterActor {
         &self,
         project: ProjectRecord,
         scope: bbox_corpus_core::identity::PublishedScope,
+        store: std::sync::Arc<bbox_code_source_store::CodeSourceStore>,
     ) -> Result<StagedIndexGeneration> {
         let (ack, ack_rx) = mpsc::sync_channel(1);
         let (release, release_rx) = mpsc::sync_channel(1);
@@ -590,6 +592,7 @@ impl IndexWriterActor {
             .send(IndexWriteOp::StageLocalGeneration {
                 project: Box::new(project),
                 scope: Box::new(scope),
+                store,
                 ack,
                 release: release_rx,
                 hold_state: hold_state.clone(),
@@ -689,11 +692,12 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
             IndexWriteOp::StageLocalGeneration {
                 project,
                 scope,
+                store,
                 ack,
                 release,
                 hold_state,
             } => {
-                let result = run_local_stage(&ctx, &project, &scope);
+                let result = run_local_stage(&ctx, &project, &scope, &store);
                 let should_hold = result.is_ok();
                 let _ = ack.send(result);
                 if should_hold {
@@ -920,17 +924,55 @@ fn run_local_stage(
     ctx: &ActorCtx,
     project: &ProjectRecord,
     scope: &bbox_corpus_core::identity::PublishedScope,
+    store: &bbox_code_source_store::CodeSourceStore,
 ) -> Result<super::project_files::CollectedIndexResult> {
     let local_lease = ctx.checkout_access.acquire(access_request(
         project,
         Some(scope.clone()),
         CheckoutAccessKind::LocalProjectWalk,
     ))?;
-    let git_lease = ctx.checkout_access.acquire(access_request(
+    // A local generation structurally requires Git: its descriptor records
+    // the checkout's HEAD, so there is no git-free local staging to degrade
+    // to (unlike the collected path, where git is an edge overlay). A
+    // denied GitHistory lease therefore records the same
+    // `git_history_unavailable` health failure the collected path records
+    // (review M10: consistent degradation policy) and refuses with that
+    // diagnostic instead of a bare lease error.
+    let git_lease = match ctx.checkout_access.acquire(access_request(
         project,
         Some(scope.clone()),
         CheckoutAccessKind::GitHistory,
-    ))?;
+    )) {
+        Ok(lease) => {
+            if let Err(error) =
+                store.clear_health_failure(&project.project_id, "git_history_unavailable")
+            {
+                tracing::warn!(
+                    project_id = %project.project_id,
+                    error = %error,
+                    "failed to clear GitHistory degradation record"
+                );
+            }
+            lease
+        }
+        Err(error) => {
+            if let Err(record_error) = store.record_health_failure(
+                &project.project_id,
+                "git_history_unavailable",
+                &format!("GitHistory access unavailable: {}", error.code.as_str()),
+            ) {
+                tracing::warn!(
+                    project_id = %project.project_id,
+                    error = %record_error,
+                    "failed to persist GitHistory degradation record"
+                );
+            }
+            return Err(anyhow::Error::new(error).context(
+                "local staging requires Git history (the local generation descriptor \
+                 records HEAD); degradation recorded as git_history_unavailable",
+            ));
+        }
+    };
     let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
     writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
     let edges_dir =

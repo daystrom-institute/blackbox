@@ -1,10 +1,12 @@
+use std::collections::BTreeSet;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use bbox_config::config::{self, LoadOptions};
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_catalog::{ProjectId, ProjectScope, ScopeMigrationKind};
+use bbox_corpus_index::index::migration_inventory as corpus_inventory;
 use bbox_indexing::project_catalog_admin;
 use bbox_indexing::project_catalog_migration::{
     ProjectCatalogMigrationApplyRequestV1, ProjectCatalogMigrationError,
@@ -14,6 +16,7 @@ use bbox_indexing::project_catalog_migration::{
 };
 use bbox_indexing::project_catalog_migration_lock::ProjectCatalogMigrationLock;
 use bbox_indexing::project_catalog_store::{ProjectCatalogStore, ProjectCatalogStoreError};
+use bbox_vectors::migration_inventory as vector_inventory;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use serde::Serialize;
 
@@ -159,6 +162,10 @@ struct ScopeMigrateArgs {
     /// Bounded migration timestamp recorded on the migration.
     #[arg(long, value_name = "TIMESTAMP")]
     migrated_at: String,
+    /// Load the same configuration file used by blackboxd. The bridge
+    /// generations are probed from the state roots it resolves.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -447,7 +454,26 @@ fn execute_verify(args: VerifyArgs) -> Result<serde_json::Value, CommandFailure>
     serialize_result(result.receipt())
 }
 
+/// Load the shared configuration for one offline command.
+///
+/// The shared loader skips a missing configuration file so the daemon can
+/// start on defaults. That is wrong for an operator who named a path on this
+/// surface: every offline command derives its state roots from the result, so
+/// a typo would silently administer the default roots instead. An explicitly
+/// named path must therefore exist, tested without following a symlink; the
+/// daemon-facing loader semantics stay unchanged.
 fn load_config(path: Option<PathBuf>) -> Result<config::Config, CommandFailure> {
+    if let Some(path) = path.as_deref()
+        && !matches!(std::fs::symlink_metadata(path), Ok(metadata) if metadata.is_file())
+    {
+        return Err(CommandFailure::new(
+            "error.project_catalog_cli_config",
+            format!(
+                "--config named {} but no regular configuration file exists there",
+                path.display()
+            ),
+        ));
+    }
     config::load_with(LoadOptions {
         config_path: path,
         ..Default::default()
@@ -766,6 +792,7 @@ fn execute_alias(args: AliasArgs) -> Result<serde_json::Value, CommandFailure> {
 }
 
 fn execute_scope_migrate(args: ScopeMigrateArgs) -> Result<serde_json::Value, CommandFailure> {
+    let config = load_config(args.config.clone())?;
     let (_lock, store) = open_admin_store(&args.store.projects_path)?;
     let kind = match args.kind.as_str() {
         "relpath-move" => ScopeMigrationKind::RelpathMove,
@@ -777,16 +804,25 @@ fn execute_scope_migrate(args: ScopeMigrateArgs) -> Result<serde_json::Value, Co
             ));
         }
     };
+    let project_id = parse_project_id(&args.project)?;
+    // Bridge generations are recorded on the attested record exactly as the
+    // attachment-proved channel records them (plan §7.5): an active collected
+    // generation or an accepted publication pointer must survive the scope
+    // change as evidence, and a channel that leaves them unset would write a
+    // record that cannot be told apart from a project holding neither.
     let request = project_catalog_admin::ScopeMigrationRequest {
-        project_id: parse_project_id(&args.project)?,
         expected_old_scope: parse_scope(&args.expected_old_repo, &args.expected_old_relpath)?,
         new_scope: parse_scope(&args.new_repo, &args.new_relpath)?,
         kind,
         designated_attachment: bbox_corpus_core::project_catalog::AttachmentId::mint(),
         acknowledge_repo_authority_change: args.acknowledge_repo_authority_change,
         attachment_probes: Default::default(),
-        code_bridge_generation: None,
-        publication_bridge_generation: None,
+        code_bridge_generation: code_bridge_generation(&config.paths.state_dir, &project_id)?,
+        publication_bridge_generation: publication_bridge_generation(
+            &args.store.projects_path,
+            &project_id,
+        )?,
+        project_id,
         operator_invocation: "cli:project-catalog scope-migrate --operator-attested".into(),
         operator_reason: Some(args.reason.clone()),
         migrated_at: args.migrated_at.clone(),
@@ -805,14 +841,35 @@ fn execute_scope_migrate(args: ScopeMigrateArgs) -> Result<serde_json::Value, Co
 }
 
 fn execute_retire(args: RetireArgs) -> Result<serde_json::Value, CommandFailure> {
+    let config = load_config(args.config.clone())?;
     let (_lock, store) = open_admin_store(&args.store.projects_path)?;
     let project_id = parse_project_id(&args.project)?;
-    let evidence = probe_retire_evidence(&args, &store, &project_id)?;
+    let probe = probe_retire_evidence(&config, &args.store.projects_path, &store, &project_id)?;
+    // An unprobeable class is not a discharged class. Removal is permanent
+    // and strict cross-validation forbids partial removal, so a class the
+    // probe could not read refuses the destructive arm by name instead of
+    // being counted as zero (plan §7.8).
+    if args.execute && !probe.unprobeable.is_empty() {
+        return Err(CommandFailure::new(
+            "error.project_catalog_cli_unprobeable_reference_class",
+            format!(
+                "these reference classes could not be probed and may still hold references: {}",
+                probe.unprobeable.join(", ")
+            ),
+        ));
+    }
     let epoch = current_epoch(&store)?;
-    let (inventory, commit) =
-        project_catalog_admin::retire_project(&store, epoch, &project_id, &evidence, args.execute)?;
+    let (inventory, commit) = project_catalog_admin::retire_project(
+        &store,
+        epoch,
+        &project_id,
+        &probe.evidence,
+        args.execute,
+    )?;
     Ok(serde_json::json!({
         "blocking": inventory.blocking,
+        "probed_reference_classes": RETIRE_REFERENCE_CLASSES,
+        "unprobeable_reference_classes": probe.unprobeable,
         "removable_attachments": inventory.removable_attachments,
         "removable_migrations": inventory.removable_migrations,
         "removable_bindings": inventory.removable_bindings,
@@ -821,24 +878,82 @@ fn execute_retire(args: RetireArgs) -> Result<serde_json::Value, CommandFailure>
     }))
 }
 
-/// Bounded external-reference probing for retire (plan §7.8): code-source
-/// activation and retained generations, the accepted-publication pointer,
-/// and project-selector rows in the shared coordination stores. Rows are
-/// matched by exact project id or any of the project's recorded attachment
-/// directories.
+/// Every external-reference class the offline retire probe covers (plan
+/// §7.8). These names are operator-facing vocabulary: a refusal names the
+/// exact classes that still hold references, and the response repeats the
+/// complete list so a class that was never probed cannot be mistaken for a
+/// discharged one. Attachment rows are inventoried by the domain layer and
+/// are deliberately absent here.
+const RETIRE_REFERENCE_CLASSES: [&str; 16] = [
+    "code_source_activation",
+    "code_source_generations",
+    "producer_assignments",
+    "accepted_publication_pointer",
+    "knowledge_rows",
+    "gap_rows",
+    "thread_rows",
+    "note_rows",
+    "pin_rows",
+    "roadmap_rows",
+    "artifact_rows",
+    "edge_sidecar_rows",
+    "index_entity_refs",
+    "index_code_metadata_rows",
+    "git_ingest_cursors",
+    "vector_entity_refs",
+];
+
+/// Outcome of one reference-class probe. A class the probe could not read is
+/// never folded into a count: `Unprobeable` keeps it distinguishable from a
+/// genuinely discharged zero.
+enum ClassProbe {
+    Counted(u64),
+    Unprobeable,
+}
+
+/// Bounded external-reference evidence plus the classes this host could not
+/// answer for.
+#[derive(Default)]
+struct RetireProbe {
+    evidence: project_catalog_admin::RetireEvidence,
+    unprobeable: Vec<String>,
+}
+
+impl RetireProbe {
+    fn record(&mut self, class: &str, probe: ClassProbe) {
+        match probe {
+            ClassProbe::Counted(0) => {}
+            ClassProbe::Counted(count) => {
+                self.evidence
+                    .external_reference_counts
+                    .insert(class.to_string(), count);
+            }
+            ClassProbe::Unprobeable => self.unprobeable.push(class.to_string()),
+        }
+    }
+}
+
+/// Bounded external-reference probing for retire (plan §7.8), covering every
+/// class in [`RETIRE_REFERENCE_CLASSES`]: code-source activation, retained
+/// generations across every scope the project has ever owned, producer
+/// assignments from the effective source manifest, the accepted-publication
+/// pointer, project-selector rows in the shared coordination stores,
+/// artifacts, the project's edge sidecar lane, and the entity refs the corpus
+/// index and vector partitions still carry. Rows are matched by exact project
+/// id or any of the project's recorded attachment directories.
+///
+/// Every filesystem probe reads no-follow metadata: a symlink standing where
+/// a store-owned record belongs answers for state this project does not own,
+/// so it is reported as unprobeable rather than as presence or absence. The
+/// index and vector owners are read through their no-create Phase 1 capture
+/// surfaces, which never open, repair, or create either store.
 fn probe_retire_evidence(
-    args: &RetireArgs,
+    config: &config::Config,
+    projects_path: &Path,
     store: &ProjectCatalogStore,
     project_id: &ProjectId,
-) -> Result<project_catalog_admin::RetireEvidence, CommandFailure> {
-    let config = config::load_with(LoadOptions {
-        config_path: args.config.clone(),
-        ..Default::default()
-    })
-    .map_err(|error| {
-        CommandFailure::new("error.project_catalog_cli_config", format!("{error:#}"))
-    })?;
-    let mut evidence = project_catalog_admin::RetireEvidence::default();
+) -> Result<RetireProbe, CommandFailure> {
+    let mut probe = RetireProbe::default();
     let state = store.snapshot()?;
     let selectors: Vec<String> = std::iter::once(project_id.as_str().to_string())
         .chain(
@@ -854,43 +969,55 @@ fn probe_retire_evidence(
     // Code-source state roots on the configured state dir (the same
     // derivation the daemon uses), never the projects-path parent.
     let code_sources = config.paths.state_dir.join("code-sources");
-    if let Ok(paths) = bbox_code_source_store::CodeSourceStorePaths::new(&code_sources) {
-        if paths.activation(project_id).exists() {
-            evidence
-                .external_reference_counts
-                .insert("code_source_activation".into(), 1);
+    match bbox_code_source_store::CodeSourceStorePaths::new(&code_sources) {
+        Ok(paths) => {
+            let activation = paths.activation(project_id);
+            probe.record("code_source_activation", presence_probe(&activation));
+            let assignments = probe_producer_assignments(&paths.anchor(), project_id);
+            probe.record("producer_assignments", assignments.class);
+            // Generations are scope-keyed, and a migrated project keeps them
+            // under every scope hash it has owned, so the walk covers each
+            // scope directory in the store rather than the current hash
+            // alone. An activation record or manifest naming an exact
+            // generation id attributes it whichever scope directory holds it.
+            let named_generations = match read_json_field(&activation, "generation_id") {
+                Ok(active) => {
+                    let mut named = assignments.generations;
+                    named.extend(active);
+                    Some(named)
+                }
+                Err(_) => None,
+            };
+            probe.record(
+                "code_source_generations",
+                match named_generations {
+                    Some(named) => probe_code_source_generations(
+                        &code_sources,
+                        &owned_scope_hashes(&state, project_id),
+                        &named,
+                    ),
+                    None => ClassProbe::Unprobeable,
+                },
+            );
         }
-        // Retained generations are scope-keyed; a published project's
-        // scope directory holds them.
-        if let Some(project) = state.catalog().projects.get(project_id)
-            && let ProjectScope::Published(scope) = &project.scope
-        {
-            let scope_dir = code_sources
-                .join("scopes")
-                .join(bbox_code_source::scope_hash(scope));
-            if scope_dir.exists() {
-                evidence
-                    .external_reference_counts
-                    .insert("code_source_generations".into(), 1);
+        Err(_) => {
+            for class in [
+                "code_source_activation",
+                "producer_assignments",
+                "code_source_generations",
+            ] {
+                probe.record(class, ClassProbe::Unprobeable);
             }
         }
     }
-    let pointer = args
-        .store
-        .projects_path
-        .parent()
-        .map(|parent| {
-            parent
-                .join("accepted-publications")
-                .join("pointers")
-                .join(format!("{project_id}.json"))
-        })
-        .unwrap_or_default();
-    if pointer.exists() {
-        evidence
-            .external_reference_counts
-            .insert("accepted_publication_pointer".into(), 1);
-    }
+
+    probe.record(
+        "accepted_publication_pointer",
+        match accepted_publication_pointer(projects_path, project_id) {
+            Some(pointer) => presence_probe(&pointer),
+            None => ClassProbe::Unprobeable,
+        },
+    );
 
     for (class, path) in [
         ("knowledge_rows", &config.paths.knowledge_path),
@@ -900,28 +1027,340 @@ fn probe_retire_evidence(
         ("pin_rows", &config.paths.pins_path),
         ("roadmap_rows", &config.paths.roadmap_path),
     ] {
-        let count = count_project_rows(path, &selectors);
-        if count > 0 {
-            evidence
-                .external_reference_counts
-                .insert(class.to_string(), count);
-        }
+        probe.record(class, count_project_rows(path, &selectors));
     }
-    Ok(evidence)
+
+    probe.record(
+        "artifact_rows",
+        probe_artifact_rows(&config.paths.artifacts_dir, &selectors),
+    );
+    probe.record(
+        "edge_sidecar_rows",
+        probe_edge_sidecar(&config.paths.state_dir.join("edges"), project_id),
+    );
+
+    // Both derived corpora are read through their no-create Phase 1 capture
+    // surfaces: neither call opens, repairs, resets, or creates a store.
+    let corpus = corpus_inventory::capture_owner_migration_snapshot_no_create(
+        &config.paths.index_path,
+        &config.paths.state_dir.join("git_meta"),
+        Default::default(),
+    );
+    probe.record(
+        "index_entity_refs",
+        probe_index_entity_refs(&corpus.index, &selectors),
+    );
+    probe.record(
+        "index_code_metadata_rows",
+        probe_index_code_metadata_rows(&corpus.code_metadata, &selectors),
+    );
+    probe.record(
+        "git_ingest_cursors",
+        probe_git_ingest_cursors(&corpus.git_cursors, &selectors),
+    );
+
+    let vectors = vector_inventory::capture_migration_snapshot_no_create(
+        &config.paths.state_dir.join("vectors"),
+        Default::default(),
+    );
+    probe.record(
+        "vector_entity_refs",
+        probe_vector_entity_refs(&vectors, &selectors),
+    );
+
+    Ok(probe)
 }
 
-/// Count rows in one JSON coordination store whose `project` or
-/// `project_id` field names the retiring project. Loose by design: an
-/// unreadable store counts as one blocking reference rather than zero.
-fn count_project_rows(path: &std::path::Path, selectors: &[String]) -> u64 {
-    if !path.exists() {
-        return 0;
+/// Every code-source scope hash this project has owned: the scope the catalog
+/// records now plus both endpoints of each of its own migration records.
+fn owned_scope_hashes(
+    state: &bbox_indexing::project_catalog_store::ProjectCatalogState,
+    project_id: &ProjectId,
+) -> BTreeSet<String> {
+    let mut hashes = BTreeSet::new();
+    let add = |scope: &ProjectScope, hashes: &mut BTreeSet<String>| {
+        if let ProjectScope::Published(scope) = scope {
+            hashes.insert(bbox_code_source::scope_hash(scope));
+        }
+    };
+    if let Some(project) = state.catalog().projects.get(project_id) {
+        add(&project.scope, &mut hashes);
     }
-    let Ok(bytes) = std::fs::read(path) else {
-        return 1;
+    for record in state.catalog().scope_migrations.values() {
+        if &record.project_id != project_id {
+            continue;
+        }
+        add(&record.old_scope, &mut hashes);
+        add(&record.new_scope, &mut hashes);
+    }
+    hashes
+}
+
+/// Producer assignments for the project, read from the effective source
+/// manifest anchor. The manifest is also the only offline evidence naming the
+/// project's generation ids across scope directories.
+struct ProducerAssignments {
+    class: ClassProbe,
+    generations: BTreeSet<String>,
+}
+
+fn probe_producer_assignments(anchor: &Path, project_id: &ProjectId) -> ProducerAssignments {
+    let bytes = match read_regular_nofollow(anchor) {
+        Ok(None) => {
+            return ProducerAssignments {
+                class: ClassProbe::Counted(0),
+                generations: BTreeSet::new(),
+            };
+        }
+        Ok(Some(bytes)) => bytes,
+        Err(()) => {
+            return ProducerAssignments {
+                class: ClassProbe::Unprobeable,
+                generations: BTreeSet::new(),
+            };
+        }
+    };
+    let decoded = bbox_code_source_store::decode_migration_effective_source_manifest_v1(&bytes);
+    let Ok(manifest) = decoded else {
+        return ProducerAssignments {
+            class: ClassProbe::Unprobeable,
+            generations: BTreeSet::new(),
+        };
+    };
+    let mut generations = BTreeSet::new();
+    let mut count = 0_u64;
+    for selection in &manifest.selections {
+        if &selection.project_id == project_id {
+            count += 1;
+            generations.insert(selection.generation_id.clone());
+        }
+    }
+    ProducerAssignments {
+        class: ClassProbe::Counted(count),
+        generations,
+    }
+}
+
+/// Retained generations attributable to the project across every scope
+/// directory present in the store.
+fn probe_code_source_generations(
+    code_sources: &Path,
+    owned_scopes: &BTreeSet<String>,
+    named_generations: &BTreeSet<String>,
+) -> ClassProbe {
+    let scopes_root = code_sources.join("scopes");
+    match std::fs::symlink_metadata(&scopes_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ClassProbe::Counted(0);
+        }
+        Ok(metadata) if metadata.is_dir() => {}
+        _ => return ClassProbe::Unprobeable,
+    }
+    let Ok(scopes) = std::fs::read_dir(&scopes_root) else {
+        return ClassProbe::Unprobeable;
+    };
+    let mut count = 0_u64;
+    for scope in scopes {
+        let Ok(scope) = scope else {
+            return ClassProbe::Unprobeable;
+        };
+        let Ok(kind) = scope.file_type() else {
+            return ClassProbe::Unprobeable;
+        };
+        if kind.is_symlink() {
+            return ClassProbe::Unprobeable;
+        }
+        if !kind.is_dir() {
+            continue;
+        }
+        let owned = scope
+            .file_name()
+            .to_str()
+            .is_some_and(|hash| owned_scopes.contains(hash));
+        let generations = match std::fs::read_dir(scope.path().join("generations")) {
+            Ok(generations) => generations,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return ClassProbe::Unprobeable,
+        };
+        for generation in generations {
+            let Ok(generation) = generation else {
+                return ClassProbe::Unprobeable;
+            };
+            let Ok(kind) = generation.file_type() else {
+                return ClassProbe::Unprobeable;
+            };
+            if kind.is_symlink() {
+                return ClassProbe::Unprobeable;
+            }
+            if !kind.is_dir() {
+                continue;
+            }
+            let named = generation
+                .file_name()
+                .to_str()
+                .is_some_and(|id| named_generations.contains(id));
+            if owned || named {
+                count += 1;
+            }
+        }
+    }
+    ClassProbe::Counted(count)
+}
+
+/// Edge rows the project still owns in its own sidecar lane. The sidecar is
+/// one JSONL file per project id, so presence and line count answer the class
+/// exactly.
+fn probe_edge_sidecar(edges_dir: &Path, project_id: &ProjectId) -> ClassProbe {
+    let bytes = match read_regular_nofollow(&edges_dir.join(format!("{project_id}.jsonl"))) {
+        Ok(None) => return ClassProbe::Counted(0),
+        Ok(Some(bytes)) => bytes,
+        Err(()) => return ClassProbe::Unprobeable,
+    };
+    let Ok(body) = String::from_utf8(bytes) else {
+        return ClassProbe::Unprobeable;
+    };
+    ClassProbe::Counted(body.lines().filter(|line| !line.trim().is_empty()).count() as u64)
+}
+
+/// Artifact rows scoped to the project, read through the Phase 1 owner
+/// snapshot so the CLI never opens (and never creates) an artifact catalog.
+fn probe_artifact_rows(artifacts_dir: &Path, selectors: &[String]) -> ClassProbe {
+    use bbox_corpus_core::project_catalog_snapshot::{
+        OwnerSnapshotRowValueV1, OwnerSnapshotStateV1,
+    };
+
+    let Ok(snapshot) = bbox_artifacts::artifacts::capture_project_catalog_owner_snapshot(
+        artifacts_dir,
+        Default::default(),
+    ) else {
+        return ClassProbe::Unprobeable;
+    };
+    match snapshot.state {
+        OwnerSnapshotStateV1::Missing { .. } if snapshot.rows.is_empty() => {
+            return ClassProbe::Counted(0);
+        }
+        OwnerSnapshotStateV1::Present { .. } => {}
+        _ => return ClassProbe::Unprobeable,
+    }
+    ClassProbe::Counted(
+        snapshot
+            .rows
+            .iter()
+            .filter(|row| match &row.value {
+                OwnerSnapshotRowValueV1::InventoryTarget { project_id, .. } => {
+                    selectors.iter().any(|selector| selector == project_id)
+                }
+                OwnerSnapshotRowValueV1::LegacyProjectSelector {
+                    literal_selector, ..
+                } => selectors
+                    .iter()
+                    .any(|selector| selector == literal_selector),
+            })
+            .count() as u64,
+    )
+}
+
+/// Committed corpus-index documents still exposing an entity ref for the
+/// project. Multiplicity is retained: two documents naming the same ref are
+/// two references to discharge.
+fn probe_index_entity_refs(
+    index: &corpus_inventory::CorpusIndexMigrationSnapshotV1,
+    selectors: &[String],
+) -> ClassProbe {
+    use corpus_inventory::CorpusMigrationSourceStateV1;
+
+    match index.state {
+        CorpusMigrationSourceStateV1::Missing => ClassProbe::Counted(0),
+        CorpusMigrationSourceStateV1::Present => ClassProbe::Counted(
+            index
+                .project_scoped_refs
+                .iter()
+                .filter(|row| selectors.iter().any(|selector| selector == &row.project_id))
+                .map(|row| row.document_count)
+                .sum(),
+        ),
+        _ => ClassProbe::Unprobeable,
+    }
+}
+
+/// Code-index metadata rows keyed to the project by id or legacy selector.
+fn probe_index_code_metadata_rows(
+    metadata: &corpus_inventory::CodeIndexMetadataMigrationSnapshotV1,
+    selectors: &[String],
+) -> ClassProbe {
+    use corpus_inventory::CorpusMigrationSourceStateV1;
+
+    match metadata.state {
+        CorpusMigrationSourceStateV1::Missing => ClassProbe::Counted(0),
+        CorpusMigrationSourceStateV1::Present => ClassProbe::Counted(
+            metadata
+                .rows
+                .iter()
+                .filter(|row| {
+                    let named = |value: &Option<String>| {
+                        value
+                            .as_deref()
+                            .is_some_and(|value| selectors.iter().any(|s| s == value))
+                    };
+                    named(&row.project_id) || named(&row.selector)
+                })
+                .count() as u64,
+        ),
+        _ => ClassProbe::Unprobeable,
+    }
+}
+
+/// Legacy Git ingest cursors still recorded for the project.
+fn probe_git_ingest_cursors(
+    cursors: &corpus_inventory::GitCursorMigrationSnapshotV1,
+    selectors: &[String],
+) -> ClassProbe {
+    use corpus_inventory::CorpusMigrationSourceStateV1;
+
+    match cursors.state {
+        CorpusMigrationSourceStateV1::Missing => ClassProbe::Counted(0),
+        CorpusMigrationSourceStateV1::Present => ClassProbe::Counted(
+            cursors
+                .rows
+                .iter()
+                .filter(|row| selectors.iter().any(|selector| selector == &row.project_id))
+                .count() as u64,
+        ),
+        _ => ClassProbe::Unprobeable,
+    }
+}
+
+/// Project-scoped entity refs still held by the vector partitions.
+fn probe_vector_entity_refs(
+    snapshot: &vector_inventory::VectorMigrationSnapshotV1,
+    selectors: &[String],
+) -> ClassProbe {
+    use vector_inventory::VectorMigrationSourceStateV1;
+
+    match snapshot.state {
+        VectorMigrationSourceStateV1::Missing => ClassProbe::Counted(0),
+        VectorMigrationSourceStateV1::Present => ClassProbe::Counted(
+            snapshot
+                .project_scoped_refs
+                .iter()
+                .filter(|row| selectors.iter().any(|selector| selector == &row.project_id))
+                .count() as u64,
+        ),
+        _ => ClassProbe::Unprobeable,
+    }
+}
+
+/// Count rows in one JSON coordination store whose `project` or `project_id`
+/// field names the retiring project. A store that exists but cannot be read
+/// or parsed is unprobeable, never zero.
+fn count_project_rows(path: &Path, selectors: &[String]) -> ClassProbe {
+    let bytes = match read_regular_nofollow(path) {
+        Ok(None) => return ClassProbe::Counted(0),
+        Ok(Some(bytes)) => bytes,
+        Err(()) => return ClassProbe::Unprobeable,
     };
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return 1;
+        return ClassProbe::Unprobeable;
     };
     let mut count = 0_u64;
     let mut stack = vec![&value];
@@ -943,5 +1382,83 @@ fn count_project_rows(path: &std::path::Path, selectors: &[String]) -> u64 {
             _ => {}
         }
     }
-    count
+    ClassProbe::Counted(count)
+}
+
+/// No-follow presence test for one store-owned record. `Path::exists`
+/// follows symlinks, which would let a link into unrelated state answer an
+/// evidence question about this project's own store.
+fn presence_probe(path: &Path) -> ClassProbe {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ClassProbe::Counted(0),
+        Ok(metadata) if metadata.is_file() => ClassProbe::Counted(1),
+        _ => ClassProbe::Unprobeable,
+    }
+}
+
+/// Read one small store-owned record without following a symlink at the
+/// leaf. An absent record reads as `Ok(None)`; anything present that cannot
+/// be read as a regular file is an error, never an empty read.
+fn read_regular_nofollow(path: &Path) -> Result<Option<Vec<u8>>, ()> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(metadata) if metadata.is_file() => std::fs::read(path).map(Some).map_err(|_| ()),
+        _ => Err(()),
+    }
+}
+
+/// Read one JSON field from a small store-owned record. Returns `Ok(None)`
+/// when the record is absent, and an error when it exists but cannot be read
+/// or does not carry the field: a bridge generation is never invented.
+fn read_json_field(path: &Path, field: &str) -> Result<Option<String>, CommandFailure> {
+    let unreadable = || {
+        CommandFailure::new(
+            "error.project_catalog_cli_bridge_generation",
+            format!("{} carries no readable {field}", path.display()),
+        )
+    };
+    let Some(bytes) = read_regular_nofollow(path).map_err(|()| unreadable())? else {
+        return Ok(None);
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| unreadable())?;
+    match value.get(field).and_then(|found| found.as_str()) {
+        Some(found) => Ok(Some(found.to_string())),
+        None => Err(unreadable()),
+    }
+}
+
+/// Active collected generation for the project, read from the code-source
+/// activation record (plan §7.5).
+fn code_bridge_generation(
+    state_dir: &Path,
+    project_id: &ProjectId,
+) -> Result<Option<String>, CommandFailure> {
+    let root = state_dir.join("code-sources");
+    let Ok(paths) = bbox_code_source_store::CodeSourceStorePaths::new(&root) else {
+        return Ok(None);
+    };
+    read_json_field(&paths.activation(project_id), "generation_id")
+}
+
+/// The pointer record that would carry an accepted publication for this
+/// project, derived from the administered projects path.
+fn accepted_publication_pointer(projects_path: &Path, project_id: &ProjectId) -> Option<PathBuf> {
+    projects_path.parent().map(|parent| {
+        parent
+            .join("accepted-publications")
+            .join("pointers")
+            .join(format!("{project_id}.json"))
+    })
+}
+
+/// Accepted publication generation for the project, read from the pointer
+/// (plan §7.5).
+fn publication_bridge_generation(
+    projects_path: &Path,
+    project_id: &ProjectId,
+) -> Result<Option<String>, CommandFailure> {
+    let Some(pointer) = accepted_publication_pointer(projects_path, project_id) else {
+        return Ok(None);
+    };
+    read_json_field(&pointer, "accepted_generation")
 }

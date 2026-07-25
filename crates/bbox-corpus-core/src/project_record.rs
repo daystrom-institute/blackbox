@@ -367,6 +367,13 @@ impl ProjectRecordsSnapshot {
 /// discipline-dependent.
 pub trait ProjectRecordsProvider: Send + Sync {
     fn records_snapshot(&self) -> ProjectRecordsSnapshot;
+
+    /// Bounded description of the provider's most recent degradation
+    /// (stale-cache serving, omitted projection rows), for doctor/health
+    /// surfacing. `None` means the last snapshot derived cleanly.
+    fn last_degradation(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Load the registered project records from a `projects.json` registry

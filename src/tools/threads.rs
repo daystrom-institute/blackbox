@@ -95,8 +95,25 @@ impl BlackboxServer {
                 // keyed under one of this project's historical paths stay
                 // visible after relocation. Empty in bridge mode.
                 p.project_ledger_paths = self.filter_ledger_paths(&raw);
+                // Query-side ids come from the resolver (§8.2): a resolving
+                // project filter also arms the id arm.
+                if p.project_id.is_none() {
+                    p.project_id = self
+                        .resolve_project_filter(&raw)
+                        .and_then(|resolution| resolution.project_id().map(str::to_owned));
+                }
                 if let Some((base, _worktree)) = self.resolve_worktree_scope_and_dir(&raw) {
                     p.project = Some(base);
+                }
+            } else if let Some(raw_id) = p.project_id.clone() {
+                // A caller-supplied id is a selector, not an assertion: it
+                // resolves through the engine to the canonical id (and the
+                // ledger arm), and an unknown id simply matches nothing.
+                if let Some(resolution) = self.resolve_project_filter(&raw_id)
+                    && let Some(resolved) = resolution.project_id()
+                {
+                    p.project_id = Some(resolved.to_owned());
+                    p.project_ledger_paths = self.ledger_historical_paths(resolved);
                 }
             }
             self.state.threads.read().thread_list(&p)

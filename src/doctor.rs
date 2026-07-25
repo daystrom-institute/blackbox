@@ -254,10 +254,17 @@ fn checkout_access_section(
 }
 
 /// Resolver compatibility-lane counters (phase-2 §9.2): the per-surface
-/// observations the Phase 6 compatibility cut consumes.
+/// observations the Phase 6 compatibility cut consumes. Also surfaces the
+/// records-provider's most recent degradation (stale projection serving,
+/// omitted rows) so a silently-thinned catalog projection is visible.
 fn resolver_compat_section(state: &crate::server::state::SharedState) -> SectionReport {
     let snapshot = state.resolver_compat.snapshot();
     let mut findings = Vec::new();
+    if let Some(degradation) = state.records_provider.last_degradation() {
+        findings.push(Finding::info(format!(
+            "records provider degradation: {degradation}"
+        )));
+    }
     if snapshot.sequence == 0 {
         findings.push(Finding::info(
             "no resolver compatibility lane has fired yet",

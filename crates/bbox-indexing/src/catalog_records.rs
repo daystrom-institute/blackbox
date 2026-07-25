@@ -33,6 +33,9 @@ use crate::project_catalog_store::ProjectCatalogStore;
 pub struct CatalogProjectRecordsProvider {
     store: Arc<ProjectCatalogStore>,
     cache: parking_lot::Mutex<Option<ProjectRecordsSnapshot>>,
+    /// Most recent degradation (stale-cache serving, cross-validation
+    /// failure, omitted rows), surfaced through doctor/health.
+    degradation: parking_lot::Mutex<Option<String>>,
 }
 
 impl CatalogProjectRecordsProvider {
@@ -40,6 +43,7 @@ impl CatalogProjectRecordsProvider {
         Self {
             store,
             cache: parking_lot::Mutex::new(None),
+            degradation: parking_lot::Mutex::new(None),
         }
     }
 }
@@ -54,6 +58,10 @@ impl ProjectRecordsProvider for CatalogProjectRecordsProvider {
                 // exists; a boot-time failure yields the empty snapshot and
                 // the strict open has already refused startup.
                 tracing::warn!(code = %error.code(), "catalog snapshot unavailable");
+                *self.degradation.lock() = Some(format!(
+                    "catalog snapshot unavailable ({}); serving the last good projection",
+                    error.code()
+                ));
                 return cache.clone().unwrap_or_else(ProjectRecordsSnapshot::empty);
             }
         };
@@ -130,7 +138,13 @@ impl ProjectRecordsProvider for CatalogProjectRecordsProvider {
             authority_epoch: state.epoch(),
         };
         *cache = Some(snapshot.clone());
+        *self.degradation.lock() = (omitted > 0)
+            .then(|| format!("compatibility projection omitted {omitted} catalog project(s)"));
         snapshot
+    }
+
+    fn last_degradation(&self) -> Option<String> {
+        self.degradation.lock().clone()
     }
 }
 

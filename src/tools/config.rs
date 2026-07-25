@@ -247,6 +247,12 @@ impl BlackboxServer {
                 "team_id, channel_id, msg_ts, proposal_id, and project_dir are all required",
             );
         }
+        // Dual-read stamping (phase-2 §8.1): the stored row carries the
+        // resolved stable id beside the path key; an unresolved dir stays
+        // on the legacy path lane with no id.
+        let project_id = self
+            .resolve_project_filter(&p.project_dir)
+            .and_then(|resolution| resolution.project_id().map(str::to_owned));
         let link = slack_proposal_links::SlackProposalLink {
             team_id: p.team_id,
             channel_id: p.channel_id,
@@ -256,7 +262,7 @@ impl BlackboxServer {
             authoring_session_id: p.authoring_session_id,
             version: 1,
             project_dir: p.project_dir,
-            project_id: None,
+            project_id,
             posted_at: util::now_iso(),
         };
         match self.state.slack_proposal_links.record(link) {

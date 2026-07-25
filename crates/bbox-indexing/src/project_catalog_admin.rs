@@ -554,6 +554,20 @@ pub fn scope_migrate_attached(
             &migration_id,
             new_epoch,
         )?;
+        // The commit path validates the complete post-image pair inside
+        // `transact` (review M4): the dry run must apply the same strict
+        // and cross-store validation or a colliding relocation reads as
+        // clean here and fails at the real invocation.
+        catalog.epoch = new_epoch;
+        attachments.epoch = new_epoch;
+        catalog
+            .validate()
+            .map_err(|error| admin_error(error.code(), error.to_string()))?;
+        attachments
+            .validate()
+            .map_err(|error| admin_error(error.code(), error.to_string()))?;
+        bbox_corpus_core::project_catalog::validate_catalog_attachments(&catalog, &attachments)
+            .map_err(|error| admin_error(error.code(), error.to_string()))?;
         return Ok(None);
     }
     let receipt_id = migration_id.clone();
@@ -780,6 +794,9 @@ pub struct PublisherBindProbe {
 #[derive(Debug, Clone)]
 pub struct PublisherBindReceipt {
     pub attachment_id: AttachmentId,
+    /// Epoch of the catalog snapshot the binding validated against, read
+    /// inside the publication-lock critical section.
+    pub catalog_epoch: u64,
 }
 
 /// Rebind the publisher attachment for one project (plan §7.7): the
@@ -787,9 +804,16 @@ pub struct PublisherBindReceipt {
 /// here; ref/commit changes are exclusively the later advance path. The
 /// catalog side validates the attachment; the pointer store enforces the
 /// pointer/generation agreement before and after.
+///
+/// Epoch CAS is real, not advisory (review): the expected epoch and the
+/// attachment's Attached status are validated against a snapshot taken
+/// INSIDE the publication-lock critical section, so a concurrent detach or
+/// admin commit between the caller's read and the rebind is a typed
+/// refusal, never a pointer naming a detached attachment.
 pub fn bind_publisher_attachment(
     store: &ProjectCatalogStore,
     projects_path: &std::path::Path,
+    expected_epoch: u64,
     project_id: &ProjectId,
     new_attachment: &AttachmentId,
     probe: &PublisherBindProbe,
@@ -806,7 +830,19 @@ pub fn bind_publisher_attachment(
              commit; fetch it before rebinding",
         ));
     }
+    let paths = AcceptedPublicationStorePaths::derive(projects_path)
+        .map_err(|error| admin_error(error.code(), "publication paths are invalid"))?;
+    let guard = acquire_accepted_publication_lock(&paths)
+        .map_err(|error| admin_error(error.code(), "publication store is locked"))?;
+    // Read-validate-rebind under the publication lock; no catalog lock is
+    // held (the catalog read uses a pinned snapshot taken after the lock).
     let state = store.snapshot()?;
+    if state.epoch() != expected_epoch {
+        return Err(admin_error(
+            "error.project_catalog_stale_epoch",
+            "expected epoch does not match the current catalog epoch",
+        ));
+    }
     let Some(row) = state.attachments().attachments.get(new_attachment) else {
         return Err(admin_error(
             "error.project_catalog_admin_unknown_attachment",
@@ -825,15 +861,7 @@ pub fn bind_publisher_attachment(
             "a detached attachment cannot carry the publisher binding",
         ));
     }
-    let attachment_scope = row.validated_scope.clone();
-
-    let paths = AcceptedPublicationStorePaths::derive(projects_path)
-        .map_err(|error| admin_error(error.code(), "publication paths are invalid"))?;
-    let guard = acquire_accepted_publication_lock(&paths)
-        .map_err(|error| admin_error(error.code(), "publication store is locked"))?;
-    // Read-validate-rebind under the publication lock; no catalog lock is
-    // held here (the catalog read above used a pinned snapshot).
-    let Some(attachment_scope) = attachment_scope else {
+    let Some(attachment_scope) = row.validated_scope.clone() else {
         return Err(admin_error(
             "error.project_catalog_admin_scope_required",
             "a scope-less attachment cannot carry the publisher binding",
@@ -853,6 +881,7 @@ pub fn bind_publisher_attachment(
     .map_err(|error| admin_error(error.code(), error.to_string()))?;
     Ok(PublisherBindReceipt {
         attachment_id: rebound.attachment_id,
+        catalog_epoch: state.epoch(),
     })
 }
 

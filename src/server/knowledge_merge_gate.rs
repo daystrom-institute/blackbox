@@ -77,17 +77,15 @@ pub(crate) fn evaluate(candidate: &CandidateTree) -> Result<CandidateGateReport>
 }
 
 fn target_contains_bbox(candidate: &CandidateTree) -> Result<bool> {
+    // `.bbox` at ANY depth counts (review M7): a monorepo whose only scope
+    // sits at a relpath carries its knowledge tree under a nested `.bbox`,
+    // and the whole-tree deletion guard must fire for it exactly like a
+    // root-level one. A bare `.bbox` pathspec matches the top level only,
+    // so the full listing is filtered here instead.
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(&candidate.repo)
-        .args([
-            "ls-tree",
-            "-r",
-            "--name-only",
-            &candidate.target,
-            "--",
-            ".bbox",
-        ])
+        .args(["ls-tree", "-r", "--name-only", &candidate.target])
         .output()
         .context("checking target tree for existing .bbox content")?;
     if !output.status.success() {
@@ -96,7 +94,13 @@ fn target_contains_bbox(candidate: &CandidateTree) -> Result<bool> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(!output.stdout.is_empty())
+    let listing = String::from_utf8_lossy(&output.stdout);
+    Ok(listing.lines().any(|line| {
+        line == ".bbox"
+            || line.starts_with(".bbox/")
+            || line.contains("/.bbox/")
+            || line.ends_with("/.bbox")
+    }))
 }
 
 #[allow(clippy::disallowed_methods)]
