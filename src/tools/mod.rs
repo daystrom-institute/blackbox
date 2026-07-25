@@ -23,6 +23,7 @@ pub mod mcp_surface;
 pub mod notes;
 pub mod orchestrate;
 pub mod packets;
+pub mod project_catalog;
 pub mod projects;
 pub mod render;
 pub mod roadmap;

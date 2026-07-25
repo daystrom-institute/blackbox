@@ -24,6 +24,7 @@ pub enum ToolCategory {
     Transcripts,
     Graph,
     Projects,
+    ProjectCatalog,
     Knowledge,
     Threads,
     Notes,
@@ -46,6 +47,7 @@ impl ToolCategory {
             Self::Transcripts => "Transcripts",
             Self::Graph => "Agentic graph",
             Self::Projects => "Projects",
+            Self::ProjectCatalog => "Project catalog administration",
             Self::Knowledge => "Knowledge",
             Self::Threads => "Threads",
             Self::Notes => "Side-channel notes",
@@ -70,6 +72,9 @@ impl ToolCategory {
             }
             Self::Graph => "Inspect entities, graph vocabulary, paths, bundles, and retrieval.",
             Self::Projects => "Register project roots for later file indexing.",
+            Self::ProjectCatalog => {
+                "Durable project-catalog administration: attach and detach local checkouts, select the default attachment, promote a legacy-local project to its committed scope, migrate a published scope, and rebind the publisher attachment. Every one of these refuses with `error.project_catalog_inactive` while the version-1 registry is the runtime authority; the proofless-authority operations (catalog add, alias accept and reject, retire) live on the offline `blackbox project-catalog` CLI instead."
+            }
             Self::Knowledge => {
                 "Memory lanes: `bbox_learn` for operator-approved rendered rules, `bbox_remember` for approved cold recall, `bbox_decide` for approved durable commitments, and `bbox_pin` for scoped active context."
             }
@@ -385,6 +390,67 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: Some(
             r#"bbox_project_unregister(project="/home/me/repos/dead-project", dry_run=true)"#,
         ),
+    },
+    // ── Project catalog administration ───────────────────────────────
+    ToolDoc {
+        name: "bbox_project_catalog_list",
+        category: ToolCategory::ProjectCatalog,
+        summary: "List every project in the durable catalog, including remote-only projects with no attachment on this host. Path-free rows: project_id, display_name, scope (published repo_id + bbox_root_relpath, or legacy_local), operator and nominated aliases, and the count of active attachments. Returns the catalog epoch to pass as expected_catalog_epoch on a following administration call. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority.",
+        when_to_use: "Use to see the complete catalog, including projects with no local checkout, and to read the current epoch before any administration call. `bbox_project_list` still reports the attached version-1 rows.",
+        example: None,
+    },
+    ToolDoc {
+        name: "bbox_project_catalog_get",
+        category: ToolCategory::ProjectCatalog,
+        summary: "Read one catalog project: its id, display name, scope, aliases, pending alias nominations, and repo-history reference, plus a separate host_local_attachments section carrying this host's attachment rows (attachment_id, status, kind, checkout dir, relpath). The catalog section stays path-free; attachment paths are host-local operator data. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority.",
+        when_to_use: "Use when you need one project's aliases, pending nominations, repo history, or the attachments this host carries for it. Pair with `bbox_project_catalog_list` for the epoch.",
+        example: Some(r#"bbox_project_catalog_get(project="p_4f6a1c9e5b2d47a8b0c3e1f5a9d76b24")"#),
+    },
+    ToolDoc {
+        name: "bbox_project_attach",
+        category: ToolCategory::ProjectCatalog,
+        summary: "Attach a local checkout to an existing catalog project. The daemon probes the path off-lock (canonical checkout top, checkout identity, kind: base, linked worktree, or managed clone, committed scope at HEAD, observed capabilities) and the catalog transaction revalidates identity and uniqueness. A published project accepts only a checkout whose committed config proves the same scope exactly; a mismatch returns the scope-migration or promotion refusal instead of attaching. Well-formed, non-colliding aliases declared by the committed config are recorded as pending nominations, never accepted automatically. Requires expected_catalog_epoch and a bounded audit_reason. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority.",
+        when_to_use: "Use to give an existing catalog project a working checkout on this host. Read the epoch from `bbox_project_catalog_list` first. A scope mismatch refusal names promotion or scope migration as the next step; do not retry attach.",
+        example: Some(
+            r#"bbox_project_attach(project="p_4f6a1c9e5b2d47a8b0c3e1f5a9d76b24", path="/home/me/repos/blackbox", expected_catalog_epoch=7, audit_reason="new laptop checkout")"#,
+        ),
+    },
+    ToolDoc {
+        name: "bbox_project_detach",
+        category: ToolCategory::ProjectCatalog,
+        summary: "Detach one attachment: the row is marked detached with a timestamp, every logical store, entity ref, and generation is left untouched, and the catalog keeps its data. Census and watcher deregistration is scoped to the detached attachment's checkout and scope pair only, so a monorepo checkout carrying sibling attachments for other projects keeps their census rows and watcher coverage. Requires expected_catalog_epoch and a bounded audit_reason. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority.",
+        when_to_use: "Use when a checkout is going away or should stop being a local source for the project. Detach keeps every stored row: it is not deletion, and re-attaching later restores the local source.",
+        example: None,
+    },
+    ToolDoc {
+        name: "bbox_project_default_attachment",
+        category: ToolCategory::ProjectCatalog,
+        summary: "Record or clear the operator-selected default local-source attachment for one project. Path operations use it when no session pin and no explicit selector is present. The selection is host-local attachment data, never catalog data; it must name an active attachment of the same project, and omitting attachment_id clears it. Requires expected_catalog_epoch and a bounded audit_reason. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority.",
+        when_to_use: "Use when a project has several attachments on this host and path operations should prefer one. Omit `attachment_id` to clear the preference.",
+        example: None,
+    },
+    ToolDoc {
+        name: "bbox_project_promote",
+        category: ToolCategory::ProjectCatalog,
+        summary: "Promote a legacy-local catalog project to the published scope its checkouts now prove. Requires the exact project_id, the designated attachment, and the proposed repo_id and bbox_root_relpath. The daemon probes every active attachment of the project at HEAD; each one must prove the exact proposed scope or the promotion refuses with per-attachment diagnostics, and the designated attachment cannot overrule siblings. An owned scope refuses and points at the offline compatibility workflow rather than merging. One pair transaction flips the scope, writes the attachment-proved promotion record with its proof, and performs the repo-history authority transition. Requires expected_catalog_epoch and a bounded audit_reason. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority.",
+        when_to_use: "Use after a legacy-local project's checkouts have committed their repo_id and every active attachment resolves the same scope. Needs the exact project_id, which register refusals hand you.",
+        example: None,
+    },
+    ToolDoc {
+        name: "bbox_project_scope_migrate",
+        category: ToolCategory::ProjectCatalog,
+        summary: "Attachment-proved scope migration for a published catalog project: kind=relpath-move for a monorepo relocation, kind=repo-authority-change for a recorded-authority change. The daemon probes every active attachment at HEAD (and, for a relpath move, the relocated directory, which must exist) and the pair transaction rewrites the catalog scope, relocates the attachments, appends host-local path bindings, and writes the migration record with its proof. A repo-authority change requires acknowledge_repo_authority_change, which agents pass through from operator input and never default or infer. dry_run validates the complete mutation and commits nothing. Requires expected_catalog_epoch and a bounded audit_reason. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority.",
+        when_to_use: "Use when a published project moves inside its monorepo (`relpath-move`) or changes recorded repository authority (`repo-authority-change`). Run `dry_run=true` first. Only pass `acknowledge_repo_authority_change` when the operator explicitly authorized the authority change.",
+        example: Some(
+            r#"bbox_project_scope_migrate(project_id="p_4f6a1c9e5b2d47a8b0c3e1f5a9d76b24", expected_old_repo_id="r_9c1d", expected_old_relpath=".", new_repo_id="r_9c1d", new_relpath="services/api", kind="relpath-move", attachment_id="att_1b7d3f", dry_run=true, expected_catalog_epoch=7, audit_reason="monorepo relocation")"#,
+        ),
+    },
+    ToolDoc {
+        name: "bbox_project_publisher_bind",
+        category: ToolCategory::ProjectCatalog,
+        summary: "Rebind the accepted-publication pointer of a published project to another of its attachments. The pointer's ref, accepted commit, accepted scope, generation, and payload bytes are unchanged: only the attachment binding moves, so the strict pointer and generation agreement holds identically before and after. The new attachment's object database must already contain the pointer's accepted commit, and a project with no pointer refuses rather than inventing one. Requires expected_catalog_epoch and a bounded audit_reason. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority.",
+        when_to_use: "Use after detaching or replacing the checkout that carried the publisher binding, so a later publication advance has a live attachment. Fetch the accepted commit into the new checkout first.",
+        example: None,
     },
     // ── Knowledge ────────────────────────────────────────────────────
     ToolDoc {
