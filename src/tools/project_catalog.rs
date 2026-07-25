@@ -474,20 +474,8 @@ impl BlackboxServer {
                 .default_attachments
                 .get(&project_id)
                 .map(|id| id.as_str().to_string());
-            // Pending nominations carry the exact offline acceptance
-            // command (plan §7.6): alias acceptance is CLI-only authority
-            // (D-005). The CLI validates the epoch itself under the
-            // exclusive lifetime lock, so the command needs no epoch flag.
-            let alias_accept_commands: Vec<String> = project
-                .nominated_aliases
-                .iter()
-                .map(|alias| {
-                    format!(
-                        "blackbox project-catalog alias accept --project {} --alias {}",
-                        project.project_id, alias
-                    )
-                })
-                .collect();
+            let alias_accept_commands =
+                alias_accept_commands(&project.project_id, state.epoch(), &project.nominated_aliases);
             Ok(serde_json::to_string_pretty(&json!({
                 "epoch": state.epoch(),
                 "project": {
@@ -555,6 +543,12 @@ impl BlackboxServer {
                 &probe.declared_aliases,
             );
 
+            // A recorded nomination is only a pending one: the response
+            // hands the operator the exact epoch-checked acceptance command
+            // for the epoch this attachment just published (plan §7.6).
+            let epoch = nominated.epoch.unwrap_or(receipt.commit.epoch);
+            let accept_commands = alias_accept_commands(&project_id, epoch, &nominated.recorded);
+
             // The bounded reason is `operator_invocation`-class data: it is
             // audited in the log line and the response, never duplicated into
             // a parallel audit store (plan §7.1, D-012).
@@ -574,10 +568,11 @@ impl BlackboxServer {
                 "kind": attach_probe.kind,
                 "checkout_project_dir": attach_probe.checkout_project_dir,
                 "project_root_relpath": attach_probe.project_root_relpath,
-                "epoch": nominated.epoch.unwrap_or(receipt.commit.epoch),
+                "epoch": epoch,
                 "catalog_sha256": receipt.commit.catalog_sha256,
                 "attachments_sha256": receipt.commit.attachments_sha256,
                 "nominated_aliases": nominated.recorded,
+                "alias_accept_commands": accept_commands,
             }))?)
         })
         .await
@@ -965,6 +960,27 @@ struct NominationOutcome {
     epoch: Option<u64>,
 }
 
+/// The exact epoch-checked offline command that accepts one pending
+/// nomination (plan §7.6). Acceptance is CLI-only authority (D-005), and the
+/// epoch is durable pair state, so the check holds across a daemon stop: a
+/// nomination accepted against a stale read refuses and the operator re-reads
+/// rather than granting host-wide selector authority from a stale snapshot.
+fn alias_accept_commands<'a>(
+    project_id: &ProjectId,
+    epoch: u64,
+    nominations: impl IntoIterator<Item = &'a String>,
+) -> Vec<String> {
+    nominations
+        .into_iter()
+        .map(|alias| {
+            format!(
+                "blackbox project-catalog alias accept --project {project_id} \
+                 --alias {alias} --expected-epoch {epoch}"
+            )
+        })
+        .collect()
+}
+
 /// Mirror of the catalog snapshot's alias rule, applied before the
 /// nomination transaction so one malformed declaration cannot fail the
 /// whole batch at commit-time validation.
@@ -1222,6 +1238,13 @@ impl BlackboxServer {
                     "registered attachment did not surface in the compatibility projection"
                 )
             })?;
+        // Same nomination contract as attach: the summary carries the exact
+        // epoch-checked acceptance command for the epoch it reports.
+        let accept_commands = alias_accept_commands(
+            &receipt.project_id,
+            nominated.epoch.unwrap_or(nomination_epoch),
+            &nominated.recorded,
+        );
         let summary = json!({
             "project_id": receipt.project_id.as_str(),
             "attachment_id": receipt.attachment_id.as_str(),
@@ -1229,6 +1252,7 @@ impl BlackboxServer {
             "already_attached": receipt.already_attached,
             "epoch": nominated.epoch.or(receipt.commit.as_ref().map(|c| c.epoch)),
             "nominated_aliases": nominated.recorded,
+            "alias_accept_commands": accept_commands,
         });
         Ok((record, summary))
     }

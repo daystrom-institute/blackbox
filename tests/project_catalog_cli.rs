@@ -459,6 +459,61 @@ fn admin_subcommands_round_trip_on_an_isolated_v2_store() {
         "clifamily"
     );
 
+    // Plant a pending nomination the way attach ingests one, then prove the
+    // acceptance command is epoch-checked (plan §7.6): acceptance grants
+    // host-wide selector authority, so a stale read must refuse rather than
+    // decide against a snapshot the operator never saw. The store handle is
+    // dropped before the CLI runs; it holds a shared lifetime lock.
+    let planted_epoch = {
+        let store = ProjectCatalogStore::open_existing(&projects_path).unwrap();
+        let current = store.snapshot().unwrap().epoch();
+        let target = ProjectId::parse(local_id.clone()).unwrap();
+        let commit = store
+            .transact(current, move |catalog, _attachments| {
+                catalog
+                    .projects
+                    .get_mut(&target)
+                    .expect("the legacy-local project is in the catalog")
+                    .nominated_aliases
+                    .insert("nominated-alias".to_string());
+                Ok(())
+            })
+            .unwrap();
+        commit.epoch
+    };
+    let stale_epoch = (planted_epoch - 1).to_string();
+    let fresh_epoch = planted_epoch.to_string();
+    let stale = run(&[
+        "project-catalog",
+        "alias",
+        "accept",
+        "--projects-path",
+        projects,
+        "--project",
+        &local_id,
+        "--alias",
+        "nominated-alias",
+        "--expected-epoch",
+        &stale_epoch,
+    ]);
+    assert!(!stale.status.success());
+    let stale: Value = serde_json::from_slice(&stale.stdout).unwrap();
+    assert_eq!(stale["error"]["code"], "error.project_catalog_stale_epoch");
+    let accepted = success_json(&run(&[
+        "project-catalog",
+        "alias",
+        "accept",
+        "--projects-path",
+        projects,
+        "--project",
+        &local_id,
+        "--alias",
+        "nominated-alias",
+        "--expected-epoch",
+        &fresh_epoch,
+    ]));
+    assert_eq!(accepted["result"]["accepted"], Value::Bool(true));
+
     // Attested relpath move on the remote-only project.
     let migrated = success_json(&run(&[
         "project-catalog",
@@ -677,6 +732,10 @@ fn retire_refuses_on_a_producer_assignment() {
     for class in [
         "producer_assignments",
         "artifact_rows",
+        "whiteboard_rows",
+        "packet_rows",
+        "slack_channel_bindings",
+        "slack_proposal_links",
         "edge_sidecar_rows",
         "index_entity_refs",
         "vector_entity_refs",
@@ -772,6 +831,71 @@ fn retire_probes_generations_under_a_previously_owned_scope() {
         &index_path,
     ));
     assert_eq!(reported["result"]["blocking"]["code_source_generations"], 1);
+
+    let refused = run_with_isolated_index(
+        &[
+            "project-catalog",
+            "retire",
+            "--projects-path",
+            projects,
+            "--project",
+            &project_id,
+            "--execute",
+            "--config",
+            config,
+        ],
+        &index_path,
+    );
+    assert!(!refused.status.success());
+    let refused: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(
+        refused["error"]["code"],
+        "error.project_catalog_admin_retire_blocked"
+    );
+}
+
+#[test]
+fn retire_refuses_on_a_slack_channel_binding() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (state, projects_path, config_path, index_path) = isolated_state_root(&root);
+    let projects = projects_path.to_str().unwrap();
+    let config = config_path.to_str().unwrap();
+    let project_id = add_published_project(projects, "slackfamily", ".", "2026-07-24T00:00:00Z");
+
+    // A channel binding keys its row by project id as well as by the legacy
+    // project directory. The owner capture surface exposes only the directory
+    // selector, so the id-keyed row is exactly what a narrower probe misses.
+    write(
+        &state.join("bro/slack-channel-bindings.json"),
+        format!(
+            r#"{{"bindings":{{"T1:C1":{{"team_id":"T1","channel_id":"C1",
+             "project_dir":"/nowhere/checkout","project_id":"{project_id}",
+             "registered_at":"2026-07-24T00:00:00Z"}}}}}}"#
+        )
+        .as_bytes(),
+    );
+
+    let reported = success_json(&run_with_isolated_index(
+        &[
+            "project-catalog",
+            "retire",
+            "--projects-path",
+            projects,
+            "--project",
+            &project_id,
+            "--config",
+            config,
+        ],
+        &index_path,
+    ));
+    assert_eq!(reported["result"]["blocking"]["slack_channel_bindings"], 1);
+    assert!(
+        reported["result"]["unprobeable_reference_classes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 
     let refused = run_with_isolated_index(
         &[

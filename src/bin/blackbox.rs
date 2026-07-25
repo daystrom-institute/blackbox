@@ -128,6 +128,11 @@ struct AliasDecisionArgs {
     project: String,
     #[arg(long, value_name = "ALIAS")]
     alias: String,
+    /// Catalog epoch the operator read when the nomination was surfaced.
+    /// A nomination accepted against a stale epoch refuses and the operator
+    /// re-reads (plan §7.6). Omitted, the store's current epoch is used.
+    #[arg(long, value_name = "EPOCH")]
+    expected_epoch: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -781,7 +786,15 @@ fn execute_alias(args: AliasArgs) -> Result<serde_json::Value, CommandFailure> {
     };
     let (_lock, store) = open_admin_store(&inner.store.projects_path)?;
     let project_id = parse_project_id(&inner.project)?;
-    let epoch = current_epoch(&store)?;
+    // The epoch the operator read when the nomination was surfaced is the
+    // authority: `alias_decide` compares-and-swaps on it, so a nomination
+    // accepted against a stale read surfaces the store's typed stale-epoch
+    // refusal (plan §7.6). Omitting the flag keeps the pre-existing
+    // read-then-decide behaviour for operators driving the store by hand.
+    let epoch = match inner.expected_epoch {
+        Some(expected) => expected,
+        None => current_epoch(&store)?,
+    };
     let commit =
         project_catalog_admin::alias_decide(&store, epoch, &project_id, &inner.alias, accept)?;
     Ok(serde_json::json!({
@@ -884,7 +897,17 @@ fn execute_retire(args: RetireArgs) -> Result<serde_json::Value, CommandFailure>
 /// complete list so a class that was never probed cannot be mistaken for a
 /// discharged one. Attachment rows are inventoried by the domain layer and
 /// are deliberately absent here.
-const RETIRE_REFERENCE_CLASSES: [&str; 16] = [
+///
+/// Two bro-owned stores are deliberately absent as well. Bro tasks
+/// (`bro/tasks.json`) and Badgey proposals (`bro/badgey/proposals`) are
+/// dispatch execution state keyed by an execution path, the §8.3
+/// execution-target class, not owners of logical project identity: a retired
+/// project's finished dispatch record references where work ran, and holding
+/// retirement on it would make the class undischargeable without deleting
+/// audit history. Slack rows are the opposite case and are included: both
+/// slack stores key their rows to a project by id and by project directory,
+/// so they are logical-identity references like any other coordination row.
+const RETIRE_REFERENCE_CLASSES: [&str; 20] = [
     "code_source_activation",
     "code_source_generations",
     "producer_assignments",
@@ -896,12 +919,24 @@ const RETIRE_REFERENCE_CLASSES: [&str; 16] = [
     "pin_rows",
     "roadmap_rows",
     "artifact_rows",
+    "whiteboard_rows",
+    "packet_rows",
+    "slack_channel_bindings",
+    "slack_proposal_links",
     "edge_sidecar_rows",
     "index_entity_refs",
     "index_code_metadata_rows",
     "git_ingest_cursors",
     "vector_entity_refs",
 ];
+
+/// JSON keys naming a project in the shared coordination stores.
+const PROJECT_ROW_KEYS: [&str; 2] = ["project", "project_id"];
+
+/// The slack stores additionally key each row by the legacy project
+/// directory, and their owner-snapshot capture surfaces expose only that
+/// directory selector, so both stores are read with the wider key set.
+const SLACK_ROW_KEYS: [&str; 3] = ["project", "project_id", "project_dir"];
 
 /// Outcome of one reference-class probe. A class the probe could not read is
 /// never folded into a count: `Unprobeable` keeps it distinguishable from a
@@ -1027,13 +1062,57 @@ fn probe_retire_evidence(
         ("pin_rows", &config.paths.pins_path),
         ("roadmap_rows", &config.paths.roadmap_path),
     ] {
-        probe.record(class, count_project_rows(path, &selectors));
+        probe.record(
+            class,
+            count_project_rows(path, &selectors, &PROJECT_ROW_KEYS),
+        );
+    }
+    for (class, path) in [
+        (
+            "slack_channel_bindings",
+            config.paths.bro_home.join("slack-channel-bindings.json"),
+        ),
+        (
+            "slack_proposal_links",
+            config.paths.bro_home.join("slack-proposal-links.json"),
+        ),
+    ] {
+        probe.record(
+            class,
+            count_project_rows(&path, &selectors, &SLACK_ROW_KEYS),
+        );
     }
 
-    probe.record(
-        "artifact_rows",
-        probe_artifact_rows(&config.paths.artifacts_dir, &selectors),
-    );
+    // Tree-shaped coordination owners, read through their Phase 1 no-create
+    // capture surfaces. Each returns rows keyed either by project id or by a
+    // legacy project selector, matched against the same selector set.
+    let owner_limits = bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1::default();
+    for (class, snapshot) in [
+        (
+            "artifact_rows",
+            bbox_artifacts::artifacts::capture_project_catalog_owner_snapshot(
+                &config.paths.artifacts_dir,
+                owner_limits,
+            ),
+        ),
+        (
+            "whiteboard_rows",
+            bbox_whiteboards::whiteboards::capture_project_catalog_owner_snapshot(
+                &config.paths.bro_home.join("whiteboards"),
+                owner_limits,
+            ),
+        ),
+        (
+            "packet_rows",
+            bbox_packets::capture_project_catalog_owner_snapshot(
+                &config.paths.packets_dir,
+                owner_limits,
+            ),
+        ),
+    ] {
+        probe.record(class, probe_owner_snapshot_rows(snapshot, &selectors));
+    }
+
     probe.record(
         "edge_sidecar_rows",
         probe_edge_sidecar(&config.paths.state_dir.join("edges"), project_id),
@@ -1222,17 +1301,21 @@ fn probe_edge_sidecar(edges_dir: &Path, project_id: &ProjectId) -> ClassProbe {
     ClassProbe::Counted(body.lines().filter(|line| !line.trim().is_empty()).count() as u64)
 }
 
-/// Artifact rows scoped to the project, read through the Phase 1 owner
-/// snapshot so the CLI never opens (and never creates) an artifact catalog.
-fn probe_artifact_rows(artifacts_dir: &Path, selectors: &[String]) -> ClassProbe {
+/// Rows naming the project in one Phase 1 owner snapshot. The capture
+/// surfaces never open or create their store, so a missing owner root with no
+/// rows is a discharged zero; any other non-present state is unprobeable.
+fn probe_owner_snapshot_rows(
+    snapshot: Result<
+        bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotV1,
+        bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotError,
+    >,
+    selectors: &[String],
+) -> ClassProbe {
     use bbox_corpus_core::project_catalog_snapshot::{
         OwnerSnapshotRowValueV1, OwnerSnapshotStateV1,
     };
 
-    let Ok(snapshot) = bbox_artifacts::artifacts::capture_project_catalog_owner_snapshot(
-        artifacts_dir,
-        Default::default(),
-    ) else {
+    let Ok(snapshot) = snapshot else {
         return ClassProbe::Unprobeable;
     };
     match snapshot.state {
@@ -1350,10 +1433,10 @@ fn probe_vector_entity_refs(
     }
 }
 
-/// Count rows in one JSON coordination store whose `project` or `project_id`
-/// field names the retiring project. A store that exists but cannot be read
-/// or parsed is unprobeable, never zero.
-fn count_project_rows(path: &Path, selectors: &[String]) -> ClassProbe {
+/// Count rows in one JSON coordination store whose project-naming field
+/// (`keys`) names the retiring project. A store that exists but cannot be
+/// read or parsed is unprobeable, never zero.
+fn count_project_rows(path: &Path, selectors: &[String], keys: &[&str]) -> ClassProbe {
     let bytes = match read_regular_nofollow(path) {
         Ok(None) => return ClassProbe::Counted(0),
         Ok(Some(bytes)) => bytes,
@@ -1368,7 +1451,7 @@ fn count_project_rows(path: &Path, selectors: &[String]) -> ClassProbe {
         match node {
             serde_json::Value::Array(items) => stack.extend(items.iter()),
             serde_json::Value::Object(map) => {
-                let hit = ["project", "project_id"].iter().any(|key| {
+                let hit = keys.iter().any(|key| {
                     map.get(*key)
                         .and_then(|v| v.as_str())
                         .is_some_and(|v| selectors.iter().any(|s| s == v))

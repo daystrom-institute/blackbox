@@ -818,3 +818,42 @@ until a later entry explicitly supersedes it.
 - Revisit only if: the observation window shows catalog-mode capability
   denials for surfaces operators expect to work (a derivation gap at
   attach time), or Phase 6 needs per-kind grant telemetry on the bridge.
+
+## D-033: Closing-review residual dispositions (publisher-bind window, v1 synthetic ids, Selected ladder)
+
+- Date: 2026-07-25
+- Phase: durable project catalog, Phase 2 (closing review, round 2)
+- Status: accepted pending implementation review
+- Decision: three review residuals are dispositioned rather than coded
+  away this phase.
+  1. Publisher-bind freshness: the bind operation performs its epoch CAS
+     and Attached revalidation inside the publication-lock critical
+     section, with a second freshness recheck immediately before the
+     pointer swap. Catalog detach transactions deliberately do NOT take
+     the publication lock (the §11 lock order keeps the pointer store's
+     lock independent, and inverting that order from the detach side
+     would couple every catalog transaction to publication I/O), so a
+     detach landing inside the final swap window can still leave the
+     pointer naming a freshly detached attachment. That state is a
+     misleading binding, not corruption: publisher freshness reporting
+     degrades it, and rebinding repairs it. Accepted for the bridge
+     window.
+  2. The version-1 authority keeps fabricating the shared deterministic
+     `v1-root` checkout id for markerless checkouts. Changing v1 lease
+     identity semantics mid-bridge is exactly what the §4.3 parity
+     contract forbids; the residual is bounded to observation identity on
+     read leases of markerless checkouts, and every catalog-mode
+     attachment mints a real marker. Retired with the v1 lane in Phase 6.
+  3. The catalog `Selected` lease ladder resolves the operator default,
+     then a single active attachment, then the unique active `Base`
+     attachment. The base rung extends exit-gate item 3's enumeration and
+     is the §5.3 key-to-base rule applied to lease selection: index and
+     overlay lanes act on the durable base checkout, and refusing the
+     normal base-plus-worktree topology would stall exactly the lanes the
+     catalog serves. Ladder rungs deliberately ignore the requested
+     capability: a selected default lacking the needed bit is a typed,
+     visible capability refusal, not a silent fall-through to a different
+     attachment than the operator selected.
+- Revisit only if: publisher freshness reporting shows bind-then-detach
+  interleavings occurring in practice, or Phase 6 retires the v1 lane and
+  the synthetic-id residual with it.

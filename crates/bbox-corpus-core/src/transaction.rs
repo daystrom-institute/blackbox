@@ -268,8 +268,21 @@ fn recover_pending_transaction_with_lock(
             // The pre-atomic v1 claim writer could crash after create_new but
             // before the pointer bytes were complete. Canonical files were not
             // touched while the pointer was in that preparing window, so an
-            // unparseable legacy pointer is safe to clear and must not wedge
-            // the checkout forever.
+            // unparseable LEGACY pointer is safe to clear and must not wedge
+            // the checkout forever. The clear is gated on the era
+            // discriminator the bytes themselves cannot supply: a
+            // current-era transaction always has a staging directory under
+            // the transaction root, so unparseable bytes BESIDE a staging
+            // directory could be a corrupted `Applying` pointer with
+            // half-applied canonical files and must route to the blocked
+            // path, never a silent clear.
+            if root_holds_transaction_dirs(&root)? {
+                anyhow::bail!(
+                    "error.repo_transaction_recovery_blocked: pending pointer is \
+                     unreadable beside staged transaction state; operator repair \
+                     required ({err})"
+                );
+            }
             clear_pointer(&pointer_path).with_context(|| {
                 format!(
                     "clearing unparseable pending pointer {} after parse error: {err}",
@@ -699,6 +712,36 @@ fn validate_manifest(manifest: &RepoTransactionManifest, transaction_id: &str) -
         }
     }
     Ok(())
+}
+
+/// Era discriminator for the unparseable-pointer clear: `true` when the
+/// transaction root holds at least one staged transaction directory. Lock
+/// and pointer files do not count; any directory does, because a
+/// current-era writer creates its staging directory before any canonical
+/// mutation and an unknown directory beside a corrupt pointer is exactly
+/// the state that must not be cleared blind.
+fn root_holds_transaction_dirs(root: &Path) -> Result<bool> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(anyhow::Error::new(err)
+                .context(format!("reading transaction root {}", root.display())));
+        }
+    };
+    for entry in entries {
+        let entry = entry?;
+        // `completed/` holds compacted closeout proofs of TERMINAL
+        // transactions; it is structural, never staged state, and its
+        // presence must not block the legacy clear.
+        if entry.file_name() == "completed" {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn validate_transaction_id(transaction_id: &str) -> Result<()> {
@@ -1236,6 +1279,30 @@ mod tests {
         assert!(
             !root_dir.join(PENDING_FILE).exists(),
             "the abandoned pointer must self-heal without daemon restart"
+        );
+    }
+
+    /// The unparseable-pointer clear is era-gated (review round 2): corrupt
+    /// bytes BESIDE a staged transaction directory could be a torn
+    /// current-era `Applying` pointer with half-applied canonical files,
+    /// so recovery must block for operator repair instead of clearing.
+    #[test]
+    fn unparseable_pointer_beside_staged_state_blocks_instead_of_clearing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let root_dir = transaction_root(&root);
+        fs::create_dir_all(root_dir.join("tx-current-era")).unwrap();
+        fs::write(root_dir.join(PENDING_FILE), b"{\"version\":").unwrap();
+
+        let err = recover_abandoned_pending_transaction(&root).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("error.repo_transaction_recovery_blocked"),
+            "{err:#}"
+        );
+        assert!(
+            root_dir.join(PENDING_FILE).exists(),
+            "the corrupt pointer must survive for operator repair"
         );
     }
 

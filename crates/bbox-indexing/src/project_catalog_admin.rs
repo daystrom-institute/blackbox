@@ -868,6 +868,28 @@ pub fn bind_publisher_attachment(
         ));
     };
     let limits = AcceptedPublicationLimits::default();
+    // Freshness recheck immediately before the swap: catalog transactions
+    // (detach) do not take the publication lock (plan §11 lock order keeps
+    // the pointer store's lock independent), so a detach can still commit
+    // while this section runs. The recheck shrinks that window to the swap
+    // itself; the residual interleaving leaves a misleading binding, not
+    // corruption, and freshness reporting degrades it (D-033).
+    let fresh = store.snapshot()?;
+    if fresh.epoch() != expected_epoch {
+        return Err(admin_error(
+            "error.project_catalog_stale_epoch",
+            "the catalog changed while the publisher binding was being validated",
+        ));
+    }
+    match fresh.attachments().attachments.get(new_attachment) {
+        Some(row) if row.status == AttachmentStatus::Attached => {}
+        _ => {
+            return Err(admin_error(
+                "error.project_catalog_admin_attachment_detached",
+                "the attachment detached while the publisher binding was being validated",
+            ));
+        }
+    }
     // The store refuses before mutating when the expected scope disagrees
     // with the pointer's accepted scope, so no restore path exists.
     let rebound = rebind_pointer_attachment_locked(
