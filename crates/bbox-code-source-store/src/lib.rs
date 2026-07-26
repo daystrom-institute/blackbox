@@ -4756,6 +4756,7 @@ impl CodeSourceStore {
             &generations,
             limits.retained_generations,
             &BTreeSet::new(),
+            &BTreeSet::new(),
         )?;
         let mut stats = MaintenanceStats::default();
         for mut generation in generations {
@@ -4796,12 +4797,29 @@ impl CodeSourceStore {
     }
 
     pub fn gc_blobs(&self) -> Result<MaintenanceStats> {
-        self.gc_blobs_for_scopes(&BTreeSet::new())
+        self.gc_blobs_for_scopes_with_bridge(&BTreeSet::new(), &BTreeSet::new())
     }
 
+    /// Backwards-compatible variant: no bridge generation ids to protect.
     pub fn gc_blobs_for_scopes(
         &self,
         catalog_scopes: &BTreeSet<PublishedScope>,
+    ) -> Result<MaintenanceStats> {
+        self.gc_blobs_for_scopes_with_bridge(catalog_scopes, &BTreeSet::new())
+    }
+
+    /// Blob GC with catalog scopes and open-bridge generation ids
+    /// (section 9.5 GC root).
+    ///
+    /// `bridge_generation_ids` carries the set of non-null
+    /// `code_bridge_generation` values from the catalog's
+    /// `scope_migrations`. Each is a GC root: the bridge holds the
+    /// named generation alive until the first new-scope activation
+    /// retires it or a scope-bridge-clear removes the reference.
+    pub fn gc_blobs_for_scopes_with_bridge(
+        &self,
+        catalog_scopes: &BTreeSet<PublishedScope>,
+        bridge_generation_ids: &BTreeSet<String>,
     ) -> Result<MaintenanceStats> {
         let _guard = self.lock_mutation()?;
         let limits = self
@@ -4815,6 +4833,7 @@ impl CodeSourceStore {
             &generations,
             limits.retained_generations,
             catalog_scopes,
+            bridge_generation_ids,
         )?;
         let mut marked = BTreeSet::new();
         for generation in &generations {
@@ -4953,6 +4972,7 @@ impl CodeSourceStore {
         generations: &[MixedStoredGeneration],
         retained_generations: usize,
         catalog_scopes: &BTreeSet<PublishedScope>,
+        bridge_generation_ids: &BTreeSet<String>,
     ) -> Result<BTreeSet<String>> {
         let desired_roots = self.desired_generation_ids()?;
         let mut authority_scopes = catalog_scopes.clone();
@@ -5030,6 +5050,7 @@ impl CodeSourceStore {
                 retained_generations,
             )?;
             protected.extend(desired_roots);
+            protected.extend(bridge_generation_ids.iter().cloned());
             return Ok(protected);
         }
 
@@ -5042,6 +5063,7 @@ impl CodeSourceStore {
             &effective_roots,
         )?;
         protected.extend(desired_roots);
+        protected.extend(bridge_generation_ids.iter().cloned());
         Ok(protected)
     }
 

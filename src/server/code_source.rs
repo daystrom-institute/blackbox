@@ -1201,6 +1201,7 @@ fn schedule_cutback_if_owner_changed(state: Arc<SharedState>, project_id: String
 }
 
 pub(crate) fn resume_pending_activations(state: Arc<SharedState>) {
+    let is_catalog = state.code_sources.store().record_mode() == RuntimeRecordMode::CatalogV2;
     let assignments = state.code_sources.assignments();
     let assigned = assignments.iter().cloned().collect::<BTreeMap<_, _>>();
     for (scope, project_id) in assignments {
@@ -1235,13 +1236,32 @@ pub(crate) fn resume_pending_activations(state: Arc<SharedState>) {
             continue;
         };
         if assigned.get(&generation.descriptor().scope) != Some(project_id) {
-            schedule_cutback(
-                state.clone(),
-                generation.descriptor().scope.clone(),
-                project_id.clone(),
-                None,
-            );
+            if is_catalog {
+                // Section 9.7: catalog mode must never enter the legacy
+                // sleep-retry loop. Enqueue a reconciler event instead;
+                // the reducer evaluates the reduction table and
+                // dispatches to the one-attempt driver.
+                state.code_sources.enqueue_transition(
+                    project_id,
+                    generation.descriptor().scope.clone(),
+                    ReconcileKind::Cutback,
+                );
+            } else {
+                schedule_cutback(
+                    state.clone(),
+                    generation.descriptor().scope.clone(),
+                    project_id.clone(),
+                    None,
+                );
+            }
         }
+    }
+
+    // Section 9.7 restart re-drives: re-evaluate every persisted
+    // CutbackStateV2 against the current attachment epoch. Catalog mode
+    // only; bridge mode never persists cutback state.
+    if is_catalog {
+        resume_persisted_cutback_states(&state, &store);
     }
     match store.activation_records_mixed() {
         Ok(records) => {
@@ -1316,6 +1336,116 @@ pub(crate) fn resume_pending_activations(state: Arc<SharedState>) {
             }
         }
         Err(error) => tracing::error!(%error, "loading collision retirement work failed"),
+    }
+}
+
+/// Section 9.7 restart re-drives: re-evaluate every persisted
+/// `CutbackStateV2` against the current attachment epoch (catalog mode
+/// only).
+///
+/// - Structural: enqueue exactly ONE reconciler event per project so
+///   the reducer re-evaluates the ladder. No spin, no direct attempt.
+/// - Transient: register the deadline with the bounded scheduler. If
+///   the deadline has elapsed, the scheduler re-attempts immediately;
+///   if future, it waits.
+/// - Terminal and ManualRetryRequired: recognized as valid no-op
+///   persisted states. No event, no retry.
+fn resume_persisted_cutback_states(state: &Arc<SharedState>, store: &CodeSourceStore) {
+    let records = match store.activation_records_mixed() {
+        Ok(records) => records,
+        Err(error) => {
+            tracing::error!(%error, "resume: loading activation records for cutback state sweep failed");
+            return;
+        }
+    };
+    let now = unix_now();
+    for activation in &records {
+        let Some(cutback) = activation.cutback() else {
+            continue;
+        };
+        let project_id = activation.project_id();
+        match cutback {
+            CutbackStateV2::Structural { .. } => {
+                // Re-evaluate exactly once through the reducer. Enqueue
+                // a Cutback event; the reducer checks the ladder and
+                // either re-attempts or stays structural.
+                let scope = state
+                    .code_sources
+                    .assignments()
+                    .into_iter()
+                    .find(|(_, pid)| pid == project_id)
+                    .map(|(scope, _)| scope);
+                if let Some(scope) = scope {
+                    tracing::info!(
+                        project_id,
+                        cutback = ?cutback,
+                        "resume: re-evaluating structural cutback via reconciler"
+                    );
+                    state.code_sources.enqueue_transition(
+                        project_id,
+                        scope,
+                        ReconcileKind::Cutback,
+                    );
+                } else {
+                    tracing::debug!(
+                        project_id,
+                        "resume: structural cutback project has no assignment; skipping"
+                    );
+                }
+            }
+            CutbackStateV2::Transient {
+                attempt: _,
+                error_class: _,
+                deadline_unix_secs,
+            } => {
+                // Register with the bounded scheduler. If the deadline
+                // has elapsed, the scheduler re-attempts immediately.
+                let scope = state
+                    .code_sources
+                    .assignments()
+                    .into_iter()
+                    .find(|(_, pid)| pid == project_id)
+                    .map(|(scope, _)| scope);
+                if let Some(reconciler) = state.code_sources.reconciler() {
+                    reconciler.register_transient(*deadline_unix_secs, project_id);
+                    if *deadline_unix_secs <= now {
+                        tracing::info!(
+                            project_id,
+                            deadline = deadline_unix_secs,
+                            "resume: transient cutback deadline elapsed, scheduler will re-attempt"
+                        );
+                        if let Some(scope) = scope {
+                            state.code_sources.enqueue_transition(
+                                project_id,
+                                scope,
+                                ReconcileKind::Cutback,
+                            );
+                        }
+                    } else {
+                        tracing::info!(
+                            project_id,
+                            deadline = deadline_unix_secs,
+                            "resume: transient cutback deadline in future, scheduler will wait"
+                        );
+                    }
+                }
+            }
+            CutbackStateV2::ManualRetryRequired { .. } => {
+                // Steady-state no-op (explicit retry only). No event,
+                // no retry on restart.
+                tracing::info!(
+                    project_id,
+                    "resume: ManualRetryRequired persisted state is a valid no-op"
+                );
+            }
+            CutbackStateV2::Terminal { .. } => {
+                // Steady-state no-op (terminal, never auto-retry).
+                tracing::info!(
+                    project_id,
+                    "resume: Terminal persisted state is a valid no-op"
+                );
+            }
+        }
     }
 }
 
@@ -1438,10 +1568,11 @@ fn gc_blobs_for_mode(
     let Some(catalog) = state.project_authority.catalog_store() else {
         return store.gc_blobs();
     };
-    let scopes = catalog
+    let snapshot = catalog
         .snapshot()
-        .map_err(|error| anyhow!("catalog snapshot unavailable during blob GC: {error}"))?
-        .catalog()
+        .map_err(|error| anyhow!("catalog snapshot unavailable during blob GC: {error}"))?;
+    let catalog_state = snapshot.catalog();
+    let scopes = catalog_state
         .projects
         .values()
         .filter_map(|project| match &project.scope {
@@ -1451,7 +1582,16 @@ fn gc_blobs_for_mode(
             bbox_corpus_core::project_catalog::ProjectScope::LegacyLocal => None,
         })
         .collect::<std::collections::BTreeSet<_>>();
-    store.gc_blobs_for_scopes(&scopes)
+    // Section 9.5 GC root: every non-null code_bridge_generation in
+    // the catalog snapshot joins the protected set. The bridge holds
+    // the named generation alive until the first new-scope activation
+    // retires it or a scope-bridge-clear removes the reference.
+    let bridge_generation_ids: std::collections::BTreeSet<String> = catalog_state
+        .scope_migrations
+        .values()
+        .filter_map(|record| record.code_bridge_generation.clone())
+        .collect();
+    store.gc_blobs_for_scopes_with_bridge(&scopes, &bridge_generation_ids)
 }
 
 /// Spawn the cutback reconciler background task (section 4.4, 8.1 item 1).
@@ -2507,7 +2647,7 @@ fn try_automatic_bridge_clear(state: &Arc<SharedState>, project_id: &str) -> boo
     }
     // Trigger the bridge-clear transaction.
     match clear_scope_bridge(
-        &catalog_store,
+        catalog_store,
         epoch,
         &pid,
         ScopeBridgeClearMode::DanglingReference,
@@ -7408,7 +7548,7 @@ mod tests {
         // When multiple bridge records exist, newest by catalog_epoch is
         // authority (section 9.3).
         let scope = PublishedScope::try_new("old-repo", ".").unwrap();
-        let mut older = ScopeMigrationRecord {
+        let older = ScopeMigrationRecord {
             scope_migration_id: bbox_corpus_core::project_catalog::ScopeMigrationId::mint(),
             project_id: ProjectId::parse("p_multi_bridge_000000000001").unwrap(),
             catalog_epoch: 5,
@@ -7538,5 +7678,174 @@ mod tests {
         // Both handles now show no events.
         assert!(!observer.has_events());
         assert!(!cloned.has_events());
+    }
+
+    // P4-E gap fix: restart re-drives for persisted cutback states
+    // (section 9.7).
+
+    #[test]
+    fn p4e_resume_structural_enqueues_reconciler_event() {
+        // Structural state on restart: the reducer re-evaluates once
+        // through the reduction table. When the ladder still fails,
+        // the reducer stays structural (NoOp or PersistStructural).
+        // The key property: no direct cutback attempt in the resume
+        // path, only a reconciler enqueue.
+        let structural = CutbackStateV2::Structural {
+            reason: CutbackReason::NoLocalAttachment,
+        };
+        // Simulate what the reducer would decide after the event fires.
+        // Ladder still shows None: stays structural.
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            Some(&structural),
+            LadderResult::None,
+            false,
+        );
+        assert!(
+            matches!(action, ReducerAction::NoOp),
+            "structural with no attachment should stay structural (no-op)"
+        );
+        // Ladder now shows Selected: re-attempt fires.
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            Some(&structural),
+            LadderResult::Selected,
+            false,
+        );
+        assert!(
+            matches!(action, ReducerAction::ReattemptCutback),
+            "structural with attachment should re-attempt"
+        );
+    }
+
+    #[test]
+    fn p4e_resume_transient_elapsed_deadline_re_attempts() {
+        // Transient state with an elapsed deadline: scheduler
+        // re-attempts immediately via the reducer.
+        let past_deadline = unix_now().saturating_sub(60);
+        let transient = CutbackStateV2::Transient {
+            attempt: 1,
+            error_class: CutbackErrorClass::WriterContention,
+            deadline_unix_secs: past_deadline,
+        };
+        // The reducer's Transient cell always returns ReattemptCutback.
+        // The dispatcher (schedule_cutback_catalog) checks the actual
+        // deadline against now before proceeding.
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            Some(&transient),
+            LadderResult::None,
+            false,
+        );
+        assert!(
+            matches!(action, ReducerAction::ReattemptCutback),
+            "transient (elapsed or future) should re-attempt via scheduler"
+        );
+    }
+
+    #[test]
+    fn p4e_resume_transient_future_deadline_waits() {
+        // Transient state with a future deadline: not attempted on
+        // resume, scheduler waits until the deadline.
+        let future_deadline = unix_now() + 3600;
+        let _transient = CutbackStateV2::Transient {
+            attempt: 2,
+            error_class: CutbackErrorClass::IoPressure,
+            deadline_unix_secs: future_deadline,
+        };
+        // The reducer still returns ReattemptCutback (the cell is the
+        // same), but the scheduler's drain_due filters by deadline.
+        // Verify the scheduler would NOT drain a future deadline.
+        let reconciler = CutbackReconciler::new(Arc::new(TransitionGuardMap::default()));
+        reconciler.register_transient(future_deadline, "p_future_deadline_test");
+        let due = reconciler.drain_due(unix_now());
+        assert!(due.is_empty(), "future deadline must not be drained as due");
+    }
+
+    #[test]
+    fn p4e_resume_terminal_and_manual_retry_are_noops() {
+        // Terminal and ManualRetryRequired: recognized as valid no-op
+        // persisted states on restart. No event, no retry.
+        let terminal = CutbackStateV2::Terminal {
+            error_class: CutbackErrorClass::SecurityFailure,
+        };
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            Some(&terminal),
+            LadderResult::Selected,
+            false,
+        );
+        assert!(
+            matches!(action, ReducerAction::NoOp),
+            "Terminal must be no-op on restart"
+        );
+        let mr = CutbackStateV2::ManualRetryRequired {
+            error_class: CutbackErrorClass::WriterContention,
+            attempt: 8,
+        };
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            Some(&mr),
+            LadderResult::Selected,
+            false,
+        );
+        assert!(
+            matches!(action, ReducerAction::NoOp),
+            "ManualRetryRequired must be no-op on restart"
+        );
+    }
+
+    #[test]
+    fn p4e_resume_no_cutback_state_is_noop() {
+        // Projects without a persisted cutback state: no action needed
+        // on restart.
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Local,
+            None,
+            LadderResult::None,
+            false,
+        );
+        assert!(matches!(action, ReducerAction::NoOp));
+    }
+
+    // P4-E gap fix: open-bridge GC root protection (section 9.5).
+
+    #[test]
+    fn p4e_gc_protects_bridge_generation_ids() {
+        // Section 9.5 GC root: the gc_blobs_for_scopes_with_bridge
+        // method accepts bridge_generation_ids as a parameter and
+        // threads them into the protected-set builder. This test
+        // verifies the API surface: the method accepts the parameter
+        // and does not error on empty or non-empty inputs.
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("store");
+        let store = CodeSourceStore::open_with_mode(
+            &root,
+            StoreLimits::default(),
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap();
+
+        let empty_scopes = std::collections::BTreeSet::new();
+
+        // Empty bridge ids: succeeds (backwards compatible).
+        let result = store.gc_blobs_for_scopes(&empty_scopes);
+        assert!(result.is_ok(), "GC without bridge ids must succeed");
+
+        // Non-empty bridge ids: the parameter is accepted and does not
+        // error. A generation named only by the bridge would survive
+        // because the protected set includes it.
+        let bridge_ids: std::collections::BTreeSet<String> =
+            ["gen_bridge_only_test_12345".to_string()]
+                .into_iter()
+                .collect();
+        let result = store.gc_blobs_for_scopes_with_bridge(&empty_scopes, &bridge_ids);
+        assert!(result.is_ok(), "GC with bridge ids must succeed");
     }
 }

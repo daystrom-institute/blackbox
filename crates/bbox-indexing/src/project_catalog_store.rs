@@ -582,13 +582,21 @@ impl ProjectCatalogStore {
             attachments_sha256: committed.attachments_sha256.to_string(),
         };
         *self.current.write() = PublishedStoreState::Ready(committed);
-        // Post-commit observer: emit committed epoch + changed project
-        // ids after durable pair publication and lock release
+        // The mutation lock and auxiliary locks (_mutation_lock,
+        // _auxiliary_locks) are released when this function returns.
+        // Move the observer push past them so the emission happens
+        // AFTER durable pair publication AND after lock release
         // (section 9.4).
-        self.commit_observer.push(CatalogCommittedEvent {
+        let observer = self.commit_observer.clone();
+        let observer_event = CatalogCommittedEvent {
             epoch: result.epoch,
             changed_project_ids,
-        });
+        };
+        // Drop the locks explicitly so the observer emission is
+        // strictly post-release.
+        drop(_auxiliary_locks);
+        drop(_mutation_lock);
+        observer.push(observer_event);
         Ok(result)
     }
 
