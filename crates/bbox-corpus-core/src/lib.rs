@@ -17,6 +17,7 @@ pub mod code_project_identity;
 pub mod edit;
 pub mod entity_ref;
 pub mod git;
+pub mod git_overlay;
 pub mod identity;
 pub mod json_store;
 pub mod language;

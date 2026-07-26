@@ -11,7 +11,11 @@
 
 pub use bbox_corpus_index::index::*;
 
+pub mod consolidated_history;
+pub mod history_gc;
+pub mod history_health;
 pub mod history_materializer;
+pub mod history_refresh;
 mod knowledge_docs;
 mod reindex;
 mod roadmap_docs;

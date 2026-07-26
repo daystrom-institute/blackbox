@@ -2229,12 +2229,10 @@ fn git_targets_for_scope(
     super::git_history::current_chunk_targets(chunks, snapshot_id)
         .into_iter()
         .map(|(relative_path, entity)| {
-            let git_path = if bbox_root_relpath == "." {
-                relative_path
-            } else {
-                format!("{bbox_root_relpath}/{relative_path}")
-            };
-            (git_path, entity)
+            (
+                super::git_history::repo_relative_path_for_scope(bbox_root_relpath, &relative_path),
+                entity,
+            )
         })
         .collect()
 }

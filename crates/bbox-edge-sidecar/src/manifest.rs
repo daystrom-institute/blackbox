@@ -22,6 +22,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use bbox_corpus_core::git_overlay::GitOverlaySelector;
 use serde::{Deserialize, Serialize};
 
 pub(crate) const MANIFEST_VERSION: u32 = 1;
@@ -184,7 +185,44 @@ pub struct WorkspaceIndexEntry {
     pub code_source_selector: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_source_generation: Option<String>,
+    /// The selected Git current-file overlay, or `None` when the project has
+    /// no usable overlay (Phase 3 plan section 10 item 1).
+    ///
+    /// Additive and defaulted: a manifest written before this field decodes
+    /// as "no overlay", which is the correct reading, because a pre-overlay
+    /// manifest's `git-current.jsonl` member was written by the in-transaction
+    /// Git walk this milestone removes. `active_paths_for_loader` gates that
+    /// member on this field, so an absent selector means the member is not
+    /// loaded rather than silently trusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_overlay: Option<GitOverlaySelector>,
+    /// Whether this entry's `git-current.jsonl` member is owned by the
+    /// overlay lifecycle.
+    ///
+    /// The two Git-current writers have genuinely different contracts and the
+    /// loader cannot tell them apart from the selector alone:
+    ///
+    /// - Overlay-managed (`true`): the collected activation and the local
+    ///   cutback lane. Their activation transaction opens no Git at all, so
+    ///   any `git-current.jsonl` in the snapshot directory belongs to a
+    ///   PREVIOUS overlay. Absent selector therefore means "do not load".
+    /// - Not overlay-managed (`false`, the default): the bridge/local reindex
+    ///   lane, which still stages Git current-file edges inside its own
+    ///   transaction (plan section 6 item 3 keeps that lane unchanged). Its
+    ///   member is always current with its own snapshot, so gating it on a
+    ///   selector it never writes would silently delete its commit-file edges
+    ///   and break bridge parity.
+    ///
+    /// Defaulting to `false` is what makes every pre-overlay manifest keep
+    /// its existing load behavior.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub git_overlay_managed: bool,
 }
+
+/// The one snapshot member the Git overlay owns. A snapshot may carry it
+/// from an earlier in-transaction walk (or from a since-cleared overlay);
+/// the loader admits it only when the manifest entry selects an overlay.
+pub const GIT_CURRENT_MEMBER: &str = "git-current.jsonl";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ManifestIndex {
@@ -330,7 +368,11 @@ impl ManifestIndex {
                                 om.covered_rel_path_hashes.into_iter().collect();
                             if !suppressed.is_empty() {
                                 let mut snap_paths = Vec::new();
-                                append_jsonl_files(&snap_dir, &mut snap_paths);
+                                append_snapshot_members_gated_on_overlay(
+                                    &snap_dir,
+                                    entry,
+                                    &mut snap_paths,
+                                );
                                 for path in snap_paths {
                                     result.push(LoadablePath {
                                         path,
@@ -349,7 +391,7 @@ impl ManifestIndex {
                 let snapshot_dir = materialized_dir(edges_dir).join(snapshot);
                 if snapshot_dir.is_dir() {
                     let mut snap_paths = Vec::new();
-                    append_jsonl_files(&snapshot_dir, &mut snap_paths);
+                    append_snapshot_members_gated_on_overlay(&snapshot_dir, entry, &mut snap_paths);
                     for path in snap_paths {
                         result.push(LoadablePath {
                             path,
@@ -479,6 +521,44 @@ fn append_jsonl_files(dir: &Path, paths: &mut Vec<PathBuf>) {
     }
 }
 
+/// Append a snapshot directory's members, admitting the Git current-file
+/// member only when the workspace entry selects an overlay for THIS
+/// snapshot's code generation (Phase 3 plan section 10 item 1).
+///
+/// The gate is what makes overlay clearing meaningful. Activating a new code
+/// generation clears the selector but does not, and must not, rewrite the
+/// snapshot directory: a stale `git-current.jsonl` left behind by an earlier
+/// walk would otherwise keep loading `COMMIT_TOUCHED_FILE` edges whose
+/// targets name a retired snapshot id. Gating on the selector means the
+/// clear is atomic with the activation (one manifest write) instead of
+/// racing a directory rewrite.
+fn append_snapshot_members_gated_on_overlay(
+    dir: &Path,
+    entry: &WorkspaceIndexEntry,
+    paths: &mut Vec<PathBuf>,
+) {
+    if !entry.git_overlay_managed {
+        append_jsonl_files(dir, paths);
+        return;
+    }
+    let overlay_admits_git_current = entry.git_overlay.as_ref().is_some_and(|overlay| {
+        entry
+            .code_source_generation
+            .as_deref()
+            .is_some_and(|generation| overlay.matches_code_generation(generation))
+    });
+    let mut candidates = Vec::new();
+    append_jsonl_files(dir, &mut candidates);
+    for path in candidates {
+        let is_git_current =
+            path.file_name().and_then(|name| name.to_str()) == Some(GIT_CURRENT_MEMBER);
+        if is_git_current && !overlay_admits_git_current {
+            continue;
+        }
+        paths.push(path);
+    }
+}
+
 /// Like `append_jsonl_files` but also skips the overlay_manifest.json
 /// (a JSON file, not JSONL, so the extension filter already excludes it —
 /// this helper exists for clarity and future-proofing).
@@ -569,6 +649,8 @@ mod tests {
                 repo_materialization: None,
                 code_source_selector: None,
                 code_source_generation: None,
+                git_overlay: None,
+                git_overlay_managed: false,
             },
         );
         idx.write_atomic(edges_dir).unwrap();
@@ -621,6 +703,8 @@ mod tests {
                 repo_materialization: None,
                 code_source_selector: None,
                 code_source_generation: None,
+                git_overlay: None,
+                git_overlay_managed: false,
             },
         );
         idx.write_atomic(edges_dir).unwrap();
@@ -680,6 +764,8 @@ mod tests {
                 repo_materialization: None,
                 code_source_selector: None,
                 code_source_generation: None,
+                git_overlay: None,
+                git_overlay_managed: false,
             },
         );
 
@@ -725,6 +811,8 @@ mod tests {
                 repo_materialization: None,
                 code_source_selector: None,
                 code_source_generation: None,
+                git_overlay: None,
+                git_overlay_managed: false,
             },
         );
 
@@ -770,6 +858,8 @@ mod tests {
                 repo_materialization: None,
                 code_source_selector: None,
                 code_source_generation: None,
+                git_overlay: None,
+                git_overlay_managed: false,
             },
         );
 

@@ -320,6 +320,52 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
                         ),
                         "repair the reported source/store condition and publish the checkout again",
                     ),
+                    // P3-C planning states. Typed here rather than falling
+                    // through to the generic warn arm so an operator sees the
+                    // ONE action each admits, and so `empty_root_refused`
+                    // reads as the deliberate refusal it is rather than as an
+                    // unexplained warning.
+                    "source_unavailable" => Finding::warn(format!(
+                        "project `{}` has no usable code source this pass: {}",
+                        record.project_id, record.diagnostic
+                    ))
+                    .with_next(
+                        "attach a checkout, or publish a collected generation, to give the project a source",
+                    ),
+                    "empty_root_refused" => Finding::action(
+                        format!(
+                            "project `{}` local scan returned zero entries and the purge was refused: {}",
+                            record.project_id, record.diagnostic
+                        ),
+                        "restore the checkout, or acknowledge the empty root with `bbox_reindex accept_empty_projects`",
+                    ),
+                    // P3-F history states. `unavailable_no_attachment` is the
+                    // remote-only STEADY STATE, so it is informational: the
+                    // commit documents stay readable and there is nothing to
+                    // repair. It replaces the `git_history_unavailable` this
+                    // case used to record, which read as a Git fault forever.
+                    bbox_indexing::index::history_health::HISTORY_UNAVAILABLE_NO_ATTACHMENT_CODE => {
+                        Finding::info(format!(
+                            "project `{}` repository history cannot be refreshed: {}",
+                            record.project_id, record.diagnostic
+                        ))
+                    }
+                    bbox_indexing::index::history_health::HISTORY_REFRESH_FAILED_CODE => {
+                        Finding::action(
+                            format!(
+                                "project `{}` last repository-history refresh failed: {}",
+                                record.project_id, record.diagnostic
+                            ),
+                            "inspect daemon logs for the walk failure, then publish the checkout again to retry",
+                        )
+                    }
+                    "git_history_unavailable" => Finding::warn(format!(
+                        "project `{}` Git current-file overlay is unavailable: {}",
+                        record.project_id, record.diagnostic
+                    ))
+                    .with_next(
+                        "restore Git access for the project's attachment; the code generation stays active and searchable",
+                    ),
                     _ => Finding::warn(format!(
                         "project `{}` code-source health issue `{}`: {}",
                         record.project_id, record.code, record.diagnostic
@@ -431,6 +477,7 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
             "code-source activation records are unreadable: {error:#}"
         ))),
     }
+    findings.extend(repo_history_findings(state));
     if findings.is_empty() {
         findings.push(if state.config.read().code_collection.enabled {
             Finding::info("code collection enabled with no active collected generations")
@@ -441,6 +488,146 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
     SectionReport {
         section: "code_sources",
         findings,
+    }
+}
+
+/// The five-state repo-history health model, rendered beside the code-source
+/// findings (Phase 3 plan section 10 item 5).
+///
+/// Catalog mode only: the model is derived from repo-history records and the
+/// attachment ladder, neither of which the bridge arm has. Every derivation
+/// input is read-only and durable, so this stays inside doctor's no-mutation
+/// contract; in particular it observes no checkout head (that would need a
+/// lease), which is why the derivation declines to claim `current` here and
+/// reports `lagging` with an explicit "not compared" diagnostic instead of
+/// guessing.
+fn repo_history_findings(state: &crate::server::state::SharedState) -> Vec<Finding> {
+    use bbox_indexing::index::history_health::{
+        HISTORY_REFRESH_FAILED_CODE, HistoryHealthInputsV1, HistoryHealthStateV1,
+        derive_history_health,
+    };
+
+    let Some(catalog_store) = state.project_authority.catalog_store() else {
+        return Vec::new();
+    };
+    let Ok(pinned) = catalog_store.snapshot() else {
+        return vec![Finding::blocked(
+            "the project catalog is unreadable, so repository-history health cannot be derived",
+        )];
+    };
+    let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
+    let overlays =
+        bbox_edge_sidecar::snapshot::selected_git_overlays(&edges_dir).unwrap_or_default();
+    let failed_refreshes = state
+        .code_sources
+        .store()
+        .health_records()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|record| record.code == HISTORY_REFRESH_FAILED_CODE)
+        .filter_map(|record| {
+            // The durable record is per PROJECT; the health model is per
+            // REPOSITORY. Map through the catalog rather than assuming the
+            // two ids are interchangeable.
+            let project_id =
+                bbox_corpus_core::project_catalog::ProjectId::parse(record.project_id).ok()?;
+            pinned
+                .catalog()
+                .projects
+                .get(&project_id)?
+                .repo_history
+                .as_ref()
+                .map(|id| id.as_str().to_string())
+        })
+        .collect();
+    let mut findings = history_gc_findings(state, pinned.catalog(), &overlays);
+    let inputs = HistoryHealthInputsV1 {
+        overlays,
+        failed_refreshes,
+        ..Default::default()
+    };
+    findings.extend(
+        derive_history_health(pinned.catalog(), pinned.attachments(), &inputs)
+        .into_iter()
+        .map(|record| {
+            let members = record.member_project_ids.len();
+            let headline = format!(
+                "repository history `{}` (namespace `{}`, {members} project(s)) is {}: {}",
+                record.repo_history_id,
+                record.commit_namespace,
+                record.state.as_str(),
+                record.diagnostic
+            );
+            match record.state {
+                HistoryHealthStateV1::Current => Finding::ok(headline),
+                HistoryHealthStateV1::Lagging
+                | HistoryHealthStateV1::UnavailableNoAttachment => Finding::info(headline),
+                HistoryHealthStateV1::InvalidScope => Finding::action(
+                    headline,
+                    "re-validate or replace the attachment so its proved repository matches the project's published scope",
+                ),
+                HistoryHealthStateV1::FailedLastRefresh => Finding::action(
+                    headline,
+                    "inspect daemon logs for the walk failure, then publish a member project's checkout again to retry",
+                ),
+            }
+        }),
+    );
+    findings
+}
+
+/// Whether history GC is currently enabled, and why not when it is off
+/// (Phase 3 plan section 10 item 4).
+///
+/// The mismatch arm is deliberately an `action` rather than a `warn`: a
+/// disabled sweep is safe but it accumulates retired generations forever, so
+/// somebody has to explain the divergence. History READS are unaffected
+/// either way, which is why this never escalates to `blocked`.
+fn history_gc_findings(
+    state: &crate::server::state::SharedState,
+    catalog: &bbox_corpus_core::project_catalog::CatalogSnapshotV2,
+    overlays: &std::collections::BTreeMap<
+        String,
+        bbox_corpus_core::git_overlay::GitOverlaySelector,
+    >,
+) -> Vec<Finding> {
+    use bbox_indexing::index::history_gc::{
+        HistoryGcEnablementV1, build_reference_manifest, evaluate_history_gc,
+    };
+
+    let index_path = state.config.read().paths.index_path.clone();
+    let Ok(generation_store) =
+        bbox_indexing::index::history_generations::HistoryGenerationStore::open_for_index(
+            &index_path,
+        )
+    else {
+        return Vec::new();
+    };
+    let rebuild_manifests = generation_store
+        .read_rebuild_manifest()
+        .ok()
+        .flatten()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let rebuilt = build_reference_manifest(
+        catalog,
+        overlays,
+        &rebuild_manifests,
+        // Doctor is read-only and holds no view or build of its own, so it
+        // reports the DURABLE reference set. A process-local root would make
+        // the report depend on who asked.
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
+    );
+    match evaluate_history_gc(&generation_store, &rebuilt) {
+        HistoryGcEnablementV1::Enabled { roots } => vec![Finding::ok(format!(
+            "repo-history GC enabled; {} generation(s) referenced",
+            roots.len()
+        ))],
+        HistoryGcEnablementV1::Disabled { diagnostic } => vec![Finding::action(
+            format!("repo-history GC is disabled: {diagnostic}"),
+            "confirm no out-of-band change touched the generations root, then restart the daemon to rebuild the reference manifest",
+        )],
     }
 }
 

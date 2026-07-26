@@ -1343,6 +1343,7 @@ mod tests {
                 metadata: Default::default(),
             }])),
             catalog_epoch: 0,
+            git_overlays: std::collections::BTreeMap::new(),
         });
 
         let inspect = |entity_ref: String| {

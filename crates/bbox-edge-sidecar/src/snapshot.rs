@@ -15,6 +15,7 @@ use crate::manifest::{
 };
 use bbox_chunker::EdgeProvenance;
 use bbox_corpus_core::entity_ref::EntityRef;
+use bbox_corpus_core::git_overlay::GitOverlaySelector;
 
 // Paired with `INDEX_SCHEMA_VERSION` in ONE commit at Phase 3 milestone P3-E:
 // the schema cut adds `relative_path`/`source_uri`/`source_kind` and stops
@@ -298,9 +299,95 @@ fn activate_source_snapshot(
             repo_materialization,
             code_source_selector: Some(selector.to_string()),
             code_source_generation: Some(generation_id.to_string()),
+            // Activating a new code generation ATOMICALLY CLEARS the
+            // project's Git overlay (governing section 11; plan section 10
+            // item 1). This assignment is that clear: it happens in the same
+            // manifest write as the selector swap, inside the manifest
+            // coordinator the caller already holds, so no reader can observe
+            // the new generation beside the old generation's overlay. A
+            // matching attachment re-establishes the overlay afterwards
+            // through `select_git_overlay`; without one the project simply
+            // has no overlay, which is the designed steady state rather than
+            // a failure.
+            git_overlay: None,
+            git_overlay_managed: true,
         },
     );
     index.write_atomic(edges_dir)
+}
+
+/// Install a Git current-file overlay for an already-active code generation,
+/// or clear it (`selector: None`).
+///
+/// Refuses an overlay whose `code_generation` is not the entry's live one:
+/// the whole point of the field is that `COMMIT_TOUCHED_FILE` targets embed a
+/// snapshot id, so installing a mismatched overlay would publish dangling
+/// edges. A refusal here means the code generation moved while the overlay
+/// was being built, and the correct response is to rebuild the overlay, not
+/// to relax the check.
+///
+/// Runs inside the manifest coordinator so the swap cannot interleave with an
+/// activation. CALLER CONSTRAINT: never invoke this while holding a staged
+/// index generation on the same thread — the writer actor's staging hold and
+/// this lock would deadlock (Phase 3 plan carry-forward flag (d)).
+pub fn select_git_overlay(
+    edges_dir: &Path,
+    project_id: &str,
+    selector: Option<GitOverlaySelector>,
+) -> Result<()> {
+    with_manifest_coordinator(|| {
+        let mut index = ManifestIndex::load_or_new(edges_dir)?;
+        let Some(entry) = index.workspaces.get(project_id).cloned() else {
+            anyhow::bail!("workspace manifest entry does not exist for the overlay swap");
+        };
+        if let Some(selector) = selector.as_ref() {
+            if !entry.git_overlay_managed {
+                anyhow::bail!(
+                    "workspace entry does not own an overlay-managed Git member; \
+                     the local reindex lane stages its own"
+                );
+            }
+            let live = entry.code_source_generation.as_deref().unwrap_or_default();
+            if !selector.matches_code_generation(live) {
+                anyhow::bail!(
+                    "Git overlay targets code generation {} but {} is active",
+                    selector.code_generation,
+                    live
+                );
+            }
+        }
+        index.upsert_workspace(
+            project_id,
+            WorkspaceIndexEntry {
+                git_overlay: selector,
+                ..entry
+            },
+        );
+        index.write_atomic(edges_dir)
+    })
+}
+
+/// Every project's currently selected Git overlay, keyed by project id.
+///
+/// The single read a `CodeReadView` publisher uses to pin `git_overlays`. It
+/// reads the manifest rather than any in-memory cache because the manifest is
+/// the durable authority for the live selector (plan section 4.7), and
+/// because a pinned view built off a stale cache is exactly the incoherence
+/// the epoch pin exists to prevent.
+pub fn selected_git_overlays(
+    edges_dir: &Path,
+) -> Result<std::collections::BTreeMap<String, GitOverlaySelector>> {
+    let index = ManifestIndex::load_or_new(edges_dir)?;
+    Ok(index
+        .workspaces
+        .iter()
+        .filter_map(|(project_id, entry)| {
+            entry
+                .git_overlay
+                .clone()
+                .map(|overlay| (project_id.clone(), overlay))
+        })
+        .collect())
 }
 
 pub fn snapshot_dir(edges_dir: &Path, project_id: &str, snapshot_id: &str) -> PathBuf {
@@ -486,6 +573,14 @@ pub fn activate_pending_local_snapshots(
                         &activation.project_id,
                     )),
                     code_source_generation: Some("local".to_string()),
+                    // The bridge/local reindex lane stages its Git
+                    // current-file member inside this same transaction
+                    // (plan section 6 item 3 leaves it unchanged), so its
+                    // member is never overlay-owned and must keep loading
+                    // unconditionally. Setting this true would delete that
+                    // lane's commit-file edges at the next rebuild.
+                    git_overlay: None,
+                    git_overlay_managed: false,
                 },
             );
         }
@@ -942,6 +1037,8 @@ fn update_manifest_for_snapshot(
             repo_materialization: None,
             code_source_selector: Some(bbox_code_source::local_selector(project_id)),
             code_source_generation: Some("local".to_string()),
+            git_overlay: None,
+            git_overlay_managed: false,
         },
     );
     idx.write_atomic(edges_dir)?;
@@ -1005,6 +1102,172 @@ mod tests {
         assert_ne!(
             a, b,
             "different head_sha must produce different snapshot ids"
+        );
+    }
+
+    // -- P3-F: Git overlay swap/clear matrix ------------------------------
+    //
+    // Every case runs through the real manifest coordinator, because the
+    // atomicity claim ("activating a new code generation clears the overlay")
+    // is a claim about ONE manifest write, not about two writes that usually
+    // happen together.
+
+    fn overlay_fixture(edges_dir: &Path, project_id: &str, generation: &str) -> String {
+        let snapshot_id = collected_snapshot_id(project_id, generation);
+        write_snapshot_files(
+            edges_dir,
+            project_id,
+            &snapshot_id,
+            &[
+                ("project.jsonl", &[]),
+                (crate::manifest::GIT_CURRENT_MEMBER, &[]),
+            ],
+        )
+        .unwrap();
+        activate_collected_snapshot(
+            edges_dir,
+            project_id,
+            "repo-authority",
+            &"a".repeat(40),
+            generation,
+            &format!("collected:{project_id}:{generation}"),
+            &snapshot_id,
+        )
+        .unwrap();
+        snapshot_id
+    }
+
+    fn overlay_for(project_id: &str, generation: &str) -> GitOverlaySelector {
+        GitOverlaySelector {
+            project_id: project_id.to_string(),
+            code_generation: generation.to_string(),
+            repo_history_generation: format!("rhg_{}", "a".repeat(64)),
+            attachment_id: "att_1".to_string(),
+            repo_head: "b".repeat(40),
+            commit_namespace: "nsmono".to_string(),
+            overlay_generation: 1,
+        }
+    }
+
+    fn git_current_is_loaded(edges_dir: &Path) -> bool {
+        ManifestIndex::load_or_new(edges_dir)
+            .unwrap()
+            .active_paths_for_loader(edges_dir)
+            .iter()
+            .any(|loadable| {
+                loadable.path.file_name().and_then(|name| name.to_str())
+                    == Some(crate::manifest::GIT_CURRENT_MEMBER)
+            })
+    }
+
+    #[test]
+    fn activation_leaves_no_overlay_and_gates_the_git_member_off() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        overlay_fixture(&edges_dir, "p_1", "gen-a");
+
+        let index = ManifestIndex::load_or_new(&edges_dir).unwrap();
+        let entry = index.workspaces.get("p_1").unwrap();
+        assert!(entry.git_overlay.is_none());
+        assert!(entry.git_overlay_managed);
+        assert!(
+            !git_current_is_loaded(&edges_dir),
+            "a freshly activated generation has no overlay, so its stale Git \
+             member must not be loaded"
+        );
+    }
+
+    #[test]
+    fn selecting_an_overlay_admits_the_git_member_and_clearing_removes_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        overlay_fixture(&edges_dir, "p_1", "gen-a");
+
+        select_git_overlay(&edges_dir, "p_1", Some(overlay_for("p_1", "gen-a"))).unwrap();
+        assert!(git_current_is_loaded(&edges_dir));
+        assert_eq!(
+            selected_git_overlays(&edges_dir).unwrap().len(),
+            1,
+            "the read-view publisher must see the selection"
+        );
+
+        select_git_overlay(&edges_dir, "p_1", None).unwrap();
+        assert!(!git_current_is_loaded(&edges_dir));
+        assert!(selected_git_overlays(&edges_dir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn activating_a_new_generation_atomically_clears_the_overlay() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        overlay_fixture(&edges_dir, "p_1", "gen-a");
+        select_git_overlay(&edges_dir, "p_1", Some(overlay_for("p_1", "gen-a"))).unwrap();
+        assert!(git_current_is_loaded(&edges_dir));
+
+        // Activating gen-b without a usable attachment: the overlay clears in
+        // the same manifest write that swaps the selector, so no reader can
+        // observe gen-b beside gen-a's overlay.
+        overlay_fixture(&edges_dir, "p_1", "gen-b");
+        let index = ManifestIndex::load_or_new(&edges_dir).unwrap();
+        let entry = index.workspaces.get("p_1").unwrap();
+        assert!(entry.git_overlay.is_none());
+        assert_eq!(entry.code_source_generation.as_deref(), Some("gen-b"));
+        assert!(
+            !git_current_is_loaded(&edges_dir),
+            "gen-a's COMMIT_TOUCHED_FILE targets name a retired snapshot id"
+        );
+    }
+
+    #[test]
+    fn an_overlay_for_a_foreign_code_generation_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        overlay_fixture(&edges_dir, "p_1", "gen-b");
+        let error = select_git_overlay(&edges_dir, "p_1", Some(overlay_for("p_1", "gen-a")))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("gen-a"), "{error}");
+        assert!(!git_current_is_loaded(&edges_dir));
+    }
+
+    #[test]
+    fn a_local_reindex_entry_keeps_its_git_member_without_an_overlay() {
+        // Bridge parity: the local reindex lane stages its Git member inside
+        // its own transaction and never writes a selector. Gating that
+        // member on a selector it does not write would silently delete its
+        // commit-file edges.
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = "head-local";
+        let pending = stage_local_snapshot_activation(
+            &edges_dir,
+            "p_local",
+            "repo-authority",
+            None,
+            &"c".repeat(40),
+            false,
+            None,
+            snapshot_id,
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        activate_pending_local_snapshots(&edges_dir, &[pending]).unwrap();
+
+        let index = ManifestIndex::load_or_new(&edges_dir).unwrap();
+        let entry = index.workspaces.get("p_local").unwrap();
+        assert!(!entry.git_overlay_managed);
+        assert!(entry.git_overlay.is_none());
+        assert!(
+            git_current_is_loaded(&edges_dir),
+            "the local lane's own Git member must keep loading unconditionally"
+        );
+        assert!(
+            select_git_overlay(&edges_dir, "p_local", Some(overlay_for("p_local", "local")))
+                .is_err(),
+            "a non-overlay-managed entry must refuse a selector rather than \
+             hand its member's lifecycle to a lane that does not own it"
         );
     }
 

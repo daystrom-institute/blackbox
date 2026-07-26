@@ -312,6 +312,55 @@ pub(crate) struct CodeReadView {
     /// that replaces a field it does not own must carry this through, or the
     /// view silently reports an epoch its selectors no longer match.
     pub(crate) catalog_epoch: u64,
+    /// The Git current-file overlay selected per project at the moment this
+    /// view was pinned (Phase 3 plan sections 4.5 and 10 item 1), keyed by
+    /// project id.
+    ///
+    /// Catalog mode only; the bridge map stays empty because bridge local
+    /// staging still writes its Git member inside its own transaction and
+    /// has no overlay identity to pin. An empty map therefore means "this
+    /// deployment has no overlay lane", never "the overlays were dropped".
+    ///
+    /// Pinned for the same reason `catalog_epoch` is: a request that reads
+    /// commit-file edges through one overlay and commit documents through a
+    /// generation the overlay no longer names is incoherent, and the only
+    /// way to rule that out is to freeze the overlay map beside the searcher
+    /// and selector map rather than re-reading the manifest mid-request.
+    pub(crate) git_overlays: BTreeMap<String, bbox_corpus_core::git_overlay::GitOverlaySelector>,
+}
+
+/// Read the durable Git-overlay map that a fresh [`CodeReadView`] must pin
+/// (Phase 3 plan sections 4.5 and 10 item 1).
+///
+/// Bridge mode returns an EMPTY map by contract, not by accident: the bridge
+/// local lane stages its Git current-file member inside its own transaction
+/// and never writes an overlay selector, so any non-empty map there would be
+/// a claim the manifest cannot back.
+///
+/// A read failure degrades to the empty map with a warning rather than
+/// failing view construction. The overlay is an enrichment on an already
+/// valid code generation; refusing to publish a read view because the
+/// manifest is momentarily unreadable would take code search down for a
+/// commit-edge problem, which is the exact inversion P3-B's F5 fix removed.
+pub(crate) fn read_git_overlays_for_view(
+    authority: &ProjectAuthority,
+    store_dir: &std::path::Path,
+) -> BTreeMap<String, bbox_corpus_core::git_overlay::GitOverlaySelector> {
+    if !matches!(authority, ProjectAuthority::Catalog { .. }) {
+        return BTreeMap::new();
+    }
+    let edges_dir = crate::edge_index::edges_dir_from_bro_store(store_dir);
+    match bbox_edge_sidecar::snapshot::selected_git_overlays(&edges_dir) {
+        Ok(overlays) => overlays,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "reading the Git overlay map for the code read view failed; \
+                 publishing without overlays"
+            );
+            BTreeMap::new()
+        }
+    }
 }
 
 pub(crate) const SIGNAL_LOG_CAP: usize = 200;
@@ -405,6 +454,12 @@ impl SharedState {
             searcher,
             edge_index: current.edge_index.clone(),
             catalog_epoch: current.catalog_epoch,
+            // Cloned through for exactly the reason `edge_index` and
+            // `catalog_epoch` are: this writer owns the searcher and nothing
+            // else, so a field it drops is silently reset to "no overlay" on
+            // the next commit. That is the drop-on-commit bug class the
+            // preservation regression test pins.
+            git_overlays: current.git_overlays.clone(),
         });
     }
 
@@ -714,6 +769,7 @@ impl SharedState {
                 searcher: code_searcher,
                 edge_index: Arc::new(edge_index::EdgeIndex::default()),
                 catalog_epoch: 0,
+                git_overlays: BTreeMap::new(),
             })),
             code_sources: Arc::new(super::code_source::CodeSourceRuntime::for_test(store_dir)),
             edge_rebuild_nudge_tx,
@@ -897,6 +953,18 @@ mod code_read_view_tests {
                 searcher: current.searcher.clone(),
                 edge_index: current.edge_index.clone(),
                 catalog_epoch: 42,
+                git_overlays: BTreeMap::from([(
+                    "p_0000000000000000000000000000ep01".to_string(),
+                    bbox_corpus_core::git_overlay::GitOverlaySelector {
+                        project_id: "p_0000000000000000000000000000ep01".to_string(),
+                        code_generation: "gen-ep01".to_string(),
+                        repo_history_generation: format!("rhg_{}", "a".repeat(64)),
+                        attachment_id: "att_0000000000000000000000000000ep01".to_string(),
+                        repo_head: "b".repeat(40),
+                        commit_namespace: "nsep01".to_string(),
+                        overlay_generation: 7,
+                    },
+                )]),
             });
         }
         let before = state.code_read_view.read().clone();
@@ -920,6 +988,15 @@ mod code_read_view_tests {
         );
         assert_eq!(before.active_selectors, after.active_selectors);
         assert!(Arc::ptr_eq(&before.edge_index, &after.edge_index));
+        // P3-F: the overlay map joins the same preservation contract. A
+        // dropped overlay map is worse than a dropped epoch: the view keeps
+        // serving code documents while silently reporting that no project
+        // has commit-file edges.
+        assert_eq!(
+            before.git_overlays, after.git_overlays,
+            "the searcher-only writer must carry the pinned Git overlay map through"
+        );
+        assert_eq!(after.git_overlays.len(), 1);
     }
 
     /// Phase 3 P3-C F3/F4 gate: every daemon "is this project registered?"

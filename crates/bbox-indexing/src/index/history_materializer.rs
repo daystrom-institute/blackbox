@@ -105,7 +105,7 @@ impl HistoryMaterializerError {
         Self::new("error.history_inventory_missing", message)
     }
 
-    fn commitment_mismatch(message: impl Into<String>) -> Self {
+    pub(crate) fn commitment_mismatch(message: impl Into<String>) -> Self {
         Self::new("error.history_commitment_mismatch", message)
     }
 }
@@ -360,16 +360,22 @@ pub fn materialize_history_generations_with_io(
             truncated.insert(namespace.clone());
         }
         let classification = classify_namespace(catalog, &namespace);
-        let generation = generation_store.create_or_open(HistoryGenerationInputV1 {
-            namespace: namespace.clone(),
-            owner: classification.clone().into_owner(),
-            commit_documents: capture.commit_documents.clone(),
-            vector_inputs: capture.vector_inputs.clone(),
-            truncated_message_count: capture.truncated_message_count,
-            source_schema_version: scan.schema_version.clone(),
-            source_schema_fingerprint_sha256: scan.schema_fingerprint_sha256.clone(),
-            source_index_fingerprint_sha256: scan.source_index_fingerprint_sha256.clone(),
-        })?;
+        // Through the shared creation path, never `create_or_open` directly:
+        // see `create_history_generation` for why a second constructor forks
+        // generation identity.
+        let generation = create_history_generation(
+            &generation_store,
+            HistoryGenerationInputV1 {
+                namespace: namespace.clone(),
+                owner: classification.clone().into_owner(),
+                commit_documents: capture.commit_documents.clone(),
+                vector_inputs: capture.vector_inputs.clone(),
+                truncated_message_count: capture.truncated_message_count,
+                source_schema_version: scan.schema_version.clone(),
+                source_schema_fingerprint_sha256: scan.schema_fingerprint_sha256.clone(),
+                source_index_fingerprint_sha256: scan.source_index_fingerprint_sha256.clone(),
+            },
+        )?;
         namespaces.push(MaterializedNamespaceV1 {
             namespace,
             classification,
@@ -386,6 +392,28 @@ pub fn materialize_history_generations_with_io(
         recorded_source_index_fingerprint: recorded_fingerprint,
         observed_source_index_fingerprint: observed_fingerprint,
     })
+}
+
+/// THE single creation path for repo-history generations.
+///
+/// Governing section 11, as amended by Phase 3 plan section 10 item 3: the
+/// pre-replacement materializer and the live history refresh are its ONLY
+/// callers, and no other code constructs a generation. The rule exists
+/// because generation identity is content-addressed: a third constructor
+/// that assembled the body slightly differently (a field defaulted, a row
+/// ordered differently, schema evidence sourced elsewhere) would mint a
+/// SECOND id for the same history and silently fork the catalog's notion of
+/// what is materialized. Funnelling both callers through one function makes
+/// that divergence impossible to introduce without editing this line.
+///
+/// Generations are immutable. A refresh that observes new commits does not
+/// append: it builds the complete superseding set and creates a NEW
+/// generation, whose id differs precisely because its content differs.
+pub fn create_history_generation(
+    store: &HistoryGenerationStore,
+    input: HistoryGenerationInputV1,
+) -> HistoryMaterializerResult<HistoryGenerationRecordV1> {
+    Ok(store.create_or_open(input)?)
 }
 
 /// Decide which asset proof this pass can run.

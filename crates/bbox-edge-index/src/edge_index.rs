@@ -2592,6 +2592,8 @@ mod tests {
                 repo_materialization: None,
                 code_source_selector: None,
                 code_source_generation: None,
+                git_overlay: None,
+                git_overlay_managed: false,
             },
         );
         idx.write_atomic(edges_dir).unwrap();
@@ -2688,6 +2690,8 @@ mod tests {
                 repo_materialization: None,
                 code_source_selector: None,
                 code_source_generation: None,
+                git_overlay: None,
+                git_overlay_managed: false,
             },
         );
         idx.write_atomic(edges_dir).unwrap();
@@ -3440,6 +3444,8 @@ mod tests {
                 repo_materialization: None,
                 code_source_selector: None,
                 code_source_generation: None,
+                git_overlay: None,
+                git_overlay_managed: false,
             },
         );
         idx.write_atomic(edges_dir).unwrap();

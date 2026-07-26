@@ -214,7 +214,7 @@ pub fn build_commit_doc(
     // 1.5x boost as project-file path matches when the query mentions
     // subject keywords. Without this, the path_tokens boost asymmetrically
     // pushes project_file results above commits whose subject also matches.
-    let subject = message.lines().next().unwrap_or("").trim();
+    let subject = commit_subject_tokens(&message);
     if !subject.is_empty() {
         doc.add_text(f.path_tokens, subject);
     }
@@ -234,6 +234,110 @@ pub fn build_commit_doc(
     doc.add_u64(f.byte_offset, 0);
     doc.add_u64(f.is_subagent, 0);
     doc
+}
+
+/// Join a project-relative path onto its scope's `bbox_root_relpath`,
+/// yielding the path Git reports for that file.
+///
+/// The two directions of this mapping are the whole reason monorepo
+/// consolidation is possible: per-project staging owns project-relative
+/// paths, Git owns repo-relative ones, and `bbox_root_relpath` is the only
+/// bridge. Keeping both directions beside each other is what makes a
+/// mismatch a compile-adjacent edit rather than a silent no-match.
+pub fn repo_relative_path_for_scope(bbox_root_relpath: &str, project_relative: &str) -> String {
+    if bbox_root_relpath == "." {
+        return project_relative.to_string();
+    }
+    format!("{bbox_root_relpath}/{project_relative}")
+}
+
+/// Inverse of [`repo_relative_path_for_scope`]: the project-relative path for
+/// a repo-relative one, or `None` when the file lies outside this project's
+/// subtree.
+///
+/// `None` is the load-bearing arm for consolidated ingestion. One walk sees
+/// every changed path in the repository, and a sibling project must emit NO
+/// edge for a path outside its own root; returning `None` rather than a
+/// best-effort guess is what keeps a monorepo sibling's edges out of its
+/// neighbour's graph.
+pub fn project_relative_path_within_scope(
+    bbox_root_relpath: &str,
+    repo_relative: &str,
+) -> Option<String> {
+    if bbox_root_relpath == "." {
+        return Some(repo_relative.to_string());
+    }
+    // The separator check is what rejects `crates/foo-extra/x.rs` for the
+    // scope `crates/foo`: a bare `starts_with` on the prefix would accept it.
+    let rest = repo_relative.strip_prefix(bbox_root_relpath)?;
+    let rest = rest.strip_prefix('/')?;
+    if rest.is_empty() {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+/// The repo-level edges one commit contributes: its parent chain.
+///
+/// Repo-level by construction - both endpoints are `Commit` refs carrying a
+/// namespace and a sha and no project at all - which is why consolidated
+/// ingestion may materialize the identical set under every member project
+/// without creating cross-project contamination or an ordering dependency.
+pub fn commit_parent_edges(repo_id: &str, commit: &GitCommit) -> Vec<Edge> {
+    let source = EntityRef::Commit {
+        repo_id: repo_id.to_string(),
+        sha: commit.sha.clone(),
+    };
+    commit
+        .parent_shas
+        .iter()
+        .map(|parent| {
+            edge(
+                source.clone(),
+                "COMMIT_PARENT",
+                EntityRef::Commit {
+                    repo_id: repo_id.to_string(),
+                    sha: parent.clone(),
+                },
+                EdgeConfidence::Exact,
+            )
+        })
+        .collect()
+}
+
+/// The `COMMIT_TOUCHED_FILE` edges one commit contributes to ONE project,
+/// given the repo-relative paths the commit changed.
+///
+/// Emits nothing for a path outside the project's `bbox_root_relpath`, and
+/// nothing for a path the project's active generation does not currently
+/// chunk (a deleted file, a binary, an excluded extension).
+pub fn commit_touched_file_edges(
+    repo_id: &str,
+    commit: &GitCommit,
+    bbox_root_relpath: &str,
+    changed_repo_paths: &[String],
+    project_chunks: &HashMap<String, EntityRef>,
+) -> Vec<Edge> {
+    let source = EntityRef::Commit {
+        repo_id: repo_id.to_string(),
+        sha: commit.sha.clone(),
+    };
+    let mut edges = Vec::new();
+    for repo_path in changed_repo_paths {
+        let Some(project_path) = project_relative_path_within_scope(bbox_root_relpath, repo_path)
+        else {
+            continue;
+        };
+        if let Some(target) = project_chunks.get(&project_path) {
+            edges.push(edge(
+                source.clone(),
+                "COMMIT_TOUCHED_FILE",
+                target.clone(),
+                EdgeConfidence::Heuristic,
+            ));
+        }
+    }
+    edges
 }
 
 fn commit_edges(
@@ -281,7 +385,15 @@ fn edge(source: EntityRef, kind: &str, target: EntityRef, confidence: EdgeConfid
     }
 }
 
-fn commit_entity_id(repo_id: &str, sha: &str) -> String {
+/// The subject line mirrored into `path_tokens` so a commit whose subject
+/// matches gets the same boost a project-file path match does. Shared with
+/// the generation-row builder so the stored row and the tantivy document can
+/// never disagree about what the field holds.
+pub fn commit_subject_tokens(indexed_message: &str) -> &str {
+    indexed_message.lines().next().unwrap_or("").trim()
+}
+
+pub fn commit_entity_id(repo_id: &str, sha: &str) -> String {
     EntityRef::Commit {
         repo_id: repo_id.to_string(),
         sha: sha.to_string(),
@@ -289,13 +401,23 @@ fn commit_entity_id(repo_id: &str, sha: &str) -> String {
     .to_string()
 }
 
-fn commit_message_hash(message: &str) -> String {
+/// SHA-256 over the exact bytes handed in.
+///
+/// CALLER CONTRACT: the commit document hashes the TRUNCATED message while
+/// the vector enqueue hashes the RAW one. That divergence is deliberate and
+/// pre-existing; the two hashes are never compared to each other, and any
+/// code that starts comparing them is asserting an equality that does not
+/// hold for an oversized commit message.
+pub fn commit_message_hash(message: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(message.as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
-fn indexable_commit_message(message: &str) -> String {
+/// The commit-message text as it is actually indexed: the raw message, or a
+/// UTF-8-boundary-safe prefix stamped with [`TRUNCATED_COMMIT_MESSAGE_SUFFIX`]
+/// when it exceeds the size cap.
+pub fn indexable_commit_message(message: &str) -> String {
     if message.len() <= MAX_COMMIT_MESSAGE_BYTES {
         return message.to_string();
     }

@@ -481,6 +481,57 @@ impl HistoryGenerationRecordV1 {
     }
 }
 
+/// The generation rows one freshly walked commit contributes.
+///
+/// EQUIVALENCE CONTRACT: these rows must be byte-identical to what
+/// [`scan_commit_documents`] would read back after `build_commit_doc` wrote
+/// the same commit into tantivy. That equivalence is what lets a live refresh
+/// and a pre-replacement materialization of the same namespace converge on
+/// the same content-addressed generation id instead of forking identity. Any
+/// change to `build_commit_doc`'s stored fields must land here in the same
+/// commit; the two path-bearing fields (`project`, `file_path`) are excluded
+/// from the generation by design and so have no counterpart here.
+///
+/// The vector input's `content_hash` is over the INDEXED (possibly truncated)
+/// message, matching the scan; it is deliberately not the raw-message hash
+/// the legacy vector key used, and the two are never compared.
+pub fn generation_rows_for_commit(
+    commit: &bbox_corpus_core::git::GitCommit,
+    namespace: &str,
+) -> (HistoryCommitDocumentV1, HistoryVectorInputV1) {
+    use super::git_history::{
+        commit_entity_id, commit_message_hash, commit_subject_tokens, indexable_commit_message,
+    };
+
+    let entity_id = commit_entity_id(namespace, &commit.sha);
+    let content = indexable_commit_message(&commit.message);
+    let content_hash = commit_message_hash(&content);
+    let document = HistoryCommitDocumentV1 {
+        entity_id: entity_id.clone(),
+        doc_type: "commit".to_string(),
+        chunk_kind: "git_message".to_string(),
+        repo_id: namespace.to_string(),
+        commit_sha: commit.sha.clone(),
+        path_tokens: commit_subject_tokens(&content).to_string(),
+        parser_version: bbox_corpus_core::entity_ref::PARSER_VERSION.to_string(),
+        commit_author_name: commit.author_name.clone(),
+        commit_author_email: commit.author_email.clone(),
+        session_id: String::new(),
+        account: "git".to_string(),
+        role: "commit".to_string(),
+        byte_offset: 0,
+        is_subagent: 0,
+        content_hash: content_hash.clone(),
+        content,
+    };
+    let vector = HistoryVectorInputV1 {
+        entity_id,
+        content_hash,
+        message: document.content.clone(),
+    };
+    (document, vector)
+}
+
 /// Everything the caller must supply to create a generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryGenerationInputV1 {
@@ -1294,6 +1345,34 @@ pub struct HistoryIndexScanV1 {
     /// subsource states rather than commit rows.
     pub source_index_fingerprint_sha256: String,
     pub namespaces: BTreeMap<String, HistoryNamespaceCaptureV1>,
+}
+
+/// Schema evidence for a generation created from a LIVE walk rather than
+/// from a scan of an outgoing index.
+///
+/// The pre-replacement materializer reads its evidence off the index it is
+/// about to destroy. A live refresh has no such index to read: it is writing
+/// INTO the running one, at the running schema. This helper supplies the same
+/// two values from the running binary so both creation callers populate the
+/// generation body identically in shape.
+///
+/// The third value, `source_index_fingerprint_sha256`, is deliberately NOT
+/// produced here: it fingerprints an observed document population, and a live
+/// refresh's population is the generation's own rows. The live caller passes
+/// a documented constant marker for that field (see
+/// `LIVE_REFRESH_SOURCE_MARKER` in the refresh module): non-hex, never
+/// validated as a SHA-256, and never compared against a scan fingerprint.
+pub fn live_schema_evidence() -> HistoryGenerationResult<(String, String)> {
+    let (schema, _fields) = super::build_schema();
+    let schema_bytes = serde_json::to_vec(&schema)
+        .map_err(|error| corrupt(format!("index schema cannot be encoded: {error}")))?;
+    let mut hasher = Sha256::new();
+    hasher.update(SOURCE_FINGERPRINT_DOMAIN);
+    put_field(&mut hasher, &schema_bytes);
+    Ok((
+        super::INDEX_SCHEMA_VERSION.to_string(),
+        hex::encode(hasher.finalize()),
+    ))
 }
 
 /// Stream the legacy index's commit documents, grouped by exact namespace.

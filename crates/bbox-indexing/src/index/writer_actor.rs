@@ -145,6 +145,33 @@ pub enum IndexWriteOp {
         current_chunk_targets: HashMap<String, bbox_corpus_core::entity_ref::EntityRef>,
         ack: mpsc::SyncSender<Result<()>>,
     },
+    /// Consolidated repo-history ingestion for ONE repo-history record
+    /// (Phase 3 plan section 10 item 2), catalog mode only.
+    ///
+    /// The walk itself happened on the daemon side, off this actor: it needs
+    /// the catalog snapshot and the attachment ladder, neither of which this
+    /// actor holds, and it must not run while a staged-generation hold is
+    /// alive. What arrives here is the already-decided result - the commits
+    /// to write under the primary namespace and the per-project edges to
+    /// materialize - so this op does index work only.
+    StageConsolidatedHistory {
+        commit_namespace: String,
+        /// Display name for the `project` field of every commit document in
+        /// this repository. Repo-level facts, one single-valued schema field:
+        /// the daemon picks the deterministic member and it travels with the
+        /// op rather than being re-derived here.
+        project_display: String,
+        commits: Vec<bbox_corpus_core::git::GitCommit>,
+        /// member project id -> that project's managed Git sidecar edges.
+        edges_by_project: std::collections::BTreeMap<String, Vec<bbox_chunker::Edge>>,
+        /// member project id -> the active snapshot whose `git-current.jsonl`
+        /// member must receive that project's edges. A member absent here
+        /// keeps its managed sidecar refreshed without a snapshot member,
+        /// which is the right shape for a sibling whose own generation has
+        /// not activated in this pass.
+        snapshot_by_project: std::collections::BTreeMap<String, String>,
+        ack: mpsc::SyncSender<Result<u64>>,
+    },
     RetireCodeSelector {
         selector: String,
         ack: mpsc::SyncSender<Result<u64>>,
@@ -1116,6 +1143,35 @@ impl IndexWriterActor {
             .map_err(|_| anyhow!("index writer actor dropped the git-overlay ack"))?
     }
 
+    /// Write one consolidated repo-history walk into the index.
+    ///
+    /// Returns the number of commit documents written. Best effort like the
+    /// overlay op: the code generation it decorates is already published, so
+    /// a failure here degrades history health and never unpublishes anything.
+    pub fn stage_consolidated_history(
+        &self,
+        commit_namespace: String,
+        project_display: String,
+        commits: Vec<bbox_corpus_core::git::GitCommit>,
+        edges_by_project: std::collections::BTreeMap<String, Vec<bbox_chunker::Edge>>,
+        snapshot_by_project: std::collections::BTreeMap<String, String>,
+    ) -> Result<u64> {
+        let (ack, ack_rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(IndexWriteOp::StageConsolidatedHistory {
+                commit_namespace,
+                project_display,
+                commits,
+                edges_by_project,
+                snapshot_by_project,
+                ack,
+            })
+            .map_err(|_| anyhow!("index writer actor unavailable"))?;
+        ack_rx
+            .recv()
+            .map_err(|_| anyhow!("index writer actor dropped the consolidated-history ack"))?
+    }
+
     pub fn retire_code_selector(&self, selector: String) -> Result<RetiredCodeSelector> {
         let (ack, ack_rx) = mpsc::sync_channel(1);
         let (release, release_rx) = mpsc::sync_channel(1);
@@ -1241,6 +1297,24 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
                 );
                 let _ = ack.send(result);
             }
+            IndexWriteOp::StageConsolidatedHistory {
+                commit_namespace,
+                project_display,
+                commits,
+                edges_by_project,
+                snapshot_by_project,
+                ack,
+            } => {
+                let result = run_consolidated_history(
+                    &ctx,
+                    &commit_namespace,
+                    &project_display,
+                    &commits,
+                    &edges_by_project,
+                    &snapshot_by_project,
+                );
+                let _ = ack.send(result);
+            }
             IndexWriteOp::RetireCodeSelector {
                 selector,
                 ack,
@@ -1277,6 +1351,13 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
                         }
                         Ok(overlay @ IndexWriteOp::StageGitCurrentOverlay { .. }) => {
                             deferred = Some(overlay);
+                            break;
+                        }
+                        // Deferred like every other control op: it opens its
+                        // own writer and commits, so batching it beside small
+                        // ops would nest two writers on one index.
+                        Ok(history @ IndexWriteOp::StageConsolidatedHistory { .. }) => {
+                            deferred = Some(history);
                             break;
                         }
                         Ok(retirement @ IndexWriteOp::RetireCodeSelector { .. }) => {
@@ -1504,31 +1585,23 @@ fn run_local_stage(
         &edges_dir,
         &mut publication,
     )?;
-    // Local staging keeps its in-transaction Git behavior this milestone
-    // (plan section 6 item 3); it converts with the overlay machinery.
-    // The record is present on the bridge cutback path exercised this
-    // milestone; catalog-mode local cutback (a Phase 4 transition) can
-    // reach the None arm when the compatibility projection omits the
-    // project, and the Git walk still needs the record's repo id, so that
-    // case skips the current-file member (an optional snapshot member)
-    // instead of guessing. Phase 4 should resolve the repo id from the
-    // catalog identity instead.
-    match compat.as_ref() {
-        Some(record) => stage_git_current_edges(
-            ctx,
-            record,
-            identity.display_name.as_str(),
-            Some(git_lease.checkout_root()),
-            &result,
-            &mut writer,
-            &edges_dir,
-            &mut publication,
-        )?,
-        None => tracing::warn!(
-            project_id,
-            "local staging has no compatibility record; skipping the Git current-file member"
-        ),
-    }
+    // P3-F completes the P3-B deferral: local staging no longer walks Git
+    // inside its own transaction. It stages the EMPTY current-file member and
+    // lets the post-activation overlay step own the walk, exactly as the
+    // collected lane does.
+    //
+    // The parity consequence is enumerated in plan section 6 item 3 as
+    // amended: after a local cutback, `git-current.jsonl` is empty and the
+    // manifest entry is overlay-managed with no selector, so the loader gates
+    // the member off until the overlay lands. That is strictly better than
+    // the alternative it replaces - a Git error mid-walk previously failed
+    // the whole cutback, which is the F5 class on the local side.
+    //
+    // `stage_snapshot_git_current` with `include_managed_git: false` is what
+    // writes the empty member: the member must EXIST (the snapshot's file set
+    // is fixed at write time) while carrying no edges.
+    let _ = compat.as_ref();
+    publication.stage_snapshot_git_current(&edges_dir, project_id, &result.snapshot_id, false);
     let _publication_guard = ctx
         .checkout_access
         .publication_guard_for([&local_lease, &git_lease])?;
@@ -1585,52 +1658,67 @@ fn run_git_current_overlay(
     Ok(())
 }
 
-fn stage_git_current_edges(
+/// Write one consolidated repo-history walk: commit documents under the
+/// PRIMARY namespace once, per-project managed Git sidecars, and one vector
+/// enqueue per commit.
+///
+/// ONE ENQUEUE PER COMMIT, not one per member project. The bridge lane
+/// enqueued inside its per-project walk, so a monorepo re-embedded every
+/// commit message once per sibling; consolidating the walk is what makes the
+/// single enqueue possible.
+// executes inside the IndexWriterActor pass (sanctioned single-writer).
+#[allow(clippy::disallowed_methods)]
+fn run_consolidated_history(
     ctx: &ActorCtx,
-    project: &ProjectRecord,
+    commit_namespace: &str,
     project_display: &str,
-    git_root: Option<&Path>,
-    result: &super::project_files::CollectedIndexResult,
-    writer: &mut IndexWriter,
-    edges_dir: &Path,
-    publication: &mut super::project_files::ProjectIndexPublicationBundle,
-) -> Result<()> {
-    let Some(root) = git_root else {
-        publication.stage_snapshot_git_current(
-            edges_dir,
-            &project.project_id,
-            &result.snapshot_id,
-            project.repo_id.is_some(),
+    commits: &[bbox_corpus_core::git::GitCommit],
+    edges_by_project: &std::collections::BTreeMap<String, Vec<bbox_chunker::Edge>>,
+    snapshot_by_project: &std::collections::BTreeMap<String, String>,
+) -> Result<u64> {
+    let edges_dir =
+        bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&ctx.config.projects_path);
+    let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
+    writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
+    let mut written = 0_u64;
+    for commit in commits {
+        let entity_id = super::git_history::commit_entity_id(commit_namespace, &commit.sha);
+        writer.delete_term(Term::from_field_text(ctx.fields.entity_id, &entity_id));
+        writer.add_document(super::git_history::build_commit_doc(
+            commit,
+            commit_namespace,
+            // The per-project source key this document's `file_path` carries
+            // is the delete term of the LEGACY per-project purge arm. A
+            // consolidated document belongs to no single project, so it is
+            // keyed by the namespace instead; the purge arm that used the
+            // project key never applied to it.
+            commit_namespace,
+            project_display,
+            ctx.fields,
+        ))?;
+        super::embed_hook::emit_git_message(
+            &entity_id,
+            &super::git_history::commit_message_hash(&commit.message),
+            &commit.message,
         );
-        return Ok(());
-    };
-    let git_meta_dir =
-        super::git_history::git_meta_dir_from_projects_path(&ctx.config.projects_path);
-    let mut meta = HashMap::new();
-    let mut git_ctx = super::git_history::GitIndexContext {
-        f: ctx.fields,
-        writer,
-        meta: &mut meta,
-        edges_dir,
-        git_meta_dir: &git_meta_dir,
-        force_full: true,
-        publication,
-        project_display,
-    };
-    super::git_history::index_git_history_for_project(
-        project,
-        root,
-        &result.current_chunk_targets,
-        &mut git_ctx,
-    )?;
-    drop(git_ctx);
-    publication.stage_snapshot_git_current(
-        edges_dir,
-        &project.project_id,
-        &result.snapshot_id,
-        true,
-    );
-    Ok(())
+        written += 1;
+    }
+    for (project_id, edges) in edges_by_project {
+        // Replace, not merge: a consolidated walk that produced no edge for a
+        // project is asserting that project currently has none, and merging
+        // would keep a retired snapshot's edges alive forever.
+        bbox_edge_sidecar::edge_sidecar::replace_materialized_edges(
+            &edges_dir, "git", project_id, edges,
+        )?;
+        if let Some(snapshot_id) = snapshot_by_project.get(project_id) {
+            let mut publication = super::project_files::ProjectIndexPublicationBundle::default();
+            publication.stage_snapshot_git_current(&edges_dir, project_id, snapshot_id, true);
+            publication.publish()?;
+        }
+    }
+    writer.commit()?;
+    post_commit(ctx);
+    Ok(written)
 }
 
 fn run_selector_retirement(ctx: &ActorCtx, selector: &str) -> Result<u64> {
@@ -1753,6 +1841,9 @@ fn run_pass(
                         let _ = ack.send(Err(anyhow::Error::new(
                             IndexWriterRetryableError::ReindexPassInProgress,
                         )));
+                    }
+                    IndexWriteOp::StageConsolidatedHistory { ack, .. } => {
+                        let _ = ack.send(Err(anyhow!("index writer actor is shutting down")));
                     }
                     IndexWriteOp::StageGitCurrentOverlay { ack, .. } => {
                         let _ = ack.send(Err(anyhow::Error::new(
@@ -1886,6 +1977,7 @@ fn apply_small_op(ctx: &ActorCtx, writer: &mut IndexWriter, op: IndexWriteOp) {
         | IndexWriteOp::StageCollectedGeneration { .. }
         | IndexWriteOp::StageLocalGeneration { .. }
         | IndexWriteOp::StageGitCurrentOverlay { .. }
+        | IndexWriteOp::StageConsolidatedHistory { .. }
         | IndexWriteOp::RetireCodeSelector { .. }
         | IndexWriteOp::Flush(_) => {
             debug_assert!(false, "control ops are routed before apply_small_op");
@@ -3216,6 +3308,8 @@ mod source_planning_tests {
                     ),
                 ),
                 code_source_generation: Some(GENERATION.to_string()),
+                git_overlay: None,
+                git_overlay_managed: false,
             },
         );
         manifest.write_atomic(&edges_dir).unwrap();

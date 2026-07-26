@@ -140,6 +140,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
             searcher: code_searcher,
             edge_index: Arc::new(edge_index::EdgeIndex::default()),
             catalog_epoch: 0,
+            git_overlays: std::collections::BTreeMap::new(),
         })),
         code_sources: Arc::new(crate::server::code_source::CodeSourceRuntime::for_test(
             tmp.path(),

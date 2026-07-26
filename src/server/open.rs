@@ -547,7 +547,17 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         // Seeded from the same boot snapshot that seeded the edge set above,
         // so the startup view and the first runtime republish agree.
         catalog_epoch: records_provider.records_snapshot().authority_epoch,
+        // Same boot snapshot, same rule: the startup view pins the durable
+        // overlay selection so the first request after open joins commit-file
+        // edges through exactly the overlays the manifest names.
+        git_overlays: super::state::read_git_overlays_for_view(&project_authority, &store_dir),
     };
+    // Phase 3 plan section 10 item 4: the derived repo-history reference
+    // manifest is rebuilt and checksummed from durable inputs at startup,
+    // BEFORE anything can sweep. A mismatch leaves history GC disabled and
+    // surfaces in doctor; it never blocks the open, because a stale
+    // acceleration index must not cost history reads.
+    refresh_history_reference_manifest(&cfg, &project_authority, &store_dir, &code_read_view);
     let (edge_rebuild_nudge_tx, edge_rebuild_nudge_rx) = std::sync::mpsc::sync_channel(1);
     let shared = Arc::new(SharedState {
         idx: RwLock::new(idx),
@@ -770,6 +780,69 @@ fn build_startup_edge_index(
             "startup EdgeIndex rebuild deferred (set BLACKBOX_EDGE_INDEX_BOOT_REBUILD=1 to restore eager rebuild)"
         );
         edge_index::EdgeIndex::default()
+    }
+}
+
+/// Rebuild and checksum the derived repo-history reference manifest from its
+/// durable inputs (Phase 3 plan section 10 item 4; governing section 11).
+///
+/// Best effort, and deliberately so. This index only ACCELERATES GC root
+/// computation; the authority is the catalog plus the overlay selectors this
+/// function reads. A failure here leaves GC disabled (doctor reports it) and
+/// must never fail the daemon open, because history reads do not depend on it.
+///
+/// The startup rebuild passes empty process-local root sets: no read view is
+/// pinned and no build is in flight yet, which is exactly the state that
+/// makes the durable set complete.
+fn refresh_history_reference_manifest(
+    cfg: &crate::config::Config,
+    authority: &super::state::ProjectAuthority,
+    store_dir: &Path,
+    code_read_view: &super::CodeReadView,
+) {
+    use bbox_indexing::index::history_gc::{build_reference_manifest, evaluate_history_gc};
+
+    let super::state::ProjectAuthority::Catalog { store } = authority else {
+        return;
+    };
+    let Ok(pinned) = store.snapshot() else {
+        tracing::warn!(
+            "the project catalog is unreadable at open; the repo-history reference \
+             manifest was not rebuilt and history GC stays disabled"
+        );
+        return;
+    };
+    let Ok(generation_store) =
+        bbox_indexing::index::history_generations::HistoryGenerationStore::open_for_index(
+            &cfg.paths.index_path,
+        )
+    else {
+        return;
+    };
+    let rebuild_manifests = generation_store
+        .read_rebuild_manifest()
+        .ok()
+        .flatten()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let _ = store_dir;
+    let rebuilt = build_reference_manifest(
+        pinned.catalog(),
+        &code_read_view.git_overlays,
+        &rebuild_manifests,
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
+    );
+    match evaluate_history_gc(&generation_store, &rebuilt) {
+        bbox_indexing::index::history_gc::HistoryGcEnablementV1::Enabled { roots } => {
+            tracing::info!(
+                referenced_generations = roots.len(),
+                "repo-history reference manifest rebuilt; history GC enabled"
+            );
+        }
+        bbox_indexing::index::history_gc::HistoryGcEnablementV1::Disabled { diagnostic } => {
+            tracing::warn!(%diagnostic, "history GC is disabled");
+        }
     }
 }
 

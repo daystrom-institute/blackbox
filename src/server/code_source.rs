@@ -21,7 +21,7 @@ use bbox_code_source_store::{
 };
 use bbox_corpus_core::code_project_identity::CodeProjectIdentity;
 use bbox_corpus_core::identity::PublishedScope;
-use bbox_corpus_core::project_catalog::{CatalogSnapshotV2, ProjectId};
+use bbox_corpus_core::project_catalog::{CatalogSnapshotV2, ProjectId, RepoHistoryMaterialization};
 use bbox_corpus_core::project_record::ProjectRecord;
 use bbox_indexing::checkout_access::{
     CheckoutAccessBroker, CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest,
@@ -1113,25 +1113,246 @@ fn republish_code_read_view(state: &Arc<SharedState>) -> Result<()> {
         searcher: index.searcher(),
         edge_index: Arc::new(rebuilt),
         catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
+        // Read AFTER the overlay selector landed in the manifest: this
+        // republish is what makes the freshly staged overlay visible to
+        // readers, so pinning a pre-swap map here would publish edges the
+        // view claims not to have.
+        git_overlays: super::state::read_git_overlays_for_view(
+            &state.project_authority,
+            &state.store_dir,
+        ),
     });
     Ok(())
 }
 
-/// Best-effort Git current-file overlay for an ALREADY ACTIVE collected
-/// generation (Phase 3 plan section 6 item 3, governing section 11).
+/// Run ONE consolidated repo-history refresh for the repo-history record the
+/// given project belongs to (Phase 3 plan section 10 items 2 and 3).
 ///
-/// Every failure mode below leaves the activation intact and records the
-/// existing `git_history_unavailable` health: no attachment to lease, a
-/// denied lease, a mid-walk Git error, or a failed republish. This is what
-/// closes F5 - the activation transaction no longer opens Git at all, so a
-/// Git problem can no longer fail or roll back a valid generation. Overlay
-/// semantics are deliberately minimal here; the typed `GitOverlaySelector`
-/// arrives in P3-F.
+/// Catalog mode only. `lease` is the already-validated `GitHistory` lease the
+/// caller holds; this function re-uses it rather than acquiring a second one,
+/// so the ladder-selected attachment and the leased checkout are the same
+/// checkout by construction.
+///
+/// STAGED-HOLD CONSTRAINT: this enqueues a writer op, so it must never be
+/// called while a `StagedIndexGeneration` is alive on this thread. The
+/// activation path drops its hold before reaching here for exactly that
+/// reason.
+fn refresh_consolidated_repo_history(
+    state: &Arc<SharedState>,
+    project_id: &str,
+    checkout_root: &std::path::Path,
+    snapshot_id: &str,
+    current_chunk_targets: &std::collections::HashMap<
+        String,
+        bbox_corpus_core::entity_ref::EntityRef,
+    >,
+) -> Result<Option<String>> {
+    use bbox_indexing::index::consolidated_history;
+
+    let Some(catalog_store) = state.project_authority.catalog_store() else {
+        return Ok(None);
+    };
+    let pinned = catalog_store.snapshot()?;
+    let parsed = ProjectId::parse(project_id.to_string())
+        .map_err(|error| anyhow!("invalid catalog project id for history refresh: {error}"))?;
+    let Some(group) = consolidated_history::plan_repo_history_ingest(pinned.catalog())
+        .into_iter()
+        .find(|group| group.members.contains_key(parsed.as_str()))
+    else {
+        return Ok(None);
+    };
+    // The ladder must agree with the checkout we already hold. When it does
+    // not, another member's attachment is the deterministic walk source and
+    // this project's activation is not the right moment to walk: refusing
+    // keeps the "same catalog state always picks the same walk source"
+    // guarantee that content-addressed generation ids depend on.
+    let Some(selected) =
+        consolidated_history::select_history_attachment(pinned.attachments(), &group)
+    else {
+        return Ok(None);
+    };
+    if selected.project_id.as_str() != parsed.as_str() {
+        return Ok(None);
+    }
+
+    let git_meta_dir = bbox_indexing::index::git_history::git_meta_dir_from_projects_path(
+        &state.config.read().paths.projects_path,
+    );
+    let cursors = consolidated_history::RepoHistoryCursorStoreV1::new(&git_meta_dir);
+    let existing_cursor = cursors.load(&group.repo_history_id)?;
+    let since = match existing_cursor.as_ref() {
+        Some(cursor) => Some(cursor.last_ingested_sha.clone()),
+        None => {
+            // FIRST consolidated generation for this record: inventory and
+            // back up every legacy per-project cursor, then walk COMPLETE
+            // reachable history. Never seed from those values - siblings may
+            // disagree, and seeding from one silently skips whatever interval
+            // the other had already passed.
+            let inventory = cursors.inventory_and_back_up_legacy_cursors(&group)?;
+            tracing::info!(
+                repo_history = %group.repo_history_id,
+                observed = inventory.observed.len(),
+                divergent = inventory.divergent,
+                "backing up legacy per-project Git cursors; the first consolidated \
+                 generation performs one complete reachable-history walk"
+            );
+            None
+        }
+    };
+
+    // Only the activating project's chunk targets are known here, so only its
+    // file edges can be emitted this pass. Sibling members keep their existing
+    // sidecars until their own activation refreshes them; the commit documents
+    // and the generation, which is what the members actually share, are
+    // produced exactly once regardless.
+    let targets =
+        std::collections::BTreeMap::from([(project_id.to_string(), current_chunk_targets.clone())]);
+    let walk =
+        consolidated_history::walk_repo_history(checkout_root, &group, since.as_deref(), &targets)?;
+    let display = pinned
+        .catalog()
+        .projects
+        .get(&parsed)
+        .map(|project| project.display_name.clone())
+        .unwrap_or_else(|| project_id.to_string());
+    let edges_for_this_project = walk
+        .edges_by_project
+        .iter()
+        .filter(|(member, _)| member.as_str() == project_id)
+        .map(|(member, edges)| (member.clone(), edges.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    state.index_writer.stage_consolidated_history(
+        group.primary_namespace.as_str().to_string(),
+        display,
+        walk.commits.clone(),
+        edges_for_this_project,
+        std::collections::BTreeMap::from([(project_id.to_string(), snapshot_id.to_string())]),
+    )?;
+
+    let generation_store =
+        bbox_indexing::index::history_generations::HistoryGenerationStore::open_for_index(
+            &state.config.read().paths.index_path,
+        )
+        .map_err(|error| anyhow!("{error}"))?;
+    let outcome = bbox_indexing::index::history_refresh::refresh_repo_history_generation(
+        catalog_store,
+        &generation_store,
+        &cursors,
+        &group,
+        &walk,
+    )
+    .map_err(|error| anyhow!("{error}"))?;
+    tracing::info!(
+        repo_history = %group.repo_history_id,
+        attachment = %selected.attachment_id,
+        rung = selected.rung.as_str(),
+        generation = %outcome.generation.id,
+        superseded = ?outcome.superseded_generation,
+        commits = walk.commits.len(),
+        "consolidated repo-history refresh published a generation"
+    );
+    Ok(Some(outcome.generation.id.as_str().to_string()))
+}
+
+/// Install the typed overlay selector for a project whose current-file edges
+/// were just staged (Phase 3 plan section 10 item 1).
+///
+/// Bridge mode installs nothing and says so: the bridge lane stages its Git
+/// member inside its own transaction and its manifest entry is not
+/// overlay-managed, so a selector there would be a claim the loader gate
+/// would then act on.
+///
+/// The `repo_history_generation` comes from the project's catalog history
+/// record. When the record has no `Ready` materialization yet the overlay is
+/// NOT installed: the selector's whole job on the GC side is to hold a
+/// reference to a real generation, and naming one that does not exist would
+/// make the reference manifest describe a generation nothing can load.
+/// History health reports that project as `lagging` until the first
+/// consolidated refresh publishes a generation.
+fn install_git_overlay_selector(
+    state: &Arc<SharedState>,
+    project_id: &str,
+    code_generation: &str,
+    attachment_id: &str,
+    repo_head: Option<&str>,
+) -> Result<()> {
+    let Some(catalog_store) = state.project_authority.catalog_store() else {
+        return Ok(());
+    };
+    let pinned = catalog_store.snapshot()?;
+    let catalog = pinned.catalog();
+    let parsed = ProjectId::parse(project_id.to_string())
+        .map_err(|error| anyhow!("invalid catalog project id for the overlay selector: {error}"))?;
+    let project = catalog
+        .projects
+        .get(&parsed)
+        .ok_or_else(|| anyhow!("catalog project disappeared before the overlay selector"))?;
+    let Some(history) = project
+        .repo_history
+        .as_ref()
+        .and_then(|id| catalog.repo_histories.get(id))
+    else {
+        return Ok(());
+    };
+    let RepoHistoryMaterialization::Ready { generation_id } = &history.materialization else {
+        return Ok(());
+    };
+    let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
+    // Monotonic per project. Read under the same manifest the swap writes, so
+    // two overlays that agree on every other field are still distinguishable
+    // - "did the overlay actually swap?" must be answerable from the manifest.
+    let previous_generation = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)
+        .ok()
+        .and_then(|index| {
+            index
+                .workspaces
+                .get(project_id)
+                .and_then(|entry| entry.git_overlay.as_ref())
+                .map(|overlay| overlay.overlay_generation)
+        })
+        .unwrap_or(0);
+    bbox_edge_sidecar::snapshot::select_git_overlay(
+        &edges_dir,
+        project_id,
+        Some(bbox_corpus_core::git_overlay::GitOverlaySelector {
+            project_id: project_id.to_string(),
+            code_generation: code_generation.to_string(),
+            repo_history_generation: generation_id.as_str().to_string(),
+            attachment_id: attachment_id.to_string(),
+            repo_head: repo_head.unwrap_or_default().to_string(),
+            commit_namespace: history.primary_namespace.as_str().to_string(),
+            overlay_generation: previous_generation.saturating_add(1),
+        }),
+    )
+}
+
+/// Best-effort Git current-file overlay for an ALREADY ACTIVE collected
+/// generation (Phase 3 plan section 6 item 3 and section 10 item 1,
+/// governing section 11).
+///
+/// Every failure mode below leaves the activation intact and records durable
+/// health: no attachment to lease, a denied lease, a mid-walk Git error, or a
+/// failed republish. This is what closes F5 - the activation transaction no
+/// longer opens Git at all, so a Git problem can no longer fail or roll back
+/// a valid generation.
+///
+/// P3-F completes the shape: on success this installs a typed
+/// [`GitOverlaySelector`] naming the exact code generation the staged edges
+/// target, so the loader admits the `git-current.jsonl` member. Until the
+/// selector lands the member is gated OFF, which is why every early return
+/// here leaves the project with no commit-file edges rather than with edges
+/// pointing at a retired snapshot.
+///
+/// `code_generation` is the collected generation id the activation just
+/// published; it must be the value the manifest entry now carries or
+/// `select_git_overlay` refuses.
+#[allow(clippy::too_many_arguments)]
 fn stage_git_current_overlay_after_activation(
     state: &Arc<SharedState>,
     project_id: &str,
     scope: &PublishedScope,
     snapshot_id: &str,
+    code_generation: &str,
     current_chunk_targets: &std::collections::HashMap<
         String,
         bbox_corpus_core::entity_ref::EntityRef,
@@ -1159,12 +1380,35 @@ fn stage_git_current_overlay_after_activation(
         }
     };
     let Some(record) = record else {
-        // A remote-only catalog project has no checkout to walk. This is a
-        // normal steady state, not a fault, but it is still recorded so the
-        // absence of commit edges is explained.
-        degrade("the project has no attached checkout".to_string());
+        // A remote-only catalog project has no checkout to walk. P3-F
+        // RECLASSIFIES this: it is a nameable catalog steady state, not a Git
+        // subsystem failure, so it gets the history-model code rather than
+        // `git_history_unavailable`. The P3-B cell flagged the conflation
+        // explicitly - every remote-only project looked permanently degraded.
+        if let Err(error) = store.record_health_failure(
+            project_id,
+            bbox_indexing::index::history_health::HISTORY_UNAVAILABLE_NO_ATTACHMENT_CODE,
+            "no attached checkout can walk this project's repository history; \
+             commit documents stay readable and cannot be refreshed",
+        ) {
+            tracing::warn!(
+                project_id,
+                error = %error,
+                "failed to persist the no-attachment history record"
+            );
+        }
         return;
     };
+    if let Err(error) = store.clear_health_failure(
+        project_id,
+        bbox_indexing::index::history_health::HISTORY_UNAVAILABLE_NO_ATTACHMENT_CODE,
+    ) {
+        tracing::warn!(
+            project_id,
+            error = %error,
+            "failed to clear the no-attachment history record"
+        );
+    }
     if record.repo_id.is_none() {
         return;
     }
@@ -1199,13 +1443,64 @@ fn stage_git_current_overlay_after_activation(
             return;
         }
     };
-    if let Err(error) = state.index_writer.stage_git_current_overlay(
-        record,
-        project_display,
-        lease,
-        snapshot_id.to_string(),
-        current_chunk_targets.clone(),
+    // Captured BEFORE the lease moves into the writer op: the selector below
+    // records which attachment and head the overlay was built from, and that
+    // evidence is what separates `current` from `lagging` history health.
+    let attachment_id = lease.attachment_id().to_string();
+    let repo_head = bbox_corpus_core::git::current_head(lease.checkout_root());
+    // Catalog mode routes through CONSOLIDATED ingestion: one walk per
+    // repo-history record keyed by its primary namespace, publishing a
+    // durable generation. The per-project walk below stays the bridge path
+    // and the catalog fallback for a project with no repo-history record.
+    // Running both would write the same commits twice under two different
+    // namespaces, so this is an either/or, not a sequence.
+    let consolidated = match refresh_consolidated_repo_history(
+        state,
+        project_id,
+        lease.checkout_root(),
+        snapshot_id,
+        current_chunk_targets,
     ) {
+        Ok(consolidated) => consolidated,
+        Err(error) => {
+            tracing::warn!(
+                project_id,
+                error = %error,
+                "consolidated repo-history refresh failed; the generation stays active"
+            );
+            if let Err(record_error) = store.record_health_failure(
+                project_id,
+                bbox_indexing::index::history_health::HISTORY_REFRESH_FAILED_CODE,
+                &format!("the consolidated repo-history refresh failed: {error}"),
+            ) {
+                tracing::warn!(
+                    project_id,
+                    error = %record_error,
+                    "failed to persist the history-refresh failure record"
+                );
+            }
+            return;
+        }
+    };
+    if let Err(error) = store.clear_health_failure(
+        project_id,
+        bbox_indexing::index::history_health::HISTORY_REFRESH_FAILED_CODE,
+    ) {
+        tracing::warn!(
+            project_id,
+            error = %error,
+            "failed to clear the history-refresh failure record"
+        );
+    }
+    if consolidated.is_none()
+        && let Err(error) = state.index_writer.stage_git_current_overlay(
+            record,
+            project_display,
+            lease,
+            snapshot_id.to_string(),
+            current_chunk_targets.clone(),
+        )
+    {
         tracing::warn!(
             project_id,
             error = %error,
@@ -1220,6 +1515,27 @@ fn stage_git_current_overlay_after_activation(
             error = %error,
             "failed to clear GitHistory degradation record"
         );
+    }
+    // The edges are staged; now name them. Until the selector lands the
+    // loader gates the `git-current.jsonl` member OFF, so this is not a
+    // decoration step - it is what makes the staged edges readable at all.
+    if let Err(error) = install_git_overlay_selector(
+        state,
+        project_id,
+        code_generation,
+        &attachment_id,
+        repo_head.as_deref(),
+    ) {
+        tracing::warn!(
+            project_id,
+            error = %error,
+            "installing the Git overlay selector failed; the staged current-file \
+             edges stay gated off and the generation stays active"
+        );
+        degrade(format!(
+            "the overlay selector could not be installed: {error}"
+        ));
+        return;
     }
     if let Err(error) = republish_code_read_view(state) {
         tracing::warn!(
@@ -1323,6 +1639,12 @@ fn cutback_to_local(
                 searcher: index.searcher(),
                 edge_index: Arc::new(rebuilt),
                 catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
+                // Inside the manifest coordinator, so this reads the entry
+                // the activation just wrote: the atomic overlay clear.
+                git_overlays: super::state::read_git_overlays_for_view(
+                    &state.project_authority,
+                    &state.store_dir,
+                ),
             });
             Ok(())
         },
@@ -1349,6 +1671,28 @@ fn cutback_to_local(
     tracing::info!(
         project_id,
         "code-source project cut back to local ownership"
+    );
+    // P3-F: local staging stopped walking Git inside its transaction, so the
+    // cutback's current-file member is empty and its manifest entry is
+    // overlay-managed with no selector. The overlay step below is what makes
+    // the project's commit-file edges exist again. Best effort by the same
+    // rule the collected lane follows: the local generation is already
+    // published and a Git failure must not unpublish it.
+    //
+    // THE STAGED HOLD MUST BE RELEASED FIRST. The writer actor is parked on
+    // it, so enqueueing the overlay op (or the consolidated-history op it
+    // may run first) while `staged` is alive deadlocks the actor against its
+    // own caller. Same ordering the collected activation path uses.
+    let overlay_snapshot_id = staged.snapshot_id.clone();
+    let overlay_chunk_targets = staged.current_chunk_targets.clone();
+    drop(staged);
+    stage_git_current_overlay_after_activation(
+        state,
+        project_id,
+        scope,
+        &overlay_snapshot_id,
+        "local",
+        &overlay_chunk_targets,
     );
     Ok(())
 }
@@ -1660,6 +2004,15 @@ fn activate_desired_loop(
                     searcher: index.searcher(),
                     edge_index: Arc::new(rebuilt),
                     catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
+                    // Inside the manifest coordinator, so this reads the
+                    // entry the activation just wrote: activating a new code
+                    // generation clears the project's overlay, and this is
+                    // the read that makes the clear visible to readers in the
+                    // same swap rather than one republish later.
+                    git_overlays: super::state::read_git_overlays_for_view(
+                        &state.project_authority,
+                        &state.store_dir,
+                    ),
                 });
                 Ok(())
             },
@@ -1698,6 +2051,7 @@ fn activate_desired_loop(
             project_id,
             scope,
             &overlay_snapshot_id,
+            &desired.generation_id,
             &overlay_chunk_targets,
         );
         return Ok(());

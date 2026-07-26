@@ -490,6 +490,8 @@ mod tests {
                 repo_materialization: Some("repo-a".to_string()),
                 code_source_selector: Some("selector-a".to_string()),
                 code_source_generation: Some("generation-a".to_string()),
+                git_overlay: None,
+                git_overlay_managed: false,
             },
         );
         index.write_atomic(&root).unwrap();
@@ -520,6 +522,8 @@ mod tests {
                 repo_materialization: None,
                 code_source_selector: None,
                 code_source_generation: None,
+                git_overlay: None,
+                git_overlay_managed: false,
             },
         );
         index.write_atomic(&root).unwrap();
@@ -565,6 +569,8 @@ mod tests {
                 repo_materialization: None,
                 code_source_selector: None,
                 code_source_generation: None,
+                git_overlay: None,
+                git_overlay_managed: false,
             },
         );
         index.write_atomic(&root).unwrap();
