@@ -2523,7 +2523,9 @@ fn probe_ladder_raw(
         Err(error) => {
             use bbox_indexing::checkout_access::CheckoutAccessErrorCode as Code;
             match error.code {
-                Code::AttachmentNotFound | Code::ObservationUnavailable => LadderResult::None,
+                Code::AttachmentNotFound
+                | Code::ObservationUnavailable
+                | Code::DeniedByTestProbe => LadderResult::None,
                 Code::ScopeMismatch
                 | Code::CapabilityDenied
                 | Code::IntentDenied
@@ -8303,5 +8305,408 @@ mod tests {
                 .collect();
         let result = store.gc_blobs_for_scopes_with_bridge(&empty_scopes, &bridge_ids);
         assert!(result.is_ok(), "GC with bridge ids must succeed");
+    }
+
+    // P4-F: pre-bind startup recovery tests (section 10.4).
+
+    /// Helper: create a catalog snapshot with one project and optional
+    /// scope migration records for relationship-chain and classification
+    /// tests.
+    fn p4f_catalog_snapshot(
+        project_id: &str,
+        scope: PublishedScope,
+        migrations: Vec<(
+            bbox_corpus_core::project_catalog::ScopeMigrationId,
+            bbox_corpus_core::project_catalog::ScopeMigrationRecord,
+        )>,
+    ) -> CatalogSnapshotV2 {
+        use bbox_corpus_core::project_catalog::{CatalogOriginV2, CorpusProject};
+        let pid = ProjectId::parse(project_id).unwrap();
+        let project = CorpusProject {
+            project_id: pid.clone(),
+            scope: bbox_corpus_core::project_catalog::ProjectScope::Published(scope),
+            operator_aliases: Default::default(),
+            nominated_aliases: Default::default(),
+            display_name: project_id.to_string(),
+            created_at: "2026-07-25T00:00:00Z".into(),
+            registered_at_compat: None,
+            repo_history: None,
+            languages: Default::default(),
+        };
+        let mut scope_migrations = BTreeMap::new();
+        for (id, record) in migrations {
+            scope_migrations.insert(id, record);
+        }
+        CatalogSnapshotV2 {
+            version: bbox_corpus_core::project_catalog::CATALOG_VERSION_V2,
+            epoch: 1,
+            origin: CatalogOriginV2::MigratedV1 {
+                transaction_id:
+                    bbox_corpus_core::project_catalog::ProjectCatalogTransactionId::mint(),
+            },
+            projects: BTreeMap::from([(pid, project)]),
+            repo_histories: BTreeMap::new(),
+            ambiguous_namespaces: BTreeMap::new(),
+            scope_migrations,
+        }
+    }
+
+    /// Helper: create a v2 activation record in the store with a given
+    /// cutback/cutback_pending shape.
+    fn p4f_seed_activation(
+        store: &CodeSourceStore,
+        root: &Path,
+        project_id: &str,
+        scope: &PublishedScope,
+        generation_id: &str,
+        cutback: Option<CutbackStateV2>,
+        cutback_pending: bool,
+    ) -> ActivationRecordV2 {
+        let descriptor = empty_generation_descriptor(scope.clone(), &"a".repeat(40));
+        let generation = StoredGenerationV2 {
+            version: bbox_code_source_store::MIGRATION_STORE_VERSION,
+            generation_id: generation_id.to_string(),
+            producer_id: "p4f-producer".to_string(),
+            ordinal: 1,
+            descriptor: descriptor.clone(),
+            published_scope: scope.clone(),
+            state: GenerationState::Ready,
+            diagnostic: None,
+            created_unix_secs: 1,
+            materialized_doc_count: Some(0),
+            entity_inventory_sha256: Some("e".repeat(64)),
+        };
+        let paths = CodeSourceStorePaths::new(root).unwrap();
+        let metadata_path = paths.generation_metadata(scope, generation_id).unwrap();
+        fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        fs::write(
+            &metadata_path,
+            encode_stored_generation_v2_for_migration(&generation).unwrap(),
+        )
+        .unwrap();
+        let activation = ActivationRecordV2 {
+            version: bbox_code_source_store::MIGRATION_STORE_VERSION,
+            project_id: ProjectId::parse(project_id).unwrap(),
+            published_scope: scope.clone(),
+            generation_id: generation_id.to_string(),
+            selector: crate::index::project_files::collected_materialization_selector(
+                project_id,
+                generation_id,
+            ),
+            snapshot_id: format!("collected-{}", "f".repeat(32)),
+            document_count: 0,
+            entity_inventory_sha256: "e".repeat(64),
+            current_chunk_targets: BTreeMap::new(),
+            activated_unix_secs: 100,
+            cutback_pending,
+            cutback,
+            diagnostic: None,
+        };
+        store.save_activation_v2(&activation).unwrap();
+        activation
+    }
+
+    /// Section 10.4 bootsmoke: a fresh catalog-mode store with no
+    /// collected state opens clean. The relationship chain and
+    /// classification pass with zero records.
+    #[test]
+    fn p4f_fresh_store_relationship_chain_passes_clean() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let runtime = CodeSourceRuntime::for_test_catalog(&root);
+        let store = runtime.store();
+        let snapshot = p4f_catalog_snapshot(
+            "p_000000000000000000000000000004f1",
+            PublishedScope::try_new("p4f-fresh", ".").unwrap(),
+            vec![],
+        );
+        let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(
+            &crate::edge_index::edges_dir_from_bro_store(&root),
+        )
+        .unwrap();
+        // No activation records in the store: chain must pass.
+        let result = validate_relationship_chain(&store, &snapshot, &manifest);
+        assert!(result.is_ok(), "fresh store must pass relationship chain");
+    }
+
+    /// Section 10.4: a hand-drifted activation record (scope mismatch
+    /// with no bridge) refuses the relationship chain with a typed code.
+    #[test]
+    fn p4f_scope_mismatch_refuses_chain() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let runtime = CodeSourceRuntime::for_test_catalog(&root);
+        let store = runtime.store();
+
+        let activation_scope = PublishedScope::try_new("activation-scope", ".").unwrap();
+        let catalog_scope = PublishedScope::try_new("catalog-scope", ".").unwrap();
+        let project_id = "p_000000000000000000000000000004f2";
+        let generation_id = compute_generation_id(
+            "p4f-producer",
+            &empty_generation_descriptor(activation_scope.clone(), &"a".repeat(40)),
+        );
+
+        p4f_seed_activation(
+            &store,
+            &root.join("code-sources"),
+            project_id,
+            &activation_scope,
+            &generation_id,
+            None,
+            false,
+        );
+
+        // Catalog has a DIFFERENT scope than the activation.
+        let snapshot = p4f_catalog_snapshot(project_id, catalog_scope, vec![]);
+        let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(
+            &crate::edge_index::edges_dir_from_bro_store(&root),
+        )
+        .unwrap();
+
+        let result = validate_relationship_chain(&store, &snapshot, &manifest);
+        assert!(
+            result.is_err(),
+            "scope mismatch without bridge must refuse chain"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("code_source_scope_agreement") || err.contains("relationship_chain"),
+            "error must carry typed code, got: {err}"
+        );
+    }
+
+    /// Section 10.4: a record with a missing workspace index entry
+    /// fails the chain at link 5.
+    #[test]
+    fn p4f_missing_workspace_entry_fails_chain() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let runtime = CodeSourceRuntime::for_test_catalog(&root);
+        let store = runtime.store();
+
+        let scope = PublishedScope::try_new("p4f-missing-ws", ".").unwrap();
+        let project_id = "p_000000000000000000000000000004f3";
+        let generation_id = compute_generation_id(
+            "p4f-producer",
+            &empty_generation_descriptor(scope.clone(), &"a".repeat(40)),
+        );
+
+        p4f_seed_activation(
+            &store,
+            &root.join("code-sources"),
+            project_id,
+            &scope,
+            &generation_id,
+            None,
+            false,
+        );
+
+        let snapshot = p4f_catalog_snapshot(project_id, scope, vec![]);
+        // Manifest is fresh/empty: no workspace entry for the project.
+        let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(
+            &crate::edge_index::edges_dir_from_bro_store(&root),
+        )
+        .unwrap();
+
+        let result = validate_relationship_chain(&store, &snapshot, &manifest);
+        assert!(result.is_err(), "missing workspace entry must fail chain");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("relationship_chain"),
+            "error must be relationship_chain, got: {err}"
+        );
+    }
+
+    /// Section 10.2 step 6 coherence clause: a record still carrying
+    /// (None, true) after classification that is not bridge-exempt
+    /// fails closed.
+    #[test]
+    fn p4f_unclassified_pending_fails_coherence() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let runtime = CodeSourceRuntime::for_test_catalog(&root);
+        let store = runtime.store();
+
+        let scope = PublishedScope::try_new("p4f-coherence", ".").unwrap();
+        let project_id = "p_000000000000000000000000000004f4";
+        let generation_id = compute_generation_id(
+            "p4f-producer",
+            &empty_generation_descriptor(scope.clone(), &"a".repeat(40)),
+        );
+
+        let activation = p4f_seed_activation(
+            &store,
+            &root.join("code-sources"),
+            project_id,
+            &scope,
+            &generation_id,
+            None,
+            true, // cutback_pending: true but cutback: None
+        );
+
+        // Catalog scope matches, no bridge: the chain must refuse at
+        // link 6 (coherence clause). We need a manifest entry so the
+        // chain reaches link 6 instead of failing at link 5.
+        let snapshot = p4f_catalog_snapshot(project_id, scope, vec![]);
+        let mut manifest = bbox_edge_sidecar::manifest::ManifestIndex::new();
+        manifest.workspaces.insert(
+            project_id.to_string(),
+            bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
+                manifest: "test-manifest".to_string(),
+                active_snapshot: Some(activation.snapshot_id.clone()),
+                dirty_overlay: None,
+                repo_materialization: None,
+                code_source_selector: Some(activation.selector.clone()),
+                code_source_generation: Some(generation_id.clone()),
+                git_overlay: None,
+                git_overlay_managed: false,
+            },
+        );
+
+        let result = validate_relationship_chain(&store, &snapshot, &manifest);
+        assert!(
+            result.is_err(),
+            "unclassified (None, true) record must fail coherence"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("cutback_coherence"),
+            "error must be cutback_coherence, got: {err}"
+        );
+    }
+
+    /// Section 10.1 step 7: a retirement journal file on disk causes
+    /// pre-bind refusal.
+    #[test]
+    fn p4f_retirement_journal_detection_refuses_boot() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let journal_dir = root.join("retirement-journals");
+        fs::create_dir_all(&journal_dir).unwrap();
+        fs::write(
+            journal_dir.join("p_000000000000000000000000000004f5.json"),
+            r#"{"version":1,"stage":"started"}"#,
+        )
+        .unwrap();
+
+        let result = detect_incomplete_retirement_journal(&root);
+        assert!(result.is_err(), "retirement journal must refuse boot");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("retirement_journal_incomplete"),
+            "error must be retirement_journal_incomplete, got: {err}"
+        );
+    }
+
+    /// Section 10.1 step 7: no journal directory means no refusal.
+    #[test]
+    fn p4f_no_retirement_journal_passes_clean() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let result = detect_incomplete_retirement_journal(&root);
+        assert!(result.is_ok(), "no journal dir must pass clean");
+    }
+
+    /// Section 10.1 step 7: empty journal directory passes.
+    #[test]
+    fn p4f_empty_retirement_journal_dir_passes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let journal_dir = root.join("retirement-journals");
+        fs::create_dir_all(&journal_dir).unwrap();
+        let result = detect_incomplete_retirement_journal(&root);
+        assert!(result.is_ok(), "empty journal dir must pass");
+    }
+
+    /// Section 10.1 step 5: once-only classification clears the mirror
+    /// for records with (None, true) and no bridge. The DenyCheckoutAccess
+    /// broker means no attachment is available, so outcome (b) persists
+    /// Structural.
+    #[test]
+    fn p4f_classification_persists_structural_for_no_attachment() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let runtime = CodeSourceRuntime::for_test_catalog(&root);
+        let store = runtime.store();
+        let broker = &runtime.checkout_access;
+
+        let scope = PublishedScope::try_new("p4f-classify-noatt", ".").unwrap();
+        let project_id = "p_000000000000000000000000000004f6";
+        let generation_id = compute_generation_id(
+            "p4f-producer",
+            &empty_generation_descriptor(scope.clone(), &"a".repeat(40)),
+        );
+
+        p4f_seed_activation(
+            &store,
+            &root.join("code-sources"),
+            project_id,
+            &scope,
+            &generation_id,
+            None,
+            true, // legacy migration shape
+        );
+
+        let snapshot = p4f_catalog_snapshot(project_id, scope, vec![]);
+        let outcomes = classify_migrated_records(&store, &snapshot, broker).unwrap();
+
+        assert_eq!(outcomes.len(), 1, "exactly one classification outcome");
+        let (pid, outcome) = &outcomes[0];
+        assert_eq!(pid, project_id);
+        assert!(
+            matches!(
+                outcome,
+                ClassificationOutcome::StructuralPersisted(CutbackReason::NoLocalAttachment)
+            ),
+            "deny-all broker means no attachment, expected StructuralPersisted(NoLocalAttachment)"
+        );
+
+        // Verify the record now has typed Structural state.
+        let after = store.load_activation_mixed(project_id).unwrap().unwrap();
+        assert_eq!(
+            after.cutback(),
+            Some(&CutbackStateV2::Structural {
+                reason: CutbackReason::NoLocalAttachment,
+            })
+        );
+    }
+
+    /// Section 10.1 step 5: classification is idempotent. Running it
+    /// twice on the same store produces no new outcomes (the record
+    /// was already classified on the first pass).
+    #[test]
+    fn p4f_classification_is_once_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let runtime = CodeSourceRuntime::for_test_catalog(&root);
+        let store = runtime.store();
+        let broker = &runtime.checkout_access;
+
+        let scope = PublishedScope::try_new("p4f-once-only", ".").unwrap();
+        let project_id = "p_000000000000000000000000000004f7";
+        let generation_id = compute_generation_id(
+            "p4f-producer",
+            &empty_generation_descriptor(scope.clone(), &"a".repeat(40)),
+        );
+
+        p4f_seed_activation(
+            &store,
+            &root.join("code-sources"),
+            project_id,
+            &scope,
+            &generation_id,
+            None,
+            true,
+        );
+
+        let snapshot = p4f_catalog_snapshot(project_id, scope, vec![]);
+
+        // First pass: classifies the record.
+        let outcomes1 = classify_migrated_records(&store, &snapshot, broker).unwrap();
+        assert_eq!(outcomes1.len(), 1);
+
+        // Second pass: no more (None, true) records to classify.
+        let outcomes2 = classify_migrated_records(&store, &snapshot, broker).unwrap();
+        assert_eq!(outcomes2.len(), 0, "classification must be once-only");
     }
 }
