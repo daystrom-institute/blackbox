@@ -993,3 +993,36 @@ until a later entry explicitly supersedes it.
 - Revisit only if: materialization becomes per-namespace catalog state, or
   the namespace-resolution operation changes compatibility-namespace
   ownership semantics.
+
+## D-038: The history reference manifest re-baselines on divergence
+
+- Date: 2026-07-26
+- Phase: durable project catalog, Phase 3 (closing-review repair)
+- Status: accepted after closing-review round 1
+- Decision: evaluate_history_gc treats the persisted reference manifest as
+  the derived acceleration index the governing design says it is. A
+  persisted manifest that decodes but disagrees with the one freshly
+  rebuilt from durable inputs (checksum or version) is REPLACED by the
+  rebuild, the divergence is logged with both checksums and carried as an
+  informational doctor finding, and GC stays enabled. Disabled survives
+  for exactly two arms: the persisted file is unreachable or undecodable.
+  A failed refresh write logs but does not disable. Sanctioned mutation
+  paths do not write through; re-baselining at evaluation is the
+  convergence mechanism.
+- Evidence:
+  - The first cut latched Disabled forever on the first legitimate
+    overlay swap or Ready advancement: the mismatch arm never persisted
+    the rebuild, so every later evaluation re-derived the same mismatch,
+    and the closing reviewer found no write-through path anywhere.
+  - Governing section 11 names the durable inputs as the authority and
+    the manifest as "a derived GC acceleration index, not authority";
+    a rebuild from authority cannot be less trustworthy than the stale
+    cache it disagrees with.
+  - The crash-window test still proves a generation is never freed
+    between an overlay swap and the manifest refresh, and now also
+    proves convergence afterward.
+- Rationale: "mismatch disables GC" was designed to catch unexplained
+  divergence; a divergence explained by the current durable inputs is
+  not unexplained. Only a manifest that cannot be read or decoded is.
+- Revisit only if: the destructive sweep is wired to production and a
+  stronger write-through invariant is wanted at that boundary.

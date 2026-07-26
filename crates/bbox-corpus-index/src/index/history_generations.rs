@@ -99,6 +99,27 @@ const VECTOR_INPUT_COMMITMENT_DOMAIN: &[u8] = b"blackbox.repo-history-generation
 const SOURCE_FINGERPRINT_DOMAIN: &[u8] = b"blackbox.repo-history-generation.source.v1";
 const REBUILD_MANIFEST_ID_DOMAIN: &[u8] = b"blackbox.repo-history-rebuild-manifest.v1";
 
+/// Tantivy's own index metadata file. Its presence is what distinguishes a
+/// directory that HOLDS an index from a directory that merely sits where one
+/// would go.
+const TANTIVY_META_FILE: &str = "meta.json";
+
+/// `source_schema_version` recorded when the scanned index carried no
+/// `schema_version.txt` marker at all.
+///
+/// Shaped like `LIVE_REFRESH_SOURCE_MARKER`: a reserved, documented sentinel
+/// that is non-hex and can never collide with a real `INDEX_SCHEMA_VERSION`
+/// value, so no reader can mistake it for an observed schema. It is a
+/// CONSTANT rather than an absent field so `source_schema_version` stays a
+/// required non-empty `String`: the field is in the generation-id preimage,
+/// and a deterministic sentinel keeps pre-marker generations content-addressed
+/// and idempotent across repeated scans exactly like every other generation.
+///
+/// This changes no existing generation id. Every generation written before
+/// this constant existed recorded a real marker, because a marker-less index
+/// previously ended the scan before any generation could be built.
+pub const PRE_MARKER_SOURCE_SCHEMA: &str = "blackbox.repo-history-generation.pre-marker-source.v1";
+
 /// Upper bounds on one scan. Mirrors the Phase 1 capture's posture: a
 /// hostile or corrupt index must fail closed rather than exhaust memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -717,8 +738,13 @@ impl HistoryGenerationStore {
         io: Arc<dyn HistoryGenerationIo>,
     ) -> HistoryGenerationResult<Self> {
         let root = generations_root_for_index(index_path)?;
+        // Refuse before AND after creating: `create_dir_all` happily follows
+        // an existing symlink, so a pre-existing link would otherwise plant
+        // the whole generations tree wherever it points.
+        refuse_symlinked_directory(&root, "history generations root")?;
         fs::create_dir_all(&root)
             .map_err(|error| io_error(format!("cannot create generations root: {error}")))?;
+        refuse_symlinked_directory(&root, "history generations root")?;
         Ok(Self { root, io })
     }
 
@@ -836,6 +862,7 @@ impl HistoryGenerationStore {
         id: &HistoryGenerationIdV1,
     ) -> HistoryGenerationResult<HistoryGenerationRecordV1> {
         let directory = self.generation_dir(id);
+        refuse_symlinked_directory(&directory, "history generation directory")?;
         let manifest_bytes = read_file(&directory.join(GENERATION_MANIFEST_FILE))?
             .ok_or_else(|| corrupt(format!("generation {id} has no manifest")))?;
         let manifest: HistoryGenerationManifestV1 = serde_json::from_slice(&manifest_bytes)
@@ -878,7 +905,13 @@ impl HistoryGenerationStore {
         for entry in entries {
             let entry = entry
                 .map_err(|error| io_error(format!("cannot read generations root: {error}")))?;
-            if !entry.path().is_dir() {
+            // `entry.file_type()` is lstat-based, unlike `Path::is_dir()`:
+            // a symlinked entry is skipped rather than enumerated as a
+            // generation, matching the refusal in `load`.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
                 continue;
             }
             let Some(name) = entry.file_name().to_str().map(str::to_string) else {
@@ -1018,6 +1051,19 @@ impl HistoryGenerationStore {
         if manifest.state == RepoHistoryRebuildStateV1::Committed {
             return Ok(RepoHistoryRebuildRecoveryV1::AlreadyCommitted { manifest });
         }
+        if manifest.prepared.source_schema_version == PRE_MARKER_SOURCE_SCHEMA {
+            // The source index carried no marker, so pre-drop and post-drop
+            // are INDISTINGUISHABLE: there is no marker to compare against and
+            // a marker-less directory looks the same on both sides of the
+            // destructive step. Resume unconditionally, because it is
+            // convergent in both worlds - the synchronous rebuild is an
+            // idempotent delete-then-re-emit, and rolling back to a
+            // marker-less index under a new-schema binary would only
+            // re-trigger the very replacement this manifest authorizes.
+            // Never RollBack here: that arm's premise is a last-good index
+            // this classifier can positively identify, and it cannot.
+            return Ok(RepoHistoryRebuildRecoveryV1::ResumePrepared { manifest });
+        }
         let marker = read_file(&index_path.join(SCHEMA_VERSION_FILE))?
             .and_then(|bytes| String::from_utf8(bytes).ok())
             .map(|value| value.trim().to_string());
@@ -1031,9 +1077,82 @@ impl HistoryGenerationStore {
     }
 }
 
+/// Durably publish `bytes` at `path`: temp file, fsync the file, atomic
+/// rename, fsync the containing directory, fsync its parent.
+///
+/// Why this discipline and not `fs::write`, for EVERY file this module
+/// writes: these artifacts are the durable crash surface of a DESTRUCTIVE
+/// boundary. The prepared rebuild manifest is written before the index drop
+/// precisely so a restart can tell "roll back" from "resume"; if a power loss
+/// can persist the drop but not the manifest, recovery classifies
+/// `NoManifest`, resume never fires, and the carried history is silently
+/// lost - the exact window this manifest exists to close. A torn write is
+/// just as bad: a half-written manifest fails to decode and wedges
+/// classification instead of merely losing it. The same reasoning covers the
+/// generation row files and generation manifest, which are what a resume
+/// re-emits from.
+///
+/// Matches the spill lane's discipline in `schema_replacement::write_commit_spill`
+/// and the catalog journal's `atomic_replace_sync_nofollow`. The parent fsync
+/// is not belt-and-braces: the containing directory is frequently created
+/// immediately before this call (a fresh generation directory), and on a
+/// non-journaled filesystem an unsynced parent entry can lose the whole
+/// directory with the synced file inside it.
 fn write_file(path: &Path, bytes: &[u8]) -> HistoryGenerationResult<()> {
-    fs::write(path, bytes)
-        .map_err(|error| io_error(format!("cannot write {}: {error}", path.display())))
+    use std::io::Write as _;
+
+    let directory = path
+        .parent()
+        .ok_or_else(|| unsafe_path("cannot publish a file with no parent directory"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| unsafe_path("cannot publish a file with an unreadable name"))?;
+    // The temporary is a FILE beside the target inside the generations tree.
+    // `list` enumerates directories only, so a crash-orphaned temporary can
+    // never be mistaken for a generation.
+    let temporary = directory.join(format!("{file_name}.tmp"));
+    {
+        let mut file = fs::File::create(&temporary)
+            .map_err(|error| io_error(format!("cannot create {}: {error}", temporary.display())))?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| io_error(format!("cannot write {}: {error}", temporary.display())))?;
+    }
+    fs::rename(&temporary, path)
+        .map_err(|error| io_error(format!("cannot publish {}: {error}", path.display())))?;
+    fsync_dir(directory)?;
+    if let Some(parent) = directory.parent() {
+        fsync_dir(parent)?;
+    }
+    Ok(())
+}
+
+fn fsync_dir(path: &Path) -> HistoryGenerationResult<()> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| io_error(format!("cannot sync {}: {error}", path.display())))
+}
+
+/// Refuse a path that is a symlink, or that exists as a non-directory.
+///
+/// The catalog family opens every component `O_NOFOLLOW` and this module's
+/// own `scan_commit_documents` already refuses a symlinked `index_path`; the
+/// generations tree holds the only checkout-independent copy of commit
+/// history, so it gets the same confinement rather than trusting whatever a
+/// symlink points at.
+fn refuse_symlinked_directory(path: &Path, role: &str) -> HistoryGenerationResult<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error(format!("cannot stat {role}: {error}"))),
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(unsafe_path(format!("{role} is a symlink")))
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            Err(unsafe_path(format!("{role} is not a directory")))
+        }
+        Ok(_) => Ok(()),
+    }
 }
 
 fn read_file(path: &Path) -> HistoryGenerationResult<Option<Vec<u8>>> {
@@ -1377,8 +1496,11 @@ pub fn live_schema_evidence() -> HistoryGenerationResult<(String, String)> {
 
 /// Stream the legacy index's commit documents, grouped by exact namespace.
 ///
-/// A missing index directory is an empty scan, not an error: a fresh v2
-/// store with no legacy residue legally produces no generations.
+/// Three shapes yield `Ok(None)` - an empty scan rather than a refusal -
+/// because in each of them there is genuinely nothing to carry: a missing
+/// index directory (a fresh v2 store with no legacy residue), and a directory
+/// that holds no tantivy index at all (see the not-an-index arm below).
+/// Everything else scans, including an index carrying no schema marker.
 pub fn scan_commit_documents(
     index_path: &Path,
     limits: HistoryScanLimitsV1,
@@ -1399,9 +1521,30 @@ pub fn scan_commit_documents(
         }
         Ok(_) => {}
     }
-    let Some(marker) = read_file(&index_path.join(SCHEMA_VERSION_FILE))? else {
-        return Ok(None);
-    };
+    let marker = read_file(&index_path.join(SCHEMA_VERSION_FILE))?;
+    if marker.is_none() {
+        // NOT-AN-INDEX arm. Removing the old marker-absent early return
+        // exposes `Index::open_in_dir` below to directories it never used to
+        // see, and that call fails on any directory without tantivy's
+        // `meta.json` (which is why `TranscriptIndex::open_or_create` wraps it
+        // in open-else-create). The arm is production-reachable:
+        // `reset_index_on_schema_mismatch` triggers when the marker is absent
+        // AND the directory is non-empty, so a directory holding one stray
+        // file and no marker both triggers the replacement and reaches this
+        // guard. Letting that return `Err` would make both replacement guards
+        // refuse and block boot.
+        //
+        // The distinction this draws, and it is the whole point: "no tantivy
+        // index here" (no `meta.json`) is NOTHING TO CARRY, so `Ok(None)`;
+        // "an index is here but it will not open or read" (`meta.json`
+        // present, open or a later read fails) is genuinely corrupt state and
+        // stays fail-closed as `Err`. Discriminating on the metadata file
+        // BEFORE the open is deliberate: classifying tantivy's open errors
+        // after the fact would couple this arm to that crate's error strings.
+        if !index_path.join(TANTIVY_META_FILE).exists() {
+            return Ok(None);
+        }
+    }
     // The observed marker is RECORDED, never required to equal the running
     // `INDEX_SCHEMA_VERSION`. This scan's entire purpose is to run BEFORE a
     // destructive schema replacement, so by construction it usually reads an
@@ -1412,13 +1555,23 @@ pub fn scan_commit_documents(
     // the field lookups below instead: a schema that cannot supply every
     // commit-document field refuses rather than emitting a partial
     // generation.
-    let schema_version = String::from_utf8(marker)
-        .map_err(|_| corrupt("index schema marker is not valid utf-8"))?
-        .trim()
-        .to_string();
-    if schema_version.is_empty() {
-        return Err(corrupt("index schema marker is empty"));
-    }
+    // A marker-less index scans and records the reserved sentinel; a marker
+    // that is present must still be well formed, so a corrupt or empty one
+    // refuses exactly as before rather than silently degrading to the
+    // sentinel.
+    let schema_version = match marker {
+        Some(bytes) => {
+            let observed = String::from_utf8(bytes)
+                .map_err(|_| corrupt("index schema marker is not valid utf-8"))?
+                .trim()
+                .to_string();
+            if observed.is_empty() {
+                return Err(corrupt("index schema marker is empty"));
+            }
+            observed
+        }
+        None => PRE_MARKER_SOURCE_SCHEMA.to_string(),
+    };
 
     let index = Index::open_in_dir(index_path)
         .map_err(|error| io_error(format!("cannot open index: {error}")))?;
@@ -1865,6 +2018,321 @@ mod tests {
             planned_lexical_generation_label: "lexical-1".to_string(),
             planned_vector_generation_label: "vector-1".to_string(),
         }
+    }
+
+    /// F1: every write class publishes through a temp file that must not
+    /// survive. A torn write cannot be simulated portably, so this asserts
+    /// the MECHANISM instead: no `.tmp` remains anywhere under the
+    /// generations tree, and every final name still decodes.
+    fn assert_no_temporaries(root: &Path) {
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(directory) = stack.pop() {
+            for entry in fs::read_dir(&directory).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name().to_string_lossy().to_string();
+                assert!(
+                    !name.ends_with(".tmp"),
+                    "temporary survived publication: {}",
+                    entry.path().display()
+                );
+                if entry.file_type().unwrap().is_dir() {
+                    stack.push(entry.path());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_write_class_publishes_atomically_and_leaves_no_temporary() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index_path = root.join("index");
+        let store = HistoryGenerationStore::open_for_index(&index_path).unwrap();
+
+        // Class 1 and 2: the generation row files and the generation manifest.
+        let record = store
+            .create_or_open(input(
+                "ns1",
+                vec![
+                    document("ns1", &"a".repeat(40), "first"),
+                    document("ns1", &"b".repeat(40), "second"),
+                ],
+            ))
+            .unwrap();
+        assert_no_temporaries(store.root());
+        assert_eq!(store.load(&record.id).unwrap(), record);
+
+        // Class 3: the prepared rebuild manifest.
+        let prepared = store
+            .write_prepared_rebuild_manifest(prepared_for(&record))
+            .unwrap();
+        assert_no_temporaries(store.root());
+        assert_eq!(store.read_rebuild_manifest().unwrap().unwrap(), prepared);
+
+        // Class 4: the committed rebuild manifest.
+        let committed = store
+            .commit_rebuild_manifest(RepoHistoryRebuildCommittedV1 {
+                verified_lexical_view: "lexical-1".to_string(),
+                verified_vector_view: "vector-1".to_string(),
+                resulting_catalog_epoch: 6,
+                vector_inventory: Vec::new(),
+            })
+            .unwrap();
+        assert_no_temporaries(store.root());
+        assert_eq!(store.read_rebuild_manifest().unwrap().unwrap(), committed);
+        assert_eq!(committed.state, RepoHistoryRebuildStateV1::Committed);
+
+        // A stray temporary must never be enumerated as a generation.
+        fs::write(store.root().join("rebuild-manifest.json.tmp"), b"partial").unwrap();
+        assert_eq!(
+            store.list().unwrap(),
+            [record.id.clone()].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn a_symlinked_generations_root_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        // The generations root is `<parent-of-index>/history-generations`.
+        let index_path = root.join("state").join("index");
+        fs::create_dir_all(root.join("state")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&elsewhere, root.join("state").join("history-generations"))
+            .unwrap();
+        #[cfg(unix)]
+        {
+            let error = HistoryGenerationStore::open_for_index(&index_path).unwrap_err();
+            assert_eq!(error.code(), "error.history_generation_unsafe_path");
+        }
+        let _ = index_path;
+    }
+
+    #[test]
+    fn a_symlinked_generation_directory_refuses_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index_path = root.join("index");
+        let store = HistoryGenerationStore::open_for_index(&index_path).unwrap();
+        let record = store
+            .create_or_open(input(
+                "ns1",
+                vec![document("ns1", &"a".repeat(40), "first")],
+            ))
+            .unwrap();
+        let real = store.root().join(record.id.as_str());
+        let moved = root.join("moved-generation");
+        fs::rename(&real, &moved).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&moved, &real).unwrap();
+            let error = store.load(&record.id).unwrap_err();
+            assert_eq!(error.code(), "error.history_generation_unsafe_path");
+            // And it is not enumerated as a generation either.
+            assert!(store.list().unwrap().is_empty());
+        }
+        let _ = moved;
+    }
+
+    // --- pre-marker source scan -------------------------------------------
+    //
+    // `reset_index_on_schema_mismatch` triggers when the marker is ABSENT and
+    // the directory is non-empty, so the replacement guards must cope with a
+    // marker-less index rather than refusing it. These rows pin the three
+    // decisions that made that possible: the scan proceeds, it records a
+    // reserved sentinel deterministically, and a directory that holds no
+    // index at all is still nothing to carry.
+
+    /// Build a real, marker-less tantivy index carrying one commit document.
+    fn marker_less_index_with_a_commit(root: &Path) -> PathBuf {
+        let index_path = root.join("index");
+        fs::create_dir_all(&index_path).unwrap();
+        let (schema, fields) = crate::index::build_schema();
+        let index = tantivy::Index::create_in_dir(&index_path, schema).unwrap();
+        crate::index::register_code_tokenizer(&index);
+        let mut writer: tantivy::IndexWriter = index.writer(15_000_000).unwrap();
+        let sha = "c".repeat(40);
+        let mut doc = TantivyDocument::new();
+        doc.add_text(fields.doc_type, "commit");
+        doc.add_text(fields.chunk_kind, "git_message");
+        doc.add_text(fields.entity_id, format!("commit:premarker-ns:{sha}"));
+        doc.add_text(fields.content, "pre-marker commit");
+        doc.add_text(
+            fields.chunk_hash,
+            hex::encode(Sha256::digest(b"pre-marker commit")),
+        );
+        doc.add_text(fields.repo_id, "premarker-ns");
+        doc.add_text(fields.commit_sha, &sha);
+        doc.add_u64(fields.byte_offset, 0);
+        doc.add_u64(fields.is_subagent, 0);
+        writer.add_document(doc).unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        assert!(!index_path.join(SCHEMA_VERSION_FILE).exists());
+        index_path
+    }
+
+    #[test]
+    fn a_marker_less_index_scans_and_records_the_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index_path = marker_less_index_with_a_commit(&root);
+        let scan = scan_commit_documents(&index_path, HistoryScanLimitsV1::default())
+            .unwrap()
+            .expect("a marker-less index still scans");
+        assert_eq!(scan.schema_version, PRE_MARKER_SOURCE_SCHEMA);
+        assert_eq!(scan.namespaces.len(), 1);
+        assert_eq!(scan.namespaces["premarker-ns"].commit_documents.len(), 1);
+        // The sentinel can never be mistaken for an observed schema version.
+        assert!(
+            !PRE_MARKER_SOURCE_SCHEMA
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
+        );
+        assert_ne!(PRE_MARKER_SOURCE_SCHEMA, INDEX_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_marker_less_scan_keeps_every_field_level_refusal() {
+        // Field-level fail-closed is what replaced the marker gate, so it must
+        // still fire on a marker-less index: an incomplete commit row refuses
+        // rather than emitting a partial generation.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index_path = root.join("index");
+        fs::create_dir_all(&index_path).unwrap();
+        let (schema, fields) = crate::index::build_schema();
+        let index = tantivy::Index::create_in_dir(&index_path, schema).unwrap();
+        crate::index::register_code_tokenizer(&index);
+        let mut writer: tantivy::IndexWriter = index.writer(15_000_000).unwrap();
+        let mut doc = TantivyDocument::new();
+        doc.add_text(fields.doc_type, "commit");
+        doc.add_text(fields.repo_id, "premarker-ns");
+        // No entity_id / commit_sha / chunk_hash: an incomplete row.
+        writer.add_document(doc).unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        let error = scan_commit_documents(&index_path, HistoryScanLimitsV1::default()).unwrap_err();
+        assert_eq!(error.code(), "error.history_generation_corrupt");
+    }
+
+    #[test]
+    fn the_sentinel_keeps_pre_marker_generation_ids_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index_path = marker_less_index_with_a_commit(&root);
+        let store = HistoryGenerationStore::open_for_index(&index_path).unwrap();
+
+        let build = || {
+            let scan = scan_commit_documents(&index_path, HistoryScanLimitsV1::default())
+                .unwrap()
+                .unwrap();
+            let capture = scan.namespaces["premarker-ns"].clone();
+            store
+                .create_or_open(HistoryGenerationInputV1 {
+                    namespace: namespace("premarker-ns"),
+                    owner: HistoryGenerationOwnerV1::Owned {
+                        repo_history_id: history_id("rh_00000000000000000000000000000001"),
+                    },
+                    commit_documents: capture.commit_documents,
+                    vector_inputs: capture.vector_inputs,
+                    truncated_message_count: capture.truncated_message_count,
+                    source_schema_version: scan.schema_version.clone(),
+                    source_schema_fingerprint_sha256: scan.schema_fingerprint_sha256.clone(),
+                    source_index_fingerprint_sha256: scan.source_index_fingerprint_sha256.clone(),
+                })
+                .unwrap()
+        };
+        let first = build();
+        let second = build();
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.manifest, second.manifest);
+        assert_eq!(
+            first.manifest.body.source_schema_version,
+            PRE_MARKER_SOURCE_SCHEMA
+        );
+    }
+
+    #[test]
+    fn a_directory_holding_no_index_is_nothing_to_carry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+
+        // Empty and marker-less.
+        let empty = root.join("empty-index");
+        fs::create_dir_all(&empty).unwrap();
+        assert!(
+            scan_commit_documents(&empty, HistoryScanLimitsV1::default())
+                .unwrap()
+                .is_none()
+        );
+
+        // Non-empty but holding only a stray non-index file: the exact shape
+        // that trips `reset_index_on_schema_mismatch` (marker absent, dir
+        // non-empty) and therefore reaches the replacement guards.
+        let stray = root.join("stray-index");
+        fs::create_dir_all(&stray).unwrap();
+        fs::write(stray.join("leftover.txt"), b"not an index").unwrap();
+        assert!(
+            scan_commit_documents(&stray, HistoryScanLimitsV1::default())
+                .unwrap()
+                .is_none()
+        );
+
+        // And an absent directory stays an empty scan.
+        assert!(
+            scan_commit_documents(&root.join("absent"), HistoryScanLimitsV1::default())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_marker_less_index_with_corrupt_metadata_stays_fail_closed() {
+        // `meta.json` present means an index IS here, so a failure to open or
+        // read it is corruption, not absence, and must not degrade to
+        // `Ok(None)` - that would silently drop carried history.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index_path = marker_less_index_with_a_commit(&root);
+        fs::write(index_path.join(TANTIVY_META_FILE), b"{ truncated").unwrap();
+        let error = scan_commit_documents(&index_path, HistoryScanLimitsV1::default())
+            .expect_err("corrupt index metadata must not read as an empty scan");
+        assert_eq!(error.code(), "error.history_generation_io");
+    }
+
+    #[test]
+    fn a_pre_marker_prepared_manifest_always_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index_path = root.join("index");
+        let store = HistoryGenerationStore::open_for_index(&index_path).unwrap();
+        let record = store
+            .create_or_open(input(
+                "ns1",
+                vec![document("ns1", &"a".repeat(40), "first")],
+            ))
+            .unwrap();
+        let mut prepared = prepared_for(&record);
+        prepared.source_schema_version = PRE_MARKER_SOURCE_SCHEMA.to_string();
+        store.write_prepared_rebuild_manifest(prepared).unwrap();
+
+        // Index dir intact (pre-drop world).
+        fs::create_dir_all(&index_path).unwrap();
+        assert!(matches!(
+            store.classify_rebuild_recovery(&index_path).unwrap(),
+            RepoHistoryRebuildRecoveryV1::ResumePrepared { .. }
+        ));
+
+        // Index dir gone (post-drop world). Same arm: the two are
+        // indistinguishable without a marker, and resume converges in both.
+        fs::remove_dir_all(&index_path).unwrap();
+        assert!(matches!(
+            store.classify_rebuild_recovery(&index_path).unwrap(),
+            RepoHistoryRebuildRecoveryV1::ResumePrepared { .. }
+        ));
     }
 
     #[test]

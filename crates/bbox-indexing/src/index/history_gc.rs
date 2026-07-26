@@ -2,13 +2,38 @@
 //! generation-driven vector tombstone path (Phase 3 plan section 10 item 4;
 //! governing section 11 and section 16).
 //!
-//! THE MANIFEST IS AN ACCELERATION INDEX, NOT AUTHORITY. Its durable inputs
-//! are the persisted catalog records and the active/retained Git overlay
-//! selectors in the edge sidecar's manifest index. It is rebuilt and
-//! checksummed from those inputs at startup and before EVERY GC pass; a
-//! mismatch disables history GC and reports a doctor finding, and never hides
-//! an otherwise-valid history read. That asymmetry is the design: a stale
-//! acceleration index may cost a sweep, but it must never cost a generation.
+//! THE MANIFEST IS AN ACCELERATION INDEX, NOT AUTHORITY (D-038). Its durable
+//! inputs - the persisted catalog records and the active/retained Git overlay
+//! selectors in the edge sidecar's manifest index - ARE the authority. It is
+//! rebuilt from those inputs at startup and before EVERY GC pass, and the
+//! rebuild always wins.
+//!
+//! That single sentence decides the divergence policy, and the first cut of
+//! this module got it backwards. It treated a checksum mismatch as evidence
+//! of corruption and disabled GC without persisting the rebuild. But NO
+//! sanctioned mutation path writes this file: an overlay swap and a
+//! `Ready` materialization advance both change durable inputs and neither
+//! refreshes the acceleration index. So the very first legitimate history
+//! operation after baselining produced a mismatch, and because the mismatch
+//! arm did not persist, every later evaluation re-derived the same mismatch
+//! against the same stale bytes. GC latched off permanently behind a doctor
+//! finding that described normal operation as corruption, recoverable only by
+//! deleting the file by hand.
+//!
+//! The policy is therefore accept-and-persist: a persisted manifest that
+//! decodes but disagrees is STALE, not suspect. The rebuild replaces it, the
+//! divergence is logged with both checksums and carried as an informational
+//! note, and GC stays enabled. `Disabled` survives for exactly two arms, both
+//! of which mean the evaluation could not be performed at all rather than
+//! that its answer was surprising:
+//!
+//!   1. the rebuild's own inputs are unreadable (catalog, generation store,
+//!      or an I/O error reaching the persisted file);
+//!   2. the persisted file exists but cannot be DECODED - genuine unexplained
+//!      corruption of bytes this daemon wrote.
+//!
+//! A stale acceleration index may cost a sweep; it must never cost a
+//! generation, and it must never cost the ability to sweep again.
 //!
 //! WHY A CRASH BETWEEN AN OVERLAY SWAP AND A MANIFEST REFRESH IS SAFE. The
 //! overlay selector is written atomically into the workspace manifest entry
@@ -16,13 +41,20 @@
 //! rebuild rather than something the reference manifest caches independently.
 //! So a process that dies after the swap and before any refresh still
 //! recomputes a reference set containing the swapped-in generation the next
-//! time it starts. There is no window in which the overlay exists on disk but
-//! the generation looks unreferenced.
+//! time it starts: the generation is never unreferenced in the window, and
+//! the next evaluation converges by persisting the rebuild.
 //!
 //! IN-PROCESS ROOTS. Pinned read views and in-flight builds are added to the
 //! rebuilt durable set while the process runs. They cannot be persisted (they
 //! do not survive the process that holds them) and they do not need to be: a
 //! restart cannot be holding them.
+//!
+//! NO PRODUCTION SWEEP THIS PHASE. `plan_history_gc` and
+//! `tombstone_generation_vectors` deliberately have no production caller:
+//! Phase 3 ships the enablement evaluation and the machinery only. The
+//! destructive pass that consumes them is a later, separately authorized
+//! wiring, and nothing may sweep this root except a caller holding a root set
+//! from an `Enabled` evaluation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -224,27 +256,64 @@ pub fn read_reference_manifest(
     }
 }
 
+/// A persisted acceleration index that decoded but disagreed with the
+/// rebuild, and was replaced by it.
+///
+/// Informational by construction: the rebuild is authoritative, so this
+/// records WHAT was replaced rather than a condition anyone must act on. It
+/// carries both checksums because the ordinary cause (a durable input
+/// changed through a sanctioned path that does not write this file) and the
+/// alarming one (something edited the generations root out of band) are
+/// indistinguishable from the enablement decision alone, and an operator
+/// chasing the second needs the values to compare against their own records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryReferenceDivergenceV1 {
+    pub persisted_version: u32,
+    pub rebuilt_version: u32,
+    pub persisted_checksum_sha256: String,
+    pub rebuilt_checksum_sha256: String,
+    /// Doctor-facing prose. Rendered as info, never as a failure.
+    pub note: String,
+}
+
 /// Whether history GC may run this pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryGcEnablementV1 {
     Enabled {
         roots: BTreeSet<String>,
+        /// `Some` when a stale persisted index was accepted and replaced.
+        /// A caller that ignores it loses only an explanation, never
+        /// correctness: `roots` is derived from the durable inputs either
+        /// way.
+        divergence: Option<HistoryReferenceDivergenceV1>,
     },
-    /// GC is off for this pass. `diagnostic` is doctor-facing prose.
-    Disabled {
-        diagnostic: String,
-    },
+    /// GC could not be evaluated this pass. `diagnostic` is doctor-facing
+    /// prose. NOT reachable merely because the persisted index was stale;
+    /// see the module docs for the two surviving arms.
+    Disabled { diagnostic: String },
 }
 
-/// Rebuild the manifest, compare it against the persisted one, and decide
-/// whether history GC may run.
+/// Rebuild the acceleration index, reconcile it against the persisted one,
+/// and decide whether history GC may run (D-038).
 ///
-/// A MISSING persisted manifest is not a mismatch: it is the first pass on a
-/// store that predates this field, and the rebuild becomes the baseline. A
-/// PRESENT manifest whose durable checksum disagrees IS a mismatch: something
-/// mutated a durable input without going through the paths that refresh this
-/// index, and sweeping under that uncertainty is exactly what governing
-/// section 11 forbids.
+/// The rebuild ALWAYS wins. Three outcomes, and only the first two exist in
+/// normal operation:
+///
+/// - no persisted manifest: baseline it and enable. This is the first pass on
+///   a store that predates the field.
+/// - persisted manifest decodes: enable, persisting the rebuild either way.
+///   When the two disagree, the persisted bytes were STALE - the ordinary
+///   cause is a durable input that changed through a sanctioned path (an
+///   overlay swap, a `Ready` advancement), none of which write this file - so
+///   the divergence is logged with both checksums and returned as a note
+///   rather than treated as corruption.
+/// - the evaluation could not be performed: the persisted file is unreachable
+///   (I/O error) or undecodable. Only then is GC disabled.
+///
+/// A FAILED WRITE does not disable GC. `roots` is derived from the durable
+/// inputs, not from the file, so failing to refresh the cache costs nothing
+/// this pass and the next pass re-derives and retries. Disabling on it would
+/// reintroduce a milder version of the latch this policy exists to remove.
 pub fn evaluate_history_gc(
     store: &HistoryGenerationStore,
     rebuilt: &HistoryReferenceManifestV1,
@@ -254,58 +323,66 @@ pub fn evaluate_history_gc(
         Err(error) => {
             return HistoryGcEnablementV1::Disabled {
                 diagnostic: format!(
-                    "the repo-history reference manifest is unreadable ({error}); \
-                     history GC is disabled until it is rebuilt"
+                    "the repo-history reference manifest could not be read or decoded \
+                     ({error}); history GC is disabled until the generations root is \
+                     inspected"
                 ),
             };
         }
     };
-    let Some(persisted) = persisted else {
-        if let Err(error) = write_reference_manifest(store, rebuilt) {
-            return HistoryGcEnablementV1::Disabled {
-                diagnostic: format!(
-                    "the repo-history reference manifest could not be written ({error}); \
-                     history GC is disabled"
-                ),
-            };
-        }
-        return HistoryGcEnablementV1::Enabled {
-            roots: rebuilt.roots(),
-        };
-    };
-    if persisted.version != rebuilt.version {
-        return HistoryGcEnablementV1::Disabled {
-            diagnostic: format!(
-                "the repo-history reference manifest is version {} but this daemon \
-                 builds version {}; history GC is disabled",
-                persisted.version, rebuilt.version
-            ),
-        };
-    }
+
     // The epoch is deliberately NOT part of the comparison: a catalog
     // mutation that changes no history reference legitimately bumps it, and
-    // treating that as drift would disable GC on every unrelated write.
-    if persisted.checksum_sha256 != rebuilt.checksum_sha256 {
-        return HistoryGcEnablementV1::Disabled {
-            diagnostic: format!(
-                "the repo-history reference manifest checksum does not re-derive \
-                 (persisted {}, rebuilt {}); history GC is disabled until the \
-                 divergence is explained",
-                &persisted.checksum_sha256[..persisted.checksum_sha256.len().min(12)],
-                &rebuilt.checksum_sha256[..rebuilt.checksum_sha256.len().min(12)],
-            ),
-        };
-    }
+    // treating that as drift would report divergence on every unrelated
+    // write. Version is compared because a differing version means the two
+    // checksums were computed by different rules and are not comparable at
+    // all - which is itself a divergence, resolved the same way.
+    let divergence = persisted.and_then(|persisted| {
+        if persisted.version == rebuilt.version
+            && persisted.checksum_sha256 == rebuilt.checksum_sha256
+        {
+            return None;
+        }
+        let short = |value: &str| value[..value.len().min(12)].to_string();
+        let note = format!(
+            "the persisted repo-history reference index was stale (version {} checksum {}) \
+             and was replaced by the rebuild (version {} checksum {}); the rebuild is \
+             derived from the catalog and overlay selectors, which are the authority",
+            persisted.version,
+            short(&persisted.checksum_sha256),
+            rebuilt.version,
+            short(&rebuilt.checksum_sha256),
+        );
+        tracing::warn!(
+            persisted_version = persisted.version,
+            rebuilt_version = rebuilt.version,
+            persisted_checksum = %persisted.checksum_sha256,
+            rebuilt_checksum = %rebuilt.checksum_sha256,
+            "the persisted repo-history reference index diverged from the rebuild; \
+             accepting the rebuild"
+        );
+        Some(HistoryReferenceDivergenceV1 {
+            persisted_version: persisted.version,
+            rebuilt_version: rebuilt.version,
+            persisted_checksum_sha256: persisted.checksum_sha256,
+            rebuilt_checksum_sha256: rebuilt.checksum_sha256.clone(),
+            note,
+        })
+    });
+
     if let Err(error) = write_reference_manifest(store, rebuilt) {
-        return HistoryGcEnablementV1::Disabled {
-            diagnostic: format!(
-                "the repo-history reference manifest could not be refreshed ({error}); \
-                 history GC is disabled"
-            ),
-        };
+        // Non-fatal by policy; see the doc comment. Logged so a persistently
+        // unwritable root is still visible rather than silently re-derived
+        // forever.
+        tracing::warn!(
+            %error,
+            "the repo-history reference index could not be refreshed; history GC stays \
+             enabled because its roots come from the durable inputs, not this file"
+        );
     }
     HistoryGcEnablementV1::Enabled {
         roots: rebuilt.roots(),
+        divergence,
     }
 }
 
@@ -505,39 +582,193 @@ mod tests {
         );
     }
 
-    #[test]
-    fn checksum_mismatch_disables_gc_and_a_missing_manifest_does_not() {
-        let directory = tempfile::tempdir().unwrap();
+    /// Fixture: a generations root with a persisted manifest already
+    /// baselined from `catalog`, plus a handle to the store.
+    fn baselined_store(
+        directory: &tempfile::TempDir,
+        catalog: &CatalogSnapshotV2,
+    ) -> (HistoryGenerationStore, HistoryReferenceManifestV1) {
         let index_path = directory.path().canonicalize().unwrap().join("index");
         fs::create_dir_all(&index_path).unwrap();
         let store = HistoryGenerationStore::open_for_index(&index_path).unwrap();
-
-        let first = build_reference_manifest(
-            &catalog_with_ready_history(&generation_id('a')),
+        let baseline = build_reference_manifest(
+            catalog,
             &BTreeMap::new(),
             &[],
             &BTreeSet::new(),
             &BTreeSet::new(),
         );
-        match evaluate_history_gc(&store, &first) {
-            HistoryGcEnablementV1::Enabled { roots } => assert_eq!(roots.len(), 1),
+        match evaluate_history_gc(&store, &baseline) {
+            HistoryGcEnablementV1::Enabled { divergence, .. } => {
+                assert!(
+                    divergence.is_none(),
+                    "a first baseline diverges from nothing"
+                );
+            }
             other => panic!("a missing manifest must baseline, not refuse: {other:?}"),
         }
-        // Same inputs re-derive the same checksum: GC stays enabled.
-        assert!(matches!(
-            evaluate_history_gc(&store, &first),
-            HistoryGcEnablementV1::Enabled { .. }
-        ));
+        (store, baseline)
+    }
 
-        // Corrupt the persisted manifest's checksum out of band.
-        let mut tampered = read_reference_manifest(&store).unwrap().unwrap();
-        tampered.checksum_sha256 = "0".repeat(64);
-        write_reference_manifest(&store, &tampered).unwrap();
-        match evaluate_history_gc(&store, &first) {
-            HistoryGcEnablementV1::Disabled { diagnostic } => {
-                assert!(diagnostic.contains("does not re-derive"), "{diagnostic}");
+    #[test]
+    fn a_missing_manifest_baselines_and_a_matching_one_stays_quiet() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = catalog_with_ready_history(&generation_id('a'));
+        let (store, baseline) = baselined_store(&directory, &catalog);
+        assert!(
+            read_reference_manifest(&store).unwrap().is_some(),
+            "baselining must persist, or the next pass baselines again forever"
+        );
+        match evaluate_history_gc(&store, &baseline) {
+            HistoryGcEnablementV1::Enabled { roots, divergence } => {
+                assert_eq!(roots.len(), 1);
+                assert!(
+                    divergence.is_none(),
+                    "identical inputs are not a divergence"
+                );
             }
-            other => panic!("a checksum mismatch must disable GC: {other:?}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// D-038: the accept-and-persist path. An ordinary overlay swap changes a
+    /// durable input, and NO sanctioned mutation path writes the acceleration
+    /// index, so the very next evaluation legitimately disagrees with the
+    /// persisted bytes.
+    #[test]
+    fn an_ordinary_swap_diverges_once_is_accepted_and_persisted_then_stays_quiet() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = catalog_with_ready_history(&generation_id('a'));
+        let (store, baseline) = baselined_store(&directory, &catalog);
+
+        let swapped = generation_id('e');
+        let overlays = BTreeMap::from([("p_1".to_string(), overlay("p_1", &swapped))]);
+        let after_swap =
+            build_reference_manifest(&catalog, &overlays, &[], &BTreeSet::new(), &BTreeSet::new());
+        assert_ne!(baseline.checksum_sha256, after_swap.checksum_sha256);
+
+        let divergence = match evaluate_history_gc(&store, &after_swap) {
+            HistoryGcEnablementV1::Enabled { roots, divergence } => {
+                assert!(
+                    roots.contains(&swapped),
+                    "the swapped-in generation is a root the moment the overlay is durable"
+                );
+                divergence.expect("a stale persisted index must be reported")
+            }
+            other => panic!("a stale index must not disable GC: {other:?}"),
+        };
+        assert_eq!(
+            divergence.persisted_checksum_sha256,
+            baseline.checksum_sha256
+        );
+        assert_eq!(
+            divergence.rebuilt_checksum_sha256,
+            after_swap.checksum_sha256
+        );
+        assert!(divergence.note.contains("stale"), "{}", divergence.note);
+        assert_eq!(
+            read_reference_manifest(&store)
+                .unwrap()
+                .unwrap()
+                .checksum_sha256,
+            after_swap.checksum_sha256,
+            "accept means PERSIST; without this the next pass re-derives the same \
+             divergence forever"
+        );
+
+        // The latch regression itself: a second evaluation against the same
+        // inputs is quiet and still enabled.
+        match evaluate_history_gc(&store, &after_swap) {
+            HistoryGcEnablementV1::Enabled { roots, divergence } => {
+                assert!(roots.contains(&swapped));
+                assert!(
+                    divergence.is_none(),
+                    "the first cut latched here: mismatch without persist re-derived \
+                     the same mismatch on every later pass"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A version difference is a divergence, not a refusal: differing versions
+    /// mean the two checksums were computed by different rules and are not
+    /// comparable, which the rebuild resolves the same way staleness is.
+    #[test]
+    fn a_foreign_manifest_version_is_accepted_as_divergence() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = catalog_with_ready_history(&generation_id('a'));
+        let (store, baseline) = baselined_store(&directory, &catalog);
+
+        let mut foreign = read_reference_manifest(&store).unwrap().unwrap();
+        foreign.version = REFERENCE_MANIFEST_VERSION_V1 + 7;
+        write_reference_manifest(&store, &foreign).unwrap();
+
+        match evaluate_history_gc(&store, &baseline) {
+            HistoryGcEnablementV1::Enabled { divergence, .. } => {
+                let divergence = divergence.expect("a foreign version must be reported");
+                assert_eq!(
+                    divergence.persisted_version,
+                    REFERENCE_MANIFEST_VERSION_V1 + 7
+                );
+                assert_eq!(divergence.rebuilt_version, REFERENCE_MANIFEST_VERSION_V1);
+            }
+            other => panic!("a foreign version must not disable GC: {other:?}"),
+        }
+        assert_eq!(
+            read_reference_manifest(&store).unwrap().unwrap().version,
+            REFERENCE_MANIFEST_VERSION_V1
+        );
+    }
+
+    /// Surviving `Disabled` arm 1: the persisted file cannot be reached at
+    /// all. A directory in its place is the portable way to make `fs::read`
+    /// fail with something other than NotFound.
+    #[test]
+    fn an_unreadable_persisted_manifest_disables_gc() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = catalog_with_ready_history(&generation_id('a'));
+        let (store, baseline) = baselined_store(&directory, &catalog);
+
+        let path = store.root().join(REFERENCE_MANIFEST_FILE);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir_all(&path).unwrap();
+
+        match evaluate_history_gc(&store, &baseline) {
+            HistoryGcEnablementV1::Disabled { diagnostic } => {
+                assert!(
+                    diagnostic.contains("could not be read or decoded"),
+                    "{diagnostic}"
+                );
+            }
+            other => panic!("an unreachable manifest must disable GC: {other:?}"),
+        }
+    }
+
+    /// Surviving `Disabled` arm 2: the file exists and is reachable but its
+    /// bytes are not a manifest. Unlike staleness, this is unexplained
+    /// corruption of bytes this daemon wrote, and the honest answer is that
+    /// the evaluation could not be performed.
+    #[test]
+    fn an_undecodable_persisted_manifest_disables_gc() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = catalog_with_ready_history(&generation_id('a'));
+        let (store, baseline) = baselined_store(&directory, &catalog);
+
+        fs::write(
+            store.root().join(REFERENCE_MANIFEST_FILE),
+            b"{not a reference manifest",
+        )
+        .unwrap();
+
+        match evaluate_history_gc(&store, &baseline) {
+            HistoryGcEnablementV1::Disabled { diagnostic } => {
+                assert!(
+                    diagnostic.contains("could not be read or decoded"),
+                    "{diagnostic}"
+                );
+            }
+            other => panic!("undecodable bytes must disable GC: {other:?}"),
         }
     }
 
@@ -565,16 +796,46 @@ mod tests {
         let overlays = BTreeMap::from([("p_1".to_string(), overlay("p_1", &swapped))]);
         let rebuilt =
             build_reference_manifest(&catalog, &overlays, &[], &BTreeSet::new(), &BTreeSet::new());
+
+        // The safety claim, unchanged: nothing could have freed the swapped-in
+        // generation in the crash window, because the rebuild reads the
+        // durable overlay selector rather than the stale persisted index.
         assert!(
             rebuilt.roots().contains(&swapped),
             "the rebuild reads the durable overlay selector, so the swapped-in \
              generation is a root even though the persisted manifest predates it"
         );
-        // And the divergence is loud rather than silent: GC is off until it
-        // is explained, which is strictly safer than sweeping.
+        assert!(
+            !pre_swap.roots().contains(&swapped),
+            "the persisted index genuinely predates the swap, so this is the real window"
+        );
+
+        // D-038: and recovery CONVERGES rather than latching. The evaluation
+        // accepts the rebuild, persists it, and leaves GC enabled with the
+        // generation still rooted.
+        match evaluate_history_gc(&store, &rebuilt) {
+            HistoryGcEnablementV1::Enabled { roots, divergence } => {
+                assert!(roots.contains(&swapped));
+                assert!(
+                    divergence.is_some(),
+                    "the crash window is a real divergence"
+                );
+            }
+            other => panic!("crash recovery must converge, not latch off: {other:?}"),
+        }
+        assert_eq!(
+            read_reference_manifest(&store)
+                .unwrap()
+                .unwrap()
+                .checksum_sha256,
+            rebuilt.checksum_sha256
+        );
         assert!(matches!(
             evaluate_history_gc(&store, &rebuilt),
-            HistoryGcEnablementV1::Disabled { .. }
+            HistoryGcEnablementV1::Enabled {
+                divergence: None,
+                ..
+            }
         ));
     }
 

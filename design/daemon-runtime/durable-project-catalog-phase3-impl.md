@@ -822,7 +822,15 @@ can change stored document identity.
    the first post-reset rebuild runs against an empty index, which
    surfaced a missing zero guard on the unavailable-git document collector
    (a zero-limit top-docs query panics); the guard now matches its
-   siblings. The rebuild pass itself carries a typed cause: the strict
+   siblings. A pre-marker index (no schema marker file, directory
+   non-empty) is authorized WITH CARRY, not authorized-empty, per the
+   closing review: the scan proceeds without a marker recording a reserved
+   sentinel in the generation-id preimage, a structurally-non-index
+   directory (no tantivy meta file) is nothing-to-carry while a corrupt
+   index stays fail-closed, recovery classification resumes
+   unconditionally on sentinel manifests, and both guards carry any
+   documents found (catalog as drift-mode generations, bridge through the
+   spill). The rebuild pass itself carries a typed cause: the strict
    collected-preservation collectors verify live counts and are
    load-bearing on an ordinary full pass, but meaningless on a freshly
    reset index, so the schema-migration rebuild (and only it, threaded
@@ -934,10 +942,18 @@ Ownership: `bbox-corpus-index/git_history.rs`, `bbox-edge-sidecar`,
    only when no catalog record, active or retained overlay, pinned read
    view, in-flight build, or prepared/committed rebuild manifest references
    the generation; the derived reference manifest is rebuilt and checksummed
-   at startup and before every GC pass, mismatch disables history GC with a
-   doctor finding; vector tombstoning for retired history generations
-   iterates the generation's own vector-input inventory
-   (`delete_entity_all_routes` per entity), never a project code selector.
+   at startup and before every GC pass. Divergence semantics, amended per
+   the closing review (D-038): the manifest is derived, not authority, so a
+   persisted copy that decodes but disagrees with the rebuild is replaced
+   by it, the divergence is logged with both checksums and surfaces as an
+   informational doctor finding, and GC stays enabled; Disabled survives
+   only for an unreachable or undecodable persisted file. The destructive
+   sweep and vector tombstoning deliberately gain no production caller
+   this phase (enablement evaluation and machinery only; a later,
+   separately authorized wiring owns the pass). Vector tombstoning for
+   retired history generations iterates the generation's own vector-input
+   inventory (`delete_entity_all_routes` per entity), never a project code
+   selector.
 5. Health: the five-state history health model (current, lagging,
    unavailable-no-attachment, invalid-scope, failed-last-refresh) lands as
    typed health records surfaced in doctor beside the existing code-source

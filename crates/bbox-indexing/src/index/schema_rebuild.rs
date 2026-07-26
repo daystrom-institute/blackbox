@@ -81,10 +81,19 @@ pub fn catalog_schema_replacement_guard(
             },
         )
         .map_err(|error| anyhow::anyhow!("{error}"))?;
+        // NOTHING TO CARRY, which is narrower than it used to read: the scan
+        // returns `None` only for an absent index path or a directory holding
+        // no tantivy index at all. A missing schema marker is NO LONGER one of
+        // these cases (F3). A pre-marker index is authorized-WITH-CARRY, not
+        // authorized-empty: the marker's absence says nothing about the
+        // documents' absence, and dropping them unproved is the silent loss
+        // this whole boundary exists to end. Such an index scans below,
+        // records `PRE_MARKER_SOURCE_SCHEMA`, and materializes in DRIFT mode -
+        // `select_proof_mode` lands there by construction, because a
+        // pre-marker index predates the marker and therefore predates
+        // migration, so no inventory asset exists to prove equality against.
+        // Drift is the weaker but always-sound direction.
         let Some(scan) = scan else {
-            // No index or no marker: nothing to carry and nothing to prove.
-            // The reset is authorized with no manifest, exactly as a fresh
-            // store's first open is.
             return Ok(SchemaReplacementAuthorization::new(
                 "catalog-materializer: no legacy history observed",
             ));
@@ -136,6 +145,11 @@ pub fn bridge_schema_replacement_guard(
     records_provider: Arc<dyn ProjectRecordsProvider>,
 ) -> SchemaReplacementGuard {
     Arc::new(move |request: &SchemaReplacementRequest<'_>| {
+        // Same narrowed meaning as the catalog arm (F3): `None` is an absent
+        // index or a directory with no tantivy index, NOT a missing marker. A
+        // pre-marker index spills exactly like any other, and its spill
+        // records `source_schema_version: None` - diagnostics only, since
+        // consumption is unconditional at every open.
         let Some(scan) = scan_commit_documents(request.index_path, HistoryScanLimitsV1::default())
             .map_err(|error| anyhow::anyhow!("{error}"))?
         else {

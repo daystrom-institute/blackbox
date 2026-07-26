@@ -834,9 +834,14 @@ fn refresh_history_reference_manifest(
         &std::collections::BTreeSet::new(),
     );
     match evaluate_history_gc(&generation_store, &rebuilt) {
-        bbox_indexing::index::history_gc::HistoryGcEnablementV1::Enabled { roots } => {
+        bbox_indexing::index::history_gc::HistoryGcEnablementV1::Enabled { roots, divergence } => {
+            // The divergence itself is already logged at warn inside the
+            // evaluation, so this stays a plain info: at startup a stale
+            // persisted index is the expected state after any history
+            // operation in the previous run (D-038).
             tracing::info!(
                 referenced_generations = roots.len(),
+                accepted_stale_index = divergence.is_some(),
                 "repo-history reference manifest rebuilt; history GC enabled"
             );
         }

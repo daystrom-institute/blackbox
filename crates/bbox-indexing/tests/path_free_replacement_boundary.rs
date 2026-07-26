@@ -938,6 +938,240 @@ fn a_collected_project_survives_the_guarded_replacement_and_stays_searchable() {
     assert_eq!(manifest.state, RepoHistoryRebuildStateV1::Committed);
 }
 
+/// F3 (parity): a PRE-MARKER index carries. `schema_version.txt` absent plus a
+/// non-empty directory is a must-replace state for
+/// `reset_index_on_schema_mismatch`, so before the scan admitted marker-less
+/// indexes its commit documents dropped with no generation, no spill, and no
+/// manifest - the silent loss this boundary exists to end, surviving in one
+/// narrow arm.
+///
+/// Both guards are asserted from ONE fixture so the two lanes cannot drift on
+/// the same input.
+#[test]
+fn a_pre_marker_index_carries_its_commit_documents_through_both_guards() {
+    // --- catalog lane: carried as drift-mode generations -------------------
+    let fixture = fixture_unstamped("repo-premarker", 3);
+    // The pre-marker state: no marker at all, index files intact.
+    fs::remove_file(fixture.index_path.join("schema_version.txt")).unwrap();
+    assert!(
+        !fixture.index_path.join("schema_version.txt").exists(),
+        "the fixture must be marker-less"
+    );
+    assert!(
+        fixture.index_path.join("meta.json").is_file(),
+        "a pre-marker index still holds a tantivy index; the not-an-index arm          must not swallow it"
+    );
+    let before = commit_rows(&fixture.index_path);
+    assert_eq!(before.len(), 3);
+
+    // The guard observes NO marker, which is exactly the request shape
+    // `reset_index_on_schema_mismatch` builds for this state.
+    let pre_marker_request = SchemaReplacementRequest {
+        index_path: &fixture.index_path,
+        projects_path: &fixture.projects_path,
+        code_source_store_path: &fixture.projects_path,
+        observed_schema_version: None,
+        target_schema_version: "incoming-test-schema",
+    };
+    let authorization = catalog_schema_replacement_guard(
+        Arc::new(ProjectCatalogStore::open_existing(&fixture.projects_path).unwrap()),
+        HistoryScanLimitsV1::default(),
+    )(&pre_marker_request)
+    .expect("a pre-marker index must be authorized, not refused");
+    assert!(
+        authorization.authorized_by.contains("rebuild manifest"),
+        "authorized-with-carry, not authorized-empty: {}",
+        authorization.authorized_by
+    );
+
+    let generation_store = HistoryGenerationStore::open_for_index(&fixture.index_path).unwrap();
+    let manifest = generation_store
+        .read_rebuild_manifest()
+        .unwrap()
+        .expect("a pre-marker replacement must still prepare a manifest");
+    assert_eq!(manifest.state, RepoHistoryRebuildStateV1::Prepared);
+    assert_eq!(
+        manifest.prepared.source_schema_version,
+        bbox_corpus_index::index::history_generations::PRE_MARKER_SOURCE_SCHEMA,
+        "the manifest records the reserved sentinel for a marker-less source"
+    );
+    assert_eq!(manifest.prepared.namespace_inventory.len(), 1);
+    assert_eq!(
+        manifest.prepared.namespace_inventory[0].commit_document_count, 3,
+        "every commit document must be pinned by the manifest"
+    );
+
+    // Survives the replacement: drop, reopen empty, re-emit from the pinned
+    // generation, and the carried set is identical.
+    fs::remove_dir_all(&fixture.index_path).unwrap();
+    let state = fixture.index_path.parent().unwrap().to_path_buf();
+    let index = TranscriptIndex::open_or_create(
+        &fixture.index_path,
+        Vec::new(),
+        None,
+        state.join("legacy-projects.json"),
+        state.join("knowledge.json"),
+        state.join("threads.json"),
+        state.join("roadmap.json"),
+    )
+    .unwrap();
+    assert!(commit_rows(&fixture.index_path).is_empty());
+    let writer: tantivy::IndexWriter = index.index_handle().writer(15_000_000).unwrap();
+    let outcome = reemit_prepared_history_generations(
+        &fixture.index_path,
+        &writer,
+        index.field_handles(),
+        &BTreeMap::from([(
+            "repo-premarker".to_string(),
+            CommitDocumentOwnerV1 {
+                project_id: Some("proj-premarker".into()),
+                project_display: "acme-service".into(),
+            },
+        )]),
+    )
+    .unwrap()
+    .expect("the pinned manifest drives re-emission");
+    let mut writer = writer;
+    writer.commit().unwrap();
+    assert_eq!(outcome.commit_documents, 3);
+    assert_eq!(
+        commit_rows(&fixture.index_path),
+        before,
+        "the pre-marker commit set must survive the replacement byte-identically"
+    );
+
+    // --- bridge lane: carried by the spill --------------------------------
+    let bridge = fixture_unstamped("repo-premarker", 3);
+    fs::remove_file(bridge.index_path.join("schema_version.txt")).unwrap();
+    let bridge_before = commit_rows(&bridge.index_path);
+    assert_eq!(bridge_before.len(), 3);
+    let bridge_request = SchemaReplacementRequest {
+        index_path: &bridge.index_path,
+        projects_path: &bridge.projects_path,
+        code_source_store_path: &bridge.projects_path,
+        observed_schema_version: None,
+        target_schema_version: "incoming-test-schema",
+    };
+    let authorization = bridge_schema_replacement_guard(Arc::new(StaticRecords(
+        ProjectRecordsSnapshot::from_bridge_records(
+            vec![ProjectRecord {
+                project_id: "proj-premarker".into(),
+                repo_id: Some("repo-premarker".into()),
+                canonical_path: OUTGOING_HOST_PATH.into(),
+                registered_at: "2026-07-25T00:00:00Z".into(),
+                is_git_repo: true,
+                languages: Default::default(),
+                aliases: ["acme-service".to_string()].into_iter().collect(),
+            }],
+            1,
+        ),
+    )))(&bridge_request)
+    .expect("a pre-marker index must be authorized, not refused");
+    assert!(
+        authorization.authorized_by.contains("3 commit documents"),
+        "authorized-with-carry, not authorized-empty: {}",
+        authorization.authorized_by
+    );
+    let spill = read_commit_spill(&bridge.index_path)
+        .unwrap()
+        .expect("a pre-marker index must spill before the drop");
+    assert_eq!(spill.commit_document_count(), 3);
+    assert_eq!(
+        spill.source_schema_version, None,
+        "the spill records the absent marker verbatim; consumption is \
+         unconditional so this is diagnostics only"
+    );
+
+    // The spill survives the drop and is consumed at the next open, which is
+    // the property that makes the pre-marker lane whole rather than merely
+    // authorized.
+    fs::remove_dir_all(&bridge.index_path).unwrap();
+    let bridge_state = bridge.index_path.parent().unwrap().to_path_buf();
+    let reopened = TranscriptIndex::open_or_create(
+        &bridge.index_path,
+        Vec::new(),
+        None,
+        bridge_state.join("legacy-projects.json"),
+        bridge_state.join("knowledge.json"),
+        bridge_state.join("threads.json"),
+        bridge_state.join("roadmap.json"),
+    )
+    .unwrap();
+    reopened.reader_reload_for_test();
+    assert_eq!(
+        commit_rows(&bridge.index_path),
+        bridge_before,
+        "the spilled pre-marker commit set must be restored at the next open"
+    );
+    assert!(read_commit_spill(&bridge.index_path).unwrap().is_none());
+}
+
+/// The other half of the F3 pair: an EMPTY pre-marker directory is genuinely
+/// nothing to carry, and both guards authorize with nothing carried. This is
+/// the row the scan's not-an-index discriminator protects - without it the
+/// exposed `Index::open_in_dir` would error and both guards would refuse,
+/// blocking boot for a directory holding one stray file and no marker.
+#[test]
+fn an_empty_pre_marker_directory_authorizes_with_nothing_carried() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let state = root.join("state");
+    let index_path = state.join("index");
+    fs::create_dir_all(&index_path).unwrap();
+    // Non-empty (so `reset_index_on_schema_mismatch` would trigger) but not a
+    // tantivy index and carrying no marker.
+    fs::write(index_path.join("stray-file"), b"not an index").unwrap();
+    assert!(!index_path.join("meta.json").exists());
+    assert!(!index_path.join("schema_version.txt").exists());
+
+    let projects_path = state.join("projects.json");
+    let store = ProjectCatalogStore::initialize_empty(&projects_path).unwrap();
+    let request = SchemaReplacementRequest {
+        index_path: &index_path,
+        projects_path: &projects_path,
+        code_source_store_path: &projects_path,
+        observed_schema_version: None,
+        target_schema_version: "incoming-test-schema",
+    };
+
+    let catalog = catalog_schema_replacement_guard(
+        Arc::new(ProjectCatalogStore::open_existing(&projects_path).unwrap()),
+        HistoryScanLimitsV1::default(),
+    )(&request)
+    .expect("an empty pre-marker directory authorizes");
+    assert!(
+        catalog.authorized_by.contains("no legacy history observed"),
+        "{}",
+        catalog.authorized_by
+    );
+    drop(store);
+
+    let bridge = bridge_schema_replacement_guard(Arc::new(StaticRecords(
+        ProjectRecordsSnapshot::from_bridge_records(Vec::new(), 1),
+    )))(&request)
+    .expect("an empty pre-marker directory authorizes");
+    assert!(
+        bridge.authorized_by.contains("no legacy history observed"),
+        "{}",
+        bridge.authorized_by
+    );
+
+    // Nothing was carried and nothing was fabricated.
+    assert!(read_commit_spill(&index_path).unwrap().is_none());
+    assert!(
+        HistoryGenerationStore::open_for_index(&index_path)
+            .unwrap()
+            .read_rebuild_manifest()
+            .unwrap()
+            .is_none(),
+        "no manifest may authorize anything for an empty directory"
+    );
+    assert!(
+        index_path.join("stray-file").is_file(),
+        "the guard must not mutate the directory it declined to carry from"
+    );
+}
+
 #[test]
 fn an_index_with_no_history_still_authorizes_both_guards() {
     let directory = tempdir().unwrap();

@@ -620,13 +620,27 @@ fn history_gc_findings(
         &std::collections::BTreeSet::new(),
     );
     match evaluate_history_gc(&generation_store, &rebuilt) {
-        HistoryGcEnablementV1::Enabled { roots } => vec![Finding::ok(format!(
-            "repo-history GC enabled; {} generation(s) referenced",
-            roots.len()
-        ))],
+        HistoryGcEnablementV1::Enabled { roots, divergence } => {
+            let mut findings = vec![Finding::ok(format!(
+                "repo-history GC enabled; {} generation(s) referenced",
+                roots.len()
+            ))];
+            // D-038: a replaced stale index is INFO, never a failure. The
+            // ordinary cause is an overlay swap or a `Ready` advancement,
+            // neither of which writes the acceleration index; rendering that
+            // as an action item would ask an operator to explain normal
+            // operation.
+            if let Some(divergence) = divergence {
+                findings.push(Finding::info(format!(
+                    "repo-history reference index refreshed: {}",
+                    divergence.note
+                )));
+            }
+            findings
+        }
         HistoryGcEnablementV1::Disabled { diagnostic } => vec![Finding::action(
             format!("repo-history GC is disabled: {diagnostic}"),
-            "confirm no out-of-band change touched the generations root, then restart the daemon to rebuild the reference manifest",
+            "inspect the generations root for a corrupt or unreachable reference-manifest.json; removing it lets the next evaluation rebuild from the catalog and overlay selectors",
         )],
     }
 }
