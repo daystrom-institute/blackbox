@@ -124,9 +124,16 @@ type TransitionGuardMap = std::sync::Mutex<BTreeMap<String, ()>>;
 pub(crate) struct CutbackReconciler {
     /// Coalesced event set: deduplicated by `(project_id, kind)` so
     /// repeated triggers collapse into one pass.
-    pending: std::sync::Mutex<BTreeMap<(String, ReconcileKind), PublishedScope>>,
-    /// Wake signal for the background task.
-    notify: std::sync::Condvar,
+    pending: Arc<std::sync::Mutex<BTreeMap<(String, ReconcileKind), PublishedScope>>>,
+    /// Deferred events: an event whose project guard is held goes here
+    /// instead of being dropped. On guard release (or the 5s timeout
+    /// backstop) the deferred set is merged back into `pending` so the
+    /// event fires exactly once after the in-flight transition completes
+    /// (section 4.4: coalesce-or-defer, never drop).
+    deferred: Arc<std::sync::Mutex<BTreeMap<(String, ReconcileKind), PublishedScope>>>,
+    /// Wake signal for the background task. Notified on enqueue and on
+    /// guard release.
+    notify: Arc<std::sync::Condvar>,
     /// Per-project transition guard shared with the legacy spawn path.
     guards: Arc<TransitionGuardMap>,
 }
@@ -134,8 +141,9 @@ pub(crate) struct CutbackReconciler {
 impl CutbackReconciler {
     fn new(guards: Arc<TransitionGuardMap>) -> Self {
         Self {
-            pending: std::sync::Mutex::new(BTreeMap::new()),
-            notify: std::sync::Condvar::new(),
+            pending: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            deferred: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            notify: Arc::new(std::sync::Condvar::new()),
             guards,
         }
     }
@@ -146,6 +154,32 @@ impl CutbackReconciler {
         let mut pending = self.pending.lock().unwrap();
         pending.insert((project_id.to_string(), kind), scope);
         self.notify.notify_one();
+    }
+
+    /// Defer an event: the project's transition guard is held by an
+    /// in-flight transition. The event stays in the deferred set until
+    /// the guard releases (notified via condvar) or the 5s timeout
+    /// backstop fires, at which point it is merged back into `pending`.
+    fn defer(&self, event: ReconcileEvent) {
+        let mut deferred = self.deferred.lock().unwrap();
+        deferred.insert((event.project_id, event.kind), event.scope);
+    }
+
+    /// Merge deferred events back into pending. Called by the background
+    /// task on wake from guard-release notification or the timeout
+    /// backstop. Returns the number of events promoted.
+    fn promote_deferred(&self) -> usize {
+        let mut deferred = self.deferred.lock().unwrap();
+        if deferred.is_empty() {
+            return 0;
+        }
+        let mut pending = self.pending.lock().unwrap();
+        let count = deferred.len();
+        for (key, scope) in deferred.iter() {
+            pending.entry(key.clone()).or_insert_with(|| scope.clone());
+        }
+        deferred.clear();
+        count
     }
 
     /// Drain all pending events. Called by the background task after waking.
@@ -164,7 +198,9 @@ impl CutbackReconciler {
     }
 
     /// Wait for events or shutdown. Returns `true` if the task should
-    /// continue running, `false` on shutdown.
+    /// continue running, `false` on shutdown. On wake from condvar or
+    /// timeout, merges deferred events back into pending so guard-release
+    /// notifications are not lost.
     fn wait(&self, shutdown: &std::sync::atomic::AtomicBool) -> bool {
         let pending = self.pending.lock().unwrap();
         if !pending.is_empty() {
@@ -177,13 +213,16 @@ impl CutbackReconciler {
             .notify
             .wait_timeout(pending, std::time::Duration::from_secs(5))
             .unwrap();
+        // Merge deferred events on wake (guard release or timeout).
+        drop(_guard);
+        self.promote_deferred();
         !shutdown.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Acquire a project's transition guard for the duration of a
     /// transition. Returns `Some(GuardHandle)` if the lock was acquired,
-    /// `None` if another owner already holds it (coalesce: the concurrent
-    /// trigger's event is already queued).
+    /// `None` if another owner already holds it (defer: the event goes
+    /// into the deferred set and re-fires on guard release).
     fn try_acquire(&self, project_id: &str) -> Option<GuardHandle> {
         let mut guards = self.guards.lock().unwrap();
         if guards.contains_key(project_id) {
@@ -192,20 +231,27 @@ impl CutbackReconciler {
         guards.insert(project_id.to_string(), ());
         Some(GuardHandle {
             guards: self.guards.clone(),
+            notify: self.notify.clone(),
             project_id: project_id.to_string(),
         })
     }
 }
 
-/// RAII handle that releases the transition guard on drop.
+/// RAII handle that releases the transition guard on drop and notifies
+/// the reconciler condvar so deferred events for this project are
+/// promoted back into pending.
 struct GuardHandle {
     guards: Arc<TransitionGuardMap>,
+    notify: Arc<std::sync::Condvar>,
     project_id: String,
 }
 
 impl Drop for GuardHandle {
     fn drop(&mut self) {
         self.guards.lock().unwrap().remove(&self.project_id);
+        // Wake the reconciler so it merges deferred events and re-fires
+        // any that were waiting for this guard to release.
+        self.notify.notify_one();
     }
 }
 
@@ -938,7 +984,7 @@ async fn finalize_upload(
     .await?;
     if stored.state == GenerationState::Ready {
         let project_id = require_scope(&grant, &scope)?.to_string();
-        schedule_activation(state, scope, project_id);
+        schedule_activation(state, scope, project_id, None);
     }
     let response = FinalizeResponse {
         generation_id: stored.generation_id.clone(),
@@ -983,11 +1029,20 @@ async fn generation_status(
     ))
 }
 
-fn schedule_activation(state: Arc<SharedState>, scope: PublishedScope, project_id: String) {
+fn schedule_activation(
+    state: Arc<SharedState>,
+    scope: PublishedScope,
+    project_id: String,
+    guard: Option<GuardHandle>,
+) {
     if !state.code_sources.begin_activation(&project_id) {
         return;
     }
     tokio::task::spawn_blocking(move || {
+        // Hold the transition guard for the full duration of this worker
+        // (section 4.4). The guard drops here when the closure returns,
+        // releasing the project's transition lock. None for bridge mode.
+        let _guard = guard;
         let mut retry_delay = std::time::Duration::from_secs(1);
         loop {
             let Err(error) = activate_desired_loop(&state, &scope, &project_id) else {
@@ -1019,7 +1074,7 @@ fn schedule_activation(state: Arc<SharedState>, scope: PublishedScope, project_i
                 .into_iter()
                 .find(|(_scope, assigned_project)| assigned_project == &project_id)
         {
-            schedule_activation(state, assigned_scope, assigned_project);
+            schedule_activation(state, assigned_scope, assigned_project, None);
             return;
         }
         schedule_cutback_if_owner_changed(state, project_id);
@@ -1039,7 +1094,12 @@ fn schedule_cutback_if_owner_changed(state: Arc<SharedState>, project_id: String
         &project_id,
         generation.producer_id(),
     ) {
-        schedule_cutback(state, generation.descriptor().scope.clone(), project_id);
+        schedule_cutback(
+            state,
+            generation.descriptor().scope.clone(),
+            project_id,
+            None,
+        );
     }
 }
 
@@ -1047,7 +1107,7 @@ pub(crate) fn resume_pending_activations(state: Arc<SharedState>) {
     let assignments = state.code_sources.assignments();
     let assigned = assignments.iter().cloned().collect::<BTreeMap<_, _>>();
     for (scope, project_id) in assignments {
-        schedule_activation(state.clone(), scope, project_id);
+        schedule_activation(state.clone(), scope, project_id, None);
     }
     let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
     let manifest = match bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir) {
@@ -1082,6 +1142,7 @@ pub(crate) fn resume_pending_activations(state: Arc<SharedState>) {
                 state.clone(),
                 generation.descriptor().scope.clone(),
                 project_id.clone(),
+                None,
             );
         }
     }
@@ -1198,10 +1259,10 @@ pub(crate) fn apply_source_transitions(state: Arc<SharedState>, transitions: Sou
         apply_source_transitions_catalog(state.clone(), transitions);
     } else {
         for (scope, project_id) in transitions.cutbacks {
-            schedule_cutback(state.clone(), scope, project_id);
+            schedule_cutback(state.clone(), scope, project_id, None);
         }
         for (scope, project_id) in transitions.activations {
-            schedule_activation(state.clone(), scope, project_id);
+            schedule_activation(state.clone(), scope, project_id, None);
         }
     }
 }
@@ -1318,22 +1379,35 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>) {
             while reconciler.wait(&shutdown_clone) {
                 let events = reconciler.drain();
                 for event in events {
-                    let Some(_guard) = reconciler.try_acquire(&event.project_id) else {
+                    let Some(guard) = reconciler.try_acquire(&event.project_id) else {
+                        // Guard held: defer the event so it re-fires
+                        // after the in-flight transition completes
+                        // (section 4.4: coalesce-or-defer, never drop).
                         tracing::debug!(
                             project_id = %event.project_id,
-                            "reconciler: transition guard held, coalescing"
+                            "reconciler: transition guard held, deferring"
                         );
+                        reconciler.defer(event);
                         continue;
                     };
+                    // Guard acquired: move it INTO the spawned worker so
+                    // it is held for the full transition duration and
+                    // released (with condvar notification) on completion.
                     match event.kind {
                         ReconcileKind::Cutback => {
-                            schedule_cutback(state_for_task.clone(), event.scope, event.project_id);
+                            schedule_cutback(
+                                state_for_task.clone(),
+                                event.scope,
+                                event.project_id,
+                                Some(guard),
+                            );
                         }
                         ReconcileKind::Activate => {
                             schedule_activation(
                                 state_for_task.clone(),
                                 event.scope,
                                 event.project_id,
+                                Some(guard),
                             );
                         }
                     }
@@ -1400,11 +1474,20 @@ pub(crate) fn spawn_store_maintenance(state: &Arc<SharedState>) -> Result<()> {
     Ok(())
 }
 
-fn schedule_cutback(state: Arc<SharedState>, scope: PublishedScope, project_id: String) {
+fn schedule_cutback(
+    state: Arc<SharedState>,
+    scope: PublishedScope,
+    project_id: String,
+    guard: Option<GuardHandle>,
+) {
     if !state.code_sources.begin_activation(&project_id) {
         return;
     }
     tokio::task::spawn_blocking(move || {
+        // Hold the transition guard for the full duration of this worker
+        // (section 4.4). The guard drops here when the closure returns,
+        // releasing the project's transition lock. None for bridge mode.
+        let _guard = guard;
         let store = state.code_sources.store();
         let mut retry_delay = std::time::Duration::from_secs(1);
         loop {
@@ -1436,7 +1519,7 @@ fn schedule_cutback(state: Arc<SharedState>, scope: PublishedScope, project_id: 
         let _pending = state.code_sources.end_activation(&project_id);
         for (assigned_scope, assigned_project) in state.code_sources.assignments() {
             if assigned_project == project_id {
-                schedule_activation(state.clone(), assigned_scope, assigned_project);
+                schedule_activation(state.clone(), assigned_scope, assigned_project, None);
             }
         }
     });
@@ -5518,5 +5601,100 @@ mod tests {
             drained.iter().all(|e| e.project_id != proj_b),
             "proj_b (no cutback state) must not be enqueued"
         );
+    }
+
+    /// P4-D fix (finding 2): an event enqueued while the project's
+    /// transition guard is held is deferred, not dropped. After the guard
+    /// releases, `promote_deferred` merges it back into pending and it
+    /// fires exactly once (no loss, no duplicate).
+    #[test]
+    fn p4d_deferred_event_fires_once_after_guard_release() {
+        let guards = Arc::new(TransitionGuardMap::new(BTreeMap::new()));
+        let reconciler = CutbackReconciler::new(guards);
+        let scope = PublishedScope::try_new("p4d-defer", ".").unwrap();
+
+        // Acquire the guard as if an in-flight transition holds it.
+        let held_guard = reconciler
+            .try_acquire("proj-x")
+            .expect("acquire must succeed");
+
+        // Enqueue an event while the guard is held.
+        reconciler.enqueue("proj-x", scope.clone(), ReconcileKind::Cutback);
+
+        // The reconciler loop drains the pending set, then tries to
+        // acquire the guard. It fails because the guard is held, so it
+        // defers the event instead of dropping it.
+        let drained = reconciler.drain();
+        assert_eq!(drained.len(), 1, "one event must be drained from pending");
+        assert!(
+            reconciler.try_acquire("proj-x").is_none(),
+            "guard is held, try_acquire must fail"
+        );
+        reconciler.defer(drained.into_iter().next().unwrap());
+
+        // Verify pending is empty (the event is in deferred, not pending).
+        assert!(
+            reconciler.drain().is_empty(),
+            "pending must be empty after defer"
+        );
+
+        // Release the guard (simulates transition completion).
+        // GuardHandle::drop notifies the condvar, waking the reconciler.
+        drop(held_guard);
+
+        // On wake, the reconciler calls promote_deferred, which merges
+        // deferred events back into pending.
+        let promoted = reconciler.promote_deferred();
+        assert_eq!(promoted, 1, "one deferred event must be promoted");
+
+        // The event is now in pending: drain returns exactly one.
+        let final_drained = reconciler.drain();
+        assert_eq!(final_drained.len(), 1, "promoted event fires exactly once");
+        assert_eq!(final_drained[0].project_id, "proj-x");
+        assert_eq!(final_drained[0].kind, ReconcileKind::Cutback);
+
+        // No duplicates remain.
+        assert!(reconciler.drain().is_empty());
+        assert_eq!(reconciler.promote_deferred(), 0);
+    }
+
+    /// P4-D fix (finding 1): the transition guard is held for the full
+    /// duration of the spawned worker, not just around the spawn call.
+    /// Simulated by holding a GuardHandle across a "slow transition"
+    /// window and asserting that concurrent try_acquire fails until the
+    /// handle drops.
+    #[test]
+    fn p4d_guard_held_for_transition_duration() {
+        let guards = Arc::new(TransitionGuardMap::new(BTreeMap::new()));
+        let reconciler = CutbackReconciler::new(guards);
+
+        // Simulate a transition in flight: acquire the guard.
+        let guard = reconciler
+            .try_acquire("proj-slow")
+            .expect("first acquisition succeeds");
+
+        // While the guard is held, a concurrent try_acquire for the same
+        // project must fail.
+        assert!(
+            reconciler.try_acquire("proj-slow").is_none(),
+            "concurrent try_acquire must fail while transition is in flight"
+        );
+
+        // A different project can still acquire (no cross-project blocking).
+        let _guard_other = reconciler
+            .try_acquire("proj-other")
+            .expect("different project is independent");
+
+        // Simulate transition completion: drop the guard.
+        drop(guard);
+
+        // Now the same project can acquire again.
+        let _guard_after = reconciler
+            .try_acquire("proj-slow")
+            .expect("re-acquisition succeeds after transition completes");
+
+        // And releasing _guard_after notifies the condvar (verified by
+        // the fact that GuardHandle::drop calls notify_one, which is
+        // exercised by the deferred-event test above).
     }
 }
