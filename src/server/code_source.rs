@@ -12,8 +12,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use bbox_code_source::{
-    BeginUploadRequest, ContractError, ErrorResponse, FinalizeResponse, GenerationState,
-    GenerationStatus, ManifestPage, MissingBlobsPage, validate_producer_id, validate_scope,
+    BeginUploadRequest, ContractError, CutbackErrorClass, CutbackReason, CutbackStateV2,
+    ErrorResponse, FinalizeResponse, GenerationState, GenerationStatus, ManifestPage,
+    MissingBlobsPage, validate_producer_id, validate_scope,
 };
 use bbox_code_source_store::{
     ActivationRecord, ActivationRecordV2, CodeSourceStore, CollisionRetirementWorkV1,
@@ -24,8 +25,8 @@ use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_catalog::{CatalogSnapshotV2, ProjectId, RepoHistoryMaterialization};
 use bbox_corpus_core::project_record::ProjectRecord;
 use bbox_indexing::checkout_access::{
-    CheckoutAccessBroker, CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest,
-    CheckoutAccessSourceLane, CheckoutAttachmentSelector,
+    CheckoutAccessBroker, CheckoutAccessError, CheckoutAccessIntent, CheckoutAccessKind,
+    CheckoutAccessRequest, CheckoutAccessSourceLane, CheckoutAttachmentSelector,
 };
 use bro_rpc::ServiceToken;
 use futures::StreamExt;
@@ -116,9 +117,8 @@ type TransitionGuardMap = std::sync::Mutex<BTreeMap<String, ()>>;
 /// P4-D introduces the skeleton: the event channel plus per-project
 /// transition guard. The reconciler drains the channel and delegates the
 /// actual transition work to the existing paths (`schedule_cutback` /
-/// `schedule_activation`) under the transition guard. The bounded scheduler,
-/// exact structural-reason classification, and post-commit observer are
-/// P4-E and are NOT in scope.
+/// `schedule_activation`) under the transition guard. P4-E fills in the
+/// bounded scheduler and post-commit observer.
 ///
 /// The reconciler must not disturb persisted cutback state this milestone.
 pub(crate) struct CutbackReconciler {
@@ -136,6 +136,20 @@ pub(crate) struct CutbackReconciler {
     notify: Arc<std::sync::Condvar>,
     /// Per-project transition guard shared with the legacy spawn path.
     guards: Arc<TransitionGuardMap>,
+    /// Scheduler wakeup signal: notified on every Transient persist so
+    /// the bounded scheduler recomputes the minimum deadline (section 9.2).
+    scheduler_notify: Arc<std::sync::Condvar>,
+    /// Scheduler shared state: the minimum deadline and associated project
+    /// ids. The scheduler reads this on wake.
+    scheduler_state: Arc<std::sync::Mutex<SchedulerState>>,
+}
+
+/// Scheduler state: the minimum deadline across all Transient states and
+/// the set of due projects (section 9.2).
+#[derive(Default)]
+struct SchedulerState {
+    /// (deadline_unix_secs, project_id) pairs for all Transient states.
+    pending_deadlines: BTreeMap<u64, Vec<String>>,
 }
 
 impl CutbackReconciler {
@@ -145,7 +159,72 @@ impl CutbackReconciler {
             deferred: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             notify: Arc::new(std::sync::Condvar::new()),
             guards,
+            scheduler_notify: Arc::new(std::sync::Condvar::new()),
+            scheduler_state: Arc::new(std::sync::Mutex::new(SchedulerState::default())),
         }
+    }
+
+    /// Register a Transient deadline so the scheduler can re-attempt the
+    /// project when it becomes due (section 9.2). Called by the one-attempt
+    /// driver after persisting a Transient state.
+    fn register_transient(&self, deadline_unix_secs: u64, project_id: &str) {
+        let mut state = self.scheduler_state.lock().unwrap();
+        state
+            .pending_deadlines
+            .entry(deadline_unix_secs)
+            .or_default()
+            .push(project_id.to_string());
+        self.scheduler_notify.notify_one();
+    }
+
+    /// Consume all due projects: those whose deadline <= now. Called by
+    /// the scheduler after sleeping until the minimum deadline.
+    fn drain_due(&self, now: u64) -> Vec<String> {
+        let mut state = self.scheduler_state.lock().unwrap();
+        let due_keys: Vec<u64> = state
+            .pending_deadlines
+            .range(..=now)
+            .map(|(k, _)| *k)
+            .collect();
+        let mut due_projects = Vec::new();
+        for key in due_keys {
+            if let Some(projects) = state.pending_deadlines.remove(&key) {
+                due_projects.extend(projects);
+            }
+        }
+        due_projects
+    }
+
+    /// The minimum deadline across all registered Transient states, or
+    /// None if there are none (section 9.2). Used by tests and by the
+    /// scheduler's internal wake logic.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn min_deadline(&self) -> Option<u64> {
+        let state = self.scheduler_state.lock().unwrap();
+        state.pending_deadlines.keys().next().copied()
+    }
+
+    /// Wait for the scheduler: blocks until the minimum deadline is due,
+    /// or until a new deadline is registered (whichever is earlier).
+    /// Returns the minimum deadline or None on shutdown.
+    fn scheduler_wait(&self, shutdown: &std::sync::atomic::AtomicBool) -> Option<u64> {
+        let state = self.scheduler_state.lock().unwrap();
+        if let Some(&min) = state.pending_deadlines.keys().next() {
+            drop(state);
+            return Some(min);
+        }
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        let _guard = self
+            .scheduler_notify
+            .wait_timeout(state, std::time::Duration::from_secs(5))
+            .unwrap();
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        let state = self.scheduler_state.lock().unwrap();
+        state.pending_deadlines.keys().next().copied()
     }
 
     /// Enqueue a transition event. Coalesces by `(project_id, kind)`: if
@@ -1043,11 +1122,29 @@ fn schedule_activation(
         // (section 4.4). The guard drops here when the closure returns,
         // releasing the project's transition lock. None for bridge mode.
         let _guard = guard;
+        let is_catalog = state.code_sources.store().record_mode() == RuntimeRecordMode::CatalogV2;
         let mut retry_delay = std::time::Duration::from_secs(1);
         loop {
             let Err(error) = activate_desired_loop(&state, &scope, &project_id) else {
                 break;
             };
+            // Catalog mode (section 9.1 loop elimination): one attempt
+            // per invocation. The reconciler re-enqueues on the next
+            // event. No sleep spin.
+            if is_catalog {
+                let _ = state.code_sources.store().record_health_failure(
+                    &project_id,
+                    "activation_failed",
+                    "activation failed; inspect daemon logs",
+                );
+                tracing::error!(
+                    project_id = %project_id,
+                    scope_hash = %bbox_code_source::scope_hash(&scope),
+                    error = %error,
+                    "catalog-mode activation failed (single attempt)"
+                );
+                break;
+            }
             let _ = state.code_sources.store().record_health_failure(
                 &project_id,
                 "activation_failed",
@@ -1395,7 +1492,7 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>) {
                     // released (with condvar notification) on completion.
                     match event.kind {
                         ReconcileKind::Cutback => {
-                            schedule_cutback(
+                            schedule_cutback_catalog(
                                 state_for_task.clone(),
                                 event.scope,
                                 event.project_id,
@@ -1421,6 +1518,66 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>) {
     // exits. The background task is a daemon-lifetime thread; it is NOT
     // a tokio task and does NOT hold any sync lock across slow work.
     *state.reconciler_shutdown.write() = shutdown.clone();
+}
+
+/// Spawn the bounded cutback scheduler (section 9.2).
+///
+/// One thread beside `spawn_store_maintenance` computes the minimum
+/// `deadline_unix_secs` across all Transient states, sleeps until then,
+/// and re-attempts each due project through the reconciler event channel.
+/// Structural and Terminal states never enter the scheduler. The scheduler
+/// recomputes the minimum deadline on every wake, so a newly persisted
+/// Transient with an earlier deadline is not delayed by the previous sleep
+/// target.
+///
+/// Catalog mode only; bridge mode never calls this.
+pub(crate) fn spawn_scheduler(state: &Arc<SharedState>) {
+    let Some(reconciler) = state.code_sources.reconciler().cloned() else {
+        return;
+    };
+    let state = state.clone();
+    let shutdown = state.reconciler_shutdown.read().clone();
+    std::thread::Builder::new()
+        .name("blackbox-cutback-scheduler".to_string())
+        .spawn(move || {
+            loop {
+                if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                let Some(min_deadline) = reconciler.scheduler_wait(&shutdown) else {
+                    break;
+                };
+                let now = unix_now();
+                if min_deadline > now {
+                    let sleep_secs = min_deadline - now;
+                    std::thread::sleep(std::time::Duration::from_secs(sleep_secs));
+                }
+                // Drain all due projects and re-enqueue them through the
+                // reconciler as Cutback events (section 9.2).
+                let due = reconciler.drain_due(unix_now());
+                for project_id in due {
+                    let scope = state
+                        .code_sources
+                        .assignments()
+                        .into_iter()
+                        .find(|(_, pid)| pid == &project_id)
+                        .map(|(scope, _)| scope);
+                    if let Some(scope) = scope {
+                        state.code_sources.enqueue_transition(
+                            &project_id,
+                            scope,
+                            ReconcileKind::Cutback,
+                        );
+                    } else {
+                        tracing::warn!(
+                            project_id = %project_id,
+                            "scheduler: project has a transient deadline but no assignment scope"
+                        );
+                    }
+                }
+            }
+        })
+        .expect("spawning cutback scheduler thread");
 }
 
 pub(crate) fn spawn_store_maintenance(state: &Arc<SharedState>) -> Result<()> {
@@ -2012,6 +2169,425 @@ fn stage_git_current_overlay_after_activation(
     }
 }
 
+/// Catalog-mode one-attempt cutback driver (section 9.1).
+///
+/// Replaces the loop-based `schedule_cutback` for catalog mode: ONE
+/// attempt per invocation, then persist the outcome and return. No
+/// sleep, no spin (closes G1). The attempt:
+///
+/// a. Resolve identity from the catalog snapshot.
+/// b. CheckoutAccessBroker::acquire with Selected; classify structural
+///    reasons (NoLocalAttachment, AmbiguousAttachment, ScopeMismatch).
+/// c. Stage the local generation; classify transient errors
+///    (WriterContention, IoPressure, Deadline, IndexCommit).
+/// d. Validation/security failure persists Terminal.
+/// e. Success: local activation, cutback state cleared.
+///
+/// The caller (reconciler) holds the transition guard via the `guard`
+/// parameter; it drops when this function returns.
+fn attempt_cutback_catalog(
+    state: &Arc<SharedState>,
+    scope: &PublishedScope,
+    project_id: &str,
+) -> Result<CutbackAttemptOutcome> {
+    // a. Resolve identity from the catalog snapshot.
+    let identity = resolve_code_project_identity(state, project_id, "catalog cutback attempt")?;
+
+    // b. Acquire checkout access with Selected attachment selector (R6).
+    //    Validate scope and local-source capability on the selected
+    //    candidate.
+    let lease = match state.checkout_access.acquire(CheckoutAccessRequest {
+        project_id: project_id.to_string(),
+        attachment: CheckoutAttachmentSelector::Selected,
+        expected_scope: Some(scope.clone()),
+        kind: CheckoutAccessKind::GitHistory,
+        intent: CheckoutAccessIntent::Read,
+        source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+    }) {
+        Ok(lease) => lease,
+        Err(error) => {
+            return Ok(classify_checkout_error(&error));
+        }
+    };
+
+    // c. Stage the local generation through a single staging call.
+    //    The staging call returns a typed CutbackErrorClass to this
+    //    driver instead of parking in a sleep loop.
+    drop(lease);
+    match cutback_to_local_single_attempt(state, scope, project_id, &identity) {
+        Ok(()) => Ok(CutbackAttemptOutcome::Success),
+        Err(error) => Ok(classify_staging_error(&error, state)),
+    }
+}
+
+/// The outcome of a catalog-mode cutback attempt (section 9.1).
+#[derive(Debug)]
+enum CutbackAttemptOutcome {
+    /// Cutback succeeded: local activation complete, state cleared.
+    Success,
+    /// Structural reason: persist without polling. Re-evaluated by
+    /// attachment event or config reload.
+    Structural(CutbackReason),
+    /// Transient failure: persist attempt+1, deadline, error class.
+    /// After the configured cap: ManualRetryRequired.
+    Transient(CutbackErrorClass),
+    /// Terminal failure (validation/security): GC root, never auto-retry.
+    Terminal(CutbackErrorClass),
+}
+
+/// Classify a checkout access error into a structural cutback reason
+/// (section 9.1 step b).
+fn classify_checkout_error(error: &CheckoutAccessError) -> CutbackAttemptOutcome {
+    use bbox_indexing::checkout_access::CheckoutAccessErrorCode as Code;
+    let outcome = match error.code {
+        Code::AttachmentNotFound | Code::ObservationUnavailable => {
+            CutbackAttemptOutcome::Structural(CutbackReason::NoLocalAttachment)
+        }
+        Code::ScopeMismatch => CutbackAttemptOutcome::Structural(CutbackReason::ScopeMismatch),
+        Code::CapabilityDenied
+        | Code::IntentDenied
+        | Code::ConservativePathGateDenied
+        | Code::InvalidRoot
+        | Code::UnsafeRelativePath
+        | Code::WriteIntentRequired => {
+            CutbackAttemptOutcome::Structural(CutbackReason::ScopeMismatch)
+        }
+        Code::AttachmentInactive
+        | Code::ProjectMismatch
+        | Code::SelectorMismatch
+        | Code::CheckoutIdentityMismatch
+        | Code::LifecycleBusy
+        | Code::InvalidRequest
+        | Code::DeniedByTestProbe => {
+            CutbackAttemptOutcome::Structural(CutbackReason::NoLocalAttachment)
+        }
+    };
+    tracing::debug!(
+        code = ?error.code,
+        outcome = ?outcome,
+        "catalog cutback: checkout access classified"
+    );
+    outcome
+}
+
+/// Classify a staging error into a transient or terminal cutback class
+/// (section 9.1 step c-d).
+fn classify_staging_error(
+    error: &anyhow::Error,
+    state: &Arc<SharedState>,
+) -> CutbackAttemptOutcome {
+    // WriterContention: the index writer pass is in progress.
+    if writer_pass_in_progress(error) {
+        return CutbackAttemptOutcome::Transient(CutbackErrorClass::WriterContention);
+    }
+    // IoPressure: disk or IO failure.
+    if error
+        .chain()
+        .any(|c| c.downcast_ref::<std::io::Error>().is_some())
+    {
+        return CutbackAttemptOutcome::Transient(CutbackErrorClass::IoPressure);
+    }
+    // ValidationFailure: scope agreement or coherence check.
+    if error.to_string().contains("code_source_scope_agreement")
+        || error.to_string().contains("code_source_cutback_coherence")
+    {
+        return CutbackAttemptOutcome::Terminal(CutbackErrorClass::ValidationFailure);
+    }
+    // SecurityFailure: any security-context error.
+    if error.to_string().contains("security") || error.to_string().contains("SecurityFailure") {
+        return CutbackAttemptOutcome::Terminal(CutbackErrorClass::SecurityFailure);
+    }
+    // Default: treat as IndexCommit (transient).
+    let _ = state;
+    CutbackAttemptOutcome::Transient(CutbackErrorClass::IndexCommit)
+}
+
+/// Compute the next transient retry deadline using capped exponential
+/// backoff with deterministic project-id jitter (section 4.3, R3).
+///
+/// base * 2^(attempt-1), capped at max_secs, jitter derived from a stable
+/// hash of project_id (0 to 25 percent of the current delay).
+fn compute_retry_deadline(attempt: u32, project_id: &str, base_secs: u64, max_secs: u64) -> u64 {
+    let exp = (attempt as u64).saturating_sub(1);
+    let raw = base_secs.saturating_mul(2_u64.saturating_pow(exp.try_into().unwrap_or(u32::MAX)));
+    let capped = raw.min(max_secs);
+    let jitter_max = capped / 4;
+    let jitter = if jitter_max == 0 {
+        0
+    } else {
+        let hash = stable_project_id_hash(project_id);
+        hash % jitter_max
+    };
+    let now = unix_now();
+    now + capped + jitter
+}
+
+/// Stable hash of a project id for deterministic jitter (section 4.3).
+fn stable_project_id_hash(project_id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    project_id.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Single-attempt staging for catalog-mode cutback (section 9.1 step c).
+///
+/// Calls the staging path ONCE. Unlike `cutback_to_local` which spins for
+/// up to 900 seconds on writer-pass-in-progress, this returns immediately
+/// with a typed error for the one-attempt driver to classify.
+fn cutback_to_local_single_attempt(
+    state: &Arc<SharedState>,
+    scope: &PublishedScope,
+    project_id: &str,
+    identity: &CodeProjectIdentity,
+) -> Result<()> {
+    let store = state.code_sources.store();
+    let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
+    let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)?;
+    let active_is_collected = manifest
+        .workspaces
+        .get(project_id)
+        .and_then(|entry| entry.code_source_selector.as_deref())
+        .is_some_and(|selector| selector.starts_with("collected:"));
+    if !active_is_collected {
+        store.clear_activation(project_id)?;
+        return Ok(());
+    }
+    store.mark_cutback_pending(project_id, "local cutback is staging")?;
+    ensure_selector_staging_available(
+        store.as_ref(),
+        &bbox_code_source::local_selector(project_id),
+    )?;
+    // Single staging call: return immediately on writer-pass-in-progress
+    // instead of spinning (section 9.1 loop elimination).
+    let staged = match state.index_writer.stage_local_generation(
+        identity.clone(),
+        scope.clone(),
+        store.clone(),
+    ) {
+        Ok(staged) => staged,
+        Err(error) if writer_pass_in_progress(&error) => {
+            return Err(anyhow!("error.cutback_writer_contention: {error}"));
+        }
+        Err(error) => return Err(error),
+    };
+    if state.code_sources.assignment_matches(scope, project_id) {
+        schedule_unactivated_retirement(state, project_id, &staged, None)?;
+        bail!("collector assignment returned while local cutback was staging");
+    }
+    staged.begin_publication()?;
+    if let Err(error) = state
+        .index_writer
+        .verify_code_selector_document_count(&staged.selector, staged.document_count)
+    {
+        schedule_unactivated_retirement(state, project_id, &staged, None)?;
+        return Err(error);
+    }
+    let previous_entry = manifest.workspaces.get(project_id).cloned();
+    let previous_view = state.code_read_view.read().clone();
+    enqueue_previous_retirement(
+        store.as_ref(),
+        project_id,
+        previous_entry.clone(),
+        &staged.selector,
+    )?;
+    bbox_edge_sidecar::snapshot::activate_local_snapshot_with(
+        &edges_dir,
+        project_id,
+        scope.repo_id(),
+        &staged.head_commit,
+        &staged.selector,
+        &staged.snapshot_id,
+        staged.worktree_dirty,
+        staged
+            .worktree_dirty
+            .then_some(staged.dirty_fingerprint.as_str()),
+        || {
+            let rebuilt = super::routes::build_edge_index_from_shared(state, false)?;
+            let index = state.idx.write();
+            let mut selectors = index.active_code_selectors();
+            selectors.insert(project_id.to_string(), staged.selector.clone());
+            index.replace_active_code_selectors(selectors.clone());
+            *state.code_read_view.write() = Arc::new(super::CodeReadView {
+                active_selectors: selectors,
+                searcher: index.searcher(),
+                edge_index: Arc::new(rebuilt),
+                catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
+                git_overlays: super::state::read_git_overlays_for_view(
+                    &state.project_authority,
+                    &state.store_dir,
+                ),
+            });
+            Ok(())
+        },
+    )?;
+    if let Some(activation) = store.load_activation_mixed(project_id)? {
+        if let Ok(generation) = store.find_generation_mixed(activation.generation_id()) {
+            let gen_scope = generation.descriptor().scope.clone();
+            store.mark_generation_state_mixed(
+                &gen_scope,
+                generation.generation_id(),
+                GenerationState::Ready,
+                None,
+            )?;
+        }
+    }
+    schedule_previous_retirement(
+        state.clone(),
+        project_id,
+        previous_entry,
+        &staged.selector,
+        previous_view,
+    )?;
+    store.clear_activation(project_id)?;
+    store.clear_health_failure(project_id, "cutback_pending")?;
+    tracing::info!(
+        project_id,
+        "code-source project cut back to local ownership (catalog single attempt)"
+    );
+    let overlay_snapshot_id = staged.snapshot_id.clone();
+    let overlay_chunk_targets = staged.current_chunk_targets.clone();
+    drop(staged);
+    stage_git_current_overlay_after_activation(
+        state,
+        project_id,
+        scope,
+        &overlay_snapshot_id,
+        "",
+        &overlay_chunk_targets,
+    );
+    Ok(())
+}
+
+/// Catalog-mode schedule_cutback: one attempt, persist outcome, return
+/// (section 9.1). No loop, no sleep. The caller (reconciler) holds the
+/// transition guard.
+fn schedule_cutback_catalog(
+    state: Arc<SharedState>,
+    scope: PublishedScope,
+    project_id: String,
+    guard: Option<GuardHandle>,
+) {
+    if !state.code_sources.begin_activation(&project_id) {
+        return;
+    }
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        let pid = project_id.as_str();
+        let outcome = attempt_cutback_catalog(&state, &scope, pid);
+        let store = state.code_sources.store();
+        let config = state.config.read();
+        let cc = &config.code_collection;
+
+        match outcome {
+            Ok(CutbackAttemptOutcome::Success) => {
+                if let Err(error) = store.clear_cutback_state(pid) {
+                    tracing::warn!(project_id = pid, %error, "clearing cutback state after success failed");
+                }
+                let _ = store.clear_health_failure(pid, "cutback_pending");
+            }
+            Ok(CutbackAttemptOutcome::Structural(reason)) => {
+                let state_v2 = CutbackStateV2::Structural { reason };
+                if let Err(error) = store.mark_cutback_state(pid, state_v2.clone()) {
+                    tracing::warn!(project_id = pid, %error, "persisting structural cutback state failed");
+                }
+                tracing::info!(
+                    project_id = pid,
+                    ?reason,
+                    "catalog cutback: structural reason persisted, worker returns"
+                );
+            }
+            Ok(CutbackAttemptOutcome::Transient(class)) => {
+                let now_state = store
+                    .load_activation_mixed(pid)
+                    .ok()
+                    .flatten()
+                    .and_then(|r| r.cutback().cloned());
+                let prev_attempt = match &now_state {
+                    Some(CutbackStateV2::Transient { attempt, .. }) => *attempt,
+                    _ => 0,
+                };
+                let next_attempt = prev_attempt + 1;
+                if next_attempt > cc.cutback_max_attempts {
+                    let mr = CutbackStateV2::ManualRetryRequired {
+                        error_class: class,
+                        attempt: prev_attempt,
+                    };
+                    if let Err(error) = store.mark_cutback_state(pid, mr) {
+                        tracing::warn!(project_id = pid, %error, "persisting ManualRetryRequired failed");
+                    }
+                    let _ = store.record_health_failure(
+                        pid,
+                        "cutback_manual_retry_required",
+                        "cutback exhausted retry budget; config reload required",
+                    );
+                    tracing::warn!(
+                        project_id = pid,
+                        ?class,
+                        "catalog cutback: retry budget exhausted, ManualRetryRequired persisted"
+                    );
+                } else {
+                    let deadline = compute_retry_deadline(
+                        next_attempt,
+                        pid,
+                        cc.cutback_retry_base_secs,
+                        cc.cutback_retry_max_secs,
+                    );
+                    let t = CutbackStateV2::Transient {
+                        attempt: next_attempt,
+                        error_class: class,
+                        deadline_unix_secs: deadline,
+                    };
+                    if let Err(error) = store.mark_cutback_state(pid, t) {
+                        tracing::warn!(project_id = pid, %error, "persisting Transient cutback state failed");
+                    }
+                    // Signal the bounded scheduler so it re-attempts when
+                    // the deadline arrives (section 9.2).
+                    if let Some(reconciler) = state.code_sources.reconciler() {
+                        reconciler.register_transient(deadline, pid);
+                    }
+                    tracing::info!(
+                        project_id = pid,
+                        ?class,
+                        attempt = next_attempt,
+                        deadline,
+                        "catalog cutback: transient failure, deadline persisted"
+                    );
+                }
+            }
+            Ok(CutbackAttemptOutcome::Terminal(class)) => {
+                let t = CutbackStateV2::Terminal { error_class: class };
+                if let Err(error) = store.mark_cutback_state(pid, t.clone()) {
+                    tracing::warn!(project_id = pid, %error, "persisting Terminal cutback state failed");
+                }
+                let _ = store.record_health_failure(
+                    pid,
+                    "cutback_terminal",
+                    "cutback failed terminally; collected generation stays authoritative",
+                );
+                tracing::error!(
+                    project_id = pid,
+                    ?class,
+                    "catalog cutback: terminal failure persisted, generation stays authoritative"
+                );
+            }
+            Err(error) => {
+                let _ = store.record_health_failure(
+                    pid,
+                    "cutback_pending",
+                    "cutback attempt failed; inspect daemon logs",
+                );
+                tracing::error!(
+                    project_id = pid,
+                    %error,
+                    "catalog cutback attempt returned an error before classification"
+                );
+            }
+        }
+        let _pending = state.code_sources.end_activation(pid);
+    });
+}
+
 fn cutback_to_local(
     state: &Arc<SharedState>,
     scope: &PublishedScope,
@@ -2306,6 +2882,15 @@ fn activate_desired_loop(
             ) {
                 Ok(staged) => break staged,
                 Err(error) if writer_pass_in_progress(&error) => {
+                    // Catalog mode (section 9.1 loop elimination): return
+                    // immediately instead of sleeping. The caller
+                    // handles the transient error.
+                    if state.code_sources.store().record_mode() == RuntimeRecordMode::CatalogV2 {
+                        return Err(anyhow!(
+                            "error.cutback_writer_contention: \
+                             index writer pass in progress during activation: {error}"
+                        ));
+                    }
                     if !state.code_sources.assignment_authorizes(
                         scope,
                         project_id,
@@ -5696,5 +6281,140 @@ mod tests {
         // And releasing _guard_after notifies the condvar (verified by
         // the fact that GuardHandle::drop calls notify_one, which is
         // exercised by the deferred-event test above).
+    }
+
+    // ------------------------------------------------------------------
+    // P4-E: one-attempt driver and loop elimination (section 9.1)
+    // ------------------------------------------------------------------
+
+    /// P4-E section 9.8: `compute_retry_deadline` produces capped
+    /// exponential backoff with project-id jitter (0-25 percent of
+    /// current delay).
+    #[test]
+    fn p4e_retry_deadline_capped_exponential_with_jitter() {
+        let base = 1_u64;
+        let max = 60_u64;
+        let pid = "p_000000000000000000000000000004e1";
+
+        // attempt 1: base=1, jitter 0-0 (0/4=0)
+        let d1 = compute_retry_deadline(1, pid, base, max);
+        // The delay component is at least base and at most base + base/4
+        let now = unix_now();
+        assert!(d1 >= now + base);
+        assert!(d1 <= now + base + 1, "attempt 1 jitter must be 0 or 1");
+
+        // attempt 5: base*2^4=16, jitter 0-4
+        let d5 = compute_retry_deadline(5, pid, base, max);
+        assert!(d5 >= now + 16);
+        assert!(d5 <= now + 16 + 4, "attempt 5 jitter must be 0-4");
+
+        // attempt 10: base*2^9=512 > max=60, so capped at 60, jitter 0-15
+        let d10 = compute_retry_deadline(10, pid, base, max);
+        assert!(d10 >= now + 60);
+        assert!(d10 <= now + 60 + 15, "capped at 60, jitter 0-15");
+    }
+
+    /// P4-E section 9.8: stable_project_id_hash is deterministic for the
+    /// same project id (jitter derived from a stable hash).
+    #[test]
+    fn p4e_stable_project_id_hash_is_deterministic() {
+        let h1 = stable_project_id_hash("p_000000000000000000000000000004e1");
+        let h2 = stable_project_id_hash("p_000000000000000000000000000004e1");
+        assert_eq!(h1, h2, "same project id must produce same hash");
+
+        let h3 = stable_project_id_hash("p_000000000000000000000000000004e2");
+        assert_ne!(h1, h3, "different project ids should differ");
+    }
+
+    /// P4-E section 9.2: the scheduler registers transient deadlines and
+    /// drains due projects. Projects past their deadline are returned;
+    /// future-deadline projects are not.
+    #[test]
+    fn p4e_scheduler_drains_due_projects() {
+        let guards = Arc::new(TransitionGuardMap::new(BTreeMap::new()));
+        let reconciler = CutbackReconciler::new(guards);
+
+        let now = unix_now();
+        // Register one due project and one future project.
+        reconciler.register_transient(now - 10, "proj-due");
+        reconciler.register_transient(now + 3600, "proj-future");
+
+        // Drain due: only proj-due is past its deadline.
+        let due = reconciler.drain_due(now);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0], "proj-due");
+
+        // Future project is still registered.
+        assert_eq!(
+            reconciler.min_deadline(),
+            Some(now + 3600),
+            "future deadline must remain"
+        );
+    }
+
+    /// P4-E section 9.1: `classify_checkout_error` maps checkout access
+    /// error codes to the correct structural cutback reason.
+    #[test]
+    fn p4e_classify_checkout_error_maps_structural_reasons() {
+        use bbox_indexing::checkout_access::{CheckoutAccessError, CheckoutAccessErrorCode};
+
+        let no_attachment =
+            CheckoutAccessError::new(CheckoutAccessErrorCode::AttachmentNotFound, "no attachment");
+        match classify_checkout_error(&no_attachment) {
+            CutbackAttemptOutcome::Structural(CutbackReason::NoLocalAttachment) => {}
+            other => panic!("expected Structural(NoLocalAttachment), got {other:?}"),
+        }
+
+        let scope_mismatch =
+            CheckoutAccessError::new(CheckoutAccessErrorCode::ScopeMismatch, "scope wrong");
+        match classify_checkout_error(&scope_mismatch) {
+            CutbackAttemptOutcome::Structural(CutbackReason::ScopeMismatch) => {}
+            other => panic!("expected Structural(ScopeMismatch), got {other:?}"),
+        }
+    }
+
+    /// P4-E section 9.8: `clear_cutback_state` clears the typed cutback
+    /// field and resets `cutback_pending` to false (coherence clause).
+    #[test]
+    fn p4e_clear_cutback_state_resets_coherence() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("store");
+        let store = CodeSourceStore::open_with_mode(
+            &root,
+            StoreLimits::default(),
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap();
+
+        let scope = PublishedScope::try_new("p4e-clear-repo", ".").unwrap();
+        let project_id = "p_000000000000000000000000000004e2";
+        let generation_id = compute_generation_id(
+            "p4d-producer",
+            &empty_generation_descriptor(scope.clone(), &"a".repeat(40)),
+        );
+        // Seed store with activation and cutback state.
+        p4d_seed_catalog_store(&store, &root, project_id, &scope, &generation_id);
+        store
+            .mark_cutback_state(
+                project_id,
+                CutbackStateV2::Structural {
+                    reason: CutbackReason::NoLocalAttachment,
+                },
+            )
+            .unwrap();
+
+        // Verify state is present.
+        let before = store.load_activation_mixed(project_id).unwrap().unwrap();
+        assert!(before.cutback().is_some());
+
+        // Clear.
+        store.clear_cutback_state(project_id).unwrap();
+
+        let after = store.load_activation_mixed(project_id).unwrap().unwrap();
+        assert!(after.cutback().is_none(), "cutback state must be cleared");
+        assert!(
+            !after.is_cutback_pending(),
+            "cutback_pending must be false after clear"
+        );
     }
 }

@@ -615,6 +615,15 @@ impl MixedActivationRecord {
     pub fn is_current_v2(&self) -> bool {
         matches!(self, Self::CurrentV2(_))
     }
+
+    /// The derived `cutback_pending` mirror (section 4.10). True when
+    /// `cutback` is `Some` and not `Terminal`.
+    pub fn is_cutback_pending(&self) -> bool {
+        match self {
+            Self::CurrentV2(record) => record.cutback_pending,
+            Self::LegacyV1(_) => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4195,6 +4204,23 @@ impl CodeSourceStore {
         let derived_pending = !matches!(cutback, CutbackStateV2::Terminal { .. });
         record.cutback = Some(cutback);
         record.cutback_pending = derived_pending;
+        self.save_activation_v2_locked(&record)
+    }
+
+    /// Clear the typed cutback state on a project's activation record
+    /// (section 9.1 step e: success clears state). Sets `cutback` to
+    /// `None` and `cutback_pending` to `false` (the coherence clause,
+    /// section 4.10). Catalog mode only.
+    pub fn clear_cutback_state(&self, project_id: &str) -> Result<()> {
+        if self.shared.record_mode == RuntimeRecordMode::BridgeV1 {
+            bail!("error.code_source_record_mode: bridge store refuses v2 activation writes");
+        }
+        let _guard = self.lock_mutation()?;
+        let Some(mut record) = self.load_activation_v2_locked(project_id)? else {
+            return Ok(());
+        };
+        record.cutback = None;
+        record.cutback_pending = false;
         self.save_activation_v2_locked(&record)
     }
 
