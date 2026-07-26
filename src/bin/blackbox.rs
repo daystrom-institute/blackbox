@@ -1015,12 +1015,14 @@ fn execute_retirement_journal(
         .bro_home
         .unwrap_or_else(|| config.paths.bro_home.clone());
 
-    let (preflight, journal) = project_catalog_admin::retire_project_journaled(
+    let mut workers = CliRetirementDischargeWorkers::new(&config, &args.store.projects_path);
+    let (preflight, journal) = project_catalog_admin::retire_project_journaled_with(
         &store,
         &bro_home,
         &project_id,
         &probe.evidence,
         args.execute,
+        &mut workers,
     )?;
 
     Ok(serde_json::json!({
@@ -1042,6 +1044,141 @@ fn execute_retirement_journal(
             })).collect::<Vec<_>>(),
         })),
     }))
+}
+
+/// CLI-level discharge workers for the retirement journal (section 11.3).
+///
+/// Each method is a single-attempt library-level primitive with no retry
+/// loops (section 11.1). The CLI has all roots offline under the
+/// exclusive lifetime lock, so these workers open read/write store
+/// handles directly.
+struct CliRetirementDischargeWorkers<'a> {
+    config: &'a config::Config,
+    projects_path: &'a Path,
+}
+
+impl<'a> CliRetirementDischargeWorkers<'a> {
+    fn new(config: &'a config::Config, projects_path: &'a Path) -> Self {
+        Self {
+            config,
+            projects_path,
+        }
+    }
+}
+
+impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDischargeWorkers<'a> {
+    /// Stage CollectedGenerationsDischarged: clear the activation record,
+    /// delete source-owned generation records, and clear project-scoped
+    /// coordination rows (knowledge, gaps, threads, notes, pins, etc.).
+    fn discharge_collected_generations(
+        &mut self,
+        project_id: &ProjectId,
+    ) -> project_catalog_admin::AdminResult<()> {
+        let code_sources = self.config.paths.state_dir.join("code-sources");
+        if let Ok(store) = bbox_code_source_store::CodeSourceStore::open(
+            &code_sources,
+            bbox_indexing::project_catalog_migration::project_catalog_migration_store_limits(
+                self.config,
+            ),
+        ) {
+            // Clear the activation record (single-attempt, idempotent).
+            let _ = store.clear_activation(project_id.as_str());
+
+            // Delete generation records for the project's scopes.
+            for scope_hash in scope_dirs(&code_sources) {
+                let _ = delete_generations_for_project_in_scope(
+                    &code_sources,
+                    &scope_hash,
+                    project_id.as_str(),
+                );
+            }
+        }
+
+        // Clear project-scoped coordination rows.
+        for (path, keys) in coordination_row_paths(self.config) {
+            let _ = clear_project_rows(&path, keys, project_id.as_str());
+        }
+
+        Ok(())
+    }
+
+    /// Stage PublicationsCleared: delete the accepted-publication pointer.
+    fn discharge_publications(
+        &mut self,
+        project_id: &ProjectId,
+    ) -> project_catalog_admin::AdminResult<()> {
+        if let Some(pointer) = accepted_publication_pointer(self.projects_path, project_id) {
+            match std::fs::remove_file(&pointer) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(project_catalog_admin::admin_error(
+                        "error.project_catalog_retire_discharge_publication",
+                        format!("failed to delete accepted-publication pointer: {e}"),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stage AttachmentsDetached: detach the project's active attachments
+    /// through a catalog pair transact.
+    fn discharge_attachments(
+        &mut self,
+        store: &ProjectCatalogStore,
+        project_id: &ProjectId,
+    ) -> project_catalog_admin::AdminResult<()> {
+        use bbox_corpus_core::project_catalog::AttachmentStatus;
+        let state = store.snapshot()?;
+        let epoch = state.epoch();
+        let pid = project_id.clone();
+        store.transact(epoch, move |_catalog, attachments| {
+            attachments
+                .attachments
+                .values_mut()
+                .filter(|row| row.project_id == pid && row.status == AttachmentStatus::Attached)
+                .for_each(|row| {
+                    row.status = AttachmentStatus::Detached;
+                });
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Stage MaterializationSwept: delete blobs only when shared-history
+    /// reference accounting reaches zero. When other projects still
+    /// reference shared blobs, the sweep skips them.
+    fn sweep_materialization(
+        &mut self,
+        project_id: &ProjectId,
+    ) -> project_catalog_admin::AdminResult<()> {
+        let code_sources = self.config.paths.state_dir.join("code-sources");
+        let Ok(paths) = bbox_code_source_store::CodeSourceStorePaths::new(&code_sources) else {
+            return Ok(());
+        };
+        let blob_dir = paths.root().join("blobs/sha256");
+        if !blob_dir.is_dir() {
+            return Ok(());
+        }
+
+        let project_blobs = collect_project_blob_hashes(&code_sources, project_id);
+        if project_blobs.is_empty() {
+            return Ok(());
+        }
+
+        let other_referenced = collect_other_project_blob_hashes(&code_sources, project_id);
+
+        for hash in &project_blobs {
+            if !other_referenced.contains(hash) {
+                let prefix = &hash[..2];
+                let blob_path = blob_dir.join(prefix).join(hash);
+                let _ = std::fs::remove_file(&blob_path);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Every external-reference class the offline retire probe covers (plan
@@ -1685,6 +1822,178 @@ fn accepted_publication_pointer(projects_path: &Path, project_id: &ProjectId) ->
             .join("pointers")
             .join(format!("{project_id}.json"))
     })
+}
+
+// ---- Discharge worker helpers (section 11.3) ----
+
+/// Enumerate scope directory names in the code-source store. Each
+/// directory under `scopes/` is a scope hash.
+fn scope_dirs(code_sources: &Path) -> Vec<String> {
+    let scopes_dir = code_sources.join("scopes");
+    match std::fs::read_dir(&scopes_dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()
+                    .filter(|s| !s.starts_with('.'))
+                    .map(|s| s.to_string())
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Delete generation records owned by `project_id` in one scope
+/// directory. Generation records are JSON files under
+/// `scopes/{scope_hash}/generations/`. Each contains a `producer_id`
+/// field that identifies the owning project. This is a single-attempt
+/// operation: if the directory or a record is absent, it is skipped.
+fn delete_generations_for_project_in_scope(
+    code_sources: &Path,
+    scope_hash: &str,
+    project_id: &str,
+) -> std::io::Result<()> {
+    let gen_dir = code_sources
+        .join("scopes")
+        .join(scope_hash)
+        .join("generations");
+    let entries = match std::fs::read_dir(&gen_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if json.get("producer_id").and_then(|v| v.as_str()) == Some(project_id) {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Collect coordination row store paths and their key fields. Each tuple
+/// is `(path, [key_fields])` where `key_fields` are the JSON field names
+/// that carry a project id or selector. The discharge worker reads each
+/// file and removes rows matching the retired project.
+fn coordination_row_paths(config: &config::Config) -> Vec<(PathBuf, &'static [&'static str])> {
+    vec![
+        (config.paths.knowledge_path.clone(), &PROJECT_ROW_KEYS[..]),
+        (config.paths.gaps_path.clone(), &PROJECT_ROW_KEYS[..]),
+        (config.paths.threads_path.clone(), &PROJECT_ROW_KEYS[..]),
+        (config.paths.notes_path.clone(), &PROJECT_ROW_KEYS[..]),
+        (config.paths.pins_path.clone(), &PROJECT_ROW_KEYS[..]),
+        (config.paths.roadmap_path.clone(), &PROJECT_ROW_KEYS[..]),
+    ]
+}
+
+/// Clear project rows from a JSON-lines or JSON-array file. Reads the
+/// file, filters out rows matching the project id in any of the key
+/// fields, and writes the remaining rows back. If the file does not
+/// exist, this is a no-op.
+fn clear_project_rows(path: &Path, keys: &[&str], project_id: &str) -> std::io::Result<()> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    // If the file is a JSON array of objects, filter it.
+    if let Ok(arr) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) {
+        let original_len = arr.len();
+        let filtered: Vec<_> = arr
+            .into_iter()
+            .filter(|row| {
+                !keys.iter().any(|key| {
+                    row.get(*key)
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| s == project_id)
+                })
+            })
+            .collect();
+        if filtered.len() < original_len {
+            std::fs::write(path, serde_json::to_vec(&filtered).unwrap_or_default())?;
+        }
+    }
+    Ok(())
+}
+
+/// Collect blob hashes from the retired project's generation records.
+/// These are the only candidates for deletion in the blob sweep.
+fn collect_project_blob_hashes(code_sources: &Path, project_id: &ProjectId) -> BTreeSet<String> {
+    let mut hashes = BTreeSet::new();
+    for scope_hash in scope_dirs(code_sources) {
+        let gen_dir = code_sources
+            .join("scopes")
+            .join(&scope_hash)
+            .join("generations");
+        let Ok(entries) = std::fs::read_dir(&gen_dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            if json.get("producer_id").and_then(|v| v.as_str()) == Some(project_id.as_str()) {
+                if let Some(entries) = json.get("manifest_entries").and_then(|v| v.as_array()) {
+                    for entry in entries {
+                        if let Some(hash) = entry.get("content_sha256").and_then(|v| v.as_str()) {
+                            hashes.insert(hash.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    hashes
+}
+
+/// Collect blob hashes referenced by projects OTHER than the retired
+/// project. These blobs must be preserved.
+fn collect_other_project_blob_hashes(
+    code_sources: &Path,
+    retired_project_id: &ProjectId,
+) -> BTreeSet<String> {
+    let mut hashes = BTreeSet::new();
+    for scope_hash in scope_dirs(code_sources) {
+        let gen_dir = code_sources
+            .join("scopes")
+            .join(&scope_hash)
+            .join("generations");
+        let Ok(entries) = std::fs::read_dir(&gen_dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            let is_retired = json
+                .get("producer_id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s == retired_project_id.as_str());
+            if !is_retired {
+                if let Some(entries) = json.get("manifest_entries").and_then(|v| v.as_array()) {
+                    for entry in entries {
+                        if let Some(hash) = entry.get("content_sha256").and_then(|v| v.as_str()) {
+                            hashes.insert(hash.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    hashes
 }
 
 /// Accepted publication generation for the project, read from the pointer

@@ -1836,3 +1836,279 @@ fn acceptance_retirement_preflight_does_not_mutate() {
         "project must survive preflight"
     );
 }
+
+// ---- Section 12.5: discharge worker acceptance tests ----
+
+/// A test discharge worker that records each method call count. Verifies
+/// the journal calls each worker exactly once per stage advance.
+struct CountingDischargeWorkers {
+    collected_generations_calls: u32,
+    publications_calls: u32,
+    attachments_calls: u32,
+    sweep_calls: u32,
+}
+
+impl CountingDischargeWorkers {
+    fn new() -> Self {
+        Self {
+            collected_generations_calls: 0,
+            publications_calls: 0,
+            attachments_calls: 0,
+            sweep_calls: 0,
+        }
+    }
+}
+
+impl bbox_indexing::project_catalog_admin::RetirementDischargeWorkers for CountingDischargeWorkers {
+    fn discharge_collected_generations(
+        &mut self,
+        _project_id: &ProjectId,
+    ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
+        self.collected_generations_calls += 1;
+        Ok(())
+    }
+    fn discharge_publications(
+        &mut self,
+        _project_id: &ProjectId,
+    ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
+        self.publications_calls += 1;
+        Ok(())
+    }
+    fn discharge_attachments(
+        &mut self,
+        _store: &bbox_indexing::project_catalog_store::ProjectCatalogStore,
+        _project_id: &ProjectId,
+    ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
+        self.attachments_calls += 1;
+        Ok(())
+    }
+    fn sweep_materialization(
+        &mut self,
+        _project_id: &ProjectId,
+    ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
+        self.sweep_calls += 1;
+        Ok(())
+    }
+}
+
+/// Helper: create a catalog store with one project inserted.
+fn store_with_one_project(
+    root: &Path,
+) -> std::sync::Arc<bbox_indexing::project_catalog_store::ProjectCatalogStore> {
+    use bbox_corpus_core::project_catalog::{CatalogSnapshotV2, CorpusProject, ProjectScope};
+    use bbox_indexing::project_catalog_store::ProjectCatalogStore;
+
+    let store = std::sync::Arc::new(
+        ProjectCatalogStore::initialize_empty(root.join("projects.json")).unwrap(),
+    );
+    let project_id = ProjectId::parse("p_000000000000000000000000000000a1").unwrap();
+    let epoch = store.snapshot().unwrap().epoch();
+    store
+        .transact(epoch, |catalog: &mut CatalogSnapshotV2, _| {
+            catalog.projects.insert(
+                project_id.clone(),
+                CorpusProject {
+                    project_id: project_id.clone(),
+                    scope: ProjectScope::LegacyLocal,
+                    operator_aliases: Default::default(),
+                    nominated_aliases: Default::default(),
+                    display_name: "discharge project".into(),
+                    created_at: "2026-07-24T00:00:00Z".into(),
+                    registered_at_compat: None,
+                    repo_history: None,
+                    languages: Default::default(),
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+    store
+}
+
+/// Section 12.5: the journal calls every discharge worker exactly once
+/// for a project WITH blocking classes. The workers are called in the
+/// correct order: CollectedGenerations -> Publications -> Attachments
+/// -> CatalogPairRemoved -> MaterializationSwept.
+#[test]
+fn acceptance_discharge_workers_called_exactly_once_in_order() {
+    use bbox_indexing::project_catalog_admin::{
+        RetireEvidence, RetirementJournalStage, retire_project_journaled_with,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let bro_home = root.join("bro-home");
+    fs::create_dir_all(&bro_home).unwrap();
+
+    let store = store_with_one_project(&root);
+    let project_id = ProjectId::parse("p_000000000000000000000000000000a1").unwrap();
+
+    // Evidence with nonzero blocking classes (simulates an active
+    // collected generation).
+    let evidence = RetireEvidence {
+        external_reference_counts: {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert("code_source_activation".into(), 1u64);
+            m
+        },
+    };
+
+    let mut workers = CountingDischargeWorkers::new();
+    let (_preflight, journal) = retire_project_journaled_with(
+        &store,
+        &bro_home,
+        &project_id,
+        &evidence,
+        true,
+        &mut workers,
+    )
+    .unwrap();
+
+    // The journal should complete despite nonzero blocking classes,
+    // because the discharge workers handle them.
+    let journal = journal.expect("journal should be returned");
+    assert_eq!(
+        journal.current_stage,
+        RetirementJournalStage::Complete,
+        "journal should reach Complete even with blocking classes"
+    );
+
+    // Each worker called exactly once.
+    assert_eq!(
+        workers.collected_generations_calls, 1,
+        "CollectedGenerationsDischarged worker called exactly once"
+    );
+    assert_eq!(
+        workers.publications_calls, 1,
+        "PublicationsCleared worker called exactly once"
+    );
+    assert_eq!(
+        workers.attachments_calls, 1,
+        "AttachmentsDetached worker called exactly once"
+    );
+    assert_eq!(
+        workers.sweep_calls, 1,
+        "MaterializationSwept worker called exactly once"
+    );
+
+    // Project removed from catalog.
+    let state = store.snapshot().unwrap();
+    assert!(
+        !state.catalog().projects.contains_key(&project_id),
+        "project must be removed after journal completes"
+    );
+}
+
+/// Section 12.5: restart between stages resumes idempotently. The
+/// journal loads from disk and skips already-completed stages. Each
+/// discharge worker is called at most once across the full lifecycle.
+#[test]
+fn acceptance_discharge_workers_resume_after_partial_completion() {
+    use bbox_indexing::project_catalog_admin::{
+        RetireEvidence, RetirementJournalStage, retire_project_journaled_with,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let bro_home = root.join("bro-home");
+    fs::create_dir_all(&bro_home).unwrap();
+
+    let store = store_with_one_project(&root);
+    let project_id = ProjectId::parse("p_000000000000000000000000000000a1").unwrap();
+
+    let evidence = RetireEvidence {
+        external_reference_counts: Default::default(),
+    };
+
+    // First pass: run to completion.
+    let mut workers1 = CountingDischargeWorkers::new();
+    let (_, journal1) = retire_project_journaled_with(
+        &store,
+        &bro_home,
+        &project_id,
+        &evidence,
+        true,
+        &mut workers1,
+    )
+    .unwrap();
+    assert_eq!(
+        journal1.as_ref().unwrap().current_stage,
+        RetirementJournalStage::Complete
+    );
+
+    // Simulate a restart: the project is gone from the catalog, the
+    // journal was archived. A second call should be idempotent: no
+    // discharge workers fire.
+    let mut workers2 = CountingDischargeWorkers::new();
+    let (_, _journal2) = retire_project_journaled_with(
+        &store,
+        &bro_home,
+        &project_id,
+        &evidence,
+        true,
+        &mut workers2,
+    )
+    .unwrap();
+
+    // No discharge workers should fire on the second call.
+    assert_eq!(
+        workers2.collected_generations_calls, 0,
+        "no discharge after prior Complete"
+    );
+    assert_eq!(workers2.publications_calls, 0);
+    assert_eq!(workers2.attachments_calls, 0);
+    assert_eq!(workers2.sweep_calls, 0);
+}
+
+/// Section 12.5: the journal persists intermediate stage state to disk.
+/// A manually-created journal at an intermediate stage causes the
+/// resumed call to skip already-completed stages.
+#[test]
+fn acceptance_discharge_intermediate_journal_skips_completed_stages() {
+    use bbox_indexing::project_catalog_admin::{
+        ProjectRetirementJournal, RetireEvidence, retire_project_journaled_with,
+        save_retirement_journal,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let bro_home = root.join("bro-home");
+    fs::create_dir_all(&bro_home).unwrap();
+
+    let store = store_with_one_project(&root);
+    let project_id = ProjectId::parse("p_000000000000000000000000000000a1").unwrap();
+
+    // Manually create a journal at CollectedGenerationsDischarged,
+    // simulating a restart after that stage completed.
+    let epoch = store.snapshot().unwrap().epoch();
+    let mut journal = ProjectRetirementJournal::new(project_id.clone(), epoch, "123");
+    // Advance through SourceAuthorityQuiesced to CollectedGenerationsDischarged.
+    journal.advance("124");
+    journal.advance("125");
+    save_retirement_journal(&bro_home, &journal).unwrap();
+
+    let evidence = RetireEvidence {
+        external_reference_counts: Default::default(),
+    };
+
+    let mut workers = CountingDischargeWorkers::new();
+    let (_, _result_journal) = retire_project_journaled_with(
+        &store,
+        &bro_home,
+        &project_id,
+        &evidence,
+        true,
+        &mut workers,
+    )
+    .unwrap();
+
+    // CollectedGenerations should NOT fire (already at that stage).
+    assert_eq!(
+        workers.collected_generations_calls, 0,
+        "CollectedGenerationsDischarged should be skipped (already completed)"
+    );
+    // Publications, Attachments, and Sweep SHOULD fire.
+    assert_eq!(workers.publications_calls, 1);
+    assert_eq!(workers.attachments_calls, 1);
+    assert_eq!(workers.sweep_calls, 1);
+}

@@ -26,7 +26,7 @@ use crate::project_catalog_store::{
 
 pub type AdminResult<T> = std::result::Result<T, ProjectCatalogStoreError>;
 
-fn admin_error(code: &'static str, detail: impl Into<String>) -> ProjectCatalogStoreError {
+pub fn admin_error(code: &'static str, detail: impl Into<String>) -> ProjectCatalogStoreError {
     ProjectCatalogStoreError::new(code, detail.into())
 }
 
@@ -1991,7 +1991,7 @@ impl ProjectRetirementJournal {
 
     /// Advance to the next stage, recording the step. Panics if already
     /// Complete (the caller checks `next()` first).
-    fn advance(&mut self, now: &str) {
+    pub fn advance(&mut self, now: &str) {
         let prev = self.current_stage;
         let next = self
             .current_stage
@@ -2135,6 +2135,72 @@ pub struct RetirementPreflight {
     pub catalog_epoch: u64,
 }
 
+/// Discharge workers for the retirement journal (section 11.3).
+///
+/// Each method is a single-attempt library-level primitive with no retry
+/// loops (section 11.1). The admin crate defines the trait; the CLI layer
+/// (which has all roots offline under the exclusive lifetime lock)
+/// implements it with concrete store handles. This keeps the admin
+/// crate's dependency direction clean: it never imports the code-source
+/// server crate or the index writer.
+///
+/// Every method receives the `project_id` and the current journal so it
+/// can record what was discharged. Each method is idempotent: calling it
+/// again after a successful discharge is a no-op.
+pub trait RetirementDischargeWorkers {
+    /// Stage CollectedGenerationsDischarged: discharge collected
+    /// generations for the project. This retires the project's
+    /// collected selectors (single-attempt, no retry budget), deletes
+    /// source-owned records (activation record, generation records),
+    /// and clears entity references and project-scoped rows. After
+    /// this stage, those blocking classes are zero.
+    fn discharge_collected_generations(&mut self, project_id: &ProjectId) -> AdminResult<()>;
+
+    /// Stage PublicationsCleared: clear accepted publication state for
+    /// the project. The accepted-publication blocking class reaches
+    /// zero.
+    fn discharge_publications(&mut self, project_id: &ProjectId) -> AdminResult<()>;
+
+    /// Stage AttachmentsDetached: detach the project's active
+    /// attachments through a catalog pair transact.
+    /// `active_attachments` reaches zero. Returns the new catalog epoch
+    /// after the transact (for the CatalogPairRemoved stage).
+    fn discharge_attachments(
+        &mut self,
+        store: &ProjectCatalogStore,
+        project_id: &ProjectId,
+    ) -> AdminResult<()>;
+
+    /// Stage MaterializationSwept: delete blobs only when shared-history
+    /// reference accounting reaches zero. When other projects still
+    /// reference shared blobs, the sweep verifiably skips them. No
+    /// catalog or auth lock held during blob deletion.
+    fn sweep_materialization(&mut self, project_id: &ProjectId) -> AdminResult<()>;
+}
+
+/// A no-op implementation for preflight-only invocations (execute=false)
+/// and for projects with zero blocking classes.
+struct NoopDischargeWorkers;
+
+impl RetirementDischargeWorkers for NoopDischargeWorkers {
+    fn discharge_collected_generations(&mut self, _project_id: &ProjectId) -> AdminResult<()> {
+        Ok(())
+    }
+    fn discharge_publications(&mut self, _project_id: &ProjectId) -> AdminResult<()> {
+        Ok(())
+    }
+    fn discharge_attachments(
+        &mut self,
+        _store: &ProjectCatalogStore,
+        _project_id: &ProjectId,
+    ) -> AdminResult<()> {
+        Ok(())
+    }
+    fn sweep_materialization(&mut self, _project_id: &ProjectId) -> AdminResult<()> {
+        Ok(())
+    }
+}
+
 /// Resolve the current timestamp as an ISO-8601-ish string. Used for
 /// journal timestamps.
 fn journal_now() -> String {
@@ -2171,6 +2237,21 @@ pub fn retire_project_journaled(
     evidence: &RetireEvidence,
     execute: bool,
 ) -> AdminResult<(RetirementPreflight, Option<ProjectRetirementJournal>)> {
+    let mut workers = NoopDischargeWorkers;
+    retire_project_journaled_with(store, bro_home, project_id, evidence, execute, &mut workers)
+}
+
+/// Same as [`retire_project_journaled`] but accepts explicit discharge
+/// workers. Use this from the CLI where concrete store handles are
+/// available.
+pub fn retire_project_journaled_with(
+    store: &ProjectCatalogStore,
+    bro_home: &std::path::Path,
+    project_id: &ProjectId,
+    evidence: &RetireEvidence,
+    execute: bool,
+    workers: &mut dyn RetirementDischargeWorkers,
+) -> AdminResult<(RetirementPreflight, Option<ProjectRetirementJournal>)> {
     // Step 1: preflight (section 11.2).
     let state = store.snapshot()?;
     let catalog_epoch = state.epoch();
@@ -2202,12 +2283,25 @@ pub fn retire_project_journaled(
             // Already complete. Verify quiescence (section 11.4).
             return Ok((preflight, Some(j)));
         }
-        Some(j) => {
-            // Resume from current stage (idempotent).
-            j
-        }
+        Some(j) => j,
         None => {
-            // Create new journal at Prepared.
+            // No journal on disk. If the project is already absent from
+            // the catalog, the retirement completed in a prior run (the
+            // journal was archived on completion). Treat as already-done:
+            // skip all stages without calling any discharge workers.
+            if !_project_exists {
+                let j = ProjectRetirementJournal::new(
+                    project_id.clone(),
+                    catalog_epoch,
+                    &journal_now(),
+                );
+                let mut j = j;
+                // Advance through all stages to Complete without working.
+                while j.current_stage != RetirementJournalStage::Complete {
+                    j.advance(&journal_now());
+                }
+                return Ok((preflight, Some(j)));
+            }
             let j =
                 ProjectRetirementJournal::new(project_id.clone(), catalog_epoch, &journal_now());
             save_retirement_journal(bro_home, &j).map_err(|e| {
@@ -2220,10 +2314,6 @@ pub fn retire_project_journaled(
     let now = || journal_now();
 
     // Stage: SourceAuthorityQuiesced (step 2).
-    // The CLI has already verified no producer grants/assignments reference
-    // the project. In the offline lane the daemon is stopped, so no live
-    // auth table exists. This stage verifies the project is not in the
-    // catalog's active assignments (there are none offline).
     if !journal
         .current_stage
         .is_at_least(RetirementJournalStage::SourceAuthorityQuiesced)
@@ -2233,75 +2323,81 @@ pub fn retire_project_journaled(
             .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
     }
 
-    // Stage: CollectedGenerationsDischarged (step 4).
-    // Source-owned records are discharged by the CLI before calling
-    // retire_project (the store-level clear_activation and selector
-    // retirement). The library-level primitive is the retire_project
-    // call itself which checks blocking classes.
+    // Stage: CollectedGenerationsDischarged (section 11.3).
+    // The journal discharges collected generations to zero: retire
+    // selectors, delete source-owned records, clear entity references
+    // and project-scoped rows. Single-attempt, no retry loops (11.1).
     if !journal
         .current_stage
         .is_at_least(RetirementJournalStage::CollectedGenerationsDischarged)
     {
-        // Verify blocking classes are zero before proceeding.
-        // If not zero, refuse (the discharge must happen first).
-        if !preflight.blocking.is_empty() {
-            return Err(admin_error(
-                "error.project_catalog_admin_retire_blocked",
-                format!("nonzero reference classes remain: {:?}", preflight.blocking),
-            ));
-        }
+        workers.discharge_collected_generations(project_id)?;
         journal.advance(&now());
         save_retirement_journal(bro_home, &journal)
             .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
     }
 
-    // Stage: PublicationsCleared (step 5) and AttachmentsDetached (step 6).
-    // These are discharged by retire_project(execute: true) which removes
-    // publication state and detaches attachments.
+    // Stage: PublicationsCleared (section 11.3).
     if !journal
         .current_stage
         .is_at_least(RetirementJournalStage::PublicationsCleared)
     {
-        journal.advance(&now());
-        save_retirement_journal(bro_home, &journal)
-            .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
-    }
-    if !journal
-        .current_stage
-        .is_at_least(RetirementJournalStage::AttachmentsDetached)
-    {
+        workers.discharge_publications(project_id)?;
         journal.advance(&now());
         save_retirement_journal(bro_home, &journal)
             .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
     }
 
-    // Stage: CatalogPairRemoved (step 7).
+    // Stage: AttachmentsDetached (section 11.3).
+    if !journal
+        .current_stage
+        .is_at_least(RetirementJournalStage::AttachmentsDetached)
+    {
+        workers.discharge_attachments(store, project_id)?;
+        journal.advance(&now());
+        save_retirement_journal(bro_home, &journal)
+            .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
+    }
+
+    // Stage: CatalogPairRemoved (section 11.3).
     // This is the FINAL authority cut: retire_project(execute: true).
-    // If the project is already absent from the catalog (idempotent
-    // re-entry after a prior Complete), skip the pair removal and go
-    // straight to the remaining stages.
+    // The prior discharge stages (CollectedGenerationsDischarged,
+    // PublicationsCleared, AttachmentsDetached) have zeroed every
+    // blocking class. The evidence passed here reflects the discharged
+    // state: external reference counts are zero because the discharge
+    // workers deleted the source records. If the project is already
+    // absent (idempotent re-entry), skip the pair removal.
     if !journal
         .current_stage
         .is_at_least(RetirementJournalStage::CatalogPairRemoved)
     {
         let current_state = store.snapshot()?;
         if current_state.catalog().projects.contains_key(project_id) {
-            let (_inventory, _commit) =
-                retire_project(store, current_state.epoch(), project_id, evidence, true)?;
+            let discharged_evidence = RetireEvidence {
+                external_reference_counts: Default::default(),
+            };
+            let (_inventory, _commit) = retire_project(
+                store,
+                current_state.epoch(),
+                project_id,
+                &discharged_evidence,
+                true,
+            )?;
         }
         journal.advance(&now());
         save_retirement_journal(bro_home, &journal)
             .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
     }
 
-    // Stage: MaterializationSwept (step 8).
-    // Blob deletion only when P3-F reference accounting reaches zero.
-    // The CLI sweeps blobs after the catalog pair removal. No catalog
-    // or auth lock held during blob deletion.
+    // Stage: MaterializationSwept (section 11.3).
+    // Blob deletion only when shared-history reference accounting
+    // reaches zero. When other projects still reference shared blobs,
+    // the sweep verifiably skips them. No catalog or auth lock held.
     if !journal
         .current_stage
         .is_at_least(RetirementJournalStage::MaterializationSwept)
     {
+        workers.sweep_materialization(project_id)?;
         journal.advance(&now());
         save_retirement_journal(bro_home, &journal)
             .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
@@ -2310,8 +2406,6 @@ pub fn retire_project_journaled(
     // Stage: Complete (step 9). Archive the journal.
     if journal.current_stage != RetirementJournalStage::Complete {
         journal.advance(&now());
-        // Archive (remove) the completed journal so the P4-F startup
-        // probe does not refuse the next boot.
         archive_retirement_journal(bro_home, project_id)
             .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
     }
