@@ -703,7 +703,12 @@ into the replacement boundary is P3-E.
    idempotent and unable to remint identity ACROSS schema generations, not
    only within one; with the whole body in the preimage, the second schema
    replacement re-derived a new id for identical content and the strict
-   no-remint advance wedged the open path permanently.
+   no-remint advance wedged the open path permanently. Transition posture:
+   generations minted under the pre-D-039 whole-body preimage fail
+   validation loudly (no silent acceptance, no compatibility shim), which
+   is acceptable because the format has never shipped as live authority;
+   only disposable catalog-mode test and bootsmoke roots can hold such
+   state, and they rebuild from scratch.
 2. Materializer: streams the legacy index's commit documents by exact
    namespace (reusing the Phase 1 capture's row shape and commitment
    function), classifies each namespace against the pinned catalog snapshot
