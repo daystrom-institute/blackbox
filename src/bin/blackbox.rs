@@ -61,6 +61,8 @@ enum ProjectCatalogCommand {
     ScopeBridgeClear(ScopeBridgeClearArgs),
     /// Inventory and optionally remove one fully discharged project.
     Retire(RetireArgs),
+    /// Resume or inspect a forward-only retirement journal (section 11).
+    RetirementJournal(RetirementJournalArgs),
 }
 
 #[derive(Debug, Args)]
@@ -204,6 +206,24 @@ struct RetireArgs {
     /// Load the same configuration file used by blackboxd.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct RetirementJournalArgs {
+    #[command(flatten)]
+    store: StoreArgs,
+    #[arg(long, value_name = "PROJECT_ID")]
+    project: String,
+    /// Resume or execute the journal discharge. Default reports only.
+    #[arg(long)]
+    execute: bool,
+    /// Load the same configuration file used by blackboxd.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// Override BRO_HOME for journal persistence. Defaults to the
+    /// config-resolved bro_home.
+    #[arg(long, value_name = "PATH")]
+    bro_home: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -399,6 +419,9 @@ fn command_name(cli: &Cli) -> &'static str {
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::Retire(_),
         }) => "project_catalog_retire",
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::RetirementJournal(_),
+        }) => "project_catalog_retirement_journal",
     }
 }
 
@@ -431,6 +454,9 @@ fn execute(cli: Cli) -> Result<serde_json::Value, CommandFailure> {
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::Retire(args),
         }) => execute_retire(args),
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::RetirementJournal(args),
+        }) => execute_retirement_journal(args),
     }
 }
 
@@ -948,6 +974,73 @@ fn execute_retire(args: RetireArgs) -> Result<serde_json::Value, CommandFailure>
         "removable_bindings": inventory.removable_bindings,
         "removed": commit.is_some(),
         "epoch": commit.map(|c| c.epoch),
+    }))
+}
+
+/// Execute the forward-only retirement journal (section 11).
+///
+/// This is the CLI-only, offline execution lane. The caller must have
+/// already stopped the daemon (the exclusive lifetime lock from
+/// open_admin_store guarantees no concurrent daemon holds the catalog).
+/// The discharge ordering is:
+///
+/// 1. Preflight (section 11.2): resolve the project, probe evidence,
+///    inventory blocking classes, detect Ready-materialization refusal.
+/// 2. If --execute is absent, report preflight only.
+/// 3. If --execute is set, discharge blocking classes to zero, then
+///    call retire_project_journaled which advances the journal
+///    forward to Complete.
+/// 4. Archive the completed journal so the P4-F startup probe does
+///    not refuse the next boot.
+fn execute_retirement_journal(
+    args: RetirementJournalArgs,
+) -> Result<serde_json::Value, CommandFailure> {
+    let config = load_config(args.config.clone())?;
+    let (_lock, store) = open_admin_store(&args.store.projects_path)?;
+    let project_id = parse_project_id(&args.project)?;
+    let probe = probe_retire_evidence(&config, &args.store.projects_path, &store, &project_id)?;
+
+    // Unprobeable classes refuse the destructive arm (same rule as retire).
+    if args.execute && !probe.unprobeable.is_empty() {
+        return Err(CommandFailure::new(
+            "error.project_catalog_cli_unprobeable_reference_class",
+            format!(
+                "these reference classes could not be probed and may still hold references: {}",
+                probe.unprobeable.join(", ")
+            ),
+        ));
+    }
+
+    let bro_home = args
+        .bro_home
+        .unwrap_or_else(|| config.paths.bro_home.clone());
+
+    let (preflight, journal) = project_catalog_admin::retire_project_journaled(
+        &store,
+        &bro_home,
+        &project_id,
+        &probe.evidence,
+        args.execute,
+    )?;
+
+    Ok(serde_json::json!({
+        "project_id": project_id.as_str(),
+        "execute": args.execute,
+        "blocking": preflight.blocking,
+        "history_ready_refusal": preflight.history_ready_refusal,
+        "source_owned_records": preflight.source_owned_records,
+        "project_exists": preflight.project_exists,
+        "catalog_epoch": preflight.catalog_epoch,
+        "probed_reference_classes": RETIRE_REFERENCE_CLASSES,
+        "unprobeable_reference_classes": probe.unprobeable,
+        "journal": journal.as_ref().map(|j| serde_json::json!({
+            "current_stage": format!("{:?}", j.current_stage),
+            "completed_steps": j.completed_steps.len(),
+            "stages": j.completed_steps.iter().map(|s| serde_json::json!({
+                "stage": format!("{:?}", s.stage),
+                "completed_at": s.completed_at,
+            })).collect::<Vec<_>>(),
+        })),
     }))
 }
 

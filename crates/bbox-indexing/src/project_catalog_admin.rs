@@ -3767,8 +3767,10 @@ mod tests {
     #[test]
     fn retirement_journal_stage_ordinal_is_forward_only() {
         assert!(RetirementJournalStage::Complete.is_at_least(RetirementJournalStage::Prepared));
-        assert!(RetirementJournalStage::CatalogPairRemoved
-            .is_at_least(RetirementJournalStage::AttachmentsDetached));
+        assert!(
+            RetirementJournalStage::CatalogPairRemoved
+                .is_at_least(RetirementJournalStage::AttachmentsDetached)
+        );
         assert!(!RetirementJournalStage::Prepared.is_at_least(RetirementJournalStage::Complete));
     }
 

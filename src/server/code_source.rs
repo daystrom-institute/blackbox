@@ -1192,12 +1192,26 @@ fn schedule_cutback_if_owner_changed(state: Arc<SharedState>, project_id: String
         &project_id,
         generation.producer_id(),
     ) {
-        schedule_cutback(
-            state,
-            generation.descriptor().scope.clone(),
-            project_id,
-            None,
-        );
+        // Catalog mode (section 11.5a): the reconciler is the SOLE
+        // transition owner. Enqueue a Cutback event so the reconciler
+        // drives the transition through schedule_cutback_catalog, which
+        // is the one-attempt driver with no retry loop. The legacy
+        // schedule_cutback path (with its loop+sleep) must never be
+        // reached from catalog mode.
+        if state.code_sources.is_catalog() {
+            state.code_sources.enqueue_transition(
+                &project_id,
+                generation.descriptor().scope.clone(),
+                ReconcileKind::Cutback,
+            );
+        } else {
+            schedule_cutback(
+                state,
+                generation.descriptor().scope.clone(),
+                project_id,
+                None,
+            );
+        }
     }
 }
 
@@ -8708,5 +8722,160 @@ mod tests {
         // Second pass: no more (None, true) records to classify.
         let outcomes2 = classify_migrated_records(&store, &snapshot, broker).unwrap();
         assert_eq!(outcomes2.len(), 0, "classification must be once-only");
+    }
+
+    // ---- Section 11.5: sole-ownership and loop-absence exit proof ----
+
+    /// Source text of this file, for the loop-absence exit proof tests.
+    fn self_source() -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/code_source.rs");
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("failed to read {}", path.display()))
+    }
+
+    /// Extract the body of a top-level `fn name(` from the source text.
+    /// Returns the text from the `fn` keyword to the matching closing
+    /// brace. Best-effort brace counting; sufficient for the structural
+    /// assertions here.
+    fn extract_fn_body(source: &str, fn_name: &str) -> String {
+        let needle = format!("fn {fn_name}(");
+        let start = source
+            .find(&needle)
+            .unwrap_or_else(|| panic!("function `{fn_name}` not found in source"));
+        // Find the opening brace of the body.
+        let body_start = source[start..]
+            .find('{')
+            .unwrap_or_else(|| panic!("no body brace for `{fn_name}`"))
+            + start;
+        let mut depth = 0i32;
+        let mut end = body_start;
+        for (i, ch) in source[body_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = body_start + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        source[start..end].to_string()
+    }
+
+    /// Section 11.5b: schedule_cutback_catalog (the sole catalog-mode
+    /// cutback driver) must NOT contain `thread::sleep` or an unbounded
+    /// retry loop. It is a one-attempt driver; the bounded scheduler
+    /// handles retries via Transient deadlines.
+    #[test]
+    fn exit_proof_cutback_catalog_no_sleep_loop() {
+        let src = self_source();
+        let body = extract_fn_body(&src, "schedule_cutback_catalog");
+        assert!(
+            !body.contains("thread::sleep"),
+            "schedule_cutback_catalog must not contain thread::sleep (section 11.5b). \
+             Found sleep in catalog cutback driver."
+        );
+        assert!(
+            !body.contains("retry_delay"),
+            "schedule_cutback_catalog must not contain retry_delay (section 11.5b). \
+             Found retry_delay in catalog cutback driver."
+        );
+    }
+
+    /// Section 11.5b: attempt_cutback_catalog (the inner catalog cutback
+    /// logic) must NOT contain `thread::sleep`.
+    #[test]
+    fn exit_proof_attempt_cutback_catalog_no_sleep() {
+        let src = self_source();
+        let body = extract_fn_body(&src, "attempt_cutback_catalog");
+        assert!(
+            !body.contains("thread::sleep"),
+            "attempt_cutback_catalog must not contain thread::sleep (section 11.5b)"
+        );
+    }
+
+    /// Section 11.5b: schedule_cutback (the legacy bridge-mode driver)
+    /// still has its retry loop, but must be unreachable from catalog
+    /// mode. Verify the legacy function still exists (bridge mode) and
+    /// that schedule_cutback_if_owner_changed has a catalog-mode guard.
+    #[test]
+    fn exit_proof_legacy_cutback_is_bridge_only() {
+        let src = self_source();
+
+        // The legacy function must still exist (bridge mode uses it).
+        let legacy_body = extract_fn_body(&src, "schedule_cutback");
+        assert!(
+            legacy_body.contains("thread::sleep"),
+            "schedule_cutback (bridge mode) should still have its retry loop"
+        );
+
+        // schedule_cutback_if_owner_changed must check catalog mode
+        // before calling schedule_cutback.
+        let guard_body = extract_fn_body(&src, "schedule_cutback_if_owner_changed");
+        assert!(
+            guard_body.contains("is_catalog()"),
+            "schedule_cutback_if_owner_changed must check is_catalog() before \
+             dispatching to the legacy cutback path (section 11.5a)"
+        );
+        assert!(
+            guard_body.contains("enqueue_transition"),
+            "schedule_cutback_if_owner_changed must enqueue_transition in \
+             catalog mode (section 11.5a)"
+        );
+    }
+
+    /// Section 11.5b: schedule_activation has a loop+sleep in bridge mode,
+    /// but the catalog-mode branch must break before the sleep. Verify
+    /// the catalog-mode break exists between the loop and the sleep.
+    #[test]
+    fn exit_proof_activation_catalog_breaks_before_sleep() {
+        let src = self_source();
+        let body = extract_fn_body(&src, "schedule_activation");
+        let is_catalog_pos = body
+            .find("is_catalog")
+            .unwrap_or_else(|| panic!("schedule_activation must have an is_catalog check"));
+        let sleep_pos = body.find("thread::sleep").unwrap_or_else(|| {
+            panic!("schedule_activation should have thread::sleep in bridge path")
+        });
+        let break_after_catalog = body[is_catalog_pos..]
+            .find("break")
+            .unwrap_or_else(|| panic!("schedule_activation must break after is_catalog check"));
+        assert!(
+            is_catalog_pos + break_after_catalog < sleep_pos,
+            "schedule_activation catalog-mode break must come before \
+             thread::sleep (section 11.5b)"
+        );
+    }
+
+    /// Section 11.5b: activate_desired_loop has a loop+sleep in bridge
+    /// mode for writer contention, but catalog mode must return early.
+    /// Verify the catalog-mode return exists before the sleep.
+    #[test]
+    fn exit_proof_activate_desired_loop_catalog_returns_before_sleep() {
+        let src = self_source();
+        let body = extract_fn_body(&src, "activate_desired_loop");
+        // The catalog check must exist.
+        let catalog_check = body
+            .find("RuntimeRecordMode::CatalogV2")
+            .unwrap_or_else(|| {
+                panic!("activate_desired_loop must check CatalogV2 for writer contention")
+            });
+        // The return-Err must come after the catalog check.
+        let return_after = body[catalog_check..]
+            .find("return")
+            .unwrap_or_else(|| panic!("activate_desired_loop must return after CatalogV2 check"));
+        // The sleep must exist (bridge path).
+        let sleep_pos = body.find("thread::sleep").unwrap_or_else(|| {
+            panic!("activate_desired_loop should have thread::sleep in bridge path")
+        });
+        // The catalog check + return must come before the sleep.
+        assert!(
+            catalog_check + return_after < sleep_pos,
+            "activate_desired_loop catalog-mode return must come before \
+             thread::sleep (section 11.5b)"
+        );
     }
 }
