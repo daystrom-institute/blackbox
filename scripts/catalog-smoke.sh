@@ -35,8 +35,8 @@ SMOKE="${BBOX_SMOKE_FIXTURE_ROOT:?set BBOX_SMOKE_FIXTURE_ROOT to the fixture roo
 BIN="${BBOX_SMOKE_BIN_DIR:-$REPO_ROOT/target/release}"
 PORT="${BBOX_SMOKE_PORT:-7397}"
 T="$SMOKE/throwaway"
-SCOPE_REPO_ID="neutral-collision"
-WINNER_PROJECT="neutral-collision-winner"
+SCOPE_REPO_ID="neutral-repository"
+WINNER_PROJECT="neutral-winner"
 
 start_daemon() {
   env -i PATH=/usr/bin:/bin:/usr/sbin \
@@ -58,7 +58,7 @@ start_daemon() {
 wait_bind() {
   for i in {1..30}; do
     local code
-    code=$(curl -s -m 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/metrics" 2>/dev/null)
+    code=$(curl -s -m 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/roster" 2>/dev/null)
     [ "$code" = "200" ] && return 0
     kill -0 "$(cat "$SMOKE/daemon.pid")" 2>/dev/null || return 1
     sleep 1
@@ -89,8 +89,10 @@ case "$1" in
     echo "produce OK: $SMOKE" ;;
   setup)
     mkdir -p "$T"/{home,config,cache,data,xdg-state,index,transcripts,codex}
-    python3 -c "import secrets; print(secrets.token_hex(32), end='')" > "$SMOKE/producer.token"
-    chmod 0600 "$SMOKE/producer.token"
+    if [ ! -f "$SMOKE/producer.token" ]; then
+      python3 -c "import secrets; print(secrets.token_hex(32), end='')" > "$SMOKE/producer.token"
+      chmod 0600 "$SMOKE/producer.token"
+    fi
     cat > "$SMOKE/daemon-config.toml" <<EOF
 [code_collection]
 enabled = true
@@ -111,16 +113,16 @@ EOF
     echo "setup OK" ;;
   s1)
     : > "$SMOKE/daemon.log"; start_daemon
-    if wait_bind; then echo "S1 PASS: catalog boot on migrated root, bind, metrics 200"
+    if wait_bind; then echo "S1 PASS: catalog boot on migrated root, bind, roster 200"
     else echo "S1 FAIL"; tail -5 "$SMOKE/daemon.log"; return 1; fi ;;
   s2)
     "$BIN/bbox-code-collector" --config "$SMOKE/collector-config.toml" once || { echo "S2 FAIL: collector"; return 1; }
     sleep 3
-    SMOKE="$SMOKE" python3 - <<'EOF'
+    SMOKE="$SMOKE" WINNER="$WINNER_PROJECT" python3 - <<'EOF'
 import json, glob, os, sys
-recs = glob.glob(os.environ["SMOKE"] + "/rehearsal/state/code-sources/activations/*.json")
+recs = [p for p in glob.glob(os.environ["SMOKE"] + "/rehearsal/state/code-sources/activations/*.json") if os.environ["WINNER"] in os.path.basename(p)]
 if not recs:
-    print("S2 FAIL: no activation record"); sys.exit(1)
+    print("S2 FAIL: no activation record for the smoke project"); sys.exit(1)
 r = json.load(open(recs[0]))
 ok = r.get("version") == 2 and r.get("published_scope") and r.get("cutback") is None and r.get("cutback_pending") is False
 print("S2", "PASS: strict v2 activation, scope", r.get("published_scope"), "cutback None/false" if ok else "FAIL: " + json.dumps(r)[:200])
@@ -134,7 +136,7 @@ EOF
     else echo "S3 FAIL"; tail -5 "$SMOKE/daemon.log"; return 1; fi ;;
   s4)
     cp "$SMOKE/daemon-config.toml" "$SMOKE/daemon-config.toml.bak"
-    printf '[code_collection]\nenabled = true\n' > "$SMOKE/daemon-config.toml"
+    printf '[code_collection]\nenabled = false\n' > "$SMOKE/daemon-config.toml"
     kill -HUP "$(cat "$SMOKE/daemon.pid")"; sleep 5
     if "$BIN/bbox-code-collector" --config "$SMOKE/collector-config.toml" once > "$SMOKE/s4-collector.log" 2>&1; then
       echo "S4 FAIL: revoked token still accepted"; return 1
