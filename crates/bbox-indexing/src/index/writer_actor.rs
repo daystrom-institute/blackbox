@@ -33,6 +33,8 @@ use tantivy::query::TermQuery;
 use tantivy::schema::{IndexRecordOption, Term};
 use tantivy::{Index, IndexReader, IndexWriter};
 
+use bbox_corpus_core::code_project_identity::{CodeProjectIdentity, IdentityOrigin};
+use bbox_corpus_core::project_catalog::ProjectScope;
 use bbox_corpus_core::project_record::ProjectRecord;
 use bbox_knowledge::knowledge::KnowledgeEntry;
 use bbox_stores::roadmap::RoadmapItem;
@@ -90,8 +92,12 @@ pub enum IndexWriteOp {
         dirty: bool,
         ack: mpsc::SyncSender<Result<String>>,
     },
+    /// Stage one collected generation. Identity-first (Phase 3 plan section 6
+    /// item 1): the op carries no checkout path and the handler opens no Git,
+    /// so a collected generation can be staged for a project with zero
+    /// attachments.
     StageCollectedGeneration {
-        project: Box<ProjectRecord>,
+        identity: Box<CodeProjectIdentity>,
         descriptor: Box<bbox_code_source::GenerationDescriptor>,
         generation_id: String,
         entries: Vec<bbox_code_source::ManifestEntry>,
@@ -100,13 +106,31 @@ pub enum IndexWriteOp {
         release: mpsc::Receiver<()>,
         hold_state: Arc<AtomicU8>,
     },
+    /// Stage one local generation by walking the leased checkout.
+    ///
+    /// `scope` is the authorized producer scope the caller acted on. For a
+    /// `Catalog` identity it must equal the identity's own published scope
+    /// (the handler refuses a mismatch); for a `Bridge` identity it is the
+    /// only `PublishedScope` in existence, because a bridge record carries
+    /// none and D-034 forbids fabricating one.
     StageLocalGeneration {
-        project: Box<ProjectRecord>,
+        identity: Box<CodeProjectIdentity>,
         scope: Box<bbox_corpus_core::identity::PublishedScope>,
         store: std::sync::Arc<bbox_code_source_store::CodeSourceStore>,
         ack: mpsc::SyncSender<Result<super::project_files::CollectedIndexResult>>,
         release: mpsc::Receiver<()>,
         hold_state: Arc<AtomicU8>,
+    },
+    /// Post-activation Git current-file overlay (Phase 3 plan section 6
+    /// item 3). Runs AFTER a collected generation is already active, never
+    /// inside its transaction: the daemon acquires the `GitHistory` lease,
+    /// hands it here for the walk, and treats every failure as best effort.
+    StageGitCurrentOverlay {
+        project: Box<ProjectRecord>,
+        lease: Box<ValidatedCheckoutLease>,
+        snapshot_id: String,
+        current_chunk_targets: HashMap<String, bbox_corpus_core::entity_ref::EntityRef>,
+        ack: mpsc::SyncSender<Result<()>>,
     },
     RetireCodeSelector {
         selector: String,
@@ -262,7 +286,7 @@ pub(super) fn acquire_project_leases(
         .cloned()
         .map(|project| {
             let publisher_config = broker.acquire(access_request(
-                &project,
+                &project.project_id,
                 None,
                 CheckoutAccessKind::PublisherConfigTreeRead,
             ));
@@ -278,7 +302,7 @@ pub(super) fn acquire_project_leases(
                 (None, None)
             } else {
                 match broker.acquire(access_request(
-                    &project,
+                    &project.project_id,
                     expected_scope.clone(),
                     CheckoutAccessKind::LocalProjectWalk,
                 )) {
@@ -288,7 +312,7 @@ pub(super) fn acquire_project_leases(
             };
             let (git, git_denial) = if project.is_git_repo {
                 match broker.acquire(access_request(
-                    &project,
+                    &project.project_id,
                     expected_scope.clone(),
                     CheckoutAccessKind::GitHistory,
                 )) {
@@ -301,7 +325,7 @@ pub(super) fn acquire_project_leases(
             let (knowledge_overlay, knowledge_overlay_denial) =
                 if purpose == ProjectLeasePurpose::Reindex {
                     match broker.acquire(access_request(
-                        &project,
+                        &project.project_id,
                         expected_scope,
                         CheckoutAccessKind::KnowledgeGapOverlayRead,
                     )) {
@@ -369,12 +393,12 @@ pub(super) fn revalidate_project_leases(
 }
 
 fn access_request(
-    project: &ProjectRecord,
+    project_id: &str,
     expected_scope: Option<bbox_corpus_core::identity::PublishedScope>,
     kind: CheckoutAccessKind,
 ) -> CheckoutAccessRequest {
     CheckoutAccessRequest {
-        project_id: project.project_id.clone(),
+        project_id: project_id.to_string(),
         attachment: CheckoutAttachmentSelector::Selected,
         expected_scope,
         kind,
@@ -548,7 +572,7 @@ impl IndexWriterActor {
 
     pub fn stage_collected_generation(
         &self,
-        project: ProjectRecord,
+        identity: CodeProjectIdentity,
         descriptor: bbox_code_source::GenerationDescriptor,
         generation_id: String,
         entries: Vec<bbox_code_source::ManifestEntry>,
@@ -559,7 +583,7 @@ impl IndexWriterActor {
         let hold_state = Arc::new(AtomicU8::new(STAGE_HOLD_HELD));
         self.tx
             .send(IndexWriteOp::StageCollectedGeneration {
-                project: Box::new(project),
+                identity: Box::new(identity),
                 descriptor: Box::new(descriptor),
                 generation_id,
                 entries,
@@ -581,7 +605,7 @@ impl IndexWriterActor {
 
     pub fn stage_local_generation(
         &self,
-        project: ProjectRecord,
+        identity: CodeProjectIdentity,
         scope: bbox_corpus_core::identity::PublishedScope,
         store: std::sync::Arc<bbox_code_source_store::CodeSourceStore>,
     ) -> Result<StagedIndexGeneration> {
@@ -590,7 +614,7 @@ impl IndexWriterActor {
         let hold_state = Arc::new(AtomicU8::new(STAGE_HOLD_HELD));
         self.tx
             .send(IndexWriteOp::StageLocalGeneration {
-                project: Box::new(project),
+                identity: Box::new(identity),
                 scope: Box::new(scope),
                 store,
                 ack,
@@ -606,6 +630,33 @@ impl IndexWriterActor {
             release: Some(release),
             hold_state,
         })
+    }
+
+    /// Stage the Git current-file overlay for an ALREADY ACTIVE generation
+    /// (Phase 3 plan section 6 item 3). The caller owns the `GitHistory`
+    /// lease and the best-effort policy: this returns the walk's error
+    /// instead of rolling anything back, because the generation it decorates
+    /// is already published and must stay published.
+    pub fn stage_git_current_overlay(
+        &self,
+        project: ProjectRecord,
+        lease: ValidatedCheckoutLease,
+        snapshot_id: String,
+        current_chunk_targets: HashMap<String, bbox_corpus_core::entity_ref::EntityRef>,
+    ) -> Result<()> {
+        let (ack, ack_rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(IndexWriteOp::StageGitCurrentOverlay {
+                project: Box::new(project),
+                lease: Box::new(lease),
+                snapshot_id,
+                current_chunk_targets,
+                ack,
+            })
+            .map_err(|_| anyhow!("index writer actor unavailable"))?;
+        ack_rx
+            .recv()
+            .map_err(|_| anyhow!("index writer actor dropped the git-overlay ack"))?
     }
 
     pub fn retire_code_selector(&self, selector: String) -> Result<RetiredCodeSelector> {
@@ -661,7 +712,7 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
                 let _ = ack.send(result);
             }
             IndexWriteOp::StageCollectedGeneration {
-                project,
+                identity,
                 descriptor,
                 generation_id,
                 entries,
@@ -672,7 +723,7 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
             } => {
                 let result = run_collected_stage(
                     &ctx,
-                    &project,
+                    &identity,
                     &descriptor,
                     &generation_id,
                     &entries,
@@ -690,14 +741,14 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
                 }
             }
             IndexWriteOp::StageLocalGeneration {
-                project,
+                identity,
                 scope,
                 store,
                 ack,
                 release,
                 hold_state,
             } => {
-                let result = run_local_stage(&ctx, &project, &scope, &store);
+                let result = run_local_stage(&ctx, &identity, &scope, &store);
                 let should_hold = result.is_ok();
                 let _ = ack.send(result);
                 if should_hold {
@@ -708,6 +759,22 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
                         STAGED_GENERATION_HOLD_TIMEOUT,
                     );
                 }
+            }
+            IndexWriteOp::StageGitCurrentOverlay {
+                project,
+                lease,
+                snapshot_id,
+                current_chunk_targets,
+                ack,
+            } => {
+                let result = run_git_current_overlay(
+                    &ctx,
+                    &project,
+                    &lease,
+                    &snapshot_id,
+                    &current_chunk_targets,
+                );
+                let _ = ack.send(result);
             }
             IndexWriteOp::RetireCodeSelector {
                 selector,
@@ -741,6 +808,10 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
                         }
                         Ok(stage @ IndexWriteOp::StageLocalGeneration { .. }) => {
                             deferred = Some(stage);
+                            break;
+                        }
+                        Ok(overlay @ IndexWriteOp::StageGitCurrentOverlay { .. }) => {
+                            deferred = Some(overlay);
                             break;
                         }
                         Ok(retirement @ IndexWriteOp::RetireCodeSelector { .. }) => {
@@ -793,127 +864,92 @@ fn await_generation_stage_release(
     }
 }
 
+/// Resolve the version-1 compatibility document fields the identity does not
+/// carry, from the attached record when one exists.
+///
+/// A remote-only catalog project has no `ProjectRecord` at all and therefore
+/// neither field; that is the correct answer, not a degradation. The lookup
+/// runs against the same epoch-cached provider snapshot every other consumer
+/// reads, so it cannot disagree with the daemon-side resolution.
+fn compat_record(ctx: &ActorCtx, project_id: &str) -> Option<ProjectRecord> {
+    ctx.records_provider
+        .records_snapshot()
+        .records
+        .iter()
+        .find(|record| record.project_id == project_id)
+        .cloned()
+}
+
+/// Refuse collected staging for an identity that cannot own a producer grant
+/// (Phase 3 plan section 6 item 1, D-034).
+///
+/// The predicate is exactly the one pinned in
+/// `bbox_corpus_core::code_project_identity`: refuse if and only if the
+/// identity came from the catalog AND its scope is `LegacyLocal`, because a
+/// catalog `LegacyLocal` project has no published scope to collect under. A
+/// `Bridge` identity always proceeds regardless of scope: bridge collected
+/// staging runs on lease/grant-table authority through Phase 3, and its
+/// placeholder `LegacyLocal` scope is an absence marker, not a signal.
+fn refuse_collected_staging_for_legacy_local(identity: &CodeProjectIdentity) -> Result<()> {
+    if identity.origin == IdentityOrigin::Catalog && identity.scope == ProjectScope::LegacyLocal {
+        anyhow::bail!(
+            "error.collected_source_scope_unavailable: catalog project {} is LegacyLocal \
+             and cannot own a collected generation",
+            identity.project_id.as_str()
+        );
+    }
+    Ok(())
+}
+
+/// Stage a collected generation with NO checkout access whatsoever.
+///
+/// Governing section 11 / Phase 3 plan section 6 item 2: the activation
+/// transaction commits code documents, code edges, the vector enqueue, and
+/// the selector without opening Git. There is no `GitHistory` lease, no
+/// current-file edge staging, and no post-stage revalidate/restage cycle
+/// here any more, so a Git problem can no longer fail or roll back a valid
+/// collected generation (F5). Current-file Git edges are a post-activation
+/// best-effort overlay owned by the daemon (`StageGitCurrentOverlay`).
 fn run_collected_stage(
     ctx: &ActorCtx,
-    project: &ProjectRecord,
+    identity: &CodeProjectIdentity,
     descriptor: &bbox_code_source::GenerationDescriptor,
     generation_id: &str,
     entries: &[bbox_code_source::ManifestEntry],
     store: &bbox_code_source_store::CodeSourceStore,
 ) -> Result<super::project_files::CollectedIndexResult> {
-    let mut git_lease = if project.repo_id.is_some() {
-        match ctx.checkout_access.acquire(access_request(
-            project,
-            Some(descriptor.scope.clone()),
-            CheckoutAccessKind::GitHistory,
-        )) {
-            Ok(lease) => {
-                if let Err(error) =
-                    store.clear_health_failure(&project.project_id, "git_history_unavailable")
-                {
-                    tracing::warn!(
-                        project_id = %project.project_id,
-                        error = %error,
-                        "failed to clear GitHistory degradation record"
-                    );
-                }
-                Some(lease)
-            }
-            Err(error) => {
-                if let Err(record_error) = store.record_health_failure(
-                    &project.project_id,
-                    "git_history_unavailable",
-                    &format!("GitHistory access unavailable: {}", error.code.as_str()),
-                ) {
-                    tracing::warn!(
-                        project_id = %project.project_id,
-                        error = %record_error,
-                        "failed to persist GitHistory degradation record"
-                    );
-                }
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // Fails BEFORE any writer work: no writer is created, no document is
+    // staged, and no store state moves.
+    refuse_collected_staging_for_legacy_local(identity)?;
+    let compat = compat_record(ctx, identity.project_id.as_str());
     let edges_dir =
         bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&ctx.config.projects_path);
-    let stage_code =
-        |writer: &mut IndexWriter,
-         publication: &mut super::project_files::ProjectIndexPublicationBundle| {
-            super::project_files::stage_collected_project_generation(
-                project,
-                descriptor,
-                generation_id,
-                entries,
-                ctx.fields,
-                writer,
-                &edges_dir,
-                publication,
-                |entry| {
-                    let mut file = store.verified_blob_file(&entry.content_sha256, entry.size)?;
-                    let mut bytes = Vec::with_capacity(entry.size as usize);
-                    std::io::Read::read_to_end(&mut file, &mut bytes)?;
-                    Ok(bytes)
-                },
-            )
-        };
     let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
     writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
     let mut publication = super::project_files::ProjectIndexPublicationBundle::default();
-    let mut result = stage_code(&mut writer, &mut publication)?;
-    stage_git_current_edges(
-        ctx,
-        project,
-        git_lease
-            .as_ref()
-            .map(ValidatedCheckoutLease::checkout_root),
-        &result,
+    let result = super::project_files::stage_collected_project_generation(
+        identity,
+        super::project_files::ProjectFileCompatFields {
+            repo_id: compat.as_ref().and_then(|record| record.repo_id.as_deref()),
+            project_display: None,
+        },
+        descriptor,
+        generation_id,
+        entries,
+        ctx.fields,
         &mut writer,
         &edges_dir,
         &mut publication,
+        |entry| {
+            let mut file = store.verified_blob_file(&entry.content_sha256, entry.size)?;
+            let mut bytes = Vec::with_capacity(entry.size as usize);
+            std::io::Read::read_to_end(&mut file, &mut bytes)?;
+            Ok(bytes)
+        },
     )?;
-    if let Some(active_git_lease) = &git_lease
-        && let Err(error) = ctx.checkout_access.revalidate(active_git_lease)
-    {
-        tracing::warn!(
-            project_id = %project.project_id,
-            error_code = %error.code.as_str(),
-            "GitHistory authority changed during collected staging; retrying path-free"
-        );
-        if let Err(record_error) = store.record_health_failure(
-            &project.project_id,
-            "git_history_unavailable",
-            &format!("GitHistory authority changed: {}", error.code.as_str()),
-        ) {
-            tracing::warn!(
-                project_id = %project.project_id,
-                error = %record_error,
-                "failed to persist GitHistory degradation record"
-            );
-        }
-        drop(writer);
-        drop(publication);
-        writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
-        writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
-        publication = super::project_files::ProjectIndexPublicationBundle::default();
-        result = stage_code(&mut writer, &mut publication)?;
-        stage_git_current_edges(
-            ctx,
-            project,
-            None,
-            &result,
-            &mut writer,
-            &edges_dir,
-            &mut publication,
-        )?;
-        git_lease = None;
-    }
-    let _publication_guard = git_lease
-        .as_ref()
-        .map(|lease| ctx.checkout_access.publication_guard(lease))
-        .transpose()?;
+    // No checkout lease contributed to this bundle, so there is no
+    // publication guard to hold: the broker's guard exists to pin checkout
+    // lifecycle across publish, and this transaction touched no checkout.
     publication.publish()?;
     writer.commit()?;
     post_commit(ctx);
@@ -922,12 +958,26 @@ fn run_collected_stage(
 
 fn run_local_stage(
     ctx: &ActorCtx,
-    project: &ProjectRecord,
+    identity: &CodeProjectIdentity,
     scope: &bbox_corpus_core::identity::PublishedScope,
     store: &bbox_code_source_store::CodeSourceStore,
 ) -> Result<super::project_files::CollectedIndexResult> {
+    let project_id = identity.project_id.as_str();
+    // A catalog identity carries its own published scope; the authorized
+    // producer scope must be that same scope (P3-B resolves the grant table
+    // by exact scope equality against the catalog snapshot, so a mismatch is
+    // a bug, not a policy). A bridge identity has no catalog scope at all
+    // and the caller-supplied one is authoritative (D-034).
+    if let ProjectScope::Published(identity_scope) = &identity.scope
+        && identity_scope != scope
+    {
+        anyhow::bail!(
+            "error.local_source_scope_mismatch: catalog project {project_id} publishes a \
+             different scope than the authorized producer scope"
+        );
+    }
     let local_lease = ctx.checkout_access.acquire(access_request(
-        project,
+        project_id,
         Some(scope.clone()),
         CheckoutAccessKind::LocalProjectWalk,
     ))?;
@@ -939,16 +989,14 @@ fn run_local_stage(
     // (review M10: consistent degradation policy) and refuses with that
     // diagnostic instead of a bare lease error.
     let git_lease = match ctx.checkout_access.acquire(access_request(
-        project,
+        project_id,
         Some(scope.clone()),
         CheckoutAccessKind::GitHistory,
     )) {
         Ok(lease) => {
-            if let Err(error) =
-                store.clear_health_failure(&project.project_id, "git_history_unavailable")
-            {
+            if let Err(error) = store.clear_health_failure(project_id, "git_history_unavailable") {
                 tracing::warn!(
-                    project_id = %project.project_id,
+                    project_id,
                     error = %error,
                     "failed to clear GitHistory degradation record"
                 );
@@ -957,12 +1005,12 @@ fn run_local_stage(
         }
         Err(error) => {
             if let Err(record_error) = store.record_health_failure(
-                &project.project_id,
+                project_id,
                 "git_history_unavailable",
                 &format!("GitHistory access unavailable: {}", error.code.as_str()),
             ) {
                 tracing::warn!(
-                    project_id = %project.project_id,
+                    project_id,
                     error = %record_error,
                     "failed to persist GitHistory degradation record"
                 );
@@ -973,13 +1021,21 @@ fn run_local_stage(
             ));
         }
     };
+    let compat = compat_record(ctx, project_id);
     let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
     writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
     let edges_dir =
         bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&ctx.config.projects_path);
     let mut publication = super::project_files::ProjectIndexPublicationBundle::default();
     let result = super::project_files::stage_local_project_generation(
-        project,
+        identity,
+        super::project_files::ProjectFileCompatFields {
+            repo_id: compat.as_ref().and_then(|record| record.repo_id.as_deref()),
+            // Local documents keep the registered display root this
+            // milestone; only collected documents go path-free at P3-B
+            // (plan section 4.3 item 2).
+            project_display: compat.as_ref().map(|record| record.canonical_path.as_str()),
+        },
         scope,
         local_lease.project_root(),
         git_lease.checkout_root(),
@@ -988,15 +1044,30 @@ fn run_local_stage(
         &edges_dir,
         &mut publication,
     )?;
-    stage_git_current_edges(
-        ctx,
-        project,
-        Some(git_lease.checkout_root()),
-        &result,
-        &mut writer,
-        &edges_dir,
-        &mut publication,
-    )?;
+    // Local staging keeps its in-transaction Git behavior this milestone
+    // (plan section 6 item 3); it converts with the overlay machinery.
+    // The record is present on the bridge cutback path exercised this
+    // milestone; catalog-mode local cutback (a Phase 4 transition) can
+    // reach the None arm when the compatibility projection omits the
+    // project, and the Git walk still needs the record's repo id, so that
+    // case skips the current-file member (an optional snapshot member)
+    // instead of guessing. Phase 4 should resolve the repo id from the
+    // catalog identity instead.
+    match compat.as_ref() {
+        Some(record) => stage_git_current_edges(
+            ctx,
+            record,
+            Some(git_lease.checkout_root()),
+            &result,
+            &mut writer,
+            &edges_dir,
+            &mut publication,
+        )?,
+        None => tracing::warn!(
+            project_id,
+            "local staging has no compatibility record; skipping the Git current-file member"
+        ),
+    }
     let _publication_guard = ctx
         .checkout_access
         .publication_guard_for([&local_lease, &git_lease])?;
@@ -1004,6 +1075,51 @@ fn run_local_stage(
     writer.commit()?;
     post_commit(ctx);
     Ok(result)
+}
+
+/// Walk Git for an already-active generation and publish its current-file
+/// overlay (Phase 3 plan section 6 item 3).
+///
+/// Failure here never touches the generation: the caller reports it as
+/// degraded health and leaves the active selector, documents, and snapshot
+/// exactly as the activation left them.
+fn run_git_current_overlay(
+    ctx: &ActorCtx,
+    project: &ProjectRecord,
+    lease: &ValidatedCheckoutLease,
+    snapshot_id: &str,
+    current_chunk_targets: &HashMap<String, bbox_corpus_core::entity_ref::EntityRef>,
+) -> Result<()> {
+    let edges_dir =
+        bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&ctx.config.projects_path);
+    let git_meta_dir =
+        super::git_history::git_meta_dir_from_projects_path(&ctx.config.projects_path);
+    let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
+    writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
+    let mut publication = super::project_files::ProjectIndexPublicationBundle::default();
+    let mut meta = HashMap::new();
+    let mut git_ctx = super::git_history::GitIndexContext {
+        f: ctx.fields,
+        writer: &mut writer,
+        meta: &mut meta,
+        edges_dir: &edges_dir,
+        git_meta_dir: &git_meta_dir,
+        force_full: true,
+        publication: &mut publication,
+    };
+    super::git_history::index_git_history_for_project(
+        project,
+        lease.checkout_root(),
+        current_chunk_targets,
+        &mut git_ctx,
+    )?;
+    drop(git_ctx);
+    publication.stage_snapshot_git_current(&edges_dir, &project.project_id, snapshot_id, true);
+    let _publication_guard = ctx.checkout_access.publication_guard(lease)?;
+    publication.publish()?;
+    writer.commit()?;
+    post_commit(ctx);
+    Ok(())
 }
 
 fn stage_git_current_edges(
@@ -1171,6 +1287,11 @@ fn run_pass(
                             IndexWriterRetryableError::ReindexPassInProgress,
                         )));
                     }
+                    IndexWriteOp::StageGitCurrentOverlay { ack, .. } => {
+                        let _ = ack.send(Err(anyhow::Error::new(
+                            IndexWriterRetryableError::ReindexPassInProgress,
+                        )));
+                    }
                     IndexWriteOp::RetireCodeSelector { ack, .. } => {
                         let _ = ack.send(Err(anyhow::Error::new(
                             IndexWriterRetryableError::ReindexPassInProgress,
@@ -1294,6 +1415,7 @@ fn apply_small_op(ctx: &ActorCtx, writer: &mut IndexWriter, op: IndexWriteOp) {
         IndexWriteOp::ReindexPass { .. }
         | IndexWriteOp::StageCollectedGeneration { .. }
         | IndexWriteOp::StageLocalGeneration { .. }
+        | IndexWriteOp::StageGitCurrentOverlay { .. }
         | IndexWriteOp::RetireCodeSelector { .. }
         | IndexWriteOp::Flush(_) => {
             debug_assert!(false, "control ops are routed before apply_small_op");
@@ -1566,28 +1688,23 @@ mod tests {
         assert_eq!(local.denied, 1);
     }
 
-    #[test]
-    fn collected_stage_degrades_git_without_requesting_local_access() {
+    /// Build a bridge identity for a staging test. Collected staging is
+    /// identity-first, so tests no longer hand it a checkout path.
+    fn bridge_identity(project_id: &str, repo_id: Option<&str>) -> CodeProjectIdentity {
+        CodeProjectIdentity::from_bridge_record(&attached_record(project_id, repo_id)).unwrap()
+    }
+
+    struct CollectedFixture {
+        descriptor: bbox_code_source::GenerationDescriptor,
+        generation_id: String,
+        entries: Vec<bbox_code_source::ManifestEntry>,
+        store: Arc<bbox_code_source_store::CodeSourceStore>,
+    }
+
+    /// One finalized collected generation in a real store, ready to stage.
+    fn collected_fixture(root: &std::path::Path) -> CollectedFixture {
         use sha2::{Digest, Sha256};
 
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let projects = Arc::new(parking_lot::RwLock::new(
-            ProjectRegistry::open(root.join("projects.json")).unwrap(),
-        ));
-        let observations = crate::checkout_access::CheckoutAccessObservations::in_memory();
-        let broker = Arc::new(CheckoutAccessBroker::new(
-            Arc::new(crate::checkout_access::DenyCheckoutAccess),
-            observations,
-        ));
-        let index = test_index(&root);
-        let records_provider: Arc<dyn ProjectRecordsProvider> =
-            Arc::new(crate::projects::BridgeProjectRecordsProvider::new(projects));
-        let actor = IndexWriterActor::spawn_for_with_checkout_access(
-            &index,
-            records_provider,
-            broker.clone(),
-        );
         let store = Arc::new(
             bbox_code_source_store::CodeSourceStore::open(
                 root.join("code-sources"),
@@ -1630,56 +1747,259 @@ mod tests {
             )
             .unwrap();
         let generation = store.finalize_upload("host-a", &upload.upload_id).unwrap();
-        let project = ProjectRecord {
-            project_id: "collected-project".into(),
-            repo_id: Some("repo-family".into()),
+        CollectedFixture {
+            descriptor,
+            generation_id: generation.generation_id,
+            entries,
+            store,
+        }
+    }
+
+    /// Records provider returning a fixed set of attached rows. The staging
+    /// path resolves the version-1 compatibility document fields (`repo_id`,
+    /// and the local display root) through this provider, so tests that pin
+    /// those fields state the attached record explicitly instead of standing
+    /// up a registry.
+    struct FixedRecordsProvider(Vec<ProjectRecord>);
+
+    impl ProjectRecordsProvider for FixedRecordsProvider {
+        fn records_snapshot(&self) -> bbox_corpus_core::project_record::ProjectRecordsSnapshot {
+            bbox_corpus_core::project_record::ProjectRecordsSnapshot::from_bridge_records(
+                self.0.clone(),
+                1,
+            )
+        }
+    }
+
+    fn deny_all_actor(
+        index: &TranscriptIndex,
+        records: Vec<ProjectRecord>,
+    ) -> (IndexWriterActor, Arc<CheckoutAccessBroker>) {
+        let broker = Arc::new(CheckoutAccessBroker::new(
+            Arc::new(crate::checkout_access::DenyCheckoutAccess),
+            crate::checkout_access::CheckoutAccessObservations::in_memory(),
+        ));
+        let records_provider: Arc<dyn ProjectRecordsProvider> =
+            Arc::new(FixedRecordsProvider(records));
+        let actor = IndexWriterActor::spawn_for_with_checkout_access(
+            index,
+            records_provider,
+            broker.clone(),
+        );
+        (actor, broker)
+    }
+
+    fn attached_record(project_id: &str, repo_id: Option<&str>) -> ProjectRecord {
+        ProjectRecord {
+            project_id: project_id.into(),
+            repo_id: repo_id.map(str::to_string),
             canonical_path: "/unavailable/remote/project".into(),
             registered_at: "2026-07-22T00:00:00Z".into(),
-            is_git_repo: true,
+            is_git_repo: repo_id.is_some(),
             languages: Default::default(),
             aliases: Default::default(),
-        };
+        }
+    }
+
+    /// Phase 3 plan section 6 item 2 (governing section 11, closing F5): the
+    /// collected activation transaction opens no Git and acquires NO
+    /// checkout lease of any kind. Under a deny-all broker the stage still
+    /// succeeds, every lease counter stays at zero, no degradation health is
+    /// recorded by staging itself, and no `git-current.jsonl` member is
+    /// staged (the post-activation overlay owns that file now).
+    #[test]
+    fn collected_stage_acquires_zero_leases_and_stages_no_git_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = test_index(&root);
+        let (actor, broker) = deny_all_actor(
+            &index,
+            vec![attached_record("collected-project", Some("repo-family"))],
+        );
+        let fixture = collected_fixture(&root);
+        let identity = bridge_identity("collected-project", Some("repo-family"));
 
         let staged = actor
             .stage_collected_generation(
-                project.clone(),
-                descriptor,
-                generation.generation_id,
-                entries,
-                store.clone(),
+                identity,
+                fixture.descriptor,
+                fixture.generation_id,
+                fixture.entries,
+                fixture.store.clone(),
             )
             .unwrap();
         let snapshot_id = staged.snapshot_id.clone();
         drop(staged);
 
         let health = broker.health();
-        let local_attempts = health
+        let attempted: u64 = health
             .operations
             .iter()
-            .find(|operation| operation.kind == CheckoutAccessKind::LocalProjectWalk)
             .map(|operation| operation.granted + operation.denied)
-            .unwrap_or(0);
-        assert_eq!(local_attempts, 0);
-        let git = health
-            .operations
-            .iter()
-            .find(|operation| operation.kind == CheckoutAccessKind::GitHistory)
-            .unwrap();
-        assert_eq!(git.granted, 0);
-        assert_eq!(git.denied, 1);
-        assert!(store.health_records().unwrap().iter().any(|record| {
-            record.project_id == project.project_id && record.code == "git_history_unavailable"
-        }));
+            .sum();
+        assert_eq!(
+            attempted, 0,
+            "collected staging must acquire no checkout lease at all"
+        );
+        assert!(
+            fixture.store.health_records().unwrap().is_empty(),
+            "collected staging no longer records a Git degradation of its own"
+        );
         let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
             &root.join("projects.json"),
         );
-        let git_overlay = bbox_edge_sidecar::snapshot::snapshot_dir(
+        let snapshot_dir = bbox_edge_sidecar::snapshot::snapshot_dir(
             &edges_dir,
-            &project.project_id,
+            "collected-project",
             &snapshot_id,
-        )
-        .join("git-current.jsonl");
-        assert_eq!(std::fs::read_to_string(git_overlay).unwrap(), "");
+        );
+        assert!(
+            snapshot_dir.join("project.jsonl").is_file(),
+            "the code-edge snapshot member is still published in the transaction"
+        );
+        assert!(
+            !snapshot_dir.join("git-current.jsonl").exists(),
+            "the Git overlay member is staged post-activation, not in the transaction"
+        );
+    }
+
+    /// Phase 3 plan section 6 item 1 (D-034): the typed refusal fires for a
+    /// catalog `LegacyLocal` identity and for that alone, BEFORE any writer
+    /// work - nothing is staged and the store is untouched.
+    #[test]
+    fn collected_stage_refuses_a_catalog_legacy_local_identity() {
+        use bbox_corpus_core::project_catalog::{CorpusProject, ProjectId, ProjectScope};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = test_index(&root);
+        let (actor, broker) = deny_all_actor(&index, Vec::new());
+        let fixture = collected_fixture(&root);
+        let project = CorpusProject {
+            project_id: ProjectId::parse("p_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            scope: ProjectScope::LegacyLocal,
+            operator_aliases: Default::default(),
+            nominated_aliases: Default::default(),
+            display_name: "legacy-local".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            registered_at_compat: None,
+            repo_history: None,
+            languages: Default::default(),
+        };
+        let identity = CodeProjectIdentity::from_catalog(&project, None);
+
+        let error = actor
+            .stage_collected_generation(
+                identity,
+                fixture.descriptor,
+                fixture.generation_id,
+                fixture.entries,
+                fixture.store.clone(),
+            )
+            .map(|_| ())
+            .expect_err("a catalog LegacyLocal project cannot own a collected generation");
+        assert!(
+            error
+                .to_string()
+                .contains("error.collected_source_scope_unavailable"),
+            "unexpected refusal diagnostic: {error}"
+        );
+        let attempted: u64 = broker
+            .health()
+            .operations
+            .iter()
+            .map(|operation| operation.granted + operation.denied)
+            .sum();
+        assert_eq!(attempted, 0, "the refusal precedes every lease decision");
+    }
+
+    /// The refusal keys on origin AND scope: a bridge identity carries a
+    /// placeholder `LegacyLocal` scope for lack of anywhere else to put "no
+    /// catalog scope resolved", and refusing it would break live bridge
+    /// collected staging.
+    #[test]
+    fn collected_stage_proceeds_for_a_bridge_legacy_local_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = test_index(&root);
+        let (actor, _broker) = deny_all_actor(
+            &index,
+            vec![attached_record("bridge-project", Some("repo-family"))],
+        );
+        let fixture = collected_fixture(&root);
+        let identity = bridge_identity("bridge-project", Some("repo-family"));
+        assert_eq!(
+            identity.scope,
+            bbox_corpus_core::project_catalog::ProjectScope::LegacyLocal
+        );
+
+        let staged = actor
+            .stage_collected_generation(
+                identity,
+                fixture.descriptor,
+                fixture.generation_id,
+                fixture.entries,
+                fixture.store.clone(),
+            )
+            .expect("every bridge identity proceeds through collected staging");
+        assert_eq!(staged.document_count, 1);
+    }
+
+    /// The staged documents carry the identity's project id, not a checkout
+    /// path (Phase 3 plan section 6 item 5, closing F6). The `project` and
+    /// `file_path` fields take the doc builder's absent-display-root
+    /// fallback: the project id and the normalized relative path.
+    #[test]
+    fn collected_documents_are_path_free_after_the_display_root_cut() {
+        use tantivy::collector::TopDocs;
+        use tantivy::query::TermQuery;
+        use tantivy::schema::{IndexRecordOption, Term};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = test_index(&root);
+        let (actor, _broker) = deny_all_actor(
+            &index,
+            vec![attached_record("collected-project", Some("repo-family"))],
+        );
+        let fixture = collected_fixture(&root);
+        let identity = bridge_identity("collected-project", Some("repo-family"));
+        let fields = index.field_handles();
+
+        let staged = actor
+            .stage_collected_generation(
+                identity,
+                fixture.descriptor,
+                fixture.generation_id.clone(),
+                fixture.entries,
+                fixture.store.clone(),
+            )
+            .unwrap();
+        let selector = staged.selector.clone();
+        drop(staged);
+        actor.flush_blocking().unwrap();
+
+        let reader = index.index_handle().reader().unwrap();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+        let query = TermQuery::new(
+            Term::from_field_text(fields.code_source_selector, &selector),
+            IndexRecordOption::Basic,
+        );
+        let hits = searcher.search(&query, &TopDocs::with_limit(4)).unwrap();
+        assert_eq!(hits.len(), 1);
+        let document = searcher.doc::<tantivy::TantivyDocument>(hits[0].1).unwrap();
+        let text = |field: tantivy::schema::Field| match document.get_first(field) {
+            Some(tantivy::schema::OwnedValue::Str(value)) => value.clone(),
+            other => panic!("expected a text field, got {other:?}"),
+        };
+        // The two enumerated changes (plan section 4.3 item 2, step one).
+        assert_eq!(text(fields.project), "collected-project");
+        assert_eq!(text(fields.file_path), "src/lib.rs");
+        // Everything else on the document is unchanged.
+        assert_eq!(text(fields.project_id), "collected-project");
+        assert_eq!(text(fields.repo_id), "repo-family");
+        assert_eq!(text(fields.doc_type), "project_file");
     }
 
     /// Write entries into the on-disk central kb store. Reindex passes

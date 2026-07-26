@@ -366,6 +366,17 @@ observable stays at parity, enforced by the parity harness:
    `corpus_project_ids` (F3/F4). In bridge mode the two sets are identical
    by construction (every registered project is attached), so this is a
    no-op there; the parity harness asserts exactly that.
+6. Defect repair discovered by the P3-B bridge bootsmoke: the first
+   collected activation of a previously locally indexed project was wedged
+   at the baseline (`validate_retirement_record` applied the strict
+   migration snapshot-id shape to the OUTGOING snapshot id, refusing the
+   `head-`/`nongit-` local snapshot every local-to-collected transition
+   retires; introduced by a Phase 1-era repair commit and never reachable
+   in any prior test or smoke). The retirement validator now uses the
+   general snapshot-id shape; the strict migration shape is unchanged for
+   its migration and collision consumers. This converts a permanent
+   activation backoff loop into the designed behavior; regression tests
+   cover the accepted outgoing shapes and the unsafe-id rejections.
 
 ### 4.4 Unclaimed namespaces: importer refusal stays, materializer handles drift
 
@@ -518,15 +529,19 @@ Ownership: `bbox-corpus-index/project_files.rs`, `bbox-indexing/writer_actor.rs`
    vectors enqueue, and the selector without opening Git (governing
    section 11). `activate_collected_snapshot_with` keeps its signature this
    milestone; the `head_commit`/`repo_id` arguments become advisory metadata.
-3. Git current-file edges for both collected and local-cutback activations
-   move to a post-activation, best-effort step owned by the daemon side
+3. Git current-file edges for collected activations move to a
+   post-activation, best-effort step owned by the daemon side
    (`code_source.rs`): acquire the Git lease, walk, stage the `git-current`
    snapshot member, republish the read view; on denial or error record the
    existing `git_history_unavailable` health and leave the activation
    intact. This is the minimal overlay semantics; the typed selector arrives
-   in P3-F. Local non-cutback staging (`run_local_stage`) keeps its current
-   in-transaction Git behavior this milestone to bound the diff; it converts
-   in P3-F with the overlay machinery.
+   in P3-F. The local-cutback lane keeps its current in-transaction Git
+   behavior this milestone (`run_local_stage`, whose only production caller
+   is `cutback_to_local`, IS the cutback path; the original wording here
+   mislabeled it as a non-cutback lane and contradicted the first sentence,
+   amended per the P3-B cell review) to bound the diff and preserve the
+   local-staging parity gate; it converts to the overlay step in P3-F with
+   the overlay machinery.
 4. `activate_desired_loop` and `cutback_to_local` resolve the identity from
    the catalog snapshot in catalog mode (fixing F1 for activation) and from
    the records provider in bridge mode; the "registered project disappeared"

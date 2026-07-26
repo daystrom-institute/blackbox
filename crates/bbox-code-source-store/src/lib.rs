@@ -5234,7 +5234,18 @@ fn validate_retirement_record(record: &RetirementRecord) -> Result<()> {
     }
     let project_id = ProjectId::parse(record.project_id.clone()).map_err(|error| anyhow!(error))?;
     validate_retirement_selector(&record.selector)?;
-    validate_migration_snapshot_id(&record.snapshot_id)?;
+    // A retirement record retires a SELECTOR; its snapshot id is whatever the
+    // OUTGOING workspace entry carried, which is not a migration id. The
+    // local-to-collected transition retires a `local:` selector whose
+    // snapshot is head-bound (`head-<sha12>-<hex8>`) or dirty
+    // (`nongit-<hex16>`), so the strict migration shape rejected the first
+    // collected activation of any previously locally indexed project and the
+    // activation loop retried forever. The general shape validator is the
+    // right gate here: non-empty, bounded, no separators or control bytes,
+    // not dot-shaped. `validate_migration_snapshot_id` stays strict for its
+    // own consumers, whose ids are collected- or legacylocal-shaped by
+    // construction.
+    validate_snapshot_id(&record.snapshot_id)?;
     if let Some(generation_id) = &record.generation_id {
         validate_sha256(generation_id)?;
         validate_collected_materialization_selector(
@@ -6616,6 +6627,93 @@ mod tests {
         );
         assert!(paths.retirement_for_selector_hash(&"A".repeat(64)).is_err());
         assert!(!paths.root().exists());
+    }
+
+    /// Regression: the first collected activation of a previously locally
+    /// indexed project retires the outgoing `local:` selector, whose
+    /// snapshot id is head-bound or dirty-shaped, never a migration id.
+    /// Rejecting those failed the whole activation and the daemon retried
+    /// forever on backoff.
+    #[test]
+    fn retirement_accepts_outgoing_local_snapshot_shapes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = open_store(&root);
+
+        // A clean local checkout: head-<sha12>-<hex8>.
+        let head_bound = RetirementRecord {
+            version: STORE_VERSION,
+            project_id: "project-a".into(),
+            selector: "local:project-a".into(),
+            snapshot_id: "head-abc123def456-0011223344556677".into(),
+            generation_id: None,
+        };
+        store
+            .enqueue_retirement(&head_bound)
+            .expect("a head-bound outgoing snapshot must be retirable");
+        assert!(store.retirement_pending(&head_bound.selector).unwrap());
+        store.complete_retirement(&head_bound).unwrap();
+        assert!(!store.retirement_pending(&head_bound.selector).unwrap());
+
+        // A dirty local worktree: nongit-<hex16>.
+        let dirty = RetirementRecord {
+            version: STORE_VERSION,
+            project_id: "project-b".into(),
+            selector: "local:project-b".into(),
+            snapshot_id: format!("nongit-{}", "a".repeat(32)),
+            generation_id: None,
+        };
+        store
+            .enqueue_retirement(&dirty)
+            .expect("a dirty-worktree outgoing snapshot must be retirable");
+        assert!(store.retirement_pending(&dirty.selector).unwrap());
+        store.complete_retirement(&dirty).unwrap();
+
+        // A collected outgoing snapshot (collected-to-collected) still works.
+        let collected = RetirementRecord {
+            version: STORE_VERSION,
+            project_id: "project-c".into(),
+            selector: "local:project-c".into(),
+            snapshot_id: format!("collected-{}", "b".repeat(32)),
+            generation_id: None,
+        };
+        store
+            .enqueue_retirement(&collected)
+            .expect("a collected outgoing snapshot must stay retirable");
+        store.complete_retirement(&collected).unwrap();
+    }
+
+    /// Widening the snapshot shape must not open the path lane: the general
+    /// validator still refuses separators, traversal, control bytes, and
+    /// empty or oversized ids.
+    #[test]
+    fn retirement_still_refuses_unsafe_snapshot_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = open_store(&root);
+
+        for unsafe_id in [
+            "../../etc/passwd".to_string(),
+            "head-abc/def".to_string(),
+            "head-abc\\def".to_string(),
+            "head-abc\u{0}def".to_string(),
+            "..".to_string(),
+            ".".to_string(),
+            String::new(),
+            "h".repeat(MAX_SNAPSHOT_ID_BYTES + 1),
+        ] {
+            let record = RetirementRecord {
+                version: STORE_VERSION,
+                project_id: "project-a".into(),
+                selector: "local:project-a".into(),
+                snapshot_id: unsafe_id.clone(),
+                generation_id: None,
+            };
+            assert!(
+                store.enqueue_retirement(&record).is_err(),
+                "{unsafe_id:?} must be refused"
+            );
+        }
     }
 
     #[test]

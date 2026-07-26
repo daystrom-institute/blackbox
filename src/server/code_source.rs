@@ -19,8 +19,9 @@ use bbox_code_source_store::{
     ActivationRecord, CodeSourceStore, CollisionRetirementWorkV1, RetirementRecord, StoreLimits,
     StoreRequestError, StoredGeneration,
 };
+use bbox_corpus_core::code_project_identity::CodeProjectIdentity;
 use bbox_corpus_core::identity::PublishedScope;
-use bbox_corpus_core::project_catalog::ProjectId;
+use bbox_corpus_core::project_catalog::{CatalogSnapshotV2, ProjectId};
 use bbox_corpus_core::project_record::ProjectRecord;
 use bbox_indexing::checkout_access::{
     CheckoutAccessBroker, CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest,
@@ -58,6 +59,62 @@ pub(crate) struct CodeSourceRuntime {
     snapshot: parking_lot::RwLock<Arc<CodeSourceSnapshot>>,
     activating_projects: parking_lot::Mutex<BTreeMap<String, bool>>,
     checkout_access: Arc<CheckoutAccessBroker>,
+    /// The strict pair store when the catalog is the runtime authority.
+    /// Fixed for the process lifetime by the startup probe, exactly like
+    /// `ProjectAuthority`, so grant resolution cannot change arms mid-run.
+    catalog_store: Option<Arc<bbox_indexing::project_catalog_store::ProjectCatalogStore>>,
+}
+
+/// How `build_snapshot` resolves a configured producer scope to the project
+/// that owns it (Phase 3 plan section 6 item 6, the single Phase 4
+/// pull-forward).
+enum GrantScopeResolution {
+    /// Version-1 bridge: one `PublisherConfigTreeRead` lease per registered
+    /// project, acquired and revalidated up front exactly as before, with
+    /// the resolved scope carried here. Unchanged, including the hard
+    /// failure of the whole snapshot on any lease error.
+    Bridge {
+        project_scopes: Vec<(String, Option<PublishedScope>)>,
+    },
+    /// Catalog mode: exact scope equality against the pinned catalog
+    /// snapshot, acquiring no leases at all. Without this arm a remote-only
+    /// project can never hold a grant, because the v1 resolution requires a
+    /// publisher-config lease on every registered project, and the Phase 3
+    /// exit gate ("a remote-only fixture activates") is unsatisfiable.
+    Catalog { catalog: Arc<CatalogSnapshotV2> },
+}
+
+/// One configured scope resolved to its owning project id. Both failure
+/// modes keep today's error shapes on both arms.
+fn resolve_grant_scope(
+    resolution: &GrantScopeResolution,
+    scope: &PublishedScope,
+) -> Result<String> {
+    let matching: Vec<&str> = match resolution {
+        GrantScopeResolution::Bridge { project_scopes } => project_scopes
+            .iter()
+            .filter(|(_, project_scope)| project_scope.as_ref() == Some(scope))
+            .map(|(project_id, _)| project_id.as_str())
+            .collect(),
+        GrantScopeResolution::Catalog { catalog } => catalog
+            .projects
+            .values()
+            .filter(|project| match &project.scope {
+                bbox_corpus_core::project_catalog::ProjectScope::Published(published) => {
+                    published == scope
+                }
+                bbox_corpus_core::project_catalog::ProjectScope::LegacyLocal => false,
+            })
+            .map(|project| project.project_id.as_str())
+            .collect(),
+    };
+    let [project_id] = matching.as_slice() else {
+        if matching.is_empty() {
+            bail!("code-collection scope is not registered");
+        }
+        bail!("code-collection scope resolves to multiple registered projects");
+    };
+    Ok((*project_id).to_string())
 }
 
 #[derive(Default)]
@@ -70,17 +127,20 @@ impl CodeSourceRuntime {
     pub(crate) fn open(
         config: &crate::config::Config,
         projects: &[ProjectRecord],
+        catalog_store: Option<Arc<bbox_indexing::project_catalog_store::ProjectCatalogStore>>,
         checkout_access: Arc<CheckoutAccessBroker>,
     ) -> Result<Self> {
         Ok(Self {
             snapshot: parking_lot::RwLock::new(Arc::new(build_snapshot(
                 config,
                 projects,
+                catalog_store.as_ref(),
                 None,
                 &checkout_access,
             )?)),
             activating_projects: parking_lot::Mutex::new(BTreeMap::new()),
             checkout_access,
+            catalog_store,
         })
     }
 
@@ -93,6 +153,7 @@ impl CodeSourceRuntime {
         let replacement = Arc::new(build_snapshot(
             config,
             projects,
+            self.catalog_store.as_ref(),
             Some(previous.store.clone()),
             &self.checkout_access,
         )?);
@@ -131,6 +192,7 @@ impl CodeSourceRuntime {
                 Arc::new(bbox_indexing::checkout_access::DenyCheckoutAccess),
                 bbox_indexing::checkout_access::CheckoutAccessObservations::in_memory(),
             )),
+            catalog_store: None,
         }
     }
 
@@ -223,6 +285,7 @@ fn assignment_map(snapshot: &CodeSourceSnapshot) -> BTreeMap<PublishedScope, (St
 fn build_snapshot(
     config: &crate::config::Config,
     projects: &[ProjectRecord],
+    catalog_store: Option<&Arc<bbox_indexing::project_catalog_store::ProjectCatalogStore>>,
     existing_store: Option<Arc<CodeSourceStore>>,
     checkout_access: &CheckoutAccessBroker,
 ) -> Result<CodeSourceSnapshot> {
@@ -258,26 +321,41 @@ fn build_snapshot(
         bail!("enabled code collection requires at least one producer");
     }
 
-    let project_scopes = projects
-        .iter()
-        .map(|project| {
-            let lease = checkout_access
-                .acquire(CheckoutAccessRequest {
-                    project_id: project.project_id.clone(),
-                    attachment: CheckoutAttachmentSelector::Selected,
-                    expected_scope: None,
-                    kind: CheckoutAccessKind::PublisherConfigTreeRead,
-                    intent: CheckoutAccessIntent::Read,
-                    source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+    // Catalog mode resolves grants against the pinned catalog snapshot and
+    // acquires nothing; bridge mode keeps the lease-derived resolution
+    // unchanged, one lease per registered project, failing the whole
+    // snapshot on any lease error.
+    let resolution = match catalog_store {
+        Some(store) => GrantScopeResolution::Catalog {
+            catalog: store
+                .snapshot()
+                .map_err(|error| anyhow!("catalog snapshot unavailable: {error}"))?
+                .catalog()
+                .clone(),
+        },
+        None => GrantScopeResolution::Bridge {
+            project_scopes: projects
+                .iter()
+                .map(|project| {
+                    let lease = checkout_access
+                        .acquire(CheckoutAccessRequest {
+                            project_id: project.project_id.clone(),
+                            attachment: CheckoutAttachmentSelector::Selected,
+                            expected_scope: None,
+                            kind: CheckoutAccessKind::PublisherConfigTreeRead,
+                            intent: CheckoutAccessIntent::Read,
+                            source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+                        })
+                        .map_err(anyhow::Error::new)?;
+                    let scope = lease.published_scope().cloned();
+                    checkout_access
+                        .revalidate(&lease)
+                        .map_err(anyhow::Error::new)?;
+                    Ok::<_, anyhow::Error>((project.project_id.clone(), scope))
                 })
-                .map_err(anyhow::Error::new)?;
-            let scope = lease.published_scope().cloned();
-            checkout_access
-                .revalidate(&lease)
-                .map_err(anyhow::Error::new)?;
-            Ok::<_, anyhow::Error>((project, scope))
-        })
-        .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>>>()?,
+        },
+    };
     let mut auth = Vec::new();
     let mut producer_ids = BTreeSet::new();
     let mut token_digests = BTreeSet::new();
@@ -303,18 +381,7 @@ fn build_snapshot(
             if !assigned_scopes.insert(scope.clone()) {
                 bail!("code-collection scope is assigned more than once");
             }
-            let matching = project_scopes
-                .iter()
-                .filter(|(_, project_scope)| project_scope.as_ref() == Some(scope))
-                .map(|(project, _)| *project)
-                .collect::<Vec<_>>();
-            let [project] = matching.as_slice() else {
-                if matching.is_empty() {
-                    bail!("code-collection scope is not registered");
-                }
-                bail!("code-collection scope resolves to multiple registered projects");
-            };
-            resolved.insert(scope.clone(), project.project_id.clone());
+            resolved.insert(scope.clone(), resolve_grant_scope(&resolution, scope)?);
         }
         auth.push(AuthEntry {
             token,
@@ -935,6 +1002,161 @@ fn schedule_cutback(state: Arc<SharedState>, scope: PublishedScope, project_id: 
     });
 }
 
+/// Resolve the source-neutral code identity for one project (Phase 3 plan
+/// section 6 item 4, governing section 10.1).
+///
+/// Catalog mode reads the pinned catalog snapshot, so a remote-only project
+/// with zero attachments resolves an identity like any other project: that
+/// is the activation half of the F1 fix. Bridge mode projects the version-1
+/// record, which is the only authority that exists there, so the
+/// "registered project disappeared" failure survives on that arm alone.
+fn resolve_code_project_identity(
+    state: &Arc<SharedState>,
+    project_id: &str,
+    during: &str,
+) -> Result<CodeProjectIdentity> {
+    if let Some(store) = state.project_authority.catalog_store() {
+        let pinned = store
+            .snapshot()
+            .map_err(|error| anyhow!("catalog snapshot unavailable during {during}: {error}"))?;
+        let catalog = pinned.catalog();
+        let parsed = ProjectId::parse(project_id.to_string())
+            .map_err(|error| anyhow!("invalid catalog project id during {during}: {error}"))?;
+        let project = catalog
+            .projects
+            .get(&parsed)
+            .ok_or_else(|| anyhow!("catalog project disappeared during {during}"))?;
+        let repo_history = project
+            .repo_history
+            .as_ref()
+            .and_then(|id| catalog.repo_histories.get(id));
+        return Ok(CodeProjectIdentity::from_catalog(project, repo_history));
+    }
+    let record = state
+        .records_provider
+        .records_snapshot()
+        .records
+        .iter()
+        .find(|record| record.project_id == project_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("registered project disappeared during {during}"))?;
+    CodeProjectIdentity::from_bridge_record(&record)
+        .map_err(|error| anyhow!("projecting a bridge code identity during {during}: {error}"))
+}
+
+/// Republish the pinned code read view after a post-activation overlay
+/// landed. The active selector map is already correct (the activation set
+/// it); only the edge index and searcher move.
+fn republish_code_read_view(state: &Arc<SharedState>) -> Result<()> {
+    let rebuilt = super::routes::build_edge_index_from_shared(state, false)?;
+    let index = state.idx.write();
+    let selectors = index.active_code_selectors();
+    *state.code_read_view.write() = Arc::new(super::CodeReadView {
+        active_selectors: selectors,
+        searcher: index.searcher(),
+        edge_index: Arc::new(rebuilt),
+    });
+    Ok(())
+}
+
+/// Best-effort Git current-file overlay for an ALREADY ACTIVE collected
+/// generation (Phase 3 plan section 6 item 3, governing section 11).
+///
+/// Every failure mode below leaves the activation intact and records the
+/// existing `git_history_unavailable` health: no attachment to lease, a
+/// denied lease, a mid-walk Git error, or a failed republish. This is what
+/// closes F5 - the activation transaction no longer opens Git at all, so a
+/// Git problem can no longer fail or roll back a valid generation. Overlay
+/// semantics are deliberately minimal here; the typed `GitOverlaySelector`
+/// arrives in P3-F.
+fn stage_git_current_overlay_after_activation(
+    state: &Arc<SharedState>,
+    project_id: &str,
+    scope: &PublishedScope,
+    snapshot_id: &str,
+    current_chunk_targets: &std::collections::HashMap<
+        String,
+        bbox_corpus_core::entity_ref::EntityRef,
+    >,
+) {
+    let store = state.code_sources.store();
+    let record = state
+        .records_provider
+        .records_snapshot()
+        .records
+        .iter()
+        .find(|record| record.project_id == project_id)
+        .cloned();
+    let degrade = |reason: String| {
+        if let Err(error) = store.record_health_failure(
+            project_id,
+            "git_history_unavailable",
+            &format!("Git current-file overlay unavailable: {reason}"),
+        ) {
+            tracing::warn!(
+                project_id,
+                error = %error,
+                "failed to persist GitHistory degradation record"
+            );
+        }
+    };
+    let Some(record) = record else {
+        // A remote-only catalog project has no checkout to walk. This is a
+        // normal steady state, not a fault, but it is still recorded so the
+        // absence of commit edges is explained.
+        degrade("the project has no attached checkout".to_string());
+        return;
+    };
+    if record.repo_id.is_none() {
+        return;
+    }
+    // The daemon-wide broker, exactly like every other checkout consumer:
+    // the overlay is a post-activation daemon step, not part of the code
+    // collection runtime's own authority.
+    let lease = match state.checkout_access.acquire(CheckoutAccessRequest {
+        project_id: project_id.to_string(),
+        attachment: CheckoutAttachmentSelector::Selected,
+        expected_scope: Some(scope.clone()),
+        kind: CheckoutAccessKind::GitHistory,
+        intent: CheckoutAccessIntent::Read,
+        source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+    }) {
+        Ok(lease) => lease,
+        Err(error) => {
+            degrade(error.code.as_str().to_string());
+            return;
+        }
+    };
+    if let Err(error) = state.index_writer.stage_git_current_overlay(
+        record,
+        lease,
+        snapshot_id.to_string(),
+        current_chunk_targets.clone(),
+    ) {
+        tracing::warn!(
+            project_id,
+            error = %error,
+            "post-activation Git current-file overlay failed; the generation stays active"
+        );
+        degrade("the Git walk failed; inspect daemon logs".to_string());
+        return;
+    }
+    if let Err(error) = store.clear_health_failure(project_id, "git_history_unavailable") {
+        tracing::warn!(
+            project_id,
+            error = %error,
+            "failed to clear GitHistory degradation record"
+        );
+    }
+    if let Err(error) = republish_code_read_view(state) {
+        tracing::warn!(
+            project_id,
+            error = %error,
+            "republishing the read view after the Git overlay failed"
+        );
+    }
+}
+
 fn cutback_to_local(
     state: &Arc<SharedState>,
     scope: &PublishedScope,
@@ -953,14 +1175,12 @@ fn cutback_to_local(
         return Ok(());
     }
     store.mark_cutback_pending(project_id, "local cutback is staging")?;
-    let project = state
-        .records_provider
-        .records_snapshot()
-        .records
-        .iter()
-        .cloned()
-        .find(|project| project.project_id == project_id)
-        .ok_or_else(|| anyhow!("registered project disappeared during local cutback"))?;
+    // Bridge local cutback genuinely needs an attachment (the walk reads the
+    // checkout), so its identity comes from the version-1 record and keeps
+    // the "registered project disappeared" failure; catalog mode resolves
+    // from the catalog and lets the local-source lease be the thing that
+    // fails closed when no attachment exists.
+    let identity = resolve_code_project_identity(state, project_id, "local cutback")?;
     ensure_selector_staging_available(
         store.as_ref(),
         &bbox_code_source::local_selector(project_id),
@@ -968,7 +1188,7 @@ fn cutback_to_local(
     let cutback_deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
     let staged = loop {
         match state.index_writer.stage_local_generation(
-            project.clone(),
+            identity.clone(),
             scope.clone(),
             store.clone(),
         ) {
@@ -977,13 +1197,7 @@ fn cutback_to_local(
                 if std::time::Instant::now() >= cutback_deadline {
                     bail!("local cutback timed out waiting for the index writer");
                 }
-                if !state
-                    .records_provider
-                    .records_snapshot()
-                    .records
-                    .iter()
-                    .any(|project| project.project_id == project_id)
-                {
+                if resolve_code_project_identity(state, project_id, "local cutback").is_err() {
                     bail!("registered project disappeared while local cutback was waiting");
                 }
                 if state.code_sources.assignment_matches(scope, project_id) {
@@ -1187,18 +1401,14 @@ fn activate_desired_loop(
             GenerationState::StagingIndex,
             None,
         )?;
-        let project = state
-            .records_provider
-            .records_snapshot()
-            .records
-            .iter()
-            .cloned()
-            .find(|project| project.project_id == project_id)
-            .ok_or_else(|| anyhow!("registered project disappeared during activation"))?;
+        // Catalog mode resolves the identity from the catalog snapshot, so a
+        // remote-only project with zero attachments activates (F1); bridge
+        // mode projects its version-1 record.
+        let identity = resolve_code_project_identity(state, project_id, "activation")?;
         let entries = store.load_generation_entries(scope, &desired.generation_id)?;
         let staged = loop {
             match state.index_writer.stage_collected_generation(
-                project.clone(),
+                identity.clone(),
                 desired.descriptor.clone(),
                 desired.generation_id.clone(),
                 entries.clone(),
@@ -1353,6 +1563,10 @@ fn activate_desired_loop(
             previous_entry.clone(),
             &staged.selector,
         )?;
+        // `repo_id` and `head_commit` are advisory manifest metadata from
+        // this milestone on (plan section 6 item 2): the transaction below
+        // no longer opens Git, so neither value gates anything it commits.
+        // The signature is unchanged; P3-F retypes the manifest entry.
         bbox_edge_sidecar::snapshot::activate_collected_snapshot_with(
             &edges_dir,
             project_id,
@@ -1381,6 +1595,7 @@ fn activate_desired_loop(
             active_projects = state.code_read_view.read().active_selectors.len(),
             "code-source generation activated"
         );
+
         store.mark_generation_state(
             scope,
             &desired.generation_id,
@@ -1396,6 +1611,20 @@ fn activate_desired_loop(
             &staged.selector,
             previous_view,
         )?;
+        // The generation is published; everything Git happens after this
+        // point and can only degrade health, never unpublish (F5). The
+        // staged hold MUST be released first: the writer actor is parked on
+        // it, so enqueueing the overlay op while it is alive would deadlock.
+        let overlay_snapshot_id = staged.snapshot_id.clone();
+        let overlay_chunk_targets = staged.current_chunk_targets.clone();
+        drop(staged);
+        stage_git_current_overlay_after_activation(
+            state,
+            project_id,
+            scope,
+            &overlay_snapshot_id,
+            &overlay_chunk_targets,
+        );
         return Ok(());
     }
 }
@@ -2009,7 +2238,7 @@ mod tests {
         encode_stored_generation_v2_for_migration,
     };
     use bbox_config::config::CodeCollectionProducerConfig;
-    use bbox_corpus_core::project_catalog::ProjectId;
+    use bbox_corpus_core::project_catalog::{ProjectId, ProjectScope};
     use bbox_indexing::checkout_access::{
         CheckoutAccessAuthority, CheckoutAccessCandidate, CheckoutAccessError,
         CheckoutAccessErrorCode, CheckoutAccessObservations, CheckoutAttachmentStatus,
@@ -2141,7 +2370,7 @@ mod tests {
         let mut config = base.clone();
         config.code_collection.enabled = true;
         config.code_collection.producers = producers;
-        let error = build_snapshot(&config, projects, Some(store), broker)
+        let error = build_snapshot(&config, projects, None, Some(store), broker)
             .err()
             .expect("invalid enabled code-source configuration must fail closed");
         assert_eq!(error.to_string(), expected);
@@ -2873,6 +3102,338 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(!store.retirement_pending(&collected_selector).unwrap());
+    }
+
+    /// A collected generation stays activated when Git is entirely
+    /// unavailable (Phase 3 plan section 6 items 2 and 3, closing F5).
+    ///
+    /// Before this milestone a Git problem during collected staging failed
+    /// the whole activation and looped on backoff. Now the transaction never
+    /// opens Git: the generation publishes first, and the post-activation
+    /// overlay records `git_history_unavailable` and leaves everything else
+    /// exactly as the activation left it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn collected_generation_activates_when_git_is_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let state_dir = root.join("state");
+        let repo = root.join("repo");
+        let home = root.join("home");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.invalid"]);
+        git(&repo, &["config", "user.name", "Blackbox Test"]);
+        fs::write(repo.join("src/lib.rs"), "pub fn phase_one() {}\n").unwrap();
+        git(&repo, &["add", "src/lib.rs"]);
+        git(&repo, &["commit", "-q", "-m", "seed"]);
+        let recorded = crate::config::ensure_recorded_repo_id(&repo).unwrap();
+
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("HOME", &home);
+        env.set("BLACKBOX_CONFIG", root.join("missing-config.toml"));
+        env.set("BLACKBOX_STATE_DIR", &state_dir);
+
+        let mut state = SharedState::for_test(&state_dir);
+        state.store_dir = state_dir.join("bro");
+        // Deny every checkout lease AFTER the index writer took its own
+        // handle, so staging still runs and only the post-activation Git
+        // overlay is starved.
+        state.checkout_access = Arc::new(CheckoutAccessBroker::new(
+            Arc::new(bbox_indexing::checkout_access::DenyCheckoutAccess),
+            CheckoutAccessObservations::in_memory(),
+        ));
+        let state = Arc::new(state);
+        let project = state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(&repo)
+            .unwrap();
+        state.persist_projects_durable().await.unwrap();
+        let scope = PublishedScope::try_new(recorded.repo_id, ".").unwrap();
+        let producer_id = "git-unavailable-producer";
+        install_test_assignment(&state, producer_id, &scope, &project.project_id);
+
+        let store = state.code_sources.store();
+        let head = "d".repeat(40);
+        let collected_source = b"pub fn collected_without_git() {}\n";
+        let entries = vec![ManifestEntry {
+            relative_path: "src/lib.rs".into(),
+            content_sha256: hex::encode(Sha256::digest(collected_source)),
+            size: collected_source.len() as u64,
+        }];
+        let descriptor = GenerationDescriptor {
+            schema_version: SCHEMA_VERSION,
+            walker_policy_version: WALKER_POLICY_VERSION.into(),
+            scope: scope.clone(),
+            head_commit: head.clone(),
+            dirty_fingerprint: dirty_fingerprint(&head, &entries),
+            manifest_sha256: manifest_sha256(&entries),
+            file_count: entries.len() as u64,
+            logical_bytes: collected_source.len() as u64,
+        };
+        let upload = store.begin_upload(producer_id, descriptor).unwrap();
+        store
+            .put_manifest_page(producer_id, &upload.upload_id, 0, &entries)
+            .unwrap();
+        store
+            .complete_manifest(producer_id, &upload.upload_id)
+            .unwrap();
+        store
+            .install_blob(
+                producer_id,
+                &upload.upload_id,
+                &entries[0].content_sha256,
+                entries[0].size,
+                std::io::Cursor::new(collected_source),
+            )
+            .unwrap();
+        let ready = store
+            .finalize_upload(producer_id, &upload.upload_id)
+            .unwrap();
+
+        activate_desired_loop(&state, &scope, &project.project_id)
+            .expect("an unavailable Git must not fail a valid collected activation");
+        state.index_writer.flush_blocking().unwrap();
+
+        let collected_selector = crate::index::project_files::collected_materialization_selector(
+            &project.project_id,
+            &ready.generation_id,
+        );
+        assert_eq!(
+            state
+                .code_read_view
+                .read()
+                .active_selectors
+                .get(&project.project_id),
+            Some(&collected_selector),
+            "the generation must be active despite the Git failure"
+        );
+        assert_eq!(
+            store
+                .load_activation(&project.project_id)
+                .unwrap()
+                .as_ref()
+                .map(|activation| activation.generation_id.as_str()),
+            Some(ready.generation_id.as_str())
+        );
+        assert!(
+            store.health_records().unwrap().iter().any(|record| {
+                record.project_id == project.project_id && record.code == "git_history_unavailable"
+            }),
+            "the degraded Git overlay must be recorded as health, not as a failure"
+        );
+        // The activation transaction stages no Git member at all now; the
+        // overlay owns that file and never got to write it.
+        let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
+        let snapshot_id = bbox_edge_sidecar::snapshot::collected_snapshot_id(
+            &project.project_id,
+            &ready.generation_id,
+        );
+        let snapshot_dir = bbox_edge_sidecar::snapshot::snapshot_dir(
+            &edges_dir,
+            &project.project_id,
+            &snapshot_id,
+        );
+        assert!(snapshot_dir.join("project.jsonl").is_file());
+        assert!(!snapshot_dir.join("git-current.jsonl").exists());
+    }
+
+    fn catalog_grant_store(
+        root: &Path,
+        projects: &[(&str, ProjectScope)],
+    ) -> Arc<bbox_indexing::project_catalog_store::ProjectCatalogStore> {
+        use bbox_corpus_core::project_catalog::{CatalogSnapshotV2, CorpusProject};
+
+        fs::create_dir_all(root).unwrap();
+        let store = bbox_indexing::project_catalog_store::ProjectCatalogStore::initialize_empty(
+            root.join("projects.json"),
+        )
+        .unwrap();
+        let epoch = store.snapshot().unwrap().epoch();
+        let projects = projects.to_vec();
+        store
+            .transact(epoch, |catalog: &mut CatalogSnapshotV2, _attachments| {
+                for (id, scope) in &projects {
+                    let project_id = ProjectId::parse(*id).unwrap();
+                    catalog.projects.insert(
+                        project_id.clone(),
+                        CorpusProject {
+                            project_id,
+                            scope: scope.clone(),
+                            operator_aliases: Default::default(),
+                            nominated_aliases: Default::default(),
+                            display_name: (*id).to_string(),
+                            created_at: "2026-07-25T00:00:00Z".into(),
+                            registered_at_compat: None,
+                            repo_history: None,
+                            languages: Default::default(),
+                        },
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        Arc::new(store)
+    }
+
+    fn catalog_grant_config(
+        base: &crate::config::Config,
+        token_file: &Path,
+        scope: &PublishedScope,
+    ) -> crate::config::Config {
+        let mut config = base.clone();
+        config.code_collection.enabled = true;
+        config.code_collection.producers = vec![CodeCollectionProducerConfig {
+            producer_id: "catalog-producer".into(),
+            token_file: token_file.to_path_buf(),
+            scopes: vec![scope.clone()],
+        }];
+        config
+    }
+
+    /// Phase 3 plan section 6 item 6: in catalog mode a configured producer
+    /// scope resolves by exact scope equality against the pinned catalog
+    /// snapshot, with NO lease acquired - which is the only way a remote-only
+    /// project (zero attachments) can ever hold a grant.
+    #[test]
+    fn catalog_grant_arm_resolves_by_exact_scope_without_leases() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let state_dir = root.join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_CONFIG", root.join("missing-config.toml"));
+        env.set("BLACKBOX_STATE_DIR", &state_dir);
+        let base = crate::config::load().unwrap();
+        let token_file = root.join("catalog-token");
+        write_service_token(&token_file, 'a');
+        let scope = PublishedScope::try_new("catalog-repo", ".").unwrap();
+        let remote_only = "p_000000000000000000000000000000c1";
+        let catalog = catalog_grant_store(
+            &root,
+            &[(remote_only, ProjectScope::Published(scope.clone()))],
+        );
+        // Deny-all: a lease attempt of any kind would fail the snapshot.
+        let broker = CheckoutAccessBroker::new(
+            Arc::new(bbox_indexing::checkout_access::DenyCheckoutAccess),
+            CheckoutAccessObservations::in_memory(),
+        );
+
+        let snapshot = build_snapshot(
+            &catalog_grant_config(&base, &token_file, &scope),
+            &[],
+            Some(&catalog),
+            None,
+            &broker,
+        )
+        .expect("the catalog arm resolves without touching a checkout");
+
+        assert_eq!(
+            assignment_map(&snapshot)
+                .get(&scope)
+                .map(|(id, _)| id.as_str()),
+            Some(remote_only)
+        );
+        let attempted: u64 = broker
+            .health()
+            .operations
+            .iter()
+            .map(|operation| operation.granted + operation.denied)
+            .sum();
+        assert_eq!(attempted, 0, "the catalog arm acquires no lease at all");
+    }
+
+    /// An unknown scope fails closed with today's error shape.
+    #[test]
+    fn catalog_grant_arm_fails_closed_on_an_unknown_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let state_dir = root.join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_CONFIG", root.join("missing-config.toml"));
+        env.set("BLACKBOX_STATE_DIR", &state_dir);
+        let base = crate::config::load().unwrap();
+        let token_file = root.join("catalog-token");
+        write_service_token(&token_file, 'b');
+        let scope = PublishedScope::try_new("catalog-repo", ".").unwrap();
+        let other_scope = PublishedScope::try_new("other-repo", ".").unwrap();
+        let broker = CheckoutAccessBroker::new(
+            Arc::new(bbox_indexing::checkout_access::DenyCheckoutAccess),
+            CheckoutAccessObservations::in_memory(),
+        );
+
+        let unknown = catalog_grant_store(
+            &root.join("unknown-store"),
+            &[(
+                "p_000000000000000000000000000000d1",
+                ProjectScope::Published(other_scope),
+            )],
+        );
+        let error = build_snapshot(
+            &catalog_grant_config(&base, &token_file, &scope),
+            &[],
+            Some(&unknown),
+            None,
+            &broker,
+        )
+        .map(|_| ())
+        .expect_err("an unregistered scope must fail closed");
+        assert_eq!(error.to_string(), "code-collection scope is not registered");
+    }
+
+    /// The collision arm is defense in depth: `validate_catalog` already
+    /// refuses a duplicate published scope
+    /// (`error.project_catalog_duplicate_scope`), so no valid store can hold
+    /// one and the case is unreachable through `ProjectCatalogStore`. The
+    /// resolver is exercised directly against a synthetic snapshot so the
+    /// fail-closed shape stays pinned if that invariant ever moves.
+    #[test]
+    fn catalog_grant_arm_fails_closed_on_a_scope_collision() {
+        use bbox_corpus_core::project_catalog::CorpusProject;
+
+        let scope = PublishedScope::try_new("catalog-repo", ".").unwrap();
+        let project = |id: &str| CorpusProject {
+            project_id: ProjectId::parse(id).unwrap(),
+            scope: ProjectScope::Published(scope.clone()),
+            operator_aliases: Default::default(),
+            nominated_aliases: Default::default(),
+            display_name: id.to_string(),
+            created_at: "2026-07-25T00:00:00Z".into(),
+            registered_at_compat: None,
+            repo_history: None,
+            languages: Default::default(),
+        };
+        let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
+        for id in [
+            "p_000000000000000000000000000000e1",
+            "p_000000000000000000000000000000e2",
+        ] {
+            catalog
+                .projects
+                .insert(ProjectId::parse(id).unwrap(), project(id));
+        }
+        assert!(
+            catalog.validate().is_err(),
+            "a duplicate published scope is not a valid catalog in the first place"
+        );
+
+        let error = resolve_grant_scope(
+            &GrantScopeResolution::Catalog {
+                catalog: Arc::new(catalog),
+            },
+            &scope,
+        )
+        .expect_err("a scope claimed by two catalog projects must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "code-collection scope resolves to multiple registered projects"
+        );
     }
 
     #[test]

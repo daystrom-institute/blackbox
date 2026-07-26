@@ -15,8 +15,31 @@ use tantivy::{Index, IndexWriter, TantivyDocument, Term};
 
 use super::{FieldHandles, FileMeta, FileMetaSource, ReindexConfig};
 use bbox_chunker::{self as chunker, Chunk, Edge, EdgeConfidence, EdgeProvenance};
+use bbox_corpus_core::code_project_identity::CodeProjectIdentity;
 use bbox_corpus_core::entity_ref::{self, EntityRef};
 use bbox_corpus_core::project_record::ProjectRecord;
+
+/// Version-1 project-file document fields that [`CodeProjectIdentity`]
+/// deliberately does not carry, resolved by the caller from the attached
+/// `ProjectRecord` when one exists (Phase 3 plan section 6 items 1 and 5).
+///
+/// Both fields are host-local compatibility values that the P3-E schema cut
+/// removes; until then a document must keep emitting exactly what it emits
+/// today for a bridge project, and a remote-only catalog project simply has
+/// neither value.
+///
+/// `repo_id` is the version-1 record's repo id (a hash of the repository's
+/// first commit), NOT the published scope's recorded `repo_id` (an operator
+/// authority string from the repo's committed config). The two are different
+/// values; this document field has always meant the first one, so it is
+/// threaded rather than re-derived from the scope.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProjectFileCompatFields<'a> {
+    pub repo_id: Option<&'a str>,
+    /// Value emitted as the `project` field. `None` renders the project id,
+    /// which is the path-free fallback collected staging now takes (F6).
+    pub project_display: Option<&'a str>,
+}
 
 /// Caller-supplied checkout roots for one project indexing operation.
 ///
@@ -711,8 +734,25 @@ fn index_active_collected_project(
         store.clear_health_failure(&project.project_id, "missing_blob_data")?;
     }
     let staged = if force_full && blobs_available {
+        // The rebuild pass still iterates version-1 `ProjectRecord` rows
+        // (planning converts to the catalog snapshot in P3-C), so the
+        // identity is projected from the record this pass already holds.
+        // Collected staging is identity-first either way, and a rebuild must
+        // produce byte-identical documents to a fresh activation.
+        let identity = CodeProjectIdentity::from_bridge_record(project)
+            .map_err(|error| anyhow::anyhow!("{error}"))
+            .with_context(|| {
+                format!(
+                    "projecting a code identity for collected rebuild of {}",
+                    project.project_id
+                )
+            })?;
         Some(stage_collected_project_generation(
-            project,
+            &identity,
+            ProjectFileCompatFields {
+                repo_id: project.repo_id.as_deref(),
+                project_display: None,
+            },
             &stored.descriptor,
             &active.generation_id,
             &entries,
@@ -827,7 +867,8 @@ pub fn build_project_file_doc(
     let entry_key = bbox_code_source::source_entry_key(&selector, &relative_path);
     build_project_file_doc_for_source(
         chunk,
-        project,
+        &project.project_id,
+        project.repo_id.as_deref(),
         absolute_path,
         &project.canonical_path,
         commit_sha,
@@ -839,8 +880,18 @@ pub fn build_project_file_doc(
     )
 }
 
+/// Stage one collected generation from immutable source blobs.
+///
+/// Identity-first (governing section 10.1, Phase 3 plan section 6 item 1):
+/// nothing here reads a checkout, so the caller supplies a
+/// [`CodeProjectIdentity`] instead of a path-bearing `ProjectRecord`. The
+/// documents carry no display root at all (item 5, closing F6); the doc
+/// builder's existing absent-root fallback renders `project` as the project
+/// id and `file_path` as the normalized relative path until the P3-E cut.
+#[allow(clippy::too_many_arguments)]
 pub fn stage_collected_project_generation<F>(
-    project: &ProjectRecord,
+    identity: &CodeProjectIdentity,
+    compat: ProjectFileCompatFields<'_>,
     descriptor: &bbox_code_source::GenerationDescriptor,
     generation_id: &str,
     entries: &[bbox_code_source::ManifestEntry],
@@ -854,11 +905,18 @@ where
     F: FnMut(&bbox_code_source::ManifestEntry) -> Result<Vec<u8>>,
 {
     descriptor.validate_manifest(entries, u64::MAX, u64::MAX)?;
-    let snapshot_id =
-        bbox_edge_sidecar::snapshot::collected_snapshot_id(&project.project_id, generation_id);
-    let selector = collected_materialization_selector(&project.project_id, generation_id);
+    let project_id = identity.project_id.as_str();
+    let snapshot_id = bbox_edge_sidecar::snapshot::collected_snapshot_id(project_id, generation_id);
+    let selector = collected_materialization_selector(project_id, generation_id);
     stage_project_file_generation(
-        project,
+        identity,
+        ProjectFileCompatFields {
+            repo_id: compat.repo_id,
+            // A collected document never carries a display root, so its
+            // `project` field falls back to the project id regardless of what
+            // the caller resolved.
+            project_display: None,
+        },
         descriptor,
         generation_id,
         entries,
@@ -869,13 +927,22 @@ where
         writer,
         edges_dir,
         publication,
-        Some(Path::new(&project.canonical_path)),
+        None,
         open_bytes,
     )
 }
 
+/// Stage one local generation by walking the leased checkout.
+///
+/// The caller (the writer actor) holds the validated local-source lease for
+/// the whole call and passes its roots; `scope` is the authorized producer
+/// scope, which for a catalog identity equals the identity's own published
+/// scope and for a bridge identity is the only place a `PublishedScope`
+/// exists at all (D-034: a bridge identity never fabricates one).
+#[allow(clippy::too_many_arguments)]
 pub fn stage_local_project_generation(
-    project: &ProjectRecord,
+    identity: &CodeProjectIdentity,
+    compat: ProjectFileCompatFields<'_>,
     scope: &bbox_corpus_core::identity::PublishedScope,
     project_root: &Path,
     git_root: &Path,
@@ -884,9 +951,10 @@ pub fn stage_local_project_generation(
     edges_dir: &Path,
     publication: &mut ProjectIndexPublicationBundle,
 ) -> Result<CollectedIndexResult> {
+    let project_id = identity.project_id.as_str();
     let root = project_root
         .canonicalize()
-        .with_context(|| format!("canonicalizing local project {}", project.project_id))?;
+        .with_context(|| format!("canonicalizing local project {project_id}"))?;
     if !root.is_dir() {
         anyhow::bail!("registered local project root is not a directory");
     }
@@ -936,19 +1004,20 @@ pub fn stage_local_project_generation(
         logical_bytes,
     };
     descriptor.validate_manifest(&entries, u64::MAX, u64::MAX)?;
-    let selector = bbox_code_source::local_selector(&project.project_id);
+    let selector = bbox_code_source::local_selector(project_id);
     let worktree_dirty = bbox_corpus_core::git::is_worktree_dirty(git_root);
     let snapshot_id = if worktree_dirty {
-        bbox_edge_sidecar::snapshot::nongit_snapshot_id(&project.project_id, &dirty_fingerprint)
+        bbox_edge_sidecar::snapshot::nongit_snapshot_id(project_id, &dirty_fingerprint)
     } else {
-        bbox_edge_sidecar::snapshot::clean_snapshot_id(
-            scope.repo_id(),
-            &project.project_id,
-            &head_commit,
-        )
+        // Bridge local staging keeps head-bound clean snapshots
+        // unconditionally this milestone (plan section 4.6); the
+        // `legacy_local_snapshot_id` derivation arrives with the catalog
+        // local lane.
+        bbox_edge_sidecar::snapshot::clean_snapshot_id(scope.repo_id(), project_id, &head_commit)
     };
     stage_project_file_generation(
-        project,
+        identity,
+        compat,
         &descriptor,
         "local",
         &entries,
@@ -969,7 +1038,8 @@ pub fn stage_local_project_generation(
 
 #[allow(clippy::too_many_arguments)]
 fn stage_project_file_generation<F>(
-    project: &ProjectRecord,
+    identity: &CodeProjectIdentity,
+    compat: ProjectFileCompatFields<'_>,
     descriptor: &bbox_code_source::GenerationDescriptor,
     generation_id: &str,
     entries: &[bbox_code_source::ManifestEntry],
@@ -990,6 +1060,8 @@ where
     const MAX_STAGED_CHUNK_TARGETS: usize = 2_000_000;
     const MAX_STAGED_ENTITY_ID_BYTES: usize = 256 * 1024 * 1024;
 
+    let project_id = identity.project_id.as_str();
+    let project_display = compat.project_display.unwrap_or(project_id);
     let registry = chunker::default_registry();
     let mut chunk_entry = |entry: &bbox_code_source::ManifestEntry| {
         let relative_path = Path::new(&entry.relative_path);
@@ -1016,7 +1088,7 @@ where
                 format.format_id()
             )
         })?;
-        let chunks = bound_chunks(&finalize_chunks(project, relative_path, chunks));
+        let chunks = bound_chunks(&finalize_chunks(project_id, relative_path, chunks));
         Ok(Some((display_path, chunks, edges)))
     };
 
@@ -1048,7 +1120,7 @@ where
     );
     let mut edge_writer = bbox_edge_sidecar::snapshot::create_snapshot_edge_writer(
         edges_dir,
-        &project.project_id,
+        project_id,
         snapshot_id,
         &staged_filename,
     )?;
@@ -1094,11 +1166,10 @@ where
             }
             let doc = build_project_file_doc_for_source(
                 &chunk,
-                project,
+                project_id,
+                compat.repo_id,
                 &display_path,
-                display_root
-                    .map(|_| project.canonical_path.as_str())
-                    .unwrap_or(project.project_id.as_str()),
+                project_display,
                 Some(&descriptor.head_commit),
                 Some(snapshot_id),
                 &selector,
@@ -1113,7 +1184,7 @@ where
     }
     edge_writer.finish()?;
     let snapshot_dir =
-        bbox_edge_sidecar::snapshot::snapshot_dir(edges_dir, &project.project_id, snapshot_id);
+        bbox_edge_sidecar::snapshot::snapshot_dir(edges_dir, project_id, snapshot_id);
     publication
         .actions
         .push(ProjectIndexPublication::SnapshotRename {
@@ -1148,7 +1219,8 @@ fn compatibility_display_path(display_root: Option<&Path>, relative_path: &Path)
 #[allow(clippy::too_many_arguments)]
 pub fn build_project_file_doc_for_source(
     chunk: &Chunk,
-    project: &ProjectRecord,
+    project_id: &str,
+    repo_id: Option<&str>,
     display_path: &Path,
     project_display: &str,
     commit_sha: Option<&str>,
@@ -1193,7 +1265,7 @@ pub fn build_project_file_doc_for_source(
         doc.add_u64(f.line_end, line_end as u64);
     }
     doc.add_u64(f.is_subagent, 0);
-    doc.add_text(f.project_id, &project.project_id);
+    doc.add_text(f.project_id, project_id);
     doc.add_text(f.chunk_kind, &chunk.chunk_kind);
     doc.add_text(f.chunk_hash, &chunk.chunk_hash);
     doc.add_text(f.entity_id, &entity_id);
@@ -1212,7 +1284,7 @@ pub fn build_project_file_doc_for_source(
     if let Some(parent_kind) = &chunk.parent_kind {
         doc.add_text(f.parent_kind, parent_kind);
     }
-    if let Some(repo_id) = &project.repo_id {
+    if let Some(repo_id) = repo_id {
         doc.add_text(f.repo_id, repo_id);
     }
     if let Some(commit_sha) = commit_sha {
@@ -1244,7 +1316,7 @@ pub fn resolve_current_chunk_entity(
         return Ok(None);
     };
     let (chunks, _edges) = format.chunk(absolute_path, &bytes)?;
-    let chunks = bound_chunks(&finalize_chunks(project, relative_path, chunks));
+    let chunks = bound_chunks(&finalize_chunks(&project.project_id, relative_path, chunks));
     let selected = byte_range
         .and_then(|(start, _end)| {
             chunks
@@ -1365,7 +1437,7 @@ fn index_project(
         let (chunks, edges) = format
             .chunk(&path, &bytes)
             .with_context(|| format!("chunking {} as {}", path.display(), format.format_id()))?;
-        let chunks = finalize_chunks(project, relative_path, chunks);
+        let chunks = finalize_chunks(&project.project_id, relative_path, chunks);
         let bounded_chunks = bound_chunks(&chunks);
         let edges = derive_edges(&bounded_chunks, edges, snapshot_id.as_deref());
         ctx.stats.emitted_edges += edges.len() as u64;
@@ -1676,14 +1748,14 @@ fn local_file_meta(
     }
 }
 
-fn finalize_chunks(project: &ProjectRecord, rel_path: &Path, chunks: Vec<Chunk>) -> Vec<Chunk> {
+fn finalize_chunks(project_id: &str, rel_path: &Path, chunks: Vec<Chunk>) -> Vec<Chunk> {
     let rel_path_hash = short_hash(rel_path.to_string_lossy().as_bytes());
     chunks
         .into_iter()
         .enumerate()
         .map(|(idx, mut chunk)| {
             let chunk_hash = full_hash(chunk.content.as_bytes());
-            chunk.project_id = project.project_id.clone();
+            chunk.project_id = project_id.to_string();
             chunk.file_path = rel_path.to_path_buf();
             chunk.rel_path_hash.clone_from(&rel_path_hash);
             chunk.chunk_hash = chunk_hash;
@@ -2336,8 +2408,11 @@ mod tests {
         );
     }
 
+    /// Local staging still joins the registered root into the display path;
+    /// collected staging passes `None` from P3-B on (plan section 6 item 5,
+    /// closing F6), which renders the bare normalized relative path.
     #[test]
-    fn collected_display_path_is_a_lexical_join_to_the_registered_root() {
+    fn display_path_joins_a_root_and_falls_back_to_the_relative_path() {
         assert_eq!(
             compatibility_display_path(
                 Some(Path::new("/registered/project")),
@@ -2345,6 +2420,76 @@ mod tests {
             ),
             PathBuf::from("/registered/project/src/lib.rs")
         );
+        assert_eq!(
+            compatibility_display_path(None, Path::new("src/lib.rs")),
+            PathBuf::from("src/lib.rs"),
+            "a collected document carries no corpus-host path component"
+        );
+    }
+
+    /// Bridge parity pin for the enumerated document-field change (plan
+    /// section 4.3 item 2, step one). A collected document renders `project`
+    /// as the project id and `file_path` as the relative path, while a local
+    /// document keeps the registered display root exactly as before; both
+    /// keep every other field, `repo_id` included.
+    #[test]
+    fn collected_and_local_documents_differ_only_in_the_enumerated_fields() {
+        let (_schema, fields) = build_schema();
+        let chunk = Chunk {
+            project_id: "proj1234".into(),
+            file_path: PathBuf::from("src/lib.rs"),
+            rel_path_hash: "abcd1234".into(),
+            chunk_kind: "code_block".into(),
+            chunk_hash: "f".repeat(64),
+            occurrence_idx: 0,
+            language: Some("rust".into()),
+            symbol: None,
+            symbol_exact: None,
+            symbol_kind: None,
+            parent_kind: None,
+            line_start: None,
+            line_end: None,
+            content: "fn helper() {}".into(),
+            byte_start: 0,
+            byte_end: 14,
+            visual_payload: None,
+        };
+
+        let collected = build_project_file_doc_for_source(
+            &chunk,
+            "proj1234",
+            Some("repo1234"),
+            &compatibility_display_path(None, Path::new("src/lib.rs")),
+            "proj1234",
+            None,
+            Some("collected-0123456789abcdef"),
+            "collected:proj1234:gen",
+            "gen",
+            "entry-key",
+            fields,
+        );
+        assert_eq!(first_text(&collected, fields.project), "proj1234");
+        assert_eq!(first_text(&collected, fields.file_path), "src/lib.rs");
+        assert_eq!(first_text(&collected, fields.path_tokens), "src/lib.rs");
+        assert_eq!(first_text(&collected, fields.project_id), "proj1234");
+        assert_eq!(first_text(&collected, fields.repo_id), "repo1234");
+
+        let local = build_project_file_doc_for_source(
+            &chunk,
+            "proj1234",
+            Some("repo1234"),
+            &compatibility_display_path(Some(Path::new("/tmp/repo")), Path::new("src/lib.rs")),
+            "/tmp/repo",
+            None,
+            Some("head-repo1234-0123456789ab"),
+            "local:proj1234",
+            "local",
+            "entry-key",
+            fields,
+        );
+        assert_eq!(first_text(&local, fields.project), "/tmp/repo");
+        assert_eq!(first_text(&local, fields.file_path), "/tmp/repo/src/lib.rs");
+        assert_eq!(first_text(&local, fields.repo_id), "repo1234");
     }
 
     #[test]
@@ -2410,7 +2555,7 @@ mod tests {
             aliases: Default::default(),
         };
         let chunks = finalize_chunks(
-            &project,
+            &project.project_id,
             Path::new("src/lib.rs"),
             vec![
                 bbox_chunker::placeholder_chunk(
@@ -2473,7 +2618,7 @@ mod tests {
             aliases: Default::default(),
         };
         let chunks = finalize_chunks(
-            &project,
+            &project.project_id,
             Path::new("src/lib.rs"),
             vec![
                 bbox_chunker::placeholder_chunk(
@@ -2559,8 +2704,10 @@ mod tests {
             .chunk(Path::new("config.json"), right)
             .unwrap()
             .0;
-        let left_chunks = finalize_chunks(&project, Path::new("config.json"), left_chunks);
-        let right_chunks = finalize_chunks(&project, Path::new("config.json"), right_chunks);
+        let left_chunks =
+            finalize_chunks(&project.project_id, Path::new("config.json"), left_chunks);
+        let right_chunks =
+            finalize_chunks(&project.project_id, Path::new("config.json"), right_chunks);
         let left_hashes = left_chunks
             .iter()
             .map(|chunk| (chunk.content.clone(), chunk.chunk_hash.clone()))

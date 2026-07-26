@@ -453,6 +453,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     let code_sources = Arc::new(super::code_source::CodeSourceRuntime::open(
         &cfg,
         &records_provider.records_snapshot().records,
+        catalog_store.clone(),
         checkout_access.clone(),
     )?);
     if idx.schema_was_reset() {
