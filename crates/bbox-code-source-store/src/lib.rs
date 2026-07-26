@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const STORE_VERSION: u32 = 1;
-const MIGRATION_STORE_VERSION: u32 = 2;
+pub const MIGRATION_STORE_VERSION: u32 = 2;
 const MISSING_PAGE_SIZE: usize = 1_000;
 const MAX_RETIREMENT_SELECTOR_BYTES: usize = 1_024;
 pub const MAX_SNAPSHOT_ID_BYTES: usize = 512;
@@ -453,10 +453,17 @@ impl MixedStoredGeneration {
         }
     }
 
-    fn generation_id(&self) -> &str {
+    pub fn generation_id(&self) -> &str {
         match self {
             Self::LegacyV1(record) => &record.generation_id,
             Self::CurrentV2(record) => &record.generation_id,
+        }
+    }
+
+    pub fn producer_id(&self) -> &str {
+        match self {
+            Self::LegacyV1(record) => &record.producer_id,
+            Self::CurrentV2(record) => &record.producer_id,
         }
     }
 
@@ -467,36 +474,54 @@ impl MixedStoredGeneration {
         }
     }
 
-    fn descriptor(&self) -> &GenerationDescriptor {
+    pub fn descriptor(&self) -> &GenerationDescriptor {
         match self {
             Self::LegacyV1(record) => &record.descriptor,
             Self::CurrentV2(record) => &record.descriptor,
         }
     }
 
-    fn state(&self) -> GenerationState {
+    pub fn state(&self) -> GenerationState {
         match self {
             Self::LegacyV1(record) => record.state,
             Self::CurrentV2(record) => record.state,
         }
     }
 
-    fn materialized_doc_count(&self) -> Option<u64> {
+    pub fn published_scope(&self) -> &PublishedScope {
+        match self {
+            Self::LegacyV1(record) => &record.descriptor.scope,
+            Self::CurrentV2(record) => &record.published_scope,
+        }
+    }
+
+    pub fn materialized_doc_count(&self) -> Option<u64> {
         match self {
             Self::LegacyV1(record) => record.materialized_doc_count,
             Self::CurrentV2(record) => record.materialized_doc_count,
         }
     }
 
-    fn entity_inventory_sha256(&self) -> Option<&str> {
+    pub fn entity_inventory_sha256(&self) -> Option<&str> {
         match self {
             Self::LegacyV1(record) => record.entity_inventory_sha256.as_deref(),
             Self::CurrentV2(record) => record.entity_inventory_sha256.as_deref(),
         }
     }
 
+    pub fn diagnostic(&self) -> Option<&str> {
+        match self {
+            Self::LegacyV1(record) => record.diagnostic.as_deref(),
+            Self::CurrentV2(record) => record.diagnostic.as_deref(),
+        }
+    }
+
     fn is_legacy_v1(&self) -> bool {
         matches!(self, Self::LegacyV1(_))
+    }
+
+    pub fn is_current_v2(&self) -> bool {
+        matches!(self, Self::CurrentV2(_))
     }
 
     fn mark_missing_blob_data(&mut self) {
@@ -521,38 +546,59 @@ pub enum MixedActivationRecord {
 }
 
 impl MixedActivationRecord {
-    fn project_id(&self) -> &str {
+    pub fn project_id(&self) -> &str {
         match self {
             Self::LegacyV1(record) => &record.project_id,
             Self::CurrentV2(record) => record.project_id.as_str(),
         }
     }
 
-    fn generation_id(&self) -> &str {
+    pub fn generation_id(&self) -> &str {
         match self {
             Self::LegacyV1(record) => &record.generation_id,
             Self::CurrentV2(record) => &record.generation_id,
         }
     }
 
-    fn published_scope(&self) -> Option<&PublishedScope> {
+    pub fn published_scope(&self) -> Option<&PublishedScope> {
         match self {
             Self::LegacyV1(_) => None,
             Self::CurrentV2(record) => Some(&record.published_scope),
         }
     }
 
-    fn document_count(&self) -> u64 {
+    pub fn document_count(&self) -> u64 {
         match self {
             Self::LegacyV1(record) => record.document_count,
             Self::CurrentV2(record) => record.document_count,
         }
     }
 
-    fn entity_inventory_sha256(&self) -> &str {
+    pub fn entity_inventory_sha256(&self) -> &str {
         match self {
             Self::LegacyV1(record) => &record.entity_inventory_sha256,
             Self::CurrentV2(record) => &record.entity_inventory_sha256,
+        }
+    }
+
+    pub fn selector(&self) -> &str {
+        match self {
+            Self::LegacyV1(record) => &record.selector,
+            Self::CurrentV2(record) => &record.selector,
+        }
+    }
+
+    pub fn snapshot_id(&self) -> &str {
+        match self {
+            Self::LegacyV1(record) => &record.snapshot_id,
+            Self::CurrentV2(record) => &record.snapshot_id,
+        }
+    }
+
+    pub fn activated_unix_secs(&self) -> u64 {
+        match self {
+            Self::LegacyV1(record) => record.activated_unix_secs,
+            Self::CurrentV2(record) => record.activated_unix_secs,
         }
     }
 
@@ -3867,6 +3913,91 @@ impl CodeSourceStore {
         Ok(stored)
     }
 
+    /// Mode-aware generation-state transition (section 7.1 item 3).
+    ///
+    /// In catalog mode the writer reads, mutates, and writes the v2 record
+    /// (including the desired pointer). In bridge mode it delegates to the
+    /// existing v1 `mark_generation_state`. The caller receives the
+    /// `MixedStoredGeneration` so it can branch on the record shape without a
+    /// separate read.
+    pub fn mark_generation_state_mixed(
+        &self,
+        scope: &PublishedScope,
+        generation: &str,
+        state: GenerationState,
+        diagnostic: Option<String>,
+    ) -> Result<MixedStoredGeneration> {
+        if self.shared.record_mode == RuntimeRecordMode::BridgeV1 {
+            let stored = self.mark_generation_state(scope, generation, state, diagnostic)?;
+            return Ok(MixedStoredGeneration::LegacyV1(stored));
+        }
+        let _guard = self.lock_mutation()?;
+        let mut stored = match self.load_generation_mixed(scope, generation)? {
+            MixedStoredGeneration::CurrentV2(record) => record,
+            MixedStoredGeneration::LegacyV1(_) => {
+                bail!("error.code_source_record_mode: catalog store found a v1 stored generation")
+            }
+        };
+        stored.state = state;
+        stored.diagnostic = diagnostic.map(|value| value.chars().take(512).collect());
+        self.save_generation_v2_locked(&stored)?;
+        let desired_path = self
+            .root()
+            .join("desired")
+            .join(format!("{}.json", scope_hash(scope)));
+        if desired_path.is_file() {
+            let desired = read_mixed_stored_generation(&desired_path)?;
+            if desired.generation_id() == generation {
+                atomic_write_json(&desired_path, &stored)?;
+            }
+        }
+        Ok(MixedStoredGeneration::CurrentV2(stored))
+    }
+
+    /// Mode-aware materialization writer (section 7.1 item 3).
+    ///
+    /// Catalog mode reads, mutates, and writes the v2 record. Bridge mode
+    /// delegates to the existing v1 `record_materialization`.
+    pub fn record_materialization_mixed(
+        &self,
+        scope: &PublishedScope,
+        generation: &str,
+        document_count: u64,
+        entity_inventory_sha256: String,
+    ) -> Result<MixedStoredGeneration> {
+        validate_sha256(&entity_inventory_sha256)?;
+        if self.shared.record_mode == RuntimeRecordMode::BridgeV1 {
+            let stored = self.record_materialization(
+                scope,
+                generation,
+                document_count,
+                entity_inventory_sha256,
+            )?;
+            return Ok(MixedStoredGeneration::LegacyV1(stored));
+        }
+        let _guard = self.lock_mutation()?;
+        let mut stored = match self.load_generation_mixed(scope, generation)? {
+            MixedStoredGeneration::CurrentV2(record) => record,
+            MixedStoredGeneration::LegacyV1(_) => {
+                bail!("error.code_source_record_mode: catalog store found a v1 stored generation")
+            }
+        };
+        stored.materialized_doc_count = Some(document_count);
+        stored.entity_inventory_sha256 = Some(entity_inventory_sha256);
+        self.save_generation_v2_locked(&stored)?;
+        Ok(MixedStoredGeneration::CurrentV2(stored))
+    }
+
+    fn save_generation_v2_locked(&self, generation: &StoredGenerationV2) -> Result<()> {
+        generation.validate()?;
+        atomic_write_json(
+            &self
+                .paths
+                .generation_metadata(&generation.published_scope, &generation.generation_id)?,
+            generation,
+        )
+    }
+
     pub fn save_activation(&self, activation: &ActivationRecord) -> Result<()> {
         let _guard = self.lock_mutation()?;
         self.save_activation_locked(activation)
@@ -4498,6 +4629,39 @@ impl CodeSourceStore {
             return Ok(None);
         }
         Ok(Some(read_stored_generation_v1(&path)?))
+    }
+
+    /// Mode-aware desired-generation read (section 7.1 item 3).
+    ///
+    /// In catalog mode the reader decodes the v2 pointer; in bridge mode it
+    /// decodes the v1 pointer and REFUSES v2 bytes with
+    /// `error.code_source_record_mode`. Returns `Ok(None)` when the pointer
+    /// file is absent.
+    pub fn desired_generation_mixed(
+        &self,
+        scope: &PublishedScope,
+    ) -> Result<Option<MixedStoredGeneration>> {
+        let path = self
+            .root()
+            .join("desired")
+            .join(format!("{}.json", scope_hash(scope)));
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let mixed = read_mixed_stored_generation(&path)?;
+        match (self.shared.record_mode, &mixed) {
+            (RuntimeRecordMode::CatalogV2, MixedStoredGeneration::LegacyV1(_)) => {
+                bail!(
+                    "error.code_source_record_mode: catalog read path found a v1 stored generation"
+                );
+            }
+            (RuntimeRecordMode::BridgeV1, MixedStoredGeneration::CurrentV2(_)) => {
+                bail!(
+                    "error.code_source_record_mode: bridge read path refuses a v2 stored generation"
+                );
+            }
+            _ => Ok(Some(mixed)),
+        }
     }
 
     /// Generation ids named by a `desired/<scope>.json` pointer.

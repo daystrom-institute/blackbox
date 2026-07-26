@@ -16,8 +16,8 @@ use bbox_code_source::{
     GenerationStatus, ManifestPage, MissingBlobsPage, validate_producer_id, validate_scope,
 };
 use bbox_code_source_store::{
-    ActivationRecord, CodeSourceStore, CollisionRetirementWorkV1, RetirementRecord, StoreLimits,
-    StoreRequestError, StoredGeneration,
+    ActivationRecord, ActivationRecordV2, CodeSourceStore, CollisionRetirementWorkV1,
+    MixedStoredGeneration, RetirementRecord, RuntimeRecordMode, StoreLimits, StoreRequestError,
 };
 use bbox_corpus_core::code_project_identity::CodeProjectIdentity;
 use bbox_corpus_core::identity::PublishedScope;
@@ -365,9 +365,15 @@ fn build_snapshot(
     let store = if let Some(store) = existing_store {
         store
     } else {
-        let store = Arc::new(CodeSourceStore::open(
+        let mode = if catalog_store.is_some() {
+            RuntimeRecordMode::CatalogV2
+        } else {
+            RuntimeRecordMode::BridgeV1
+        };
+        let store = Arc::new(CodeSourceStore::open_with_mode(
             config.paths.state_dir.join("code-sources"),
             limits,
+            mode,
         )?);
         store
     };
@@ -755,13 +761,13 @@ async fn generation_status(
             let store = store.clone();
             let scope = scope.clone();
             let generation = generation.clone();
-            tokio::task::spawn_blocking(move || store.load_generation(&scope, &generation))
+            tokio::task::spawn_blocking(move || store.load_generation_mixed(&scope, &generation))
                 .await
                 .map_err(|_| HttpError::storage("generation status task failed"))?
         };
         match result {
-            Ok(stored) if stored.producer_id == grant.producer_id => {
-                return Ok(Json(status_from_generation(stored)));
+            Ok(stored) if stored.producer_id() == grant.producer_id => {
+                return Ok(Json(status_from_mixed_generation(stored)));
             }
             Ok(_) => {}
             Err(error) if store_error_is_not_found(&error) => {}
@@ -820,18 +826,18 @@ fn schedule_activation(state: Arc<SharedState>, scope: PublishedScope, project_i
 
 fn schedule_cutback_if_owner_changed(state: Arc<SharedState>, project_id: String) {
     let store = state.code_sources.store();
-    let Some(activation) = store.load_activation(&project_id).ok().flatten() else {
+    let Some(activation) = store.load_activation_mixed(&project_id).ok().flatten() else {
         return;
     };
-    let Ok(generation) = store.find_generation(&activation.generation_id) else {
+    let Ok(generation) = store.find_generation_mixed(activation.generation_id()) else {
         return;
     };
     if !state.code_sources.assignment_authorizes(
-        &generation.descriptor.scope,
+        &generation.descriptor().scope,
         &project_id,
-        &generation.producer_id,
+        generation.producer_id(),
     ) {
-        schedule_cutback(state, generation.descriptor.scope, project_id);
+        schedule_cutback(state, generation.descriptor().scope.clone(), project_id);
     }
 }
 
@@ -858,37 +864,37 @@ pub(crate) fn resume_pending_activations(state: Arc<SharedState>) {
         {
             continue;
         }
-        let Some(activation) = store.load_activation(project_id).ok().flatten() else {
+        let Some(activation) = store.load_activation_mixed(project_id).ok().flatten() else {
             tracing::error!(project_id, "active collected source has no recovery record");
             continue;
         };
-        let Ok(generation) = store.find_generation(&activation.generation_id) else {
+        let Ok(generation) = store.find_generation_mixed(activation.generation_id()) else {
             tracing::error!(
                 project_id,
                 "active collected source generation is unavailable"
             );
             continue;
         };
-        if assigned.get(&generation.descriptor.scope) != Some(project_id) {
+        if assigned.get(&generation.descriptor().scope) != Some(project_id) {
             schedule_cutback(
                 state.clone(),
-                generation.descriptor.scope,
+                generation.descriptor().scope.clone(),
                 project_id.clone(),
             );
         }
     }
-    match store.activation_records() {
+    match store.activation_records_mixed() {
         Ok(records) => {
             for activation in records {
                 if assigned
                     .values()
-                    .any(|project_id| project_id == &activation.project_id)
+                    .any(|project_id| project_id == activation.project_id())
                 {
                     continue;
                 }
                 let active_selector = manifest
                     .workspaces
-                    .get(&activation.project_id)
+                    .get(activation.project_id())
                     .cloned()
                     .and_then(|entry| entry.code_source_selector);
                 if !active_selector
@@ -899,16 +905,16 @@ pub(crate) fn resume_pending_activations(state: Arc<SharedState>) {
                 }
                 let retirement = RetirementRecord {
                     version: 1,
-                    project_id: activation.project_id.clone(),
-                    selector: activation.selector,
-                    snapshot_id: activation.snapshot_id,
-                    generation_id: Some(activation.generation_id),
+                    project_id: activation.project_id().to_string(),
+                    selector: activation.selector().to_string(),
+                    snapshot_id: activation.snapshot_id().to_string(),
+                    generation_id: Some(activation.generation_id().to_string()),
                 };
                 if let Err(error) = store
                     .enqueue_retirement(&retirement)
-                    .and_then(|()| store.clear_activation(&activation.project_id))
+                    .and_then(|()| store.clear_activation(activation.project_id()))
                     .and_then(|()| {
-                        store.clear_health_failure(&activation.project_id, "cutback_pending")
+                        store.clear_health_failure(activation.project_id(), "cutback_pending")
                     })
                 {
                     tracing::error!(%error, "recovering completed code-source cutback failed");
@@ -1719,11 +1725,12 @@ fn cutback_to_local(
             Ok(())
         },
     )?;
-    if let Some(activation) = store.load_activation(project_id)? {
-        if let Ok(generation) = store.find_generation(&activation.generation_id) {
-            store.mark_generation_state(
-                &generation.descriptor.scope,
-                &generation.generation_id,
+    if let Some(activation) = store.load_activation_mixed(project_id)? {
+        if let Ok(generation) = store.find_generation_mixed(activation.generation_id()) {
+            let scope = generation.descriptor().scope.clone();
+            store.mark_generation_state_mixed(
+                &scope,
+                generation.generation_id(),
                 GenerationState::Ready,
                 None,
             )?;
@@ -1774,30 +1781,35 @@ fn activate_desired_loop(
 ) -> Result<()> {
     loop {
         let store = state.code_sources.store();
-        let Some(desired) = store.desired_generation(scope)? else {
+        let Some(mixed) = store.desired_generation_mixed(scope)? else {
             return Ok(());
         };
+        let desired_generation_id = mixed.generation_id().to_string();
+        let desired_producer_id = mixed.producer_id().to_string();
+        let desired_state = mixed.state();
+        let desired_descriptor = mixed.descriptor().clone();
+        let desired_published_scope = mixed.published_scope().clone();
         if !state
             .code_sources
-            .assignment_authorizes(scope, project_id, &desired.producer_id)
+            .assignment_authorizes(scope, project_id, &desired_producer_id)
         {
             return Ok(());
         }
-        if desired.state == GenerationState::Active {
+        if desired_state == GenerationState::Active {
             let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
             let expected_snapshot = bbox_edge_sidecar::snapshot::collected_snapshot_id(
                 project_id,
-                &desired.generation_id,
+                &desired_generation_id,
             );
             let expected_selector = crate::index::project_files::collected_materialization_selector(
                 project_id,
-                &desired.generation_id,
+                &desired_generation_id,
             );
             let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)?;
             let active_entry = manifest.workspaces.get(project_id);
-            let activation = store.load_activation(project_id)?;
+            let activation = store.load_activation_mixed(project_id)?;
             let still_active = active_entry.is_some_and(|entry| {
-                entry.code_source_generation.as_deref() == Some(desired.generation_id.as_str())
+                entry.code_source_generation.as_deref() == Some(desired_generation_id.as_str())
                     && entry.code_source_selector.as_deref() == Some(expected_selector.as_str())
                     && entry.active_snapshot.as_deref()
                         == Some(
@@ -1808,22 +1820,22 @@ fn activate_desired_loop(
                             .as_str(),
                         )
             }) && activation.is_some_and(|activation| {
-                activation.generation_id == desired.generation_id
-                    && activation.selector == expected_selector
-                    && activation.snapshot_id == expected_snapshot
+                activation.generation_id() == desired_generation_id.as_str()
+                    && activation.selector() == expected_selector
+                    && activation.snapshot_id() == expected_snapshot
             });
             if still_active {
                 return Ok(());
             }
-            store.mark_generation_state(
+            store.mark_generation_state_mixed(
                 scope,
-                &desired.generation_id,
+                &desired_generation_id,
                 GenerationState::Ready,
                 None,
             )?;
             continue;
         }
-        if desired.state == GenerationState::StagingIndex {
+        if desired_state == GenerationState::StagingIndex {
             let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
             let active_entry = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)?
                 .workspaces
@@ -1831,14 +1843,14 @@ fn activate_desired_loop(
                 .cloned();
             let expected_snapshot = bbox_edge_sidecar::snapshot::collected_snapshot_id(
                 project_id,
-                &desired.generation_id,
+                &desired_generation_id,
             );
             let expected_selector = crate::index::project_files::collected_materialization_selector(
                 project_id,
-                &desired.generation_id,
+                &desired_generation_id,
             );
             let already_active = active_entry.as_ref().is_some_and(|entry| {
-                entry.code_source_generation.as_deref() == Some(desired.generation_id.as_str())
+                entry.code_source_generation.as_deref() == Some(desired_generation_id.as_str())
                     && entry.code_source_selector.as_deref() == Some(expected_selector.as_str())
                     && entry.active_snapshot.as_deref()
                         == Some(
@@ -1849,43 +1861,44 @@ fn activate_desired_loop(
                             .as_str(),
                         )
             });
-            let journal_matches = store
-                .load_activation(project_id)?
-                .is_some_and(|activation| {
-                    activation.generation_id == desired.generation_id
-                        && activation.selector == expected_selector
-                        && activation.snapshot_id == expected_snapshot
-                });
+            let journal_matches =
+                store
+                    .load_activation_mixed(project_id)?
+                    .is_some_and(|activation| {
+                        activation.generation_id() == desired_generation_id.as_str()
+                            && activation.selector() == expected_selector
+                            && activation.snapshot_id() == expected_snapshot
+                    });
             if already_active && journal_matches {
-                store.mark_generation_state(
+                store.mark_generation_state_mixed(
                     scope,
-                    &desired.generation_id,
+                    &desired_generation_id,
                     GenerationState::Active,
                     None,
                 )?;
                 return Ok(());
             }
-            store.mark_generation_state(
+            store.mark_generation_state_mixed(
                 scope,
-                &desired.generation_id,
+                &desired_generation_id,
                 GenerationState::Ready,
                 None,
             )?;
             continue;
         }
-        if desired.state != GenerationState::Ready {
+        if desired_state != GenerationState::Ready {
             return Ok(());
         }
         ensure_selector_staging_available(
             store.as_ref(),
             &crate::index::project_files::collected_materialization_selector(
                 project_id,
-                &desired.generation_id,
+                &desired_generation_id,
             ),
         )?;
-        store.mark_generation_state(
+        store.mark_generation_state_mixed(
             scope,
-            &desired.generation_id,
+            &desired_generation_id,
             GenerationState::StagingIndex,
             None,
         )?;
@@ -1893,12 +1906,12 @@ fn activate_desired_loop(
         // remote-only project with zero attachments activates (F1); bridge
         // mode projects its version-1 record.
         let identity = resolve_code_project_identity(state, project_id, "activation")?;
-        let entries = store.load_generation_entries(scope, &desired.generation_id)?;
+        let entries = store.load_generation_entries(scope, &desired_generation_id)?;
         let staged = loop {
             match state.index_writer.stage_collected_generation(
                 identity.clone(),
-                desired.descriptor.clone(),
-                desired.generation_id.clone(),
+                desired_descriptor.clone(),
+                desired_generation_id.clone(),
                 entries.clone(),
                 store.clone(),
             ) {
@@ -1907,11 +1920,11 @@ fn activate_desired_loop(
                     if !state.code_sources.assignment_authorizes(
                         scope,
                         project_id,
-                        &desired.producer_id,
+                        &desired_producer_id,
                     ) {
-                        store.mark_generation_state(
+                        store.mark_generation_state_mixed(
                             scope,
-                            &desired.generation_id,
+                            &desired_generation_id,
                             GenerationState::Ready,
                             None,
                         )?;
@@ -1920,9 +1933,9 @@ fn activate_desired_loop(
                     std::thread::sleep(std::time::Duration::from_secs(1));
                 }
                 Err(error) => {
-                    store.mark_generation_state(
+                    store.mark_generation_state_mixed(
                         scope,
-                        &desired.generation_id,
+                        &desired_generation_id,
                         GenerationState::Failed,
                         Some("activation failed; inspect daemon logs".into()),
                     )?;
@@ -1937,35 +1950,35 @@ fn activate_desired_loop(
         };
         if !state
             .code_sources
-            .assignment_authorizes(scope, project_id, &desired.producer_id)
+            .assignment_authorizes(scope, project_id, &desired_producer_id)
         {
             schedule_unactivated_retirement(
                 state,
                 project_id,
                 &staged,
-                Some(desired.generation_id.clone()),
+                Some(desired_generation_id.clone()),
             )?;
-            store.mark_generation_state(
+            store.mark_generation_state_mixed(
                 scope,
-                &desired.generation_id,
+                &desired_generation_id,
                 GenerationState::Ready,
                 None,
             )?;
             return Ok(());
         }
         let newest = store
-            .desired_generation(scope)?
+            .desired_generation_mixed(scope)?
             .ok_or_else(|| anyhow!("desired generation disappeared during activation"))?;
-        if newest.generation_id != desired.generation_id {
+        if newest.generation_id() != desired_generation_id {
             schedule_unactivated_retirement(
                 state,
                 project_id,
                 &staged,
-                Some(desired.generation_id.clone()),
+                Some(desired_generation_id.clone()),
             )?;
-            store.mark_generation_state(
+            store.mark_generation_state_mixed(
                 scope,
-                &desired.generation_id,
+                &desired_generation_id,
                 GenerationState::Superseded,
                 None,
             )?;
@@ -1980,11 +1993,11 @@ fn activate_desired_loop(
                 state,
                 project_id,
                 &staged,
-                Some(desired.generation_id.clone()),
+                Some(desired_generation_id.clone()),
             )?;
-            let mark_result = store.mark_generation_state(
+            let mark_result = store.mark_generation_state_mixed(
                 scope,
-                &desired.generation_id,
+                &desired_generation_id,
                 GenerationState::Failed,
                 Some("staged document verification failed; inspect daemon logs".into()),
             );
@@ -1997,43 +2010,76 @@ fn activate_desired_loop(
             mark_result?;
             return Err(error);
         }
-        store.record_materialization(
+        store.record_materialization_mixed(
             scope,
-            &desired.generation_id,
+            &desired_generation_id,
             staged.document_count,
             staged.entity_inventory_sha256.clone(),
         )?;
-        store.save_activation(&ActivationRecord {
-            version: 1,
-            project_id: project_id.to_string(),
-            generation_id: desired.generation_id.clone(),
-            selector: staged.selector.clone(),
-            snapshot_id: staged.snapshot_id.clone(),
-            document_count: staged.document_count,
-            entity_inventory_sha256: store
-                .load_generation(scope, &desired.generation_id)?
-                .entity_inventory_sha256
-                .ok_or_else(|| anyhow!("materialization inventory was not recorded"))?,
-            current_chunk_targets: staged.current_chunk_targets.clone().into_iter().collect(),
-            activated_unix_secs: unix_now(),
-            cutback_pending: false,
-            diagnostic: None,
-        })?;
+        let inventory_sha256 = store
+            .load_generation_mixed(scope, &desired_generation_id)?
+            .entity_inventory_sha256()
+            .map(|hash| hash.to_string())
+            .ok_or_else(|| anyhow!("materialization inventory was not recorded"))?;
+        if state.code_sources.store().record_mode() == RuntimeRecordMode::CatalogV2 {
+            let activation = ActivationRecordV2 {
+                version: bbox_code_source_store::MIGRATION_STORE_VERSION,
+                project_id: ProjectId::parse(project_id.to_string())
+                    .map_err(|error| anyhow!(error))?,
+                published_scope: desired_published_scope.clone(),
+                generation_id: desired_generation_id.clone(),
+                selector: staged.selector.clone(),
+                snapshot_id: staged.snapshot_id.clone(),
+                document_count: staged.document_count,
+                entity_inventory_sha256: inventory_sha256,
+                current_chunk_targets: staged.current_chunk_targets.clone().into_iter().collect(),
+                activated_unix_secs: unix_now(),
+                cutback_pending: false,
+                cutback: None,
+                diagnostic: None,
+            };
+            let generation_v2 = match store.load_generation_mixed(scope, &desired_generation_id)? {
+                MixedStoredGeneration::CurrentV2(record) => record,
+                MixedStoredGeneration::LegacyV1(_) => {
+                    bail!(
+                        "error.code_source_record_mode: catalog store found a v1 stored generation"
+                    )
+                }
+            };
+            activation
+                .validate_against_generation(&generation_v2)
+                .map_err(|error| anyhow!("error.code_source_scope_agreement: {error}"))?;
+            store.save_activation_v2(&activation)?;
+        } else {
+            store.save_activation(&ActivationRecord {
+                version: 1,
+                project_id: project_id.to_string(),
+                generation_id: desired_generation_id.clone(),
+                selector: staged.selector.clone(),
+                snapshot_id: staged.snapshot_id.clone(),
+                document_count: staged.document_count,
+                entity_inventory_sha256: inventory_sha256,
+                current_chunk_targets: staged.current_chunk_targets.clone().into_iter().collect(),
+                activated_unix_secs: unix_now(),
+                cutback_pending: false,
+                diagnostic: None,
+            })?;
+        }
 
         if !state
             .code_sources
-            .assignment_authorizes(scope, project_id, &desired.producer_id)
+            .assignment_authorizes(scope, project_id, &desired_producer_id)
         {
             schedule_unactivated_retirement(
                 state,
                 project_id,
                 &staged,
-                Some(desired.generation_id.clone()),
+                Some(desired_generation_id.clone()),
             )?;
             store.clear_activation(project_id)?;
-            store.mark_generation_state(
+            store.mark_generation_state_mixed(
                 scope,
-                &desired.generation_id,
+                &desired_generation_id,
                 GenerationState::Ready,
                 None,
             )?;
@@ -2059,8 +2105,8 @@ fn activate_desired_loop(
             &edges_dir,
             project_id,
             scope.repo_id(),
-            &desired.descriptor.head_commit,
-            &desired.generation_id,
+            &desired_descriptor.head_commit,
+            &desired_generation_id,
             &staged.selector,
             &staged.snapshot_id,
             || {
@@ -2089,14 +2135,14 @@ fn activate_desired_loop(
         )?;
         tracing::info!(
             project_id,
-            generation = %desired.generation_id,
+            generation = %desired_generation_id,
             active_projects = state.code_read_view.read().active_selectors.len(),
             "code-source generation activated"
         );
 
-        store.mark_generation_state(
+        store.mark_generation_state_mixed(
             scope,
-            &desired.generation_id,
+            &desired_generation_id,
             GenerationState::Active,
             None,
         )?;
@@ -2121,7 +2167,7 @@ fn activate_desired_loop(
             project_id,
             scope,
             &overlay_snapshot_id,
-            &desired.generation_id,
+            &desired_generation_id,
             &overlay_chunk_targets,
         );
         return Ok(());
@@ -2571,9 +2617,10 @@ fn require_scope<'a>(
         })
 }
 
-fn status_from_generation(stored: StoredGeneration) -> GenerationStatus {
-    let diagnostic = stored.diagnostic.map(|_| {
-        match stored.state {
+fn status_from_mixed_generation(mixed: MixedStoredGeneration) -> GenerationStatus {
+    let state = mixed.state();
+    let diagnostic = mixed.diagnostic().map(|_| {
+        match state {
             GenerationState::MissingBlobData => {
                 "retained blob data is unavailable; recollect this generation"
             }
@@ -2583,10 +2630,10 @@ fn status_from_generation(stored: StoredGeneration) -> GenerationStatus {
         .to_string()
     });
     GenerationStatus {
-        generation_id: stored.generation_id,
-        state: stored.state,
-        file_count: stored.descriptor.file_count,
-        logical_bytes: stored.descriptor.logical_bytes,
+        generation_id: mixed.generation_id().to_string(),
+        state,
+        file_count: mixed.descriptor().file_count,
+        logical_bytes: mixed.descriptor().logical_bytes,
         diagnostic,
     }
 }
@@ -4427,5 +4474,319 @@ mod tests {
                     .is_empty()
             );
         }
+    }
+
+    /// P4-C section 7.3: a v2 activation record round-trips through the
+    /// catalog-mode mixed reader and its scope agrees with the stored
+    /// generation.
+    #[test]
+    fn p4c_v2_activation_round_trips_with_scope_agreement() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("store");
+        let store = CodeSourceStore::open_with_mode(
+            &root,
+            StoreLimits::default(),
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap();
+        let paths = CodeSourceStorePaths::new(&root).unwrap();
+        let project_id = ProjectId::parse("p_000000000000000000000000000004c1").unwrap();
+        let scope = PublishedScope::try_new("p4c-rt-repo", ".").unwrap();
+        let producer_id = "p4c-producer";
+        let descriptor = empty_generation_descriptor(scope.clone(), &"a".repeat(40));
+        let generation_id = compute_generation_id(producer_id, &descriptor);
+
+        let generation = StoredGenerationV2 {
+            version: bbox_code_source_store::MIGRATION_STORE_VERSION,
+            generation_id: generation_id.clone(),
+            producer_id: producer_id.to_string(),
+            ordinal: 1,
+            descriptor: descriptor.clone(),
+            published_scope: scope.clone(),
+            state: GenerationState::Ready,
+            diagnostic: None,
+            created_unix_secs: 1,
+            materialized_doc_count: Some(0),
+            entity_inventory_sha256: Some("e".repeat(64)),
+        };
+        let metadata_path = paths.generation_metadata(&scope, &generation_id).unwrap();
+        fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        fs::write(
+            &metadata_path,
+            encode_stored_generation_v2_for_migration(&generation).unwrap(),
+        )
+        .unwrap();
+
+        let activation = ActivationRecordV2 {
+            version: bbox_code_source_store::MIGRATION_STORE_VERSION,
+            project_id: project_id.clone(),
+            published_scope: scope.clone(),
+            generation_id: generation_id.clone(),
+            selector: crate::index::project_files::collected_materialization_selector(
+                project_id.as_str(),
+                &generation_id,
+            ),
+            snapshot_id: format!("collected-{}", "f".repeat(32)),
+            document_count: 0,
+            entity_inventory_sha256: "e".repeat(64),
+            current_chunk_targets: BTreeMap::new(),
+            activated_unix_secs: 100,
+            cutback_pending: false,
+            cutback: None,
+            diagnostic: None,
+        };
+        activation
+            .validate_against_generation(&generation)
+            .expect("scope agreement must hold before commit");
+        store.save_activation_v2(&activation).unwrap();
+
+        let loaded = store
+            .load_activation_mixed(project_id.as_str())
+            .unwrap()
+            .expect("v2 activation record must be present");
+        assert!(loaded.is_current_v2(), "catalog mode must read a v2 record");
+        assert_eq!(loaded.generation_id(), generation_id);
+        assert_eq!(loaded.published_scope(), Some(&scope));
+
+        let loaded_gen = store.load_generation_mixed(&scope, &generation_id).unwrap();
+        assert!(loaded_gen.is_current_v2());
+        assert_eq!(loaded_gen.generation_id(), generation_id);
+        assert_eq!(loaded_gen.published_scope(), &scope);
+
+        let found = store.find_generation_mixed(&generation_id).unwrap();
+        assert!(found.is_current_v2());
+        assert_eq!(found.published_scope(), &scope);
+
+        let desired_dir = root.join("desired");
+        fs::create_dir_all(&desired_dir).unwrap();
+        let desired_path =
+            desired_dir.join(format!("{}.json", bbox_code_source::scope_hash(&scope)));
+        fs::write(
+            &desired_path,
+            encode_stored_generation_v2_for_migration(&generation).unwrap(),
+        )
+        .unwrap();
+        let desired = store
+            .desired_generation_mixed(&scope)
+            .unwrap()
+            .expect("desired pointer must resolve");
+        assert!(desired.is_current_v2());
+        assert_eq!(desired.generation_id(), generation_id);
+    }
+
+    /// P4-C section 7.3: `validate_against_generation` refuses when the
+    /// activation's scope differs from the generation's scope, failing
+    /// before any selector or index commit.
+    #[test]
+    fn p4c_scope_disagreement_refuses_before_commit() {
+        let scope_a = PublishedScope::try_new("scope-a-repo", ".").unwrap();
+        let scope_b = PublishedScope::try_new("scope-b-repo", ".").unwrap();
+        let producer_id = "p4c-producer";
+        let descriptor_a = empty_generation_descriptor(scope_a.clone(), &"a".repeat(40));
+        let generation_id_a = compute_generation_id(producer_id, &descriptor_a);
+        let project_id = ProjectId::parse("p_000000000000000000000000000004c2").unwrap();
+
+        let generation = StoredGenerationV2 {
+            version: bbox_code_source_store::MIGRATION_STORE_VERSION,
+            generation_id: generation_id_a.clone(),
+            producer_id: producer_id.to_string(),
+            ordinal: 1,
+            descriptor: descriptor_a,
+            published_scope: scope_a.clone(),
+            state: GenerationState::Ready,
+            diagnostic: None,
+            created_unix_secs: 1,
+            materialized_doc_count: Some(0),
+            entity_inventory_sha256: Some("e".repeat(64)),
+        };
+
+        let activation_wrong_scope = ActivationRecordV2 {
+            version: bbox_code_source_store::MIGRATION_STORE_VERSION,
+            project_id: project_id.clone(),
+            published_scope: scope_b,
+            generation_id: generation_id_a.clone(),
+            selector: crate::index::project_files::collected_materialization_selector(
+                project_id.as_str(),
+                &generation_id_a,
+            ),
+            snapshot_id: format!("collected-{}", "f".repeat(32)),
+            document_count: 0,
+            entity_inventory_sha256: "e".repeat(64),
+            current_chunk_targets: BTreeMap::new(),
+            activated_unix_secs: 100,
+            cutback_pending: false,
+            cutback: None,
+            diagnostic: None,
+        };
+        let error = activation_wrong_scope
+            .validate_against_generation(&generation)
+            .expect_err("scope disagreement must refuse");
+        assert!(
+            error.to_string().contains("does not match"),
+            "scope mismatch error must be descriptive: {error}"
+        );
+
+        let wrong_gen_id = compute_generation_id(
+            producer_id,
+            &empty_generation_descriptor(scope_a.clone(), &"b".repeat(40)),
+        );
+        let activation_wrong_gen = ActivationRecordV2 {
+            version: bbox_code_source_store::MIGRATION_STORE_VERSION,
+            project_id: project_id.clone(),
+            published_scope: scope_a.clone(),
+            generation_id: wrong_gen_id.clone(),
+            selector: crate::index::project_files::collected_materialization_selector(
+                project_id.as_str(),
+                &wrong_gen_id,
+            ),
+            snapshot_id: format!("collected-{}", "f".repeat(32)),
+            document_count: 0,
+            entity_inventory_sha256: "e".repeat(64),
+            current_chunk_targets: BTreeMap::new(),
+            activated_unix_secs: 100,
+            cutback_pending: false,
+            cutback: None,
+            diagnostic: None,
+        };
+        let error = activation_wrong_gen
+            .validate_against_generation(&generation)
+            .expect_err("generation id mismatch must refuse");
+        assert!(
+            error.to_string().contains("does not match"),
+            "generation mismatch error must be descriptive: {error}"
+        );
+    }
+
+    /// P4-C section 7.3: bridge-mode v1 records round-trip unchanged through
+    /// the mixed readers.
+    #[test]
+    fn p4c_bridge_v1_round_trip_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("store");
+        let store = CodeSourceStore::open_with_mode(
+            &root,
+            StoreLimits::default(),
+            RuntimeRecordMode::BridgeV1,
+        )
+        .unwrap();
+        let project_id = "bridge-v1-project";
+        let generation_id = "a".repeat(64);
+        let selector = crate::index::project_files::collected_materialization_selector(
+            project_id,
+            &generation_id,
+        );
+        let snapshot_id = format!("collected-{}", "b".repeat(32));
+
+        store
+            .save_activation(&ActivationRecord {
+                version: 1,
+                project_id: project_id.to_string(),
+                generation_id: generation_id.clone(),
+                selector: selector.clone(),
+                snapshot_id: snapshot_id.clone(),
+                document_count: 42,
+                entity_inventory_sha256: "c".repeat(64),
+                current_chunk_targets: BTreeMap::new(),
+                activated_unix_secs: 99,
+                cutback_pending: false,
+                diagnostic: None,
+            })
+            .unwrap();
+
+        let loaded = store
+            .load_activation_mixed(project_id)
+            .unwrap()
+            .expect("v1 activation record must be present");
+        assert!(
+            !loaded.is_current_v2(),
+            "bridge mode must read a v1 record, not v2"
+        );
+        assert_eq!(loaded.generation_id(), generation_id);
+        assert_eq!(loaded.selector(), selector);
+        assert_eq!(loaded.snapshot_id(), snapshot_id);
+        assert_eq!(loaded.document_count(), 42);
+    }
+
+    /// P4-C section 7.3: a catalog-mode store refuses a v2 activation write
+    /// on a bridge store, and vice versa, enforcing end-to-end mode closure.
+    #[test]
+    fn p4c_bridge_store_refuses_v2_activation_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("store");
+        let store = CodeSourceStore::open_with_mode(
+            &root,
+            StoreLimits::default(),
+            RuntimeRecordMode::BridgeV1,
+        )
+        .unwrap();
+        let project_id = ProjectId::parse("p_000000000000000000000000000004c3").unwrap();
+        let scope = PublishedScope::try_new("refuse-v2-repo", ".").unwrap();
+
+        let activation = ActivationRecordV2 {
+            version: bbox_code_source_store::MIGRATION_STORE_VERSION,
+            project_id: project_id.clone(),
+            published_scope: scope,
+            generation_id: "d".repeat(64),
+            selector: crate::index::project_files::collected_materialization_selector(
+                project_id.as_str(),
+                &"d".repeat(64),
+            ),
+            snapshot_id: format!("collected-{}", "e".repeat(32)),
+            document_count: 0,
+            entity_inventory_sha256: "f".repeat(64),
+            current_chunk_targets: BTreeMap::new(),
+            activated_unix_secs: 1,
+            cutback_pending: false,
+            cutback: None,
+            diagnostic: None,
+        };
+        let error = store
+            .save_activation_v2(&activation)
+            .expect_err("bridge store must refuse v2 writes");
+        assert!(
+            error.to_string().contains("code_source_record_mode"),
+            "refusal must carry the typed mode error: {error}"
+        );
+    }
+
+    /// P4-C section 7.3: mixed readers enumerate v2 activation records in
+    /// catalog mode and skip legacy v1 records.
+    #[test]
+    fn p4c_catalog_mode_activation_records_mixed_skips_legacy() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("store");
+        let store = CodeSourceStore::open_with_mode(
+            &root,
+            StoreLimits::default(),
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap();
+        let project_id = ProjectId::parse("p_000000000000000000000000000004c4").unwrap();
+        let scope = PublishedScope::try_new("mixed-enum-repo", ".").unwrap();
+
+        let activation = ActivationRecordV2 {
+            version: bbox_code_source_store::MIGRATION_STORE_VERSION,
+            project_id: project_id.clone(),
+            published_scope: scope,
+            generation_id: "a".repeat(64),
+            selector: crate::index::project_files::collected_materialization_selector(
+                project_id.as_str(),
+                &"a".repeat(64),
+            ),
+            snapshot_id: format!("collected-{}", "b".repeat(32)),
+            document_count: 0,
+            entity_inventory_sha256: "c".repeat(64),
+            current_chunk_targets: BTreeMap::new(),
+            activated_unix_secs: 1,
+            cutback_pending: false,
+            cutback: None,
+            diagnostic: None,
+        };
+        store.save_activation_v2(&activation).unwrap();
+
+        let records = store.activation_records_mixed().unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].is_current_v2());
+        assert_eq!(records[0].project_id(), project_id.as_str());
     }
 }

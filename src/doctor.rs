@@ -384,34 +384,35 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
         .unwrap_or_default()
         .as_secs();
     let stale_hours = state.config.read().code_collection.stale_warning_hours;
-    match store.activation_records() {
+    match store.activation_records_mixed() {
         Ok(activations) => {
             for activation in activations {
-                let generation = match store.find_generation(&activation.generation_id) {
+                let generation = match store.find_generation_mixed(activation.generation_id()) {
                     Ok(generation) => generation,
                     Err(error) => {
                         findings.push(Finding::blocked(format!(
                             "project `{}` active collected generation is unreadable: {error:#}",
-                            activation.project_id
+                            activation.project_id()
                         )));
                         continue;
                     }
                 };
                 let age_hours = now
-                    .saturating_sub(activation.activated_unix_secs)
+                    .saturating_sub(activation.activated_unix_secs())
                     .checked_div(3_600)
                     .unwrap_or_default();
                 if age_hours >= stale_hours {
                     findings.push(Finding::warn(format!(
                         "project `{}` collected generation is {} hours old",
-                        activation.project_id, age_hours
+                        activation.project_id(),
+                        age_hours
                     )));
-                } else if generation.state == bbox_code_source::GenerationState::Active {
+                } else if generation.state() == bbox_code_source::GenerationState::Active {
                     findings.push(Finding::ok(format!(
                         "project `{}` collected generation active ({} files, {} bytes, age {}h)",
-                        activation.project_id,
-                        generation.descriptor.file_count,
-                        generation.descriptor.logical_bytes,
+                        activation.project_id(),
+                        generation.descriptor().file_count,
+                        generation.descriptor().logical_bytes,
                         age_hours
                     )));
                 }
@@ -421,7 +422,7 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
                     .records
                     .iter()
                     .cloned()
-                    .find(|project| project.project_id == activation.project_id)
+                    .find(|project| project.project_id == activation.project_id())
                 {
                     use bbox_indexing::checkout_access::{
                         CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest,
@@ -449,7 +450,7 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
                         Err(error) => {
                             findings.push(Finding::warn(format!(
                                 "project `{}` Git-history freshness unavailable ({})",
-                                activation.project_id,
+                                activation.project_id(),
                                 error.code.as_str()
                             )));
                             continue;
@@ -459,15 +460,15 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
                     if let Err(error) = state.checkout_access.revalidate(&git) {
                         findings.push(Finding::warn(format!(
                             "project `{}` Git-history freshness unavailable ({})",
-                            activation.project_id,
+                            activation.project_id(),
                             error.code.as_str()
                         )));
                         continue;
                     }
-                    if local_head.as_deref() != Some(generation.descriptor.head_commit.as_str()) {
+                    if local_head.as_deref() != Some(generation.descriptor().head_commit.as_str()) {
                         findings.push(Finding::warn(format!(
                             "project `{}` local Git-history HEAD differs from collected current files",
-                            activation.project_id
+                            activation.project_id()
                         )));
                     }
                 }
