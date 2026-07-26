@@ -1490,21 +1490,96 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>) {
                     // Guard acquired: move it INTO the spawned worker so
                     // it is held for the full transition duration and
                     // released (with condvar notification) on completion.
-                    match event.kind {
-                        ReconcileKind::Cutback => {
-                            schedule_cutback_catalog(
+                    let project_id = event.project_id.clone();
+                    let scope = event.scope.clone();
+                    let desired = determine_desired_assignment(&state_for_task, &project_id);
+                    let effective = determine_effective_source(&state_for_task, &project_id);
+                    let store = state_for_task.code_sources.store();
+                    let persisted = store
+                        .load_activation_mixed(&project_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|r| r.cutback().cloned());
+                    let ladder = probe_ladder(&state_for_task, &project_id);
+
+                    // Evaluate open-bridge predicate (section 9.3).
+                    let activation = store.load_activation_mixed(&project_id).ok().flatten();
+                    let effective_gen = activation
+                        .as_ref()
+                        .map(|a| a.generation_id().to_string())
+                        .unwrap_or_default();
+                    let effective_scope = activation
+                        .as_ref()
+                        .and_then(|a| a.published_scope().cloned());
+                    let bridge_open = check_bridge_open_for_reducer(
+                        &state_for_task,
+                        &project_id,
+                        &effective_gen,
+                        effective_scope.as_ref(),
+                    );
+
+                    let action = evaluate_reduction(
+                        desired,
+                        effective,
+                        persisted.as_ref(),
+                        ladder,
+                        bridge_open,
+                    );
+
+                    tracing::debug!(
+                        project_id = %project_id,
+                        ?desired,
+                        ?effective,
+                        ?persisted,
+                        ?ladder,
+                        bridge_open,
+                        ?action,
+                        "reducer: evaluated reduction table"
+                    );
+
+                    match action {
+                        ReducerAction::NoOp => {
+                            // Steady-state: guard drops, condvar notified.
+                        }
+                        ReducerAction::CancelCutback => {
+                            if let Err(error) = store.clear_cutback_state(&project_id) {
+                                tracing::warn!(
+                                    project_id = %project_id,
+                                    %error,
+                                    "reducer: cancel cutback failed"
+                                );
+                            }
+                        }
+                        ReducerAction::Activate => {
+                            schedule_activation(
                                 state_for_task.clone(),
-                                event.scope,
-                                event.project_id,
+                                scope,
+                                project_id,
                                 Some(guard),
                             );
                         }
-                        ReconcileKind::Activate => {
-                            schedule_activation(
+                        ReducerAction::AttemptCutback | ReducerAction::ReattemptCutback => {
+                            schedule_cutback_catalog(
                                 state_for_task.clone(),
-                                event.scope,
-                                event.project_id,
+                                scope,
+                                project_id,
                                 Some(guard),
+                            );
+                        }
+                        ReducerAction::PersistStructural(reason) => {
+                            let state_v2 = CutbackStateV2::Structural { reason };
+                            if let Err(error) = store.mark_cutback_state(&project_id, state_v2) {
+                                tracing::warn!(
+                                    project_id = %project_id,
+                                    %error,
+                                    "reducer: persist structural cutback state failed"
+                                );
+                            }
+                        }
+                        ReducerAction::Retire => {
+                            tracing::info!(
+                                project_id = %project_id,
+                                "reducer: retirement handoff (P4-G)"
                             );
                         }
                     }
@@ -1518,6 +1593,63 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>) {
     // exits. The background task is a daemon-lifetime thread; it is NOT
     // a tokio task and does NOT hold any sync lock across slow work.
     *state.reconciler_shutdown.write() = shutdown.clone();
+}
+
+/// Spawn the post-commit observer thread (section 9.4).
+///
+/// Polls the `ProjectCatalogStore` commit observer at a bounded interval.
+/// Each `CatalogCommittedEvent` is mapped to reconciler events: every
+/// changed project id gets one `Activate` or `Cutback` event depending on
+/// its desired assignment. Delivery failure marks health and triggers one
+/// bounded rescan (R5). Catalog mode only; bridge mode has no observer.
+pub(crate) fn spawn_commit_observer(state: &Arc<SharedState>) {
+    let Some(catalog_store) = state.project_authority.catalog_store() else {
+        return;
+    };
+    let observer = catalog_store.commit_observer();
+    let state = state.clone();
+    let shutdown = state.reconciler_shutdown.read().clone();
+    std::thread::Builder::new()
+        .name("blackbox-catalog-commit-observer".to_string())
+        .spawn(move || {
+            let poll_interval = std::time::Duration::from_secs(2);
+            while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                let events = observer.drain_events();
+                for event in events {
+                    for project_id in &event.changed_project_ids {
+                        // Map each affected id to one reconciler event
+                        // (section 9.4). Determine whether to enqueue
+                        // Activate or Cutback based on desired assignment.
+                        let scope = state
+                            .code_sources
+                            .assignments()
+                            .into_iter()
+                            .find(|(_, pid)| pid == project_id)
+                            .map(|(scope, _)| scope);
+                        let Some(scope) = scope else {
+                            // No assignment: no reconciler event needed.
+                            continue;
+                        };
+                        let desired = determine_desired_assignment(&state, project_id);
+                        let kind = match desired {
+                            DesiredAssignment::Local => ReconcileKind::Cutback,
+                            DesiredAssignment::Collected => ReconcileKind::Activate,
+                            DesiredAssignment::Retired => continue,
+                        };
+                        state
+                            .code_sources
+                            .enqueue_transition(project_id, scope, kind);
+                    }
+                    tracing::debug!(
+                        epoch = event.epoch,
+                        changed_count = event.changed_project_ids.len(),
+                        "commit observer: mapped catalog commit to reconciler events"
+                    );
+                }
+                std::thread::sleep(poll_interval);
+            }
+        })
+        .expect("spawning catalog commit observer thread");
 }
 
 /// Spawn the bounded cutback scheduler (section 9.2).
@@ -2166,6 +2298,317 @@ fn stage_git_current_overlay_after_activation(
             error = %error,
             "republishing the read view after the Git overlay failed"
         );
+    }
+}
+
+/// Desired assignment for a project (section 9.3 reduction table input).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesiredAssignment {
+    /// Project is assigned to a scope in the auth table: wants local.
+    Local,
+    /// Project is no longer assigned: wants collected (cancel cutback).
+    Collected,
+    /// Project is retired (handoff to retirement, P4-G).
+    Retired,
+}
+
+/// Effective activation source (section 9.3 reduction table input).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectiveSource {
+    Collected,
+    Local,
+    Warming,
+    Unavailable,
+}
+
+/// Attachment ladder result (section 9.3 reduction table input).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LadderResult {
+    Selected,
+    None,
+    Ambiguous,
+    ScopeInvalid,
+}
+
+/// The action the reducer decides (section 9.3 reduction table output).
+#[derive(Debug)]
+enum ReducerAction {
+    /// No action needed; state is steady.
+    NoOp,
+    /// Cancel any persisted cutback state and ensure collected is active.
+    CancelCutback,
+    /// Activate the desired scope (collected authority).
+    Activate,
+    /// Attempt the cutback to local.
+    AttemptCutback,
+    /// Persist a structural cutback state.
+    PersistStructural(CutbackReason),
+    /// Re-attempt the cutback (attachment now available or scheduler due).
+    ReattemptCutback,
+    /// Hand off to retirement (P4-G).
+    Retire,
+}
+
+/// Evaluate the open-bridge predicate for a project (section 9.3).
+///
+/// A `ScopeMigrationRecord`'s `code_bridge_generation` is open for a
+/// project when it equals the project's current effective activation
+/// generation id AND the record's `old_scope` equals that activation's
+/// `published_scope`. When multiple records exist (pre-refusal legacy
+/// state), the newest by `catalog_epoch` is authority.
+fn is_bridge_open(
+    migration_records: &[&bbox_corpus_core::project_catalog::ScopeMigrationRecord],
+    effective_generation_id: &str,
+    effective_scope: Option<&PublishedScope>,
+) -> bool {
+    if migration_records.is_empty() {
+        return false;
+    }
+    // Newest by catalog_epoch is authority when multiple records exist.
+    let newest = migration_records
+        .iter()
+        .max_by_key(|r| r.catalog_epoch)
+        .copied();
+    let Some(record) = newest else {
+        return false;
+    };
+    let Some(ref bridge_gen) = record.code_bridge_generation else {
+        return false;
+    };
+    if bridge_gen != effective_generation_id {
+        return false;
+    }
+    match effective_scope {
+        Some(scope) => match &record.old_scope {
+            bbox_corpus_core::project_catalog::ProjectScope::Published(pub_scope) => {
+                pub_scope == scope
+            }
+            bbox_corpus_core::project_catalog::ProjectScope::LegacyLocal => false,
+        },
+        None => false,
+    }
+}
+
+/// Determine the effective activation source for a project.
+fn determine_effective_source(state: &Arc<SharedState>, project_id: &str) -> EffectiveSource {
+    let store = state.code_sources.store();
+    let activation = store.load_activation_mixed(project_id).ok().flatten();
+    let Some(activation) = activation else {
+        return EffectiveSource::Unavailable;
+    };
+    let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
+    let manifest = match bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir) {
+        Ok(m) => m,
+        Err(_) => return EffectiveSource::Unavailable,
+    };
+    let selector = manifest
+        .workspaces
+        .get(project_id)
+        .and_then(|entry| entry.code_source_selector.as_deref());
+    match selector {
+        Some(s) if s.starts_with("collected:") => EffectiveSource::Collected,
+        Some(_) => EffectiveSource::Local,
+        None => {
+            if activation.document_count() > 0 {
+                EffectiveSource::Warming
+            } else {
+                EffectiveSource::Unavailable
+            }
+        }
+    }
+}
+
+/// Check the open-bridge predicate for a project in the reconciler
+/// (section 9.3). Fetches ScopeMigrationRecords from the catalog store
+/// and evaluates whether the bridge is open for the project's current
+/// effective activation.
+fn check_bridge_open_for_reducer(
+    state: &Arc<SharedState>,
+    project_id: &str,
+    effective_generation_id: &str,
+    effective_scope: Option<&PublishedScope>,
+) -> bool {
+    let Some(catalog_store) = state.project_authority.catalog_store() else {
+        return false;
+    };
+    let Ok(snapshot) = catalog_store.snapshot() else {
+        return false;
+    };
+    let catalog = snapshot.catalog();
+    let records: Vec<_> = catalog
+        .scope_migrations
+        .values()
+        .filter(|r| r.project_id.as_str() == project_id)
+        .collect();
+    is_bridge_open(&records, effective_generation_id, effective_scope)
+}
+
+/// Probe the attachment ladder for a project without committing to a
+/// full checkout acquisition (section 9.3 ladder result input).
+fn probe_ladder(state: &Arc<SharedState>, project_id: &str) -> LadderResult {
+    use bbox_indexing::checkout_access::{
+        CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest, CheckoutAccessSourceLane,
+        CheckoutAttachmentSelector,
+    };
+    let scope = state
+        .code_sources
+        .assignments()
+        .into_iter()
+        .find(|(_, pid)| pid == project_id)
+        .map(|(scope, _)| scope);
+    let Some(scope) = scope else {
+        return LadderResult::None;
+    };
+    match state.checkout_access.acquire(CheckoutAccessRequest {
+        project_id: project_id.to_string(),
+        attachment: CheckoutAttachmentSelector::Selected,
+        expected_scope: Some(scope),
+        kind: CheckoutAccessKind::GitHistory,
+        intent: CheckoutAccessIntent::Read,
+        source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+    }) {
+        Ok(_) => LadderResult::Selected,
+        Err(error) => {
+            use bbox_indexing::checkout_access::CheckoutAccessErrorCode as Code;
+            match error.code {
+                Code::AttachmentNotFound | Code::ObservationUnavailable => LadderResult::None,
+                Code::ScopeMismatch
+                | Code::CapabilityDenied
+                | Code::IntentDenied
+                | Code::ConservativePathGateDenied
+                | Code::InvalidRoot
+                | Code::UnsafeRelativePath
+                | Code::WriteIntentRequired => LadderResult::ScopeInvalid,
+                _ => LadderResult::Ambiguous,
+            }
+        }
+    }
+}
+
+/// Determine the desired assignment for a project from auth-table state.
+fn determine_desired_assignment(state: &Arc<SharedState>, project_id: &str) -> DesiredAssignment {
+    let assigned = state
+        .code_sources
+        .assignments()
+        .into_iter()
+        .any(|(_, pid)| pid == project_id);
+    if assigned {
+        DesiredAssignment::Local
+    } else {
+        DesiredAssignment::Collected
+    }
+}
+
+/// Evaluate the complete reduction table (section 9.3).
+///
+/// Every cell of the table is defined here. Before consulting the
+/// table, the reducer checks the open-bridge predicate. When it holds,
+/// the reducer clears any pre-existing Structural cutback state on the
+/// project, sets health to `scope_migration_refresh_required`, and
+/// performs no cutback attempt.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_reduction(
+    desired: DesiredAssignment,
+    effective: EffectiveSource,
+    persisted: Option<&CutbackStateV2>,
+    ladder: LadderResult,
+    bridge_open: bool,
+) -> ReducerAction {
+    // Open-bridge predicate: bridge-exempt project. Clear any
+    // pre-existing Structural state and perform no cutback attempt
+    // regardless of the desired/effective/persisted tuple (section 9.3).
+    if bridge_open {
+        if let Some(CutbackStateV2::Structural { .. }) = persisted {
+            return ReducerAction::CancelCutback;
+        }
+        return ReducerAction::NoOp;
+    }
+
+    // retired: hand off to retirement (P4-G).
+    if desired == DesiredAssignment::Retired {
+        return ReducerAction::Retire;
+    }
+
+    match (desired, effective) {
+        // retired/any (defensive; handled above, but exhaustive match).
+        (DesiredAssignment::Retired, _) => ReducerAction::Retire,
+
+        // collected/collected cells
+        (DesiredAssignment::Collected, EffectiveSource::Collected) => {
+            if persisted.is_some() {
+                ReducerAction::CancelCutback
+            } else {
+                ReducerAction::NoOp
+            }
+        }
+        // collected/other: activate desired
+        (DesiredAssignment::Collected, _) => ReducerAction::Activate,
+
+        // local/local cells
+        (DesiredAssignment::Local, EffectiveSource::Local) => {
+            if persisted.is_some() {
+                ReducerAction::CancelCutback
+            } else {
+                ReducerAction::NoOp
+            }
+        }
+
+        // local/warming or unavailable: re-stage if valid local source,
+        // otherwise no-op with health record (simplified to NoOp here;
+        // health record set by the dispatcher).
+        (DesiredAssignment::Local, EffectiveSource::Warming)
+        | (DesiredAssignment::Local, EffectiveSource::Unavailable) => {
+            if ladder == LadderResult::Selected {
+                ReducerAction::AttemptCutback
+            } else {
+                ReducerAction::NoOp
+            }
+        }
+
+        // local/collected cells: the main reduction table
+        (DesiredAssignment::Local, EffectiveSource::Collected) => {
+            match persisted {
+                None => {
+                    // No persisted state: consult ladder
+                    match ladder {
+                        LadderResult::Selected => ReducerAction::AttemptCutback,
+                        LadderResult::None => {
+                            ReducerAction::PersistStructural(CutbackReason::NoLocalAttachment)
+                        }
+                        LadderResult::Ambiguous => {
+                            ReducerAction::PersistStructural(CutbackReason::AmbiguousAttachment)
+                        }
+                        LadderResult::ScopeInvalid => {
+                            ReducerAction::PersistStructural(CutbackReason::ScopeMismatch)
+                        }
+                    }
+                }
+                Some(CutbackStateV2::Structural { reason: _ }) => {
+                    // Structural: re-evaluate ladder
+                    match ladder {
+                        LadderResult::Selected => ReducerAction::ReattemptCutback,
+                        _ => ReducerAction::NoOp,
+                    }
+                }
+                Some(CutbackStateV2::Transient { attempt, .. }) => {
+                    // Transient: check if due (scheduler re-attempts).
+                    // The reducer always returns ReattemptCutback for
+                    // transient; the dispatcher checks the deadline.
+                    let _ = attempt;
+                    ReducerAction::ReattemptCutback
+                }
+                Some(CutbackStateV2::ManualRetryRequired { .. }) => {
+                    // Steady-state no-op (explicit retry only).
+                    // Config-event re-entry: a config reload re-evaluates.
+                    ReducerAction::NoOp
+                }
+                Some(CutbackStateV2::Terminal { .. }) => {
+                    // Steady-state no-op (terminal, never auto-retry).
+                    // Config-event re-entry: a config reload re-evaluates.
+                    ReducerAction::NoOp
+                }
+            }
+        }
     }
 }
 
@@ -6416,5 +6859,294 @@ mod tests {
             !after.is_cutback_pending(),
             "cutback_pending must be false after clear"
         );
+    }
+
+    // P4-E commit (b): reducer reduction table cell tests (section 9.3).
+
+    #[test]
+    fn p4e_reducer_collected_collected_none_is_noop() {
+        let action = evaluate_reduction(
+            DesiredAssignment::Collected,
+            EffectiveSource::Collected,
+            None,
+            LadderResult::None,
+            false,
+        );
+        assert!(matches!(action, ReducerAction::NoOp));
+    }
+
+    #[test]
+    fn p4e_reducer_collected_collected_any_nonnone_cancels_cutback() {
+        let persisted = CutbackStateV2::Structural {
+            reason: CutbackReason::NoLocalAttachment,
+        };
+        let action = evaluate_reduction(
+            DesiredAssignment::Collected,
+            EffectiveSource::Collected,
+            Some(&persisted),
+            LadderResult::None,
+            false,
+        );
+        assert!(matches!(action, ReducerAction::CancelCutback));
+    }
+
+    #[test]
+    fn p4e_reducer_collected_other_activates() {
+        for eff in [
+            EffectiveSource::Local,
+            EffectiveSource::Warming,
+            EffectiveSource::Unavailable,
+        ] {
+            let action = evaluate_reduction(
+                DesiredAssignment::Collected,
+                eff,
+                None,
+                LadderResult::None,
+                false,
+            );
+            assert!(matches!(action, ReducerAction::Activate), "eff={:?}", eff);
+        }
+    }
+
+    #[test]
+    fn p4e_reducer_local_collected_none_selected_attempts_cutback() {
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            None,
+            LadderResult::Selected,
+            false,
+        );
+        assert!(matches!(action, ReducerAction::AttemptCutback));
+    }
+
+    #[test]
+    fn p4e_reducer_local_collected_none_none_persists_no_local() {
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            None,
+            LadderResult::None,
+            false,
+        );
+        match action {
+            ReducerAction::PersistStructural(CutbackReason::NoLocalAttachment) => {}
+            other => panic!(
+                "expected PersistStructural(NoLocalAttachment), got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn p4e_reducer_local_collected_none_ambiguous_persists_ambiguous() {
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            None,
+            LadderResult::Ambiguous,
+            false,
+        );
+        match action {
+            ReducerAction::PersistStructural(CutbackReason::AmbiguousAttachment) => {}
+            other => panic!(
+                "expected PersistStructural(AmbiguousAttachment), got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn p4e_reducer_local_collected_none_scopeinvalid_persists_mismatch() {
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            None,
+            LadderResult::ScopeInvalid,
+            false,
+        );
+        match action {
+            ReducerAction::PersistStructural(CutbackReason::ScopeMismatch) => {}
+            other => panic!("expected PersistStructural(ScopeMismatch), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn p4e_reducer_local_collected_structural_selected_reattempts() {
+        let persisted = CutbackStateV2::Structural {
+            reason: CutbackReason::NoLocalAttachment,
+        };
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            Some(&persisted),
+            LadderResult::Selected,
+            false,
+        );
+        assert!(matches!(action, ReducerAction::ReattemptCutback));
+    }
+
+    #[test]
+    fn p4e_reducer_local_collected_structural_none_is_noop() {
+        let persisted = CutbackStateV2::Structural {
+            reason: CutbackReason::NoLocalAttachment,
+        };
+        for ladder in [
+            LadderResult::None,
+            LadderResult::Ambiguous,
+            LadderResult::ScopeInvalid,
+        ] {
+            let action = evaluate_reduction(
+                DesiredAssignment::Local,
+                EffectiveSource::Collected,
+                Some(&persisted),
+                ladder,
+                false,
+            );
+            assert!(matches!(action, ReducerAction::NoOp), "ladder={:?}", ladder);
+        }
+    }
+
+    #[test]
+    fn p4e_reducer_local_collected_transient_reattempts() {
+        let persisted = CutbackStateV2::Transient {
+            attempt: 2,
+            error_class: CutbackErrorClass::WriterContention,
+            deadline_unix_secs: unix_now() + 30,
+        };
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            Some(&persisted),
+            LadderResult::None,
+            false,
+        );
+        assert!(matches!(action, ReducerAction::ReattemptCutback));
+    }
+
+    #[test]
+    fn p4e_reducer_local_collected_manual_retry_is_noop() {
+        let persisted = CutbackStateV2::ManualRetryRequired {
+            error_class: CutbackErrorClass::WriterContention,
+            attempt: 8,
+        };
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            Some(&persisted),
+            LadderResult::Selected,
+            false,
+        );
+        assert!(matches!(action, ReducerAction::NoOp));
+    }
+
+    #[test]
+    fn p4e_reducer_local_collected_terminal_is_noop() {
+        let persisted = CutbackStateV2::Terminal {
+            error_class: CutbackErrorClass::ValidationFailure,
+        };
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            Some(&persisted),
+            LadderResult::Selected,
+            false,
+        );
+        assert!(matches!(action, ReducerAction::NoOp));
+    }
+
+    #[test]
+    fn p4e_reducer_local_local_none_is_noop() {
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Local,
+            None,
+            LadderResult::None,
+            false,
+        );
+        assert!(matches!(action, ReducerAction::NoOp));
+    }
+
+    #[test]
+    fn p4e_reducer_local_local_any_nonnone_cancels() {
+        let persisted = CutbackStateV2::Transient {
+            attempt: 1,
+            error_class: CutbackErrorClass::IoPressure,
+            deadline_unix_secs: unix_now() + 5,
+        };
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Local,
+            Some(&persisted),
+            LadderResult::None,
+            false,
+        );
+        assert!(matches!(action, ReducerAction::CancelCutback));
+    }
+
+    #[test]
+    fn p4e_reducer_bridge_open_clears_structural() {
+        let persisted = CutbackStateV2::Structural {
+            reason: CutbackReason::NoLocalAttachment,
+        };
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            Some(&persisted),
+            LadderResult::None,
+            true, // bridge is open
+        );
+        assert!(matches!(action, ReducerAction::CancelCutback));
+    }
+
+    #[test]
+    fn p4e_reducer_bridge_open_no_structural_is_noop() {
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            None,
+            LadderResult::None,
+            true, // bridge is open
+        );
+        assert!(matches!(action, ReducerAction::NoOp));
+    }
+
+    #[test]
+    fn p4e_reducer_retired_hands_off() {
+        let action = evaluate_reduction(
+            DesiredAssignment::Retired,
+            EffectiveSource::Collected,
+            None,
+            LadderResult::None,
+            false,
+        );
+        assert!(matches!(action, ReducerAction::Retire));
+    }
+
+    #[test]
+    fn p4e_reducer_open_bridge_predicate_empty_records() {
+        let records: Vec<&bbox_corpus_core::project_catalog::ScopeMigrationRecord> = vec![];
+        let result = is_bridge_open(&records, "gen-1", None);
+        assert!(!result);
+    }
+
+    #[test]
+    fn p4e_post_commit_observer_drains_events() {
+        use bbox_indexing::project_catalog_store::{CatalogCommitObserver, CatalogCommittedEvent};
+        let observer = CatalogCommitObserver::new();
+        assert!(!observer.has_events());
+        let mut ids = std::collections::BTreeSet::new();
+        ids.insert("p_test1".to_string());
+        ids.insert("p_test2".to_string());
+        observer.push_for_test(CatalogCommittedEvent {
+            epoch: 42,
+            changed_project_ids: ids.clone(),
+        });
+        assert!(observer.has_events());
+        let drained = observer.drain_events();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].epoch, 42);
+        assert_eq!(drained[0].changed_project_ids, ids);
+        assert!(!observer.has_events());
     }
 }

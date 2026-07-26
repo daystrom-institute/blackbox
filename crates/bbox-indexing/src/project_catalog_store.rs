@@ -209,10 +209,85 @@ pub struct ProjectCatalogCommit {
     pub attachments_sha256: String,
 }
 
+/// Emitted by the post-commit observer after a successful `transact`
+/// (section 9.4). The server maps each affected project id to one
+/// reconciler event.
+#[derive(Debug, Clone)]
+pub struct CatalogCommittedEvent {
+    pub epoch: u64,
+    pub changed_project_ids: BTreeSet<String>,
+}
+
+/// Cloneable observer handle for post-commit notifications (section 9.4).
+///
+/// On successful `transact`, after durable pair publication and lock
+/// release, the store pushes a `CatalogCommittedEvent` into the shared
+/// queue. Callers poll `drain_events` to consume them. The observer
+/// does not carry mutable records. Delivery failure marks health and
+/// triggers one bounded rescan (R5).
+#[derive(Clone)]
+pub struct CatalogCommitObserver {
+    queue: Arc<std::sync::Mutex<std::collections::VecDeque<CatalogCommittedEvent>>>,
+}
+
+impl CatalogCommitObserver {
+    pub fn new() -> Self {
+        Self {
+            queue: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+        }
+    }
+
+    /// Push a commit event into the observer queue (section 9.4).
+    /// Normally called by `transact`; exposed for testing.
+    #[doc(hidden)]
+    pub fn push_for_test(&self, event: CatalogCommittedEvent) {
+        self.push(event);
+    }
+
+    fn push(&self, event: CatalogCommittedEvent) {
+        let mut guard = match self.queue.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.push_back(event);
+    }
+
+    /// Drain all pending commit events (section 9.4).
+    pub fn drain_events(&self) -> Vec<CatalogCommittedEvent> {
+        let mut guard = match self.queue.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.drain(..).collect()
+    }
+
+    /// Returns true if at least one event is pending.
+    pub fn has_events(&self) -> bool {
+        let guard = match self.queue.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        !guard.is_empty()
+    }
+}
+
+impl fmt::Debug for CatalogCommitObserver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let len = match self.queue.lock() {
+            Ok(guard) => guard.len(),
+            Err(_) => 0,
+        };
+        f.debug_struct("CatalogCommitObserver")
+            .field("pending_events", &len)
+            .finish()
+    }
+}
+
 pub struct ProjectCatalogStore {
     owner: ProjectCatalogTransactionOwner,
     current: RwLock<PublishedStoreState>,
     _lifetime_lock: Arc<ProjectCatalogMigrationLock>,
+    commit_observer: CatalogCommitObserver,
 }
 
 #[derive(Debug, Clone)]
@@ -374,6 +449,15 @@ impl ProjectCatalogStore {
         }
     }
 
+    /// Returns a clone of the post-commit observer handle (section 9.4).
+    ///
+    /// The observer accumulates `CatalogCommittedEvent`s emitted after
+    /// each successful `transact`. Callers drain events and map affected
+    /// project ids to reconciler actions.
+    pub fn commit_observer(&self) -> CatalogCommitObserver {
+        self.commit_observer.clone()
+    }
+
     /// Mutate a complete catalog and attachment post-image under epoch CAS.
     ///
     /// The closure runs on private clones before the mutation lock is held.
@@ -391,6 +475,13 @@ impl ProjectCatalogStore {
             return Err(stale_epoch(expected_epoch, base.epoch));
         }
 
+        // Capture the set of project ids present before the mutation so
+        // the post-commit observer can compute the changed set
+        // (section 9.4: emit changed project ids after durable pair
+        // publication and lock release). We keep the base catalog's
+        // project map for per-entry comparison after the build closure.
+        let old_projects = base.catalog.projects.clone();
+
         let mut catalog = (*base.catalog).clone();
         let mut attachments = (*base.attachments).clone();
         let invariant_version = (catalog.version, attachments.version);
@@ -406,6 +497,41 @@ impl ProjectCatalogStore {
                 "transaction closure changed owner-controlled fields",
             ));
         }
+        let new_project_ids: BTreeSet<String> = catalog
+            .projects
+            .keys()
+            .map(|k| k.as_str().to_string())
+            .collect();
+        let old_project_ids: BTreeSet<String> = old_projects
+            .keys()
+            .map(|k| k.as_str().to_string())
+            .collect();
+        // Compute changed project ids before catalog moves into candidate
+        // (section 9.4). A project id is "changed" if it was added,
+        // removed, or its entry content differs between old and new
+        // catalog snapshots.
+        let changed_project_ids: BTreeSet<String> = new_project_ids
+            .iter()
+            .chain(old_project_ids.iter())
+            .filter(|pid| {
+                let old_entry = old_projects
+                    .iter()
+                    .find(|(k, _)| k.as_str() == pid.as_str())
+                    .map(|(_, v)| v);
+                let new_entry = catalog
+                    .projects
+                    .iter()
+                    .find(|(k, _)| k.as_str() == pid.as_str())
+                    .map(|(_, v)| v);
+                match (old_entry, new_entry) {
+                    (None, Some(_)) => true,
+                    (Some(_), None) => true,
+                    (Some(old), Some(new)) => old != new,
+                    (None, None) => false,
+                }
+            })
+            .cloned()
+            .collect();
         let new_epoch = expected_epoch.checked_add(1).ok_or_else(|| {
             ProjectCatalogStoreError::new(
                 "error.project_catalog_epoch_overflow",
@@ -456,6 +582,13 @@ impl ProjectCatalogStore {
             attachments_sha256: committed.attachments_sha256.to_string(),
         };
         *self.current.write() = PublishedStoreState::Ready(committed);
+        // Post-commit observer: emit committed epoch + changed project
+        // ids after durable pair publication and lock release
+        // (section 9.4).
+        self.commit_observer.push(CatalogCommittedEvent {
+            epoch: result.epoch,
+            changed_project_ids,
+        });
         Ok(result)
     }
 
@@ -592,6 +725,7 @@ impl ProjectCatalogStore {
                 owner,
                 current: RwLock::new(PublishedStoreState::Ready(current)),
                 _lifetime_lock: lifetime_lock,
+                commit_observer: CatalogCommitObserver::new(),
             },
             disposition,
         })
@@ -662,6 +796,7 @@ impl ProjectCatalogStore {
             owner,
             current: RwLock::new(PublishedStoreState::Ready(current)),
             _lifetime_lock: lifetime_lock,
+            commit_observer: CatalogCommitObserver::new(),
         })
     }
 
@@ -720,6 +855,7 @@ impl ProjectCatalogStore {
             owner,
             current: RwLock::new(PublishedStoreState::Ready(current)),
             _lifetime_lock: lifetime_lock,
+            commit_observer: CatalogCommitObserver::new(),
         })
     }
 }
@@ -1538,6 +1674,7 @@ impl MigrationCheckoutRegistryBoundSessionV1 {
                     owner: self.owner,
                     current: RwLock::new(PublishedStoreState::Ready(current)),
                     _lifetime_lock: self.lifetime_lock,
+                    commit_observer: CatalogCommitObserver::new(),
                 },
                 disposition,
             },

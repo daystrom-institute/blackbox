@@ -11,12 +11,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bbox_code_source::{
-    BeginUploadResponse, CutbackErrorClass, CutbackReason, CutbackStateV2,
-    DEFAULT_MAX_MANIFEST_FILES, DEFAULT_MAX_MANIFEST_LOGICAL_BYTES, GenerationDescriptor,
-    GenerationState, GenerationStatus, MAX_MANIFEST_PAGE_ENTRIES, ManifestEntry, MissingBlobsPage,
-    generation_id, scope_hash, validate_collected_materialization_selector, validate_manifest,
-    validate_producer_id, validate_sha256,
+    BeginUploadResponse, CutbackStateV2, DEFAULT_MAX_MANIFEST_FILES,
+    DEFAULT_MAX_MANIFEST_LOGICAL_BYTES, GenerationDescriptor, GenerationState, GenerationStatus,
+    MAX_MANIFEST_PAGE_ENTRIES, ManifestEntry, MissingBlobsPage, generation_id, scope_hash,
+    validate_collected_materialization_selector, validate_manifest, validate_producer_id,
+    validate_sha256,
 };
+#[cfg(test)]
+use bbox_code_source::{CutbackErrorClass, CutbackReason};
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::json_store::{
