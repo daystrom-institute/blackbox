@@ -43,6 +43,10 @@ positions; blind authoring is what makes the later critique sharp. Its
 cost is roughly double, and majority opinion among authors is worthless
 (see hard rules), so buy the panel only for the independence.
 
+The shape choice above assumes you can rank the pool ex ante (the
+prototype regime: one clearly dominant author). When you cannot, use the
+casting option below instead.
+
 Provider profile observed across runs (revisit as models move): brodex
 (gpt-5.6-sol, xhigh) is the strongest author, slowest and costliest,
 differentially right on hard design forks; deepseek (deepseek-v4-pro,
@@ -53,6 +57,75 @@ balance and a reliable repair/consolidation executor. Kimi (k3 via the
 participant. In the panel shape, pick the consolidation author per round
 on merit (whose final position matched the adjudication and whose
 corrections held), never by habit.
+
+## Option two: casting by role requirements, with an audition (peer pools)
+
+Use this option when the available pool is peer-class at the top (for
+example several frontier models of comparable tier) and "who is
+strongest" is not knowable in advance. In that regime, per-subject
+variance among peers typically exceeds their mean differences, so the
+right question is not "which model is best" but "what does each seat
+actually need". Status: designed from the prototype's data but NOT yet
+exercised end to end; treat the first run under this option as an
+iteration experiment and record it to the thread.
+
+Three of the four seats are SATISFICING seats: define the requirement
+floor and the independence constraints, then fill each with the cheapest
+qualifying model.
+
+- **Reviewer (bookend):** frontier-tier consequence-walking (re-deriving
+  state machines, reproducing findings from failure sequences; a mid
+  model rubber-stamps this work). Structural requirements: independence
+  from the authoring pool, no stake in the deliberation, the fixed lens
+  and exact-PASS bar, and preferably a different prior family than the
+  author, since shared-prior blind spots are the one thing role
+  structure cannot fix. No specific model is magic in this seat.
+- **Adjudicator/orchestrator:** frontier tier, tool-loop discipline, the
+  longest context in the system, and one hard constraint: it must not
+  have authored anything it rules on. The prototype's one adjudication
+  failure was procedural (a skipped caller-path walk by a
+  frontier-class agent), not a capability gap, which is why firsthand
+  verification is a gate in this runbook rather than a trusted
+  property of the seat. The live interactive agent is the natural
+  occupant for structural reasons: operator trust, accumulated context,
+  the tool loop.
+- **Critics:** the floor is genuinely lower, because the role's
+  structure substitutes for capability: quote-the-line, the scored
+  verified-sound list, and mandatory caller-path walks turned the
+  prototype's weakest author into a sharp critic. Requirements:
+  adversarial reading under that scaffolding, plus pairwise prior
+  diversity and diversity from the author.
+
+The AUTHOR is the one MAXIMIZING seat: its output is the quality ceiling
+of the whole pipeline, and it is the only seat where per-subject peer
+variance matters and cannot be substituted by structure. Fill it with
+the audition:
+
+1. Each candidate blind-writes a SKETCH only: the scope decision, the
+   fixed-decisions section, and the milestone spine, roughly 100 lines,
+   grounded to the same brief and verification rules as a full draft.
+   Cost is a small fraction of a full blind round.
+2. Adjudicate the sketches on evidence quality, exactly as you would
+   critiques: grounding of claims, quality of rejected alternatives,
+   scope judgment against the governing text. The winner authors the
+   full plan.
+3. The audition pays for itself twice more. Losers become PRE-GROUNDED
+   critics: they already read the governing sources, so their critique
+   pass is warmer, cheaper, and sharper than a cold critic's. And the
+   audition doubles as the FORK-OPENNESS DETECTOR: if the sketches
+   converge on one spine, proceed author-critic with the winner; if
+   they diverge structurally, you have discovered you are in panel
+   territory, and the sketches are already the seeds of a blind round.
+   The shape decision stops being an advance judgment call and becomes
+   something the first stage measures.
+
+In the known-dominant regime the audition collapses to zero and this
+option degenerates to the default shape, which makes option one a
+special case rather than a competing philosophy. Voting never becomes
+valid in peer pools: frontier models train on overlapping distributions,
+so two peers confidently agreeing on an unverified claim is still shared
+prior, not evidence. All adjudication and grounding rules apply
+unchanged.
 
 ## Workspace and tracking
 
