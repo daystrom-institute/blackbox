@@ -18,7 +18,8 @@ use bbox_code_source::{
 };
 use bbox_code_source_store::{
     ActivationRecord, ActivationRecordV2, CodeSourceStore, CollisionRetirementWorkV1,
-    MixedStoredGeneration, RetirementRecord, RuntimeRecordMode, StoreLimits, StoreRequestError,
+    MixedActivationRecord, MixedStoredGeneration, RetirementRecord, RuntimeRecordMode, StoreLimits,
+    StoreRequestError,
 };
 use bbox_corpus_core::code_project_identity::CodeProjectIdentity;
 use bbox_corpus_core::identity::PublishedScope;
@@ -1257,12 +1258,10 @@ pub(crate) fn resume_pending_activations(state: Arc<SharedState>) {
         }
     }
 
-    // Section 9.7 restart re-drives: re-evaluate every persisted
-    // CutbackStateV2 against the current attachment epoch. Catalog mode
-    // only; bridge mode never persists cutback state.
-    if is_catalog {
-        resume_persisted_cutback_states(&state, &store);
-    }
+    // Section 9.7 restart re-drives have been folded into the pre-bind
+    // startup sweep (section 10.1 step 8). The background task no longer
+    // re-evaluates persisted cutback states separately; the pre-bind
+    // path enqueues all reducer events before the listener binds.
     match store.activation_records_mixed() {
         Ok(records) => {
             for activation in records {
@@ -1336,116 +1335,6 @@ pub(crate) fn resume_pending_activations(state: Arc<SharedState>) {
             }
         }
         Err(error) => tracing::error!(%error, "loading collision retirement work failed"),
-    }
-}
-
-/// Section 9.7 restart re-drives: re-evaluate every persisted
-/// `CutbackStateV2` against the current attachment epoch (catalog mode
-/// only).
-///
-/// - Structural: enqueue exactly ONE reconciler event per project so
-///   the reducer re-evaluates the ladder. No spin, no direct attempt.
-/// - Transient: register the deadline with the bounded scheduler. If
-///   the deadline has elapsed, the scheduler re-attempts immediately;
-///   if future, it waits.
-/// - Terminal and ManualRetryRequired: recognized as valid no-op
-///   persisted states. No event, no retry.
-fn resume_persisted_cutback_states(state: &Arc<SharedState>, store: &CodeSourceStore) {
-    let records = match store.activation_records_mixed() {
-        Ok(records) => records,
-        Err(error) => {
-            tracing::error!(%error, "resume: loading activation records for cutback state sweep failed");
-            return;
-        }
-    };
-    let now = unix_now();
-    for activation in &records {
-        let Some(cutback) = activation.cutback() else {
-            continue;
-        };
-        let project_id = activation.project_id();
-        match cutback {
-            CutbackStateV2::Structural { .. } => {
-                // Re-evaluate exactly once through the reducer. Enqueue
-                // a Cutback event; the reducer checks the ladder and
-                // either re-attempts or stays structural.
-                let scope = state
-                    .code_sources
-                    .assignments()
-                    .into_iter()
-                    .find(|(_, pid)| pid == project_id)
-                    .map(|(scope, _)| scope);
-                if let Some(scope) = scope {
-                    tracing::info!(
-                        project_id,
-                        cutback = ?cutback,
-                        "resume: re-evaluating structural cutback via reconciler"
-                    );
-                    state.code_sources.enqueue_transition(
-                        project_id,
-                        scope,
-                        ReconcileKind::Cutback,
-                    );
-                } else {
-                    tracing::debug!(
-                        project_id,
-                        "resume: structural cutback project has no assignment; skipping"
-                    );
-                }
-            }
-            CutbackStateV2::Transient {
-                attempt: _,
-                error_class: _,
-                deadline_unix_secs,
-            } => {
-                // Register with the bounded scheduler. If the deadline
-                // has elapsed, the scheduler re-attempts immediately.
-                let scope = state
-                    .code_sources
-                    .assignments()
-                    .into_iter()
-                    .find(|(_, pid)| pid == project_id)
-                    .map(|(scope, _)| scope);
-                if let Some(reconciler) = state.code_sources.reconciler() {
-                    reconciler.register_transient(*deadline_unix_secs, project_id);
-                    if *deadline_unix_secs <= now {
-                        tracing::info!(
-                            project_id,
-                            deadline = deadline_unix_secs,
-                            "resume: transient cutback deadline elapsed, scheduler will re-attempt"
-                        );
-                        if let Some(scope) = scope {
-                            state.code_sources.enqueue_transition(
-                                project_id,
-                                scope,
-                                ReconcileKind::Cutback,
-                            );
-                        }
-                    } else {
-                        tracing::info!(
-                            project_id,
-                            deadline = deadline_unix_secs,
-                            "resume: transient cutback deadline in future, scheduler will wait"
-                        );
-                    }
-                }
-            }
-            CutbackStateV2::ManualRetryRequired { .. } => {
-                // Steady-state no-op (explicit retry only). No event,
-                // no retry on restart.
-                tracing::info!(
-                    project_id,
-                    "resume: ManualRetryRequired persisted state is a valid no-op"
-                );
-            }
-            CutbackStateV2::Terminal { .. } => {
-                // Steady-state no-op (terminal, never auto-retry).
-                tracing::info!(
-                    project_id,
-                    "resume: Terminal persisted state is a valid no-op"
-                );
-            }
-        }
     }
 }
 
@@ -2496,6 +2385,573 @@ enum ReducerAction {
     ReattemptCutback,
     /// Hand off to retirement (P4-G).
     Retire,
+}
+
+/// Outcome of once-only classification for a single migrated record
+/// (section 10.1 step 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClassificationOutcome {
+    /// Open-bridge predicate holds: mirror cleared, bridge-exempt.
+    BridgeExempt,
+    /// No valid attachment: Structural persisted.
+    StructuralPersisted(CutbackReason),
+    /// Valid attachment: mirror cleared, cutback deferred to sweep.
+    DeferredToSweep,
+}
+
+/// Once-only classification of migrated records with
+/// (`cutback: None`, `cutback_pending: true`) (section 10.1 step 5).
+///
+/// This runs BEFORE the relationship chain so the coherence clause
+/// (section 4.10) never sees an unclassified record. For each such
+/// record, three outcomes:
+/// (a) open-bridge predicate holds: clear mirror to (`None`, `false`),
+///     mark bridge-exempt;
+/// (b) no valid scope-matching attachment: persist typed Structural;
+/// (c) valid attachment: clear mirror to (`None`, `false`), defer
+///     cutback to the step-8 sweep.
+///
+/// Returns the set of project classifications for the step-8 sweep to
+/// consume. Bridge-exempt projects are NOT queued.
+fn classify_migrated_records(
+    store: &CodeSourceStore,
+    snapshot: &CatalogSnapshotV2,
+    checkout_access: &CheckoutAccessBroker,
+) -> Result<Vec<(String, ClassificationOutcome)>> {
+    let records = store.activation_records_mixed()?;
+    let mut results = Vec::new();
+    for activation in &records {
+        if !activation.is_current_v2() {
+            continue;
+        }
+        // Only classify the legacy-migration shape: typed field is None
+        // but the derived mirror says pending.
+        let pending = activation.is_cutback_pending();
+        let typed = activation.cutback().is_some();
+        if !pending || typed {
+            continue;
+        }
+        let project_id = activation.project_id();
+        let generation_id = activation.generation_id();
+        let scope = activation.published_scope();
+
+        // (a) Open-bridge predicate check.
+        let migration_records: Vec<_> = snapshot
+            .scope_migrations
+            .values()
+            .filter(|r| r.project_id.as_str() == project_id)
+            .collect();
+        if is_bridge_open(&migration_records, generation_id, scope) {
+            // Outcome (a): clear mirror, mark bridge-exempt.
+            store.clear_cutback_state(project_id)?;
+            results.push((project_id.to_string(), ClassificationOutcome::BridgeExempt));
+            continue;
+        }
+
+        // (b)/(c) probe the attachment ladder.
+        let ladder = probe_ladder_raw(store, checkout_access, project_id);
+        match ladder {
+            LadderResult::Selected => {
+                // Outcome (c): valid attachment, clear mirror, defer.
+                store.clear_cutback_state(project_id)?;
+                results.push((
+                    project_id.to_string(),
+                    ClassificationOutcome::DeferredToSweep,
+                ));
+            }
+            LadderResult::None => {
+                let reason = CutbackReason::NoLocalAttachment;
+                store.mark_cutback_state(project_id, CutbackStateV2::Structural { reason })?;
+                results.push((
+                    project_id.to_string(),
+                    ClassificationOutcome::StructuralPersisted(reason),
+                ));
+            }
+            LadderResult::Ambiguous => {
+                let reason = CutbackReason::AmbiguousAttachment;
+                store.mark_cutback_state(project_id, CutbackStateV2::Structural { reason })?;
+                results.push((
+                    project_id.to_string(),
+                    ClassificationOutcome::StructuralPersisted(reason),
+                ));
+            }
+            LadderResult::ScopeInvalid => {
+                let reason = CutbackReason::ScopeMismatch;
+                store.mark_cutback_state(project_id, CutbackStateV2::Structural { reason })?;
+                results.push((
+                    project_id.to_string(),
+                    ClassificationOutcome::StructuralPersisted(reason),
+                ));
+            }
+        }
+    }
+    Ok(results)
+}
+
+/// Probe the attachment ladder without requiring `Arc<SharedState>`.
+/// Used during pre-bind startup classification (section 10.1 step 5)
+/// where SharedState is still being constructed.
+fn probe_ladder_raw(
+    store: &CodeSourceStore,
+    checkout_access: &CheckoutAccessBroker,
+    project_id: &str,
+) -> LadderResult {
+    use bbox_indexing::checkout_access::{
+        CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest, CheckoutAccessSourceLane,
+        CheckoutAttachmentSelector,
+    };
+    // Determine the expected scope from the activation record's
+    // published_scope, not from the auth-table assignment (which is not
+    // available pre-bind in the same form).
+    let scope = store
+        .load_activation_mixed(project_id)
+        .ok()
+        .flatten()
+        .and_then(|a| a.published_scope().cloned());
+    let Some(scope) = scope else {
+        return LadderResult::None;
+    };
+    match checkout_access.acquire(CheckoutAccessRequest {
+        project_id: project_id.to_string(),
+        attachment: CheckoutAttachmentSelector::Selected,
+        expected_scope: Some(scope),
+        kind: CheckoutAccessKind::GitHistory,
+        intent: CheckoutAccessIntent::Read,
+        source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+    }) {
+        Ok(_) => LadderResult::Selected,
+        Err(error) => {
+            use bbox_indexing::checkout_access::CheckoutAccessErrorCode as Code;
+            match error.code {
+                Code::AttachmentNotFound | Code::ObservationUnavailable => LadderResult::None,
+                Code::ScopeMismatch
+                | Code::CapabilityDenied
+                | Code::IntentDenied
+                | Code::ConservativePathGateDenied
+                | Code::InvalidRoot
+                | Code::UnsafeRelativePath
+                | Code::WriteIntentRequired => LadderResult::ScopeInvalid,
+                _ => LadderResult::Ambiguous,
+            }
+        }
+    }
+}
+
+/// Validate the typed relationship chain (section 10.2) for every active
+/// catalog-mode collected activation. Any failure is fail-closed BEFORE
+/// HTTP bind with a typed error code.
+///
+/// The six links per activation:
+/// 1. Catalog project exists and bears the activation's published_scope,
+///    or the open-bridge predicate admits (sole sanctioned exception).
+/// 2. Activation validates against StoredGenerationV2.
+/// 3. Stored generation validates descriptor scope and generation identity.
+/// 4. Descriptor validates immutable manifest digest and entries.
+/// 5. WorkspaceIndexEntry agrees: project key, selector, generation,
+///    snapshot, manifest path.
+/// 6. CutbackStateV2 internally consistent (coherence clause holds).
+fn validate_relationship_chain(
+    store: &CodeSourceStore,
+    snapshot: &CatalogSnapshotV2,
+    manifest: &bbox_edge_sidecar::manifest::ManifestIndex,
+) -> Result<()> {
+    let records = store.activation_records_mixed()?;
+    for activation in &records {
+        if !activation.is_current_v2() {
+            continue;
+        }
+        let project_id = activation.project_id();
+        let generation_id = activation.generation_id();
+        let scope = activation
+            .published_scope()
+            .ok_or_else(|| anyhow!("error.code_source_relationship_chain: v2 activation has no published scope for project {project_id}"))?;
+
+        // Link 1: catalog project exists and bears the activation's
+        // published_scope, or the open-bridge predicate admits.
+        let pid = ProjectId::parse(project_id.to_string()).map_err(|e| {
+            anyhow!("error.code_source_relationship_chain: invalid project id {project_id}: {e}")
+        })?;
+        let catalog_project = snapshot.projects.get(&pid);
+        let scope_matches = catalog_project.is_some_and(|p| {
+            matches!(&p.scope, bbox_corpus_core::project_catalog::ProjectScope::Published(ps) if ps == scope)
+        });
+        let migration_records: Vec<_> = snapshot
+            .scope_migrations
+            .values()
+            .filter(|r| r.project_id.as_str() == project_id)
+            .collect();
+        let bridge_admits = is_bridge_open(&migration_records, generation_id, Some(scope));
+        if !scope_matches && !bridge_admits {
+            if catalog_project.is_none() {
+                bail!(
+                    "error.code_source_relationship_chain: \
+                     catalog project not found for activation project {project_id}"
+                );
+            }
+            bail!(
+                "error.code_source_scope_agreement: \
+                 catalog scope does not match activation scope for project {project_id} \
+                 and no open code bridge admits"
+            );
+        }
+
+        // Link 2: activation validates against stored generation.
+        let generation = store.find_generation_mixed(generation_id).map_err(|e| {
+            anyhow!(
+                "error.code_source_relationship_chain: \
+                 stored generation not found for project {project_id}: {e}"
+            )
+        })?;
+        if let MixedActivationRecord::CurrentV2(v2_act) = activation {
+            let v2_gen = match &generation {
+                MixedStoredGeneration::CurrentV2(g) => g,
+                MixedStoredGeneration::LegacyV1(_) => bail!(
+                    "error.code_source_record_mode: \
+                     v2 activation references v1 generation for project {project_id}"
+                ),
+            };
+            v2_act
+                .validate_against_generation(v2_gen)
+                .map_err(|e| {
+                    anyhow!(
+                        "error.code_source_relationship_chain: \
+                         activation does not validate against generation for project {project_id}: {e}"
+                    )
+                })?;
+        }
+
+        // Link 3: stored generation validates descriptor scope and
+        // generation identity. The generation_id identity is already
+        // checked by validate_against_generation (link 2); here we
+        // confirm the descriptor scope matches the activation scope.
+        let descriptor = generation.descriptor();
+        if &descriptor.scope != scope {
+            bail!(
+                "error.code_source_relationship_chain: \
+                 descriptor scope does not match activation scope for project {project_id}"
+            );
+        }
+
+        // Link 4: descriptor validates immutable manifest digest and
+        // entries. The manifest digest is part of validate_header.
+        descriptor.validate_header().map_err(|e| {
+            anyhow!(
+                "error.code_source_relationship_chain: \
+                 descriptor header validation failed for project {project_id}: {e}"
+            )
+        })?;
+
+        // Link 5: WorkspaceIndexEntry agrees: project key, selector,
+        // generation, snapshot, manifest path.
+        let entry = manifest.workspaces.get(project_id).ok_or_else(|| {
+            anyhow!(
+                "error.code_source_relationship_chain: \
+                 no workspace index entry for project {project_id}"
+            )
+        })?;
+        if entry.code_source_selector.as_deref() != Some(activation.selector()) {
+            bail!(
+                "error.code_source_relationship_chain: \
+                 workspace selector mismatch for project {project_id}"
+            );
+        }
+        if entry.code_source_generation.as_deref() != Some(generation_id) {
+            bail!(
+                "error.code_source_relationship_chain: \
+                 workspace generation mismatch for project {project_id}"
+            );
+        }
+        if entry.active_snapshot.as_deref() != Some(activation.snapshot_id()) {
+            bail!(
+                "error.code_source_relationship_chain: \
+                 workspace snapshot mismatch for project {project_id}"
+            );
+        }
+
+        // Link 6: CutbackStateV2 coherence. After once-only
+        // classification (step 5), the sole refuser for the coherence
+        // clause is a record still carrying (None, true) that is not
+        // bridge-exempt.
+        if activation.is_cutback_pending() && activation.cutback().is_none() {
+            // This should not happen after classification, but if a
+            // record was written by a live writer with the wrong shape,
+            // fail closed.
+            if !bridge_admits {
+                bail!(
+                    "error.code_source_cutback_coherence: \
+                     unclassified cutback_pending record for project {project_id} \
+                     that is not bridge-exempt"
+                );
+            }
+        }
+        // Typed cutback states are validated by ActivationRecordV2::validate
+        // (called transitively through validate_against_generation). Terminal
+        // and ManualRetryRequired are valid persisted states.
+    }
+    Ok(())
+}
+
+/// Detect incomplete retirement journals on disk (section 10.1 step 7).
+///
+/// If a `ProjectRetirementJournal` file is found, fail closed with a
+/// typed diagnostic naming the CLI resume command. The daemon never
+/// executes journal stages (the offline lane decision, section 4.8).
+///
+/// Path convention: `journal` files live under
+/// `{bro_home}/retirement-journals/{project_id}.json`. The daemon probes
+/// the directory for ANY `.json` file; any presence is a refusal.
+fn detect_incomplete_retirement_journal(bro_home: &std::path::Path) -> Result<()> {
+    let journal_dir = bro_home.join("retirement-journals");
+    if !journal_dir.is_dir() {
+        return Ok(());
+    }
+    let mut journals: Vec<_> = std::fs::read_dir(&journal_dir)
+        .with_context(|| format!("reading retirement journal dir {}", journal_dir.display()))?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    journals.sort_by_key(|e| e.path());
+    if let Some(first) = journals.first() {
+        let path = first.path();
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        bail!(
+            "error.code_source_retirement_journal_incomplete: \
+             retirement journal '{name}' is present; \
+             run `blackbox retirement-journal resume {name}` \
+             with the daemon stopped to complete it"
+        );
+    }
+    Ok(())
+}
+
+/// Pre-bind catalog-mode recovery: steps 5-8 of the startup order
+/// (section 10.1). Runs in `open_shared_state` BEFORE the listener
+/// binds. Bridge mode is a no-op (byte-compatible).
+///
+/// Returns the classification outcomes for the step-8 reducer sweep.
+/// The sweep itself runs as part of `resume_pending_activations` in
+/// background tasks (the events are enqueued here so the reducer picks
+/// them up when it starts).
+pub(crate) fn pre_bind_catalog_recovery(
+    project_authority: &super::state::ProjectAuthority,
+    code_sources: &CodeSourceRuntime,
+    checkout_access: &CheckoutAccessBroker,
+    bro_home: &std::path::Path,
+) -> Result<()> {
+    let Some(catalog_store) = project_authority.catalog_store() else {
+        // Bridge mode: steps 5-8 do not run (byte-compatible).
+        return Ok(());
+    };
+    let store = code_sources.store();
+    if store.record_mode() != RuntimeRecordMode::CatalogV2 {
+        return Ok(());
+    }
+    let store: &CodeSourceStore = &store;
+
+    let snapshot = catalog_store
+        .snapshot()
+        .context("pre-bind: catalog snapshot for startup recovery")?;
+    let catalog = snapshot.catalog();
+
+    // Load the manifest index for workspace entries (link 5).
+    let edges_dir = crate::edge_index::edges_dir_from_bro_store(bro_home);
+    let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)
+        .context("pre-bind: manifest index for relationship chain")?;
+
+    // Step 5: once-only classification of migrated records.
+    let classifications = classify_migrated_records(store, catalog, checkout_access)
+        .context("pre-bind: once-only classification")?;
+
+    // Step 6: validate the relationship chain.
+    validate_relationship_chain(store, catalog, &manifest)
+        .context("pre-bind: relationship chain validation")?;
+
+    // Step 7: detect incomplete retirement journals.
+    detect_incomplete_retirement_journal(bro_home)
+        .context("pre-bind: retirement journal detection")?;
+
+    // Step 8: startup reducer sweep. Every classification outcome (b)
+    // or (c) is queued to the reducer. Bridge-exempt (a) is NOT queued.
+    for (project_id, outcome) in &classifications {
+        match outcome {
+            ClassificationOutcome::BridgeExempt => {
+                tracing::info!(
+                    project_id,
+                    "startup classification: bridge-exempt, not queued to reducer"
+                );
+            }
+            ClassificationOutcome::StructuralPersisted(reason) => {
+                tracing::info!(
+                    project_id,
+                    ?reason,
+                    "startup classification: structural persisted, queued to reducer"
+                );
+                // Enqueue for the reducer to re-evaluate.
+                let scope = store
+                    .load_activation_mixed(project_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|a| a.published_scope().cloned());
+                if let Some(scope) = scope {
+                    code_sources.enqueue_transition(project_id, scope, ReconcileKind::Cutback);
+                }
+            }
+            ClassificationOutcome::DeferredToSweep => {
+                tracing::info!(
+                    project_id,
+                    "startup classification: valid attachment, deferred to sweep"
+                );
+                let scope = store
+                    .load_activation_mixed(project_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|a| a.published_scope().cloned());
+                if let Some(scope) = scope {
+                    code_sources.enqueue_transition(project_id, scope, ReconcileKind::Cutback);
+                }
+            }
+        }
+    }
+
+    // Section 9.7 restart re-drives folded into the startup sweep (one
+    // feed, not two). Re-evaluate every persisted CutbackStateV2 against
+    // the current attachment epoch. This replaces the separate
+    // resume_persisted_cutback_states call that previously ran in
+    // background tasks.
+    resume_persisted_cutback_states_pre_bind(store, code_sources);
+
+    // Desired/effective mismatch sweep: every project whose desired
+    // (local) and effective (collected) sources differ gets queued.
+    // This catches the crash-between-auth-swap-and-structural-persist
+    // case where a live-written record has cutback: None.
+    enqueue_desired_effective_mismatches(store, code_sources);
+
+    Ok(())
+}
+
+/// Pre-bind version of resume_persisted_cutback_states (section 9.7).
+/// Re-evaluates every persisted CutbackStateV2 against the current
+/// attachment epoch, enqueuing reducer events for Structural and
+/// Transient states. This replaces the background-task version so the
+/// startup feed is unified (section 10.1 step 8).
+fn resume_persisted_cutback_states_pre_bind(
+    store: &CodeSourceStore,
+    code_sources: &CodeSourceRuntime,
+) {
+    let records = match store.activation_records_mixed() {
+        Ok(records) => records,
+        Err(error) => {
+            tracing::error!(%error, "startup sweep: loading activation records for cutback state sweep failed");
+            return;
+        }
+    };
+    let now = unix_now();
+    for activation in &records {
+        let Some(cutback) = activation.cutback() else {
+            continue;
+        };
+        let project_id = activation.project_id();
+        let scope = activation.published_scope().cloned();
+        match cutback {
+            CutbackStateV2::Structural { .. } => {
+                if let Some(scope) = scope {
+                    tracing::info!(
+                        project_id,
+                        cutback = ?cutback,
+                        "startup sweep: re-evaluating structural cutback via reconciler"
+                    );
+                    code_sources.enqueue_transition(project_id, scope, ReconcileKind::Cutback);
+                }
+            }
+            CutbackStateV2::Transient {
+                deadline_unix_secs, ..
+            } => {
+                if let Some(reconciler) = code_sources.reconciler() {
+                    reconciler.register_transient(*deadline_unix_secs, project_id);
+                    if *deadline_unix_secs <= now {
+                        tracing::info!(
+                            project_id,
+                            deadline = deadline_unix_secs,
+                            "startup sweep: transient cutback deadline elapsed, scheduler will re-attempt"
+                        );
+                        if let Some(scope) = scope {
+                            code_sources.enqueue_transition(
+                                project_id,
+                                scope,
+                                ReconcileKind::Cutback,
+                            );
+                        }
+                    } else {
+                        tracing::info!(
+                            project_id,
+                            deadline = deadline_unix_secs,
+                            "startup sweep: transient cutback deadline in future, scheduler will wait"
+                        );
+                    }
+                }
+            }
+            CutbackStateV2::ManualRetryRequired { .. } => {
+                tracing::info!(
+                    project_id,
+                    "startup sweep: ManualRetryRequired persisted state is a valid no-op"
+                );
+            }
+            CutbackStateV2::Terminal { .. } => {
+                tracing::info!(
+                    project_id,
+                    "startup sweep: Terminal persisted state is a valid no-op"
+                );
+            }
+        }
+    }
+}
+
+/// Desired/effective mismatch sweep (section 10.1 step 8). Every project
+/// whose desired (local) and effective (collected) sources differ is
+/// queued to the reducer. This catches the crash-between-auth-swap-and-
+/// structural-persist case where a live-written record has cutback: None.
+fn enqueue_desired_effective_mismatches(store: &CodeSourceStore, code_sources: &CodeSourceRuntime) {
+    let records = match store.activation_records_mixed() {
+        Ok(records) => records,
+        Err(error) => {
+            tracing::error!(%error, "startup sweep: loading records for mismatch sweep failed");
+            return;
+        }
+    };
+    for activation in &records {
+        if !activation.is_current_v2() {
+            continue;
+        }
+        let project_id = activation.project_id();
+        // If the record already has a typed cutback state, it was handled
+        // by resume_persisted_cutback_states_pre_bind above. Only enqueue
+        // records with no cutback state (the mismatch case).
+        if activation.cutback().is_some() {
+            continue;
+        }
+        if activation.is_cutback_pending() {
+            // Should have been classified in step 5; skip defensively.
+            continue;
+        }
+        // Determine effective source: collected activations with no
+        // assignment are candidates for cutback. The actual desired/
+        // effective comparison happens in the reducer via
+        // evaluate_reduction. Here we just enqueue every collected
+        // activation that has no assignment (desired=local,
+        // effective=collected).
+        let assigned = code_sources
+            .assignments()
+            .into_iter()
+            .any(|(_, pid)| pid == project_id);
+        if !assigned {
+            if let Some(scope) = activation.published_scope().cloned() {
+                code_sources.enqueue_transition(project_id, scope, ReconcileKind::Cutback);
+            }
+        }
+    }
 }
 
 /// Evaluate the open-bridge predicate for a project (section 9.3).
