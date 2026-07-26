@@ -2698,7 +2698,22 @@ fn validate_relationship_chain(
                          workspace generation mismatch for project {project_id}"
                     );
                 }
-                if entry.active_snapshot.as_deref() != Some(activation.snapshot_id()) {
+                // Compare snapshot by the final path segment: the production
+                // republish writer (activate_source_snapshot in
+                // bbox_edge_sidecar::snapshot) stores active_snapshot as the
+                // ManifestIndex-relative path
+                // "workspace/{project_id}/snapshots/{snapshot_id}" (built by
+                // active_snapshot_rel), while the activation record stores the
+                // bare snapshot id. Comparing the final segment matches the
+                // production format; real drift (a different id in the final
+                // segment) still fails closed.
+                let snapshot_matches = entry.active_snapshot.as_deref().is_some_and(|stored| {
+                    std::path::Path::new(stored)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        == Some(activation.snapshot_id())
+                });
+                if !snapshot_matches {
                     bail!(
                         "error.code_source_relationship_chain: \
                          workspace snapshot mismatch for project {project_id}"
@@ -8584,13 +8599,18 @@ mod tests {
         );
 
         let snapshot = p4f_catalog_snapshot(project_id, scope, vec![]);
-        // Workspace entry is PRESENT but has the WRONG generation id.
+        // Workspace entry in the production path-bearing format
+        // (active_snapshot_rel writes "workspace/{pid}/snapshots/{id}").
+        // The generation id is WRONG so the chain must still fail closed.
         let mut manifest = bbox_edge_sidecar::manifest::ManifestIndex::new();
         manifest.workspaces.insert(
             project_id.to_string(),
             bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
-                manifest: "test-manifest".to_string(),
-                active_snapshot: Some(activation.snapshot_id.clone()),
+                manifest: format!("workspace/{project_id}/manifest.json"),
+                active_snapshot: Some(format!(
+                    "workspace/{project_id}/snapshots/{}",
+                    activation.snapshot_id
+                )),
                 dirty_overlay: None,
                 repo_materialization: None,
                 code_source_selector: Some(activation.selector.clone()),
@@ -8609,6 +8629,116 @@ mod tests {
         assert!(
             err.contains("workspace generation mismatch"),
             "error must be workspace generation mismatch, got: {err}"
+        );
+    }
+
+    /// Section 10.4: a workspace entry in the production path-bearing
+    /// format (active_snapshot = "workspace/{pid}/snapshots/{id}") with a
+    /// MATCHING snapshot id passes the chain at link 5.
+    #[test]
+    fn p4f_path_bearing_snapshot_entry_passes_chain() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let runtime = CodeSourceRuntime::for_test_catalog(&root);
+        let store = runtime.store();
+
+        let scope = PublishedScope::try_new("p4f-path-snap", ".").unwrap();
+        let project_id = "p_000000000000000000000000000004f6";
+        let generation_id = compute_generation_id(
+            "p4f-producer",
+            &empty_generation_descriptor(scope.clone(), &"a".repeat(40)),
+        );
+
+        let activation = p4f_seed_activation(
+            &store,
+            &root.join("code-sources"),
+            project_id,
+            &scope,
+            &generation_id,
+            None,
+            false,
+        );
+
+        let snapshot = p4f_catalog_snapshot(project_id, scope, vec![]);
+        let mut manifest = bbox_edge_sidecar::manifest::ManifestIndex::new();
+        manifest.workspaces.insert(
+            project_id.to_string(),
+            bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
+                manifest: format!("workspace/{project_id}/manifest.json"),
+                active_snapshot: Some(format!(
+                    "workspace/{project_id}/snapshots/{}",
+                    activation.snapshot_id
+                )),
+                dirty_overlay: None,
+                repo_materialization: None,
+                code_source_selector: Some(activation.selector.clone()),
+                code_source_generation: Some(generation_id),
+                git_overlay: None,
+                git_overlay_managed: false,
+            },
+        );
+
+        let result = validate_relationship_chain(&store, &snapshot, &manifest);
+        assert!(
+            result.is_ok(),
+            "path-bearing snapshot with matching id must pass chain, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// Section 10.4: a workspace entry whose active_snapshot final path
+    /// segment is a DIFFERENT id still fails closed at link 5.
+    #[test]
+    fn p4f_path_bearing_wrong_snapshot_fails_chain() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let runtime = CodeSourceRuntime::for_test_catalog(&root);
+        let store = runtime.store();
+
+        let scope = PublishedScope::try_new("p4f-wrong-snap", ".").unwrap();
+        let project_id = "p_000000000000000000000000000004f7";
+        let generation_id = compute_generation_id(
+            "p4f-producer",
+            &empty_generation_descriptor(scope.clone(), &"a".repeat(40)),
+        );
+
+        let activation = p4f_seed_activation(
+            &store,
+            &root.join("code-sources"),
+            project_id,
+            &scope,
+            &generation_id,
+            None,
+            false,
+        );
+
+        let snapshot = p4f_catalog_snapshot(project_id, scope, vec![]);
+        let mut manifest = bbox_edge_sidecar::manifest::ManifestIndex::new();
+        manifest.workspaces.insert(
+            project_id.to_string(),
+            bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
+                manifest: format!("workspace/{project_id}/manifest.json"),
+                active_snapshot: Some(format!(
+                    "workspace/{project_id}/snapshots/collected-different_snapshot_id"
+                )),
+                dirty_overlay: None,
+                repo_materialization: None,
+                code_source_selector: Some(activation.selector.clone()),
+                code_source_generation: Some(generation_id),
+                git_overlay: None,
+                git_overlay_managed: false,
+            },
+        );
+
+        let result = validate_relationship_chain(&store, &snapshot, &manifest);
+        assert!(
+            result.is_err(),
+            "path-bearing snapshot with wrong id must fail chain"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("workspace snapshot mismatch"),
+            "error must be workspace snapshot mismatch, got: {err}"
         );
     }
 
