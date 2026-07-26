@@ -103,9 +103,12 @@ pub fn resolve_file(ctx: &ProviderContext<'_>, path: &str) -> Result<ResolvedFil
     let stores = ctx
         .stores()
         .ok_or_else(|| anyhow!("file refs require a registered project context"))?;
-    let projects = stores.projects.records_snapshot().records;
+    let snapshot = stores.projects.records_snapshot();
+    let projects = snapshot.records.clone();
     if projects.is_empty() {
-        bail!("file refs require at least one registered project");
+        return Err(no_attached_projects_error(
+            snapshot.corpus_project_ids.len(),
+        ));
     }
 
     let raw = Path::new(path);
@@ -121,6 +124,22 @@ pub fn resolve_file(ctx: &ProviderContext<'_>, path: &str) -> Result<ResolvedFil
             &projects,
             ctx.checkout_selection(),
             stores.checkout_access,
+        )
+    }
+}
+
+/// A `file:` ref genuinely needs a checkout, so attachment-binding is
+/// correct here; the MESSAGE was what misled. In a catalog-mode deployment
+/// whose projects are all remote-only, "no registered project" sends the
+/// reader looking for a registration that already exists (Phase 3 plan
+/// section 7 item 3). Distinguish the two states.
+fn no_attached_projects_error(registered_projects: usize) -> anyhow::Error {
+    if registered_projects == 0 {
+        anyhow!("file refs require at least one registered project")
+    } else {
+        anyhow!(
+            "file refs require a project with an attached checkout; \
+             {registered_projects} registered project(s) have no attachment on this host"
         )
     }
 }
@@ -494,6 +513,21 @@ mod tests {
             languages: BTreeSet::new(),
             aliases: BTreeSet::new(),
         }
+    }
+
+    #[test]
+    fn empty_attached_projects_distinguishes_unregistered_from_unattached() {
+        assert!(
+            no_attached_projects_error(0)
+                .to_string()
+                .contains("at least one registered project")
+        );
+        let unattached = no_attached_projects_error(3).to_string();
+        assert!(unattached.contains("attached checkout"), "{unattached}");
+        assert!(
+            unattached.contains("3 registered project(s)"),
+            "{unattached}"
+        );
     }
 
     #[test]

@@ -222,7 +222,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_reindex",
         category: ToolCategory::Transcripts,
         summary: "Build or incrementally update the search index.",
-        when_to_use: "Rarely — background reindexer runs every 120s. Use `full=true` after corpus corruption or schema changes.",
+        when_to_use: "Rarely — background reindexer runs every 120s. Use `full=true` after corpus corruption or schema changes. `accept_empty_projects` is an operator acknowledgement: name the projects whose empty local root should purge normally (clearing their `empty_root_refused` health), never set it on the operator's behalf.",
         example: None,
     },
     ToolDoc {

@@ -139,6 +139,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
             active_selectors: active_code_selectors,
             searcher: code_searcher,
             edge_index: Arc::new(edge_index::EdgeIndex::default()),
+            catalog_epoch: 0,
         })),
         code_sources: Arc::new(crate::server::code_source::CodeSourceRuntime::for_test(
             tmp.path(),

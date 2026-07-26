@@ -48,9 +48,55 @@ pub struct ProjectFileCompatFields<'a> {
 /// knows nothing about the authority or lease types.
 #[derive(Clone, Copy)]
 pub struct ProjectIndexAccess<'a> {
-    pub project: &'a ProjectRecord,
+    /// Source-neutral identity of the project being indexed. Present for
+    /// every planned project, including one with zero attachments, so the
+    /// pass never has to project an identity out of a path-bearing record.
+    pub identity: &'a bbox_corpus_core::code_project_identity::CodeProjectIdentity,
+    /// The version-1 compatibility record, present exactly when the project
+    /// has an attached checkout this pass. `None` is the detached and
+    /// remote-only case: every lane that needs a checkout path (local walk,
+    /// Git history) is `None` alongside it by construction.
+    pub project: Option<&'a ProjectRecord>,
     pub local_root: Option<&'a Path>,
     pub git_root: Option<&'a Path>,
+}
+
+impl ProjectIndexAccess<'_> {
+    pub fn project_id(&self) -> &str {
+        self.identity.project_id.as_str()
+    }
+}
+
+/// Cheap "does this root contain at least one indexable file?" probe for the
+/// H3 empty-scan refusal (Phase 3 plan section 7 item 2). Deliberately NOT a
+/// full scan: it stops at the first admissible entry, so the common
+/// non-empty case costs a handful of stats instead of a second walk of the
+/// whole checkout. It applies the same admission rules as
+/// [`scan_project_files`], because "indexable" must mean the same thing in
+/// both places or the refusal fires on roots the pass would legitimately
+/// scan as empty.
+pub fn project_root_has_indexable_entry(root: &Path, _config: &ReindexConfig) -> bool {
+    let walker = WalkBuilder::new(root)
+        .hidden(false)
+        .filter_entry(|entry| entry.depth() == 0 || !is_skipped_entry(entry))
+        .build();
+    for entry in walker.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            continue;
+        }
+        let Some(max_bytes) = bbox_code_source::max_bytes_for_path(path) else {
+            continue;
+        };
+        if meta.len() > max_bytes || path.to_str().is_none() {
+            continue;
+        }
+        return true;
+    }
+    false
 }
 
 #[derive(Debug, Default)]
@@ -362,10 +408,158 @@ pub struct ActiveCollectedSource {
     pub generation_id: String,
 }
 
+/// What the stale-path purge should do with one stale freshness row.
+///
+/// Shared by BOTH purge loops (the reindex pass and the legacy
+/// `build_index` path) so the F2 exemptions can never drift apart: the two
+/// loops were identical by copy before Phase 3 and the plan requires them to
+/// move in lockstep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StalePurgeAction {
+    /// Exempt, and the freshness row stays: it is the preservation
+    /// authority for this project's last-good local documents.
+    ExemptRetainRow,
+    /// Exempt, and the freshness row is dropped: an active collected
+    /// generation serves the project now, so its local freshness rows carry
+    /// no preservation obligation. This is the pre-Phase-3 behavior for the
+    /// collected arm, preserved exactly.
+    ExemptDropRow,
+    /// Delete the project-file documents keyed by this source entry key.
+    DeleteProjectEntry(String),
+    /// Delete by the absolute `file_path` term. Transcripts, session
+    /// artifacts, and pre-`LocalProjectFile` legacy rows key this way; the
+    /// lane is untouched by Phase 3.
+    DeleteByPath,
+}
+
+/// Classify one stale freshness row against the pass's purge exemptions
+/// (Phase 3 plan section 7 item 2). `exempt_project_ids` is every project
+/// whose plan is not `Local`-scanned this pass: collected, unavailable,
+/// cutback-pending, warming-without-a-local-source, detached, and
+/// empty-root-refused. `collected_project_ids` is the subset an active
+/// collected generation serves, which is the only exempt arm whose
+/// freshness rows are dropped rather than retained.
+pub fn classify_stale_meta_row(
+    source: Option<&FileMetaSource>,
+    exempt_project_ids: &BTreeSet<String>,
+    collected_project_ids: &BTreeSet<String>,
+) -> StalePurgeAction {
+    match source {
+        Some(FileMetaSource::LocalProjectFile {
+            project_id,
+            entry_key,
+            ..
+        }) => {
+            if !exempt_project_ids.contains(project_id) {
+                StalePurgeAction::DeleteProjectEntry(entry_key.clone())
+            } else if collected_project_ids.contains(project_id) {
+                StalePurgeAction::ExemptDropRow
+            } else {
+                StalePurgeAction::ExemptRetainRow
+            }
+        }
+        _ => StalePurgeAction::DeleteByPath,
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct PreservedCollectedDocuments {
     pub project_ids: BTreeSet<String>,
     pub documents: Vec<TantivyDocument>,
+}
+
+/// Verified preservation of a project's LOCAL documents across a full
+/// rebuild for a project this pass does not scan (Phase 3 plan section 7
+/// item 2, closing F2/H1). The verification authority is the project's own
+/// freshness rows: the per-project `FileMeta` set enumerates the files whose
+/// documents must still be live, and the live document set must carry
+/// exactly that entry-key inventory.
+///
+/// A mismatch records `preservation_failed` and returns an error BEFORE the
+/// caller reaches `delete_all_documents()`, exactly like the collected arm
+/// ([`collect_preserved_collected_documents`]). Convergence is through the
+/// operator surfaces only: an acknowledged purge, detach/unregister, or
+/// retire. There is deliberately no unverified-preservation downgrade.
+pub fn collect_verified_detached_documents(
+    index: &Index,
+    config: &ReindexConfig,
+    f: FieldHandles,
+    project_ids: &BTreeSet<String>,
+    meta: &HashMap<String, FileMeta>,
+) -> Result<Vec<TantivyDocument>> {
+    if project_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut expected: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for row in meta.values() {
+        if let FileMetaSource::LocalProjectFile {
+            project_id,
+            entry_key,
+            ..
+        } = &row.source
+            && project_ids.contains(project_id.as_str())
+        {
+            expected
+                .entry(project_id.as_str())
+                .or_default()
+                .insert(entry_key.as_str());
+        }
+    }
+    let searcher = index.reader()?.searcher();
+    let mut store = None;
+    let mut documents = Vec::new();
+    for project_id in project_ids {
+        let selector = bbox_code_source::local_selector(project_id);
+        let query = TermQuery::new(
+            Term::from_field_text(f.code_source_selector, &selector),
+            IndexRecordOption::Basic,
+        );
+        let count = searcher.search(&query, &Count)?;
+        let expected_keys = expected.remove(project_id.as_str()).unwrap_or_default();
+        if count == 0 && expected_keys.is_empty() {
+            // Nothing indexed and nothing promised: not a preservation case.
+            continue;
+        }
+        let mut observed_keys: BTreeSet<String> = BTreeSet::new();
+        let mut project_documents = Vec::with_capacity(count);
+        for (_score, address) in searcher.search(&query, &TopDocs::with_limit(count))? {
+            let document = searcher.doc::<TantivyDocument>(address)?;
+            if let Some(entry_key) = document
+                .get_first(f.code_source_entry_key)
+                .and_then(|value| match value {
+                    tantivy::schema::OwnedValue::Str(value) => Some(value.clone()),
+                    _ => None,
+                })
+            {
+                observed_keys.insert(entry_key);
+            }
+            project_documents.push(document);
+        }
+        let expected_owned: BTreeSet<String> =
+            expected_keys.iter().map(|key| (*key).to_string()).collect();
+        if observed_keys != expected_owned {
+            let diagnostic = format!(
+                "detached project preservation inventory mismatch: freshness rows list {} \
+                 file(s), live documents carry {} distinct entry key(s)",
+                expected_owned.len(),
+                observed_keys.len()
+            );
+            let store = match store.as_ref() {
+                Some(store) => store,
+                None => {
+                    store = Some(bbox_code_source_store::CodeSourceStore::open(
+                        &config.code_source_store_path,
+                        bbox_code_source_store::StoreLimits::default(),
+                    )?);
+                    store.as_ref().expect("store was just installed")
+                }
+            };
+            store.record_health_failure(project_id, "preservation_failed", &diagnostic)?;
+            anyhow::bail!("{diagnostic} (project {project_id})");
+        }
+        documents.extend(project_documents);
+    }
+    Ok(documents)
 }
 
 pub fn collect_project_documents(
@@ -585,22 +779,19 @@ pub fn scan_project_files_with_access(
     let mut files = Vec::new();
     let collected = active_collected_sources(config)?;
     for access in projects {
-        let project = access.project;
-        if !collected.contains_key(&project.project_id)
+        let project_id = access.project_id();
+        if !collected.contains_key(project_id)
             && let Some(root) = access.local_root
         {
             let _ = scan_project_files(&root, &mut files)?;
         }
-        if project.repo_id.is_some()
+        if access
+            .project
+            .is_some_and(|project| project.repo_id.is_some())
             && let Some(git_root) = access.git_root
+            && let Some(head) = bbox_corpus_core::git::head_fingerprint(git_root)
         {
-            if let Some(head) = bbox_corpus_core::git::head_fingerprint(git_root) {
-                files.push((
-                    super::git_history::git_source_key(&project.project_id),
-                    0,
-                    head,
-                ));
-            }
+            files.push((super::git_history::git_source_key(project_id), 0, head));
         }
     }
     Ok(files)
@@ -627,15 +818,16 @@ pub fn index_projects_with_access(
         )
     });
     for access in projects {
-        let project = access.project;
-        if let Some(active) = collected.get(&project.project_id) {
+        let project_id = access.project_id();
+        if let Some(active) = collected.get(project_id) {
             let store = collected_store
                 .as_ref()
                 .expect("collected store exists when collected sources exist")
                 .as_ref()
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             index_active_collected_project(
-                project,
+                access.identity,
+                access.project,
                 access.git_root,
                 active,
                 store,
@@ -645,13 +837,22 @@ pub fn index_projects_with_access(
                 &edges_dir,
                 &git_meta_dir,
                 force_git_full,
-                preserved_collected.contains(&project.project_id),
+                preserved_collected.contains(project_id),
                 &mut stats,
             )?;
             continue;
         }
+        // Only an attached project can be walked locally; a detached or
+        // remote-only project reaches here with both `project` and
+        // `local_root` absent and is a pass-level no-op by construction.
+        let Some(project) = access.project else {
+            continue;
+        };
         let Some(root) = access.local_root else {
-            tracing::warn!(
+            // Source planning already recorded the durable `source_unavailable`
+            // health for this project (Phase 3 plan section 7 item 1); this
+            // stays as a pass-local breadcrumb, not the only trace.
+            tracing::debug!(
                 project_id = %project.project_id,
                 "local project unavailable; retaining its last-good indexed generation"
             );
@@ -673,7 +874,8 @@ pub fn index_projects_with_access(
 
 #[allow(clippy::too_many_arguments)]
 fn index_active_collected_project(
-    project: &ProjectRecord,
+    identity: &bbox_corpus_core::code_project_identity::CodeProjectIdentity,
+    project: Option<&ProjectRecord>,
     git_root: Option<&Path>,
     active: &ActiveCollectedSource,
     store: &bbox_code_source_store::CodeSourceStore,
@@ -686,21 +888,20 @@ fn index_active_collected_project(
     preserved_documents_are_staged: bool,
     stats: &mut ProjectIndexStats,
 ) -> Result<()> {
+    let project_id = identity.project_id.as_str();
+    let repo_id = project.and_then(|project| project.repo_id.as_deref());
     let activation = store
-        .load_activation(&project.project_id)?
+        .load_activation(project_id)?
         .ok_or_else(|| anyhow::anyhow!("active collected selector has no activation record"))?;
     if activation.generation_id != active.generation_id || activation.selector != active.selector {
         anyhow::bail!("active collected selector disagrees with its activation record");
     }
-    let expected_selector =
-        collected_materialization_selector(&project.project_id, &active.generation_id);
+    let expected_selector = collected_materialization_selector(project_id, &active.generation_id);
     if active.selector != expected_selector {
         anyhow::bail!("active collected selector requires materialization migration");
     }
-    let expected_snapshot = bbox_edge_sidecar::snapshot::collected_snapshot_id(
-        &project.project_id,
-        &active.generation_id,
-    );
+    let expected_snapshot =
+        bbox_edge_sidecar::snapshot::collected_snapshot_id(project_id, &active.generation_id);
     if activation.snapshot_id != expected_snapshot {
         anyhow::bail!("active collected materialization version requires an explicit migration");
     }
@@ -720,7 +921,7 @@ fn index_active_collected_project(
             Some("one or more active source blobs are missing or corrupt".to_string()),
         )?;
         store.record_health_failure(
-            &project.project_id,
+            project_id,
             "missing_blob_data",
             "one or more active source blobs are missing or corrupt",
         )?;
@@ -731,26 +932,17 @@ fn index_active_collected_project(
             bbox_code_source::GenerationState::Active,
             None,
         )?;
-        store.clear_health_failure(&project.project_id, "missing_blob_data")?;
+        store.clear_health_failure(project_id, "missing_blob_data")?;
     }
     let staged = if force_full && blobs_available {
-        // The rebuild pass still iterates version-1 `ProjectRecord` rows
-        // (planning converts to the catalog snapshot in P3-C), so the
-        // identity is projected from the record this pass already holds.
-        // Collected staging is identity-first either way, and a rebuild must
-        // produce byte-identical documents to a fresh activation.
-        let identity = CodeProjectIdentity::from_bridge_record(project)
-            .map_err(|error| anyhow::anyhow!("{error}"))
-            .with_context(|| {
-                format!(
-                    "projecting a code identity for collected rebuild of {}",
-                    project.project_id
-                )
-            })?;
+        // Planning supplies the identity (Phase 3 plan section 7 item 1), so
+        // a rebuild of a project with zero attachments takes the same
+        // identity-first path a fresh activation does and produces
+        // byte-identical documents to it.
         Some(stage_collected_project_generation(
-            &identity,
+            identity,
             ProjectFileCompatFields {
-                repo_id: project.repo_id.as_deref(),
+                repo_id,
                 project_display: None,
             },
             &stored.descriptor,
@@ -774,7 +966,7 @@ fn index_active_collected_project(
     } else {
         if force_full && !blobs_available {
             tracing::warn!(
-                project_id = %project.project_id,
+                project_id = %project_id,
                 generation = %active.generation_id,
                 "full rebuild preserved active collected documents because source blobs are unavailable"
             );
@@ -791,7 +983,10 @@ fn index_active_collected_project(
                 .into_iter()
                 .collect()
         });
-    let git_stats = if let Some(git_root) = git_root {
+    // The Git history walk needs the version-1 record (its own path-bearing
+    // lane, untouched this milestone); a project with no attachment reaches
+    // the degradation arm below instead, exactly as a denied Git lease does.
+    let git_stats = if let (Some(project), Some(git_root)) = (project, git_root) {
         let mut git_ctx = super::git_history::GitIndexContext {
             f,
             writer,
@@ -807,11 +1002,9 @@ fn index_active_collected_project(
             &current_chunk_targets,
             &mut git_ctx,
         )?;
-        if let Err(error) =
-            store.clear_health_failure(&project.project_id, "git_history_unavailable")
-        {
+        if let Err(error) = store.clear_health_failure(project_id, "git_history_unavailable") {
             tracing::warn!(
-                project_id = %project.project_id,
+                project_id = %project_id,
                 error = %error,
                 "failed to clear GitHistory degradation record"
             );
@@ -819,12 +1012,12 @@ fn index_active_collected_project(
         stats
     } else {
         if let Err(error) = store.record_health_failure(
-            &project.project_id,
+            project_id,
             "git_history_unavailable",
             "active code generation has no validated GitHistory attachment",
         ) {
             tracing::warn!(
-                project_id = %project.project_id,
+                project_id = %project_id,
                 error = %error,
                 "failed to persist GitHistory degradation record"
             );
@@ -837,18 +1030,18 @@ fn index_active_collected_project(
     if let Some(staged) = staged {
         stats.publication.stage_snapshot_git_current(
             edges_dir,
-            &project.project_id,
+            project_id,
             &staged.snapshot_id,
-            project.repo_id.is_some(),
+            repo_id.is_some(),
         );
         stats.indexed_docs += staged.document_count;
         stats.indexed_files += stored.descriptor.file_count;
     } else {
         stats.publication.stage_snapshot_git_current(
             edges_dir,
-            &project.project_id,
+            project_id,
             &activation.snapshot_id,
-            project.repo_id.is_some(),
+            repo_id.is_some(),
         );
     }
     Ok(())
@@ -3035,5 +3228,277 @@ mod tests {
             chunks.iter().all(|chunk| chunk.chunk_kind == "web_section"),
             "expected web_section chunks, got {chunks:?}"
         );
+    }
+}
+
+/// Phase 3 P3-C purge and preservation gate (plan section 7 item 2, F2).
+///
+/// The classification these tests pin is the SHARED one: both the reindex
+/// pass and the legacy `build_index` loop route through
+/// `classify_stale_meta_row`, so a divergence between the two loops is a
+/// compile-time impossibility rather than a review discipline.
+#[cfg(test)]
+mod purge_exemption_tests {
+    use super::*;
+
+    fn local_row(project_id: &str) -> FileMetaSource {
+        FileMetaSource::LocalProjectFile {
+            project_id: project_id.to_string(),
+            selector: bbox_code_source::local_selector(project_id),
+            relative_path: "src/lib.rs".into(),
+            entry_key: format!("entry-{project_id}"),
+        }
+    }
+
+    fn meta_row(project_id: &str, entry_suffix: &str) -> FileMeta {
+        FileMeta {
+            mtime: 1,
+            size: 1,
+            mat_version: Some("v1".into()),
+            source: FileMetaSource::LocalProjectFile {
+                project_id: project_id.to_string(),
+                selector: bbox_code_source::local_selector(project_id),
+                relative_path: format!("src/{entry_suffix}.rs"),
+                entry_key: format!("entry-{project_id}-{entry_suffix}"),
+            },
+        }
+    }
+
+    #[test]
+    fn non_project_rows_always_keep_the_absolute_path_delete_lane() {
+        // Transcripts and pre-`LocalProjectFile` legacy rows key by absolute
+        // path; Phase 3 does not touch that lane in either loop.
+        assert_eq!(
+            classify_stale_meta_row(None, &BTreeSet::new(), &BTreeSet::new()),
+            StalePurgeAction::DeleteByPath
+        );
+        assert_eq!(
+            classify_stale_meta_row(
+                Some(&FileMetaSource::LegacyFilesystem),
+                &BTreeSet::from(["p1".to_string()]),
+                &BTreeSet::new()
+            ),
+            StalePurgeAction::DeleteByPath
+        );
+    }
+
+    #[test]
+    fn a_locally_scanned_project_still_purges_by_entry_key() {
+        assert_eq!(
+            classify_stale_meta_row(Some(&local_row("p1")), &BTreeSet::new(), &BTreeSet::new()),
+            StalePurgeAction::DeleteProjectEntry("entry-p1".into())
+        );
+    }
+
+    #[test]
+    fn every_exempt_state_keeps_its_documents() {
+        // Detached, unavailable, cutback-pending, warming-without-local, and
+        // empty-root-refused all arrive here as "in the exempt set, not
+        // collected", which is the single fact the purge needs (F2 H1/H2/H3).
+        assert_eq!(
+            classify_stale_meta_row(
+                Some(&local_row("p1")),
+                &BTreeSet::from(["p1".to_string()]),
+                &BTreeSet::new()
+            ),
+            StalePurgeAction::ExemptRetainRow
+        );
+    }
+
+    #[test]
+    fn a_collected_project_keeps_documents_but_drops_its_local_rows() {
+        // Pre-Phase-3 behavior for the collected arm, preserved exactly: the
+        // local freshness rows carry no preservation obligation once a
+        // collected generation serves the project.
+        assert_eq!(
+            classify_stale_meta_row(
+                Some(&local_row("p1")),
+                &BTreeSet::from(["p1".to_string()]),
+                &BTreeSet::from(["p1".to_string()])
+            ),
+            StalePurgeAction::ExemptDropRow
+        );
+    }
+
+    fn write_local_document(
+        writer: &mut IndexWriter,
+        f: FieldHandles,
+        project_id: &str,
+        entry_suffix: &str,
+    ) {
+        let mut document = TantivyDocument::new();
+        document.add_text(f.doc_type, "project_file");
+        document.add_text(f.project_id, project_id);
+        document.add_text(
+            f.code_source_selector,
+            &bbox_code_source::local_selector(project_id),
+        );
+        document.add_text(
+            f.code_source_entry_key,
+            &format!("entry-{project_id}-{entry_suffix}"),
+        );
+        document.add_text(
+            f.entity_id,
+            &format!("project_file:{project_id}:{entry_suffix}"),
+        );
+        writer.add_document(document).unwrap();
+    }
+
+    struct PreservationFixture {
+        _dir: tempfile::TempDir,
+        index: Index,
+        fields: FieldHandles,
+        config: ReindexConfig,
+    }
+
+    fn preservation_fixture(documents: &[(&str, &str)]) -> PreservationFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        // Built through the real opener so the code tokenizers are
+        // registered; a hand-rolled `Index::create_in_dir` cannot write a
+        // project-file document at all.
+        let transcript_index = crate::index::TranscriptIndex::open_or_create(
+            &root.join("idx"),
+            Vec::new(),
+            None,
+            root.join("projects.json"),
+            root.join("kb.json"),
+            root.join("threads.json"),
+            root.join("roadmap.json"),
+        )
+        .unwrap();
+        let index = transcript_index.index_handle();
+        let fields = transcript_index.field_handles();
+        let config = transcript_index.reindex_config();
+        let mut writer: IndexWriter = index.writer(50_000_000).unwrap();
+        for (project_id, entry) in documents {
+            write_local_document(&mut writer, fields, project_id, entry);
+        }
+        writer.commit().unwrap();
+        PreservationFixture {
+            _dir: dir,
+            index,
+            fields,
+            config,
+        }
+    }
+
+    #[test]
+    fn detached_preservation_returns_the_documents_its_inventory_promises() {
+        let fixture = preservation_fixture(&[("p1", "a"), ("p1", "b")]);
+        let meta: HashMap<String, FileMeta> = [
+            ("/gone/src/a.rs".to_string(), meta_row("p1", "a")),
+            ("/gone/src/b.rs".to_string(), meta_row("p1", "b")),
+        ]
+        .into_iter()
+        .collect();
+        let preserved = collect_verified_detached_documents(
+            &fixture.index,
+            &fixture.config,
+            fixture.fields,
+            &BTreeSet::from(["p1".to_string()]),
+            &meta,
+        )
+        .unwrap();
+        assert_eq!(preserved.len(), 2);
+    }
+
+    #[test]
+    fn detached_preservation_is_a_no_op_when_nothing_is_indexed_or_promised() {
+        let fixture = preservation_fixture(&[]);
+        let preserved = collect_verified_detached_documents(
+            &fixture.index,
+            &fixture.config,
+            fixture.fields,
+            &BTreeSet::from(["p1".to_string()]),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert!(preserved.is_empty());
+    }
+
+    #[test]
+    fn detached_preservation_mismatch_aborts_before_any_delete() {
+        // The freshness inventory promises two files; only one document is
+        // live. The arm must refuse and record `preservation_failed` while
+        // the caller is still upstream of `delete_all_documents()`.
+        let fixture = preservation_fixture(&[("p1", "a")]);
+        let meta: HashMap<String, FileMeta> = [
+            ("/gone/src/a.rs".to_string(), meta_row("p1", "a")),
+            ("/gone/src/b.rs".to_string(), meta_row("p1", "b")),
+        ]
+        .into_iter()
+        .collect();
+        let error = collect_verified_detached_documents(
+            &fixture.index,
+            &fixture.config,
+            fixture.fields,
+            &BTreeSet::from(["p1".to_string()]),
+            &meta,
+        )
+        .expect_err("a mismatched inventory must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("preservation inventory mismatch"),
+            "{error}"
+        );
+        let store = bbox_code_source_store::CodeSourceStore::open(
+            &fixture.config.code_source_store_path,
+            bbox_code_source_store::StoreLimits::default(),
+        )
+        .unwrap();
+        assert!(
+            store
+                .health_records()
+                .unwrap()
+                .iter()
+                .any(|row| row.project_id == "p1" && row.code == "preservation_failed")
+        );
+        // The index is untouched: the refusal happened before any deletion.
+        let searcher = fixture.index.reader().unwrap().searcher();
+        let query = TermQuery::new(
+            Term::from_field_text(
+                fixture.fields.code_source_selector,
+                &bbox_code_source::local_selector("p1"),
+            ),
+            IndexRecordOption::Basic,
+        );
+        assert_eq!(searcher.search(&query, &Count).unwrap(), 1);
+    }
+
+    #[test]
+    fn detached_preservation_refuses_documents_with_no_inventory_at_all() {
+        // The inverse direction: documents exist but the freshness rows were
+        // lost, so there is no authority to verify them against. Refuse
+        // rather than preserve unverified, exactly like the collected arm.
+        let fixture = preservation_fixture(&[("p1", "a")]);
+        let error = collect_verified_detached_documents(
+            &fixture.index,
+            &fixture.config,
+            fixture.fields,
+            &BTreeSet::from(["p1".to_string()]),
+            &HashMap::new(),
+        )
+        .expect_err("documents with no inventory must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("preservation inventory mismatch")
+        );
+    }
+
+    #[test]
+    fn empty_root_probe_matches_the_scan_admission_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let config = preservation_fixture(&[]).config;
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        assert!(
+            !project_root_has_indexable_entry(&root, &config),
+            "a directory tree with no files is empty"
+        );
+        std::fs::write(root.join("nested/lib.rs"), "fn main() {}\n").unwrap();
+        assert!(project_root_has_indexable_entry(&root, &config));
     }
 }

@@ -43,14 +43,7 @@ impl BlackboxServer {
         Self::run_blocking("bbox_storage_migrate_legacy_edges", move || {
             let edges_dir = storage_health::find_edges_dir(&server.state.store_dir, None);
 
-            let registered: std::collections::HashSet<String> = server
-                .state
-                .records_provider
-                .records_snapshot()
-                .corpus_project_ids
-                .iter()
-                .cloned()
-                .collect();
+            let registered = server.state.corpus_registered_project_ids();
 
             if p.dry_run {
                 let mut results = Vec::new();

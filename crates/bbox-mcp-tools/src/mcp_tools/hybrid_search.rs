@@ -161,35 +161,19 @@ impl HybridDegraded {
     }
 }
 
-pub fn hybrid_search(
-    index: &TranscriptIndex,
-    knowledge: &Knowledge,
-    ctx: &ProviderContext<'_>,
-    p: &HybridSearchParams,
-) -> Result<String> {
-    Ok(serde_json::to_string_pretty(&hybrid_search_typed(
-        index, knowledge, ctx, p,
-    )?)?)
-}
-
-pub fn hybrid_search_with_active_selectors(
-    index: &TranscriptIndex,
-    knowledge: &Knowledge,
-    ctx: &ProviderContext<'_>,
-    p: &HybridSearchParams,
-    active_selectors: &BTreeMap<String, String>,
-) -> Result<String> {
-    let searcher = index.searcher();
-    hybrid_search_with_active_selectors_and_searcher(
-        index,
-        knowledge,
-        ctx,
-        p,
-        active_selectors,
-        &searcher,
-    )
-}
-
+/// Hybrid search over an EXPLICITLY PINNED read view: the caller supplies
+/// both the active-selector map and the searcher, and every downstream
+/// consistency check - the lexical selector gate and the per-hit vector
+/// filter [`retain_active_code_vectors`] - reads that pin instead of live
+/// index state (Phase 3 plan section 4.5). The unpinned convenience
+/// wrappers that used to sit here (`hybrid_search`,
+/// `hybrid_search_with_active_selectors`, `hybrid_search_typed`,
+/// `hybrid_search_typed_with_active_selectors`) are deliberately gone: each
+/// minted a fresh searcher or read live selectors mid-call, so a commit
+/// landing between the BM25 lane and the vector retain could filter vector
+/// hits against a different index generation than the one that produced
+/// them. Do not reintroduce them; take the pin from
+/// `SharedState::code_read_view`.
 pub fn hybrid_search_with_active_selectors_and_searcher(
     index: &TranscriptIndex,
     knowledge: &Knowledge,
@@ -208,34 +192,6 @@ pub fn hybrid_search_with_active_selectors_and_searcher(
             searcher,
         )?,
     )?)
-}
-
-pub fn hybrid_search_typed(
-    index: &TranscriptIndex,
-    knowledge: &Knowledge,
-    ctx: &ProviderContext<'_>,
-    p: &HybridSearchParams,
-) -> Result<HybridSearchResponse> {
-    let active_selectors = index.active_code_selectors();
-    hybrid_search_typed_with_active_selectors(index, knowledge, ctx, p, &active_selectors)
-}
-
-pub fn hybrid_search_typed_with_active_selectors(
-    index: &TranscriptIndex,
-    knowledge: &Knowledge,
-    ctx: &ProviderContext<'_>,
-    p: &HybridSearchParams,
-    active_selectors: &BTreeMap<String, String>,
-) -> Result<HybridSearchResponse> {
-    let searcher = index.searcher();
-    hybrid_search_typed_with_active_selectors_and_searcher(
-        index,
-        knowledge,
-        ctx,
-        p,
-        active_selectors,
-        &searcher,
-    )
 }
 
 pub fn hybrid_search_typed_with_active_selectors_and_searcher(

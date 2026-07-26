@@ -18,9 +18,10 @@
 //! Snapshots are derived on read against the catalog epoch, so staleness
 //! is unrepresentable and admin commits publish without a republish call.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use bbox_corpus_core::code_project_identity::CodeProjectIdentity;
 use bbox_corpus_core::project_catalog::{
     AttachmentKind, AttachmentStatus, validate_catalog_attachments,
 };
@@ -141,6 +142,41 @@ impl ProjectRecordsProvider for CatalogProjectRecordsProvider {
         *self.degradation.lock() = (omitted > 0)
             .then(|| format!("compatibility projection omitted {omitted} catalog project(s)"));
         snapshot
+    }
+
+    /// Catalog derivation of the planning identity map (Phase 3 plan
+    /// section 7 item 1): one entry per catalog project, INCLUDING projects
+    /// with zero attachments, which the compatibility `records` projection
+    /// deliberately omits. Read live off the catalog store rather than the
+    /// cached record snapshot, because the cache holds the attached-only
+    /// projection and would silently drop exactly the remote-only projects
+    /// this map exists to serve.
+    fn code_identities(&self) -> BTreeMap<String, CodeProjectIdentity> {
+        let state = match self.store.snapshot() {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(
+                    code = %error.code(),
+                    "catalog snapshot unavailable; planning identity map is empty this pass"
+                );
+                return BTreeMap::new();
+            }
+        };
+        let catalog = state.catalog();
+        catalog
+            .projects
+            .values()
+            .map(|project| {
+                let repo_history = project
+                    .repo_history
+                    .as_ref()
+                    .and_then(|id| catalog.repo_histories.get(id));
+                (
+                    project.project_id.as_str().to_string(),
+                    CodeProjectIdentity::from_catalog(project, repo_history),
+                )
+            })
+            .collect()
     }
 
     fn last_degradation(&self) -> Option<String> {

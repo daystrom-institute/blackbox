@@ -73,10 +73,14 @@ impl BlackboxServer {
             // Runs on the writer actor: unified with the background pass
             // (which also picks up thread/roadmap store docs the old manual
             // path skipped) and never contends for the writer lock.
-            server
-                .state
-                .index_writer
-                .run_reindex_pass(p.full.unwrap_or(false), true)
+            // `accept_empty_projects` is operator authority passed straight
+            // through (RX-V1): never defaulted, never inferred from a prior
+            // refusal.
+            server.state.index_writer.run_reindex_pass_accepting_empty(
+                p.full.unwrap_or(false),
+                true,
+                p.accept_empty_projects.clone().unwrap_or_default(),
+            )
         })
         .await
     }

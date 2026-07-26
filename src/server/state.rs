@@ -304,6 +304,14 @@ pub(crate) struct CodeReadView {
     pub(crate) active_selectors: BTreeMap<String, String>,
     pub(crate) searcher: tantivy::Searcher,
     pub(crate) edge_index: Arc<edge_index::EdgeIndex>,
+    /// Catalog authority epoch this view was derived from
+    /// (`ProjectRecordsSnapshot.authority_epoch`; Phase 3 plan section 4.5).
+    /// Pinning it is what makes the view a coherent read: without it two
+    /// `records_snapshot()` calls inside one request can observe different
+    /// catalog epochs while the selector map says otherwise. Every writer
+    /// that replaces a field it does not own must carry this through, or the
+    /// view silently reports an epoch its selectors no longer match.
+    pub(crate) catalog_epoch: u64,
 }
 
 pub(crate) const SIGNAL_LOG_CAP: usize = 200;
@@ -354,6 +362,24 @@ pub(crate) struct WebhookDelivery {
 }
 
 impl SharedState {
+    /// The COMPLETE catalog project-id set, as a `HashSet` for the sidecar
+    /// registered-project gate and the storage-GC liveness seed.
+    ///
+    /// Phase 3 plan section 7 item 3 (F3/F4): every daemon surface that
+    /// answers "is this project registered?" MUST route through this one
+    /// accessor. Two of them previously seeded from the attached-only
+    /// compatibility rows, which silently dropped a remote-only project's
+    /// edges on the first runtime rebuild and deleted its sidecars after the
+    /// background GC's 30-day orphan fuse, while the equivalent MCP tools
+    /// classified the same project as live. The divergence was a one-line
+    /// difference in two constructors; concentrating it here is what makes
+    /// re-introducing it a deliberate act.
+    pub(crate) fn corpus_registered_project_ids(&self) -> std::collections::HashSet<String> {
+        self.records_provider
+            .records_snapshot()
+            .registered_project_ids()
+    }
+
     /// Attach the daemon read-view publisher to the index writer's commit
     /// boundary. The actor invokes the hook once immediately, then after each
     /// successful commit, so no startup or small-op batch can leave the pinned
@@ -378,6 +404,7 @@ impl SharedState {
             active_selectors: current.active_selectors.clone(),
             searcher,
             edge_index: current.edge_index.clone(),
+            catalog_epoch: current.catalog_epoch,
         });
     }
 
@@ -678,6 +705,7 @@ impl SharedState {
                 active_selectors: active_code_selectors,
                 searcher: code_searcher,
                 edge_index: Arc::new(edge_index::EdgeIndex::default()),
+                catalog_epoch: 0,
             })),
             code_sources: Arc::new(super::code_source::CodeSourceRuntime::for_test(store_dir)),
             edge_rebuild_nudge_tx,
@@ -835,6 +863,83 @@ mod code_read_view_tests {
         assert!(
             !pinned_search(&state, &before, "pinnedrefreshsentinel")
                 .contains("pinnedrefreshsentinel")
+        );
+    }
+
+    /// Phase 3 P3-C read-view pin regression (plan section 4.5).
+    ///
+    /// `publish_code_read_searcher` replaces ONLY the searcher and must
+    /// carry every field it does not own through untouched. The
+    /// drop-on-commit bug class is silent by construction: the view keeps
+    /// serving, it just reports an epoch (or a selector map, or an edge
+    /// index) that no longer matches what a concurrent activation
+    /// published. Every field added to `CodeReadView` must be asserted here.
+    #[test]
+    fn searcher_only_republish_preserves_the_catalog_epoch() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let state = Arc::new(SharedState::for_test(&root));
+        {
+            let current = state.code_read_view.read().clone();
+            *state.code_read_view.write() = Arc::new(CodeReadView {
+                active_selectors: BTreeMap::from([(
+                    "p_0000000000000000000000000000ep01".to_string(),
+                    "local:p_0000000000000000000000000000ep01".to_string(),
+                )]),
+                searcher: current.searcher.clone(),
+                edge_index: current.edge_index.clone(),
+                catalog_epoch: 42,
+            });
+        }
+        let before = state.code_read_view.read().clone();
+
+        state.install_code_read_view_commit_hook();
+        state
+            .index_writer
+            .enqueue(crate::index::IndexWriteOp::UpsertKnowledge(Box::new(
+                knowledge_entry("epochpreservationsentinel"),
+            )));
+        state.index_writer.flush_blocking().unwrap();
+
+        let after = state.code_read_view.read().clone();
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "the commit must have republished the view"
+        );
+        assert_eq!(
+            after.catalog_epoch, 42,
+            "the searcher-only writer must carry the pinned catalog epoch through"
+        );
+        assert_eq!(before.active_selectors, after.active_selectors);
+        assert!(Arc::ptr_eq(&before.edge_index, &after.edge_index));
+    }
+
+    /// Phase 3 P3-C F3/F4 gate: every daemon "is this project registered?"
+    /// surface derives from ONE accessor, so a remote-only project cannot be
+    /// live for the MCP tools and an orphan for the background GC at the
+    /// same time. The two divergent constructors this replaced differed by a
+    /// single line each.
+    #[test]
+    fn registered_project_ids_include_projects_with_no_attachment() {
+        use bbox_corpus_core::project_record::ProjectRecordsSnapshot;
+
+        let snapshot = ProjectRecordsSnapshot {
+            records: Arc::new(Vec::new()),
+            corpus_project_ids: Arc::new(std::collections::BTreeSet::from([
+                "p_0000000000000000000000000000rem1".to_string(),
+            ])),
+            omitted_catalog_count: 1,
+            authority_epoch: 3,
+        };
+        let registered = snapshot.registered_project_ids();
+        assert!(
+            registered.contains("p_0000000000000000000000000000rem1"),
+            "a project with zero attachments is registered, just not attached"
+        );
+        assert_eq!(registered.len(), 1);
+        assert!(
+            snapshot.records.is_empty(),
+            "the attached-only projection is exactly what must NOT seed this set"
         );
     }
 }

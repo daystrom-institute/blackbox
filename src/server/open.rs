@@ -456,6 +456,10 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         catalog_store.clone(),
         checkout_access.clone(),
     )?);
+    // The grant table is built after the writer actor spawns, so the
+    // planner's assignment view is installed here rather than passed to
+    // `spawn` (same shape as the post-commit searcher hook).
+    index_writer.set_producer_assignment_source(code_sources.clone());
     if idx.schema_was_reset() {
         tracing::info!(
             schema = crate::index::INDEX_SCHEMA_VERSION,
@@ -494,6 +498,9 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         active_selectors: idx.active_code_selectors(),
         searcher: idx.searcher(),
         edge_index: Arc::new(edge_index),
+        // Seeded from the same boot snapshot that seeded the edge set above,
+        // so the startup view and the first runtime republish agree.
+        catalog_epoch: records_provider.records_snapshot().authority_epoch,
     };
     let (edge_rebuild_nudge_tx, edge_rebuild_nudge_rx) = std::sync::mpsc::sync_channel(1);
     let shared = Arc::new(SharedState {
@@ -708,7 +715,7 @@ fn build_startup_edge_index(
             session_brofile_rows: task_store.session_brofile_rows(),
             roadmap: roadmap_store,
             edges_dir: edge_index::edges_dir_from_bro_store(store_dir),
-            registered_project_ids: Some(records.corpus_project_ids.iter().cloned().collect()),
+            registered_project_ids: Some(records.registered_project_ids()),
             include_tantivy_projection: false,
             include_observed: true,
         })

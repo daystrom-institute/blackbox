@@ -584,9 +584,22 @@ Ownership: `bbox-indexing` (reindex, writer_actor), `src/server/*`,
 1. Planning iterates the pinned catalog snapshot: `acquire_project_leases`
    becomes `plan_project_sources`, which walks `corpus_project_ids`, computes
    `EffectiveSource` per section 4.7, and yields typed per-project plans:
-   `Collected` plans carry the identity and no lease; `Local` plans carry the
-   identity plus the lease bundle acquired exactly as today for attached
-   projects; `Unavailable` plans carry the reason and a durable health write;
+   `Collected` plans carry the identity and acquire no code-walk lease for
+   the collected indexing lane (the active immutable generation is
+   rematerialized without walking a checkout); the non-code lease bundle
+   (`PublisherConfigTreeRead`, `GitHistory`, `KnowledgeGapOverlayRead`) is
+   keyed on ATTACHMENT exactly as today, so an attached collected project
+   keeps the lease set its git-history and repo-owned-knowledge lanes depend
+   on, while a project with no compatibility record acquires nothing at all.
+   Governing section 10.3's "without a lease" clause is scoped to the
+   code-source staging lane; section 4.3 enumerates no change to the
+   git-history or repo-owned-knowledge lanes for an attached collected
+   project, which is what makes attachment-keying the parity-correct and
+   phase-correct reading (the overlay that would replace checkout-based git
+   history does not exist until P3-F). Amended per the P3-C cell review.
+   `Local` plans carry the identity plus the full lease bundle acquired
+   exactly as today for attached projects; `Unavailable` plans carry the
+   reason and a durable health write;
    `Warming` plans as `Local` whenever a local source exists (section 4.7)
    and otherwise as a pass-level no-op; `CutbackPending` plans are
    pass-level no-ops; the no-op arms acquire nothing and participate in

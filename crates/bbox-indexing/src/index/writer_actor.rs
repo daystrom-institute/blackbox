@@ -90,6 +90,11 @@ pub enum IndexWriteOp {
     ReindexPass {
         full: bool,
         dirty: bool,
+        /// Operator-named projects whose H3 empty-scan refusal is waived for
+        /// THIS pass (Phase 3 plan section 7 item 2). Operator authority,
+        /// passed through and never defaulted (RX-V1): no code path may add
+        /// a project here on the operator's behalf.
+        accept_empty_projects: Vec<String>,
         ack: mpsc::SyncSender<Result<String>>,
     },
     /// Stage one collected generation. Identity-first (Phase 3 plan section 6
@@ -152,6 +157,7 @@ pub struct IndexWriterActor {
     post_commit_hook: Arc<parking_lot::RwLock<Option<PostCommitHook>>>,
     checkout_access: Arc<CheckoutAccessBroker>,
     records_provider: Arc<dyn ProjectRecordsProvider>,
+    assignments: Arc<parking_lot::RwLock<Option<Arc<dyn ProducerAssignmentSource>>>>,
     config: ReindexConfig,
 }
 
@@ -238,6 +244,168 @@ struct ActorCtx {
     post_commit_hook: Arc<parking_lot::RwLock<Option<PostCommitHook>>>,
     checkout_access: Arc<CheckoutAccessBroker>,
     records_provider: Arc<dyn ProjectRecordsProvider>,
+    assignments: Arc<parking_lot::RwLock<Option<Arc<dyn ProducerAssignmentSource>>>>,
+}
+
+/// Derived effective source for one catalog project at planning time
+/// (Phase 3 plan section 4.7). There is no persisted effective-source store:
+/// this is computed per pass from the pinned catalog snapshot, the edge
+/// manifest, the activation record, and the producer assignment table, and
+/// the edge-sidecar workspace entry stays the single durable authority for
+/// the live selector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum EffectiveSource {
+    /// An active collected generation serves this project. Planned with no
+    /// local walk and no lease requirement: a project with zero attachments
+    /// reaches this arm and stays fully indexed.
+    Collected { generation: String },
+    /// A validated local checkout is the live source; walked as today.
+    Local,
+    /// A cutback to local is in flight. Pass-level no-op: the pass neither
+    /// walks nor purges, so the in-flight transition owns the transition.
+    CutbackPending,
+    /// A producer assignment exists but no collected generation is active
+    /// yet (first upload in flight). Warming preserves local freshness: with
+    /// a usable local source this plans exactly as `Local`; with none (the
+    /// remote-only warming case) it is a pass-level no-op with NO durable
+    /// health record, because nothing is wrong.
+    Warming,
+    /// No usable source this pass. Carries the reason and gets a durable
+    /// health record instead of a per-pass warning.
+    Unavailable { reason: UnavailableReason },
+}
+
+/// Why a project has no usable source this pass. Each arm maps to a durable
+/// health code so doctor can render the state (the sweep's "unavailable" and
+/// "unavailable-no-attachment" rows), replacing the per-pass `tracing::warn`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum UnavailableReason {
+    /// A compatibility record exists but the `LocalProjectWalk` lease was
+    /// denied. Diagnostic is the broker denial string.
+    LocalWalkDenied(String),
+    /// The catalog project has no attached checkout and no collected
+    /// generation: the state H1/H2 previously expressed as silent deletion.
+    NoAttachment,
+    /// The scan of an attached, readable root returned zero entries while
+    /// the prior pass recorded files for this project (H3). Refusing is the
+    /// only safe reading: an empty automount is indistinguishable from a
+    /// deleted project by scan alone.
+    EmptyRootRefused,
+    /// Planning could not derive an identity for a catalog project id.
+    IdentityUnavailable(String),
+}
+
+impl UnavailableReason {
+    /// Durable health code for this state. `empty_root_refused` is the
+    /// operator-acknowledgeable one (`bbox_reindex accept_empty_projects`).
+    pub(super) fn health_code(&self) -> &'static str {
+        match self {
+            Self::EmptyRootRefused => "empty_root_refused",
+            _ => "source_unavailable",
+        }
+    }
+
+    pub(super) fn diagnostic(&self) -> String {
+        match self {
+            Self::LocalWalkDenied(error) => {
+                format!("LocalProjectWalk unavailable: {error}")
+            }
+            Self::NoAttachment => {
+                "project has no attached checkout and no active collected generation".to_string()
+            }
+            Self::EmptyRootRefused => {
+                "local scan returned zero entries while the prior pass recorded files; \
+                 purge refused"
+                    .to_string()
+            }
+            Self::IdentityUnavailable(error) => {
+                format!("no code identity could be derived: {error}")
+            }
+        }
+    }
+}
+
+/// Every durable health code source planning owns. Used to clear stale
+/// records for projects that left the state, so a resolved condition does
+/// not linger in doctor forever.
+pub(super) const PLANNING_HEALTH_CODES: [&str; 2] = ["source_unavailable", "empty_root_refused"];
+
+/// One project's planned source for one pass.
+///
+/// `access` is present exactly when the project has a compatibility record
+/// this pass; leases are a property of ATTACHMENT, not of effective source,
+/// so an attached collected project keeps today's lease bundle (its Git
+/// history walk and repo-owned knowledge lanes are bridge-observable and
+/// stay at parity) while a detached or remote-only project acquires nothing
+/// at all. That is what makes the remote-only exit-gate row zero-lease: the
+/// broker is never called for a project with no record.
+pub(super) struct ProjectSourcePlan {
+    pub(super) project_id: String,
+    pub(super) identity: Option<CodeProjectIdentity>,
+    pub(super) effective: EffectiveSource,
+    pub(super) access: Option<LeasedProjectAccess>,
+}
+
+impl ProjectSourcePlan {
+    /// True when this pass walks the project's local checkout. This is the
+    /// single predicate the purge exemptions key on: every project that is
+    /// NOT locally scanned this pass keeps its last-good documents (F2).
+    pub(super) fn is_local_scanned(&self) -> bool {
+        match &self.effective {
+            EffectiveSource::Local => true,
+            // Warming plans as Local exactly when a valid local source
+            // exists; the remote-only warming arm has no access at all.
+            EffectiveSource::Warming => self
+                .access
+                .as_ref()
+                .is_some_and(|access| access.local.is_some()),
+            EffectiveSource::Collected { .. }
+            | EffectiveSource::CutbackPending
+            | EffectiveSource::Unavailable { .. } => false,
+        }
+    }
+
+    /// Lower this plan into the crate-boundary access shape.
+    ///
+    /// `None` for a plan the pass must not touch at all: a `CutbackPending`
+    /// project (the in-flight transition owns it) or a project with no
+    /// derivable identity. Every other plan lowers, INCLUDING one with no
+    /// compatibility record, which is how a remote-only collected project
+    /// reaches the indexer at all. `local_root` is populated only when the
+    /// plan is actually locally scanned this pass, so an exempt project can
+    /// never be walked (and therefore never scanned as empty) by accident.
+    pub(super) fn lowered(&self) -> Option<super::project_files::ProjectIndexAccess<'_>> {
+        if matches!(self.effective, EffectiveSource::CutbackPending) {
+            return None;
+        }
+        let identity = self.identity.as_ref()?;
+        let scanned = self.is_local_scanned();
+        Some(super::project_files::ProjectIndexAccess {
+            identity,
+            project: self.access.as_ref().map(|access| &access.project),
+            local_root: self
+                .access
+                .as_ref()
+                .filter(|_| scanned)
+                .and_then(|access| access.local.as_ref())
+                .map(ValidatedCheckoutLease::project_root),
+            git_root: self
+                .access
+                .as_ref()
+                .and_then(|access| access.git.as_ref())
+                .map(ValidatedCheckoutLease::checkout_root),
+        })
+    }
+}
+
+/// Producer assignment view for source planning (Phase 3 plan section 4.7).
+/// The grant table lives in the daemon's code-source runtime, above this
+/// crate; the actor receives it as an injected read so a `Warming` project
+/// is classified from real assignment state instead of guessed from store
+/// residue. Absent (bridge, tests, offline) means no assignments exist.
+pub trait ProducerAssignmentSource: Send + Sync {
+    /// Project ids with a configured collector assignment.
+    fn assigned_project_ids(&self) -> std::collections::BTreeSet<String>;
 }
 
 pub(super) struct LeasedProjectAccess {
@@ -250,21 +418,20 @@ pub(super) struct LeasedProjectAccess {
     pub(super) local_denial: Option<String>,
     pub(super) git: Option<ValidatedCheckoutLease>,
     pub(super) git_denial: Option<String>,
-    pub(super) code_local_enabled: bool,
 }
 
-impl LeasedProjectAccess {
-    pub(super) fn lower(&self) -> super::project_files::ProjectIndexAccess<'_> {
-        super::project_files::ProjectIndexAccess {
-            project: &self.project,
-            local_root: self
-                .code_local_enabled
-                .then(|| self.local.as_ref())
-                .flatten()
-                .map(ValidatedCheckoutLease::project_root),
-            git_root: self.git.as_ref().map(ValidatedCheckoutLease::checkout_root),
-        }
-    }
+/// Every project the stale-path purge must exempt this pass: exactly the
+/// projects that are not locally scanned (Phase 3 plan section 7 item 2).
+/// A missing scanned path proves a file was deleted only when the pass
+/// actually walked that project's checkout.
+pub(super) fn purge_exempt_project_ids(
+    plans: &[ProjectSourcePlan],
+) -> std::collections::BTreeSet<String> {
+    plans
+        .iter()
+        .filter(|plan| !plan.is_local_scanned())
+        .map(|plan| plan.project_id.clone())
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,89 +440,305 @@ pub(super) enum ProjectLeasePurpose {
     Reindex,
 }
 
-pub(super) fn acquire_project_leases(
+/// Walk the pinned catalog snapshot and plan one source per corpus project
+/// (Phase 3 plan section 7 item 1). Supersedes `acquire_project_leases`,
+/// which iterated the attached-only compatibility rows and therefore never
+/// visited a remote-only project (F1) and never gave the purge a name for
+/// the states it was silently deleting (F2).
+///
+/// `accept_empty_projects` is operator authority passed straight through
+/// (RX-V1): a named project skips the H3 empty-scan refusal on THIS pass and
+/// has its `empty_root_refused` record cleared. Nothing in this function may
+/// add a project to that set on its own.
+pub(super) fn plan_project_sources(
     config: &ReindexConfig,
     records_provider: &Arc<dyn ProjectRecordsProvider>,
     broker: &Arc<CheckoutAccessBroker>,
+    assignments: Option<&Arc<dyn ProducerAssignmentSource>>,
     purpose: ProjectLeasePurpose,
-) -> Result<Vec<LeasedProjectAccess>> {
+    prior_meta: &HashMap<String, super::FileMeta>,
+    accept_empty_projects: &std::collections::BTreeSet<String>,
+) -> Result<Vec<ProjectSourcePlan>> {
     let collected = super::project_files::active_collected_sources(config)?;
-    let records = records_provider.records_snapshot().records;
-    records
+    let snapshot = records_provider.records_snapshot();
+    let identities = records_provider.code_identities();
+    let records = snapshot
+        .records
         .iter()
-        .cloned()
-        .map(|project| {
-            let publisher_config = broker.acquire(access_request(
-                &project.project_id,
-                None,
-                CheckoutAccessKind::PublisherConfigTreeRead,
-            ));
-            let expected_scope = publisher_config
-                .as_ref()
-                .ok()
-                .and_then(|lease| lease.published_scope().cloned());
-            let publisher_config_denial = publisher_config.as_ref().err().map(ToString::to_string);
-            let publisher_config = publisher_config.ok();
-            let code_local_enabled = !collected.contains_key(&project.project_id);
-            let needs_local = code_local_enabled || purpose == ProjectLeasePurpose::Reindex;
-            let (local, local_denial) = if !needs_local {
-                (None, None)
-            } else {
-                match broker.acquire(access_request(
-                    &project.project_id,
-                    expected_scope.clone(),
-                    CheckoutAccessKind::LocalProjectWalk,
-                )) {
-                    Ok(lease) => (Some(lease), None),
-                    Err(error) => (None, Some(error.to_string())),
-                }
-            };
-            let (git, git_denial) = if project.is_git_repo {
-                match broker.acquire(access_request(
-                    &project.project_id,
-                    expected_scope.clone(),
-                    CheckoutAccessKind::GitHistory,
-                )) {
-                    Ok(lease) => (Some(lease), None),
-                    Err(error) => (None, Some(error.to_string())),
-                }
-            } else {
-                (None, None)
-            };
-            let (knowledge_overlay, knowledge_overlay_denial) =
-                if purpose == ProjectLeasePurpose::Reindex {
-                    match broker.acquire(access_request(
-                        &project.project_id,
-                        expected_scope,
-                        CheckoutAccessKind::KnowledgeGapOverlayRead,
-                    )) {
-                        Ok(lease) => (Some(lease), None),
-                        Err(error) => (None, Some(error.to_string())),
-                    }
-                } else {
-                    (None, None)
-                };
-            Ok(LeasedProjectAccess {
-                project,
-                publisher_config,
-                publisher_config_denial,
-                knowledge_overlay,
-                knowledge_overlay_denial,
-                local,
-                local_denial,
-                git,
-                git_denial,
-                code_local_enabled,
-            })
-        })
-        .collect()
+        .map(|record| (record.project_id.clone(), record.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let assigned = assignments
+        .map(|source| source.assigned_project_ids())
+        .unwrap_or_default();
+    // Health writes are best-effort per project: a store that cannot be
+    // opened must degrade planning to today's warn-only behavior, never fail
+    // the pass.
+    let health_store = bbox_code_source_store::CodeSourceStore::open(
+        &config.code_source_store_path,
+        bbox_code_source_store::StoreLimits::default(),
+    )
+    .map_err(|error| {
+        tracing::warn!(%error, "code-source store unavailable; planning health records skipped");
+    })
+    .ok();
+    let prior_meta_counts = prior_meta_project_file_counts(prior_meta);
+
+    let mut plans = Vec::with_capacity(snapshot.corpus_project_ids.len());
+    for project_id in snapshot.corpus_project_ids.iter() {
+        let identity = identities.get(project_id).cloned();
+        let record = records.get(project_id).cloned();
+        let access = match record {
+            Some(record) => Some(acquire_leases_for_record(
+                broker, record, &collected, purpose,
+            )?),
+            None => None,
+        };
+        let cutback_pending = health_store
+            .as_ref()
+            .and_then(|store| store.load_activation(project_id).ok().flatten())
+            .is_some_and(|activation| activation.cutback_pending);
+        let effective = classify_effective_source(
+            project_id,
+            identity.as_ref(),
+            access.as_ref(),
+            collected.get(project_id),
+            cutback_pending,
+            assigned.contains(project_id),
+            config,
+            prior_meta_counts.get(project_id).copied().unwrap_or(0),
+            accept_empty_projects.contains(project_id),
+        );
+        plans.push(ProjectSourcePlan {
+            project_id: project_id.clone(),
+            identity,
+            effective,
+            access,
+        });
+    }
+    if let Some(store) = health_store.as_ref() {
+        reconcile_planning_health(store, &plans, accept_empty_projects);
+    }
+    Ok(plans)
 }
 
-pub(super) fn revalidate_project_leases(
+/// Prior-pass file counts per project, from the freshness rows. This is the
+/// only inventory that can distinguish "an empty root" from "a project with
+/// no files" (H3), and the same inventory the detached preservation arm
+/// verifies against.
+fn prior_meta_project_file_counts(
+    meta: &HashMap<String, super::FileMeta>,
+) -> std::collections::BTreeMap<String, usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    for row in meta.values() {
+        if let super::FileMetaSource::LocalProjectFile { project_id, .. } = &row.source {
+            *counts.entry(project_id.clone()).or_insert(0_usize) += 1;
+        }
+    }
+    counts
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_effective_source(
+    project_id: &str,
+    identity: Option<&CodeProjectIdentity>,
+    access: Option<&LeasedProjectAccess>,
+    collected: Option<&super::project_files::ActiveCollectedSource>,
+    cutback_pending: bool,
+    assigned: bool,
+    config: &ReindexConfig,
+    prior_meta_files: usize,
+    empty_purge_accepted: bool,
+) -> EffectiveSource {
+    if identity.is_none() {
+        return EffectiveSource::Unavailable {
+            reason: UnavailableReason::IdentityUnavailable(format!(
+                "catalog project {project_id} has no projected identity"
+            )),
+        };
+    }
+    // A cutback in flight owns the transition; the pass neither walks nor
+    // purges. Checked before the collected arm because the collected
+    // selector is still live while the cutback stages.
+    if cutback_pending {
+        return EffectiveSource::CutbackPending;
+    }
+    if let Some(collected) = collected {
+        return EffectiveSource::Collected {
+            generation: collected.generation_id.clone(),
+        };
+    }
+    let Some(access) = access else {
+        // No compatibility record: nothing to lease and nothing to walk.
+        // Warming here is the remote-only first-upload window, which is
+        // informational, not a fault.
+        return if assigned {
+            EffectiveSource::Warming
+        } else {
+            EffectiveSource::Unavailable {
+                reason: UnavailableReason::NoAttachment,
+            }
+        };
+    };
+    let Some(local) = access.local.as_ref() else {
+        return EffectiveSource::Unavailable {
+            reason: UnavailableReason::LocalWalkDenied(
+                access
+                    .local_denial
+                    .clone()
+                    .unwrap_or_else(|| "no LocalProjectWalk lease was acquired".to_string()),
+            ),
+        };
+    };
+    // H3: an attached, readable, EMPTY root is indistinguishable from a
+    // deleted project by scan alone. Refuse rather than purge whenever the
+    // prior pass recorded files, unless the operator acknowledged this pass.
+    if !empty_purge_accepted
+        && prior_meta_files > 0
+        && !super::project_files::project_root_has_indexable_entry(local.project_root(), config)
+    {
+        return EffectiveSource::Unavailable {
+            reason: UnavailableReason::EmptyRootRefused,
+        };
+    }
+    if assigned {
+        EffectiveSource::Warming
+    } else {
+        EffectiveSource::Local
+    }
+}
+
+/// Persist the pass's unavailable states and clear the records of projects
+/// that left them. Clearing is what makes the operator escapes converge:
+/// detach, unregister, retire, and an acknowledged purge all remove the
+/// project from the state that produced the record.
+fn reconcile_planning_health(
+    store: &bbox_code_source_store::CodeSourceStore,
+    plans: &[ProjectSourcePlan],
+    accept_empty_projects: &std::collections::BTreeSet<String>,
+) {
+    for plan in plans {
+        let active_code = match &plan.effective {
+            EffectiveSource::Unavailable { reason } => Some(reason.health_code()),
+            _ => None,
+        };
+        for code in PLANNING_HEALTH_CODES {
+            if Some(code) == active_code {
+                let reason = match &plan.effective {
+                    EffectiveSource::Unavailable { reason } => reason,
+                    _ => unreachable!("active_code is Some only on the Unavailable arm"),
+                };
+                if let Err(error) =
+                    store.record_health_failure(&plan.project_id, code, &reason.diagnostic())
+                {
+                    tracing::warn!(
+                        project_id = %plan.project_id,
+                        %error,
+                        "persisting a source-planning health record failed"
+                    );
+                }
+            } else if let Err(error) = store.clear_health_failure(&plan.project_id, code) {
+                tracing::warn!(
+                    project_id = %plan.project_id,
+                    %error,
+                    "clearing a source-planning health record failed"
+                );
+            }
+        }
+    }
+    // An acknowledged project that is no longer planned at all (detached,
+    // unregistered, retired between passes) still gets its record cleared.
+    for project_id in accept_empty_projects {
+        if plans.iter().any(|plan| &plan.project_id == project_id) {
+            continue;
+        }
+        if let Err(error) = store.clear_health_failure(project_id, "empty_root_refused") {
+            tracing::warn!(
+                %project_id,
+                %error,
+                "clearing an acknowledged empty-root record failed"
+            );
+        }
+    }
+}
+
+fn acquire_leases_for_record(
+    broker: &Arc<CheckoutAccessBroker>,
+    project: ProjectRecord,
+    collected: &std::collections::BTreeMap<String, super::project_files::ActiveCollectedSource>,
+    purpose: ProjectLeasePurpose,
+) -> Result<LeasedProjectAccess> {
+    let publisher_config = broker.acquire(access_request(
+        &project.project_id,
+        None,
+        CheckoutAccessKind::PublisherConfigTreeRead,
+    ));
+    let expected_scope = publisher_config
+        .as_ref()
+        .ok()
+        .and_then(|lease| lease.published_scope().cloned());
+    let publisher_config_denial = publisher_config.as_ref().err().map(ToString::to_string);
+    let publisher_config = publisher_config.ok();
+    // A collected project needs no local walk lease for its own indexing,
+    // but a full reindex pass still uses the local root for the tool-edge,
+    // project-record, and knowledge lanes, so the acquisition set stays
+    // exactly today's (bridge parity; leases are a property of attachment,
+    // not of effective source).
+    let needs_local =
+        !collected.contains_key(&project.project_id) || purpose == ProjectLeasePurpose::Reindex;
+    let (local, local_denial) = if !needs_local {
+        (None, None)
+    } else {
+        match broker.acquire(access_request(
+            &project.project_id,
+            expected_scope.clone(),
+            CheckoutAccessKind::LocalProjectWalk,
+        )) {
+            Ok(lease) => (Some(lease), None),
+            Err(error) => (None, Some(error.to_string())),
+        }
+    };
+    let (git, git_denial) = if project.is_git_repo {
+        match broker.acquire(access_request(
+            &project.project_id,
+            expected_scope.clone(),
+            CheckoutAccessKind::GitHistory,
+        )) {
+            Ok(lease) => (Some(lease), None),
+            Err(error) => (None, Some(error.to_string())),
+        }
+    } else {
+        (None, None)
+    };
+    let (knowledge_overlay, knowledge_overlay_denial) = if purpose == ProjectLeasePurpose::Reindex {
+        match broker.acquire(access_request(
+            &project.project_id,
+            expected_scope,
+            CheckoutAccessKind::KnowledgeGapOverlayRead,
+        )) {
+            Ok(lease) => (Some(lease), None),
+            Err(error) => (None, Some(error.to_string())),
+        }
+    } else {
+        (None, None)
+    };
+    Ok(LeasedProjectAccess {
+        project,
+        publisher_config,
+        publisher_config_denial,
+        knowledge_overlay,
+        knowledge_overlay_denial,
+        local,
+        local_denial,
+        git,
+        git_denial,
+    })
+}
+
+pub(super) fn revalidate_planned_leases(
     broker: &CheckoutAccessBroker,
-    projects: &[LeasedProjectAccess],
+    plans: &[ProjectSourcePlan],
 ) -> Result<()> {
-    for access in projects {
+    for access in plans.iter().filter_map(|plan| plan.access.as_ref()) {
         if let Some(publisher_config) = &access.publisher_config {
             broker.revalidate(publisher_config).with_context(|| {
                 format!(
@@ -485,6 +868,8 @@ impl IndexWriterActor {
     ) -> Self {
         let (tx, rx) = mpsc::channel::<IndexWriteOp>();
         let post_commit_hook = Arc::new(parking_lot::RwLock::new(None));
+        let assignments: Arc<parking_lot::RwLock<Option<Arc<dyn ProducerAssignmentSource>>>> =
+            Arc::new(parking_lot::RwLock::new(None));
         let ctx = ActorCtx {
             index,
             fields,
@@ -494,6 +879,7 @@ impl IndexWriterActor {
             post_commit_hook: post_commit_hook.clone(),
             checkout_access: checkout_access.clone(),
             records_provider: records_provider.clone(),
+            assignments: assignments.clone(),
         };
         if let Err(err) = std::thread::Builder::new()
             .name("blackbox-index-writer".into())
@@ -511,8 +897,18 @@ impl IndexWriterActor {
             post_commit_hook,
             checkout_access,
             records_provider,
+            assignments,
             config,
         }
+    }
+
+    /// Inject the producer assignment table (Phase 3 plan section 4.7). The
+    /// daemon's code-source runtime is built after the writer actor spawns,
+    /// so this is a post-spawn install exactly like the post-commit hook
+    /// rather than a constructor argument. Unset means no assignments exist,
+    /// which is correct for the bridge, tests, and offline index builds.
+    pub fn set_producer_assignment_source(&self, source: Arc<dyn ProducerAssignmentSource>) {
+        *self.assignments.write() = Some(source);
     }
 
     /// Publish a fresh searcher after every successful commit. Installing the
@@ -541,9 +937,26 @@ impl IndexWriterActor {
     /// Run a reindex pass on the actor thread and wait for its outcome.
     /// Returns the human-readable summary line on commit/no-op.
     pub fn run_reindex_pass(&self, full: bool, dirty: bool) -> Result<String> {
+        self.run_reindex_pass_accepting_empty(full, dirty, Vec::new())
+    }
+
+    /// Reindex pass with the operator's H3 acknowledgement list. Only
+    /// `bbox_reindex` supplies a non-empty list; every other caller uses
+    /// [`Self::run_reindex_pass`], which passes none (RX-V1: never defaulted).
+    pub fn run_reindex_pass_accepting_empty(
+        &self,
+        full: bool,
+        dirty: bool,
+        accept_empty_projects: Vec<String>,
+    ) -> Result<String> {
         let (ack, ack_rx) = mpsc::sync_channel(1);
         self.tx
-            .send(IndexWriteOp::ReindexPass { full, dirty, ack })
+            .send(IndexWriteOp::ReindexPass {
+                full,
+                dirty,
+                accept_empty_projects,
+                ack,
+            })
             .map_err(|_| anyhow!("index writer actor unavailable"))?;
         ack_rx
             .recv()
@@ -551,7 +964,12 @@ impl IndexWriterActor {
     }
 
     pub fn needs_reindex(&self) -> Result<bool> {
-        super::reindex::needs_reindex(&self.config, &self.records_provider, &self.checkout_access)
+        super::reindex::needs_reindex(
+            &self.config,
+            &self.records_provider,
+            &self.checkout_access,
+            self.assignments.read().clone().as_ref(),
+        )
     }
 
     pub fn verify_code_selector_document_count(&self, selector: &str, expected: u64) -> Result<()> {
@@ -707,8 +1125,13 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
             },
         };
         match op {
-            IndexWriteOp::ReindexPass { full, dirty, ack } => {
-                let result = run_pass(&ctx, &rx, full, dirty);
+            IndexWriteOp::ReindexPass {
+                full,
+                dirty,
+                accept_empty_projects,
+                ack,
+            } => {
+                let result = run_pass(&ctx, &rx, full, dirty, &accept_empty_projects);
                 let _ = ack.send(result);
             }
             IndexWriteOp::StageCollectedGeneration {
@@ -1262,6 +1685,7 @@ fn run_pass(
     rx: &mpsc::Receiver<IndexWriteOp>,
     full: bool,
     dirty: bool,
+    accept_empty_projects: &[String],
 ) -> Result<String> {
     let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
     if !full {
@@ -1312,6 +1736,8 @@ fn run_pass(
             &mut drain,
             &ctx.records_provider,
             &ctx.checkout_access,
+            ctx.assignments.read().clone().as_ref(),
+            accept_empty_projects,
         )
     };
     if outcome.is_ok() {
@@ -1624,16 +2050,20 @@ mod tests {
         let records_provider: Arc<dyn ProjectRecordsProvider> = Arc::new(
             crate::projects::BridgeProjectRecordsProvider::new(projects.clone()),
         );
-        let leased = acquire_project_leases(
+        let plans = plan_project_sources(
             &index.reindex_config(),
             &records_provider,
             &broker,
+            None,
             ProjectLeasePurpose::Reindex,
+            &HashMap::new(),
+            &std::collections::BTreeSet::new(),
         )
         .unwrap();
-        assert_eq!(leased.len(), 1);
-        assert!(leased[0].local.is_some());
-        assert!(leased[0].git.is_some());
+        assert_eq!(plans.len(), 1);
+        let leased = plans[0].access.as_ref().unwrap();
+        assert!(leased.local.is_some());
+        assert!(leased.git.is_some());
 
         let health = broker.health();
         for kind in [
@@ -2298,5 +2728,644 @@ mod tests {
         release.send(()).unwrap();
         waiter.join().unwrap();
         assert_eq!(hold_state.load(Ordering::Acquire), STAGE_HOLD_RELEASED);
+    }
+}
+
+/// Phase 3 P3-C source-planning matrix (plan section 7 item 1 gate).
+///
+/// Each row is one `EffectiveSource` classification plus its
+/// lease-acquisition and purge-exemption consequences, driven through
+/// `plan_project_sources` against a catalog-shaped records provider: a
+/// corpus id set that EXCEEDS the attached rows, which is exactly the shape
+/// the bridge cannot produce and the pre-Phase-3 planner could not see (F1).
+#[cfg(test)]
+mod source_planning_tests {
+    use super::*;
+    use crate::index::TranscriptIndex;
+    use bbox_corpus_core::project_catalog::{ProjectId, ProjectScope};
+    use bbox_corpus_core::project_record::ProjectRecordsSnapshot;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const REMOTE: &str = "p_000000000000000000000000000000b1";
+    const GENERATION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    struct PlanningProvider {
+        snapshot: ProjectRecordsSnapshot,
+        identities: BTreeMap<String, CodeProjectIdentity>,
+    }
+
+    impl ProjectRecordsProvider for PlanningProvider {
+        fn records_snapshot(&self) -> ProjectRecordsSnapshot {
+            self.snapshot.clone()
+        }
+
+        fn code_identities(&self) -> BTreeMap<String, CodeProjectIdentity> {
+            self.identities.clone()
+        }
+    }
+
+    struct TestAssignments(BTreeSet<String>);
+
+    impl ProducerAssignmentSource for TestAssignments {
+        fn assigned_project_ids(&self) -> BTreeSet<String> {
+            self.0.clone()
+        }
+    }
+
+    fn identity(id: &str) -> CodeProjectIdentity {
+        CodeProjectIdentity {
+            project_id: ProjectId::parse(id.to_string()).unwrap(),
+            scope: ProjectScope::LegacyLocal,
+            display_name: format!("display {id}"),
+            repo_history: None,
+            origin: IdentityOrigin::Catalog,
+        }
+    }
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        root: std::path::PathBuf,
+        config: ReindexConfig,
+        projects: Arc<parking_lot::RwLock<ProjectRegistry>>,
+        broker: Arc<CheckoutAccessBroker>,
+    }
+
+    impl Fixture {
+        /// Register a real checkout so the version-1 access authority can
+        /// grant leases against it, returning the record with the id the
+        /// registry actually minted.
+        fn attach(&self, name: &str, files: &[(&str, &str)]) -> ProjectRecord {
+            let root = self.root.join(name);
+            std::fs::create_dir_all(root.join(".bbox")).unwrap();
+            for (path, contents) in files {
+                let path = root.join(path);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                std::fs::write(path, contents).unwrap();
+            }
+            self.projects.write().register_path(&root).unwrap()
+        }
+
+        fn store(&self) -> bbox_code_source_store::CodeSourceStore {
+            bbox_code_source_store::CodeSourceStore::open(
+                &self.config.code_source_store_path,
+                bbox_code_source_store::StoreLimits::default(),
+            )
+            .unwrap()
+        }
+
+        fn has_health(&self, project_id: &str, code: &str) -> bool {
+            self.store()
+                .health_records()
+                .unwrap()
+                .iter()
+                .any(|row| row.project_id == project_id && row.code == code)
+        }
+    }
+
+    fn fixture() -> Fixture {
+        fixture_with_broker(true)
+    }
+
+    fn deny_all_fixture() -> Fixture {
+        fixture_with_broker(false)
+    }
+
+    fn fixture_with_broker(grant: bool) -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = TranscriptIndex::open_or_create(
+            &root.join("idx"),
+            Vec::new(),
+            None,
+            root.join("projects.json"),
+            root.join("kb.json"),
+            root.join("threads.json"),
+            root.join("roadmap.json"),
+        )
+        .unwrap();
+        let config = index.reindex_config();
+        let projects = Arc::new(parking_lot::RwLock::new(
+            ProjectRegistry::open(&config.projects_path).unwrap(),
+        ));
+        let checkouts = Arc::new(parking_lot::RwLock::new(
+            crate::checkout_registry::CheckoutRegistry::open(&root.join("checkouts.json")).unwrap(),
+        ));
+        let broker = if grant {
+            Arc::new(CheckoutAccessBroker::new(
+                Arc::new(crate::checkout_access_v1::V1CheckoutAccessAuthority::new(
+                    projects.clone(),
+                    checkouts,
+                )),
+                crate::checkout_access::CheckoutAccessObservations::in_memory(),
+            ))
+        } else {
+            Arc::new(CheckoutAccessBroker::new(
+                Arc::new(crate::checkout_access::DenyCheckoutAccess),
+                crate::checkout_access::CheckoutAccessObservations::in_memory(),
+            ))
+        };
+        Fixture {
+            _dir: dir,
+            root,
+            config,
+            projects,
+            broker,
+        }
+    }
+
+    fn provider(
+        records: Vec<ProjectRecord>,
+        corpus_ids: &[&str],
+    ) -> Arc<dyn ProjectRecordsProvider> {
+        Arc::new(PlanningProvider {
+            snapshot: ProjectRecordsSnapshot {
+                records: Arc::new(records),
+                corpus_project_ids: Arc::new(
+                    corpus_ids.iter().map(|id| (*id).to_string()).collect(),
+                ),
+                omitted_catalog_count: 0,
+                authority_epoch: 7,
+            },
+            identities: corpus_ids
+                .iter()
+                .map(|id| ((*id).to_string(), identity(id)))
+                .collect(),
+        })
+    }
+
+    fn mark_collected(config: &ReindexConfig, project_id: &str) {
+        let edges_dir =
+            bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&config.projects_path);
+        std::fs::create_dir_all(&edges_dir).unwrap();
+        let mut manifest =
+            bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir).unwrap();
+        manifest.upsert_workspace(
+            project_id,
+            bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
+                manifest: format!("{project_id}.json"),
+                active_snapshot: None,
+                dirty_overlay: None,
+                repo_materialization: None,
+                code_source_selector: Some(
+                    bbox_corpus_index::index::project_files::collected_materialization_selector(
+                        project_id, GENERATION,
+                    ),
+                ),
+                code_source_generation: Some(GENERATION.to_string()),
+            },
+        );
+        manifest.write_atomic(&edges_dir).unwrap();
+    }
+
+    fn mark_cutback_pending(config: &ReindexConfig, project_id: &str) {
+        let store = bbox_code_source_store::CodeSourceStore::open(
+            &config.code_source_store_path,
+            bbox_code_source_store::StoreLimits::default(),
+        )
+        .unwrap();
+        store
+            .save_activation(&bbox_code_source_store::ActivationRecord {
+                version: 1,
+                project_id: project_id.to_string(),
+                generation_id: GENERATION.to_string(),
+                selector:
+                    bbox_corpus_index::index::project_files::collected_materialization_selector(
+                        project_id, GENERATION,
+                    ),
+                snapshot_id: bbox_edge_sidecar::snapshot::collected_snapshot_id(
+                    project_id, GENERATION,
+                ),
+                document_count: 0,
+                entity_inventory_sha256: "b".repeat(64),
+                current_chunk_targets: Default::default(),
+                activated_unix_secs: 0,
+                cutback_pending: true,
+                diagnostic: Some("cutback staged".into()),
+            })
+            .unwrap();
+    }
+
+    fn local_meta(project_id: &str) -> HashMap<String, super::super::FileMeta> {
+        [(
+            "/previous/pass/src/lib.rs".to_string(),
+            super::super::FileMeta {
+                mtime: 1,
+                size: 1,
+                mat_version: Some("v1".into()),
+                source: super::super::FileMetaSource::LocalProjectFile {
+                    project_id: project_id.to_string(),
+                    selector: bbox_code_source::local_selector(project_id),
+                    relative_path: "src/lib.rs".into(),
+                    entry_key: format!("entry-{project_id}"),
+                },
+            },
+        )]
+        .into_iter()
+        .collect()
+    }
+
+    fn plan(
+        fixture: &Fixture,
+        provider: &Arc<dyn ProjectRecordsProvider>,
+        assignments: Option<&Arc<dyn ProducerAssignmentSource>>,
+        meta: &HashMap<String, super::super::FileMeta>,
+        accept: &BTreeSet<String>,
+    ) -> Vec<ProjectSourcePlan> {
+        plan_project_sources(
+            &fixture.config,
+            provider,
+            &fixture.broker,
+            assignments,
+            ProjectLeasePurpose::Reindex,
+            meta,
+            accept,
+        )
+        .unwrap()
+    }
+
+    fn find<'a>(plans: &'a [ProjectSourcePlan], id: &str) -> &'a ProjectSourcePlan {
+        plans
+            .iter()
+            .find(|plan| plan.project_id == id)
+            .expect("planned project")
+    }
+
+    #[test]
+    fn remote_only_project_plans_collected_with_zero_leases() {
+        let fixture = deny_all_fixture();
+        mark_collected(&fixture.config, REMOTE);
+        let provider = provider(Vec::new(), &[REMOTE]);
+        let plans = plan(&fixture, &provider, None, &HashMap::new(), &BTreeSet::new());
+        let remote = find(&plans, REMOTE);
+        assert_eq!(
+            remote.effective,
+            EffectiveSource::Collected {
+                generation: GENERATION.to_string()
+            }
+        );
+        assert!(remote.access.is_none(), "collected plan holds no lease");
+        assert!(!remote.is_local_scanned());
+        assert!(
+            remote.lowered().is_some(),
+            "a remote-only collected project still reaches the indexer"
+        );
+        // The exit-gate property: the broker was never called at all for a
+        // project with no compatibility record.
+        for operation in &fixture.broker.health().operations {
+            assert_eq!(operation.granted, 0, "{:?} grants", operation.kind);
+            assert_eq!(operation.denied, 0, "{:?} denials", operation.kind);
+        }
+    }
+
+    #[test]
+    fn detached_project_plans_unavailable_and_is_purge_exempt() {
+        let fixture = fixture();
+        let provider = provider(Vec::new(), &[REMOTE]);
+        let plans = plan(&fixture, &provider, None, &HashMap::new(), &BTreeSet::new());
+        assert_eq!(
+            find(&plans, REMOTE).effective,
+            EffectiveSource::Unavailable {
+                reason: UnavailableReason::NoAttachment
+            }
+        );
+        assert!(purge_exempt_project_ids(&plans).contains(REMOTE));
+        assert!(
+            fixture.has_health(REMOTE, "source_unavailable"),
+            "the detached state gets a durable record, not a per-pass warn"
+        );
+    }
+
+    #[test]
+    fn attached_project_plans_local_and_is_not_exempt() {
+        let fixture = fixture();
+        let record = fixture.attach("attached", &[("lib.rs", "fn main() {}\n")]);
+        let id = record.project_id.clone();
+        let provider = provider(vec![record], &[&id]);
+        let plans = plan(&fixture, &provider, None, &HashMap::new(), &BTreeSet::new());
+        let attached = find(&plans, &id);
+        assert_eq!(attached.effective, EffectiveSource::Local);
+        assert!(
+            attached.access.is_some(),
+            "local plans carry the lease bundle"
+        );
+        assert!(attached.is_local_scanned());
+        assert!(!purge_exempt_project_ids(&plans).contains(&id));
+        assert!(!fixture.has_health(&id, "source_unavailable"));
+    }
+
+    #[test]
+    fn empty_root_refuses_purge_when_the_prior_pass_recorded_files() {
+        let fixture = fixture();
+        let record = fixture.attach("attached-empty", &[]);
+        let id = record.project_id.clone();
+        let provider = provider(vec![record], &[&id]);
+        let plans = plan(
+            &fixture,
+            &provider,
+            None,
+            &local_meta(&id),
+            &BTreeSet::new(),
+        );
+        let refused = find(&plans, &id);
+        assert_eq!(
+            refused.effective,
+            EffectiveSource::Unavailable {
+                reason: UnavailableReason::EmptyRootRefused
+            }
+        );
+        assert!(!refused.is_local_scanned());
+        assert!(
+            refused.lowered().unwrap().local_root.is_none(),
+            "a refused project must never be walked"
+        );
+        assert!(purge_exempt_project_ids(&plans).contains(&id));
+        assert!(fixture.has_health(&id, "empty_root_refused"));
+    }
+
+    #[test]
+    fn empty_root_with_no_prior_files_is_an_ordinary_local_plan() {
+        // The refusal is about losing a known non-empty inventory, not about
+        // emptiness: a genuinely new empty project must not be refused.
+        let fixture = fixture();
+        let record = fixture.attach("fresh-empty", &[]);
+        let id = record.project_id.clone();
+        let provider = provider(vec![record], &[&id]);
+        let plans = plan(&fixture, &provider, None, &HashMap::new(), &BTreeSet::new());
+        assert_eq!(find(&plans, &id).effective, EffectiveSource::Local);
+        assert!(!fixture.has_health(&id, "empty_root_refused"));
+    }
+
+    #[test]
+    fn accept_empty_projects_waives_the_refusal_and_clears_the_record() {
+        let fixture = fixture();
+        let record = fixture.attach("attached-empty", &[]);
+        let id = record.project_id.clone();
+        let provider = provider(vec![record], &[&id]);
+        let meta = local_meta(&id);
+
+        let plans = plan(&fixture, &provider, None, &meta, &BTreeSet::new());
+        assert!(!find(&plans, &id).is_local_scanned());
+        assert!(fixture.has_health(&id, "empty_root_refused"));
+
+        let accepted = BTreeSet::from([id.clone()]);
+        let plans = plan(&fixture, &provider, None, &meta, &accepted);
+        let acknowledged = find(&plans, &id);
+        assert_eq!(acknowledged.effective, EffectiveSource::Local);
+        assert!(acknowledged.is_local_scanned());
+        assert!(!purge_exempt_project_ids(&plans).contains(&id));
+        assert!(
+            !fixture.has_health(&id, "empty_root_refused"),
+            "the acknowledgement clears the record on that pass"
+        );
+    }
+
+    #[test]
+    fn detaching_an_empty_root_project_also_clears_the_record() {
+        let fixture = fixture();
+        let record = fixture.attach("attached-empty", &[]);
+        let id = record.project_id.clone();
+        let meta = local_meta(&id);
+        let attached_provider = provider(vec![record], &[&id]);
+        plan(&fixture, &attached_provider, None, &meta, &BTreeSet::new());
+        assert!(fixture.has_health(&id, "empty_root_refused"));
+
+        // Detach: the project leaves Local planning entirely, which is the
+        // second operator escape the plan names.
+        let detached_provider = provider(Vec::new(), &[&id]);
+        let plans = plan(&fixture, &detached_provider, None, &meta, &BTreeSet::new());
+        assert_eq!(
+            find(&plans, &id).effective,
+            EffectiveSource::Unavailable {
+                reason: UnavailableReason::NoAttachment
+            }
+        );
+        assert!(!fixture.has_health(&id, "empty_root_refused"));
+        assert!(fixture.has_health(&id, "source_unavailable"));
+    }
+
+    #[test]
+    fn attached_warming_keeps_local_walking_and_leases() {
+        let fixture = fixture();
+        let record = fixture.attach("warming", &[("lib.rs", "fn main() {}\n")]);
+        let id = record.project_id.clone();
+        let provider = provider(vec![record], &[&id]);
+        let assignments: Arc<dyn ProducerAssignmentSource> =
+            Arc::new(TestAssignments(BTreeSet::from([id.clone()])));
+        let plans = plan(
+            &fixture,
+            &provider,
+            Some(&assignments),
+            &HashMap::new(),
+            &BTreeSet::new(),
+        );
+        let warming = find(&plans, &id);
+        assert_eq!(warming.effective, EffectiveSource::Warming);
+        assert!(
+            warming.is_local_scanned(),
+            "warming with a valid local source plans exactly as Local"
+        );
+        assert!(warming.access.as_ref().unwrap().local.is_some());
+        assert!(warming.lowered().unwrap().local_root.is_some());
+        assert!(!purge_exempt_project_ids(&plans).contains(&id));
+        assert!(!fixture.has_health(&id, "source_unavailable"));
+    }
+
+    #[test]
+    fn remote_only_warming_is_a_no_op_with_no_health_record() {
+        let fixture = deny_all_fixture();
+        let provider = provider(Vec::new(), &[REMOTE]);
+        let assignments: Arc<dyn ProducerAssignmentSource> =
+            Arc::new(TestAssignments(BTreeSet::from([REMOTE.to_string()])));
+        let plans = plan(
+            &fixture,
+            &provider,
+            Some(&assignments),
+            &HashMap::new(),
+            &BTreeSet::new(),
+        );
+        let warming = find(&plans, REMOTE);
+        assert_eq!(warming.effective, EffectiveSource::Warming);
+        assert!(!warming.is_local_scanned());
+        assert!(warming.access.is_none());
+        assert!(purge_exempt_project_ids(&plans).contains(REMOTE));
+        assert!(
+            fixture.store().health_records().unwrap().is_empty(),
+            "a first upload in flight is informational, not a fault"
+        );
+    }
+
+    #[test]
+    fn bridge_shaped_snapshot_reproduces_the_lease_set_including_warming() {
+        // Bridge parity row: corpus ids == record ids, so every project is
+        // attached, and the warming window must not change the lease set or
+        // local freshness.
+        let fixture = fixture();
+        let record = fixture.attach("bridge", &[("lib.rs", "fn main() {}\n")]);
+        let id = record.project_id.clone();
+        let provider = provider(vec![record], &[&id]);
+        let baseline = plan(&fixture, &provider, None, &HashMap::new(), &BTreeSet::new());
+        let assignments: Arc<dyn ProducerAssignmentSource> =
+            Arc::new(TestAssignments(BTreeSet::from([id.clone()])));
+        let warming = plan(
+            &fixture,
+            &provider,
+            Some(&assignments),
+            &HashMap::new(),
+            &BTreeSet::new(),
+        );
+        let shape = |plans: &[ProjectSourcePlan]| {
+            plans
+                .iter()
+                .map(|plan| {
+                    let access = plan.access.as_ref().expect("bridge plans are attached");
+                    (
+                        plan.project_id.clone(),
+                        access.publisher_config.is_some(),
+                        access.knowledge_overlay.is_some(),
+                        access.local.is_some(),
+                        access.git.is_some(),
+                        plan.is_local_scanned(),
+                        plan.lowered().map(|lowered| lowered.local_root.is_some()),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&baseline), shape(&warming));
+        assert!(purge_exempt_project_ids(&warming).is_empty());
+    }
+
+    #[test]
+    fn cutback_pending_is_a_pass_level_no_op() {
+        let fixture = fixture();
+        let record = fixture.attach("cutback", &[("lib.rs", "fn main() {}\n")]);
+        let id = record.project_id.clone();
+        mark_collected(&fixture.config, &id);
+        mark_cutback_pending(&fixture.config, &id);
+        let provider = provider(vec![record], &[&id]);
+        let plans = plan(&fixture, &provider, None, &HashMap::new(), &BTreeSet::new());
+        let cutback = find(&plans, &id);
+        assert_eq!(cutback.effective, EffectiveSource::CutbackPending);
+        assert!(!cutback.is_local_scanned());
+        assert!(purge_exempt_project_ids(&plans).contains(&id));
+        assert!(
+            cutback.lowered().is_none(),
+            "the in-flight transition owns the project this pass"
+        );
+    }
+
+    /// End-to-end F2/H1 closure on the REINDEX pass: a catalog project with
+    /// no attachment keeps its documents across both an incremental tick and
+    /// a full rebuild. Before Phase 3 the incremental purge deleted them on
+    /// the next ordinary tick and `delete_all_documents()` dropped them with
+    /// no preservation arm at all, in both cases with no health record.
+    #[test]
+    fn a_detached_project_survives_an_incremental_tick_and_a_full_rebuild() {
+        let fixture = fixture();
+        let entry_key = format!("entry-{REMOTE}");
+        let index = TranscriptIndex::open_or_create(
+            &fixture.root.join("idx"),
+            Vec::new(),
+            None,
+            fixture.config.projects_path.clone(),
+            fixture.config.knowledge_path.clone(),
+            fixture.config.threads_path.clone(),
+            fixture.config.roadmap_path.clone(),
+        )
+        .unwrap();
+        let fields = index.field_handles();
+        {
+            let handle = index.index_handle();
+            let mut writer: IndexWriter = handle.writer(WRITER_HEAP_SMALL_OPS).unwrap();
+            let mut document = tantivy::TantivyDocument::new();
+            document.add_text(fields.doc_type, "project_file");
+            document.add_text(fields.project_id, REMOTE);
+            document.add_text(fields.entity_id, "project_file:detached:fixture");
+            document.add_text(
+                fields.code_source_selector,
+                &bbox_code_source::local_selector(REMOTE),
+            );
+            document.add_text(fields.code_source_entry_key, &entry_key);
+            document.add_text(fields.content, "detached preservation fixture");
+            document.add_text(fields.file_path, "/gone/src/lib.rs");
+            writer.add_document(document).unwrap();
+            writer.commit().unwrap();
+        }
+        index.reader_reload_for_test();
+
+        let meta: HashMap<String, super::super::FileMeta> = [(
+            "/gone/src/lib.rs".to_string(),
+            super::super::FileMeta {
+                mtime: 1,
+                size: 1,
+                mat_version: Some("v1".into()),
+                source: super::super::FileMetaSource::LocalProjectFile {
+                    project_id: REMOTE.to_string(),
+                    selector: bbox_code_source::local_selector(REMOTE),
+                    relative_path: "src/lib.rs".into(),
+                    entry_key: entry_key.clone(),
+                },
+            },
+        )]
+        .into_iter()
+        .collect();
+        bbox_corpus_index::index::passes::save_meta(&index.reindex_config().meta_path, &meta)
+            .unwrap();
+
+        let provider = provider(Vec::new(), &[REMOTE]);
+        let actor = IndexWriterActor::spawn_for_with_checkout_access(
+            &index,
+            provider,
+            fixture.broker.clone(),
+        );
+
+        let live = |index: &TranscriptIndex| {
+            index.reader_reload_for_test();
+            index
+                .searcher()
+                .search(
+                    &TermQuery::new(
+                        Term::from_field_text(fields.code_source_entry_key, &entry_key),
+                        IndexRecordOption::Basic,
+                    ),
+                    &Count,
+                )
+                .unwrap()
+        };
+
+        actor.run_reindex_pass(false, true).unwrap();
+        assert_eq!(live(&index), 1, "incremental tick must not purge (H2)");
+
+        actor.run_reindex_pass(true, true).unwrap();
+        assert_eq!(live(&index), 1, "full rebuild must preserve (H1)");
+        assert!(
+            bbox_corpus_index::index::passes::load_meta(&index.reindex_config().meta_path)
+                .unwrap()
+                .contains_key("/gone/src/lib.rs"),
+            "the freshness inventory that verified the preservation must survive it"
+        );
+    }
+
+    #[test]
+    fn identity_absent_for_a_corpus_id_plans_unavailable_rather_than_vanishing() {
+        let fixture = fixture();
+        let provider: Arc<dyn ProjectRecordsProvider> = Arc::new(PlanningProvider {
+            snapshot: ProjectRecordsSnapshot {
+                records: Arc::new(Vec::new()),
+                corpus_project_ids: Arc::new(BTreeSet::from([REMOTE.to_string()])),
+                omitted_catalog_count: 0,
+                authority_epoch: 1,
+            },
+            identities: BTreeMap::new(),
+        });
+        let plans = plan(&fixture, &provider, None, &HashMap::new(), &BTreeSet::new());
+        assert!(matches!(
+            find(&plans, REMOTE).effective,
+            EffectiveSource::Unavailable {
+                reason: UnavailableReason::IdentityUnavailable(_)
+            }
+        ));
+        assert!(purge_exempt_project_ids(&plans).contains(REMOTE));
     }
 }

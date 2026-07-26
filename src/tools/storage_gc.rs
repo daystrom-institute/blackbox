@@ -135,14 +135,7 @@ impl BlackboxServer {
         Self::run_blocking("bbox_storage_gc", move || {
             let edges_dir = storage_health::find_edges_dir(&server.state.store_dir, None);
 
-            let registered: std::collections::HashSet<String> = server
-                .state
-                .records_provider
-                .records_snapshot()
-                .corpus_project_ids
-                .iter()
-                .cloned()
-                .collect();
+            let registered = server.state.corpus_registered_project_ids();
 
             // Filter-class engine resolution (phase-2 §9.2 B6): a resolving
             // selector narrows by identity; a miss keeps the literal

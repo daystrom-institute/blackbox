@@ -25,4 +25,4 @@ pub use knowledge_docs::{
 pub use reindex::backfill_tool_edges_for_project;
 pub use reindex::spawn_reindex_thread;
 pub use roadmap_docs::{roadmap_chunk_hash, roadmap_entity_id};
-pub use writer_actor::{IndexWriteOp, IndexWriterActor};
+pub use writer_actor::{IndexWriteOp, IndexWriterActor, ProducerAssignmentSource};

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -351,6 +351,19 @@ impl ProjectRecordsSnapshot {
         }
     }
 
+    /// The COMPLETE catalog project-id set as a `HashSet`, for the sidecar
+    /// registered-project gate and the storage-GC liveness seed.
+    ///
+    /// Phase 3 plan section 7 item 3 (F3/F4): every "is this project
+    /// registered?" surface derives its set here. Two daemon constructors
+    /// previously built the same set from `records` (attached rows only),
+    /// which dropped a remote-only project's edges on the first runtime
+    /// rebuild and deleted its sidecars after the background GC's 30-day
+    /// orphan fuse while the equivalent MCP tools treated it as live.
+    pub fn registered_project_ids(&self) -> std::collections::HashSet<String> {
+        self.corpus_project_ids.iter().cloned().collect()
+    }
+
     pub fn empty() -> Self {
         Self {
             records: std::sync::Arc::new(Vec::new()),
@@ -367,6 +380,40 @@ impl ProjectRecordsSnapshot {
 /// discipline-dependent.
 pub trait ProjectRecordsProvider: Send + Sync {
     fn records_snapshot(&self) -> ProjectRecordsSnapshot;
+
+    /// Per-project code identity for the COMPLETE corpus id set (Phase 3
+    /// plan section 7 item 1). Source planning needs an identity for every
+    /// catalog project, including one with zero attachments, so it cannot
+    /// derive identities from `records` (attached rows only).
+    ///
+    /// The default derivation is the bridge one: project the attached v1
+    /// rows, which on the bridge are exactly the corpus id set. Catalog-mode
+    /// providers override this to build from catalog projects plus their
+    /// resolved history records, so a remote-only project is present here
+    /// even though it has no `ProjectRecord`. A project id absent from the
+    /// returned map has no derivable identity this pass; planning classifies
+    /// it as unavailable rather than silently skipping it.
+    fn code_identities(
+        &self,
+    ) -> BTreeMap<String, crate::code_project_identity::CodeProjectIdentity> {
+        self.records_snapshot()
+            .records
+            .iter()
+            .filter_map(|record| {
+                match crate::code_project_identity::CodeProjectIdentity::from_bridge_record(record) {
+                    Ok(identity) => Some((record.project_id.clone(), identity)),
+                    Err(error) => {
+                        tracing::warn!(
+                            project_id = %record.project_id,
+                            %error,
+                            "projecting a bridge code identity failed; project omitted from planning"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect()
+    }
 
     /// Bounded description of the provider's most recent degradation
     /// (stale-cache serving, omitted projection rows), for doctor/health

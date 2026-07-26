@@ -1332,6 +1332,7 @@ mod tests {
                 confidence: EdgeConfidence::Exact,
                 metadata: Default::default(),
             }])),
+            catalog_epoch: 0,
         });
 
         let inspect = |entity_ref: String| {

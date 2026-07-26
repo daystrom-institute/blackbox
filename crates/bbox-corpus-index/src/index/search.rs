@@ -127,6 +127,14 @@ pub struct ReindexParams {
     /// Force full reindex (default: false)
     #[serde(default)]
     pub full: Option<bool>,
+    /// Operator acknowledgement for the empty-root purge refusal: project
+    /// ids whose local scan may purge normally on THIS pass even though it
+    /// returned zero entries, clearing their `empty_root_refused` health
+    /// record. Operator authority, never defaulted and never inferred
+    /// (RX-V1): an agent may pass an operator-supplied list through, but
+    /// must not populate it on the operator's behalf after seeing a refusal.
+    #[serde(default)]
+    pub accept_empty_projects: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -247,12 +255,13 @@ impl TranscriptIndex {
         Ok(sessions)
     }
 
-    /// Project filter as an OR of the legacy substring lane (literal cwd in
-    /// the `project` field) and an exact term on the stamped
-    /// `base_project_id`, so a base-project selector matches sessions from
-    /// every checkout/worktree (gap-72fd5932). Both lanes come from the
-    /// caller-supplied filter: the id lane is present only when the caller
-    /// resolved one.
+    /// Project filter as an OR of three lanes: the permanent legacy
+    /// substring lane (literal cwd in the `project` field), an exact term on
+    /// the stamped `base_project_id` so a base-project selector matches
+    /// sessions from every checkout/worktree (gap-72fd5932), and an exact
+    /// term on `project_id` so it also reaches project-file documents (F7).
+    /// Every lane comes from the caller-supplied filter: the two id lanes
+    /// fire only when the caller resolved an id.
     fn push_project_filter_clause(
         &self,
         clauses: &mut Vec<(Occur, Box<dyn tantivy::query::Query>)>,
@@ -269,6 +278,22 @@ impl TranscriptIndex {
                 Occur::Should,
                 Box::new(TermQuery::new(
                     Term::from_field_text(self.fields.base_project_id, base_id),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+            // F7: project-file documents never carry `base_project_id`, so
+            // before this lane a resolved selector could reach them only
+            // through the literal substring hitting their absolute `project`
+            // value. `project_id` is already stamped and indexed on them, so
+            // this is a pure clause addition: no schema change, no new
+            // identity authority, and the permanent literal lane above is
+            // untouched. Without it the P3-E schema cut (which removes the
+            // absolute value from `project`) would silently return empty
+            // results for every resolved project filter over code.
+            lanes.push((
+                Occur::Should,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.project_id, base_id),
                     IndexRecordOption::Basic,
                 )),
             ));
@@ -1725,12 +1750,15 @@ impl TranscriptIndex {
             project_access
                 .iter()
                 .filter_map(|access| {
-                    access.local_root.map(|local_root| {
-                        crate::index::tool_edges::ToolEdgeProjectAccess {
-                            project: access.project.clone(),
-                            local_root: local_root.to_path_buf(),
-                            git_root: access.git_root.map(Path::to_path_buf),
-                        }
+                    // A local root implies an attached compatibility record;
+                    // tool edges are a checkout-bound lane and have nothing
+                    // to attribute for a detached project.
+                    let project = access.project?;
+                    let local_root = access.local_root?;
+                    Some(crate::index::tool_edges::ToolEdgeProjectAccess {
+                        project: project.clone(),
+                        local_root: local_root.to_path_buf(),
+                        git_root: access.git_root.map(Path::to_path_buf),
                     })
                 })
                 .collect(),
@@ -1798,15 +1826,40 @@ impl TranscriptIndex {
             .filter(|p| !current_paths.contains(p.as_str()))
             .cloned()
             .collect();
-        let active_collected = project_files::active_collected_sources(&self.config)?;
+        let collected_project_ids = project_files::active_collected_sources(&self.config)?
+            .into_keys()
+            .collect::<std::collections::BTreeSet<_>>();
+        // F2 on the legacy manual-build lane. This loop has no source
+        // planner, so the exemption set is derived from the access list it
+        // was handed: any project whose freshness rows exist but that this
+        // build does NOT locally scan is exempt, exactly as a non-`Local`
+        // plan is in the reindex pass. Both loops must move together, so the
+        // classification itself is shared rather than duplicated.
+        let locally_scanned = project_access
+            .iter()
+            .filter(|access| access.local_root.is_some())
+            .map(|access| access.project_id().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut purge_exempt = collected_project_ids.clone();
+        for row in meta.values() {
+            if let super::FileMetaSource::LocalProjectFile { project_id, .. } = &row.source
+                && !locally_scanned.contains(project_id)
+            {
+                purge_exempt.insert(project_id.clone());
+            }
+        }
         for path in &stale_paths {
-            match meta.get(path).map(|row| row.source.clone()) {
-                Some(super::FileMetaSource::LocalProjectFile { project_id, .. })
-                    if active_collected.contains_key(&project_id) => {}
-                Some(super::FileMetaSource::LocalProjectFile { entry_key, .. }) => {
+            match project_files::classify_stale_meta_row(
+                meta.get(path).map(|row| &row.source),
+                &purge_exempt,
+                &collected_project_ids,
+            ) {
+                project_files::StalePurgeAction::ExemptRetainRow => continue,
+                project_files::StalePurgeAction::ExemptDropRow => {}
+                project_files::StalePurgeAction::DeleteProjectEntry(entry_key) => {
                     writer.delete_term(Term::from_field_text(f.code_source_entry_key, &entry_key));
                 }
-                _ => {
+                project_files::StalePurgeAction::DeleteByPath => {
                     writer.delete_term(Term::from_field_text(f.file_path, path));
                 }
             }
@@ -1950,8 +2003,14 @@ mod agentic_project_file_tests {
             dir.path().join("roadmap.json"),
         )
         .unwrap();
+        let identity =
+            bbox_corpus_core::code_project_identity::CodeProjectIdentity::from_bridge_record(
+                &project,
+            )
+            .unwrap();
         let access = project_files::ProjectIndexAccess {
-            project: &project,
+            identity: &identity,
+            project: Some(&project),
             local_root: Some(repo_root),
             git_root: project.repo_id.as_ref().map(|_| repo_root),
         };
@@ -2046,11 +2105,17 @@ mod agentic_project_file_tests {
             dir.path().join("roadmap.json"),
         )
         .unwrap();
+        let identity =
+            bbox_corpus_core::code_project_identity::CodeProjectIdentity::from_bridge_record(
+                &project,
+            )
+            .unwrap();
         index
             .build_index_with_project_access(
                 false,
                 &[project_files::ProjectIndexAccess {
-                    project: &project,
+                    identity: &identity,
+                    project: Some(&project),
                     local_root: Some(&repo),
                     git_root: Some(&repo),
                 }],
@@ -2087,6 +2152,221 @@ mod agentic_project_file_tests {
             "git {:?} failed: {}",
             args,
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// Phase 3 P3-C filter-lane gate (plan section 7 item 4, F7).
+#[cfg(test)]
+mod project_filter_lane_tests {
+    use super::*;
+    use crate::index::TranscriptIndex;
+
+    const PROJECT: &str = "p_00000000000000000000000000000f71";
+
+    fn index_with_project_file_document(root: &std::path::Path) -> TranscriptIndex {
+        let index = TranscriptIndex::open_or_create(
+            &root.join("idx"),
+            Vec::new(),
+            None,
+            root.join("projects.json"),
+            root.join("kb.json"),
+            root.join("threads.json"),
+            root.join("roadmap.json"),
+        )
+        .unwrap();
+        let fields = index.field_handles();
+        let handle = index.index_handle();
+        let mut writer: IndexWriter = handle.writer(50_000_000).unwrap();
+        let mut document = TantivyDocument::new();
+        document.add_text(fields.doc_type, "project_file");
+        document.add_text(fields.project_id, PROJECT);
+        document.add_text(fields.entity_id, "project_file:lane:fixture");
+        document.add_text(
+            fields.code_source_selector,
+            &bbox_code_source::local_selector(PROJECT),
+        );
+        document.add_text(fields.content, "phase three filter lane fixture");
+        // The literal lane is deliberately unusable in this fixture: the
+        // `project` field carries a value no selector could ever match, so a
+        // hit can only arrive through the id lane under test.
+        document.add_text(fields.project, "unmatchable-literal-value");
+        document.add_text(fields.file_path, "src/lane.rs");
+        writer.add_document(document).unwrap();
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+        index
+    }
+
+    fn search(index: &TranscriptIndex, filter: Option<&ProjectFilterInput>) -> String {
+        let selectors = std::collections::BTreeMap::from([(
+            PROJECT.to_string(),
+            bbox_code_source::local_selector(PROJECT),
+        )]);
+        let searcher = index.searcher();
+        index
+            .search_with_project_filter(
+                &SearchParams {
+                    query: "filter lane fixture".into(),
+                    mode: Some("fulltext".into()),
+                    account: None,
+                    project: None,
+                    role: None,
+                    include_subagents: None,
+                    limit: Some(10),
+                    exclude_self: None,
+                },
+                filter,
+                &selectors,
+                &searcher,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_resolved_project_id_reaches_project_file_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = index_with_project_file_document(&root);
+
+        assert!(
+            search(&index, None).contains("src/lane.rs"),
+            "the unfiltered query must find the fixture at all"
+        );
+        assert!(
+            search(
+                &index,
+                Some(&ProjectFilterInput {
+                    project_id: Some(PROJECT.to_string()),
+                    // A literal that cannot match the fixture: without the
+                    // `project_id` lane this filter returns silently empty,
+                    // which is exactly the F7 failure mode.
+                    literal: "no-such-literal".into(),
+                })
+            )
+            .contains("src/lane.rs"),
+            "a resolved id must reach project-file documents through the id lane"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_literal_filter_still_narrows_to_nothing() {
+        // The id lane must not widen an UNRESOLVED filter: a selector that
+        // resolved to no project still gets literal-only semantics.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = index_with_project_file_document(&root);
+        let output = search(
+            &index,
+            Some(&ProjectFilterInput::unresolved("no-such-literal")),
+        );
+        assert!(!output.contains("src/lane.rs"), "{output}");
+    }
+
+    #[test]
+    fn a_foreign_resolved_id_does_not_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = index_with_project_file_document(&root);
+        let output = search(
+            &index,
+            Some(&ProjectFilterInput {
+                project_id: Some("p_0000000000000000000000000000ffff".into()),
+                literal: "no-such-literal".into(),
+            }),
+        );
+        assert!(!output.contains("src/lane.rs"), "{output}");
+    }
+}
+
+/// Phase 3 P3-C purge exemption on the LEGACY `build_index` loop (plan
+/// section 7 item 2, F2). The reindex pass's loop is covered by
+/// `project_files::purge_exemption_tests`; both loops route through the same
+/// `classify_stale_meta_row`, and this is the second loop's end-to-end row.
+#[cfg(test)]
+mod legacy_purge_exemption_tests {
+    use super::*;
+    use crate::index::passes::{load_meta, save_meta};
+    use crate::index::{FileMeta, FileMetaSource, TranscriptIndex};
+
+    const PROJECT: &str = "p_00000000000000000000000000000f22";
+
+    #[test]
+    fn a_project_this_build_does_not_scan_keeps_its_documents_and_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut index = TranscriptIndex::open_or_create(
+            &root.join("idx"),
+            Vec::new(),
+            None,
+            root.join("projects.json"),
+            root.join("kb.json"),
+            root.join("threads.json"),
+            root.join("roadmap.json"),
+        )
+        .unwrap();
+        let fields = index.field_handles();
+        let config = index.reindex_config();
+        let entry_key = format!("entry-{PROJECT}");
+        {
+            let handle = index.index_handle();
+            let mut writer: IndexWriter = handle.writer(50_000_000).unwrap();
+            let mut document = TantivyDocument::new();
+            document.add_text(fields.doc_type, "project_file");
+            document.add_text(fields.project_id, PROJECT);
+            document.add_text(fields.entity_id, "project_file:legacy:purge");
+            document.add_text(
+                fields.code_source_selector,
+                &bbox_code_source::local_selector(PROJECT),
+            );
+            document.add_text(fields.code_source_entry_key, &entry_key);
+            document.add_text(fields.content, "legacy purge exemption fixture");
+            document.add_text(fields.file_path, "/gone/src/lib.rs");
+            writer.add_document(document).unwrap();
+            writer.commit().unwrap();
+        }
+        index.reader_reload_for_test();
+
+        let meta: HashMap<String, FileMeta> = [(
+            "/gone/src/lib.rs".to_string(),
+            FileMeta {
+                mtime: 1,
+                size: 1,
+                mat_version: Some("v1".into()),
+                source: FileMetaSource::LocalProjectFile {
+                    project_id: PROJECT.to_string(),
+                    selector: bbox_code_source::local_selector(PROJECT),
+                    relative_path: "src/lib.rs".into(),
+                    entry_key: entry_key.clone(),
+                },
+            },
+        )]
+        .into_iter()
+        .collect();
+        save_meta(&config.meta_path, &meta).unwrap();
+
+        // No access at all: the project is detached as far as this build is
+        // concerned, so its scanned path set is empty. Before F2 that made
+        // every one of its rows "stale" and deleted its documents.
+        index.build_index_with_project_access(false, &[]).unwrap();
+        index.reader_reload_for_test();
+
+        let searcher = index.searcher();
+        let live = searcher
+            .search(
+                &TermQuery::new(
+                    Term::from_field_text(fields.code_source_entry_key, &entry_key),
+                    IndexRecordOption::Basic,
+                ),
+                &Count,
+            )
+            .unwrap();
+        assert_eq!(live, 1, "an unscanned project's documents must survive");
+        assert!(
+            load_meta(&config.meta_path)
+                .unwrap()
+                .contains_key("/gone/src/lib.rs"),
+            "its freshness row is the preservation authority and must survive too"
         );
     }
 }

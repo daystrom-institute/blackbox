@@ -482,20 +482,15 @@ impl TranscriptIndex {
         Some(Box::new(BooleanQuery::new(lanes)))
     }
 
-    pub fn is_active_code_entity(&self, entity_id: &str) -> bool {
-        let selectors = self.active_code_selectors.read().clone();
-        self.is_active_code_entity_for(entity_id, &selectors)
-    }
-
-    pub fn is_active_code_entity_for(
-        &self,
-        entity_id: &str,
-        selectors: &BTreeMap<String, String>,
-    ) -> bool {
-        let searcher = self.reader.searcher();
-        self.is_active_code_entity_for_with_searcher(entity_id, selectors, &searcher)
-    }
-
+    /// Per-hit code-activity probe. Both the selector map and the searcher
+    /// are caller-supplied ON PURPOSE (Phase 3 plan section 4.5): the daemon
+    /// passes its pinned `CodeReadView`, so a vector hit is filtered against
+    /// exactly the index generation and selector snapshot the rest of the
+    /// request saw. The former live-state variants (`is_active_code_entity`,
+    /// `is_active_code_entity_for`) read `self.active_code_selectors` and
+    /// minted a fresh searcher per call; they are removed rather than
+    /// deprecated, because their only failure mode was silent (a hit
+    /// filtered against a newer generation than the one that produced it).
     pub fn is_active_code_entity_for_with_searcher(
         &self,
         entity_id: &str,

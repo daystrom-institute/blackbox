@@ -40,23 +40,29 @@ pub(super) fn needs_reindex(
     config: &ReindexConfig,
     records_provider: &Arc<dyn ProjectRecordsProvider>,
     checkout_access: &Arc<CheckoutAccessBroker>,
+    assignments: Option<&Arc<dyn super::writer_actor::ProducerAssignmentSource>>,
 ) -> Result<bool> {
     let meta = load_meta(&config.meta_path).unwrap_or_default();
-    let leased = super::writer_actor::acquire_project_leases(
+    let plans = super::writer_actor::plan_project_sources(
         config,
         records_provider,
         checkout_access,
+        assignments,
         super::writer_actor::ProjectLeasePurpose::SpeculativeScan,
+        &meta,
+        // The speculative scan never consumes an operator acknowledgement:
+        // acknowledgements are scoped to the pass the operator invoked.
+        &std::collections::BTreeSet::new(),
     )?;
-    let lower = leased
+    let lower = plans
         .iter()
-        .map(|project| project.lower())
+        .filter_map(|plan| plan.lowered())
         .collect::<Vec<_>>();
     let mut files = scan_non_project_source_files(config);
     files.extend(project_files::scan_project_files_with_access(
         config, &lower,
     )?);
-    for access in &leased {
+    for access in plans.iter().filter_map(|plan| plan.access.as_ref()) {
         if access.git.is_none() && access.git_denial.is_some() {
             let source_key = super::git_history::git_source_key(&access.project.project_id);
             if let Some(previous) = meta.get(&source_key) {
@@ -64,7 +70,7 @@ pub(super) fn needs_reindex(
             }
         }
     }
-    super::writer_actor::revalidate_project_leases(checkout_access, &leased)?;
+    super::writer_actor::revalidate_planned_leases(checkout_access, &plans)?;
     let current_paths: std::collections::HashSet<&str> =
         files.iter().map(|(p, _, _)| p.as_str()).collect();
     // Check for new or changed files
@@ -74,11 +80,23 @@ pub(super) fn needs_reindex(
             _ => return Ok(true),
         }
     }
-    // Check for deleted files (in meta but not on disk)
-    for path in meta.keys() {
-        if !current_paths.contains(path.as_str()) {
-            return Ok(true);
+    // Check for deleted files (in meta but not on disk). Rows belonging to a
+    // purge-exempt project are skipped: their absence from the scan is
+    // expected (the pass does not walk them), so counting them here would
+    // schedule a pass on every tick forever for a detached, collected, or
+    // empty-root-refused project.
+    let exempt = super::writer_actor::purge_exempt_project_ids(&plans);
+    for (path, row) in meta.iter() {
+        if current_paths.contains(path.as_str()) {
+            continue;
         }
+        if matches!(
+            &row.source,
+            FileMetaSource::LocalProjectFile { project_id, .. } if exempt.contains(project_id)
+        ) {
+            continue;
+        }
+        return Ok(true);
     }
     Ok(false)
 }
@@ -156,6 +174,8 @@ pub(super) fn execute_reindex_pass(
     drain: &mut dyn FnMut(&mut IndexWriter),
     records_provider: &Arc<dyn ProjectRecordsProvider>,
     checkout_access: &Arc<CheckoutAccessBroker>,
+    assignments: Option<&Arc<dyn super::writer_actor::ProducerAssignmentSource>>,
+    accept_empty_projects: &[String],
 ) -> Result<String> {
     let edges_dir =
         bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&config.projects_path);
@@ -171,12 +191,27 @@ pub(super) fn execute_reindex_pass(
         Vec::new()
     };
     let preserved_published_knowledge = collect_scoped_published_knowledge(index, fields)?;
-    let leased = super::writer_actor::acquire_project_leases(
+    // Source planning walks the pinned catalog snapshot, not the attached-only
+    // compatibility rows (Phase 3 plan section 7 item 1). `prior_meta` is the
+    // freshness inventory the H3 empty-scan refusal and the detached
+    // preservation arm both verify against, so it is loaded before planning.
+    let prior_meta = load_meta(&config.meta_path).unwrap_or_default();
+    let accept_empty_projects: std::collections::BTreeSet<String> =
+        accept_empty_projects.iter().cloned().collect();
+    let plans = super::writer_actor::plan_project_sources(
         config,
         records_provider,
         checkout_access,
+        assignments,
         super::writer_actor::ProjectLeasePurpose::Reindex,
+        &prior_meta,
+        &accept_empty_projects,
     )?;
+    let purge_exempt = super::writer_actor::purge_exempt_project_ids(&plans);
+    let leased = plans
+        .iter()
+        .filter_map(|plan| plan.access.as_ref())
+        .collect::<Vec<_>>();
     for access in &leased {
         if let Some(error) = &access.local_denial {
             tracing::warn!(
@@ -232,9 +267,9 @@ pub(super) fn execute_reindex_pass(
     } else {
         Vec::new()
     };
-    let project_access = leased
+    let project_access = plans
         .iter()
-        .map(|project| project.lower())
+        .filter_map(|plan| plan.lowered())
         .collect::<Vec<_>>();
     let unavailable_local = leased
         .iter()
@@ -248,6 +283,40 @@ pub(super) fn execute_reindex_pass(
     };
     let preserved_unavailable = if full {
         project_files::collect_project_documents(index, fields, &unavailable_local)?
+    } else {
+        Vec::new()
+    };
+    // The detached / no-attachment preservation arm (F2 H1). Every purge-exempt
+    // project whose last-good source is LOCAL keeps its documents across the
+    // rebuild, verified against its own freshness inventory. Collected projects
+    // are excluded here (the strict collected arm above owns them) and so are
+    // the lease-denied projects the legacy `unavailable_local` arm already
+    // preserves, so no document is collected twice.
+    let detached_preserved_ids = if full {
+        plans
+            .iter()
+            .filter(|plan| !plan.is_local_scanned())
+            .filter(|plan| {
+                !matches!(
+                    plan.effective,
+                    super::writer_actor::EffectiveSource::Collected { .. }
+                )
+            })
+            .map(|plan| plan.project_id.clone())
+            .filter(|project_id| !unavailable_local.contains(project_id))
+            .filter(|project_id| !preserved_collected.project_ids.contains(project_id))
+            .collect::<std::collections::BTreeSet<_>>()
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let preserved_detached = if full {
+        project_files::collect_verified_detached_documents(
+            index,
+            config,
+            fields,
+            &detached_preserved_ids,
+            &prior_meta,
+        )?
     } else {
         Vec::new()
     };
@@ -265,6 +334,9 @@ pub(super) fn execute_reindex_pass(
         for document in preserved_unavailable {
             writer.add_document(document)?;
         }
+        for document in preserved_detached {
+            writer.add_document(document)?;
+        }
         for document in preserved_record_documents {
             writer.add_document(document)?;
         }
@@ -275,21 +347,27 @@ pub(super) fn execute_reindex_pass(
         // writer.commit() atomically commit delete+adds together.
         // If we commit delete now and a later step fails, the index
         // is empty while _meta.json still says sources are current.
-        load_meta(&config.meta_path)
-            .unwrap_or_default()
+        // Freshness rows survive the rebuild for exactly the projects whose
+        // documents did: the lease-denied set, the detached-preserved set,
+        // and the git-unavailable source keys. Dropping a preserved project's
+        // rows would strand its documents with no inventory to verify them
+        // against on the next pass.
+        prior_meta
+            .clone()
             .into_iter()
             .filter(|(_path, row)| {
                 matches!(
                     &row.source,
                     FileMetaSource::LocalProjectFile { project_id, .. }
                         if unavailable_local.contains(project_id)
+                            || detached_preserved_ids.contains(project_id)
                 ) || _path
                     .strip_prefix("git:")
                     .is_some_and(|project_id| unavailable_git_ids.contains(project_id))
             })
             .collect()
     } else {
-        load_meta(&config.meta_path).unwrap_or_default()
+        prior_meta.clone()
     };
 
     // 4. Index changed files
@@ -496,19 +574,28 @@ pub(super) fn execute_reindex_pass(
         .filter(|p| !current_paths.contains(p.as_str()))
         .cloned()
         .collect();
-    let active_collected = project_files::active_collected_sources(config)?;
+    let collected_project_ids = project_files::active_collected_sources(config)?
+        .into_keys()
+        .collect::<std::collections::BTreeSet<_>>();
     for path in &stale_paths {
-        match meta.get(path).map(|row| row.source.clone()) {
-            Some(FileMetaSource::LocalProjectFile { project_id, .. })
-                if active_collected.contains_key(&project_id)
-                    || unavailable_local.contains(&project_id) => {}
-            Some(FileMetaSource::LocalProjectFile { entry_key, .. }) => {
+        // F2: exemption is keyed on the pass's own plans, not on the
+        // collected-selector map alone. Every non-locally-scanned project
+        // keeps its documents; the ones whose last-good source is local also
+        // keep the freshness rows the preservation arm verifies against.
+        match project_files::classify_stale_meta_row(
+            meta.get(path).map(|row| &row.source),
+            &purge_exempt,
+            &collected_project_ids,
+        ) {
+            project_files::StalePurgeAction::ExemptRetainRow => continue,
+            project_files::StalePurgeAction::ExemptDropRow => {}
+            project_files::StalePurgeAction::DeleteProjectEntry(entry_key) => {
                 writer.delete_term(Term::from_field_text(
                     fields.code_source_entry_key,
                     &entry_key,
                 ));
             }
-            _ => {
+            project_files::StalePurgeAction::DeleteByPath => {
                 writer.delete_term(Term::from_field_text(fields.file_path, path));
             }
         }
@@ -1117,7 +1204,7 @@ mod tests {
             crate::checkout_access::CheckoutAccessObservations::in_memory(),
         ));
         assert!(
-            needs_reindex(&config, &records_provider, &broker).unwrap(),
+            needs_reindex(&config, &records_provider, &broker, None).unwrap(),
             "new harness session log must trigger needs_reindex"
         );
     }

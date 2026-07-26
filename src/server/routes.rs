@@ -1933,6 +1933,7 @@ pub(crate) fn rebuild_edge_index_from_shared(
             active_selectors: selectors,
             searcher,
             edge_index: std::sync::Arc::new(rebuilt),
+            catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
         });
         state
             .code_sources
@@ -1957,14 +1958,9 @@ pub(crate) fn build_edge_index_from_shared(
 ) -> anyhow::Result<edge_index::EdgeIndex> {
     let started = std::time::Instant::now();
     let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
-    let registered_project_ids: std::collections::HashSet<String> = state
-        .records_provider
-        .records_snapshot()
-        .records
-        .iter()
-        .cloned()
-        .map(|project| project.project_id)
-        .collect();
+    // F3: the COMPLETE catalog id set, through the one shared accessor that
+    // also seeds startup, the storage tools, and the background GC pass.
+    let registered_project_ids = state.corpus_registered_project_ids();
     match bbox_edge_sidecar::manifest::try_load_manifest_index(&edges_dir) {
         Ok(_) | Err(bbox_edge_sidecar::manifest::ManifestFallbackReason::MissingNotMigrated) => {}
         Err(reason) => anyhow::bail!("edge manifest is unavailable: {reason:?}"),

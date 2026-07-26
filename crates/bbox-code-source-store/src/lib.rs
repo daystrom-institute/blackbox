@@ -5773,7 +5773,7 @@ mod tests {
         SCHEMA_VERSION, WALKER_POLICY_VERSION, dirty_fingerprint, manifest_sha256, source_selector,
     };
 
-    fn descriptor(entries: &[ManifestEntry]) -> GenerationDescriptor {
+    pub(super) fn descriptor(entries: &[ManifestEntry]) -> GenerationDescriptor {
         let head = "b".repeat(40);
         GenerationDescriptor {
             schema_version: SCHEMA_VERSION,
@@ -5791,7 +5791,7 @@ mod tests {
         CodeSourceStore::open(root.join("code-sources"), StoreLimits::default()).unwrap()
     }
 
-    fn manifest_bytes(entries: &[ManifestEntry]) -> Vec<u8> {
+    pub(super) fn manifest_bytes(entries: &[ManifestEntry]) -> Vec<u8> {
         let mut bytes = Vec::new();
         for entry in entries {
             serde_json::to_writer(&mut bytes, entry).unwrap();
@@ -5869,7 +5869,7 @@ mod tests {
         validate_sha256(&inventory.canonical_sha256).unwrap();
     }
 
-    fn stored_generation_v1(
+    pub(super) fn stored_generation_v1(
         producer_id: &str,
         descriptor: GenerationDescriptor,
     ) -> StoredGeneration {
@@ -8664,5 +8664,126 @@ mod tests {
         assert_eq!(store.retirement_records().unwrap().len(), 1);
         store.gc_blobs().unwrap();
         assert!(store.blob_path(&hash).is_file());
+    }
+}
+
+/// Phase 3 P3-C blob-GC mode split (plan section 7 item 3, F8).
+///
+/// The daemon's hourly maintenance pass keeps calling the EMPTY-scope
+/// `gc_blobs()` in bridge mode and only passes catalog scopes in catalog
+/// mode. These tests pin why that asymmetry exists, so a later "unification"
+/// has to delete an explicit assertion rather than a comment.
+#[cfg(test)]
+mod blob_gc_mode_tests {
+    use super::tests::{descriptor, manifest_bytes, stored_generation_v1};
+    use super::*;
+
+    /// Local copy of the legacy-generation fixture: the parent test module's
+    /// helper takes `CodeSourceStorePaths` directly, which is private to the
+    /// store, so this writes through a store-derived path set instead.
+    fn write_legacy_generation(
+        paths: &CodeSourceStorePaths,
+        state: GenerationState,
+    ) -> StoredGeneration {
+        let entries = Vec::new();
+        let descriptor = descriptor(&entries);
+        let mut record = stored_generation_v1("host-a", descriptor.clone());
+        record.state = state;
+        let metadata = paths
+            .generation_metadata(&descriptor.scope, &record.generation_id)
+            .unwrap();
+        fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+        fs::write(&metadata, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        fs::write(
+            paths
+                .generation_manifest(&descriptor.scope, &record.generation_id)
+                .unwrap(),
+            manifest_bytes(&entries),
+        )
+        .unwrap();
+        record
+    }
+
+    fn store_with_grace_zero(root: &Path) -> CodeSourceStore {
+        CodeSourceStore::open(
+            root.join("code-sources"),
+            StoreLimits {
+                unreferenced_blob_grace_hours: 0,
+                ..StoreLimits::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn bridge_v1_store_gc_succeeds_with_empty_scopes_and_wedges_with_catalog_scopes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = store_with_grace_zero(&root);
+        let generation = write_legacy_generation(&store.paths, GenerationState::Active);
+        let scope = generation.descriptor.scope.clone();
+
+        // Bridge parity: the empty-scope call is what the daemon keeps
+        // making, and it stays on the legacy classifier arm.
+        store.gc_blobs().unwrap();
+
+        // The exact hazard the catalog-mode wiring must never hit on the
+        // bridge: a non-empty scope set flips this store onto the mixed
+        // classifier, which refuses every v1 row and would permanently wedge
+        // blob GC for the whole bridge window.
+        let error = store
+            .gc_blobs_for_scopes(&BTreeSet::from([scope]))
+            .expect_err("a v1-only store must refuse a catalog scope set");
+        assert!(
+            error
+                .to_string()
+                .contains("protected legacy generation lacks strict v2 ownership"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn catalog_scope_root_protects_a_retained_only_v2_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = store_with_grace_zero(&root);
+        let legacy = write_legacy_generation(&store.paths, GenerationState::Superseded);
+        let scope = legacy.descriptor.scope.clone();
+        // Promote the row to a strict v2 record: retained-generation
+        // protection is a v2-only arm by construction.
+        let record = StoredGenerationV2::from_v1_for_migration(legacy, scope.clone()).unwrap();
+        let metadata = store
+            .paths
+            .generation_metadata(&scope, &record.generation_id)
+            .unwrap();
+        fs::write(&metadata, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let generation_dir = metadata.parent().unwrap().to_path_buf();
+
+        // With no anchor, no activation, and no desired record, the scope is
+        // not an authority scope at all, so the retained generation is
+        // unprotected and reclaimed.
+        let stats = store.gc_blobs_for_scopes(&BTreeSet::new()).unwrap();
+        assert_eq!(stats.reclaimed_generations, 1);
+        assert!(!generation_dir.exists());
+
+        // Same shape, but the catalog scope set names the scope: the
+        // retained generation is protected through its scope root. This is
+        // the production behavior the hourly pass gains in catalog mode.
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = store_with_grace_zero(&root);
+        let legacy = write_legacy_generation(&store.paths, GenerationState::Superseded);
+        let scope = legacy.descriptor.scope.clone();
+        let record = StoredGenerationV2::from_v1_for_migration(legacy, scope.clone()).unwrap();
+        let metadata = store
+            .paths
+            .generation_metadata(&scope, &record.generation_id)
+            .unwrap();
+        fs::write(&metadata, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let generation_dir = metadata.parent().unwrap().to_path_buf();
+
+        let stats = store.gc_blobs_for_scopes(&BTreeSet::from([scope])).unwrap();
+        assert_eq!(stats.reclaimed_generations, 0);
+        assert!(generation_dir.exists());
     }
 }

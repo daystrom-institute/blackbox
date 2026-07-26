@@ -267,6 +267,21 @@ impl CodeSourceRuntime {
     }
 }
 
+/// Producer assignment view for source planning (Phase 3 plan section 4.7).
+/// A project named by a configured grant with no active collected generation
+/// yet is `Warming`, which is why the planner must see live assignment state
+/// rather than infer it from store residue.
+impl bbox_indexing::index::ProducerAssignmentSource for CodeSourceRuntime {
+    fn assigned_project_ids(&self) -> std::collections::BTreeSet<String> {
+        self.snapshot
+            .read()
+            .auth
+            .iter()
+            .flat_map(|entry| entry.grant.projects.values().cloned())
+            .collect()
+    }
+}
+
 fn assignment_map(snapshot: &CodeSourceSnapshot) -> BTreeMap<PublishedScope, (String, String)> {
     snapshot
         .auth
@@ -909,6 +924,48 @@ pub(crate) fn apply_source_transitions(state: Arc<SharedState>, transitions: Sou
     }
 }
 
+/// Hourly blob GC, mode-split (F8).
+///
+/// CATALOG MODE passes the catalog scope set, which
+/// `gc_blobs_for_scopes` already accepts and which no production caller ever
+/// supplied. That is what gives a retained-only generation (one no
+/// activation or desired record names, but whose scope is still a live
+/// catalog scope) GC protection through its scope root. `LegacyLocal`
+/// catalog projects have no `PublishedScope` and therefore add no scope
+/// entry; they stay protected exactly as today through their activation and
+/// anchor roots.
+///
+/// BRIDGE MODE keeps the empty-scope `gc_blobs()` call byte-for-byte. This
+/// is not an oversight and must not be "unified": every bridge activation
+/// and generation is a v1 record, and `protected_generation_ids` selects its
+/// legacy classifier arm only when there is no current anchor, no v2 rows,
+/// AND `catalog_scopes.is_empty()`. Passing a non-empty scope set on the
+/// bridge therefore flips it onto the mixed classifier, which hard-fails on
+/// v1 rows ("protected legacy generation lacks strict v2 ownership") and
+/// would permanently wedge bridge blob GC.
+fn gc_blobs_for_mode(
+    state: &Arc<SharedState>,
+    store: &Arc<CodeSourceStore>,
+) -> Result<bbox_code_source_store::MaintenanceStats> {
+    let Some(catalog) = state.project_authority.catalog_store() else {
+        return store.gc_blobs();
+    };
+    let scopes = catalog
+        .snapshot()
+        .map_err(|error| anyhow!("catalog snapshot unavailable during blob GC: {error}"))?
+        .catalog()
+        .projects
+        .values()
+        .filter_map(|project| match &project.scope {
+            bbox_corpus_core::project_catalog::ProjectScope::Published(scope) => {
+                Some(scope.clone())
+            }
+            bbox_corpus_core::project_catalog::ProjectScope::LegacyLocal => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    store.gc_blobs_for_scopes(&scopes)
+}
+
 pub(crate) fn spawn_store_maintenance(state: &Arc<SharedState>) -> Result<()> {
     let weak = Arc::downgrade(state);
     std::thread::Builder::new()
@@ -927,7 +984,7 @@ pub(crate) fn spawn_store_maintenance(state: &Arc<SharedState>) -> Result<()> {
                     Ok(_) => {}
                     Err(error) => tracing::warn!(%error, "code-source upload expiry failed"),
                 }
-                match store.gc_blobs() {
+                match gc_blobs_for_mode(&state, &store) {
                     Ok(stats) if stats.reclaimed_blobs > 0 || stats.reclaimed_generations > 0 => {
                         tracing::info!(
                             blobs = stats.reclaimed_blobs,
@@ -1055,6 +1112,7 @@ fn republish_code_read_view(state: &Arc<SharedState>) -> Result<()> {
         active_selectors: selectors,
         searcher: index.searcher(),
         edge_index: Arc::new(rebuilt),
+        catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
     });
     Ok(())
 }
@@ -1249,6 +1307,7 @@ fn cutback_to_local(
                 active_selectors: selectors,
                 searcher: index.searcher(),
                 edge_index: Arc::new(rebuilt),
+                catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
             });
             Ok(())
         },
@@ -1585,6 +1644,7 @@ fn activate_desired_loop(
                     active_selectors: selectors,
                     searcher: index.searcher(),
                     edge_index: Arc::new(rebuilt),
+                    catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
                 });
                 Ok(())
             },

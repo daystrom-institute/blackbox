@@ -52,14 +52,11 @@ pub(crate) fn spawn_storage_gc_thread(state: Arc<SharedState>, interval: std::ti
 
 fn run_storage_gc_pass(state: &SharedState) -> anyhow::Result<()> {
     let edges_dir = storage_health::find_edges_dir(&state.store_dir, None);
-    let registered: std::collections::HashSet<String> = state
-        .records_provider
-        .records_snapshot()
-        .records
-        .iter()
-        .cloned()
-        .map(|project| project.project_id)
-        .collect();
+    // F4: the COMPLETE catalog id set, through the one shared accessor. This
+    // pass runs destructively (prune_orphans, dry_run false) behind a 30-day
+    // fuse, so seeding it from the attached-only rows deleted exactly the
+    // sidecars the manual tool classified as live.
+    let registered = state.corpus_registered_project_ids();
     let params = storage_health::GcParams {
         dry_run: false,
         project_filter: None,
