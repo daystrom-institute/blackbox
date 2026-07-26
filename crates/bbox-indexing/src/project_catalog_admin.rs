@@ -2176,6 +2176,21 @@ pub trait RetirementDischargeWorkers {
     /// reference shared blobs, the sweep verifiably skips them. No
     /// catalog or auth lock held during blob deletion.
     fn sweep_materialization(&mut self, project_id: &ProjectId) -> AdminResult<()>;
+
+    /// Re-inventory the cross-store reference classes from CURRENT state
+    /// after all discharge stages have run. Called at CatalogPairRemoved
+    /// (section 11.3 step 7) to verify that the discharge workers actually
+    /// zeroed every blocking class, rather than trusting fabricated evidence.
+    ///
+    /// The CLI worker re-runs its existing probe machinery against live
+    /// stores. The Noop/test default returns the ORIGINAL evidence
+    /// unchanged, so a journal driven with no-op workers on a referenced
+    /// project refuses at the final cut instead of orphaning records.
+    fn reprobe_evidence(
+        &mut self,
+        project_id: &ProjectId,
+        original_evidence: &RetireEvidence,
+    ) -> AdminResult<RetireEvidence>;
 }
 
 /// A no-op implementation for preflight-only invocations (execute=false)
@@ -2198,6 +2213,14 @@ impl RetirementDischargeWorkers for NoopDischargeWorkers {
     }
     fn sweep_materialization(&mut self, _project_id: &ProjectId) -> AdminResult<()> {
         Ok(())
+    }
+
+    fn reprobe_evidence(
+        &mut self,
+        _project_id: &ProjectId,
+        original_evidence: &RetireEvidence,
+    ) -> AdminResult<RetireEvidence> {
+        Ok(original_evidence.clone())
     }
 }
 
@@ -2362,25 +2385,28 @@ pub fn retire_project_journaled_with(
     // Stage: CatalogPairRemoved (section 11.3).
     // This is the FINAL authority cut: retire_project(execute: true).
     // The prior discharge stages (CollectedGenerationsDischarged,
-    // PublicationsCleared, AttachmentsDetached) have zeroed every
-    // blocking class. The evidence passed here reflects the discharged
-    // state: external reference counts are zero because the discharge
-    // workers deleted the source records. If the project is already
-    // absent (idempotent re-entry), skip the pair removal.
+    // PublicationsCleared, AttachmentsDetached) should have zeroed every
+    // blocking class. Rather than trust that the discharge workers
+    // succeeded (spec 11.3 step 7: "At this point every blocking class
+    // is zero, so it succeeds" describes verified reality, not
+    // synthesized input), the journal calls reprobe_evidence to
+    // re-inventory the cross-store reference classes from CURRENT state.
+    // If any class is still nonzero, retire_project refuses with the
+    // existing retire_blocked error (fail-closed): the journal stays at
+    // its current stage for resume after the operator investigates.
+    // If the project is already absent (idempotent re-entry), skip.
     if !journal
         .current_stage
         .is_at_least(RetirementJournalStage::CatalogPairRemoved)
     {
         let current_state = store.snapshot()?;
         if current_state.catalog().projects.contains_key(project_id) {
-            let discharged_evidence = RetireEvidence {
-                external_reference_counts: Default::default(),
-            };
+            let reprobed_evidence = workers.reprobe_evidence(project_id, evidence)?;
             let (_inventory, _commit) = retire_project(
                 store,
                 current_state.epoch(),
                 project_id,
-                &discharged_evidence,
+                &reprobed_evidence,
                 true,
             )?;
         }

@@ -1840,12 +1840,16 @@ fn acceptance_retirement_preflight_does_not_mutate() {
 // ---- Section 12.5: discharge worker acceptance tests ----
 
 /// A test discharge worker that records each method call count. Verifies
-/// the journal calls each worker exactly once per stage advance.
+/// the journal calls each worker exactly once per stage advance. The
+/// reprobe returns zeroed evidence so the final authority cut succeeds:
+/// the trust boundary is explicit in the test (the test workers claim
+/// the discharge cleared everything, and reprobe confirms that claim).
 struct CountingDischargeWorkers {
     collected_generations_calls: u32,
     publications_calls: u32,
     attachments_calls: u32,
     sweep_calls: u32,
+    reprobe_calls: u32,
 }
 
 impl CountingDischargeWorkers {
@@ -1855,6 +1859,7 @@ impl CountingDischargeWorkers {
             publications_calls: 0,
             attachments_calls: 0,
             sweep_calls: 0,
+            reprobe_calls: 0,
         }
     }
 }
@@ -1888,6 +1893,20 @@ impl bbox_indexing::project_catalog_admin::RetirementDischargeWorkers for Counti
     ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
         self.sweep_calls += 1;
         Ok(())
+    }
+    fn reprobe_evidence(
+        &mut self,
+        _project_id: &ProjectId,
+        _original_evidence: &bbox_indexing::project_catalog_admin::RetireEvidence,
+    ) -> bbox_indexing::project_catalog_admin::AdminResult<
+        bbox_indexing::project_catalog_admin::RetireEvidence,
+    > {
+        self.reprobe_calls += 1;
+        // Return zeroed evidence: the test workers claim discharge cleared
+        // everything. This is the explicit trust boundary.
+        Ok(bbox_indexing::project_catalog_admin::RetireEvidence {
+            external_reference_counts: Default::default(),
+        })
     }
 }
 
@@ -1990,6 +2009,10 @@ fn acceptance_discharge_workers_called_exactly_once_in_order() {
         workers.sweep_calls, 1,
         "MaterializationSwept worker called exactly once"
     );
+    assert_eq!(
+        workers.reprobe_calls, 1,
+        "reprobe_evidence called exactly once at CatalogPairRemoved"
+    );
 
     // Project removed from catalog.
     let state = store.snapshot().unwrap();
@@ -2058,6 +2081,7 @@ fn acceptance_discharge_workers_resume_after_partial_completion() {
     assert_eq!(workers2.publications_calls, 0);
     assert_eq!(workers2.attachments_calls, 0);
     assert_eq!(workers2.sweep_calls, 0);
+    assert_eq!(workers2.reprobe_calls, 0);
 }
 
 /// Section 12.5: the journal persists intermediate stage state to disk.
@@ -2111,4 +2135,123 @@ fn acceptance_discharge_intermediate_journal_skips_completed_stages() {
     assert_eq!(workers.publications_calls, 1);
     assert_eq!(workers.attachments_calls, 1);
     assert_eq!(workers.sweep_calls, 1);
+    assert_eq!(
+        workers.reprobe_calls, 1,
+        "reprobe fires at CatalogPairRemoved"
+    );
+}
+
+/// Section 12.5: a discharge worker whose reprobe still reports a
+/// nonzero reference class causes CatalogPairRemoved to refuse
+/// (fail-closed). The journal stays at the AttachmentsDetached stage
+/// and the project remains in the catalog, ready for resume after the
+/// operator investigates the residual references.
+#[test]
+fn acceptance_discharge_nonzero_reprobe_refuses_at_final_cut() {
+    use bbox_indexing::project_catalog_admin::{
+        RetireEvidence, RetirementJournalStage, retire_project_journaled_with,
+    };
+
+    /// Worker whose reprobe always returns a nonzero class, simulating
+    /// a buggy or partial discharge that left real references behind.
+    struct NonzeroReprobeWorkers {
+        reprobe_calls: u32,
+    }
+
+    impl bbox_indexing::project_catalog_admin::RetirementDischargeWorkers for NonzeroReprobeWorkers {
+        fn discharge_collected_generations(
+            &mut self,
+            _project_id: &ProjectId,
+        ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
+            Ok(())
+        }
+        fn discharge_publications(
+            &mut self,
+            _project_id: &ProjectId,
+        ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
+            Ok(())
+        }
+        fn discharge_attachments(
+            &mut self,
+            _store: &bbox_indexing::project_catalog_store::ProjectCatalogStore,
+            _project_id: &ProjectId,
+        ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
+            Ok(())
+        }
+        fn sweep_materialization(
+            &mut self,
+            _project_id: &ProjectId,
+        ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
+            Ok(())
+        }
+        fn reprobe_evidence(
+            &mut self,
+            _project_id: &ProjectId,
+            _original_evidence: &RetireEvidence,
+        ) -> bbox_indexing::project_catalog_admin::AdminResult<RetireEvidence> {
+            self.reprobe_calls += 1;
+            // Return evidence with a nonzero class: the discharge did NOT
+            // actually clear this reference.
+            Ok(RetireEvidence {
+                external_reference_counts: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert("code_source_activation".into(), 1u64);
+                    m
+                },
+            })
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let bro_home = root.join("bro-home");
+    fs::create_dir_all(&bro_home).unwrap();
+
+    let store = store_with_one_project(&root);
+    let project_id = ProjectId::parse("p_000000000000000000000000000000a1").unwrap();
+
+    let evidence = RetireEvidence {
+        external_reference_counts: Default::default(),
+    };
+
+    let mut workers = NonzeroReprobeWorkers { reprobe_calls: 0 };
+    let result = retire_project_journaled_with(
+        &store,
+        &bro_home,
+        &project_id,
+        &evidence,
+        true,
+        &mut workers,
+    );
+
+    // The final cut must refuse.
+    let err = result.unwrap_err();
+    assert!(
+        err.code()
+            .starts_with("error.project_catalog_admin_retire_blocked"),
+        "expected retire_blocked, got: {}",
+        err.code()
+    );
+
+    // reprobe was called exactly once.
+    assert_eq!(workers.reprobe_calls, 1);
+
+    // The journal persists on disk at AttachmentsDetached (the stage
+    // before CatalogPairRemoved), ready for resume.
+    let journal =
+        bbox_indexing::project_catalog_admin::load_retirement_journal(&bro_home, &project_id)
+            .unwrap()
+            .expect("journal should persist on disk after refusal");
+    assert_eq!(
+        journal.current_stage,
+        RetirementJournalStage::AttachmentsDetached,
+        "journal stays at AttachmentsDetached for resume"
+    );
+
+    // The project is still in the catalog.
+    let state = store.snapshot().unwrap();
+    assert!(
+        state.catalog().projects.contains_key(&project_id),
+        "project must remain in catalog after refused final cut"
+    );
 }

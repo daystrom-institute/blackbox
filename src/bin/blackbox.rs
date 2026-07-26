@@ -1179,6 +1179,30 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
 
         Ok(())
     }
+
+    /// Re-inventory cross-store reference classes from current state after
+    /// all discharge stages. Re-runs the existing probe machinery against
+    /// live stores (section 11.3 step 7).
+    fn reprobe_evidence(
+        &mut self,
+        project_id: &ProjectId,
+        _original_evidence: &project_catalog_admin::RetireEvidence,
+    ) -> project_catalog_admin::AdminResult<project_catalog_admin::RetireEvidence> {
+        let (_lock, store) = open_admin_store(&self.projects_path.to_path_buf()).map_err(|e| {
+            project_catalog_admin::admin_error(
+                "error.project_catalog_cli_reprobe_store_open",
+                format!("{}: {}", e.code, e.message),
+            )
+        })?;
+        let probe = probe_retire_evidence(self.config, self.projects_path, &store, project_id)
+            .map_err(|e| {
+                project_catalog_admin::admin_error(
+                    "error.project_catalog_cli_reprobe_failed",
+                    format!("{}: {}", e.code, e.message),
+                )
+            })?;
+        Ok(probe.evidence)
+    }
 }
 
 /// Every external-reference class the offline retire probe covers (plan
