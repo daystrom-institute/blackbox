@@ -11374,6 +11374,7 @@ mod tests {
             current_chunk_targets: BTreeMap::new(),
             activated_unix_secs: 1,
             cutback_pending: false,
+            cutback: None,
             diagnostic: None,
         };
         let activation_role = ParticipantRoleV1::Activation {
@@ -14086,6 +14087,7 @@ mod tests {
             current_chunk_targets: BTreeMap::new(),
             activated_unix_secs: 2,
             cutback_pending: false,
+            cutback: None,
             diagnostic: None,
         };
         let metadata = registry

@@ -11,11 +11,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bbox_code_source::{
-    BeginUploadResponse, DEFAULT_MAX_MANIFEST_FILES, DEFAULT_MAX_MANIFEST_LOGICAL_BYTES,
-    GenerationDescriptor, GenerationState, GenerationStatus, MAX_MANIFEST_PAGE_ENTRIES,
-    ManifestEntry, MissingBlobsPage, generation_id, scope_hash,
-    validate_collected_materialization_selector, validate_manifest, validate_producer_id,
-    validate_sha256,
+    BeginUploadResponse, CutbackErrorClass, CutbackReason, CutbackStateV2,
+    DEFAULT_MAX_MANIFEST_FILES, DEFAULT_MAX_MANIFEST_LOGICAL_BYTES, GenerationDescriptor,
+    GenerationState, GenerationStatus, MAX_MANIFEST_PAGE_ENTRIES, ManifestEntry, MissingBlobsPage,
+    generation_id, scope_hash, validate_collected_materialization_selector, validate_manifest,
+    validate_producer_id, validate_sha256,
 };
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_core::identity::PublishedScope;
@@ -45,6 +45,29 @@ pub const MAX_MIGRATION_INVENTORY_GENERATIONS: usize = MAX_PROJECT_CATALOG_ENTRI
 pub const MAX_MIGRATION_INVENTORY_COLLISION_RECORDS: usize = MAX_PROJECT_CATALOG_ENTRIES;
 pub const MAX_MIGRATION_INVENTORY_RETIREMENTS: usize = MAX_PROJECT_CATALOG_ENTRIES;
 pub const MAX_COLLISION_RETIREMENT_ENTRIES: usize = MAX_PROJECT_CATALOG_ENTRIES;
+
+/// The record codec the runtime expects on this store.
+///
+/// Set at open time from the server-crate authority selection (section 4.9):
+/// the store crate never imports `ProjectAuthority`; the mode reaches it as
+/// this enum. Catalog APIs accept only strict v2 protected records; bridge
+/// wrappers retain v1 signatures and bytes. The default for the legacy
+/// `open` entry point is [`RuntimeRecordMode::BridgeV1`] so bridge behavior
+/// is byte-identical until the server crate selects catalog mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum RuntimeRecordMode {
+    /// Legacy version-1 records (bridge daemon).
+    BridgeV1,
+    /// Strict scope-bearing version-2 records (catalog mode).
+    CatalogV2,
+}
+
+impl Default for RuntimeRecordMode {
+    fn default() -> Self {
+        Self::BridgeV1
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreLimits {
@@ -100,6 +123,7 @@ impl std::error::Error for StoreRequestError {}
 struct SharedStoreState {
     limits: RwLock<StoreLimits>,
     mutation: Mutex<()>,
+    record_mode: RuntimeRecordMode,
     verified_blobs: Mutex<HashMap<String, BlobIdentity>>,
     #[cfg(test)]
     blob_verifications: AtomicU64,
@@ -416,7 +440,7 @@ impl StoredGenerationV2 {
 }
 
 #[derive(Debug, Clone)]
-enum MixedStoredGeneration {
+pub enum MixedStoredGeneration {
     LegacyV1(StoredGeneration),
     CurrentV2(StoredGenerationV2),
 }
@@ -491,7 +515,7 @@ impl MixedStoredGeneration {
 }
 
 #[derive(Debug, Clone)]
-enum MixedActivationRecord {
+pub enum MixedActivationRecord {
     LegacyV1(ActivationRecord),
     CurrentV2(ActivationRecordV2),
 }
@@ -531,6 +555,20 @@ impl MixedActivationRecord {
             Self::CurrentV2(record) => &record.entity_inventory_sha256,
         }
     }
+
+    /// The typed cutback state on a catalog-mode (v2) record, or `None` for
+    /// bridge (v1) records which carry only the derived boolean mirror.
+    pub fn cutback(&self) -> Option<&CutbackStateV2> {
+        match self {
+            Self::LegacyV1(_) => None,
+            Self::CurrentV2(record) => record.cutback.as_ref(),
+        }
+    }
+
+    /// True when the record is a v2 (catalog-mode) activation record.
+    pub fn is_current_v2(&self) -> bool {
+        matches!(self, Self::CurrentV2(_))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -547,6 +585,12 @@ pub struct ActivationRecordV2 {
     pub current_chunk_targets: BTreeMap<String, EntityRef>,
     pub activated_unix_secs: u64,
     pub cutback_pending: bool,
+    /// The typed cutback state authority (section 4.10). `cutback_pending`
+    /// is the derived mirror; this field is the sole authority for live
+    /// writers. Defaulted to `None` so migration bytes written without the
+    /// field decode cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cutback: Option<CutbackStateV2>,
     pub diagnostic: Option<String>,
 }
 
@@ -568,6 +612,7 @@ impl ActivationRecordV2 {
             current_chunk_targets: legacy.current_chunk_targets,
             activated_unix_secs: legacy.activated_unix_secs,
             cutback_pending: legacy.cutback_pending,
+            cutback: None,
             diagnostic: legacy.diagnostic,
         };
         record.validate_against_generation(generation)?;
@@ -603,6 +648,30 @@ impl ActivationRecordV2 {
             target
                 .try_render()
                 .map_err(|error| anyhow!("activation record has an invalid entity ref: {error}"))?;
+        }
+        // Typed cutback state validates per-variant (section 5.2 item 3).
+        if let Some(cutback) = self.cutback.as_ref() {
+            cutback
+                .validate()
+                .map_err(|error| anyhow!("error.code_source_cutback_state: {error}"))?;
+        }
+        // Layered coherence clause (section 4.10): cutback_pending is the
+        // derived mirror of the typed cutback field. Store-level validate
+        // is pure and load-time, so it ADMITS the legacy-migration shape
+        // (cutback: None, cutback_pending: true) left by the migration
+        // writer before once-only startup classification. The sole refuser
+        // of that shape is the startup relationship chain (section 10.2
+        // step 6). Live writers never emit it. A typed cutback field whose
+        // derived mirror disagrees fails closed here with a coherence
+        // error.
+        let derived_pending = match self.cutback.as_ref() {
+            Some(CutbackStateV2::Terminal { .. }) | None => false,
+            Some(_) => true,
+        };
+        if self.cutback.is_some() && derived_pending != self.cutback_pending {
+            bail!(
+                "error.code_source_cutback_coherence: cutback_pending mirror does not match typed cutback"
+            );
         }
         Ok(())
     }
@@ -3074,6 +3143,19 @@ pub struct RetirementRecord {
 
 impl CodeSourceStore {
     pub fn open(root: impl Into<PathBuf>, limits: StoreLimits) -> Result<Self> {
+        Self::open_with_mode(root, limits, RuntimeRecordMode::BridgeV1)
+    }
+
+    /// Open a store with an explicit record mode (section 4.9).
+    ///
+    /// The server crate derives the mode from the `ProjectAuthority`
+    /// selection and passes it here; the store never imports that type.
+    /// Bridge callers keep using [`Self::open`], which defaults to v1.
+    pub fn open_with_mode(
+        root: impl Into<PathBuf>,
+        limits: StoreLimits,
+        record_mode: RuntimeRecordMode,
+    ) -> Result<Self> {
         let paths = CodeSourceStorePaths::new(root)?;
         let _anchor = acquire_store_lock_nofollow(&paths.anchor())?;
         create_private_dir(paths.root())?;
@@ -3098,7 +3180,7 @@ impl CodeSourceStore {
             )
         })?;
         let paths = CodeSourceStorePaths::new(root)?;
-        Self::from_existing_paths(paths, limits)
+        Self::from_existing_paths(paths, limits, record_mode)
     }
 
     /// Open an existing migration owner without creating its root, lock, or
@@ -3131,10 +3213,19 @@ impl CodeSourceStore {
             .root()
             .canonicalize()
             .context("canonicalizing existing code-source store root")?;
-        Self::from_existing_paths(CodeSourceStorePaths::new(root)?, limits).map(Some)
+        Self::from_existing_paths(
+            CodeSourceStorePaths::new(root)?,
+            limits,
+            RuntimeRecordMode::default(),
+        )
+        .map(Some)
     }
 
-    fn from_existing_paths(paths: CodeSourceStorePaths, limits: StoreLimits) -> Result<Self> {
+    fn from_existing_paths(
+        paths: CodeSourceStorePaths,
+        limits: StoreLimits,
+        record_mode: RuntimeRecordMode,
+    ) -> Result<Self> {
         let mut registry = STORE_REGISTRY
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
@@ -3147,6 +3238,7 @@ impl CodeSourceStore {
                 let shared = Arc::new(SharedStoreState {
                     limits: RwLock::new(limits),
                     mutation: Mutex::new(()),
+                    record_mode,
                     verified_blobs: Mutex::new(HashMap::new()),
                     #[cfg(test)]
                     blob_verifications: AtomicU64::new(0),
@@ -3155,6 +3247,11 @@ impl CodeSourceStore {
                 shared
             });
         Ok(Self { paths, shared })
+    }
+
+    /// The record codec this store was opened with (section 4.9).
+    pub fn record_mode(&self) -> RuntimeRecordMode {
+        self.shared.record_mode
     }
 
     pub fn root(&self) -> &Path {
@@ -3815,6 +3912,160 @@ impl CodeSourceStore {
         record.cutback_pending = true;
         record.diagnostic = Some(diagnostic.chars().take(512).collect());
         self.save_activation_locked(&record)
+    }
+
+    // ---- Catalog-mode (v2) activation and cutback writers/readers (P4-A) ----
+
+    /// Persist a catalog-mode v2 activation record through the mutation mutex
+    /// and anchor lock via `atomic_write_json` to the existing
+    /// `activations/<project_id>.json` path (section 5.2 item 5).
+    pub fn save_activation_v2(&self, activation: &ActivationRecordV2) -> Result<()> {
+        let _guard = self.lock_mutation()?;
+        self.save_activation_v2_locked(activation)
+    }
+
+    fn save_activation_v2_locked(&self, activation: &ActivationRecordV2) -> Result<()> {
+        activation.validate()?;
+        atomic_write_json(&self.paths.activation(&activation.project_id), activation)
+    }
+
+    /// Mode-aware single-project activation read (section 5.2 item 5, 7.2).
+    ///
+    /// In catalog mode the reader decodes the v2 record. In bridge mode it
+    /// decodes the v1 record and REFUSES v2 bytes with
+    /// `error.code_source_record_mode` rather than silently rewriting them
+    /// as v1 (store AGENTS.md invariant). Returns `Ok(None)` when the file
+    /// is absent.
+    pub fn load_activation_mixed(&self, project_id: &str) -> Result<Option<MixedActivationRecord>> {
+        let path = self.paths.activation_for_str(project_id)?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let mixed = read_mixed_activation(&path)?;
+        match (self.shared.record_mode, &mixed) {
+            (RuntimeRecordMode::CatalogV2, MixedActivationRecord::LegacyV1(_)) => {
+                // Catalog mode found a v1 record: treat as absent so the
+                // caller's "no recovery record" path fires rather than a
+                // decode-mismatch error (section 7.2).
+                Ok(None)
+            }
+            (RuntimeRecordMode::BridgeV1, MixedActivationRecord::CurrentV2(_)) => Err(anyhow!(
+                "error.code_source_record_mode: bridge read path refuses a v2 activation record"
+            )),
+            _ => {
+                if mixed.project_id() != project_id {
+                    bail!("activation record identity mismatch");
+                }
+                Ok(Some(mixed))
+            }
+        }
+    }
+
+    /// Mode-aware activation enumeration (section 5.2 item 5, 7.2).
+    pub fn activation_records_mixed(&self) -> Result<Vec<MixedActivationRecord>> {
+        let mut records: Vec<MixedActivationRecord> = Vec::new();
+        for entry in fs::read_dir(self.root().join("activations"))? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() && is_canonical_record_file(&entry) {
+                let mixed = read_mixed_activation(&entry.path())?;
+                match (self.shared.record_mode, &mixed) {
+                    (RuntimeRecordMode::CatalogV2, MixedActivationRecord::LegacyV1(_)) => {
+                        continue;
+                    }
+                    (RuntimeRecordMode::BridgeV1, MixedActivationRecord::CurrentV2(_)) => {
+                        bail!(
+                            "error.code_source_record_mode: bridge read path refuses a v2 activation record"
+                        );
+                    }
+                    _ => records.push(mixed),
+                }
+            }
+        }
+        records.sort_by(|left, right| left.project_id().cmp(right.project_id()));
+        Ok(records)
+    }
+
+    /// Mode-aware generation lookup by id across all scopes (section 7.2).
+    pub fn find_generation_mixed(&self, generation: &str) -> Result<MixedStoredGeneration> {
+        validate_sha256(generation)?;
+        for scope_entry in fs::read_dir(self.root().join("scopes"))? {
+            let metadata = scope_entry?
+                .path()
+                .join("generations")
+                .join(generation)
+                .join("metadata.json");
+            if metadata.is_file() {
+                let mixed = read_mixed_stored_generation(&metadata)?;
+                match (self.shared.record_mode, &mixed) {
+                    (RuntimeRecordMode::CatalogV2, MixedStoredGeneration::LegacyV1(_)) => {
+                        continue;
+                    }
+                    (RuntimeRecordMode::BridgeV1, MixedStoredGeneration::CurrentV2(_)) => {
+                        bail!(
+                            "error.code_source_record_mode: bridge read path refuses a v2 stored generation"
+                        );
+                    }
+                    _ => return Ok(mixed),
+                }
+            }
+        }
+        bail!("generation not found")
+    }
+
+    /// Mode-aware generation load by scope and id (section 7.2).
+    pub fn load_generation_mixed(
+        &self,
+        scope: &PublishedScope,
+        generation: &str,
+    ) -> Result<MixedStoredGeneration> {
+        let mixed =
+            read_mixed_stored_generation(&self.paths.generation_metadata(scope, generation)?)?;
+        match (self.shared.record_mode, &mixed) {
+            (RuntimeRecordMode::CatalogV2, MixedStoredGeneration::LegacyV1(_)) => {
+                bail!(
+                    "error.code_source_record_mode: catalog read path found a v1 stored generation"
+                );
+            }
+            (RuntimeRecordMode::BridgeV1, MixedStoredGeneration::CurrentV2(_)) => {
+                bail!(
+                    "error.code_source_record_mode: bridge read path refuses a v2 stored generation"
+                );
+            }
+            _ => Ok(mixed),
+        }
+    }
+
+    /// Write the typed cutback state onto the project's v2 activation record
+    /// under catalog mode, updating both `cutback` and the derived
+    /// `cutback_pending` mirror in one atomic write (section 5.2 item 5).
+    pub fn mark_cutback_state(&self, project_id: &str, cutback: CutbackStateV2) -> Result<()> {
+        let _guard = self.lock_mutation()?;
+        cutback
+            .validate()
+            .map_err(|error| anyhow!("error.code_source_cutback_state: {error}"))?;
+        let Some(mut record) = self.load_activation_v2_locked(project_id)? else {
+            return Ok(());
+        };
+        let derived_pending = !matches!(cutback, CutbackStateV2::Terminal { .. });
+        record.cutback = Some(cutback);
+        record.cutback_pending = derived_pending;
+        self.save_activation_v2_locked(&record)
+    }
+
+    fn load_activation_v2_locked(&self, project_id: &str) -> Result<Option<ActivationRecordV2>> {
+        let path = self.paths.activation_for_str(project_id)?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        if bytes.len() > MAX_MIGRATION_RECORD_BYTES {
+            bail!("activation record exceeds its byte limit");
+        }
+        let record: ActivationRecordV2 = decode_activation_v2_for_migration(&bytes)?;
+        if record.project_id.as_str() != project_id {
+            bail!("activation record identity mismatch");
+        }
+        Ok(Some(record))
     }
 
     pub fn clear_activation(&self, project_id: &str) -> Result<()> {
@@ -8664,6 +8915,320 @@ mod tests {
         assert_eq!(store.retirement_records().unwrap().len(), 1);
         store.gc_blobs().unwrap();
         assert!(store.blob_path(&hash).is_file());
+    }
+
+    // ---- Phase 4-A cutback substrate tests ----
+
+    fn sample_v2_generation() -> StoredGenerationV2 {
+        let entries = vec![ManifestEntry {
+            relative_path: "src/lib.rs".into(),
+            content_sha256: "a".repeat(64),
+            size: 1,
+        }];
+        let descriptor = descriptor(&entries);
+        let legacy = stored_generation_v1("host-a", descriptor.clone());
+        StoredGenerationV2::from_v1_for_migration(legacy, descriptor.scope).unwrap()
+    }
+
+    fn sample_v2_activation(generation: &StoredGenerationV2) -> ActivationRecordV2 {
+        ActivationRecordV2::from_v1_for_migration(
+            activation_v1(&generation.generation_id),
+            generation,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cutback_codec_round_trips_every_variant_through_activation_v2() {
+        let generation = sample_v2_generation();
+        let mut activation = sample_v2_activation(&generation);
+        let states = vec![
+            CutbackStateV2::Structural {
+                reason: CutbackReason::NoLocalAttachment,
+            },
+            CutbackStateV2::Structural {
+                reason: CutbackReason::AmbiguousAttachment,
+            },
+            CutbackStateV2::Structural {
+                reason: CutbackReason::ScopeMismatch,
+            },
+            CutbackStateV2::Transient {
+                attempt: 1,
+                error_class: CutbackErrorClass::WriterContention,
+                deadline_unix_secs: 1_700_000_000,
+            },
+            CutbackStateV2::Transient {
+                attempt: 8,
+                error_class: CutbackErrorClass::IoPressure,
+                deadline_unix_secs: 1_700_000_001,
+            },
+            CutbackStateV2::ManualRetryRequired {
+                error_class: CutbackErrorClass::IndexCommit,
+                attempt: 9,
+            },
+            CutbackStateV2::Terminal {
+                error_class: CutbackErrorClass::SecurityFailure,
+            },
+        ];
+        for state in &states {
+            let derived_pending = !matches!(state, CutbackStateV2::Terminal { .. });
+            activation.cutback = Some(state.clone());
+            activation.cutback_pending = derived_pending;
+            let bytes = encode_activation_v2_for_migration(&activation).unwrap();
+            let decoded = decode_activation_v2_for_migration(&bytes).unwrap();
+            assert_eq!(decoded.cutback.as_ref(), Some(state));
+            assert_eq!(decoded.cutback_pending, derived_pending);
+        }
+    }
+
+    #[test]
+    fn old_v2_bytes_without_cutback_decode_to_none() {
+        let generation = sample_v2_generation();
+        let activation = sample_v2_activation(&generation);
+        assert!(activation.cutback.is_none());
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&encode_activation_v2_for_migration(&activation).unwrap())
+                .unwrap();
+        assert!(
+            json.as_object().unwrap().get("cutback").is_none()
+                || json.as_object().unwrap()["cutback"].is_null()
+        );
+        json.as_object_mut().unwrap().remove("cutback");
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let decoded = decode_activation_v2_for_migration(&bytes).unwrap();
+        assert!(decoded.cutback.is_none());
+        assert!(!decoded.cutback_pending);
+    }
+
+    #[test]
+    fn validate_refuses_transient_with_zero_attempt() {
+        let generation = sample_v2_generation();
+        let mut activation = sample_v2_activation(&generation);
+        activation.cutback = Some(CutbackStateV2::Transient {
+            attempt: 0,
+            error_class: CutbackErrorClass::IoPressure,
+            deadline_unix_secs: 1_700_000_000,
+        });
+        activation.cutback_pending = true;
+        assert!(activation.validate().is_err());
+    }
+
+    #[test]
+    fn validate_refuses_coherence_violation_for_typed_cutback() {
+        let generation = sample_v2_generation();
+        let mut activation = sample_v2_activation(&generation);
+        // A non-Terminal typed cutback requires cutback_pending == true.
+        activation.cutback = Some(CutbackStateV2::Structural {
+            reason: CutbackReason::NoLocalAttachment,
+        });
+        activation.cutback_pending = false;
+        let err = activation.validate().unwrap_err().to_string();
+        assert!(err.contains("code_source_cutback_coherence"), "{err}");
+
+        // Terminal requires cutback_pending == false.
+        activation.cutback = Some(CutbackStateV2::Terminal {
+            error_class: CutbackErrorClass::SecurityFailure,
+        });
+        activation.cutback_pending = true;
+        let err = activation.validate().unwrap_err().to_string();
+        assert!(err.contains("code_source_cutback_coherence"), "{err}");
+    }
+
+    #[test]
+    fn validate_admits_legacy_migration_shape() {
+        let generation = sample_v2_generation();
+        let mut activation = sample_v2_activation(&generation);
+        // The legacy-migration shape (cutback: None, cutback_pending: true)
+        // is admitted at store-level validate; the startup relationship
+        // chain is the sole refuser (section 4.10).
+        activation.cutback = None;
+        activation.cutback_pending = true;
+        assert!(activation.validate().is_ok());
+    }
+
+    #[test]
+    fn mixed_read_bridge_refuses_v2_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = CodeSourceStore::open_with_mode(
+            root.join("code-sources"),
+            StoreLimits::default(),
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap();
+        let generation = sample_v2_generation();
+        let activation = sample_v2_activation(&generation);
+        store.save_activation_v2(&activation).unwrap();
+
+        // Reopen in bridge mode: the v2 bytes must be refused.
+        drop(store);
+        let bridge =
+            CodeSourceStore::open(root.join("code-sources"), StoreLimits::default()).unwrap();
+        let err = bridge
+            .load_activation_mixed("project-a")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("code_source_record_mode"), "{err}");
+
+        let err = bridge.activation_records_mixed().unwrap_err().to_string();
+        assert!(err.contains("code_source_record_mode"), "{err}");
+    }
+
+    #[test]
+    fn mixed_read_catalog_reads_v2_and_treats_v1_as_absent() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let bridge =
+            CodeSourceStore::open(root.join("code-sources"), StoreLimits::default()).unwrap();
+        let generation = sample_v2_generation();
+        let activation = activation_v1(&generation.generation_id);
+        bridge.save_activation(&activation).unwrap();
+
+        // Catalog mode sees the v1 record as absent (not a decode error).
+        drop(bridge);
+        let catalog = CodeSourceStore::open_with_mode(
+            root.join("code-sources"),
+            StoreLimits::default(),
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap();
+        assert!(
+            catalog
+                .load_activation_mixed("project-a")
+                .unwrap()
+                .is_none()
+        );
+        assert!(catalog.activation_records_mixed().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mixed_read_catalog_round_trips_v2_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = CodeSourceStore::open_with_mode(
+            root.join("code-sources"),
+            StoreLimits::default(),
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap();
+        let generation = sample_v2_generation();
+        let activation = sample_v2_activation(&generation);
+        store.save_activation_v2(&activation).unwrap();
+
+        let loaded = store
+            .load_activation_mixed("project-a")
+            .unwrap()
+            .expect("v2 record should load in catalog mode");
+        assert!(loaded.is_current_v2());
+        assert_eq!(loaded.generation_id(), activation.generation_id);
+        assert!(loaded.cutback().is_none());
+
+        let records = store.activation_records_mixed().unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].is_current_v2());
+    }
+
+    #[test]
+    fn mark_cutback_state_updates_cutback_and_derived_pending() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = CodeSourceStore::open_with_mode(
+            root.join("code-sources"),
+            StoreLimits::default(),
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap();
+        let generation = sample_v2_generation();
+        let activation = sample_v2_activation(&generation);
+        store.save_activation_v2(&activation).unwrap();
+
+        // Structural -> cutback_pending derived true.
+        store
+            .mark_cutback_state(
+                "project-a",
+                CutbackStateV2::Structural {
+                    reason: CutbackReason::NoLocalAttachment,
+                },
+            )
+            .unwrap();
+        let loaded = store.load_activation_mixed("project-a").unwrap().unwrap();
+        match loaded {
+            MixedActivationRecord::CurrentV2(record) => {
+                assert!(record.cutback_pending);
+                assert!(matches!(
+                    record.cutback,
+                    Some(CutbackStateV2::Structural {
+                        reason: CutbackReason::NoLocalAttachment
+                    })
+                ));
+            }
+            _ => panic!("expected v2 record"),
+        }
+
+        // Terminal -> cutback_pending derived false.
+        store
+            .mark_cutback_state(
+                "project-a",
+                CutbackStateV2::Terminal {
+                    error_class: CutbackErrorClass::SecurityFailure,
+                },
+            )
+            .unwrap();
+        let loaded = store.load_activation_mixed("project-a").unwrap().unwrap();
+        match loaded {
+            MixedActivationRecord::CurrentV2(record) => {
+                assert!(!record.cutback_pending);
+                assert!(matches!(
+                    record.cutback,
+                    Some(CutbackStateV2::Terminal {
+                        error_class: CutbackErrorClass::SecurityFailure
+                    })
+                ));
+            }
+            _ => panic!("expected v2 record"),
+        }
+    }
+
+    #[test]
+    fn mark_cutback_state_refuses_invalid_transient() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = CodeSourceStore::open_with_mode(
+            root.join("code-sources"),
+            StoreLimits::default(),
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap();
+        let generation = sample_v2_generation();
+        let activation = sample_v2_activation(&generation);
+        store.save_activation_v2(&activation).unwrap();
+
+        let err = store
+            .mark_cutback_state(
+                "project-a",
+                CutbackStateV2::Transient {
+                    attempt: 0,
+                    error_class: CutbackErrorClass::IoPressure,
+                    deadline_unix_secs: 1_700_000_000,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("code_source_cutback_state"), "{err}");
+    }
+
+    #[test]
+    fn cutback_skip_serializing_none() {
+        let generation = sample_v2_generation();
+        let activation = sample_v2_activation(&generation);
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&activation).unwrap()).unwrap();
+        // The optional `cutback` field is skipped when None, so it must not
+        // appear as a JSON key (cutback_pending is a separate required key).
+        assert!(
+            json.as_object().unwrap().get("cutback").is_none(),
+            "cutback key should be absent when None"
+        );
     }
 }
 

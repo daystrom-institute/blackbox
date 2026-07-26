@@ -1,5 +1,9 @@
 //! Dependency-clean wire and filesystem policy for distributed code sources.
 
+pub mod cutback_state;
+
+pub use cutback_state::{CutbackErrorClass, CutbackReason, CutbackStateV2};
+
 use std::path::{Component, Path};
 
 use bbox_corpus_core::identity::PublishedScope;

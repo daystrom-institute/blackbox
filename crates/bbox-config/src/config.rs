@@ -141,6 +141,12 @@ struct RawCodeCollectionConfig {
     pub max_migration_survivor_bytes: usize,
     #[serde(default = "default_code_collection_stale_warning_hours")]
     pub stale_warning_hours: u64,
+    #[serde(default = "default_cutback_retry_base_secs")]
+    pub cutback_retry_base_secs: u64,
+    #[serde(default = "default_cutback_retry_max_secs")]
+    pub cutback_retry_max_secs: u64,
+    #[serde(default = "default_cutback_max_attempts")]
+    pub cutback_max_attempts: u32,
     #[serde(default)]
     pub producers: Vec<CodeCollectionProducerConfig>,
 }
@@ -157,6 +163,9 @@ impl Default for RawCodeCollectionConfig {
             max_migration_survivor_rows: default_code_collection_migration_survivor_rows(),
             max_migration_survivor_bytes: default_code_collection_migration_survivor_bytes(),
             stale_warning_hours: default_code_collection_stale_warning_hours(),
+            cutback_retry_base_secs: default_cutback_retry_base_secs(),
+            cutback_retry_max_secs: default_cutback_retry_max_secs(),
+            cutback_max_attempts: default_cutback_max_attempts(),
             producers: Vec::new(),
         }
     }
@@ -192,6 +201,33 @@ fn default_code_collection_migration_survivor_bytes() -> usize {
 
 fn default_code_collection_stale_warning_hours() -> u64 {
     24
+}
+
+fn default_cutback_retry_base_secs() -> u64 {
+    1
+}
+
+fn default_cutback_retry_max_secs() -> u64 {
+    60
+}
+
+fn default_cutback_max_attempts() -> u32 {
+    8
+}
+
+/// Validate cutback retry configuration (section 5.3): base, max, and
+/// attempts must all be non-zero.
+fn validate_cutback_retry_config(base_secs: u64, max_secs: u64, max_attempts: u32) -> Result<()> {
+    if base_secs == 0 {
+        anyhow::bail!("cutback_retry_base_secs must be non-zero");
+    }
+    if max_secs == 0 {
+        anyhow::bail!("cutback_retry_max_secs must be non-zero");
+    }
+    if max_attempts == 0 {
+        anyhow::bail!("cutback_max_attempts must be non-zero");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -489,6 +525,9 @@ pub struct CodeCollectionConfig {
     pub max_migration_survivor_rows: usize,
     pub max_migration_survivor_bytes: usize,
     pub stale_warning_hours: u64,
+    pub cutback_retry_base_secs: u64,
+    pub cutback_retry_max_secs: u64,
+    pub cutback_max_attempts: u32,
     pub producers: Vec<CodeCollectionProducerConfig>,
 }
 
@@ -856,6 +895,12 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
         })
         .collect::<Result<Vec<_>>>()?;
 
+    validate_cutback_retry_config(
+        raw.code_collection.cutback_retry_base_secs,
+        raw.code_collection.cutback_retry_max_secs,
+        raw.code_collection.cutback_max_attempts,
+    )?;
+
     // Build final config
     Ok(Config {
         daemon: DaemonConfig {
@@ -884,6 +929,9 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             max_migration_survivor_rows: raw.code_collection.max_migration_survivor_rows,
             max_migration_survivor_bytes: raw.code_collection.max_migration_survivor_bytes,
             stale_warning_hours: raw.code_collection.stale_warning_hours,
+            cutback_retry_base_secs: raw.code_collection.cutback_retry_base_secs,
+            cutback_retry_max_secs: raw.code_collection.cutback_retry_max_secs,
+            cutback_max_attempts: raw.code_collection.cutback_max_attempts,
             producers: code_collection_producers,
         },
         provenance: ProvenanceConfig {
@@ -2605,5 +2653,35 @@ state_dir = "~"
             Some(PathBuf::from("/tmp/project-template.md"))
         );
         assert_eq!(merged.daemon.port, base.daemon.port);
+    }
+
+    #[test]
+    fn cutback_retry_defaults_are_non_zero() {
+        let config = CodeCollectionConfig {
+            enabled: false,
+            max_manifest_files: 0,
+            max_manifest_logical_bytes: 0,
+            max_open_uploads_per_producer: 0,
+            retained_generations: 0,
+            unreferenced_blob_grace_hours: 0,
+            max_migration_survivor_rows: 0,
+            max_migration_survivor_bytes: 0,
+            stale_warning_hours: 0,
+            cutback_retry_base_secs: default_cutback_retry_base_secs(),
+            cutback_retry_max_secs: default_cutback_retry_max_secs(),
+            cutback_max_attempts: default_cutback_max_attempts(),
+            producers: Vec::new(),
+        };
+        assert_eq!(config.cutback_retry_base_secs, 1);
+        assert_eq!(config.cutback_retry_max_secs, 60);
+        assert_eq!(config.cutback_max_attempts, 8);
+    }
+
+    #[test]
+    fn cutback_retry_validation_refuses_zeros() {
+        assert!(validate_cutback_retry_config(0, 60, 8).is_err());
+        assert!(validate_cutback_retry_config(1, 0, 8).is_err());
+        assert!(validate_cutback_retry_config(1, 60, 0).is_err());
+        assert!(validate_cutback_retry_config(1, 60, 8).is_ok());
     }
 }
