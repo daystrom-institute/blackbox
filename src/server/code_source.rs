@@ -1788,7 +1788,6 @@ fn activate_desired_loop(
         let desired_producer_id = mixed.producer_id().to_string();
         let desired_state = mixed.state();
         let desired_descriptor = mixed.descriptor().clone();
-        let desired_published_scope = mixed.published_scope().clone();
         if !state
             .code_sources
             .assignment_authorizes(scope, project_id, &desired_producer_id)
@@ -2026,7 +2025,7 @@ fn activate_desired_loop(
                 version: bbox_code_source_store::MIGRATION_STORE_VERSION,
                 project_id: ProjectId::parse(project_id.to_string())
                     .map_err(|error| anyhow!(error))?,
-                published_scope: desired_published_scope.clone(),
+                published_scope: scope.clone(),
                 generation_id: desired_generation_id.clone(),
                 selector: staged.selector.clone(),
                 snapshot_id: staged.snapshot_id.clone(),
@@ -4654,6 +4653,96 @@ mod tests {
         assert!(
             error.to_string().contains("does not match"),
             "generation mismatch error must be descriptive: {error}"
+        );
+    }
+
+    /// P4-C section 7.1 item 1/2: the activation record's `published_scope`
+    /// must come from the grant scope, not the generation record's own
+    /// self-reported scope. When a drifted v2 generation record whose scope
+    /// disagrees with the grant scope under which it is activated is
+    /// validated, the scope-agreement cross-check must fail before any
+    /// activation record is saved.
+    #[test]
+    fn p4c_grant_scope_disagreement_refuses_before_activation_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("store");
+        let store = CodeSourceStore::open_with_mode(
+            &root,
+            StoreLimits::default(),
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap();
+        let paths = CodeSourceStorePaths::new(&root).unwrap();
+
+        // The generation record claims scope_a as its published_scope.
+        let scope_a = PublishedScope::try_new("gen-scope-repo", ".").unwrap();
+        // The grant/assignment scope is scope_b (the real grant scope).
+        let scope_b = PublishedScope::try_new("grant-scope-repo", ".").unwrap();
+        let producer_id = "p4c-drift-producer";
+        let descriptor = empty_generation_descriptor(scope_a.clone(), &"a".repeat(40));
+        let generation_id = compute_generation_id(producer_id, &descriptor);
+        let project_id = ProjectId::parse("p_000000000000000000000000000004c5").unwrap();
+
+        let generation = StoredGenerationV2 {
+            version: bbox_code_source_store::MIGRATION_STORE_VERSION,
+            generation_id: generation_id.clone(),
+            producer_id: producer_id.to_string(),
+            ordinal: 1,
+            descriptor: descriptor.clone(),
+            published_scope: scope_a.clone(),
+            state: GenerationState::Ready,
+            diagnostic: None,
+            created_unix_secs: 1,
+            materialized_doc_count: Some(0),
+            entity_inventory_sha256: Some("e".repeat(64)),
+        };
+        let metadata_path = paths.generation_metadata(&scope_a, &generation_id).unwrap();
+        fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        fs::write(
+            &metadata_path,
+            encode_stored_generation_v2_for_migration(&generation).unwrap(),
+        )
+        .unwrap();
+
+        // The activation record is constructed with the GRANT scope (scope_b),
+        // not the generation's self-reported scope (scope_a). This is the
+        // production path: activate_desired_loop passes `scope` (the grant
+        // parameter) as published_scope.
+        let activation = ActivationRecordV2 {
+            version: bbox_code_source_store::MIGRATION_STORE_VERSION,
+            project_id: project_id.clone(),
+            published_scope: scope_b,
+            generation_id: generation_id.clone(),
+            selector: crate::index::project_files::collected_materialization_selector(
+                project_id.as_str(),
+                &generation_id,
+            ),
+            snapshot_id: format!("collected-{}", "f".repeat(32)),
+            document_count: 0,
+            entity_inventory_sha256: "e".repeat(64),
+            current_chunk_targets: BTreeMap::new(),
+            activated_unix_secs: 100,
+            cutback_pending: false,
+            cutback: None,
+            diagnostic: None,
+        };
+
+        // The cross-check must fail: scope_b != scope_a.
+        let error = activation
+            .validate_against_generation(&generation)
+            .expect_err("grant scope disagreeing with generation scope must refuse");
+        assert!(
+            error.to_string().contains("does not match"),
+            "scope agreement must catch the drift: {error}"
+        );
+
+        // No activation record was saved.
+        assert!(
+            store
+                .load_activation_mixed(project_id.as_str())
+                .unwrap()
+                .is_none(),
+            "no activation record must exist after scope agreement refusal"
         );
     }
 
