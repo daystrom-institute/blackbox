@@ -12,9 +12,10 @@ use crate::{embed, embed_queue, orchestration, util, vectors, watcher};
 use std::sync::Arc;
 
 pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::Result<()> {
+    let runtime_handle = tokio::runtime::Handle::current();
     super::code_source::resume_pending_activations(shared.clone());
-    super::code_source::spawn_reconciler(&shared);
-    super::code_source::spawn_scheduler(&shared);
+    super::code_source::spawn_reconciler(&shared, runtime_handle.clone());
+    super::code_source::spawn_scheduler(&shared, runtime_handle.clone());
     super::code_source::spawn_commit_observer(&shared);
     super::code_source::spawn_store_maintenance(&shared)?;
     install_badgey_adapter(&shared);

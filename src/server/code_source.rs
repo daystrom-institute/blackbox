@@ -1057,20 +1057,20 @@ async fn finalize_upload(
     let store = state.code_sources.store();
     let scope = require_upload_scope(&store, &grant, &upload_id).await?;
     let producer_id = grant.producer_id.clone();
-    let stored = blocking({
+    let mixed = blocking({
         let store = store.clone();
-        move || store.finalize_upload(&producer_id, &upload_id)
+        move || store.finalize_upload_mixed(&producer_id, &upload_id)
     })
     .await?;
-    if stored.state == GenerationState::Ready {
+    if mixed.state() == GenerationState::Ready {
         let project_id = require_scope(&grant, &scope)?.to_string();
         schedule_activation(state, scope, project_id, None);
     }
     let response = FinalizeResponse {
-        generation_id: stored.generation_id.clone(),
+        generation_id: mixed.generation_id().to_string(),
         status_url: format!(
             "/internal/code-source/v1/generations/{}/status",
-            stored.generation_id
+            mixed.generation_id()
         ),
     };
     Ok((StatusCode::ACCEPTED, Json(response)))
@@ -1506,7 +1506,7 @@ fn gc_blobs_for_mode(
 /// post-commit observer are P4-E and are NOT in scope.
 ///
 /// Catalog mode only; bridge mode never calls this.
-pub(crate) fn spawn_reconciler(state: &Arc<SharedState>) {
+pub(crate) fn spawn_reconciler(state: &Arc<SharedState>, runtime_handle: tokio::runtime::Handle) {
     let Some(reconciler) = state.code_sources.reconciler().cloned() else {
         return;
     };
@@ -1516,6 +1516,11 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>) {
     std::thread::Builder::new()
         .name("blackbox-cutback-reconciler".to_string())
         .spawn(move || {
+            // Enter the tokio runtime context so schedule_activation
+            // and schedule_cutback_catalog can call spawn_blocking
+            // from this plain std::thread (section 9.1: the reconciler
+            // dispatches through the tokio pool, not inline).
+            let _runtime_guard = runtime_handle.enter();
             while reconciler.wait(&shutdown_clone) {
                 let events = reconciler.drain();
                 for event in events {
@@ -1715,7 +1720,7 @@ pub(crate) fn spawn_commit_observer(state: &Arc<SharedState>) {
 /// target.
 ///
 /// Catalog mode only; bridge mode never calls this.
-pub(crate) fn spawn_scheduler(state: &Arc<SharedState>) {
+pub(crate) fn spawn_scheduler(state: &Arc<SharedState>, runtime_handle: tokio::runtime::Handle) {
     let Some(reconciler) = state.code_sources.reconciler().cloned() else {
         return;
     };
@@ -1724,6 +1729,9 @@ pub(crate) fn spawn_scheduler(state: &Arc<SharedState>) {
     std::thread::Builder::new()
         .name("blackbox-cutback-scheduler".to_string())
         .spawn(move || {
+            // Enter the tokio runtime context so dispatched cutback
+            // events reach schedule_cutback_catalog's spawn_blocking.
+            let _runtime_guard = runtime_handle.enter();
             loop {
                 if shutdown.load(std::sync::atomic::Ordering::Acquire) {
                     break;
@@ -8940,6 +8948,37 @@ mod tests {
             catalog_check + return_after < sleep_pos,
             "activate_desired_loop catalog-mode return must come before \
              thread::sleep (section 11.5b)"
+        );
+    }
+
+    /// Regression: a plain std::thread (like the reconciler/scheduler)
+    /// that enters the captured tokio runtime handle can dispatch
+    /// `schedule_activation` -> `spawn_blocking` without panicking.
+    /// Pre-fix, the thread had no runtime context and spawn_blocking
+    /// panicked with "there is no reactor running".
+    #[tokio::test]
+    async fn reconciler_thread_dispatches_through_captured_runtime_handle() {
+        let handle = tokio::runtime::Handle::current();
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_clone = ran.clone();
+
+        // Spawn a plain std::thread exactly as spawn_reconciler does.
+        // Without `handle.enter()`, the `spawn_blocking` call inside
+        // would panic ("there is no reactor running").
+        let thread = std::thread::spawn(move || {
+            let _guard = handle.enter();
+            tokio::task::spawn_blocking(move || {
+                ran_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+        });
+        thread.join().expect("reconciler thread must not panic");
+
+        // Give the spawn_blocking task a moment to execute.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "spawn_blocking dispatched from a plain thread via captured \
+             runtime handle must actually run"
         );
     }
 }
