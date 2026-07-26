@@ -2659,29 +2659,44 @@ fn validate_relationship_chain(
 
         // Link 5: WorkspaceIndexEntry agrees: project key, selector,
         // generation, snapshot, manifest path.
-        let entry = manifest.workspaces.get(project_id).ok_or_else(|| {
-            anyhow!(
-                "error.code_source_relationship_chain: \
-                 no workspace index entry for project {project_id}"
-            )
-        })?;
-        if entry.code_source_selector.as_deref() != Some(activation.selector()) {
-            bail!(
-                "error.code_source_relationship_chain: \
-                 workspace selector mismatch for project {project_id}"
-            );
-        }
-        if entry.code_source_generation.as_deref() != Some(generation_id) {
-            bail!(
-                "error.code_source_relationship_chain: \
-                 workspace generation mismatch for project {project_id}"
-            );
-        }
-        if entry.active_snapshot.as_deref() != Some(activation.snapshot_id()) {
-            bail!(
-                "error.code_source_relationship_chain: \
-                 workspace snapshot mismatch for project {project_id}"
-            );
+        //
+        // ABSENCE of a workspace index entry for an active collected
+        // activation is valid-pending-first-republish: the migration
+        // facade does not fabricate WorkspaceIndexEntry rows; they are
+        // created by the daemon's own first activation republish (the
+        // startup read-view construction and step-8 reducer sweep
+        // establish the entry on first boot). The chain's purpose is
+        // to catch DRIFT (a present entry that disagrees), not
+        // pre-first-boot absence. Admitting absence keeps migrated
+        // roots bootable (plan section 10.4 bootsmoke row).
+        match manifest.workspaces.get(project_id) {
+            None => {
+                tracing::info!(
+                    project = %project_id,
+                    "relationship chain link 5: no workspace index entry \
+                     (valid-pending-first-republish for migrated root)"
+                );
+            }
+            Some(entry) => {
+                if entry.code_source_selector.as_deref() != Some(activation.selector()) {
+                    bail!(
+                        "error.code_source_relationship_chain: \
+                         workspace selector mismatch for project {project_id}"
+                    );
+                }
+                if entry.code_source_generation.as_deref() != Some(generation_id) {
+                    bail!(
+                        "error.code_source_relationship_chain: \
+                         workspace generation mismatch for project {project_id}"
+                    );
+                }
+                if entry.active_snapshot.as_deref() != Some(activation.snapshot_id()) {
+                    bail!(
+                        "error.code_source_relationship_chain: \
+                         workspace snapshot mismatch for project {project_id}"
+                    );
+                }
+            }
         }
 
         // Link 6: CutbackStateV2 coherence. After once-only
@@ -8489,10 +8504,13 @@ mod tests {
         );
     }
 
-    /// Section 10.4: a record with a missing workspace index entry
-    /// fails the chain at link 5.
+    /// Section 10.4: a migrated-shape root has an active collected v2
+    /// activation and generation but NO workspace index entry. The
+    /// chain admits this as valid-pending-first-republish: the
+    /// migration facade does not fabricate WorkspaceIndexEntry rows;
+    /// they are created by the daemon's own first activation republish.
     #[test]
-    fn p4f_missing_workspace_entry_fails_chain() {
+    fn p4f_absent_workspace_entry_passes_as_pending_first_republish() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let runtime = CodeSourceRuntime::for_test_catalog(&root);
@@ -8517,17 +8535,72 @@ mod tests {
 
         let snapshot = p4f_catalog_snapshot(project_id, scope, vec![]);
         // Manifest is fresh/empty: no workspace entry for the project.
+        // This is the migrated-root shape: chain must PASS.
         let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(
             &crate::edge_index::edges_dir_from_bro_store(&root),
         )
         .unwrap();
 
         let result = validate_relationship_chain(&store, &snapshot, &manifest);
-        assert!(result.is_err(), "missing workspace entry must fail chain");
+        assert!(
+            result.is_ok(),
+            "absent workspace entry must pass as pending-first-republish, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// Section 10.4: a PRESENT workspace entry that disagrees on
+    /// generation still fails closed at link 5 (drift detection).
+    #[test]
+    fn p4f_present_wrong_generation_workspace_entry_fails_chain() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let runtime = CodeSourceRuntime::for_test_catalog(&root);
+        let store = runtime.store();
+
+        let scope = PublishedScope::try_new("p4f-wrong-gen", ".").unwrap();
+        let project_id = "p_000000000000000000000000000004f3";
+        let generation_id = compute_generation_id(
+            "p4f-producer",
+            &empty_generation_descriptor(scope.clone(), &"a".repeat(40)),
+        );
+
+        let activation = p4f_seed_activation(
+            &store,
+            &root.join("code-sources"),
+            project_id,
+            &scope,
+            &generation_id,
+            None,
+            false,
+        );
+
+        let snapshot = p4f_catalog_snapshot(project_id, scope, vec![]);
+        // Workspace entry is PRESENT but has the WRONG generation id.
+        let mut manifest = bbox_edge_sidecar::manifest::ManifestIndex::new();
+        manifest.workspaces.insert(
+            project_id.to_string(),
+            bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
+                manifest: "test-manifest".to_string(),
+                active_snapshot: Some(activation.snapshot_id.clone()),
+                dirty_overlay: None,
+                repo_materialization: None,
+                code_source_selector: Some(activation.selector.clone()),
+                code_source_generation: Some("rhg_wrong_generation_id".to_string()),
+                git_overlay: None,
+                git_overlay_managed: false,
+            },
+        );
+
+        let result = validate_relationship_chain(&store, &snapshot, &manifest);
+        assert!(
+            result.is_err(),
+            "present-but-wrong-generation workspace entry must fail chain"
+        );
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("relationship_chain"),
-            "error must be relationship_chain, got: {err}"
+            err.contains("workspace generation mismatch"),
+            "error must be workspace generation mismatch, got: {err}"
         );
     }
 
@@ -8548,7 +8621,7 @@ mod tests {
             &empty_generation_descriptor(scope.clone(), &"a".repeat(40)),
         );
 
-        let activation = p4f_seed_activation(
+        let _activation = p4f_seed_activation(
             &store,
             &root.join("code-sources"),
             project_id,
@@ -8559,23 +8632,14 @@ mod tests {
         );
 
         // Catalog scope matches, no bridge: the chain must refuse at
-        // link 6 (coherence clause). We need a manifest entry so the
-        // chain reaches link 6 instead of failing at link 5.
+        // link 6 (coherence clause). The workspace entry is absent
+        // (migrated-root shape); link 5 admits it as
+        // pending-first-republish so the chain reaches link 6.
         let snapshot = p4f_catalog_snapshot(project_id, scope, vec![]);
-        let mut manifest = bbox_edge_sidecar::manifest::ManifestIndex::new();
-        manifest.workspaces.insert(
-            project_id.to_string(),
-            bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
-                manifest: "test-manifest".to_string(),
-                active_snapshot: Some(activation.snapshot_id.clone()),
-                dirty_overlay: None,
-                repo_materialization: None,
-                code_source_selector: Some(activation.selector.clone()),
-                code_source_generation: Some(generation_id.clone()),
-                git_overlay: None,
-                git_overlay_managed: false,
-            },
-        );
+        let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(
+            &crate::edge_index::edges_dir_from_bro_store(&root),
+        )
+        .unwrap();
 
         let result = validate_relationship_chain(&store, &snapshot, &manifest);
         assert!(
