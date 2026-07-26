@@ -44,14 +44,38 @@ pub(crate) struct ProducerGrant {
     projects: BTreeMap<PublishedScope, String>,
 }
 
+#[derive(Clone)]
 struct AuthEntry {
     token: ServiceToken,
     grant: ProducerGrant,
 }
 
+/// Catalog-mode typed grant table (P4-B plan section 6.1 item 3). Carries
+/// the same entries as `CodeSourceSnapshot.auth` plus typed
+/// `scope_to_project` and `producer_to_scopes` indexes resolved from the
+/// pinned `CatalogSnapshotV2`. Constructed only in catalog mode; bridge
+/// mode leaves this `None` and keeps its lease-derived `String` grants
+/// byte-identical.
+///
+/// The typed indexes are consumed by P4-C (strict scope-bearing v2
+/// records) and later milestones; this milestone establishes the table
+/// and verifies catalog-scope resolution.
+#[allow(dead_code)]
+struct AuthTable {
+    entries: Vec<AuthEntry>,
+    scope_to_project: BTreeMap<PublishedScope, ProjectId>,
+    producer_to_scopes: BTreeMap<String, BTreeSet<PublishedScope>>,
+}
+
 struct CodeSourceSnapshot {
     enabled: bool,
     auth: Vec<AuthEntry>,
+    /// `Some` only in catalog mode, carrying the typed grant indexes
+    /// resolved from the pinned catalog snapshot. `None` on the bridge.
+    /// Consumed by P4-C and later milestones; this milestone establishes
+    /// the table and verifies catalog-scope resolution.
+    #[allow(dead_code)]
+    auth_table: Option<AuthTable>,
     store: Arc<CodeSourceStore>,
 }
 
@@ -90,31 +114,53 @@ fn resolve_grant_scope(
     resolution: &GrantScopeResolution,
     scope: &PublishedScope,
 ) -> Result<String> {
-    let matching: Vec<&str> = match resolution {
-        GrantScopeResolution::Bridge { project_scopes } => project_scopes
-            .iter()
-            .filter(|(_, project_scope)| project_scope.as_ref() == Some(scope))
-            .map(|(project_id, _)| project_id.as_str())
-            .collect(),
-        GrantScopeResolution::Catalog { catalog } => catalog
-            .projects
-            .values()
-            .filter(|project| match &project.scope {
-                bbox_corpus_core::project_catalog::ProjectScope::Published(published) => {
-                    published == scope
+    match resolution {
+        GrantScopeResolution::Bridge { project_scopes } => {
+            let matching: Vec<&str> = project_scopes
+                .iter()
+                .filter(|(_, project_scope)| project_scope.as_ref() == Some(scope))
+                .map(|(project_id, _)| project_id.as_str())
+                .collect();
+            let [project_id] = matching.as_slice() else {
+                if matching.is_empty() {
+                    bail!("code-collection scope is not registered");
                 }
-                bbox_corpus_core::project_catalog::ProjectScope::LegacyLocal => false,
-            })
-            .map(|project| project.project_id.as_str())
-            .collect(),
-    };
+                bail!("code-collection scope resolves to multiple registered projects");
+            };
+            Ok((*project_id).to_string())
+        }
+        GrantScopeResolution::Catalog { catalog } => Ok(resolve_catalog_project(catalog, scope)?
+            .as_str()
+            .to_string()),
+    }
+}
+
+/// Catalog-mode scope resolution returning the typed `ProjectId` (P4-B plan
+/// section 6.1 item 2). Exact `PublishedScope` equality against the pinned
+/// snapshot; unknown scope and multi-project collision fail closed with the
+/// same error shapes as the bridge arm.
+fn resolve_catalog_project(
+    catalog: &CatalogSnapshotV2,
+    scope: &PublishedScope,
+) -> Result<ProjectId> {
+    let matching: Vec<&ProjectId> = catalog
+        .projects
+        .iter()
+        .filter(|(_, project)| match &project.scope {
+            bbox_corpus_core::project_catalog::ProjectScope::Published(published) => {
+                published == scope
+            }
+            bbox_corpus_core::project_catalog::ProjectScope::LegacyLocal => false,
+        })
+        .map(|(project_id, _)| project_id)
+        .collect();
     let [project_id] = matching.as_slice() else {
         if matching.is_empty() {
             bail!("code-collection scope is not registered");
         }
         bail!("code-collection scope resolves to multiple registered projects");
     };
-    Ok((*project_id).to_string())
+    Ok((*project_id).clone())
 }
 
 #[derive(Default)]
@@ -185,6 +231,7 @@ impl CodeSourceRuntime {
             snapshot: parking_lot::RwLock::new(Arc::new(CodeSourceSnapshot {
                 enabled: false,
                 auth: Vec::new(),
+                auth_table: None,
                 store,
             })),
             activating_projects: parking_lot::Mutex::new(BTreeMap::new()),
@@ -328,6 +375,7 @@ fn build_snapshot(
         return Ok(CodeSourceSnapshot {
             enabled: false,
             auth: Vec::new(),
+            auth_table: None,
             store,
         });
     }
@@ -372,6 +420,8 @@ fn build_snapshot(
         },
     };
     let mut auth = Vec::new();
+    let mut scope_to_project: BTreeMap<PublishedScope, ProjectId> = BTreeMap::new();
+    let mut producer_to_scopes: BTreeMap<String, BTreeSet<PublishedScope>> = BTreeMap::new();
     let mut producer_ids = BTreeSet::new();
     let mut token_digests = BTreeSet::new();
     let mut assigned_scopes = BTreeSet::new();
@@ -391,13 +441,21 @@ fn build_snapshot(
             bail!("enabled code-collection producer has no scopes");
         }
         let mut resolved = BTreeMap::new();
+        let mut producer_scopes = BTreeSet::new();
         for scope in &producer.scopes {
             validate_scope(scope)?;
             if !assigned_scopes.insert(scope.clone()) {
                 bail!("code-collection scope is assigned more than once");
             }
-            resolved.insert(scope.clone(), resolve_grant_scope(&resolution, scope)?);
+            let project_id_string = resolve_grant_scope(&resolution, scope)?;
+            if let GrantScopeResolution::Catalog { catalog } = &resolution {
+                let project_id = resolve_catalog_project(catalog, scope)?;
+                scope_to_project.insert(scope.clone(), project_id);
+            }
+            producer_scopes.insert(scope.clone());
+            resolved.insert(scope.clone(), project_id_string);
         }
+        producer_to_scopes.insert(producer.producer_id.clone(), producer_scopes);
         auth.push(AuthEntry {
             token,
             grant: ProducerGrant {
@@ -406,9 +464,21 @@ fn build_snapshot(
             },
         });
     }
+    // The typed AuthTable exists only in catalog mode (P4-B plan section
+    // 6.1 item 3 and 6.2): bridge mode leaves it None and retains its
+    // lease-derived String grants byte-identical.
+    let auth_table = match &resolution {
+        GrantScopeResolution::Catalog { .. } => Some(AuthTable {
+            entries: auth.clone(),
+            scope_to_project,
+            producer_to_scopes,
+        }),
+        GrantScopeResolution::Bridge { .. } => None,
+    };
     Ok(CodeSourceSnapshot {
         enabled: true,
         auth,
+        auth_table,
         store,
     })
 }
@@ -2821,6 +2891,7 @@ mod tests {
                     projects: BTreeMap::from([(scope.clone(), project_id.to_string())]),
                 },
             }],
+            auth_table: None,
             store,
         });
     }
@@ -2851,6 +2922,7 @@ mod tests {
                     projects: BTreeMap::from([(scope.clone(), "http-test-project".into())]),
                 },
             }],
+            auth_table: None,
             store,
         });
         (state, token_secret)
@@ -2953,6 +3025,7 @@ mod tests {
                     },
                 },
             ],
+            auth_table: None,
             store: state.code_sources.store(),
         });
         let response = app
@@ -3494,6 +3567,7 @@ mod tests {
         *restarted.code_sources.snapshot.write() = Arc::new(CodeSourceSnapshot {
             enabled: false,
             auth: Vec::new(),
+            auth_table: None,
             store: store.clone(),
         });
         cutback_to_local(&restarted, &scope, &project.project_id).unwrap();
@@ -3729,6 +3803,10 @@ mod tests {
     /// scope resolves by exact scope equality against the pinned catalog
     /// snapshot, with NO lease acquired - which is the only way a remote-only
     /// project (zero attachments) can ever hold a grant.
+    ///
+    /// P4-B extends this: the typed `AuthTable` is populated with
+    /// `scope_to_project` mapping to the typed `ProjectId` (not a path hash)
+    /// and `producer_to_scopes` indexing every producer's scopes.
     #[test]
     fn catalog_grant_arm_resolves_by_exact_scope_without_leases() {
         let directory = tempfile::tempdir().unwrap();
@@ -3775,6 +3853,31 @@ mod tests {
             .map(|operation| operation.granted + operation.denied)
             .sum();
         assert_eq!(attempted, 0, "the catalog arm acquires no lease at all");
+
+        // P4-B: the typed AuthTable is populated in catalog mode with the
+        // typed ProjectId (not a path hash) and producer scope index.
+        let auth_table = snapshot
+            .auth_table
+            .as_ref()
+            .expect("catalog mode must populate the typed AuthTable");
+        assert_eq!(
+            auth_table.scope_to_project.get(&scope),
+            Some(&ProjectId::parse(remote_only).unwrap()),
+            "scope_to_project must map to the typed catalog ProjectId"
+        );
+        assert_eq!(
+            auth_table
+                .producer_to_scopes
+                .get("catalog-producer")
+                .map(|scopes| scopes.iter().cloned().collect::<Vec<_>>()),
+            Some(vec![scope.clone()]),
+            "producer_to_scopes must index the producer's resolved scopes"
+        );
+        assert_eq!(
+            auth_table.entries.len(),
+            1,
+            "the AuthTable carries the resolved entries"
+        );
     }
 
     /// An unknown scope fails closed with today's error shape.
@@ -3863,6 +3966,181 @@ mod tests {
             error.to_string(),
             "code-collection scope resolves to multiple registered projects"
         );
+    }
+
+    /// P4-B plan section 6.2 (bridge parity): the typed `AuthTable` is
+    /// catalog-mode only. In bridge mode `build_snapshot` leaves it `None`
+    /// and retains its lease-derived `String` grants byte-identical.
+    #[test]
+    fn bridge_mode_does_not_construct_an_auth_table() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let state_dir = root.join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_CONFIG", root.join("missing-config.toml"));
+        env.set("BLACKBOX_STATE_DIR", &state_dir);
+        let base = crate::config::load().unwrap();
+        let scope = PublishedScope::try_new("bridge-repo", ".");
+        let scope = scope.unwrap();
+        let (project, candidate) = snapshot_project(&root, "bridge-project", &scope);
+        let token_file = root.join("bridge-token");
+        write_service_token(&token_file, 'a');
+        let broker = snapshot_broker(vec![candidate]);
+        let mut config = base.clone();
+        config.code_collection.enabled = true;
+        config.code_collection.producers = vec![CodeCollectionProducerConfig {
+            producer_id: "bridge-producer".into(),
+            token_file: token_file.to_path_buf(),
+            scopes: vec![scope.clone()],
+        }];
+
+        // Bridge mode: no catalog_store passed, so resolution is lease-derived.
+        let snapshot = build_snapshot(&config, &[project], None, None, &broker)
+            .expect("bridge mode resolves grants through leases");
+
+        assert!(
+            snapshot.auth_table.is_none(),
+            "bridge mode must not construct a typed AuthTable"
+        );
+        assert!(
+            !snapshot.auth.is_empty(),
+            "bridge mode still populates the String-based auth entries"
+        );
+    }
+
+    /// P4-B plan section 6.3 verification matrix: a duplicate scope (the
+    /// same scope configured for two producers) fails closed in catalog
+    /// mode with the same error shape as bridge mode.
+    #[test]
+    fn catalog_grant_arm_fails_closed_on_a_duplicate_configured_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let state_dir = root.join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_CONFIG", root.join("missing-config.toml"));
+        env.set("BLACKBOX_STATE_DIR", &state_dir);
+        let base = crate::config::load().unwrap();
+        let token_a = root.join("dup-token-a");
+        let token_b = root.join("dup-token-b");
+        write_service_token(&token_a, 'a');
+        write_service_token(&token_b, 'b');
+        let scope = PublishedScope::try_new("dup-repo", ".").unwrap();
+        let project_id = "p_000000000000000000000000000000f1";
+        let catalog = catalog_grant_store(
+            &root,
+            &[(project_id, ProjectScope::Published(scope.clone()))],
+        );
+        let broker = CheckoutAccessBroker::new(
+            Arc::new(bbox_indexing::checkout_access::DenyCheckoutAccess),
+            CheckoutAccessObservations::in_memory(),
+        );
+        let mut config = base.clone();
+        config.code_collection.enabled = true;
+        config.code_collection.producers = vec![
+            CodeCollectionProducerConfig {
+                producer_id: "dup-producer-a".into(),
+                token_file: token_a,
+                scopes: vec![scope.clone()],
+            },
+            CodeCollectionProducerConfig {
+                producer_id: "dup-producer-b".into(),
+                token_file: token_b,
+                scopes: vec![scope.clone()],
+            },
+        ];
+
+        let error = build_snapshot(&config, &[], Some(&catalog), None, &broker)
+            .map(|_| ())
+            .expect_err("a scope assigned to two producers must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "code-collection scope is assigned more than once"
+        );
+    }
+
+    /// P4-B plan section 6.3 bootsmoke: a catalog-mode cold-open (no
+    /// existing store, no prior bind) refuses an unresolved scope before
+    /// the daemon ever binds its HTTP listener. The typed AuthTable is not
+    /// constructed on failure.
+    #[test]
+    fn catalog_mode_cold_open_refuses_an_unresolved_scope_before_bind() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let state_dir = root.join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_CONFIG", root.join("missing-config.toml"));
+        env.set("BLACKBOX_STATE_DIR", &state_dir);
+        let base = crate::config::load().unwrap();
+        let token_file = root.join("cold-open-token");
+        write_service_token(&token_file, 'a');
+        let configured_scope = PublishedScope::try_new("cold-open-repo", ".").unwrap();
+        let registered_scope = PublishedScope::try_new("different-repo", ".").unwrap();
+        let catalog = catalog_grant_store(
+            &root,
+            &[(
+                "p_000000000000000000000000000001a1",
+                ProjectScope::Published(registered_scope),
+            )],
+        );
+        let broker = CheckoutAccessBroker::new(
+            Arc::new(bbox_indexing::checkout_access::DenyCheckoutAccess),
+            CheckoutAccessObservations::in_memory(),
+        );
+
+        // Cold open: no existing store, fresh state dir. The configured
+        // scope is not in the catalog, so resolution must fail closed.
+        let error = build_snapshot(
+            &catalog_grant_config(&base, &token_file, &configured_scope),
+            &[],
+            Some(&catalog),
+            None,
+            &broker,
+        )
+        .map(|_| ())
+        .expect_err("catalog-mode cold-open must refuse an unresolved scope");
+        assert_eq!(error.to_string(), "code-collection scope is not registered");
+        // No leases were acquired during the failed cold-open.
+        let attempted: u64 = broker
+            .health()
+            .operations
+            .iter()
+            .map(|operation| operation.granted + operation.denied)
+            .sum();
+        assert_eq!(
+            attempted, 0,
+            "the failed cold-open must not have acquired any lease"
+        );
+    }
+
+    /// P4-B plan section 6.1 item 2: the typed catalog resolver maps scope
+    /// to the typed `ProjectId`, not a path hash. Verified directly against
+    /// the resolver so the typed contract stays pinned.
+    #[test]
+    fn resolve_catalog_project_returns_the_typed_project_id() {
+        use bbox_corpus_core::project_catalog::CorpusProject;
+
+        let scope = PublishedScope::try_new("typed-repo", ".").unwrap();
+        let project_id = ProjectId::parse("p_00000000000000000000000000000abc").unwrap();
+        let project = CorpusProject {
+            project_id: project_id.clone(),
+            scope: ProjectScope::Published(scope.clone()),
+            operator_aliases: Default::default(),
+            nominated_aliases: Default::default(),
+            display_name: "typed".into(),
+            created_at: "2026-07-25T00:00:00Z".into(),
+            registered_at_compat: None,
+            repo_history: None,
+            languages: Default::default(),
+        };
+        let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
+        catalog.projects.insert(project_id.clone(), project);
+
+        let resolved = resolve_catalog_project(&catalog, &scope)
+            .expect("an exact scope match resolves to the typed ProjectId");
+        assert_eq!(resolved, project_id);
     }
 
     #[test]
