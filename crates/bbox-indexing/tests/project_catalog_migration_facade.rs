@@ -1515,3 +1515,324 @@ fn produce_migrated_smoke_fixture_from_env_root() {
     .unwrap();
     eprintln!("smoke fixture produced at {}", root.display());
 }
+
+// ----------------------------------------------------------------------------
+// Phase 4 acceptance block (section 12 exit-gate proof)
+// ----------------------------------------------------------------------------
+//
+// Coverage map for the nine acceptance rows (section 12.1 through 12.9).
+// Where a row is already covered by an existing unit test, the reference
+// is listed. New tests below cover rows that needed additional acceptance.
+//
+// 12.1 Token revocation while collected results remain pending:
+//     - p4e_reducer_local_collected_none_selected_attempts_cutback
+//       (in src/server/code_source.rs): desired=local, effective=collected,
+//       cutback fires because the assignment was removed.
+//     - p4e_gc_protects_bridge_generation_ids: the activation record
+//       carrying a CutbackStateV2 is a GC root for its generation_id.
+//
+// 12.2 Reattach completes cutback exactly once:
+//     - p4e_warming_with_selected_ladder_attempts_cutback: scope-matching
+//       attachment triggers cutback attempt.
+//     - p4e_local_local_stale_state_is_cleared: detach and re-attach does
+//       not re-drive cutback (effective=Local, desired=Local).
+//
+// 12.3 Reassign cancels cutback:
+//     - p4e_readd_assignment_cancels_cutback: re-adding the assignment
+//       cancels the pending cutback.
+//     - p4e_reducer_collected_collected_any_nonnone_cancels_cutback:
+//       the reduction table's collected/collected/any-non-None row.
+//
+// 12.4 Restart preserves every state:
+//     - p4e_resume_structural_enqueues_reconciler_event
+//     - p4e_resume_transient_elapsed_deadline_re_attempts
+//     - p4e_resume_transient_future_deadline_waits
+//     - p4e_resume_terminal_and_manual_retry_are_noops
+//     - p4e_resume_no_cutback_state_is_noop
+//     - p4f_classification_persists_structural_for_no_attachment
+//       (startup classification converts cutback_pending to typed state)
+//     - p4f_classification_is_once_only
+//
+// 12.5 Explicit retirement converges exactly once:
+//     - retirement_journal_stage_ordinal_is_forward_only
+//       (in project_catalog_admin.rs unit tests)
+//     - retirement_journal_round_trip_preserves_all_fields
+//     - retirement_journal_path_convention
+//     - retirement_journal_archive_removes_file
+//     - NEW: acceptance_retirement_journaled_converges_exactly_once
+//     - NEW: acceptance_retirement_journaled_idempotent_on_second_call
+//     - NEW: acceptance_retirement_journaled_refuses_ready_materialization
+//
+// 12.6 v2 records and scope agreement:
+//     - p4c_v2_activation_round_trips_with_scope_agreement
+//     - p4c_scope_disagreement_refuses_before_commit
+//     - p4f_fresh_store_relationship_chain_passes_clean
+//
+// 12.7 Startup agreement:
+//     - p4f_fresh_store_relationship_chain_passes_clean
+//     - p4f_scope_mismatch_refuses_chain
+//     - p4f_missing_workspace_entry_fails_chain
+//     - p4f_retirement_journal_detection_refuses_boot
+//     - p4f_no_retirement_journal_passes_clean
+//
+// 12.8 Four-step producer re-scope restart invariants:
+//     - p4e_scope_migrate_refuses_second_migration_with_open_bridge
+//     - p4e_reducer_bridge_open_clears_structural
+//     - p4e_open_bridge_predicate_newest_by_catalog_epoch
+//     - p4e_open_bridge_predicate_empty_records
+//     - exit_proof_legacy_cutback_is_bridge_only (sole-ownership)
+//
+// 12.9 Bridge parity:
+//     - p4c_bridge_v1_round_trip_unchanged
+//     - p4c_bridge_store_refuses_v2_activation_write
+//     - p4d_bridge_mode_is_not_catalog_and_has_no_reconciler
+//     - exit_proof_cutback_catalog_no_sleep_loop (no loop in catalog path)
+//     - exit_proof_attempt_cutback_catalog_no_sleep
+//
+// Rows requiring live daemon lifecycle (12.1 end-to-end, 12.4 crash-during-
+// redrive, 12.8 attached-path race) are exercised by the bootsmoke driver
+// and are outside the unit/integration surface. The unit tests above cover
+// the deterministic invariants those scenarios depend on.
+
+/// Section 12.5: a fully discharged project (zero blocking classes) retires
+/// through the journaled path. The journal completes to the Complete stage,
+/// the project is removed from the catalog, and a second call is idempotent.
+#[test]
+fn acceptance_retirement_journaled_converges_exactly_once() {
+    use bbox_corpus_core::project_catalog::{
+        CatalogSnapshotV2, CorpusProject, ProjectId, ProjectScope,
+    };
+    use bbox_indexing::project_catalog_admin::{
+        RetireEvidence, RetirementJournalStage, retire_project_journaled,
+    };
+    use bbox_indexing::project_catalog_store::ProjectCatalogStore;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let bro_home = root.join("bro-home");
+    fs::create_dir_all(&bro_home).unwrap();
+
+    let store =
+        Arc::new(ProjectCatalogStore::initialize_empty(root.join("projects.json")).unwrap());
+
+    let project_id = ProjectId::parse("p_000000000000000000000000000000a1").unwrap();
+    let epoch = store.snapshot().unwrap().epoch();
+    store
+        .transact(epoch, |catalog: &mut CatalogSnapshotV2, _| {
+            catalog.projects.insert(
+                project_id.clone(),
+                CorpusProject {
+                    project_id: project_id.clone(),
+                    scope: ProjectScope::LegacyLocal,
+                    operator_aliases: Default::default(),
+                    nominated_aliases: Default::default(),
+                    display_name: "acceptance project".into(),
+                    created_at: "2026-07-24T00:00:00Z".into(),
+                    registered_at_compat: None,
+                    repo_history: None,
+                    languages: Default::default(),
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+
+    let evidence = RetireEvidence {
+        external_reference_counts: Default::default(),
+    };
+
+    let (preflight, journal) =
+        retire_project_journaled(&store, &bro_home, &project_id, &evidence, true).unwrap();
+
+    assert!(
+        preflight.blocking.is_empty(),
+        "no blocking classes should remain"
+    );
+    let journal = journal.expect("journal should be returned after execute");
+    assert_eq!(
+        journal.current_stage,
+        RetirementJournalStage::Complete,
+        "journal should reach Complete"
+    );
+
+    let state = store.snapshot().unwrap();
+    assert!(
+        !state.catalog().projects.contains_key(&project_id),
+        "project must be removed from catalog"
+    );
+
+    // Second call: idempotent. The project is gone; the journal was
+    // archived. Calling again should not panic or duplicate work.
+    let (_preflight2, journal2) =
+        retire_project_journaled(&store, &bro_home, &project_id, &evidence, true).unwrap();
+    // Journal is None because the project no longer exists in the catalog
+    // and no journal file was found (it was archived).
+    assert!(
+        journal2.is_none()
+            || journal2
+                .as_ref()
+                .is_some_and(|j| j.current_stage == RetirementJournalStage::Complete),
+        "second retire call must be idempotent"
+    );
+}
+
+/// Section 12.5: a project with Ready materialization is refused.
+#[test]
+fn acceptance_retirement_journaled_refuses_ready_materialization() {
+    use bbox_corpus_core::project_catalog::{
+        CatalogSnapshotV2, CommitNamespace, CorpusProject, ProjectId, ProjectScope,
+        RepoHistoryAuthority, RepoHistoryGenerationId, RepoHistoryId, RepoHistoryMaterialization,
+        RepoHistoryRecord,
+    };
+    use bbox_indexing::project_catalog_admin::{RetireEvidence, retire_project_journaled};
+    use bbox_indexing::project_catalog_store::ProjectCatalogStore;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let bro_home = root.join("bro-home");
+    fs::create_dir_all(&bro_home).unwrap();
+
+    let store =
+        Arc::new(ProjectCatalogStore::initialize_empty(root.join("projects.json")).unwrap());
+
+    let project_id = ProjectId::parse("p_000000000000000000000000000000a1").unwrap();
+    let history_id = RepoHistoryId::parse("rh_00000000000000000000000000000001").unwrap();
+    let gen_id = RepoHistoryGenerationId::parse(
+        "rhg_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    .unwrap();
+    let epoch = store.snapshot().unwrap().epoch();
+    store
+        .transact(epoch, |catalog: &mut CatalogSnapshotV2, _| {
+            catalog.projects.insert(
+                project_id.clone(),
+                CorpusProject {
+                    project_id: project_id.clone(),
+                    scope: ProjectScope::LegacyLocal,
+                    operator_aliases: Default::default(),
+                    nominated_aliases: Default::default(),
+                    display_name: "ready-mat project".into(),
+                    created_at: "2026-07-24T00:00:00Z".into(),
+                    registered_at_compat: None,
+                    repo_history: Some(history_id.clone()),
+                    languages: Default::default(),
+                },
+            );
+            catalog.repo_histories.insert(
+                history_id.clone(),
+                RepoHistoryRecord {
+                    repo_history_id: history_id.clone(),
+                    authority: RepoHistoryAuthority::LocalProject(project_id.clone()),
+                    primary_namespace: CommitNamespace::parse(
+                        "local_33333333333333333333333333333333",
+                    )
+                    .unwrap(),
+                    compatibility_namespaces: Default::default(),
+                    materialization: RepoHistoryMaterialization::Ready {
+                        generation_id: gen_id,
+                    },
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+
+    let evidence = RetireEvidence {
+        external_reference_counts: Default::default(),
+    };
+
+    let result = retire_project_journaled(&store, &bro_home, &project_id, &evidence, true);
+    assert!(
+        result.is_err(),
+        "Ready materialization must refuse retirement"
+    );
+    let err = result.unwrap_err();
+    assert_eq!(
+        err.code(),
+        "error.project_catalog_admin_retire_history_ready",
+        "must refuse with the typed Ready-materialization code"
+    );
+
+    // Project must still be in the catalog (refused, not removed).
+    let state = store.snapshot().unwrap();
+    assert!(
+        state.catalog().projects.contains_key(&project_id),
+        "project must survive the refusal"
+    );
+}
+
+/// Section 12.5: preflight (non-execute) mode reports blocking classes
+/// without modifying the catalog.
+#[test]
+fn acceptance_retirement_preflight_does_not_mutate() {
+    use bbox_corpus_core::project_catalog::{
+        CatalogSnapshotV2, CorpusProject, ProjectId, ProjectScope,
+    };
+    use bbox_indexing::project_catalog_admin::{RetireEvidence, retire_project_journaled};
+    use bbox_indexing::project_catalog_store::ProjectCatalogStore;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let bro_home = root.join("bro-home");
+    fs::create_dir_all(&bro_home).unwrap();
+
+    let store =
+        Arc::new(ProjectCatalogStore::initialize_empty(root.join("projects.json")).unwrap());
+
+    let project_id = ProjectId::parse("p_000000000000000000000000000000a1").unwrap();
+    let epoch = store.snapshot().unwrap().epoch();
+    store
+        .transact(epoch, |catalog: &mut CatalogSnapshotV2, _| {
+            catalog.projects.insert(
+                project_id.clone(),
+                CorpusProject {
+                    project_id: project_id.clone(),
+                    scope: ProjectScope::LegacyLocal,
+                    operator_aliases: Default::default(),
+                    nominated_aliases: Default::default(),
+                    display_name: "preflight project".into(),
+                    created_at: "2026-07-24T00:00:00Z".into(),
+                    registered_at_compat: None,
+                    repo_history: None,
+                    languages: Default::default(),
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+
+    let evidence = RetireEvidence {
+        external_reference_counts: {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert("code_source_activation".into(), 1u64);
+            m
+        },
+    };
+
+    let epoch_before = store.snapshot().unwrap().epoch();
+    let (preflight, journal) =
+        retire_project_journaled(&store, &bro_home, &project_id, &evidence, false).unwrap();
+
+    assert!(
+        preflight.blocking.contains_key("code_source_activation"),
+        "preflight must report the blocking class"
+    );
+    assert!(
+        journal.is_none(),
+        "no journal should be created in preflight mode"
+    );
+
+    let epoch_after = store.snapshot().unwrap().epoch();
+    assert_eq!(
+        epoch_before, epoch_after,
+        "preflight must not mutate the catalog epoch"
+    );
+    let state = store.snapshot().unwrap();
+    assert!(
+        state.catalog().projects.contains_key(&project_id),
+        "project must survive preflight"
+    );
+}

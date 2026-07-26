@@ -2277,17 +2277,18 @@ pub fn retire_project_journaled(
 
     // Stage: CatalogPairRemoved (step 7).
     // This is the FINAL authority cut: retire_project(execute: true).
+    // If the project is already absent from the catalog (idempotent
+    // re-entry after a prior Complete), skip the pair removal and go
+    // straight to the remaining stages.
     if !journal
         .current_stage
         .is_at_least(RetirementJournalStage::CatalogPairRemoved)
     {
-        let (_inventory, _commit) = retire_project(
-            store,
-            journal.catalog_epoch_at_start,
-            project_id,
-            evidence,
-            true,
-        )?;
+        let current_state = store.snapshot()?;
+        if current_state.catalog().projects.contains_key(project_id) {
+            let (_inventory, _commit) =
+                retire_project(store, current_state.epoch(), project_id, evidence, true)?;
+        }
         journal.advance(&now());
         save_retirement_journal(bro_home, &journal)
             .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
