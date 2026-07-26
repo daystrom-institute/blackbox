@@ -324,6 +324,33 @@ pub fn probe_project_store_mode(
     }
 }
 
+/// The migration immutable-asset root for a projects store path, plus the
+/// stable on-disk name prefix of the legacy commit-namespace inventory asset
+/// installed by transaction `transaction_id`.
+///
+/// Exposed crate-internally so the Phase 3 history materializer can read
+/// back the asset it must prove against without duplicating this module's
+/// path-role table. The prefix is exactly what `immutable_target_name`
+/// produces up to the content hash, which the reader recomputes rather than
+/// trusts.
+pub(crate) fn legacy_commit_namespace_inventory_asset_location(
+    projects_path: &Path,
+    transaction_id: &ProjectCatalogTransactionId,
+) -> ProjectCatalogStoreResult<(PathBuf, String)> {
+    let paths = ProjectCatalogPaths::derive(projects_path)?;
+    let prefix = format!(
+        "{}.{}.",
+        transaction_id,
+        ImmutableAssetRoleV1::LegacyCommitNamespaceInventory.artifact_token()
+    );
+    Ok((paths.migration_assets_dir, prefix))
+}
+
+/// Byte cap the installer applied to that asset, so the reader bounds itself
+/// identically instead of picking its own number.
+pub(crate) const LEGACY_COMMIT_NAMESPACE_INVENTORY_ASSET_MAX_BYTES: usize =
+    MAX_LEGACY_COMMIT_NAMESPACE_INVENTORY_ASSET_BYTES;
+
 impl ProjectCatalogStore {
     /// Open an already initialized strict v2 pair.
     ///
@@ -7573,7 +7600,7 @@ impl<'de> Deserialize<'de> for Sha256Hex {
     }
 }
 
-fn sha256(bytes: &[u8]) -> Sha256Hex {
+pub(crate) fn sha256(bytes: &[u8]) -> Sha256Hex {
     Sha256Hex(hex::encode(Sha256::digest(bytes)))
 }
 

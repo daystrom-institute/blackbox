@@ -14,7 +14,11 @@ use bbox_corpus_core::git::GitCommit;
 use bbox_corpus_core::project_record::ProjectRecord;
 
 const MAX_COMMIT_MESSAGE_BYTES: usize = 16 * 1024;
-const TRUNCATED_COMMIT_MESSAGE_SUFFIX: &str = "\n\n[... message truncated]";
+/// Suffix stamped on a commit message that exceeded [`MAX_COMMIT_MESSAGE_BYTES`].
+///
+/// Public because the history generation store detects truncated messages by
+/// this exact marker; a duplicated copy there would drift silently.
+pub const TRUNCATED_COMMIT_MESSAGE_SUFFIX: &str = "\n\n[... message truncated]";
 
 #[derive(Debug, Default)]
 pub struct GitIndexStats {

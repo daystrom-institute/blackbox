@@ -74,15 +74,16 @@ use crate::project_catalog_inventory_adapters::{
 };
 use crate::project_catalog_migration_lock::project_catalog_migration_lock_path;
 use crate::project_catalog_store::{
-    ImmutableAssetRoleV1, MigrationCheckoutIdentityActionDraftV1,
-    MigrationCheckoutRegistryBootstrapV1, MigrationCodeSourceActivationDraftV1,
-    MigrationCodeSourceDispositionV1, MigrationCodeSourceGenerationDraftV1,
-    MigrationCodeSourceSnapshotDraftV1, MigrationImmutableAssetDraftV1,
-    MigrationLegacyProjectSourceDraftV1, MigrationMutationDispositionV1,
-    MigrationParticipantDraftV1, MigrationParticipantRegistry, MigrationPlanDraftV1,
-    MigrationPublisherSourceDraftV1, MigrationStoreOpenOutcomeV1, ParticipantRoleV1,
-    PublisherDispositionEvidenceV1, PublisherPinEvidenceV1, Sha256Hex, ValidatedMigrationPlanV1,
-    begin_migration_checkout_registry_bootstrap, transact_migration_classified,
+    ImmutableAssetRoleV1, LEGACY_COMMIT_NAMESPACE_INVENTORY_ASSET_MAX_BYTES,
+    MigrationCheckoutIdentityActionDraftV1, MigrationCheckoutRegistryBootstrapV1,
+    MigrationCodeSourceActivationDraftV1, MigrationCodeSourceDispositionV1,
+    MigrationCodeSourceGenerationDraftV1, MigrationCodeSourceSnapshotDraftV1,
+    MigrationImmutableAssetDraftV1, MigrationLegacyProjectSourceDraftV1,
+    MigrationMutationDispositionV1, MigrationParticipantDraftV1, MigrationParticipantRegistry,
+    MigrationPlanDraftV1, MigrationPublisherSourceDraftV1, MigrationStoreOpenOutcomeV1,
+    ParticipantRoleV1, PublisherDispositionEvidenceV1, PublisherPinEvidenceV1, Sha256Hex,
+    ValidatedMigrationPlanV1, begin_migration_checkout_registry_bootstrap,
+    legacy_commit_namespace_inventory_asset_location, sha256, transact_migration_classified,
     validate_migration_plan,
 };
 use crate::publisher::PublisherRefStore;
@@ -3866,6 +3867,118 @@ impl LegacyCommitNamespaceInventoryAssetV1 {
         serde_json::to_vec(self)
             .map_err(|_| planner_error("legacy commit namespace inventory asset cannot be encoded"))
     }
+}
+
+/// Read back the installed legacy commit-namespace inventory asset for a
+/// migrated store, or `None` when the store predates the asset.
+///
+/// The Phase 3 history materializer is the only consumer: it proves the
+/// namespaces it observes in the live index against these recorded rows
+/// before any of them may authorize a destructive replacement.
+///
+/// The asset filename embeds its own content hash. This reader recomputes
+/// that hash from the bytes it read and refuses a mismatch, so a truncated
+/// or edited asset can never pass itself off as recorded evidence. Exactly
+/// one asset may exist for a transaction (the role is a singleton), and more
+/// than one candidate file refuses rather than picking.
+pub fn load_legacy_commit_namespace_inventory_asset(
+    projects_path: &Path,
+    transaction_id: &ProjectCatalogTransactionId,
+) -> Result<Option<LegacyCommitNamespaceInventoryAssetV1>, ProjectCatalogMigrationError> {
+    let (assets_dir, prefix) =
+        legacy_commit_namespace_inventory_asset_location(projects_path, transaction_id).map_err(
+            |error| {
+                ProjectCatalogMigrationError::no_mutation(
+                    "error.project_catalog_migration_artifact_unreadable",
+                    format!("cannot derive the migration asset root: {}", error.code()),
+                )
+            },
+        )?;
+    let entries = match std::fs::read_dir(&assets_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(ProjectCatalogMigrationError::no_mutation(
+                "error.project_catalog_migration_artifact_unreadable",
+                "migration asset root cannot be listed",
+            ));
+        }
+    };
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return Err(ProjectCatalogMigrationError::no_mutation(
+                "error.project_catalog_migration_artifact_unreadable",
+                "migration asset root entry cannot be read",
+            ));
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if name.starts_with(&prefix) && name.ends_with(".immutable") {
+            candidates.push(name);
+        }
+    }
+    if candidates.len() > 1 {
+        return Err(ProjectCatalogMigrationError::no_mutation(
+            "error.project_catalog_migration_artifact_identity",
+            "more than one legacy commit-namespace inventory asset is installed",
+        ));
+    }
+    let Some(name) = candidates.pop() else {
+        return Ok(None);
+    };
+    let expected_hash = name
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix(".immutable"))
+        .map(str::to_string)
+        .ok_or_else(|| {
+            ProjectCatalogMigrationError::no_mutation(
+                "error.project_catalog_migration_artifact_identity",
+                "legacy commit-namespace inventory asset has an unreadable name",
+            )
+        })?;
+    let path = assets_dir.join(&name);
+    let metadata = std::fs::symlink_metadata(&path).map_err(|_| {
+        ProjectCatalogMigrationError::no_mutation(
+            "error.project_catalog_migration_artifact_unreadable",
+            "legacy commit-namespace inventory asset cannot be stat'ed",
+        )
+    })?;
+    if !metadata.is_file()
+        || metadata.len() > LEGACY_COMMIT_NAMESPACE_INVENTORY_ASSET_MAX_BYTES as u64
+    {
+        return Err(ProjectCatalogMigrationError::no_mutation(
+            "error.project_catalog_migration_artifact_unreadable",
+            "legacy commit-namespace inventory asset is not a bounded regular file",
+        ));
+    }
+    let bytes = std::fs::read(&path).map_err(|_| {
+        ProjectCatalogMigrationError::no_mutation(
+            "error.project_catalog_migration_artifact_unreadable",
+            "legacy commit-namespace inventory asset cannot be read",
+        )
+    })?;
+    if sha256(&bytes).as_str() != expected_hash {
+        return Err(ProjectCatalogMigrationError::no_mutation(
+            "error.project_catalog_migration_artifact_identity",
+            "legacy commit-namespace inventory asset disagrees with its content hash",
+        ));
+    }
+    let asset: LegacyCommitNamespaceInventoryAssetV1 =
+        serde_json::from_slice(&bytes).map_err(|_| {
+            ProjectCatalogMigrationError::no_mutation(
+                "error.project_catalog_migration_artifact_identity",
+                "legacy commit-namespace inventory asset cannot be decoded",
+            )
+        })?;
+    if asset.version != LEGACY_COMMIT_NAMESPACE_INVENTORY_ASSET_VERSION_V1 {
+        return Err(ProjectCatalogMigrationError::no_mutation(
+            "error.project_catalog_migration_artifact_identity",
+            "legacy commit-namespace inventory asset version is not supported",
+        ));
+    }
+    Ok(Some(asset))
 }
 
 /// Folds the captured tantivy and vector source states the namespace rows

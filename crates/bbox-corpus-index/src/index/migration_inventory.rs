@@ -155,12 +155,18 @@ struct GitIngestMetaV1 {
     last_ingested_sha: Option<String>,
 }
 
+/// One commit document reduced to its committable identity.
+///
+/// Public because the Phase 3 history generation store commits the exact
+/// same row shape through the exact same [`hash_commit_rows`] function; a
+/// second definition would let the two drift and silently break the proof
+/// that a generation carries the namespace the Phase 1 inventory recorded.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct CommitRowV1 {
-    namespace: String,
-    entity_ref: String,
-    commit_sha: String,
-    content_hash: String,
+pub struct CommitRowV1 {
+    pub namespace: String,
+    pub entity_ref: String,
+    pub commit_sha: String,
+    pub content_hash: String,
 }
 
 /// Capture committed corpus-index and legacy Git-cursor evidence without
@@ -743,7 +749,15 @@ fn hash_project_ref_rows(rows: &[CorpusProjectScopedRefV1]) -> String {
     hex::encode(digest.finalize())
 }
 
-fn hash_commit_rows(rows: &[CommitRowV1]) -> String {
+/// Ordered commitment over a namespace's commit rows.
+///
+/// The fold covers ONLY namespace, entity_ref, commit_sha, and content_hash.
+/// That exclusion of the two path-bearing stored fields (`project`,
+/// `file_path`) is load-bearing, not an oversight: it is what lets a history
+/// generation re-emit its documents with new path values across the
+/// path-free schema cut and still prove set equality against Phase 1
+/// evidence. Never widen it.
+pub fn hash_commit_rows(rows: &[CommitRowV1]) -> String {
     let mut digest = Sha256::new();
     digest.update(COMMIT_ROW_HASH_DOMAIN);
     for row in rows {

@@ -11,6 +11,7 @@
 
 pub use bbox_corpus_index::index::*;
 
+pub mod history_materializer;
 mod knowledge_docs;
 mod reindex;
 mod roadmap_docs;
