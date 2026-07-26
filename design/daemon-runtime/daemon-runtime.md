@@ -32,3 +32,4 @@ all of that work.
 - [Durable project catalog Phase 4 implementation plan](durable-project-catalog-phase4-impl.md)
 - [Durable project catalog Phase 5 implementation plan](durable-project-catalog-phase5-impl.md)
 - [Durable project catalog Phase 6 implementation plan](durable-project-catalog-phase6-impl.md)
+- [Typed Git-history and provenance transport implementation plan](git-history-provenance-transport-impl.md)
