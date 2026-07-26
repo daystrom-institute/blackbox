@@ -1026,3 +1026,44 @@ until a later entry explicitly supersedes it.
   not unexplained. Only a manifest that cannot be read or decoded is.
 - Revisit only if: the destructive sweep is wired to production and a
   stronger write-through invariant is wanted at that boundary.
+
+## D-039: Generation identity excludes source evidence
+
+- Date: 2026-07-26
+- Phase: durable project catalog, Phase 3 (closing-review repair)
+- Status: accepted after closing-review round 2
+- Decision: the repo-history generation id is derived over the body's
+  content-bearing fields only (version, namespace, owner, counts,
+  commitments, byte hashes, truncated count) via an explicit preimage
+  view. The three source evidence fields (source_schema_version,
+  source_schema_fingerprint_sha256, source_index_fingerprint_sha256)
+  stay in the persisted body as provenance but are OUTSIDE the id
+  preimage. When identical content is re-created under different
+  evidence, create_or_open returns the on-disk generation and the first
+  writer's evidence is retained. The materializer's strict no-remint
+  advance is unchanged: with evidence out of the preimage, an id
+  mismatch genuinely means content disagreement.
+- Evidence:
+  - The whole-body preimage wedged the daemon at the SECOND schema
+    replacement: the next bump's scan re-derived a different id for
+    byte-identical content (new marker, new fingerprints), the advance
+    refused with history_commitment_mismatch, and open failed
+    identically on every retry. The live-refresh path (constant marker
+    in the fingerprint slot) wedged one composition earlier.
+  - Every existing idempotence test re-ran against the SAME marker; the
+    new rows compose two sequential replacements at different markers
+    and a refresh followed by a replacement scan, both of which must
+    re-derive the same id.
+  - The governing design's idempotence claim ("re-materialization is
+    idempotent and cannot remint identity") only holds when identity is
+    a pure content address; volatile evidence in the preimage falsified
+    same-content-same-id across schema generations.
+- Rationale: identity answers "is this the same carried history";
+  evidence answers "where was it observed". Folding the second question
+  into the first made the answer to the first wrong exactly at the
+  boundary the machinery exists to survive. No compatibility shim is
+  needed: the format has never shipped, so no released store carries
+  ids minted by the whole-body preimage.
+- Revisit only if: a future body field is content-bearing but added
+  outside the preimage view (the view struct is the audit point), or
+  the advance is ever changed to compare anything other than ids.

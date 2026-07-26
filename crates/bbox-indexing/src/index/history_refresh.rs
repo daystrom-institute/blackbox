@@ -183,11 +183,12 @@ pub fn refresh_repo_history_generation(
             source_schema_fingerprint_sha256: schema_fingerprint,
             // A live refresh has no outgoing index population to fingerprint:
             // its source is the walk, not a document set someone else wrote.
-            // A constant marker states that honestly. It cannot weaken
-            // identity, because the id is derived over the whole body, whose
-            // document and vector commitments already pin the content; and it
-            // keeps the field from being mistaken for a scan fingerprint,
-            // which the two are never compared as.
+            // A constant marker states that honestly. It cannot shift
+            // identity, because source evidence is outside the id preimage
+            // (D-039): the id pins the document and vector commitments, so a
+            // scan of the same content and this refresh derive the SAME
+            // generation id, and the marker is provenance only, never
+            // compared against a scan fingerprint.
             source_index_fingerprint_sha256: LIVE_REFRESH_SOURCE_MARKER.to_string(),
         },
     )?;

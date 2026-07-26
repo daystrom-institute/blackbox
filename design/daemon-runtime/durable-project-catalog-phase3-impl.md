@@ -691,10 +691,19 @@ into the replacement boundary is P3-E.
    ordered document-set commitment, counts, content hashes, source
    schema/fingerprint evidence, and the typed owner/disposition. Generation
    ids are content-addressed SHA-256 over a versioned domain separator,
-   namespace, typed owner/disposition, and the canonical generation bytes,
-   using the `put_field` length-prefix convention from
-   `bbox_code_source::generation_id`; re-materialization is idempotent and
-   cannot remint identity.
+   namespace, typed owner/disposition, and the canonical bytes of the
+   body's CONTENT-BEARING preimage view, using the `put_field`
+   length-prefix convention from `bbox_code_source::generation_id`.
+   Amended per closing-review round 2 (D-039): the three source evidence
+   fields are provenance, recorded in the body but excluded from the id
+   preimage, so identical carried content re-derives the same id across
+   schema bumps and across the scan and live-refresh construction sites;
+   when identical content is re-created under different evidence the first
+   writer's evidence is retained. This is what makes re-materialization
+   idempotent and unable to remint identity ACROSS schema generations, not
+   only within one; with the whole body in the preimage, the second schema
+   replacement re-derived a new id for identical content and the strict
+   no-remint advance wedged the open path permanently.
 2. Materializer: streams the legacy index's commit documents by exact
    namespace (reusing the Phase 1 capture's row shape and commitment
    function), classifies each namespace against the pinned catalog snapshot
@@ -825,12 +834,18 @@ can change stored document identity.
    siblings. A pre-marker index (no schema marker file, directory
    non-empty) is authorized WITH CARRY, not authorized-empty, per the
    closing review: the scan proceeds without a marker recording a reserved
-   sentinel in the generation-id preimage, a structurally-non-index
+   sentinel in the generation body's source evidence (provenance only,
+   outside the id preimage per D-039), a structurally-non-index
    directory (no tantivy meta file) is nothing-to-carry while a corrupt
    index stays fail-closed, recovery classification resumes
    unconditionally on sentinel manifests, and both guards carry any
    documents found (catalog as drift-mode generations, bridge through the
-   spill). The rebuild pass itself carries a typed cause: the strict
+   spill). The corrupt arm is deliberately fail-closed even for a
+   marker-less directory (confirmed at closing-review round 2): a tantivy
+   meta file that is present but unreadable means an index is there whose
+   history cannot be carried, and refusing to open beats the old
+   self-heal-by-rebuild, which silently destroyed whatever that index
+   held; the posture matches the marked-index corrupt arm. The rebuild pass itself carries a typed cause: the strict
    collected-preservation collectors verify live counts and are
    load-bearing on an ordinary full pass, but meaningless on a freshly
    reset index, so the schema-migration rebuild (and only it, threaded
@@ -937,7 +952,15 @@ Ownership: `bbox-corpus-index/git_history.rs`, `bbox-edge-sidecar`,
    live refresh, with no other code constructing generations (the governing
    section 11 wording is amended to this formulation in the same commit as
    this plan). `Ready` generation ids advance through transact; commit
-   vectors enqueue once per repo, not per project.
+   vectors enqueue once per repo, not per project. Amended per
+   closing-review round 2: the refresh's constant source marker is
+   provenance only (D-039 keeps evidence out of the id preimage, so the
+   scan and refresh sites converge on one id for one content), and the
+   refresh path carries its own test coverage (supersede-and-retain,
+   no-change no-op, cursor-after-publication, foreign-namespace refusal,
+   and the refresh-then-replacement identity composition), closing the
+   round-2 N2 gap where the sole production `Ready` advancement path was
+   test-free.
 4. History GC: commit documents and vectors become eligible for tombstone
    only when no catalog record, active or retained overlay, pinned read
    view, in-flight build, or prepared/committed rebuild manifest references

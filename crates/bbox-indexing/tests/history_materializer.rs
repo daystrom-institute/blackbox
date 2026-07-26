@@ -17,11 +17,13 @@
 //! resolves `/var/folders` to `/private/var/folders` under the code being
 //! tested) and touches no real HOME or XDG state.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+
+use bbox_corpus_core::git::GitCommit;
 
 use bbox_code_source_store::CodeSourceStore;
 use bbox_config::config::{self, Config, LoadOptions};
@@ -31,17 +33,21 @@ use bbox_corpus_core::project_catalog::{
     RepoHistoryQuarantineMaterialization, RepoHistoryRecord,
 };
 use bbox_corpus_index::index::history_generations::{
-    HistoryFaultPoint, HistoryGenerationError, HistoryGenerationIo, HistoryGenerationStore,
-    HistoryProofModeV1, HistoryScanLimitsV1, RepoHistoryRebuildCommittedV1,
+    HistoryCommitDocumentV1, HistoryFaultPoint, HistoryGenerationError, HistoryGenerationIo,
+    HistoryGenerationStore, HistoryProofModeV1, HistoryScanLimitsV1, RepoHistoryRebuildCommittedV1,
     RepoHistoryRebuildRecoveryV1, scan_commit_documents,
 };
 use bbox_corpus_index::index::{TranscriptIndex, register_code_tokenizer};
 use bbox_edge_sidecar::manifest::ManifestIndex;
+use bbox_indexing::index::consolidated_history::{
+    ConsolidatedWalkOutcomeV1, RepoHistoryCursorStoreV1, RepoHistoryIngestGroupV1,
+};
 use bbox_indexing::index::history_materializer::{
     HistoryMaterializerRequestV1, NamespaceClassificationV1, classify_rebuild_recovery,
     history_generation_gc_roots, materialize_history_generations,
     materialize_history_generations_with_io, plan_history_generation_gc, prepare_rebuild_manifest,
 };
+use bbox_indexing::index::history_refresh::refresh_repo_history_generation;
 use bbox_indexing::project_catalog_inventory::{
     ProjectCatalogMigrationStatusV1, decode_migration_report_v1,
 };
@@ -1546,6 +1552,147 @@ fn a_migrated_root_materializes_idempotently_across_two_passes() {
     assert_eq!(first.generation_ids(), second.generation_ids());
     assert_eq!(second.catalog_epoch_after, None);
     assert_eq!(fixture.store.snapshot().unwrap().epoch(), epoch);
+}
+
+// ---------------------------------------------------------------------------
+// Identity across schema generations (D-039)
+// ---------------------------------------------------------------------------
+
+/// Append commit documents whose stored fields mirror EXACT generation rows,
+/// so a scan of this index reconstructs byte-identical
+/// `HistoryCommitDocumentV1` values. Used by the composition rows below to
+/// model an index whose content equals an already-materialized generation.
+fn write_commit_documents_from_rows(index_path: &Path, rows: &[HistoryCommitDocumentV1]) {
+    let index = Index::open_in_dir(index_path).unwrap();
+    register_code_tokenizer(&index);
+    let schema = index.schema();
+    let mut writer: tantivy::IndexWriter = index.writer(15_000_000).unwrap();
+    let field = |name: &str| schema.get_field(name).unwrap();
+    for row in rows {
+        let mut doc = TantivyDocument::new();
+        doc.add_text(field("doc_type"), &row.doc_type);
+        doc.add_text(field("chunk_kind"), &row.chunk_kind);
+        doc.add_text(field("entity_id"), &row.entity_id);
+        doc.add_text(field("content"), &row.content);
+        doc.add_text(field("path_tokens"), &row.path_tokens);
+        doc.add_text(field("chunk_hash"), &row.content_hash);
+        doc.add_text(field("parser_version"), &row.parser_version);
+        doc.add_text(field("repo_id"), &row.repo_id);
+        doc.add_text(field("commit_sha"), &row.commit_sha);
+        doc.add_text(field("commit_author_name"), &row.commit_author_name);
+        doc.add_text(field("commit_author_email"), &row.commit_author_email);
+        doc.add_text(field("session_id"), &row.session_id);
+        doc.add_text(field("account"), &row.account);
+        doc.add_text(field("project"), "/host/path/that/must/not/travel");
+        doc.add_text(field("file_path"), "git:some-project");
+        doc.add_text(field("role"), &row.role);
+        doc.add_u64(field("byte_offset"), row.byte_offset);
+        doc.add_u64(field("is_subagent"), row.is_subagent);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().unwrap();
+    drop(writer);
+}
+
+#[test]
+fn a_second_replacement_at_a_new_marker_re_derives_the_same_id_and_advances_nothing() {
+    // D-039 regression row: the SECOND schema replacement scans the same
+    // carried content under a DIFFERENT outgoing marker. Source evidence is
+    // outside the id preimage, so the re-derived id must equal the recorded
+    // one and the strict no-remint advance must see nothing to do. Before
+    // D-039 this refused with `history_commitment_mismatch` and wedged every
+    // catalog-mode store at its next schema bump.
+    let fixture = fresh_fixture(&[("owned-ns", 1)], None);
+    write_commit_documents(
+        &fixture.index_path,
+        "owned-ns",
+        &[(commit_sha(40).as_str(), "carried across bumps")],
+    );
+    fs::write(
+        fixture.index_path.join("schema_version.txt"),
+        b"outgoing-schema-a",
+    )
+    .unwrap();
+    let first = materialize_history_generations(&fixture.store, &fixture.request()).unwrap();
+    let epoch_after_first = fixture.store.snapshot().unwrap().epoch();
+
+    // The next bump: identical content, new outgoing marker (and therefore a
+    // new schema fingerprint recorded by the scan).
+    fs::write(
+        fixture.index_path.join("schema_version.txt"),
+        b"outgoing-schema-b",
+    )
+    .unwrap();
+    let second = materialize_history_generations(&fixture.store, &fixture.request()).unwrap();
+
+    assert_eq!(first.generation_ids(), second.generation_ids());
+    assert_eq!(second.catalog_epoch_after, None);
+    assert_eq!(fixture.store.snapshot().unwrap().epoch(), epoch_after_first);
+    // Provenance stays the first writer's: the on-disk generation still
+    // records the evidence it was actually observed under.
+    assert_eq!(
+        second.namespaces[0]
+            .generation
+            .manifest
+            .body
+            .source_schema_version,
+        "outgoing-schema-a"
+    );
+}
+
+#[test]
+fn a_live_refresh_then_a_replacement_scan_agree_on_generation_identity() {
+    // D-039 composition row: a live refresh advances `Ready` with the
+    // constant live-refresh marker in its evidence slot; the next
+    // replacement's scan observes the same content with scan evidence. The
+    // two construction sites must re-derive the SAME id, so the advance is a
+    // no-op instead of a permanent open-time refusal.
+    let fixture = fresh_fixture(&[("owned-ns", 1)], None);
+    let generation_store = HistoryGenerationStore::open_for_index(&fixture.index_path).unwrap();
+    let cursors = RepoHistoryCursorStoreV1::new(fixture.root.join("state").join("git_meta"));
+    let group = RepoHistoryIngestGroupV1 {
+        repo_history_id: history_id(1),
+        primary_namespace: CommitNamespace::parse("owned-ns").unwrap(),
+        members: BTreeMap::new(),
+    };
+    let walk = ConsolidatedWalkOutcomeV1 {
+        commits: vec![GitCommit {
+            sha: commit_sha(41),
+            parent_shas: Vec::new(),
+            author_name: "History Fixture".to_string(),
+            author_email: "fixture@example.invalid".to_string(),
+            message: "refreshed commit".to_string(),
+        }],
+        head: commit_sha(41),
+        ..Default::default()
+    };
+    let refreshed =
+        refresh_repo_history_generation(&fixture.store, &generation_store, &cursors, &group, &walk)
+            .unwrap();
+    assert!(refreshed.catalog_epoch_after.is_some());
+
+    // The next schema replacement: an index carrying exactly the refreshed
+    // generation's rows, scanned under an outgoing marker.
+    write_commit_documents_from_rows(&fixture.index_path, &refreshed.generation.commit_documents);
+    fs::write(
+        fixture.index_path.join("schema_version.txt"),
+        b"outgoing-schema-next",
+    )
+    .unwrap();
+    let outcome = materialize_history_generations(&fixture.store, &fixture.request()).unwrap();
+
+    assert_eq!(outcome.namespaces.len(), 1);
+    assert_eq!(outcome.namespaces[0].generation.id, refreshed.generation.id);
+    assert_eq!(outcome.catalog_epoch_after, None);
+    // The on-disk evidence remains the refresh's, provenance only.
+    assert_eq!(
+        outcome.namespaces[0]
+            .generation
+            .manifest
+            .body
+            .source_index_fingerprint_sha256,
+        "blackbox.repo-history-generation.live-refresh.v1"
+    );
 }
 
 #[test]

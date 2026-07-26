@@ -400,11 +400,15 @@ pub fn materialize_history_generations_with_io(
 /// pre-replacement materializer and the live history refresh are its ONLY
 /// callers, and no other code constructs a generation. The rule exists
 /// because generation identity is content-addressed: a third constructor
-/// that assembled the body slightly differently (a field defaulted, a row
-/// ordered differently, schema evidence sourced elsewhere) would mint a
-/// SECOND id for the same history and silently fork the catalog's notion of
-/// what is materialized. Funnelling both callers through one function makes
-/// that divergence impossible to introduce without editing this line.
+/// that assembled the body slightly differently (a field defaulted, a
+/// truncation count derived by another rule, rows filtered by another
+/// predicate) would mint a SECOND id for the same history and silently fork
+/// the catalog's notion of what is materialized. Source evidence is the one
+/// deliberate exception: it sits outside the id preimage (D-039), so the two
+/// callers' different evidence (scan marker vs live-refresh marker) converges
+/// on the same id for the same content. Funnelling both callers through one
+/// function makes any other divergence impossible to introduce without
+/// editing this line.
 ///
 /// Generations are immutable. A refresh that observes new commits does not
 /// append: it builds the complete superseding set and creates a NEW

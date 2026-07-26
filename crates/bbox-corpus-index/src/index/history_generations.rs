@@ -344,8 +344,13 @@ impl std::fmt::Display for HistoryGenerationIdV1 {
 }
 
 /// The canonical, id-free body of a generation. The generation id is a hash
-/// over this body's canonical bytes plus namespace and owner, so the body is
-/// serialized WITHOUT the id: an id can never be part of its own preimage.
+/// over the body's CONTENT-BEARING subset (`HistoryGenerationIdPreimageV1`)
+/// plus namespace and owner, so the body is serialized WITHOUT the id: an id
+/// can never be part of its own preimage. The three `source_*` evidence
+/// fields are provenance, deliberately OUTSIDE the preimage (D-039): identity
+/// is a pure content address, so re-emitting byte-identical history under a
+/// different source (the next schema bump's scan, a live refresh) re-derives
+/// the SAME id instead of tripping the strict no-remint advance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HistoryGenerationBodyV1 {
@@ -365,17 +370,70 @@ pub struct HistoryGenerationBodyV1 {
     /// How many carried messages were truncated at ingest. Non-zero means
     /// re-emitted vector keys will not reproduce the legacy key hashes.
     pub truncated_message_count: u64,
+    /// Source evidence: which schema marker, schema fingerprint, and index
+    /// population (or live-refresh marker) this generation's rows were
+    /// observed under. PROVENANCE ONLY, excluded from the id preimage
+    /// (D-039): the evidence is volatile across schema bumps and across the
+    /// scan/live-refresh construction sites, while the id must stay a stable
+    /// content address for the same carried history. When identical content
+    /// is re-created under different evidence, the first writer's evidence
+    /// is retained on disk (see `create_or_open`).
     pub source_schema_version: String,
     pub source_schema_fingerprint_sha256: String,
     pub source_index_fingerprint_sha256: String,
 }
 
+/// The exact fields the generation id commits to: everything in the body
+/// EXCEPT the three `source_*` evidence fields. A borrowed view so hashing
+/// and persistence can never drift apart field-by-field without this struct
+/// changing shape. A future body field is OUT of the preimage unless it is
+/// consciously added here; only content-bearing fields belong. (No domain
+/// bump is needed relative to the pre-D-039 whole-body preimage: this JSON
+/// always lacks the `source_*` keys while a whole-body encoding always
+/// carries them, so the two encodings can never collide byte-for-byte.)
+#[derive(Serialize)]
+struct HistoryGenerationIdPreimageV1<'a> {
+    version: u32,
+    namespace: &'a CommitNamespace,
+    owner: &'a HistoryGenerationOwnerV1,
+    commit_document_count: u64,
+    commit_document_commitment_sha256: &'a str,
+    commit_documents_sha256: &'a str,
+    vector_input_count: u64,
+    vector_input_commitment_sha256: &'a str,
+    vector_inputs_sha256: &'a str,
+    truncated_message_count: u64,
+}
+
+impl<'a> HistoryGenerationIdPreimageV1<'a> {
+    fn of(body: &'a HistoryGenerationBodyV1) -> Self {
+        Self {
+            version: body.version,
+            namespace: &body.namespace,
+            owner: &body.owner,
+            commit_document_count: body.commit_document_count,
+            commit_document_commitment_sha256: &body.commit_document_commitment_sha256,
+            commit_documents_sha256: &body.commit_documents_sha256,
+            vector_input_count: body.vector_input_count,
+            vector_input_commitment_sha256: &body.vector_input_commitment_sha256,
+            vector_inputs_sha256: &body.vector_inputs_sha256,
+            truncated_message_count: body.truncated_message_count,
+        }
+    }
+
+    fn canonical_bytes(&self) -> HistoryGenerationResult<Vec<u8>> {
+        serde_json::to_vec(self)
+            .map_err(|error| corrupt(format!("generation id preimage cannot be encoded: {error}")))
+    }
+}
+
 /// The generation manifest as persisted: the body plus its derived id.
 ///
 /// The body is a nested object rather than a flattened one on purpose: the
-/// id's preimage is the body's canonical bytes, so the body must serialize
-/// identically whether it is being hashed or persisted, and `serde(flatten)`
-/// is incompatible with the `deny_unknown_fields` posture the rest of this
+/// id's preimage is a canonical serialization of the body's content-bearing
+/// fields, so the body must keep one unambiguous field layout whether it is
+/// being projected for hashing or persisted, and `serde(flatten)` is
+/// incompatible with the `deny_unknown_fields` posture the rest of this
 /// format uses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -606,8 +664,11 @@ fn put_owner(hasher: &mut Sha256, owner: &HistoryGenerationOwnerV1) {
 fn derive_generation_id(
     body: &HistoryGenerationBodyV1,
 ) -> HistoryGenerationResult<HistoryGenerationIdV1> {
-    let canonical = serde_json::to_vec(body)
-        .map_err(|error| corrupt(format!("generation body cannot be encoded: {error}")))?;
+    // The preimage view, NOT the whole body: the `source_*` evidence fields
+    // are provenance and must not shift identity (D-039). Two construction
+    // sites (pre-replacement scan, live refresh) and every future schema
+    // bump re-derive the same id for the same carried content.
+    let canonical = HistoryGenerationIdPreimageV1::of(body).canonical_bytes()?;
     let mut hasher = Sha256::new();
     put_field(&mut hasher, GENERATION_ID_DOMAIN);
     put_field(&mut hasher, body.namespace.as_str().as_bytes());
@@ -761,9 +822,14 @@ impl HistoryGenerationStore {
     /// Create the generation, or return the identical one already on disk.
     ///
     /// Identity is content-addressed, so an existing directory under the
-    /// derived id can only hold the same bytes; it is loaded and validated
+    /// derived id can only hold the same CONTENT; it is loaded and validated
     /// rather than rewritten. That is what makes re-materialization
-    /// idempotent and byte-identical instead of a remint.
+    /// idempotent and byte-identical instead of a remint. The existing
+    /// manifest's `source_*` evidence may legitimately differ from this
+    /// input's (the same history observed from another source: an earlier
+    /// schema's scan, a live refresh); evidence is outside the id preimage
+    /// (D-039), the first writer's evidence is retained, and the caller gets
+    /// the on-disk record.
     pub fn create_or_open(
         &self,
         input: HistoryGenerationInputV1,
@@ -829,9 +895,19 @@ impl HistoryGenerationStore {
         let directory = self.generation_dir(&id);
         if directory.join(GENERATION_MANIFEST_FILE).exists() {
             let existing = self.load(&id)?;
-            if existing != record {
-                // Unreachable while ids stay content-addressed; if it ever
-                // fires the store is corrupt, not merely stale.
+            // Compare identity content, NOT whole records: the manifest's
+            // `source_*` evidence is allowed to differ (same history observed
+            // from another source), while the rows and every preimage field
+            // must agree. Unreachable while ids stay content-addressed; if it
+            // ever fires the store is corrupt, not merely stale.
+            let existing_preimage =
+                HistoryGenerationIdPreimageV1::of(&existing.manifest.body).canonical_bytes()?;
+            let record_preimage =
+                HistoryGenerationIdPreimageV1::of(&record.manifest.body).canonical_bytes()?;
+            if existing_preimage != record_preimage
+                || existing.commit_documents != record.commit_documents
+                || existing.vector_inputs != record.vector_inputs
+            {
                 return Err(identity_error(
                     "existing generation disagrees with its content-addressed identity",
                 ));
@@ -1830,6 +1906,66 @@ mod tests {
         assert_eq!(first.id, second.id);
         assert_eq!(first, second);
         assert!(first.id.as_str().starts_with("rhg_"));
+    }
+
+    #[test]
+    fn source_evidence_drift_re_derives_the_same_id_and_keeps_first_writer_evidence() {
+        // D-039: the id is a pure content address. The same carried history
+        // observed under a different schema marker, schema fingerprint, and
+        // index fingerprint (the next schema bump's scan, or the live-refresh
+        // constant marker) must re-derive the SAME id, open the existing
+        // generation, and retain the first writer's evidence.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = HistoryGenerationStore::open_for_index(&root.join("index")).unwrap();
+        let documents = vec![
+            document("ns1", "a".repeat(40).as_str(), "first"),
+            document("ns1", "b".repeat(40).as_str(), "second"),
+        ];
+        let first = store
+            .create_or_open(input("ns1", documents.clone()))
+            .unwrap();
+
+        let mut drifted = input("ns1", documents);
+        drifted.source_schema_version = "v999".to_string();
+        drifted.source_schema_fingerprint_sha256 = "f".repeat(64);
+        drifted.source_index_fingerprint_sha256 =
+            "blackbox.repo-history-generation.live-refresh.v1".to_string();
+        let second = store.create_or_open(drifted).unwrap();
+
+        assert_eq!(first.id, second.id);
+        // First writer wins on provenance: the on-disk record is returned
+        // unchanged, still carrying the original evidence.
+        assert_eq!(second, first);
+        assert_eq!(
+            second.manifest.body.source_schema_version,
+            INDEX_SCHEMA_VERSION.to_string()
+        );
+    }
+
+    #[test]
+    fn content_drift_still_changes_the_id() {
+        // The evidence exclusion must not weaken content addressing: any
+        // change to the carried rows still mints a different id.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = HistoryGenerationStore::open_for_index(&root.join("index")).unwrap();
+        let base = store
+            .create_or_open(input(
+                "ns1",
+                vec![document("ns1", &"a".repeat(40), "first")],
+            ))
+            .unwrap();
+        let grown = store
+            .create_or_open(input(
+                "ns1",
+                vec![
+                    document("ns1", &"a".repeat(40), "first"),
+                    document("ns1", &"b".repeat(40), "second"),
+                ],
+            ))
+            .unwrap();
+        assert_ne!(base.id, grown.id);
     }
 
     #[test]
