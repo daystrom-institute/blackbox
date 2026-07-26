@@ -3919,7 +3919,14 @@ impl CodeSourceStore {
     /// Persist a catalog-mode v2 activation record through the mutation mutex
     /// and anchor lock via `atomic_write_json` to the existing
     /// `activations/<project_id>.json` path (section 5.2 item 5).
+    ///
+    /// Refuses on a bridge-mode store (section 4.9): catalog APIs accept
+    /// only strict v2 protected records, and a bridge store must never
+    /// accept v2 writes even though its read paths already refuse them.
     pub fn save_activation_v2(&self, activation: &ActivationRecordV2) -> Result<()> {
+        if self.shared.record_mode == RuntimeRecordMode::BridgeV1 {
+            bail!("error.code_source_record_mode: bridge store refuses v2 activation writes");
+        }
         let _guard = self.lock_mutation()?;
         self.save_activation_v2_locked(activation)
     }
@@ -4038,13 +4045,21 @@ impl CodeSourceStore {
     /// Write the typed cutback state onto the project's v2 activation record
     /// under catalog mode, updating both `cutback` and the derived
     /// `cutback_pending` mirror in one atomic write (section 5.2 item 5).
+    ///
+    /// Refuses on a bridge-mode store (section 4.9) and bails with a typed
+    /// error when no activation record exists for the project: the reducer
+    /// only marks cutback state on projects with an active collected
+    /// activation, so a missing record is a lost-record invariant violation.
     pub fn mark_cutback_state(&self, project_id: &str, cutback: CutbackStateV2) -> Result<()> {
+        if self.shared.record_mode == RuntimeRecordMode::BridgeV1 {
+            bail!("error.code_source_record_mode: bridge store refuses v2 activation writes");
+        }
         let _guard = self.lock_mutation()?;
         cutback
             .validate()
             .map_err(|error| anyhow!("error.code_source_cutback_state: {error}"))?;
         let Some(mut record) = self.load_activation_v2_locked(project_id)? else {
-            return Ok(());
+            bail!("error.code_source_cutback_state: no activation record for project {project_id}");
         };
         let derived_pending = !matches!(cutback, CutbackStateV2::Terminal { .. });
         record.cutback = Some(cutback);
@@ -9215,6 +9230,68 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("code_source_cutback_state"), "{err}");
+    }
+
+    #[test]
+    fn save_activation_v2_refuses_on_bridge_mode_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let bridge =
+            CodeSourceStore::open(root.join("code-sources"), StoreLimits::default()).unwrap();
+        assert_eq!(bridge.record_mode(), RuntimeRecordMode::BridgeV1);
+        let generation = sample_v2_generation();
+        let activation = sample_v2_activation(&generation);
+        let err = bridge
+            .save_activation_v2(&activation)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("code_source_record_mode"), "{err}");
+        assert!(err.contains("refuses v2 activation writes"), "{err}");
+    }
+
+    #[test]
+    fn mark_cutback_state_refuses_on_bridge_mode_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let bridge =
+            CodeSourceStore::open(root.join("code-sources"), StoreLimits::default()).unwrap();
+        let err = bridge
+            .mark_cutback_state(
+                "project-a",
+                CutbackStateV2::Structural {
+                    reason: CutbackReason::NoLocalAttachment,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("code_source_record_mode"), "{err}");
+        assert!(err.contains("refuses v2 activation writes"), "{err}");
+    }
+
+    #[test]
+    fn mark_cutback_state_errors_on_missing_activation_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = CodeSourceStore::open_with_mode(
+            root.join("code-sources"),
+            StoreLimits::default(),
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap();
+        let err = store
+            .mark_cutback_state(
+                "project-a",
+                CutbackStateV2::Structural {
+                    reason: CutbackReason::NoLocalAttachment,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("code_source_cutback_state"), "{err}");
+        assert!(
+            err.contains("no activation record for project project-a"),
+            "{err}"
+        );
     }
 
     #[test]
