@@ -29,3 +29,6 @@ all of that work.
 - [Durable project catalog Phase 1 implementation plan](durable-project-catalog-phase1-impl.md)
 - [Durable project catalog Phase 2 implementation plan](durable-project-catalog-phase2-impl.md)
 - [Durable project catalog Phase 3 implementation plan](durable-project-catalog-phase3-impl.md)
+- [Durable project catalog Phase 4 implementation plan](durable-project-catalog-phase4-impl.md)
+- [Durable project catalog Phase 5 implementation plan](durable-project-catalog-phase5-impl.md)
+- [Durable project catalog Phase 6 implementation plan](durable-project-catalog-phase6-impl.md)
