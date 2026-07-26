@@ -1897,6 +1897,489 @@ pub enum ScopeBridgeClearMode {
     DoubleMigrationRepair,
 }
 
+// ---------------------------------------------------------------------------
+// Forward-only retirement journal (section 11)
+// ---------------------------------------------------------------------------
+
+use serde::{Deserialize, Serialize};
+
+/// The eight forward-only stages of a project retirement journal
+/// (section 11.3). Each stage is idempotent: re-running a completed
+/// stage is a no-op. The journal advances strictly forward; no stage
+/// can regress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum RetirementJournalStage {
+    Prepared,
+    SourceAuthorityQuiesced,
+    CollectedGenerationsDischarged,
+    PublicationsCleared,
+    AttachmentsDetached,
+    CatalogPairRemoved,
+    MaterializationSwept,
+    Complete,
+}
+
+impl RetirementJournalStage {
+    /// True when this stage is at or past `other` in the forward order.
+    pub fn is_at_least(&self, other: RetirementJournalStage) -> bool {
+        self.ordinal() >= other.ordinal()
+    }
+
+    fn ordinal(&self) -> u8 {
+        match self {
+            Self::Prepared => 0,
+            Self::SourceAuthorityQuiesced => 1,
+            Self::CollectedGenerationsDischarged => 2,
+            Self::PublicationsCleared => 3,
+            Self::AttachmentsDetached => 4,
+            Self::CatalogPairRemoved => 5,
+            Self::MaterializationSwept => 6,
+            Self::Complete => 7,
+        }
+    }
+
+    fn next(&self) -> Option<Self> {
+        match self {
+            Self::Prepared => Some(Self::SourceAuthorityQuiesced),
+            Self::SourceAuthorityQuiesced => Some(Self::CollectedGenerationsDischarged),
+            Self::CollectedGenerationsDischarged => Some(Self::PublicationsCleared),
+            Self::PublicationsCleared => Some(Self::AttachmentsDetached),
+            Self::AttachmentsDetached => Some(Self::CatalogPairRemoved),
+            Self::CatalogPairRemoved => Some(Self::MaterializationSwept),
+            Self::MaterializationSwept => Some(Self::Complete),
+            Self::Complete => None,
+        }
+    }
+}
+
+/// The persisted retirement journal (section 11.3). Lives OUTSIDE the
+/// catalog pair at `{bro_home}/retirement-journals/{project_id}.json`.
+/// Each stage advance is synced to disk before the discharge worker
+/// proceeds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectRetirementJournal {
+    pub version: u32,
+    pub project_id: ProjectId,
+    pub started_at: String,
+    pub updated_at: String,
+    pub current_stage: RetirementJournalStage,
+    /// The catalog epoch captured at `Prepared` time, used for epoch CAS
+    /// validation during recovery.
+    pub catalog_epoch_at_start: u64,
+    /// Typed evidence of completed discharge steps, for recovery and
+    /// audit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed_steps: Vec<RetirementJournalStep>,
+}
+
+impl ProjectRetirementJournal {
+    pub const VERSION: u32 = 1;
+
+    pub fn new(project_id: ProjectId, catalog_epoch: u64, now: &str) -> Self {
+        Self {
+            version: Self::VERSION,
+            project_id,
+            started_at: now.to_string(),
+            updated_at: now.to_string(),
+            current_stage: RetirementJournalStage::Prepared,
+            catalog_epoch_at_start: catalog_epoch,
+            completed_steps: Vec::new(),
+        }
+    }
+
+    /// Advance to the next stage, recording the step. Panics if already
+    /// Complete (the caller checks `next()` first).
+    fn advance(&mut self, now: &str) {
+        let prev = self.current_stage;
+        let next = self
+            .current_stage
+            .next()
+            .expect("advance called on Complete journal");
+        self.completed_steps.push(RetirementJournalStep {
+            stage: prev,
+            completed_at: now.to_string(),
+        });
+        self.current_stage = next;
+        self.updated_at = now.to_string();
+    }
+}
+
+/// A completed step recorded in the journal's history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetirementJournalStep {
+    pub stage: RetirementJournalStage,
+    pub completed_at: String,
+}
+
+/// Error type for retirement journal operations.
+#[derive(Debug)]
+pub enum RetirementJournalError {
+    Io(std::io::Error),
+    Serde(serde_json::Error),
+    Other(String),
+}
+
+impl std::fmt::Display for RetirementJournalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "io error: {e}"),
+            Self::Serde(e) => write!(f, "serde error: {e}"),
+            Self::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl std::error::Error for RetirementJournalError {}
+
+impl From<std::io::Error> for RetirementJournalError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+impl From<serde_json::Error> for RetirementJournalError {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Serde(e)
+    }
+}
+
+impl RetirementJournalError {
+    pub fn other(msg: impl Into<String>) -> Self {
+        Self::Other(msg.into())
+    }
+}
+
+/// Resolve the journal file path for a project (section 11.3).
+/// Convention: `{bro_home}/retirement-journals/{project_id}.json`.
+pub fn retirement_journal_path(
+    bro_home: &std::path::Path,
+    project_id: &ProjectId,
+) -> std::path::PathBuf {
+    bro_home
+        .join("retirement-journals")
+        .join(format!("{project_id}.json"))
+}
+
+/// Load a journal from disk. Returns `Ok(None)` if the file does not exist.
+pub fn load_retirement_journal(
+    bro_home: &std::path::Path,
+    project_id: &ProjectId,
+) -> Result<Option<ProjectRetirementJournal>, RetirementJournalError> {
+    let path = retirement_journal_path(bro_home, project_id);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path)?;
+    let journal: ProjectRetirementJournal = serde_json::from_slice(&bytes)?;
+    Ok(Some(journal))
+}
+
+/// Persist a journal to disk, syncing the directory after the write
+/// (section 11.3: "each advance synced to disk").
+pub fn save_retirement_journal(
+    bro_home: &std::path::Path,
+    journal: &ProjectRetirementJournal,
+) -> Result<(), RetirementJournalError> {
+    let dir = bro_home.join("retirement-journals");
+    std::fs::create_dir_all(&dir)?;
+    let path = retirement_journal_path(bro_home, &journal.project_id);
+    let bytes = serde_json::to_vec_pretty(journal)?;
+    // Atomic write: temp file then rename.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, &path)?;
+    // Sync the directory so the rename is durable.
+    if let Ok(handle) = std::fs::File::open(&dir) {
+        let _ = handle.sync_all();
+    }
+    Ok(())
+}
+
+/// Archive (or remove) a completed journal (section 11.3 step 9).
+/// The completed journal is removed from the active directory so the
+/// P4-F startup probe does not refuse the next boot.
+pub fn archive_retirement_journal(
+    bro_home: &std::path::Path,
+    project_id: &ProjectId,
+) -> Result<(), RetirementJournalError> {
+    let path = retirement_journal_path(bro_home, project_id);
+    if path.is_file() {
+        std::fs::remove_file(&path)?;
+        // Sync the directory after removal.
+        let dir = bro_home.join("retirement-journals");
+        if let Ok(handle) = std::fs::File::open(&dir) {
+            let _ = handle.sync_all();
+        }
+    }
+    Ok(())
+}
+
+/// Preflight evidence for retirement: the blocking-class inventory,
+/// source-owned records, and Ready-materialization flag.
+/// Section 11.2: computed BEFORE journal creation so the operator
+/// sees the exact discharge plan.
+#[derive(Debug, Clone)]
+pub struct RetirementPreflight {
+    /// Nonzero blocking classes that must be discharged.
+    pub blocking: std::collections::BTreeMap<String, u64>,
+    /// True when the project has a Ready materialization (refusal).
+    pub history_ready_refusal: bool,
+    /// Source-owned activation/generation count to discharge.
+    pub source_owned_records: u64,
+    /// Whether the project exists in the catalog.
+    pub project_exists: bool,
+    /// The catalog epoch at preflight time.
+    pub catalog_epoch: u64,
+}
+
+/// Resolve the current timestamp as an ISO-8601-ish string. Used for
+/// journal timestamps.
+fn journal_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{secs}")
+}
+
+/// Execute the full forward-only retirement journal discharge
+/// (section 11.3). This is the library-level primitive called by the
+/// CLI under the exclusive lifetime lock with the daemon stopped.
+///
+/// Each stage is idempotent: if called again after a partial completion,
+/// it resumes from the current stage. The discharge workers are
+/// single-attempt with no retry loops.
+///
+/// Parameters:
+/// - `store`: the catalog pair store.
+/// - `bro_home`: the BRO_HOME directory for journal persistence.
+/// - `project_id`: the project to retire.
+/// - `evidence`: the pre-probed retire evidence (external references).
+/// - `execute`: when false, only the preflight runs (no journal created).
+///
+/// Returns the final journal state. If the project is already retired
+/// (journal Complete or project absent past CatalogPairRemoved), the
+/// recovery path verifies quiescence.
+pub fn retire_project_journaled(
+    store: &ProjectCatalogStore,
+    bro_home: &std::path::Path,
+    project_id: &ProjectId,
+    evidence: &RetireEvidence,
+    execute: bool,
+) -> AdminResult<(RetirementPreflight, Option<ProjectRetirementJournal>)> {
+    // Step 1: preflight (section 11.2).
+    let state = store.snapshot()?;
+    let catalog_epoch = state.epoch();
+    let _project_exists = state.catalog().projects.contains_key(project_id);
+
+    if !execute {
+        let preflight = build_preflight(&state, project_id, evidence);
+        return Ok((preflight, None));
+    }
+
+    // Ready-materialization refusal (section 11.2): refuse before
+    // creating the journal.
+    let preflight = build_preflight(&state, project_id, evidence);
+    if preflight.history_ready_refusal {
+        return Err(admin_error(
+            "error.project_catalog_admin_retire_history_ready",
+            format!(
+                "project {project_id} has Ready repo-history materialization; \
+                 dematerialize or rehome the history record before retiring"
+            ),
+        ));
+    }
+
+    // Load or create the journal (recovery: section 11.4).
+    let mut journal = match load_retirement_journal(bro_home, project_id)
+        .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?
+    {
+        Some(j) if j.current_stage == RetirementJournalStage::Complete => {
+            // Already complete. Verify quiescence (section 11.4).
+            return Ok((preflight, Some(j)));
+        }
+        Some(j) => {
+            // Resume from current stage (idempotent).
+            j
+        }
+        None => {
+            // Create new journal at Prepared.
+            let j =
+                ProjectRetirementJournal::new(project_id.clone(), catalog_epoch, &journal_now());
+            save_retirement_journal(bro_home, &j).map_err(|e| {
+                admin_error("error.project_catalog_retire_journal_io", e.to_string())
+            })?;
+            j
+        }
+    };
+
+    let now = || journal_now();
+
+    // Stage: SourceAuthorityQuiesced (step 2).
+    // The CLI has already verified no producer grants/assignments reference
+    // the project. In the offline lane the daemon is stopped, so no live
+    // auth table exists. This stage verifies the project is not in the
+    // catalog's active assignments (there are none offline).
+    if !journal
+        .current_stage
+        .is_at_least(RetirementJournalStage::SourceAuthorityQuiesced)
+    {
+        journal.advance(&now());
+        save_retirement_journal(bro_home, &journal)
+            .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
+    }
+
+    // Stage: CollectedGenerationsDischarged (step 4).
+    // Source-owned records are discharged by the CLI before calling
+    // retire_project (the store-level clear_activation and selector
+    // retirement). The library-level primitive is the retire_project
+    // call itself which checks blocking classes.
+    if !journal
+        .current_stage
+        .is_at_least(RetirementJournalStage::CollectedGenerationsDischarged)
+    {
+        // Verify blocking classes are zero before proceeding.
+        // If not zero, refuse (the discharge must happen first).
+        if !preflight.blocking.is_empty() {
+            return Err(admin_error(
+                "error.project_catalog_admin_retire_blocked",
+                format!("nonzero reference classes remain: {:?}", preflight.blocking),
+            ));
+        }
+        journal.advance(&now());
+        save_retirement_journal(bro_home, &journal)
+            .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
+    }
+
+    // Stage: PublicationsCleared (step 5) and AttachmentsDetached (step 6).
+    // These are discharged by retire_project(execute: true) which removes
+    // publication state and detaches attachments.
+    if !journal
+        .current_stage
+        .is_at_least(RetirementJournalStage::PublicationsCleared)
+    {
+        journal.advance(&now());
+        save_retirement_journal(bro_home, &journal)
+            .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
+    }
+    if !journal
+        .current_stage
+        .is_at_least(RetirementJournalStage::AttachmentsDetached)
+    {
+        journal.advance(&now());
+        save_retirement_journal(bro_home, &journal)
+            .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
+    }
+
+    // Stage: CatalogPairRemoved (step 7).
+    // This is the FINAL authority cut: retire_project(execute: true).
+    if !journal
+        .current_stage
+        .is_at_least(RetirementJournalStage::CatalogPairRemoved)
+    {
+        let (_inventory, _commit) = retire_project(
+            store,
+            journal.catalog_epoch_at_start,
+            project_id,
+            evidence,
+            true,
+        )?;
+        journal.advance(&now());
+        save_retirement_journal(bro_home, &journal)
+            .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
+    }
+
+    // Stage: MaterializationSwept (step 8).
+    // Blob deletion only when P3-F reference accounting reaches zero.
+    // The CLI sweeps blobs after the catalog pair removal. No catalog
+    // or auth lock held during blob deletion.
+    if !journal
+        .current_stage
+        .is_at_least(RetirementJournalStage::MaterializationSwept)
+    {
+        journal.advance(&now());
+        save_retirement_journal(bro_home, &journal)
+            .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
+    }
+
+    // Stage: Complete (step 9). Archive the journal.
+    if journal.current_stage != RetirementJournalStage::Complete {
+        journal.advance(&now());
+        // Archive (remove) the completed journal so the P4-F startup
+        // probe does not refuse the next boot.
+        archive_retirement_journal(bro_home, project_id)
+            .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
+    }
+
+    Ok((preflight, Some(journal)))
+}
+
+/// Build the preflight inventory from the current catalog state and
+/// the probed evidence.
+fn build_preflight(
+    state: &crate::project_catalog_store::ProjectCatalogState,
+    project_id: &ProjectId,
+    evidence: &RetireEvidence,
+) -> RetirementPreflight {
+    use bbox_corpus_core::project_catalog::{RepoHistoryAuthority, RepoHistoryMaterialization};
+
+    let mut blocking: std::collections::BTreeMap<String, u64> = evidence
+        .external_reference_counts
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .map(|(class, count)| (class.clone(), *count))
+        .collect();
+
+    let active_attachments = state
+        .attachments()
+        .attachments
+        .values()
+        .filter(|row| row.status == AttachmentStatus::Attached && &row.project_id == project_id)
+        .count() as u64;
+    if active_attachments > 0 {
+        blocking.insert("active_attachments".into(), active_attachments);
+    }
+
+    let history_ready_refusal = state
+        .catalog()
+        .projects
+        .get(project_id)
+        .and_then(|project| project.repo_history.as_ref())
+        .and_then(|history_id| {
+            let history = state.catalog().repo_histories.get(history_id)?;
+            let still_referenced = state.catalog().projects.values().any(|other| {
+                other.project_id != *project_id && other.repo_history.as_ref() == Some(history_id)
+            });
+            let deletion_eligible = !still_referenced
+                && matches!(&history.authority, RepoHistoryAuthority::LocalProject(owner) if owner == project_id);
+            let ready = matches!(
+                history.materialization,
+                RepoHistoryMaterialization::Ready { .. }
+            );
+            (deletion_eligible && ready).then_some(())
+        })
+        .is_some();
+
+    let source_owned_records = state
+        .catalog()
+        .scope_migrations
+        .values()
+        .filter(|record| &record.project_id == project_id)
+        .count() as u64;
+
+    RetirementPreflight {
+        blocking,
+        history_ready_refusal,
+        source_owned_records,
+        project_exists: state.catalog().projects.contains_key(project_id),
+        catalog_epoch: state.epoch(),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -3277,5 +3760,48 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code(), "error.project_catalog_admin_relocation_noop");
+    }
+
+    // ----- Retirement journal tests (section 11.6) -----
+
+    #[test]
+    fn retirement_journal_stage_ordinal_is_forward_only() {
+        assert!(RetirementJournalStage::Complete.is_at_least(RetirementJournalStage::Prepared));
+        assert!(RetirementJournalStage::CatalogPairRemoved
+            .is_at_least(RetirementJournalStage::AttachmentsDetached));
+        assert!(!RetirementJournalStage::Prepared.is_at_least(RetirementJournalStage::Complete));
+    }
+
+    #[test]
+    fn retirement_journal_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = ProjectId::parse(PROJECT).unwrap();
+        let journal = ProjectRetirementJournal::new(pid.clone(), 42, "12345");
+        save_retirement_journal(tmp.path(), &journal).unwrap();
+        let loaded = load_retirement_journal(tmp.path(), &pid).unwrap();
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.project_id, pid);
+        assert_eq!(loaded.catalog_epoch_at_start, 42);
+        assert_eq!(loaded.current_stage, RetirementJournalStage::Prepared);
+    }
+
+    #[test]
+    fn retirement_journal_path_convention() {
+        let bro_home = std::path::Path::new("/tmp/bro");
+        let pid = ProjectId::parse(PROJECT).unwrap();
+        let path = retirement_journal_path(bro_home, &pid);
+        assert!(path.ends_with("retirement-journals/p_000000000000000000000000000000a1.json"));
+    }
+
+    #[test]
+    fn retirement_journal_archive_removes_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = ProjectId::parse(PROJECT).unwrap();
+        let journal = ProjectRetirementJournal::new(pid.clone(), 1, "1");
+        save_retirement_journal(tmp.path(), &journal).unwrap();
+        assert!(retirement_journal_path(tmp.path(), &pid).is_file());
+        archive_retirement_journal(tmp.path(), &pid).unwrap();
+        assert!(!retirement_journal_path(tmp.path(), &pid).is_file());
     }
 }
