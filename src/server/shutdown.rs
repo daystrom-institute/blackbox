@@ -111,6 +111,12 @@ async fn serve_with_grace_period(
 }
 
 fn persist_shutdown_state(shared: Arc<SharedState>, store_dir: PathBuf) {
+    // Signal the cutback reconciler background task to drain and exit
+    // (P4-D section 8.1 item 1) before durable flushes.
+    shared
+        .reconciler_shutdown
+        .read()
+        .store(true, std::sync::atomic::Ordering::Release);
     embed_queue::shutdown();
     // Block until durable: shutdown must not race the persist actor's thread.
     crate::orchestration::flush_persist_blocking(&shared.task_store, &store_dir);

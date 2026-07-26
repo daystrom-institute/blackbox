@@ -603,6 +603,9 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         reindex_dirty,
         code_read_view: RwLock::new(Arc::new(code_read_view)),
         code_sources,
+        reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        )),
         edge_rebuild_nudge_tx,
         edge_rebuild_nudge_rx: std::sync::Mutex::new(Some(edge_rebuild_nudge_rx)),
         path_cache: RwLock::new(path_cache::PathCache::default()),

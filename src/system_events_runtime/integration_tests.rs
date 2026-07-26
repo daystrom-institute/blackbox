@@ -145,6 +145,9 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         code_sources: Arc::new(crate::server::code_source::CodeSourceRuntime::for_test(
             tmp.path(),
         )),
+        reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        )),
         edge_rebuild_nudge_tx: std::sync::mpsc::sync_channel(1).0,
         edge_rebuild_nudge_rx: std::sync::Mutex::new(None),
         path_cache: RwLock::new(path_cache::PathCache::default()),

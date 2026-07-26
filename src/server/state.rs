@@ -175,6 +175,9 @@ pub(crate) struct SharedState {
     pub(crate) reindex_dirty: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) code_read_view: RwLock<Arc<CodeReadView>>,
     pub(crate) code_sources: Arc<super::code_source::CodeSourceRuntime>,
+    /// Shutdown flag for the cutback reconciler background task (P4-D).
+    /// `None` in bridge mode (no reconciler spawned).
+    pub(crate) reconciler_shutdown: parking_lot::RwLock<Arc<std::sync::atomic::AtomicBool>>,
     /// Out-of-band wake for the edge-index rebuild watcher. Async tool
     /// handlers whose store mutations change projected edges (bbox_thread
     /// link, project unregister) nudge instead of rebuilding inline — a
@@ -772,6 +775,9 @@ impl SharedState {
                 git_overlays: BTreeMap::new(),
             })),
             code_sources: Arc::new(super::code_source::CodeSourceRuntime::for_test(store_dir)),
+            reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            )),
             edge_rebuild_nudge_tx,
             edge_rebuild_nudge_rx: std::sync::Mutex::new(Some(edge_rebuild_nudge_rx)),
             path_cache: RwLock::new(path_cache::PathCache::default()),

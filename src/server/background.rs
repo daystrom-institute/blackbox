@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::Result<()> {
     super::code_source::resume_pending_activations(shared.clone());
+    super::code_source::spawn_reconciler(&shared);
     super::code_source::spawn_store_maintenance(&shared)?;
     install_badgey_adapter(&shared);
     configure_dispatch_path_env();
