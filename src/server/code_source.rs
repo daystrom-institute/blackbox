@@ -1518,6 +1518,15 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>) {
                         effective_scope.as_ref(),
                     );
 
+                    // Automatic bridge-clear (section 9.5): if the project
+                    // has a non-null code_bridge_generation but the bridge
+                    // is no longer open (effective scope is the new scope),
+                    // trigger the transact to null it before evaluating the
+                    // reduction table.
+                    if !bridge_open {
+                        try_automatic_bridge_clear(&state_for_task, &project_id);
+                    }
+
                     let action = evaluate_reduction(
                         desired,
                         effective,
@@ -2441,6 +2450,85 @@ fn check_bridge_open_for_reducer(
         .filter(|r| r.project_id.as_str() == project_id)
         .collect();
     is_bridge_open(&records, effective_generation_id, effective_scope)
+}
+
+/// Attempt the automatic bridge-clear transaction (section 9.5).
+///
+/// When the reconciler detects that a project has a non-null
+/// `code_bridge_generation` but the open-bridge predicate is false
+/// (effective scope is the new scope, not the old scope named in the
+/// record), trigger a transact nulling `code_bridge_generation` on the
+/// record. This fires exactly once: the first new-scope activation
+/// that makes the open-bridge predicate false.
+///
+/// Returns true if the bridge was cleared (or was already clear).
+fn try_automatic_bridge_clear(state: &Arc<SharedState>, project_id: &str) -> bool {
+    use bbox_corpus_core::project_catalog::ProjectScope;
+    use bbox_indexing::project_catalog_admin::{ScopeBridgeClearMode, clear_scope_bridge};
+    let Some(catalog_store) = state.project_authority.catalog_store() else {
+        return false;
+    };
+    let Ok(snapshot) = catalog_store.snapshot() else {
+        return false;
+    };
+    let epoch = snapshot.epoch();
+    let catalog = snapshot.catalog();
+    // Find bridge-bearing records for this project.
+    let bridge_records: Vec<_> = catalog
+        .scope_migrations
+        .values()
+        .filter(|r| r.project_id.as_str() == project_id && r.code_bridge_generation.is_some())
+        .collect();
+    if bridge_records.is_empty() {
+        return true; // no bridge to clear
+    }
+    // Check if the effective activation's scope matches the migration
+    // record's new_scope. If so, the bridge is stale and can be cleared.
+    let Ok(pid) = bbox_corpus_core::project_catalog::ProjectId::parse(project_id.to_string())
+    else {
+        return false;
+    };
+    let project_scope = catalog.projects.get(&pid).map(|p| &p.scope);
+    let Some(ProjectScope::Published(current_scope)) = project_scope else {
+        return false; // project not in published state
+    };
+    // The bridge is clearable when the newest bridge record's new_scope
+    // matches the current project scope (meaning the new scope is active).
+    let newest = bridge_records.iter().max_by_key(|r| r.catalog_epoch);
+    let Some(record) = newest else {
+        return false;
+    };
+    let bridge_is_stale = match &record.new_scope {
+        ProjectScope::Published(new_scope) => new_scope == current_scope,
+        ProjectScope::LegacyLocal => false,
+    };
+    if !bridge_is_stale {
+        return false;
+    }
+    // Trigger the bridge-clear transaction.
+    match clear_scope_bridge(
+        &catalog_store,
+        epoch,
+        &pid,
+        ScopeBridgeClearMode::DanglingReference,
+    ) {
+        Ok(_) => {
+            tracing::info!(
+                project_id = project_id,
+                epoch,
+                "automatic bridge-clear: nulled code_bridge_generation"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                project_id = project_id,
+                %error,
+                "automatic bridge-clear transaction failed"
+            );
+            false
+        }
+    }
 }
 
 /// Probe the attachment ladder for a project without committing to a
@@ -7148,5 +7236,71 @@ mod tests {
         assert_eq!(drained[0].epoch, 42);
         assert_eq!(drained[0].changed_project_ids, ids);
         assert!(!observer.has_events());
+    }
+
+    // P4-E commit (c): bridge-clear and scope-migrate refusal tests.
+
+    #[test]
+    fn p4e_scope_migrate_refuses_second_migration_with_open_bridge() {
+        use bbox_corpus_core::project_catalog::ScopeMigrationRecord;
+
+        // Build a minimal catalog with one bridge-bearing record.
+        let record = ScopeMigrationRecord {
+            scope_migration_id: bbox_corpus_core::project_catalog::ScopeMigrationId::mint(),
+            project_id: ProjectId::parse("p_bridge_refuse_test_000001").unwrap(),
+            catalog_epoch: 1,
+            authority_provenance: bbox_corpus_core::project_catalog::ScopeMigrationAuthorityProvenance::AttachmentProved,
+            operator_invocation: "test".into(),
+            operator_reason: None,
+            old_scope: ProjectScope::Published(
+                PublishedScope::try_new("old-repo", ".").unwrap(),
+            ),
+            new_scope: ProjectScope::Published(
+                PublishedScope::try_new("new-repo", ".").unwrap(),
+            ),
+            kind: bbox_corpus_core::project_catalog::ScopeMigrationKind::RelpathMove,
+            migrated_at: "2024-01-01T00:00:00Z".into(),
+            code_bridge_generation: Some("gen-bridge-123".into()),
+            publication_bridge_generation: None,
+            pending_capabilities: Default::default(),
+        };
+
+        // Verify the record has an open bridge.
+        let records: Vec<&ScopeMigrationRecord> = vec![&record];
+        assert!(is_bridge_open(
+            &records,
+            "gen-bridge-123",
+            Some(&PublishedScope::try_new("old-repo", ".").unwrap())
+        ));
+        // Different generation: not open.
+        assert!(!is_bridge_open(
+            &records,
+            "gen-other",
+            Some(&PublishedScope::try_new("old-repo", ".").unwrap())
+        ));
+        // Different scope: not open.
+        assert!(!is_bridge_open(
+            &records,
+            "gen-bridge-123",
+            Some(&PublishedScope::try_new("new-repo", ".").unwrap())
+        ));
+        // No bridge generation: not open.
+        let mut no_bridge = record.clone();
+        no_bridge.code_bridge_generation = None;
+        let no_bridge_refs: Vec<&ScopeMigrationRecord> = vec![&no_bridge];
+        assert!(!is_bridge_open(&no_bridge_refs, "gen-bridge-123", None));
+    }
+
+    #[test]
+    fn p4e_scope_bridge_clear_mode_enum_round_trips() {
+        use bbox_indexing::project_catalog_admin::ScopeBridgeClearMode;
+        assert_eq!(
+            format!("{:?}", ScopeBridgeClearMode::DanglingReference),
+            "DanglingReference"
+        );
+        assert_eq!(
+            format!("{:?}", ScopeBridgeClearMode::DoubleMigrationRepair),
+            "DoubleMigrationRepair"
+        );
     }
 }

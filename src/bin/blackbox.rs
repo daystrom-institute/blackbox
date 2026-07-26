@@ -57,6 +57,8 @@ enum ProjectCatalogCommand {
     Alias(AliasArgs),
     /// Operator-attested unattached scope migration.
     ScopeMigrate(ScopeMigrateArgs),
+    /// Clear a stale or broken code bridge on a scope-migrated project.
+    ScopeBridgeClear(ScopeBridgeClearArgs),
     /// Inventory and optionally remove one fully discharged project.
     Retire(RetireArgs),
 }
@@ -169,6 +171,23 @@ struct ScopeMigrateArgs {
     migrated_at: String,
     /// Load the same configuration file used by blackboxd. The bridge
     /// generations are probed from the state roots it resolves.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ScopeBridgeClearArgs {
+    #[command(flatten)]
+    store: StoreArgs,
+    #[arg(long, value_name = "PROJECT_ID")]
+    project: String,
+    /// Mode 1: clear a dangling reference (named generation retired).
+    #[arg(long)]
+    dangling_reference: bool,
+    /// Mode 2: double-migration truthfulness repair (null newest bridge).
+    #[arg(long)]
+    double_migration_repair: bool,
+    /// Load the same configuration file used by blackboxd.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 }
@@ -375,6 +394,9 @@ fn command_name(cli: &Cli) -> &'static str {
             command: ProjectCatalogCommand::ScopeMigrate(_),
         }) => "project_catalog_scope_migrate_attested",
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::ScopeBridgeClear(_),
+        }) => "project_catalog_scope_bridge_clear",
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::Retire(_),
         }) => "project_catalog_retire",
     }
@@ -403,6 +425,9 @@ fn execute(cli: Cli) -> Result<serde_json::Value, CommandFailure> {
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::ScopeMigrate(args),
         }) => execute_scope_migrate(args),
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::ScopeBridgeClear(args),
+        }) => execute_scope_bridge_clear(args),
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::Retire(args),
         }) => execute_retire(args),
@@ -850,6 +875,41 @@ fn execute_scope_migrate(args: ScopeMigrateArgs) -> Result<serde_json::Value, Co
     Ok(serde_json::json!({
         "scope_migration_id": receipt.scope_migration_id.as_str(),
         "epoch": receipt.commit.epoch,
+    }))
+}
+
+fn execute_scope_bridge_clear(
+    args: ScopeBridgeClearArgs,
+) -> Result<serde_json::Value, CommandFailure> {
+    let (_lock, store) = open_admin_store(&args.store.projects_path)?;
+    let project_id = parse_project_id(&args.project)?;
+    let mode = match (args.dangling_reference, args.double_migration_repair) {
+        (true, false) => project_catalog_admin::ScopeBridgeClearMode::DanglingReference,
+        (false, true) => project_catalog_admin::ScopeBridgeClearMode::DoubleMigrationRepair,
+        (false, false) => {
+            return Err(CommandFailure::new(
+                "error.project_catalog_cli_arguments",
+                "specify exactly one of --dangling-reference or --double-migration-repair",
+            ));
+        }
+        (true, true) => {
+            return Err(CommandFailure::new(
+                "error.project_catalog_cli_arguments",
+                "--dangling-reference and --double-migration-repair are mutually exclusive",
+            ));
+        }
+    };
+    let epoch = current_epoch(&store)?;
+    let commit = project_catalog_admin::clear_scope_bridge(&store, epoch, &project_id, mode)?;
+    Ok(serde_json::json!({
+        "project_id": project_id.as_str(),
+        "mode": match mode {
+            project_catalog_admin::ScopeBridgeClearMode::DanglingReference => "dangling_reference",
+            project_catalog_admin::ScopeBridgeClearMode::DoubleMigrationRepair => {
+                "double_migration_repair"
+            }
+        },
+        "epoch": commit.epoch,
     }))
 }
 

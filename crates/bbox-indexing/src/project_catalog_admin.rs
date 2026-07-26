@@ -609,6 +609,23 @@ fn apply_scope_migration(
              the legacy-local surface",
         ));
     };
+    // Section 4.11: refuse a second scope migration while a code bridge
+    // is open for this project. An open bridge means an existing
+    // ScopeMigrationRecord carries a non-null code_bridge_generation
+    // that names a still-effective generation. A second migration would
+    // create an untruthful record (the generation's scope is the first
+    // migration's old_scope, not the second's) and an unbootable
+    // catalog.
+    let has_open_bridge = catalog.scope_migrations.values().any(|record| {
+        record.project_id == request.project_id && record.code_bridge_generation.is_some()
+    });
+    if has_open_bridge {
+        return Err(admin_error(
+            "error.project_catalog_scope_migration_bridge_open",
+            "a code bridge is open for this project; clear the bridge via \
+             new-scope activation before re-attempting the migration",
+        ));
+    }
     if current != &request.expected_old_scope {
         return Err(admin_error(
             "error.project_catalog_admin_scope_mismatch",
@@ -1673,6 +1690,18 @@ pub fn scope_migrate_attested(
                 "the project no longer carries the expected old scope",
             ));
         }
+        // Section 4.11: refuse a second scope migration while a code
+        // bridge is open for this project.
+        let has_open_bridge = catalog.scope_migrations.values().any(|record| {
+            record.project_id == request.project_id && record.code_bridge_generation.is_some()
+        });
+        if has_open_bridge {
+            return Err(admin_error(
+                "error.project_catalog_scope_migration_bridge_open",
+                "a code bridge is open for this project; clear the bridge via \
+                 new-scope activation before re-attempting the migration",
+            ));
+        }
         match request.kind {
             ScopeMigrationKind::RelpathMove => {
                 if request.new_scope.repo_id() != current.repo_id()
@@ -1758,6 +1787,114 @@ pub fn scope_migrate_attested(
         scope_migration_id: migration_id,
         commit,
     })
+}
+
+/// Bridge-clear transaction: null `code_bridge_generation` on a
+/// ScopeMigrationRecord (section 9.5).
+///
+/// This is the sole code-source-side path that mutates a migration
+/// record. It fires automatically on first new-scope activation
+/// (via the reconciler) and manually via the `scope-bridge-clear` CLI.
+///
+/// Two precondition-distinct modes:
+/// - Mode 1 (dangling-reference): the named generation is retired.
+///   Null `code_bridge_generation`.
+/// - Mode 2 (double-migration truthfulness repair): null the newest
+///   bridge-bearing record, restoring an older admitting record as
+///   the sole bridge.
+pub fn clear_scope_bridge(
+    store: &ProjectCatalogStore,
+    expected_epoch: u64,
+    project_id: &ProjectId,
+    mode: ScopeBridgeClearMode,
+) -> AdminResult<ProjectCatalogCommit> {
+    let state = store.snapshot()?;
+    if state.epoch() != expected_epoch {
+        return Err(admin_error(
+            "error.project_catalog_stale_epoch",
+            "expected epoch does not match the current catalog epoch",
+        ));
+    }
+    let catalog = state.catalog();
+    // Find bridge-bearing records for this project, sorted by catalog_epoch.
+    let mut bridge_records: Vec<_> = catalog
+        .scope_migrations
+        .values()
+        .filter(|r| r.project_id == *project_id && r.code_bridge_generation.is_some())
+        .collect();
+    bridge_records.sort_by_key(|r| r.catalog_epoch);
+    if bridge_records.is_empty() {
+        return Err(admin_error(
+            "error.project_catalog_scope_bridge_clear_no_bridge",
+            "no bridge-bearing scope migration record found for this project",
+        ));
+    }
+    let target_migration_id = match mode {
+        ScopeBridgeClearMode::DanglingReference => {
+            // Mode 1: exactly one bridge-bearing record expected.
+            // If multiple exist, target the newest (the dangling one).
+            bridge_records
+                .last()
+                .map(|r| r.scope_migration_id.clone())
+                .ok_or_else(|| {
+                    admin_error(
+                        "error.project_catalog_scope_bridge_clear_no_bridge",
+                        "no bridge-bearing record to clear",
+                    )
+                })?
+        }
+        ScopeBridgeClearMode::DoubleMigrationRepair => {
+            // Mode 2: null the newest bridge-bearing record, restoring
+            // the older one as the sole bridge. Refuses if only one
+            // bridge record exists (no older admitting record).
+            if bridge_records.len() < 2 {
+                return Err(admin_error(
+                    "error.project_catalog_scope_bridge_clear_no_double_migration",
+                    "mode 2 requires a pre-refusal double-migration state: \
+                     at least two bridge-bearing records",
+                ));
+            }
+            bridge_records
+                .last()
+                .map(|r| r.scope_migration_id.clone())
+                .ok_or_else(|| {
+                    admin_error(
+                        "error.project_catalog_scope_bridge_clear_no_bridge",
+                        "no newest bridge-bearing record to null",
+                    )
+                })?
+        }
+    };
+    let project_id_owned = project_id.clone();
+    store.transact(expected_epoch, move |catalog, _attachments| {
+        let record = catalog
+            .scope_migrations
+            .get_mut(&target_migration_id)
+            .ok_or_else(|| {
+                admin_error(
+                    "error.project_catalog_scope_bridge_clear_record_missing",
+                    "the target migration record disappeared between snapshot and transact",
+                )
+            })?;
+        if record.project_id != project_id_owned {
+            return Err(admin_error(
+                "error.project_catalog_scope_bridge_clear_project_mismatch",
+                "the target migration record belongs to a different project",
+            ));
+        }
+        record.code_bridge_generation = None;
+        Ok(())
+    })
+}
+
+/// Which bridge-clear mode to use (section 9.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeBridgeClearMode {
+    /// Mode 1: the named generation is retired (dangling reference).
+    DanglingReference,
+    /// Mode 2: double-migration truthfulness repair. Null the newest
+    /// bridge-bearing record, restoring the older admitting record.
+    DoubleMigrationRepair,
 }
 
 #[cfg(test)]
