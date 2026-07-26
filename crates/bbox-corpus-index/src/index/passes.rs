@@ -38,16 +38,57 @@ pub fn segment_count(index: &Index) -> usize {
         .unwrap_or(0)
 }
 
+/// Version marker on the persisted freshness file (Phase 3 plan section 4.6).
+///
+/// The P3-E cut rekeys project rows from the checkout absolute path to the
+/// `pf\0<project_id>\0<source_kind>\0<relative_path>` composite. An old-format
+/// file is therefore not merely stale, it is *mis-keyed*: its project rows
+/// would look like foreign absolute-path rows and be purged by path. Rows
+/// under any other version are discarded wholesale at load, which is sound
+/// only because the paired `INDEX_SCHEMA_VERSION` bump drops the index those
+/// rows described in the same release.
+pub const FILE_META_VERSION_V2: u32 = 2;
+
+#[derive(serde::Deserialize)]
+struct FileMetaFile {
+    version: u32,
+    rows: HashMap<String, FileMeta>,
+}
+
+#[derive(serde::Serialize)]
+struct FileMetaFileRef<'a> {
+    version: u32,
+    rows: &'a HashMap<String, FileMeta>,
+}
+
 pub fn load_meta(path: &Path) -> Result<HashMap<String, FileMeta>> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
     let raw = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&raw)?)
+    // A bare map is the pre-P3-E format: absolute-keyed and unversioned.
+    match serde_json::from_str::<FileMetaFile>(&raw) {
+        Ok(file) if file.version == FILE_META_VERSION_V2 => Ok(file.rows),
+        Ok(file) => {
+            tracing::info!(
+                stored_version = file.version,
+                expected_version = FILE_META_VERSION_V2,
+                "discarding index freshness rows written under a different meta version"
+            );
+            Ok(HashMap::new())
+        }
+        Err(_) => {
+            tracing::info!("discarding unversioned (pre-path-free) index freshness rows");
+            Ok(HashMap::new())
+        }
+    }
 }
 
 pub fn save_meta(path: &Path, meta: &HashMap<String, FileMeta>) -> Result<()> {
-    let raw = serde_json::to_string(meta)?;
+    let raw = serde_json::to_string(&FileMetaFileRef {
+        version: FILE_META_VERSION_V2,
+        rows: meta,
+    })?;
     let tmp_path = path.with_extension("json.tmp");
     let mut file = fs::File::create(&tmp_path)?;
     file.write_all(raw.as_bytes())?;

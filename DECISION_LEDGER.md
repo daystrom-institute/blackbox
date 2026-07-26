@@ -888,3 +888,108 @@ until a later entry explicitly supersedes it.
 - Revisit only if: Phase 6 retires the bridge lane, at which point
   `IdentityOrigin::Bridge` and the placeholder scope can be deleted with
   it.
+
+## D-035: A version bump migrates collected materializations in place
+
+- Date: 2026-07-26
+- Phase: durable project catalog, Phase 3 (P3-E schema cut)
+- Status: accepted after milestone review
+- Decision: The full-rebuild collected path classifies a persisted
+  collected selector whose materialization suffix differs from the running
+  binary's mint, for the same project and generation and with an agreeing
+  activation record, as outgoing rather than corrupt, and migrates it in
+  place: re-stage from store blobs under the current version with zero
+  leases, save the new activation record preserving cutback state
+  verbatim, flip the manifest entry under the coordinator, and enqueue the
+  outgoing selector's retirement. Every other mismatch shape keeps the
+  fail-closed bail; incremental passes preserve rather than migrate.
+- Evidence:
+  - Persisted collected selectors and snapshot ids fold the
+    materialization version; the P3-E INDEXER_VERSION bump is the first
+    since the collected lane shipped, and the pre-existing bail made the
+    first post-deploy boot fail for every project with an active collected
+    generation (the synchronous post-reset rebuild errored before the
+    activation-driven convergence path could ever run).
+  - The grounding sweep's footgun list predicted the class; four
+    plan-review rounds missed it because the plan never enumerated a
+    collected-selector materialization migration.
+  - The milestone reviewer verified the classification matrix fail-closed
+    for every non-outgoing shape, and the re-recorded document count and
+    entity inventory keep the next rebuild's preservation check satisfied.
+- Rationale: outgoing state is not corrupt; it is the deterministic
+  consequence of the version bump the release itself ships. Refusing it
+  converts every upgrade into an outage; migrating from immutable store
+  blobs preserves the zero-lease remote-only contract.
+- Revisit only if: materialization versioning moves into a
+  selector-independent read-view layer, or Phase 6 retires the persisted
+  selector shapes entirely.
+
+## D-036: The materializer proof is two-mode, gated by source fingerprint
+
+- Date: 2026-07-26
+- Phase: durable project catalog, Phase 3 (P3-E integration of the P3-D
+  materializer)
+- Status: accepted after milestone review and live forced-replacement smoke
+- Decision: prove_against_inventory selects its mode by recomputing the
+  Phase 1 capture-recipe source fingerprint over the current index through
+  the same shared fold the asset was written with. Equality mode (recorded
+  fingerprint matches recomputed) keeps exact per-namespace count and
+  commitment equality. Every other case is Drift mode: namespaces absent
+  from the asset classify normally with no asset constraint, recorded
+  namespaces must survive with observed counts at least the recorded ones,
+  and commitments are not compared because an ordered fold cannot prove
+  subset containment. A cross-namespace survival check runs in both modes.
+  The proof mode and both fingerprints are recorded in the outcome and the
+  rebuild manifest; a Phase 6 offline rebuild must require Equality mode.
+- Evidence:
+  - The live forced-replacement smoke refused on a real migrated root that
+    had been live-indexed since migration: a post-migration local
+    namespace was absent from the point-in-time asset, and growth within
+    recorded namespaces is equally legitimate for append-only history.
+  - Two pre-existing tests asserted refusal on exactly the growth a live
+    root produces; they encoded the defect and were converted.
+  - The reviewer verified the shared fold leaves one recipe with two
+    callers, the loss guards hold in both modes, and equality-mode
+    reachability is proven first in the facade-rehearsal row.
+- Rationale: the asset is a point-in-time migration record, not a
+  description of a living index. Equality is the right contract exactly
+  when the index is unchanged since migration; under drift the honest
+  provable property is that no recorded history was lost.
+- Revisit only if: the asset gains per-row content (not just fold hashes)
+  sufficient to prove subset containment, or Phase 6 changes the offline
+  rebuild's capture story.
+
+## D-037: Ready binds the primary namespace; compatibility generations are manifest-owned
+
+- Date: 2026-07-26
+- Phase: durable project catalog, Phase 3 (P3-E integration, materializer
+  addendum)
+- Status: accepted after milestone review
+- Decision: RepoHistoryRecord.materialization Ready names the generation of
+  the record's PRIMARY namespace only. Generations materialized for a
+  record's compatibility namespaces mint owned (rhg_) ids but are owned
+  durably by the rebuild manifest through a dedicated
+  compatibility_generation_ids bucket, exactly as unclaimed generations
+  are; no catalog field names them. The double-advancement refusal narrows
+  to the primary map: one advancement per record per pass, keyed to the
+  primary namespace.
+- Evidence:
+  - One record legally owns a primary plus compatibility namespaces:
+    validate_catalog enforces global uniqueness across records, not one
+    namespace per record; the runtime admin path produces the state (the
+    v1 importer cannot, because conflicting published authorities refuse
+    at preflight - the fixture documents the exact refusal chain).
+  - The prior guard comment claimed unreachability from a misreading of
+    the uniqueness invariant; the pin test made the wrongness visible.
+  - Pin continuity holds because every rebuild re-materializes the same
+    content-addressed ids into its own manifest while the documents
+    persist, and the Phase 6 strict startup check rides the committed
+    manifest it already requires together with Equality proof mode.
+- Rationale: the governing model routes all new materialization through
+  the primary namespace; compatibility namespaces are legacy-lookup
+  surfaces. A dedicated manifest bucket keeps the audit honest: a
+  generation the catalog cannot reach must not be reported as
+  catalog-owned.
+- Revisit only if: materialization becomes per-namespace catalog state, or
+  the namespace-resolution operation changes compatibility-namespace
+  ownership semantics.

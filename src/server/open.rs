@@ -246,6 +246,30 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         projects_needs_persist |= backfill_project_languages(registry, &checkout_access);
     }
 
+    // Rebuild-manifest recovery, classified BEFORE the index opens (P3-E, plan
+    // section 9 item 2). Two reasons the ordering is not cosmetic: the
+    // classifier locates itself relative to the destructive drop by reading the
+    // index's schema marker, and opening the index rewrites that marker; and a
+    // crash after the drop leaves no schema mismatch to detect, so without the
+    // resume signal below the synchronous rebuild would never run and the
+    // carried-over history would stay unmaterialized.
+    let rebuild_resume =
+        bbox_indexing::index::schema_rebuild::recover_rebuild_manifest_before_open(&index_path)
+            .context("classifying repo-history rebuild recovery")?;
+    // The injected pre-replacement guard. Catalog mode drives the P3-D
+    // materializer; bridge mode writes the commit spill. There is deliberately
+    // no third arm: an absent guard refuses the reset outright, so a future
+    // authority mode must supply one rather than inheriting a silent drop.
+    let schema_replacement_guard: bbox_corpus_index::index::schema_replacement::SchemaReplacementGuard =
+        match &catalog_store {
+            Some(store) => bbox_indexing::index::schema_rebuild::catalog_schema_replacement_guard(
+                store.clone(),
+                bbox_corpus_index::index::history_generations::HistoryScanLimitsV1::default(),
+            ),
+            None => bbox_indexing::index::schema_rebuild::bridge_schema_replacement_guard(
+                records_provider.clone(),
+            ),
+        };
     let mut idx = TranscriptIndex::open_or_create_with_code_source_store_path(
         &index_path,
         roots,
@@ -256,6 +280,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         th_path.clone(),
         rm_path.clone(),
         records_provider.clone(),
+        Some(schema_replacement_guard),
     )?;
     // Index harness session event logs (sidecar JSONL next to the resume
     // snapshots) so harness sessions are searchable like any other provider
@@ -460,15 +485,36 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     // planner's assignment view is installed here rather than passed to
     // `spawn` (same shape as the post-commit searcher hook).
     index_writer.set_producer_assignment_source(code_sources.clone());
-    if idx.schema_was_reset() {
+    // The resume arm forces the same synchronous rebuild a fresh mismatch does.
+    // After a crash that already dropped the index there is no marker left to
+    // mismatch against, so `schema_was_reset` is false and the prepared
+    // manifest is the only surviving evidence that a replacement is half done.
+    let resume_interrupted_rebuild = matches!(
+        rebuild_resume,
+        bbox_indexing::index::schema_rebuild::SchemaRebuildResume::Resume { .. }
+    );
+    if idx.schema_was_reset() || resume_interrupted_rebuild {
         tracing::info!(
             schema = crate::index::INDEX_SCHEMA_VERSION,
+            resume_interrupted_rebuild,
             "running synchronous full rebuild after index schema migration"
         );
+        // Explicit cause, not `run_reindex_pass(true, true)`: this pass runs
+        // against the index the replacement guard just authorized emptying, so
+        // the preservation gates must not verify against it. Re-staging from the
+        // proved sources is the authority here (`FullRebuildCause`).
         index_writer
-            .run_reindex_pass(true, true)
+            .run_reindex_pass_for_schema_migration()
             .context("synchronous schema-migration rebuild failed")?;
         idx.reader_reload_for_test();
+        // Re-read the selector map from the edge-sidecar manifest. The paired
+        // INDEXER_VERSION bump changes every collected selector's
+        // materialization suffix, so the rebuild above may have migrated one or
+        // more projects onto a new selector and flipped the manifest; the map
+        // seeded at open still names the outgoing one, and the read view built
+        // below would filter out exactly the documents the rebuild just staged.
+        idx.refresh_active_code_selectors()
+            .context("refreshing active code selectors after the schema-migration rebuild")?;
         idx.complete_schema_migration()
             .context("committing schema-migration version marker failed")?;
     }

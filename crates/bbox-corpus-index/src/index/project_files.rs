@@ -36,9 +36,6 @@ use bbox_corpus_core::project_record::ProjectRecord;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProjectFileCompatFields<'a> {
     pub repo_id: Option<&'a str>,
-    /// Value emitted as the `project` field. `None` renders the project id,
-    /// which is the path-free fallback collected staging now takes (F6).
-    pub project_display: Option<&'a str>,
 }
 
 /// Caller-supplied checkout roots for one project indexing operation.
@@ -114,6 +111,11 @@ pub struct ProjectIndexStats {
     pub skipped_oversize: u64,
     pub pending_local_snapshots: Vec<bbox_edge_sidecar::snapshot::PendingLocalSnapshotActivation>,
     pub publication: ProjectIndexPublicationBundle,
+    /// `project_id -> new selector` for every collected generation this pass
+    /// migrated off an outgoing materialization version. The caller republishes
+    /// the pinned selector map from it, since the in-memory map was seeded from
+    /// the pre-flip manifest.
+    pub migrated_collected_selectors: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default)]
@@ -406,6 +408,83 @@ struct ProjectFileScanStats {
 pub struct ActiveCollectedSource {
     pub selector: String,
     pub generation_id: String,
+}
+
+/// Where a project's PERSISTED collected materialization sits relative to the
+/// version the running binary mints.
+///
+/// Why this classification exists: `collected_materialization_selector` and
+/// `collected_snapshot_id` both fold `current_materialization_version()`, which
+/// folds `INDEXER_VERSION`. A version bump therefore changes the selector's
+/// `m` suffix and the snapshot id BY CONSTRUCTION, for every already-active
+/// collected generation, with nothing wrong on disk. Treating that as a refusal
+/// (which it was before P3-E) wedges the very full rebuild the paired
+/// `INDEX_SCHEMA_VERSION` bump forces at the first open after deploy, and
+/// therefore wedges boot.
+///
+/// The discriminator is whether the outgoing state is INTERNALLY CONSISTENT: a
+/// well-formed collected materialization selector for the SAME
+/// `(project_id, generation_id)`, a well-formed collected snapshot id, and an
+/// activation record that agrees with the persisted selector. Anything else -
+/// a different generation, a different project, an activation record that
+/// disagrees with the manifest, a malformed selector or snapshot id - is
+/// genuinely inconsistent and still fails closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectedMaterializationState {
+    /// The persisted selector and snapshot id are exactly what this binary
+    /// mints. Nothing to migrate.
+    Current,
+    /// Minted under an outgoing materialization version. Re-stage under the
+    /// current one and move the durable pointers with it.
+    Outgoing,
+}
+
+/// A collected snapshot id is `collected-` plus 32 lowercase hex (16 bytes),
+/// per `bbox_edge_sidecar::snapshot::collected_snapshot_id`. Shape-only: the
+/// outgoing version's digest cannot be re-derived, which is precisely why the
+/// migration arm exists.
+fn is_collected_snapshot_id_shape(value: &str) -> bool {
+    match value.strip_prefix("collected-") {
+        Some(hex) => {
+            hex.len() == 32
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase() && byte <= b'f')
+        }
+        None => false,
+    }
+}
+
+pub fn classify_collected_materialization(
+    project_id: &str,
+    active: &ActiveCollectedSource,
+    activation: &bbox_code_source_store::ActivationRecord,
+) -> Result<CollectedMaterializationState> {
+    let expected_selector = collected_materialization_selector(project_id, &active.generation_id);
+    let expected_snapshot =
+        bbox_edge_sidecar::snapshot::collected_snapshot_id(project_id, &active.generation_id);
+    if active.selector == expected_selector && activation.snapshot_id == expected_snapshot {
+        return Ok(CollectedMaterializationState::Current);
+    }
+    // A selector at the current suffix whose snapshot id is NOT current (or the
+    // reverse) cannot be an outgoing version: both derive from the same version
+    // string, so they move together or the state is corrupt.
+    if active.selector == expected_selector || activation.snapshot_id == expected_snapshot {
+        anyhow::bail!("active collected materialization version requires an explicit migration");
+    }
+    // Shape-only per `validate_collected_materialization_selector`: it accepts
+    // any historic 16-hex suffix, and pins the project and generation.
+    if bbox_code_source::validate_collected_materialization_selector(
+        project_id,
+        &active.generation_id,
+        &active.selector,
+    )
+    .is_err()
+        || !is_collected_snapshot_id_shape(&activation.snapshot_id)
+    {
+        anyhow::bail!("active collected selector requires materialization migration");
+    }
+    Ok(CollectedMaterializationState::Outgoing)
 }
 
 /// What the stale-path purge should do with one stale freshness row.
@@ -718,8 +797,11 @@ pub fn collect_preserved_collected_documents(
 }
 
 struct PendingProjectFile {
-    path_str: String,
-    absolute_path: PathBuf,
+    /// The P3-E composite freshness key (`pf\0<pid>\0<kind>\0<relpath>`), not
+    /// a host path: the meta map is keyed by it, so carrying the absolute path
+    /// here would only invite a caller to re-key by it.
+    meta_key: String,
+    relative_path: String,
     mtime: u64,
     size: u64,
     chunks: Vec<Chunk>,
@@ -733,6 +815,9 @@ struct ProjectIndexContext<'a> {
     edges_dir: &'a Path,
     git_meta_dir: &'a Path,
     force_git_full: bool,
+    /// The identity's display name, the only value the `project` field of a
+    /// project-file or commit document may carry after the P3-E cut.
+    project_display: &'a str,
 }
 
 fn project_refs_v2_enabled() -> bool {
@@ -772,6 +857,12 @@ fn ref_snapshot_id(
     ))
 }
 
+/// The pass's current freshness-key set, in the SAME key space the meta map
+/// uses: project rows carry the P3-E composite key, the `git:<project_id>`
+/// history source key stays as it was, and no absolute path appears for a
+/// project row. The purge loops diff meta keys against this set, so a mixed
+/// key space here would purge every project row on the first pass after the
+/// cut.
 pub fn scan_project_files_with_access(
     config: &ReindexConfig,
     projects: &[ProjectIndexAccess<'_>],
@@ -783,7 +874,21 @@ pub fn scan_project_files_with_access(
         if !collected.contains_key(project_id)
             && let Some(root) = access.local_root
         {
-            let _ = scan_project_files(&root, &mut files)?;
+            let mut scanned = Vec::new();
+            let _ = scan_project_files(&root, &mut scanned)?;
+            let selector = bbox_code_source::local_selector(project_id);
+            let source_kind = bbox_code_source::source_kind_for_selector(&selector);
+            files.extend(scanned.into_iter().map(|(path_str, mtime, size)| {
+                (
+                    bbox_code_source::project_file_meta_key(
+                        project_id,
+                        source_kind,
+                        &local_relative_path(root, Path::new(&path_str)),
+                    ),
+                    mtime,
+                    size,
+                )
+            }));
         }
         if access
             .project
@@ -866,10 +971,106 @@ pub fn index_projects_with_access(
             edges_dir: &edges_dir,
             git_meta_dir: &git_meta_dir,
             force_git_full,
+            project_display: access.identity.display_name.as_str(),
         };
         index_project(project, root, access.git_root, &mut ctx)?;
     }
     Ok(stats)
+}
+
+/// Move a project's durable collected pointers from an OUTGOING
+/// materialization onto the one the caller just re-staged.
+///
+/// Ordering mirrors `activate_desired_loop`'s activation transaction, which is
+/// the only other writer of these records: record the new materialization
+/// inventory, save the activation record naming the new selector and snapshot,
+/// flip the manifest entry under the manifest coordinator, then enqueue
+/// retirement of the outgoing selector.
+///
+/// The new `entity_inventory_sha256` MUST be recorded before the activation
+/// record is saved: the re-staged documents carry snapshot-qualified entity ids
+/// derived from the NEW snapshot id, so leaving the old inventory in place would
+/// make `collect_preserved_collected_documents` refuse the project on the next
+/// full rebuild.
+///
+/// Crash window, stated rather than hidden: the writer's `delete_all_documents`
+/// plus re-adds are still uncommitted here, so a failure after the manifest flip
+/// leaves the manifest naming a selector whose documents were never committed.
+/// That is self-healing, not a wedge - the next pass observes the flipped
+/// selector as `Current` and re-stages it - and it is strictly better than the
+/// alternative, since the outgoing selector's documents are already deleted in
+/// this writer and the manifest has to move for the committed index to be
+/// searchable at all.
+#[allow(clippy::too_many_arguments)]
+fn migrate_collected_materialization(
+    project_id: &str,
+    active: &ActiveCollectedSource,
+    activation: &bbox_code_source_store::ActivationRecord,
+    stored: &bbox_code_source_store::StoredGeneration,
+    staged: &CollectedIndexResult,
+    store: &bbox_code_source_store::CodeSourceStore,
+    edges_dir: &Path,
+    stats: &mut ProjectIndexStats,
+) -> Result<()> {
+    tracing::info!(
+        project_id = %project_id,
+        generation = %active.generation_id,
+        outgoing_selector = %active.selector,
+        selector = %staged.selector,
+        outgoing_snapshot = %activation.snapshot_id,
+        snapshot = %staged.snapshot_id,
+        "migrating an active collected generation to the current materialization version"
+    );
+    store.record_materialization(
+        &stored.descriptor.scope,
+        &active.generation_id,
+        staged.document_count,
+        staged.entity_inventory_sha256.clone(),
+    )?;
+    store.save_activation(&bbox_code_source_store::ActivationRecord {
+        version: 1,
+        project_id: project_id.to_string(),
+        generation_id: active.generation_id.clone(),
+        selector: staged.selector.clone(),
+        snapshot_id: staged.snapshot_id.clone(),
+        document_count: staged.document_count,
+        entity_inventory_sha256: staged.entity_inventory_sha256.clone(),
+        current_chunk_targets: staged.current_chunk_targets.clone().into_iter().collect(),
+        activated_unix_secs: std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or_default(),
+        // Preserved verbatim: a cutback in flight is orthogonal to which
+        // materialization version minted the selector, and clearing it here
+        // would silently complete somebody else's transition.
+        cutback_pending: activation.cutback_pending,
+        diagnostic: activation.diagnostic.clone(),
+    })?;
+    // `repo_id` and `head_commit` are advisory manifest metadata from P3-B on:
+    // this flip opens no Git, so neither value gates anything it commits.
+    bbox_edge_sidecar::snapshot::activate_collected_snapshot_with(
+        edges_dir,
+        project_id,
+        stored.descriptor.scope.repo_id(),
+        &stored.descriptor.head_commit,
+        &active.generation_id,
+        &staged.selector,
+        &staged.snapshot_id,
+        || Ok(()),
+    )?;
+    // Validator-safe since the P3-B retirement fix widened
+    // `validate_retirement_record` to the general snapshot-id shape.
+    store.enqueue_retirement(&bbox_code_source_store::RetirementRecord {
+        version: 1,
+        project_id: project_id.to_string(),
+        selector: active.selector.clone(),
+        snapshot_id: activation.snapshot_id.clone(),
+        generation_id: Some(active.generation_id.clone()),
+    })?;
+    stats
+        .migrated_collected_selectors
+        .insert(project_id.to_string(), staged.selector.clone());
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -893,18 +1094,13 @@ fn index_active_collected_project(
     let activation = store
         .load_activation(project_id)?
         .ok_or_else(|| anyhow::anyhow!("active collected selector has no activation record"))?;
+    // Unchanged and deliberately BEFORE the classification: an activation
+    // record that disagrees with the manifest is inconsistent regardless of
+    // which materialization version either was minted under.
     if activation.generation_id != active.generation_id || activation.selector != active.selector {
         anyhow::bail!("active collected selector disagrees with its activation record");
     }
-    let expected_selector = collected_materialization_selector(project_id, &active.generation_id);
-    if active.selector != expected_selector {
-        anyhow::bail!("active collected selector requires materialization migration");
-    }
-    let expected_snapshot =
-        bbox_edge_sidecar::snapshot::collected_snapshot_id(project_id, &active.generation_id);
-    if activation.snapshot_id != expected_snapshot {
-        anyhow::bail!("active collected materialization version requires an explicit migration");
-    }
+    let materialization = classify_collected_materialization(project_id, active, &activation)?;
     let stored = store.find_generation(&active.generation_id)?;
     let entries = store.load_generation_entries(&stored.descriptor.scope, &active.generation_id)?;
     let blobs_available = !force_full
@@ -941,10 +1137,7 @@ fn index_active_collected_project(
         // byte-identical documents to it.
         Some(stage_collected_project_generation(
             identity,
-            ProjectFileCompatFields {
-                repo_id,
-                project_display: None,
-            },
+            ProjectFileCompatFields { repo_id },
             &stored.descriptor,
             &active.generation_id,
             &entries,
@@ -973,6 +1166,29 @@ fn index_active_collected_project(
         }
         None
     };
+    // Materialization migration (Phase 3 plan section 9): the re-stage above
+    // already minted the CURRENT selector and snapshot id, so all that is left
+    // is to move the durable pointers onto them and retire the outgoing ones.
+    //
+    // Zero leases and zero Git: the whole arm reads verified store blobs and
+    // writes store records plus the edge-sidecar manifest, which is what lets a
+    // remote-only project with no attachment migrate at all.
+    //
+    // An incremental pass never reaches this (`staged` is `None` when
+    // `force_full` is false), so it preserves the outgoing documents and the
+    // next full rebuild performs the migration.
+    if let (CollectedMaterializationState::Outgoing, Some(staged)) = (materialization, &staged) {
+        migrate_collected_materialization(
+            project_id,
+            active,
+            &activation,
+            &stored,
+            staged,
+            store,
+            edges_dir,
+            stats,
+        )?;
+    }
     let current_chunk_targets = staged
         .as_ref()
         .map(|result| result.current_chunk_targets.clone())
@@ -995,6 +1211,7 @@ fn index_active_collected_project(
             git_meta_dir,
             force_full,
             publication: &mut stats.publication,
+            project_display: identity.display_name.as_str(),
         };
         let stats = super::git_history::index_git_history_for_project(
             project,
@@ -1047,23 +1264,27 @@ fn index_active_collected_project(
     Ok(())
 }
 
+/// Bridge/local reindex-lane document. `project_display` is the identity's
+/// display name (plan section 4.6 / P3-A item 1), never `canonical_path`: the
+/// P3-E cut removes the checkout path from `project` on every project-file
+/// document, local staging included.
 pub fn build_project_file_doc(
     chunk: &Chunk,
     project: &ProjectRecord,
-    absolute_path: &Path,
+    project_display: &str,
     commit_sha: Option<&str>,
     snapshot_id: Option<&str>,
     f: FieldHandles,
 ) -> TantivyDocument {
     let selector = bbox_code_source::local_selector(&project.project_id);
-    let relative_path = chunk.file_path.to_string_lossy();
+    let relative_path = normalized_relative_path(&chunk.file_path);
     let entry_key = bbox_code_source::source_entry_key(&selector, &relative_path);
     build_project_file_doc_for_source(
         chunk,
         &project.project_id,
         project.repo_id.as_deref(),
-        absolute_path,
-        &project.canonical_path,
+        &relative_path,
+        project_display,
         commit_sha,
         snapshot_id,
         &selector,
@@ -1077,10 +1298,9 @@ pub fn build_project_file_doc(
 ///
 /// Identity-first (governing section 10.1, Phase 3 plan section 6 item 1):
 /// nothing here reads a checkout, so the caller supplies a
-/// [`CodeProjectIdentity`] instead of a path-bearing `ProjectRecord`. The
-/// documents carry no display root at all (item 5, closing F6); the doc
-/// builder's existing absent-root fallback renders `project` as the project
-/// id and `file_path` as the normalized relative path until the P3-E cut.
+/// [`CodeProjectIdentity`] instead of a path-bearing `ProjectRecord`. At the
+/// P3-E cut the documents carry `project` = the identity's display name and
+/// `file_path`/`relative_path` = the manifest's normalized relative path.
 #[allow(clippy::too_many_arguments)]
 pub fn stage_collected_project_generation<F>(
     identity: &CodeProjectIdentity,
@@ -1105,10 +1325,6 @@ where
         identity,
         ProjectFileCompatFields {
             repo_id: compat.repo_id,
-            // A collected document never carries a display root, so its
-            // `project` field falls back to the project id regardless of what
-            // the caller resolved.
-            project_display: None,
         },
         descriptor,
         generation_id,
@@ -1120,7 +1336,6 @@ where
         writer,
         edges_dir,
         publication,
-        None,
         open_bytes,
     )
 }
@@ -1221,7 +1436,6 @@ pub fn stage_local_project_generation(
         writer,
         edges_dir,
         publication,
-        Some(&root),
         |entry| {
             read_regular_file_confined(&root, Path::new(&entry.relative_path))
                 .with_context(|| format!("re-reading local source {}", entry.relative_path))
@@ -1243,7 +1457,6 @@ fn stage_project_file_generation<F>(
     writer: &mut IndexWriter,
     edges_dir: &Path,
     publication: &mut ProjectIndexPublicationBundle,
-    display_root: Option<&Path>,
     mut open_bytes: F,
 ) -> Result<CollectedIndexResult>
 where
@@ -1254,11 +1467,13 @@ where
     const MAX_STAGED_ENTITY_ID_BYTES: usize = 256 * 1024 * 1024;
 
     let project_id = identity.project_id.as_str();
-    let project_display = compat.project_display.unwrap_or(project_id);
+    // The identity is the single authority for the display value at the P3-E
+    // cut: catalog mode carries the catalog display name, bridge mode the
+    // first alias else the project id. No checkout root participates.
+    let project_display = identity.display_name.as_str();
     let registry = chunker::default_registry();
     let mut chunk_entry = |entry: &bbox_code_source::ManifestEntry| {
         let relative_path = Path::new(&entry.relative_path);
-        let display_path = compatibility_display_path(display_root, relative_path);
         let bytes = open_bytes(entry)
             .with_context(|| format!("opening collected source {}", entry.relative_path))?;
         if bytes.len() as u64 != entry.size || full_hash(&bytes) != entry.content_sha256 {
@@ -1282,7 +1497,7 @@ where
             )
         })?;
         let chunks = bound_chunks(&finalize_chunks(project_id, relative_path, chunks));
-        Ok(Some((display_path, chunks, edges)))
+        Ok(Some((chunks, edges)))
     };
 
     // Pass one retains only symbol identities. Chunk bodies and file bytes are
@@ -1290,7 +1505,7 @@ where
     // directly to peak staging memory.
     let mut symbol_table = HashMap::new();
     for entry in entries {
-        let Some((_display_path, chunks, _edges)) = chunk_entry(entry)? else {
+        let Some((chunks, _edges)) = chunk_entry(entry)? else {
             continue;
         };
         extend_symbol_table(&mut symbol_table, &chunks, Some(snapshot_id));
@@ -1318,7 +1533,7 @@ where
         &staged_filename,
     )?;
     for entry in entries {
-        let Some((display_path, chunks, parser_edges)) = chunk_entry(entry)? else {
+        let Some((chunks, parser_edges)) = chunk_entry(entry)? else {
             continue;
         };
         let mut project_edges = derive_edges(&chunks, parser_edges, Some(snapshot_id));
@@ -1361,7 +1576,7 @@ where
                 &chunk,
                 project_id,
                 compat.repo_id,
-                &display_path,
+                &entry.relative_path,
                 project_display,
                 Some(&descriptor.head_commit),
                 Some(snapshot_id),
@@ -1370,7 +1585,7 @@ where
                 &entry_key,
                 f,
             );
-            super::embed_hook::emit_project_file(&chunk, &entity_id);
+            super::embed_hook::emit_project_file(&chunk, project_display, &entity_id);
             writer.add_document(doc)?;
             entity_ids.push(entity_id);
         }
@@ -1403,10 +1618,14 @@ where
     })
 }
 
-fn compatibility_display_path(display_root: Option<&Path>, relative_path: &Path) -> PathBuf {
-    display_root
-        .map(|root| root.join(relative_path))
-        .unwrap_or_else(|| relative_path.to_path_buf())
+/// Normalize a chunk-relative path to the slash-separated form the stored
+/// `relative_path`/`file_path` fields and the `FileMeta` composite key all
+/// use. Chunks already carry a project-relative path
+/// ([`finalize_chunks`]); this only fixes the separator on non-slash hosts.
+pub fn normalized_relative_path(relative_path: &Path) -> String {
+    relative_path
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1414,7 +1633,7 @@ pub fn build_project_file_doc_for_source(
     chunk: &Chunk,
     project_id: &str,
     repo_id: Option<&str>,
-    display_path: &Path,
+    relative_path: &str,
     project_display: &str,
     commit_sha: Option<&str>,
     snapshot_id: Option<&str>,
@@ -1433,17 +1652,37 @@ pub fn build_project_file_doc_for_source(
     }
     doc.add_text(f.session_id, "");
     doc.add_text(f.account, "project_file");
+    // P3-E: the display NAME, never a checkout path. Catalog mode supplies the
+    // catalog display name; bridge mode supplies the first alias, else the
+    // project id (P3-A item 1). Two deliberate search consequences ride this
+    // (plan section 4.3 item 2): the permanent literal substring lane stops
+    // matching project-file documents by unregistered absolute-path fragments,
+    // and BM25 queries carrying host-root components stop matching
+    // `path_tokens`. Resolved project filters reach these documents through
+    // the `project_id` term lane instead (F7).
     doc.add_text(f.project, project_display);
     doc.add_text(f.role, "file");
-    let path_str = display_path.to_string_lossy();
-    doc.add_text(f.file_path, &*path_str);
+    doc.add_text(f.file_path, relative_path);
+    doc.add_text(f.relative_path, relative_path);
+    doc.add_text(
+        f.source_kind,
+        bbox_code_source::source_kind_for_selector(selector),
+    );
+    // An unencodable relative path cannot happen for a chunk that reached
+    // here (the walkers and manifest validators reject the shapes
+    // `validate_relative_path` rejects), and a document with no `source_uri`
+    // is still queryable by every other lane, so this degrades rather than
+    // failing the whole pass.
+    if let Ok(source_uri) = bbox_code_source::encode_source_uri(project_id, relative_path) {
+        doc.add_text(f.source_uri, &source_uri);
+    }
     doc.add_text(f.code_source_selector, selector);
     doc.add_text(f.code_source_generation, generation);
     doc.add_text(f.code_source_entry_key, entry_key);
     // Reuse the same string for the tokenized path field; the code tokenizer
-    // splits on `/`, `_`, `.`, etc., so /home/x/src/embed/voyage.rs becomes
-    // tokens [home, x, src, embed, voyage, rs] available to BM25 ranking.
-    doc.add_text(f.path_tokens, &*path_str);
+    // splits on `/`, `_`, `.`, etc., so src/embed/voyage.rs becomes tokens
+    // [src, embed, voyage, rs] available to BM25 ranking.
+    doc.add_text(f.path_tokens, relative_path);
     if let Some(symbol) = &chunk.symbol {
         // Symbol path also tokenized for BM25 boost — `Witness.Authority` →
         // [Witness, Authority] so symbol-named queries surface correctly.
@@ -1581,24 +1820,37 @@ fn index_project(
         .map_or(base_mat_version.clone(), |snapshot_id| {
             format!("{base_mat_version}+ref-snapshot:{snapshot_id}")
         });
-    // On-disk text-file set for this project, captured before `files` is moved.
-    // Used to detect tracked-file deletions (in meta, absent on disk) so their
-    // derived edges are purged rather than lingering in the materialized graph.
-    let current_paths: std::collections::HashSet<String> =
-        files.iter().map(|(p, _, _)| p.clone()).collect();
+    // On-disk freshness-key set for this project, captured before `files` is
+    // moved. Keyed by the P3-E composite (plan section 4.6), the same key the
+    // meta map now uses, so the deletion detection below compares like with
+    // like instead of a mix of absolute and composite keys.
+    let selector = bbox_code_source::local_selector(&project.project_id);
+    let source_kind = bbox_code_source::source_kind_for_selector(&selector);
+    let current_paths: std::collections::HashSet<String> = files
+        .iter()
+        .map(|(path_str, _, _)| {
+            bbox_code_source::project_file_meta_key(
+                &project.project_id,
+                source_kind,
+                &local_relative_path(root, Path::new(path_str)),
+            )
+        })
+        .collect();
     for (path_str, mtime, size) in files {
-        match classify_project_file(ctx.meta.get(path_str.as_str()), mtime, size, &mat_version) {
+        let path = PathBuf::from(&path_str);
+        let relative_path = local_relative_path(root, &path);
+        let meta_key = bbox_code_source::project_file_meta_key(
+            &project.project_id,
+            source_kind,
+            &relative_path,
+        );
+        match classify_project_file(ctx.meta.get(meta_key.as_str()), mtime, size, &mat_version) {
             ProjectFileAction::Skip => {
                 ctx.stats.skipped += 1;
                 continue;
             }
             ProjectFileAction::Reindex => {
-                let relative_path = Path::new(&path_str)
-                    .strip_prefix(root)
-                    .unwrap_or_else(|_| Path::new(&path_str));
-                let selector = bbox_code_source::local_selector(&project.project_id);
-                let entry_key =
-                    bbox_code_source::source_entry_key(&selector, &relative_path.to_string_lossy());
+                let entry_key = bbox_code_source::source_entry_key(&selector, &relative_path);
                 ctx.writer.delete_term(Term::from_field_text(
                     ctx.f.code_source_entry_key,
                     &entry_key,
@@ -1606,8 +1858,8 @@ fn index_project(
             }
         }
 
-        let path = PathBuf::from(&path_str);
-        let relative_path = path.strip_prefix(root).unwrap_or(&path);
+        let relative_path = PathBuf::from(&relative_path);
+        let relative_path = relative_path.as_path();
         let bytes = match read_regular_file_confined(root, relative_path) {
             Ok(bytes) => bytes,
             Err(err) => {
@@ -1636,8 +1888,8 @@ fn index_project(
         ctx.stats.emitted_edges += edges.len() as u64;
         project_edges.extend(edges);
         pending.push(PendingProjectFile {
-            path_str,
-            absolute_path: path,
+            meta_key,
+            relative_path: relative_path.to_string_lossy().into_owned(),
             mtime,
             size,
             chunks: bounded_chunks,
@@ -1671,7 +1923,7 @@ fn index_project(
             let doc = build_project_file_doc(
                 &chunk,
                 project,
-                &file.absolute_path,
+                ctx.project_display,
                 commit_sha.as_deref(),
                 snapshot_id.as_deref(),
                 ctx.f,
@@ -1680,16 +1932,15 @@ fn index_project(
                 &chunk,
                 snapshot_id.as_deref(),
             );
-            super::embed_hook::emit_project_file(&chunk, &entity_id);
+            super::embed_hook::emit_project_file(&chunk, ctx.project_display, &entity_id);
             ctx.writer.add_document(doc)?;
             ctx.stats.indexed_docs += 1;
         }
         ctx.meta.insert(
-            file.path_str.clone(),
+            file.meta_key.clone(),
             local_file_meta(
                 project,
-                root,
-                Path::new(&file.path_str),
+                &file.relative_path,
                 file.mtime,
                 file.size,
                 Some(mat_version.clone()),
@@ -1706,6 +1957,7 @@ fn index_project(
             git_meta_dir: ctx.git_meta_dir,
             force_full: ctx.force_git_full,
             publication: &mut ctx.stats.publication,
+            project_display: ctx.project_display,
         };
         super::git_history::index_git_history_for_project(
             project,
@@ -1730,13 +1982,19 @@ fn index_project(
     // graph. Matched by rel_path_hash, mirroring the incremental-replace
     // granularity; symbol→symbol edges (CALLS/USES_TYPE) carry no file ref and
     // age out with the snapshot id rather than being purged here.
+    // P3-E: the relative path is read straight off the composite key instead
+    // of being de-fabricated by stripping a checkout root off an absolute one
+    // (plan section 4.6, "edge purge reads the relative key directly"). Rows
+    // from another project or another lane are filtered out by key shape, so
+    // one project's pass can no longer hash a foreign row's path.
     let deleted_rel_hashes: std::collections::HashSet<String> = ctx
         .meta
         .keys()
         .filter(|key| !current_paths.contains(key.as_str()))
         .filter_map(|key| {
-            let rel = Path::new(key).strip_prefix(root).ok()?;
-            Some(short_hash(rel.to_string_lossy().as_bytes()))
+            let (key_project_id, _, relative_path) =
+                bbox_code_source::parse_project_file_meta_key(key)?;
+            (key_project_id == project.project_id).then(|| short_hash(relative_path.as_bytes()))
         })
         .collect();
     let has_deletions = !deleted_rel_hashes.is_empty();
@@ -1913,21 +2171,26 @@ fn read_regular_file_confined(root: &Path, relative_path: &Path) -> Result<Vec<u
     Ok(bytes)
 }
 
+/// Slash-normalized project-relative path for one scanned absolute path.
+/// `unwrap_or(path)` keeps a path that somehow escaped the root verbatim
+/// rather than silently rebasing it; the walkers only ever produce paths
+/// under `root`.
+fn local_relative_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/")
+}
+
 fn local_file_meta(
     project: &ProjectRecord,
-    root: &Path,
-    path: &Path,
+    relative_path: &str,
     mtime: u64,
     size: u64,
     mat_version: Option<String>,
 ) -> FileMeta {
-    let relative_path = path
-        .strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace(std::path::MAIN_SEPARATOR, "/");
     let selector = bbox_code_source::local_selector(&project.project_id);
-    let entry_key = bbox_code_source::source_entry_key(&selector, &relative_path);
+    let entry_key = bbox_code_source::source_entry_key(&selector, relative_path);
     FileMeta {
         mtime,
         size,
@@ -1935,7 +2198,7 @@ fn local_file_meta(
         source: FileMetaSource::LocalProjectFile {
             project_id: project.project_id.clone(),
             selector,
-            relative_path,
+            relative_path: relative_path.to_string(),
             entry_key,
         },
     }
@@ -2585,7 +2848,7 @@ mod tests {
         let doc = build_project_file_doc(
             &chunk,
             &project,
-            Path::new("/tmp/repo/design/agentic-corpus.md"),
+            "acme-design",
             Some(commit_sha.as_str()),
             None,
             fields,
@@ -2601,32 +2864,31 @@ mod tests {
         );
     }
 
-    /// Local staging still joins the registered root into the display path;
-    /// collected staging passes `None` from P3-B on (plan section 6 item 5,
-    /// closing F6), which renders the bare normalized relative path.
+    /// P3-E: there is no display-root join left on any project-file lane. The
+    /// normalizer only fixes the separator, and a path that is already
+    /// slash-separated passes through byte-identically.
     #[test]
-    fn display_path_joins_a_root_and_falls_back_to_the_relative_path() {
+    fn relative_path_normalization_never_joins_a_host_root() {
         assert_eq!(
-            compatibility_display_path(
-                Some(Path::new("/registered/project")),
-                Path::new("src/lib.rs"),
-            ),
-            PathBuf::from("/registered/project/src/lib.rs")
+            normalized_relative_path(Path::new("src/lib.rs")),
+            "src/lib.rs"
         );
         assert_eq!(
-            compatibility_display_path(None, Path::new("src/lib.rs")),
-            PathBuf::from("src/lib.rs"),
-            "a collected document carries no corpus-host path component"
+            normalized_relative_path(Path::new("a/b/c.md")),
+            "a/b/c.md",
+            "a nested relative path keeps every component and gains no prefix"
         );
     }
 
     /// Bridge parity pin for the enumerated document-field change (plan
-    /// section 4.3 item 2, step one). A collected document renders `project`
-    /// as the project id and `file_path` as the relative path, while a local
-    /// document keeps the registered display root exactly as before; both
-    /// keep every other field, `repo_id` included.
+    /// section 4.3 item 2, step TWO: the P3-E cut). Collected and local
+    /// documents are now identical in the once-divergent fields: `project` is
+    /// the display name and `file_path` / `relative_path` / `path_tokens` are
+    /// the normalized relative path on BOTH lanes. Only `source_kind` and the
+    /// selector/generation differ, and every other field is untouched,
+    /// `repo_id` included.
     #[test]
-    fn collected_and_local_documents_differ_only_in_the_enumerated_fields() {
+    fn collected_and_local_documents_carry_identical_path_free_fields() {
         let (_schema, fields) = build_schema();
         let chunk = Chunk {
             project_id: "proj1234".into(),
@@ -2652,8 +2914,8 @@ mod tests {
             &chunk,
             "proj1234",
             Some("repo1234"),
-            &compatibility_display_path(None, Path::new("src/lib.rs")),
-            "proj1234",
+            "src/lib.rs",
+            "acme",
             None,
             Some("collected-0123456789abcdef"),
             "collected:proj1234:gen",
@@ -2661,18 +2923,12 @@ mod tests {
             "entry-key",
             fields,
         );
-        assert_eq!(first_text(&collected, fields.project), "proj1234");
-        assert_eq!(first_text(&collected, fields.file_path), "src/lib.rs");
-        assert_eq!(first_text(&collected, fields.path_tokens), "src/lib.rs");
-        assert_eq!(first_text(&collected, fields.project_id), "proj1234");
-        assert_eq!(first_text(&collected, fields.repo_id), "repo1234");
-
         let local = build_project_file_doc_for_source(
             &chunk,
             "proj1234",
             Some("repo1234"),
-            &compatibility_display_path(Some(Path::new("/tmp/repo")), Path::new("src/lib.rs")),
-            "/tmp/repo",
+            "src/lib.rs",
+            "acme",
             None,
             Some("head-repo1234-0123456789ab"),
             "local:proj1234",
@@ -2680,9 +2936,34 @@ mod tests {
             "entry-key",
             fields,
         );
-        assert_eq!(first_text(&local, fields.project), "/tmp/repo");
-        assert_eq!(first_text(&local, fields.file_path), "/tmp/repo/src/lib.rs");
-        assert_eq!(first_text(&local, fields.repo_id), "repo1234");
+
+        for (label, doc) in [("collected", &collected), ("local", &local)] {
+            assert_eq!(first_text(doc, fields.project), "acme", "{label} project");
+            assert_eq!(
+                first_text(doc, fields.file_path),
+                "src/lib.rs",
+                "{label} file_path"
+            );
+            assert_eq!(
+                first_text(doc, fields.relative_path),
+                "src/lib.rs",
+                "{label} relative_path"
+            );
+            assert_eq!(
+                first_text(doc, fields.path_tokens),
+                "src/lib.rs",
+                "{label} path_tokens"
+            );
+            assert_eq!(
+                first_text(doc, fields.source_uri),
+                "bbox://project/proj1234/src/lib.rs",
+                "{label} source_uri"
+            );
+            assert_eq!(first_text(doc, fields.project_id), "proj1234");
+            assert_eq!(first_text(doc, fields.repo_id), "repo1234");
+        }
+        assert_eq!(first_text(&collected, fields.source_kind), "collected");
+        assert_eq!(first_text(&local, fields.source_kind), "local");
     }
 
     #[test]
@@ -2721,7 +3002,7 @@ mod tests {
         let doc = build_project_file_doc(
             &chunk,
             &project,
-            Path::new("/tmp/repo/src/lib.rs"),
+            "acme",
             Some(commit_sha.as_str()),
             Some("head-repo1234-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             fields,
@@ -2785,8 +3066,12 @@ mod tests {
         })
         .collect::<Vec<_>>();
         let pending = vec![PendingProjectFile {
-            path_str: "/tmp/repo/src/lib.rs".into(),
-            absolute_path: PathBuf::from("/tmp/repo/src/lib.rs"),
+            meta_key: bbox_code_source::project_file_meta_key(
+                "proj1234",
+                bbox_code_source::SOURCE_KIND_LOCAL,
+                "src/lib.rs",
+            ),
+            relative_path: "src/lib.rs".into(),
             mtime: 1,
             size: 39,
             chunks,
@@ -2848,8 +3133,12 @@ mod tests {
         })
         .collect::<Vec<_>>();
         let pending = vec![PendingProjectFile {
-            path_str: "/tmp/repo/src/lib.rs".into(),
-            absolute_path: PathBuf::from("/tmp/repo/src/lib.rs"),
+            meta_key: bbox_code_source::project_file_meta_key(
+                "proj1234",
+                bbox_code_source::SOURCE_KIND_LOCAL,
+                "src/lib.rs",
+            ),
+            relative_path: "src/lib.rs".into(),
             mtime: 1,
             size: 72,
             chunks,
@@ -3227,6 +3516,226 @@ mod tests {
         assert!(
             chunks.iter().all(|chunk| chunk.chunk_kind == "web_section"),
             "expected web_section chunks, got {chunks:?}"
+        );
+    }
+}
+
+/// Phase 3 P3-E materialization-migration classification.
+///
+/// The version bump that ships with this milestone changes every active
+/// collected selector's `m` suffix and every collected snapshot id by
+/// construction. These rows pin the discriminator between "outgoing, migrate
+/// it" and "genuinely inconsistent, fail closed".
+#[cfg(test)]
+mod collected_materialization_tests {
+    use super::*;
+
+    const PROJECT: &str = "p_0000000000000000000000000000ab12";
+    const GENERATION: &str = "gen-0123456789abcdef";
+
+    fn activation(
+        project_id: &str,
+        generation_id: &str,
+        selector: &str,
+        snapshot_id: &str,
+    ) -> bbox_code_source_store::ActivationRecord {
+        bbox_code_source_store::ActivationRecord {
+            version: 1,
+            project_id: project_id.to_string(),
+            generation_id: generation_id.to_string(),
+            selector: selector.to_string(),
+            snapshot_id: snapshot_id.to_string(),
+            document_count: 0,
+            entity_inventory_sha256: "0".repeat(64),
+            current_chunk_targets: Default::default(),
+            activated_unix_secs: 0,
+            cutback_pending: false,
+            diagnostic: None,
+        }
+    }
+
+    /// A synthetic OUTGOING selector: the same project and generation, a
+    /// 16-hex `m` suffix that is not this binary's. `validate_collected_
+    /// materialization_selector` is shape-only, so any historic suffix is
+    /// well-formed - which is exactly what makes the migration decidable.
+    fn outgoing_selector() -> String {
+        format!(
+            "{}:m{}",
+            bbox_code_source::source_selector(PROJECT, GENERATION),
+            "0123456789abcdef"
+        )
+    }
+
+    fn outgoing_snapshot() -> String {
+        format!("collected-{}", "9".repeat(32))
+    }
+
+    #[test]
+    fn a_current_selector_and_snapshot_need_no_migration() {
+        let selector = collected_materialization_selector(PROJECT, GENERATION);
+        let snapshot = bbox_edge_sidecar::snapshot::collected_snapshot_id(PROJECT, GENERATION);
+        let active = ActiveCollectedSource {
+            selector: selector.clone(),
+            generation_id: GENERATION.into(),
+        };
+        assert_eq!(
+            classify_collected_materialization(
+                PROJECT,
+                &active,
+                &activation(PROJECT, GENERATION, &selector, &snapshot),
+            )
+            .unwrap(),
+            CollectedMaterializationState::Current
+        );
+    }
+
+    #[test]
+    fn an_outgoing_suffix_with_an_agreeing_activation_is_migratable() {
+        let selector = outgoing_selector();
+        let active = ActiveCollectedSource {
+            selector: selector.clone(),
+            generation_id: GENERATION.into(),
+        };
+        assert_eq!(
+            classify_collected_materialization(
+                PROJECT,
+                &active,
+                &activation(PROJECT, GENERATION, &selector, &outgoing_snapshot()),
+            )
+            .unwrap(),
+            CollectedMaterializationState::Outgoing
+        );
+    }
+
+    /// A selector naming a DIFFERENT generation is not an outgoing version, it
+    /// is a disagreement about which generation is active.
+    #[test]
+    fn a_different_generation_still_fails_closed() {
+        let selector = format!(
+            "{}:m{}",
+            bbox_code_source::source_selector(PROJECT, "gen-other"),
+            "0123456789abcdef"
+        );
+        let active = ActiveCollectedSource {
+            selector: selector.clone(),
+            generation_id: GENERATION.into(),
+        };
+        let error = classify_collected_materialization(
+            PROJECT,
+            &active,
+            &activation(PROJECT, GENERATION, &selector, &outgoing_snapshot()),
+        )
+        .err()
+        .expect("a foreign generation must fail closed");
+        assert!(
+            format!("{error:#}").contains("requires materialization migration"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_different_project_still_fails_closed() {
+        let selector = format!(
+            "{}:m{}",
+            bbox_code_source::source_selector("p_0000000000000000000000000000ffff", GENERATION),
+            "0123456789abcdef"
+        );
+        let active = ActiveCollectedSource {
+            selector: selector.clone(),
+            generation_id: GENERATION.into(),
+        };
+        assert!(
+            classify_collected_materialization(
+                PROJECT,
+                &active,
+                &activation(PROJECT, GENERATION, &selector, &outgoing_snapshot()),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_malformed_selector_still_fails_closed() {
+        for selector in [
+            "not-a-selector",
+            &format!(
+                "{}:mzzzz",
+                bbox_code_source::source_selector(PROJECT, GENERATION)
+            ),
+            &bbox_code_source::source_selector(PROJECT, GENERATION),
+        ] {
+            let active = ActiveCollectedSource {
+                selector: selector.to_string(),
+                generation_id: GENERATION.into(),
+            };
+            assert!(
+                classify_collected_materialization(
+                    PROJECT,
+                    &active,
+                    &activation(PROJECT, GENERATION, selector, &outgoing_snapshot()),
+                )
+                .is_err(),
+                "{selector} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_snapshot_id_still_fails_closed() {
+        let selector = outgoing_selector();
+        let active = ActiveCollectedSource {
+            selector: selector.clone(),
+            generation_id: GENERATION.into(),
+        };
+        for snapshot in ["head-repo-0123456789ab", "collected-zzzz", "collected-"] {
+            assert!(
+                classify_collected_materialization(
+                    PROJECT,
+                    &active,
+                    &activation(PROJECT, GENERATION, &selector, snapshot),
+                )
+                .is_err(),
+                "{snapshot} must fail closed"
+            );
+        }
+    }
+
+    /// Selector at the current suffix but a stale snapshot id (or the reverse)
+    /// cannot be an outgoing version: both derive from the same version string,
+    /// so a split is corruption and keeps the pre-P3-E refusal.
+    #[test]
+    fn a_split_selector_and_snapshot_still_fails_closed() {
+        let current_selector = collected_materialization_selector(PROJECT, GENERATION);
+        let current_snapshot =
+            bbox_edge_sidecar::snapshot::collected_snapshot_id(PROJECT, GENERATION);
+        let active = ActiveCollectedSource {
+            selector: current_selector.clone(),
+            generation_id: GENERATION.into(),
+        };
+        let error = classify_collected_materialization(
+            PROJECT,
+            &active,
+            &activation(PROJECT, GENERATION, &current_selector, &outgoing_snapshot()),
+        )
+        .err()
+        .expect("a current selector with a stale snapshot must fail closed");
+        assert!(
+            format!("{error:#}").contains("requires an explicit migration"),
+            "{error:#}"
+        );
+
+        let active = ActiveCollectedSource {
+            selector: outgoing_selector(),
+            generation_id: GENERATION.into(),
+        };
+        assert!(
+            classify_collected_materialization(
+                PROJECT,
+                &active,
+                &activation(PROJECT, GENERATION, &outgoing_selector(), &current_snapshot),
+            )
+            .is_err(),
+            "an outgoing selector with a current snapshot must fail closed"
         );
     }
 }

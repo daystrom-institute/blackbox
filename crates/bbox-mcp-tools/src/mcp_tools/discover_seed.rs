@@ -337,6 +337,9 @@ mod tests {
             doc_type: Some("knowledge".into()),
             chunk_kind: None,
             role: None,
+            project_id: None,
+            relative_path: None,
+            source_uri: None,
             sources: std::collections::BTreeMap::from([("bm25".into(), 0.1)]),
             excerpt: None,
         };

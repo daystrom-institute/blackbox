@@ -598,6 +598,14 @@ fn record_index_doc_coverage(
             let Some(chunk) = chunk_from_embedding_doc(doc) else {
                 return Ok(());
             };
+            // The envelope crosses every boundary that compares project-file
+            // vector hashes (plan section 9 item 5). The vector record's
+            // freshness hash for a text row IS the envelope hash, so comparing
+            // the raw `chunk_hash` against `active_entity_hashes` would read a
+            // permanent phantom zero after the version bump - masking real
+            // embedding outages and turning every residue sweep into
+            // full-corpus churn. The visual arm above keeps raw comparison
+            // because that lane is outside the envelope.
             record_coverage(
                 router,
                 coverage,
@@ -605,7 +613,7 @@ fn record_index_doc_coverage(
                 bucket,
                 Some(&chunk.project_id),
                 &crate::embed_queue::project_file_entity_id(&chunk),
-                &chunk.chunk_hash,
+                &crate::embed_queue::project_file_text_content_hash(&chunk.chunk_hash),
             )
         }
         Bucket::Transcripts => {
@@ -1155,7 +1163,12 @@ fn enqueue_reembed_index_doc(buckets: &[Bucket], doc: &EmbeddingSourceDoc) -> bo
                 return false;
             };
             let entity_id = crate::embed_queue::project_file_entity_id(&chunk);
-            crate::embed_queue::enqueue_project_file_as(&chunk, &entity_id, bucket)
+            // The stored `project` field is the display name after the P3-E
+            // cut, so the backfill lane reproduces the same embedding input
+            // the index-time enqueue produced. Reading it from the document
+            // rather than re-resolving the catalog keeps this pass free of a
+            // project-authority dependency.
+            crate::embed_queue::enqueue_project_file_as(&chunk, &doc.project, &entity_id, bucket)
         }
         Bucket::Transcripts => {
             let chunk_hash = doc
@@ -1263,9 +1276,18 @@ fn chunk_from_embedding_doc(doc: &EmbeddingSourceDoc) -> Option<Chunk> {
                 .and_then(bbox_visual_store::VisualPayloadRef::decode)
         })
         .flatten();
+    // P3-E: rehydrate the normalized RELATIVE path (governing section 10.2).
+    // `relative_path` is the authority; `file_path` is the compat fallback for
+    // a pre-bump document still in a segment mid-migration, and after the
+    // paired bump it carries the same relative value anyway.
+    let relative_path = if doc.relative_path.is_empty() {
+        doc.file_path.clone()
+    } else {
+        doc.relative_path.clone()
+    };
     Some(Chunk {
         project_id,
-        file_path: PathBuf::from(&doc.file_path),
+        file_path: PathBuf::from(&relative_path),
         rel_path_hash,
         chunk_kind: doc.chunk_kind.clone(),
         chunk_hash,
@@ -2013,6 +2035,7 @@ mod tests {
                 session_id: "s1".into(),
                 project: String::new(),
                 file_path: String::new(),
+                relative_path: String::new(),
                 byte_offset: 0,
                 chunk_kind: String::new(),
                 language: None,
@@ -2028,6 +2051,7 @@ mod tests {
                 session_id: "s2".into(),
                 project: String::new(),
                 file_path: String::new(),
+                relative_path: String::new(),
                 byte_offset: 0,
                 chunk_kind: String::new(),
                 language: None,
@@ -2140,6 +2164,7 @@ mod tests {
             session_id: String::new(),
             project: "proj1234".into(),
             file_path: "assets/figure.png".into(),
+            relative_path: "assets/figure.png".into(),
             byte_offset: 0,
             chunk_kind: "image".into(),
             language: None,
@@ -2209,6 +2234,192 @@ image = "voyage_visual"
         let entry = coverage.get("visual:image").expect("visual route counted");
         assert_eq!(entry.source_count, 1);
         assert_eq!(entry.indexed_count, 0, "vector store has nothing yet");
+    }
+
+    fn code_embedding_source_doc() -> EmbeddingSourceDoc {
+        EmbeddingSourceDoc {
+            doc_type: "project_file".into(),
+            account: "project_file".into(),
+            session_id: String::new(),
+            // Post-P3-E: the DISPLAY NAME, which is also the backfill lane's
+            // prepend value.
+            project: "acme-service".into(),
+            file_path: "src/helper.rs".into(),
+            relative_path: "src/helper.rs".into(),
+            byte_offset: 0,
+            chunk_kind: "code_block".into(),
+            language: Some("rust".into()),
+            symbol: Some("Helper".into()),
+            symbol_exact: Some("crate::Helper".into()),
+            chunk_hash: Some("f".repeat(64)),
+            entity_id: Some(format!(
+                "project_file:proj1234:abcd1234:{}:0",
+                "f".repeat(64)
+            )),
+            content: "pub struct Helper;".into(),
+        }
+    }
+
+    fn code_route(router: &EmbeddingRouter) -> (String, String) {
+        router
+            .queue_and_vector_route(Bucket::Code, Some("proj1234"))
+            .unwrap()
+    }
+
+    /// P3-E embed row: the Code/Docs coverage arm applies the SAME envelope the
+    /// enqueue applies, so coverage converges to full after the version bump
+    /// with zero phantom residue. A raw-hash comparison here would read a
+    /// permanent zero, masking real embedding outages and turning every residue
+    /// sweep into full-corpus churn.
+    #[test]
+    fn code_coverage_converges_to_full_against_the_enveloped_vector_hash() {
+        let vector_tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(VectorStore::open(vector_tmp.path()).unwrap());
+        let _guard = install_test_global(store);
+        let router = EmbeddingRouter::from_toml_str("").unwrap();
+        let doc = code_embedding_source_doc();
+        let chunk = chunk_from_embedding_doc(&doc).unwrap();
+        let entity_id = crate::embed_queue::project_file_entity_id(&chunk);
+        let (_queue_route, vector_route) = code_route(&router);
+
+        // The worker stores the vector under the ENVELOPE hash, exactly as the
+        // enqueue keyed it.
+        crate::vectors::upsert(
+            &vector_route,
+            &entity_id,
+            &crate::embed_queue::project_file_text_content_hash(&chunk.chunk_hash),
+            vec![0.5; 8],
+        )
+        .unwrap();
+
+        let mut coverage = BTreeMap::new();
+        let mut active_by_route = BTreeMap::new();
+        record_index_doc_coverage(
+            &router,
+            &mut coverage,
+            &mut active_by_route,
+            &[Bucket::Code],
+            &doc,
+        )
+        .unwrap();
+        let entry = coverage
+            .values()
+            .find(|entry| entry.source_count > 0)
+            .expect("the code route was counted");
+        assert_eq!(entry.source_count, 1);
+        assert_eq!(
+            entry.indexed_count, 1,
+            "coverage must be full, not a phantom zero"
+        );
+    }
+
+    /// P3-E embed row: a vector stored under the PRE-bump raw hash reads as
+    /// uncovered, which is exactly the dedup miss that drives the one-time
+    /// re-embed. The same assertion is the regression guard against someone
+    /// "fixing" the coverage arm by dropping the envelope.
+    #[test]
+    fn a_pre_bump_raw_hash_vector_reads_as_uncovered() {
+        let vector_tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(VectorStore::open(vector_tmp.path()).unwrap());
+        let _guard = install_test_global(store);
+        let router = EmbeddingRouter::from_toml_str("").unwrap();
+        let doc = code_embedding_source_doc();
+        let chunk = chunk_from_embedding_doc(&doc).unwrap();
+        let entity_id = crate::embed_queue::project_file_entity_id(&chunk);
+        let (_queue_route, vector_route) = code_route(&router);
+        crate::vectors::upsert(&vector_route, &entity_id, &chunk.chunk_hash, vec![0.5; 8]).unwrap();
+
+        let mut coverage = BTreeMap::new();
+        let mut active_by_route = BTreeMap::new();
+        record_index_doc_coverage(
+            &router,
+            &mut coverage,
+            &mut active_by_route,
+            &[Bucket::Code],
+            &doc,
+        )
+        .unwrap();
+        let entry = coverage
+            .values()
+            .find(|entry| entry.source_count > 0)
+            .expect("the code route was counted");
+        assert_eq!(entry.indexed_count, 0);
+    }
+
+    /// P3-E embed row: the post-bump vector REPLACES the pre-bump one rather
+    /// than duplicating it. The store keeps one active entry per
+    /// `(route, entity_id)`, so no duplicate hit can surface during the
+    /// one-time re-embed.
+    #[test]
+    fn the_post_bump_vector_replaces_rather_than_duplicates() {
+        let vector_tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(VectorStore::open(vector_tmp.path()).unwrap());
+        let _guard = install_test_global(store);
+        let router = EmbeddingRouter::from_toml_str("").unwrap();
+        let doc = code_embedding_source_doc();
+        let chunk = chunk_from_embedding_doc(&doc).unwrap();
+        let entity_id = crate::embed_queue::project_file_entity_id(&chunk);
+        let (_queue_route, vector_route) = code_route(&router);
+        let enveloped = crate::embed_queue::project_file_text_content_hash(&chunk.chunk_hash);
+
+        crate::vectors::upsert(&vector_route, &entity_id, &chunk.chunk_hash, vec![0.1; 8]).unwrap();
+        crate::vectors::upsert(&vector_route, &entity_id, &enveloped, vec![0.2; 8]).unwrap();
+
+        let active = crate::vectors::active_entity_hashes(&vector_route).unwrap();
+        let for_entity = active
+            .iter()
+            .filter(|(id, _)| id == &entity_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            for_entity.len(),
+            1,
+            "one active entry per entity id: {for_entity:?}"
+        );
+        assert_eq!(for_entity[0].1, enveloped);
+    }
+
+    /// P3-E embed row: the visual lane is OUTSIDE the envelope. Its embedding
+    /// input carries no text prepend and is unchanged by this milestone, so it
+    /// neither re-embeds nor loses coverage - its vectors stay keyed by the raw
+    /// `chunk_hash` and the coverage visual arm keeps raw comparison.
+    #[test]
+    fn the_visual_lane_stays_outside_the_envelope_and_keeps_coverage() {
+        let vector_tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(VectorStore::open(vector_tmp.path()).unwrap());
+        let _guard = install_test_global(store);
+        let router = EmbeddingRouter::from_toml_str(
+            r#"
+[embed.routes.visual]
+image = "voyage_visual"
+"#,
+        )
+        .unwrap();
+        let doc = image_embedding_source_doc();
+        let raw_hash = doc.chunk_hash.clone().unwrap();
+        let entity_id = doc.entity_id.clone().unwrap();
+        let vector_route = router
+            .visual_route("image")
+            .unwrap()
+            .expect("configured visual route")
+            .vector_route_id();
+        crate::vectors::upsert(&vector_route, &entity_id, &raw_hash, vec![0.3; 8]).unwrap();
+
+        let mut coverage = BTreeMap::new();
+        let mut active_by_route = BTreeMap::new();
+        record_index_doc_coverage(
+            &router,
+            &mut coverage,
+            &mut active_by_route,
+            &[Bucket::Docs],
+            &doc,
+        )
+        .unwrap();
+        let entry = coverage.get("visual:image").expect("visual route counted");
+        assert_eq!(entry.source_count, 1);
+        assert_eq!(
+            entry.indexed_count, 1,
+            "the visual lane keeps raw-hash coverage across the text-envelope bump"
+        );
     }
 
     /// An unconfigured visual chunk kind is skipped, not counted: visual

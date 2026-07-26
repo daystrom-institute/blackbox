@@ -708,10 +708,15 @@ impl TranscriptIndex {
     }
 
     fn hybrid_title(&self, doc: &TantivyDocument) -> Option<String> {
+        // P3-E: `relative_path` precedes `file_path` so a project-file title is
+        // explicitly the relative path rather than whatever the compat field
+        // happens to hold. Both carry the same value after the bump; the order
+        // makes the intent non-accidental and survives a later `file_path` cut.
         for field in [
             self.fields.symbol,
             self.fields.symbol_exact,
             self.fields.commit_sha,
+            self.fields.relative_path,
             self.fields.file_path,
             self.fields.session_id,
         ] {
@@ -2276,6 +2281,77 @@ mod project_filter_lane_tests {
             }),
         );
         assert!(!output.contains("src/lane.rs"), "{output}");
+    }
+
+    /// P3-E enumerated search consequence (plan section 4.3 item 2): the
+    /// permanent literal substring lane stops matching project-file documents
+    /// by an unregistered absolute-path fragment, because `project` now carries
+    /// the display name. The id lane is what reaches them instead, so the
+    /// narrowing is a lane change and not a loss of reachability.
+    #[test]
+    fn a_host_path_fragment_no_longer_reaches_project_file_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = TranscriptIndex::open_or_create(
+            &root.join("idx"),
+            Vec::new(),
+            None,
+            root.join("projects.json"),
+            root.join("kb.json"),
+            root.join("threads.json"),
+            root.join("roadmap.json"),
+        )
+        .unwrap();
+        let fields = index.field_handles();
+        let handle = index.index_handle();
+        let mut writer: IndexWriter = handle.writer(50_000_000).unwrap();
+        let mut document = TantivyDocument::new();
+        document.add_text(fields.doc_type, "project_file");
+        document.add_text(fields.project_id, PROJECT);
+        document.add_text(fields.entity_id, "project_file:lane:display");
+        document.add_text(
+            fields.code_source_selector,
+            &bbox_code_source::local_selector(PROJECT),
+        );
+        document.add_text(fields.content, "phase three filter lane fixture");
+        // Exactly what the P3-E doc builder emits now.
+        document.add_text(fields.project, "acme-service");
+        document.add_text(fields.file_path, "src/lane.rs");
+        document.add_text(fields.relative_path, "src/lane.rs");
+        writer.add_document(document).unwrap();
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+
+        let by_host_fragment = search(
+            &index,
+            Some(&ProjectFilterInput::unresolved(
+                "/host-checkouts/acme-service",
+            )),
+        );
+        assert!(
+            !by_host_fragment.contains("src/lane.rs"),
+            "a host-path fragment must no longer match a project-file document: \
+             {by_host_fragment}"
+        );
+        let by_resolved_id = search(
+            &index,
+            Some(&ProjectFilterInput {
+                project_id: Some(PROJECT.to_string()),
+                literal: "/host-checkouts/acme-service".into(),
+            }),
+        );
+        assert!(
+            by_resolved_id.contains("src/lane.rs"),
+            "the id lane must still reach it: {by_resolved_id}"
+        );
+        let by_display_name = search(
+            &index,
+            Some(&ProjectFilterInput::unresolved("acme-service")),
+        );
+        assert!(
+            by_display_name.contains("src/lane.rs"),
+            "the literal lane still works against the display value: {by_display_name}"
+        );
     }
 }
 

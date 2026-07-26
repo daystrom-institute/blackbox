@@ -374,7 +374,17 @@ fn acquire_project_file(
         CheckoutAccessKind::Blame,
         CheckoutAccessIntent::Read,
     )?;
+    // P3-E: the stored path IS the project-relative path, so the normal arm is
+    // a straight consume. The absolute-strip arm survives ONLY as a tagged
+    // compat path for a pre-bump ref (a `file_path` fallback resolved against a
+    // document written under the previous schema, or an operator-supplied
+    // absolute hint); it is not the primary lane any more, and it never
+    // fabricates a relative path from a foreign root.
     let relative = if indexed_path_hint.is_absolute() {
+        tracing::debug!(
+            project_id = %project.project_id,
+            "compat: de-fabricating a relative path from a pre-path-free absolute hint"
+        );
         indexed_path_hint
             .strip_prefix(Path::new(&project.canonical_path))
             .map(Path::to_path_buf)

@@ -1185,8 +1185,23 @@ fn stage_git_current_overlay_after_activation(
             return;
         }
     };
+    // P3-E: the overlay's commit documents carry the identity's display name in
+    // `project`, so it is resolved through the same authority the reindex pass
+    // uses rather than derived from the compat record's alias set.
+    let project_display = match resolve_code_project_identity(
+        state,
+        project_id,
+        "the post-activation Git current-file overlay",
+    ) {
+        Ok(identity) => identity.display_name,
+        Err(error) => {
+            degrade(format!("the project identity is unresolvable: {error}"));
+            return;
+        }
+    };
     if let Err(error) = state.index_writer.stage_git_current_overlay(
         record,
+        project_display,
         lease,
         snapshot_id.to_string(),
         current_chunk_targets.clone(),

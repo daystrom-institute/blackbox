@@ -115,6 +115,16 @@ pub struct HybridResult {
     pub chunk_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// Structured project identity (governing section 10.2). Present on code
+    /// results; callers no longer have to string-parse `entity_id` for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// Normalized project-relative path. Never a host root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relative_path: Option<String>,
+    /// Stable machine identifier; unchanged when aliases or attachments change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_uri: Option<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub sources: BTreeMap<String, f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -401,6 +411,13 @@ pub fn hybrid_search_typed_with_active_selectors_and_searcher(
             let bm25 = ranked_hits
                 .iter()
                 .find(|bm25| bm25.entity_id == hit.entity_id);
+            let properties = loaded_properties.get(&hit.entity_id);
+            let stored = |key: &str| {
+                properties
+                    .and_then(|properties| properties.get(key))
+                    .filter(|value| !value.is_empty())
+                    .cloned()
+            };
             HybridResult {
                 rank: 0,
                 entity_id: hit.entity_id.clone(),
@@ -409,12 +426,17 @@ pub fn hybrid_search_typed_with_active_selectors_and_searcher(
                 label: label_for_entity(
                     ctx,
                     &hit.entity_id,
-                    loaded_properties.get(&hit.entity_id),
+                    properties,
                     bm25.and_then(|hit| hit.title.as_deref()),
                 ),
                 doc_type: feature.doc_type,
                 chunk_kind: feature.chunk_kind,
                 role: feature.role,
+                // Structured triple straight off the stored fields (P3-E item
+                // 4): no entity-id string parsing, no path de-fabrication.
+                project_id: stored("project_id"),
+                relative_path: stored("relative_path"),
+                source_uri: stored("source_uri"),
                 sources: hit.sources,
                 excerpt: bm25.map(|hit| hit.excerpt.clone()),
             }
@@ -1022,10 +1044,24 @@ fn candidate_document(
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(properties) = properties {
-        for key in ["title", "file_path", "symbol"] {
+        // P3-E: the reranker sees the relative path, not a host absolute path.
+        // Feeding host-root components to a cross-encoder both leaks them into
+        // the rerank input and lets an unrelated query token match a machine's
+        // directory names. `relative_path` and `file_path` carry the same value
+        // after the bump, so this takes whichever is present, once.
+        for key in ["title"] {
             if let Some(value) = properties.get(key) {
                 parts.push(value.clone());
             }
+        }
+        if let Some(value) = properties
+            .get("relative_path")
+            .or_else(|| properties.get("file_path"))
+        {
+            parts.push(value.clone());
+        }
+        if let Some(value) = properties.get("symbol") {
+            parts.push(value.clone());
         }
         for key in ["content_preview", "content"] {
             if let Some(value) = properties.get(key) {
@@ -1545,6 +1581,9 @@ mod tests {
             doc_type: Some("knowledge".into()),
             chunk_kind: None,
             role: None,
+            project_id: None,
+            relative_path: None,
+            source_uri: None,
             sources: BTreeMap::new(),
             excerpt: None,
         }];
@@ -1586,6 +1625,9 @@ mod tests {
                 doc_type: None,
                 chunk_kind: None,
                 role: None,
+                project_id: None,
+                relative_path: None,
+                source_uri: None,
                 sources: BTreeMap::new(),
                 excerpt: None,
             }],
@@ -1671,6 +1713,9 @@ mod tests {
                 doc_type: Some("knowledge".into()),
                 chunk_kind: None,
                 role: None,
+                project_id: None,
+                relative_path: None,
+                source_uri: None,
                 sources: BTreeMap::new(),
                 excerpt: None,
             },
@@ -1683,6 +1728,9 @@ mod tests {
                 doc_type: Some("thread".into()),
                 chunk_kind: None,
                 role: None,
+                project_id: None,
+                relative_path: None,
+                source_uri: None,
                 sources: BTreeMap::new(),
                 excerpt: None,
             },

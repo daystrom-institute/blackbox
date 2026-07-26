@@ -2992,7 +2992,7 @@ fn lane_capture<T>(
     Ok(ImmutableLaneCaptureV1 { evidence, rows })
 }
 
-fn corpus_source_state(
+pub(crate) fn corpus_source_state(
     source_id: &str,
     state: &CorpusMigrationSourceStateV1,
     fingerprint: Option<&str>,
@@ -3013,7 +3013,7 @@ fn corpus_source_state(
     }
 }
 
-fn vector_source_state(snapshot: &VectorMigrationSnapshotV1) -> InventorySourceStateV1 {
+pub(crate) fn vector_source_state(snapshot: &VectorMigrationSnapshotV1) -> InventorySourceStateV1 {
     match &snapshot.state {
         VectorMigrationSourceStateV1::Present => direct_owner_state(
             "vector-metadata",
@@ -3626,7 +3626,7 @@ fn capture_legacy_path_observations_lane(
     Ok((lane, bindings))
 }
 
-fn aggregate_inventory_states(
+pub(crate) fn aggregate_inventory_states(
     source_id: &str,
     states: &[InventorySourceStateV1],
 ) -> InventorySourceStateV1 {

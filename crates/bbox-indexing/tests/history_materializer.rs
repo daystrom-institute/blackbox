@@ -32,8 +32,8 @@ use bbox_corpus_core::project_catalog::{
 };
 use bbox_corpus_index::index::history_generations::{
     HistoryFaultPoint, HistoryGenerationError, HistoryGenerationIo, HistoryGenerationStore,
-    HistoryScanLimitsV1, RepoHistoryRebuildCommittedV1, RepoHistoryRebuildRecoveryV1,
-    scan_commit_documents,
+    HistoryProofModeV1, HistoryScanLimitsV1, RepoHistoryRebuildCommittedV1,
+    RepoHistoryRebuildRecoveryV1, scan_commit_documents,
 };
 use bbox_corpus_index::index::{TranscriptIndex, register_code_tokenizer};
 use bbox_edge_sidecar::manifest::ManifestIndex;
@@ -232,6 +232,24 @@ fn write_commit_documents(index_path: &Path, namespace: &str, messages: &[(&str,
         doc.add_u64(field("byte_offset"), 0);
         doc.add_u64(field("is_subagent"), 0);
         writer.add_document(doc).unwrap();
+    }
+    writer.commit().unwrap();
+    drop(writer);
+}
+
+/// Delete commit documents by entity id, so a fixture can model history LOSS
+/// (a shrunk or vanished namespace) rather than only growth.
+fn delete_commit_documents(index_path: &Path, namespace: &str, shas: &[&str]) {
+    let index = Index::open_in_dir(index_path).unwrap();
+    register_code_tokenizer(&index);
+    let schema = index.schema();
+    let entity_id = schema.get_field("entity_id").unwrap();
+    let mut writer: tantivy::IndexWriter = index.writer(15_000_000).unwrap();
+    for sha in shas {
+        writer.delete_term(tantivy::Term::from_field_text(
+            entity_id,
+            &format!("commit:{namespace}:{sha}"),
+        ));
     }
     writer.commit().unwrap();
     drop(writer);
@@ -863,6 +881,7 @@ fn recovery_row_crash_after_committed_is_a_no_op() {
             verified_lexical_view: "lexical-next".to_string(),
             verified_vector_view: "vector-next".to_string(),
             resulting_catalog_epoch: epoch + 1,
+            vector_inventory: Vec::new(),
         })
         .unwrap();
     fs::remove_dir_all(&fixture.index_path).unwrap();
@@ -1019,6 +1038,188 @@ fn migrated_fixture(commits: &[(&str, &str)]) -> MigratedFixture {
     }
 }
 
+/// A migrated root whose repo-history record owns a POPULATED COMPATIBILITY
+/// namespace in addition to its primary one.
+///
+/// How this shape is reached, and why it is built this way:
+///
+/// The v1 importer cannot emit it. `inventoried_group_namespaces` only
+/// admits namespaces the inventory ATTRIBUTED, and attribution is `Proved`
+/// only for a namespace equal to some project's committed authority; but a
+/// history group holding two distinct published authorities is refused
+/// outright with `conflicting_published_authorities`
+/// (`project_catalog_migration.rs`, authority selection). So a migrated group
+/// has exactly one attributed namespace and `planned_compatibility_namespaces`
+/// stays empty. A genuine two-project monorepo fixture was tried first and
+/// refuses at preflight for exactly that reason.
+///
+/// Compatibility namespaces are nonetheless a designed, REACHABLE state: the
+/// runtime admin path adds them (relpath move / authority change), the
+/// governing design's namespace-resolution op will add them, and
+/// `validate_catalog` accepts them. This fixture therefore reaches the shape
+/// the way production does - a real migrated root plus a catalog transaction -
+/// and then gives the compatibility namespace its own commit documents.
+///
+/// The resulting pass runs in DRIFT proof mode (the index moved after the
+/// asset was captured). That is not a limitation of the row: the
+/// primary-versus-compatibility routing in `advance_catalog_materialization`
+/// never consults the proof mode, so the assertions below hold identically in
+/// either mode.
+fn migrated_fixture_with_compatibility_namespace() -> (MigratedFixture, RepoHistoryId, String) {
+    let fixture = migrated_fixture(&[(commit_sha(61).as_str(), "primary namespace commit")]);
+    let compatibility = "neutral-legacy-compatibility".to_string();
+    let state = fixture.store.snapshot().unwrap();
+    let history_id = state
+        .catalog()
+        .repo_histories
+        .keys()
+        .next()
+        .cloned()
+        .expect("the migrated fixture has one repo history record");
+    let epoch = state.epoch();
+    let namespace_to_add = compatibility.clone();
+    let target = history_id.clone();
+    fixture
+        .store
+        .transact(epoch, move |catalog, _attachments| {
+            catalog
+                .repo_histories
+                .get_mut(&target)
+                .unwrap()
+                .compatibility_namespaces
+                .insert(CommitNamespace::parse(namespace_to_add).unwrap());
+            Ok(())
+        })
+        .unwrap();
+    write_commit_documents(
+        &fixture.index_path(),
+        &compatibility,
+        &[(commit_sha(62).as_str(), "compatibility namespace commit")],
+    );
+    (fixture, history_id, compatibility)
+}
+
+#[test]
+fn a_record_with_a_compatibility_namespace_advances_only_its_primary() {
+    let (fixture, history_id, compatibility) = migrated_fixture_with_compatibility_namespace();
+    let epoch = fixture.store.snapshot().unwrap().epoch();
+    let outcome = materialize_history_generations(&fixture.store, &fixture.request()).unwrap();
+    assert_eq!(outcome.namespaces.len(), 2);
+
+    let entry_for = |name: &str| {
+        outcome
+            .namespaces
+            .iter()
+            .find(|entry| entry.namespace.as_str() == name)
+            .unwrap_or_else(|| panic!("{name} materializes"))
+    };
+    let primary_entry = entry_for(&fixture.namespace);
+    let compatibility_entry = entry_for(&compatibility);
+    assert!(matches!(
+        primary_entry.classification,
+        NamespaceClassificationV1::Owned { .. }
+    ));
+    assert!(matches!(
+        compatibility_entry.classification,
+        NamespaceClassificationV1::OwnedCompatibility { .. }
+    ));
+    // Both are genuinely owned history, so both carry `rhg_` ids; a
+    // compatibility namespace is not quarantined and must not look like it.
+    assert!(primary_entry.generation.id.as_str().starts_with("rhg_"));
+    assert!(
+        compatibility_entry
+            .generation
+            .id
+            .as_str()
+            .starts_with("rhg_")
+    );
+    compatibility_entry.generation.validate().unwrap();
+    assert_eq!(
+        compatibility_entry
+            .generation
+            .manifest
+            .body
+            .commit_document_count,
+        1
+    );
+
+    // Exactly ONE Ready id in the whole catalog, and it is the primary's.
+    let after = fixture.store.snapshot().unwrap();
+    after.catalog().validate().unwrap();
+    let ready = after
+        .catalog()
+        .repo_histories
+        .values()
+        .filter_map(|record| match &record.materialization {
+            RepoHistoryMaterialization::Ready { generation_id } => Some(generation_id.clone()),
+            RepoHistoryMaterialization::NotBuilt => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].as_str(), primary_entry.generation.id.as_str());
+    assert!(matches!(
+        &after.catalog().repo_histories[&history_id].materialization,
+        RepoHistoryMaterialization::Ready { generation_id }
+            if generation_id.as_str() == primary_entry.generation.id.as_str()
+    ));
+
+    // The compatibility generation's ONLY durable owner is the manifest.
+    let scan = scan_commit_documents(&fixture.index_path(), HistoryScanLimitsV1::default())
+        .unwrap()
+        .unwrap();
+    let prepared =
+        prepare_rebuild_manifest(&scan, &outcome, epoch, "lexical-next", "vector-next").unwrap();
+    assert_eq!(
+        prepared.owned_generation_ids,
+        [primary_entry.generation.id.as_str().to_string()]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
+        prepared.compatibility_generation_ids,
+        [compatibility_entry.generation.id.as_str().to_string()]
+            .into_iter()
+            .collect()
+    );
+    let generation_store = HistoryGenerationStore::open_for_index(&fixture.index_path()).unwrap();
+    let manifest = generation_store
+        .write_prepared_rebuild_manifest(prepared)
+        .unwrap();
+
+    // GC: both are roots, the compatibility one SOLELY through the manifest.
+    // Dropping the manifest leaves the catalog naming only the primary, which
+    // is precisely why the manifest must pin the other.
+    let roots = history_generation_gc_roots(after.catalog(), std::slice::from_ref(&manifest));
+    assert_eq!(roots.len(), 2);
+    assert!(roots.contains(compatibility_entry.generation.id.as_str()));
+    assert!(
+        plan_history_generation_gc(&generation_store, &roots)
+            .unwrap()
+            .is_empty()
+    );
+    let catalog_only = history_generation_gc_roots(after.catalog(), &[]);
+    assert_eq!(catalog_only.len(), 1);
+    assert!(!catalog_only.contains(compatibility_entry.generation.id.as_str()));
+}
+
+#[test]
+fn a_compatibility_namespace_re_run_is_idempotent_and_byte_identical() {
+    let (fixture, _, _) = migrated_fixture_with_compatibility_namespace();
+    let first = materialize_history_generations(&fixture.store, &fixture.request()).unwrap();
+    let epoch = fixture.store.snapshot().unwrap().epoch();
+    let second = materialize_history_generations(&fixture.store, &fixture.request()).unwrap();
+    assert_eq!(first.generation_ids(), second.generation_ids());
+    assert_eq!(first.generation_ids().len(), 2);
+    for (left, right) in first.namespaces.iter().zip(second.namespaces.iter()) {
+        assert_eq!(left.generation.manifest, right.generation.manifest);
+        assert_eq!(left.classification, right.classification);
+    }
+    // The compatibility namespace advances nothing and the primary is already
+    // Ready at the same content-addressed id, so the second pass is a no-op.
+    assert_eq!(second.catalog_epoch_after, None);
+    assert_eq!(fixture.store.snapshot().unwrap().epoch(), epoch);
+}
+
 fn asset_path(fixture: &MigratedFixture) -> PathBuf {
     let assets = fixture
         .rehearsal_root
@@ -1073,6 +1274,17 @@ fn a_migrated_root_proves_its_namespace_against_the_persisted_asset() {
     let before = fixture.store.snapshot().unwrap().epoch();
     let outcome = materialize_history_generations(&fixture.store, &fixture.request()).unwrap();
 
+    // Equality mode must be genuinely REACHED here, not merely satisfied:
+    // an unchanged-since-migration index is the one shape where the asset is
+    // an exact description, and Phase 6's offline rebuild depends on this
+    // mode being reachable at all. Drift mode would also pass the assertions
+    // below, so the mode itself is asserted first.
+    assert_eq!(outcome.proof_mode, HistoryProofModeV1::Equality);
+    assert_eq!(
+        outcome.recorded_source_index_fingerprint,
+        outcome.observed_source_index_fingerprint
+    );
+    assert!(outcome.recorded_source_index_fingerprint.is_some());
     assert_eq!(outcome.namespaces.len(), 1);
     let entry = &outcome.namespaces[0];
     assert_eq!(entry.namespace.as_str(), fixture.namespace);
@@ -1098,18 +1310,121 @@ fn a_migrated_root_proves_its_namespace_against_the_persisted_asset() {
     assert_eq!(ready[0].as_str(), entry.generation.id.as_str());
 }
 
+// --- drift mode -----------------------------------------------------------
+//
+// The persisted asset is a POINT-IN-TIME migration record. A root that has
+// been live-indexed since migration legitimately outgrows it, so equality is
+// only the right contract while the index is unchanged. These rows replace
+// two earlier ones that asserted refusal on exactly the growth a live root
+// produces; that assertion was what the live forced-replacement smoke hit.
+
 #[test]
-fn a_migrated_root_refuses_when_the_index_gained_a_commit_after_capture() {
+fn drift_mode_a_recorded_namespace_that_grew_after_capture_materializes() {
     let fixture = migrated_fixture(&[(commit_sha(23).as_str(), "migrated first")]);
-    // Drift the live index away from the recorded inventory.
     write_commit_documents(
         &fixture.index_path(),
         &fixture.namespace,
-        &[(commit_sha(24).as_str(), "commit added after capture")],
+        &[(commit_sha(24).as_str(), "commit ingested after migration")],
+    );
+    let outcome = materialize_history_generations(&fixture.store, &fixture.request()).unwrap();
+    assert_eq!(outcome.proof_mode, HistoryProofModeV1::Drift);
+    assert_ne!(
+        outcome.recorded_source_index_fingerprint,
+        outcome.observed_source_index_fingerprint
+    );
+    assert_eq!(outcome.namespaces.len(), 1);
+    // Append-only growth carries the full observed set, not the recorded one.
+    assert_eq!(
+        outcome.namespaces[0]
+            .generation
+            .manifest
+            .body
+            .commit_document_count,
+        2
+    );
+    let state = fixture.store.snapshot().unwrap();
+    state.catalog().validate().unwrap();
+}
+
+#[test]
+fn drift_mode_a_namespace_minted_after_migration_classifies_with_no_asset_constraint() {
+    // The live-smoke shape: a `local_` history minted BY the migration whose
+    // commit documents were ingested afterwards by live walks. It is
+    // catalog-OWNED and absent from the asset, and it must materialize.
+    let fixture = migrated_fixture(&[(commit_sha(25).as_str(), "migrated first")]);
+    let minted = "local_8889982e025a4390a22acd07fc69e00d";
+    // Modelled as its OWN repo-history record whose PRIMARY namespace is the
+    // minted one, which is how the migration mints a local history: one
+    // record, one namespace. (Hanging it off an existing record as a
+    // COMPATIBILITY namespace is a different and currently unsupported
+    // shape - see the note in the report - and is deliberately not what this
+    // row exercises.)
+    let epoch = fixture.store.snapshot().unwrap().epoch();
+    fixture
+        .store
+        .transact(epoch, |catalog, _attachments| {
+            let id = RepoHistoryId::parse("rh_000000000000000000000000000000aa").unwrap();
+            catalog.repo_histories.insert(
+                id.clone(),
+                RepoHistoryRecord {
+                    repo_history_id: id,
+                    authority: RepoHistoryAuthority::LegacyNamespace(
+                        CommitNamespace::parse(minted).unwrap(),
+                    ),
+                    primary_namespace: CommitNamespace::parse(minted).unwrap(),
+                    compatibility_namespaces: BTreeSet::new(),
+                    materialization: RepoHistoryMaterialization::NotBuilt,
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+    write_commit_documents(
+        &fixture.index_path(),
+        minted,
+        &[(commit_sha(26).as_str(), "ingested after migration")],
+    );
+
+    let outcome = materialize_history_generations(&fixture.store, &fixture.request()).unwrap();
+    assert_eq!(outcome.proof_mode, HistoryProofModeV1::Drift);
+    let minted_entry = outcome
+        .namespaces
+        .iter()
+        .find(|entry| entry.namespace.as_str() == minted)
+        .expect("the post-migration namespace materializes");
+    assert!(matches!(
+        minted_entry.classification,
+        NamespaceClassificationV1::Owned { .. }
+    ));
+    fixture
+        .store
+        .snapshot()
+        .unwrap()
+        .catalog()
+        .validate()
+        .unwrap();
+}
+
+#[test]
+fn drift_mode_a_recorded_namespace_that_shrank_refuses() {
+    let fixture = migrated_fixture(&[
+        (commit_sha(41).as_str(), "migrated first"),
+        (commit_sha(42).as_str(), "migrated second"),
+        (commit_sha(43).as_str(), "migrated third"),
+    ]);
+    delete_commit_documents(
+        &fixture.index_path(),
+        &fixture.namespace,
+        &[commit_sha(43).as_str()],
     );
     let error = materialize_history_generations(&fixture.store, &fixture.request()).unwrap_err();
     assert_eq!(error.code(), "error.history_commitment_mismatch");
-    // The refusal preserves last-good state: nothing advanced.
+    assert!(
+        error.message().contains("cannot shrink"),
+        "unexpected message: {}",
+        error.message()
+    );
+    // Loss evidence keeps the replacement refused with last-good intact.
     let state = fixture.store.snapshot().unwrap();
     assert!(
         state
@@ -1121,15 +1436,71 @@ fn a_migrated_root_refuses_when_the_index_gained_a_commit_after_capture() {
 }
 
 #[test]
-fn a_migrated_root_refuses_when_a_new_namespace_appeared_after_capture() {
-    let fixture = migrated_fixture(&[(commit_sha(25).as_str(), "migrated first")]);
-    write_commit_documents(
+fn drift_mode_a_recorded_namespace_that_vanished_refuses() {
+    let fixture = migrated_fixture(&[
+        (commit_sha(44).as_str(), "migrated first"),
+        (commit_sha(45).as_str(), "migrated second"),
+    ]);
+    delete_commit_documents(
         &fixture.index_path(),
-        "namespace-that-was-never-captured",
-        &[(commit_sha(26).as_str(), "drifted")],
+        &fixture.namespace,
+        &[commit_sha(44).as_str(), commit_sha(45).as_str()],
     );
     let error = materialize_history_generations(&fixture.store, &fixture.request()).unwrap_err();
     assert_eq!(error.code(), "error.history_commitment_mismatch");
+    assert!(
+        error.message().contains("absent from the index"),
+        "unexpected message: {}",
+        error.message()
+    );
+}
+
+#[test]
+fn the_prepared_manifest_records_the_proof_mode_and_both_fingerprints() {
+    // Drift arm.
+    let fixture = migrated_fixture(&[(commit_sha(46).as_str(), "migrated first")]);
+    write_commit_documents(
+        &fixture.index_path(),
+        &fixture.namespace,
+        &[(commit_sha(47).as_str(), "ingested after migration")],
+    );
+    let epoch = fixture.store.snapshot().unwrap().epoch();
+    let outcome = materialize_history_generations(&fixture.store, &fixture.request()).unwrap();
+    let scan = scan_commit_documents(&fixture.index_path(), HistoryScanLimitsV1::default())
+        .unwrap()
+        .unwrap();
+    let prepared =
+        prepare_rebuild_manifest(&scan, &outcome, epoch, "lexical-next", "vector-next").unwrap();
+    assert_eq!(prepared.proof_mode, HistoryProofModeV1::Drift);
+    assert!(prepared.recorded_source_index_fingerprint.is_some());
+    assert!(prepared.observed_source_index_fingerprint.is_some());
+    assert_ne!(
+        prepared.recorded_source_index_fingerprint,
+        prepared.observed_source_index_fingerprint
+    );
+    let generation_store = HistoryGenerationStore::open_for_index(&fixture.index_path()).unwrap();
+    let manifest = generation_store
+        .write_prepared_rebuild_manifest(prepared)
+        .unwrap();
+    let reloaded = generation_store.read_rebuild_manifest().unwrap().unwrap();
+    assert_eq!(reloaded, manifest);
+    assert_eq!(reloaded.prepared.proof_mode, HistoryProofModeV1::Drift);
+
+    // Equality arm.
+    let untouched = migrated_fixture(&[(commit_sha(48).as_str(), "migrated first")]);
+    let epoch = untouched.store.snapshot().unwrap().epoch();
+    let outcome = materialize_history_generations(&untouched.store, &untouched.request()).unwrap();
+    let scan = scan_commit_documents(&untouched.index_path(), HistoryScanLimitsV1::default())
+        .unwrap()
+        .unwrap();
+    let prepared =
+        prepare_rebuild_manifest(&scan, &outcome, epoch, "lexical-next", "vector-next").unwrap();
+    assert_eq!(prepared.proof_mode, HistoryProofModeV1::Equality);
+    assert_eq!(
+        prepared.recorded_source_index_fingerprint,
+        prepared.observed_source_index_fingerprint
+    );
+    assert!(prepared.recorded_source_index_fingerprint.is_some());
 }
 
 #[test]

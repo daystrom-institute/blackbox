@@ -13,7 +13,7 @@ use tantivy::schema::*;
 use tantivy::tokenizer::TextAnalyzer;
 use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, Term};
 
-pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g10-code-source-selectors";
+pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g11-path-free-project-files";
 const SCHEMA_VERSION_FILE: &str = "schema_version.txt";
 
 /// Metadata about an indexed file, for incremental updates.
@@ -57,6 +57,20 @@ pub struct FieldHandles {
     pub role: Field,
     pub timestamp: Field,
     pub file_path: Field,
+    /// Normalized, slash-separated project-relative path (P3-E, governing
+    /// section 10.2). On a project-file document this is the same value
+    /// `file_path` carries; it exists as its own field so the response
+    /// boundary can return the structured triple without re-deriving
+    /// anything from a display string, and so a future field-level cut of
+    /// `file_path` needs no reader change.
+    pub relative_path: Field,
+    /// Stable machine identifier `bbox://project/<project_id>/<encoded>`
+    /// (`bbox_code_source::encode_source_uri`). Never changes when aliases
+    /// or attachments change.
+    pub source_uri: Field,
+    /// `local` / `collected`, derived from the selector
+    /// (`bbox_code_source::source_kind_for_selector`).
+    pub source_kind: Field,
     pub code_source_selector: Field,
     pub code_source_generation: Field,
     pub code_source_entry_key: Field,
@@ -250,9 +264,14 @@ pub struct EmbeddingSourceDoc {
     pub doc_type: String,
     pub account: String,
     pub session_id: String,
-    #[allow(dead_code)] // Debug-formatted in trace logs
+    /// The stored `project` field. After the P3-E cut this is the identity's
+    /// DISPLAY NAME on a project-file document, never a checkout path, which
+    /// is what makes it usable as the backfill lane's prepend value.
     pub project: String,
     pub file_path: String,
+    /// The stored `relative_path` field. Empty on document kinds that do not
+    /// carry one (transcripts, store docs).
+    pub relative_path: String,
     pub byte_offset: u64,
     pub chunk_kind: String,
     pub language: Option<String>,
@@ -268,6 +287,11 @@ impl TranscriptIndex {
     /// authority from `projects.json`. The daemon opens the index through
     /// [`TranscriptIndex::open_or_create_with_code_source_store_path`] with a
     /// live [`ProjectRecordsProvider`].
+    ///
+    /// No guard is injected here, so this path REFUSES a destructive schema
+    /// replacement (P3-E fail-closed contract). A fresh index directory never
+    /// triggers one; a test or offline caller that intends a replacement must
+    /// use [`TranscriptIndex::open_or_create_guarded`].
     pub fn open_or_create(
         index_path: &Path,
         roots: Vec<(String, PathBuf)>,
@@ -276,6 +300,32 @@ impl TranscriptIndex {
         knowledge_path: PathBuf,
         threads_path: PathBuf,
         roadmap_path: PathBuf,
+    ) -> Result<Self> {
+        Self::open_or_create_guarded(
+            index_path,
+            roots,
+            codex_root,
+            projects_path,
+            knowledge_path,
+            threads_path,
+            roadmap_path,
+            None,
+        )
+    }
+
+    /// [`TranscriptIndex::open_or_create`] with an explicit pre-replacement
+    /// guard, for the test and offline lanes that exercise the replacement
+    /// boundary itself.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_or_create_guarded(
+        index_path: &Path,
+        roots: Vec<(String, PathBuf)>,
+        codex_root: Option<PathBuf>,
+        projects_path: PathBuf,
+        knowledge_path: PathBuf,
+        threads_path: PathBuf,
+        roadmap_path: PathBuf,
+        schema_replacement_guard: Option<schema_replacement::SchemaReplacementGuard>,
     ) -> Result<Self> {
         let code_source_store_path = projects_path
             .parent()
@@ -294,6 +344,7 @@ impl TranscriptIndex {
             threads_path,
             roadmap_path,
             records_provider,
+            schema_replacement_guard,
         )
     }
 
@@ -308,9 +359,14 @@ impl TranscriptIndex {
         threads_path: PathBuf,
         roadmap_path: PathBuf,
         records_provider: std::sync::Arc<dyn ProjectRecordsProvider>,
+        schema_replacement_guard: Option<schema_replacement::SchemaReplacementGuard>,
     ) -> Result<Self> {
-        let schema_was_reset =
-            reset_index_on_schema_mismatch(index_path, &projects_path, &code_source_store_path)?;
+        let schema_was_reset = reset_index_on_schema_mismatch(
+            index_path,
+            &projects_path,
+            &code_source_store_path,
+            schema_replacement_guard.as_ref(),
+        )?;
         let meta_path = index_path.join("_meta.json");
 
         let (schema, fields) = build_schema();
@@ -331,6 +387,22 @@ impl TranscriptIndex {
         register_code_tokenizer(&index);
         if !schema_was_reset {
             write_schema_version_marker(index_path)?;
+        }
+
+        // Bridge commit carryover, consumed at EVERY open when present and
+        // BEFORE the reader below binds (plan section 9 item 2). Not gated on
+        // `schema_was_reset`: the mismatch trigger fires once, so a crash after
+        // the drop leaves no mismatch on the next open and a gated consumer
+        // would never run. The re-add is delete-term-then-add and the spill file
+        // is removed only after the commit, so replaying is safe and losing the
+        // population is not possible.
+        let carried_commits =
+            schema_replacement::consume_commit_spill_if_present(index_path, &index, fields)?;
+        if carried_commits > 0 {
+            tracing::info!(
+                commit_documents = carried_commits,
+                "carried commit documents across the index replacement"
+            );
         }
 
         let reader = index
@@ -718,6 +790,7 @@ impl TranscriptIndex {
             session_id: first_text(doc, self.fields.session_id),
             project: first_text(doc, self.fields.project),
             file_path: first_text(doc, self.fields.file_path),
+            relative_path: first_text(doc, self.fields.relative_path),
             byte_offset: first_u64(doc, self.fields.byte_offset),
             chunk_kind: first_text(doc, self.fields.chunk_kind),
             language: optional_text(doc, self.fields.language),
@@ -830,6 +903,11 @@ impl TranscriptIndex {
             ("symbol", self.fields.symbol),
             ("symbol_exact", self.fields.symbol_exact),
             ("file_path", self.fields.file_path),
+            ("relative_path", self.fields.relative_path),
+            ("source_uri", self.fields.source_uri),
+            ("source_kind", self.fields.source_kind),
+            ("project", self.fields.project),
+            ("project_id", self.fields.project_id),
             ("code_source_selector", self.fields.code_source_selector),
             ("code_source_generation", self.fields.code_source_generation),
             ("repo_id", self.fields.repo_id),
@@ -856,8 +934,49 @@ impl TranscriptIndex {
         if let Some(offset) = optional_u64(doc, self.fields.byte_offset) {
             properties.insert("byte_offset".into(), offset.to_string());
         }
+        if let Some(display_path) = render_display_path(&properties) {
+            properties.insert("display_path".into(), display_path);
+        }
         properties
     }
+}
+
+/// Render `display_path` in the fixed fallback order of governing
+/// section 10.2:
+///
+/// 1. session workspace mapping - does not exist yet, returns `None` this
+///    phase, deliberately not faked from anything else;
+/// 2. explicitly selected operator attachment for local UI output - joined
+///    ABOVE this function by the daemon surface that holds the resolved
+///    attachment and RENDERED, never opened (no lease, no stat, no read);
+/// 3. accepted project alias/display name plus relative path.
+///
+/// Tier 3 is what this function can compute from stored fields alone, so it is
+/// the only tier implemented here. `source_uri` stays the machine identity and
+/// is unaffected by which tier renders.
+pub fn render_display_path(properties: &BTreeMap<String, String>) -> Option<String> {
+    let relative_path = properties
+        .get("relative_path")
+        .filter(|value| !value.is_empty())?;
+    let display_name = properties
+        .get("project")
+        .filter(|value| !value.is_empty())?;
+    Some(format!("{display_name}/{relative_path}"))
+}
+
+/// Tier 2 of the `display_path` order: the operator-selected attachment root
+/// joined onto the stored relative path. Rendered for local UI output and
+/// NEVER opened - this returns a string, takes no lease, and touches no
+/// filesystem, which is why a detached or unavailable checkout cannot make it
+/// fail.
+pub fn render_selected_attachment_display_path(
+    selected_checkout_root: &Path,
+    relative_path: &str,
+) -> String {
+    selected_checkout_root
+        .join(relative_path)
+        .to_string_lossy()
+        .into_owned()
 }
 
 pub fn first_text(doc: &TantivyDocument, field: Field) -> String {
@@ -928,6 +1047,9 @@ pub fn build_schema() -> (Schema, FieldHandles) {
         role: builder.add_text_field("role", STRING | STORED),
         timestamp: builder.add_text_field("timestamp", STRING | STORED),
         file_path: builder.add_text_field("file_path", STRING | STORED),
+        relative_path: builder.add_text_field("relative_path", STRING | STORED),
+        source_uri: builder.add_text_field("source_uri", STRING | STORED),
+        source_kind: builder.add_text_field("source_kind", STRING | STORED),
         code_source_selector: builder.add_text_field("code_source_selector", STRING | STORED),
         code_source_generation: builder.add_text_field("code_source_generation", STRING | STORED),
         code_source_entry_key: builder.add_text_field("code_source_entry_key", STRING | STORED),
@@ -991,26 +1113,56 @@ fn reset_index_on_schema_mismatch(
     index_path: &Path,
     projects_path: &Path,
     code_source_store_path: &Path,
+    guard: Option<&schema_replacement::SchemaReplacementGuard>,
 ) -> Result<bool> {
     if !index_path.exists() {
         return Ok(false);
     }
     let marker_path = index_path.join(SCHEMA_VERSION_FILE);
-    let should_reset = match fs::read_to_string(&marker_path) {
-        Ok(raw) => raw.trim() != INDEX_SCHEMA_VERSION,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            index_path.read_dir()?.next().is_some()
-        }
+    let observed = match fs::read_to_string(&marker_path) {
+        Ok(raw) => Some(raw.trim().to_string()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
         Err(err) => return Err(err.into()),
+    };
+    let should_reset = match observed.as_deref() {
+        Some(marker) => marker != INDEX_SCHEMA_VERSION,
+        // A non-empty index directory with no marker at all predates the
+        // marker and must be replaced; an empty one is a fresh create.
+        None => index_path.read_dir()?.next().is_some(),
     };
     if should_reset {
         let edges_dir =
             bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(projects_path);
         let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)?;
         verify_collected_schema_migration_sources(&manifest, code_source_store_path)?;
+        // P3-E: fail closed. Before this milestone the drop below was
+        // unconditional for every caller. An absent guard now refuses it
+        // outright rather than silently dropping a history population no
+        // inventory has proved, and a guard that refuses aborts the reset with
+        // the last-good lexical and vector views still selected because
+        // nothing has been replaced yet.
+        let Some(guard) = guard else {
+            anyhow::bail!(
+                "error.schema_replacement_unguarded: refusing to replace the index at {} \
+                 (observed {}, target {}) with no pre-replacement guard injected",
+                index_path.display(),
+                observed.as_deref().unwrap_or("<no marker>"),
+                INDEX_SCHEMA_VERSION
+            );
+        };
+        let authorization = guard(&schema_replacement::SchemaReplacementRequest {
+            index_path,
+            projects_path,
+            code_source_store_path,
+            observed_schema_version: observed.clone(),
+            target_schema_version: INDEX_SCHEMA_VERSION,
+        })
+        .context("pre-replacement guard refused the index schema replacement")?;
         tracing::info!(
             path = %index_path.display(),
             schema_version = INDEX_SCHEMA_VERSION,
+            observed_schema_version = observed.as_deref().unwrap_or("<no marker>"),
+            authorized_by = %authorization.authorized_by,
             "dropping transcript index for schema migration"
         );
         fs::remove_dir_all(index_path)?;
@@ -1116,6 +1268,7 @@ mod tests {
             std::sync::Arc::new(StaticProjectRecordsProvider::new(
                 ProjectRecordsSnapshot::empty(),
             )),
+            None,
         )
         .unwrap();
 
@@ -1181,7 +1334,7 @@ mod tests {
         fs::write(index_path.join(SCHEMA_VERSION_FILE), "old-schema\n").unwrap();
         fs::write(index_path.join("stale-file"), "stale").unwrap();
 
-        let index = TranscriptIndex::open_or_create(
+        let index = TranscriptIndex::open_or_create_guarded(
             &index_path,
             Vec::new(),
             None,
@@ -1189,6 +1342,7 @@ mod tests {
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
             dir.path().join("roadmap.json"),
+            Some(test_authorizing_guard()),
         )
         .unwrap();
 
@@ -1197,6 +1351,163 @@ mod tests {
         index.complete_schema_migration().unwrap();
         let marker = fs::read_to_string(index_path.join(SCHEMA_VERSION_FILE)).unwrap();
         assert_eq!(marker.trim(), INDEX_SCHEMA_VERSION);
+    }
+
+    /// A guard that authorizes unconditionally, for the tests that care about
+    /// the mechanics AFTER authorization rather than about the guard itself.
+    fn test_authorizing_guard() -> schema_replacement::SchemaReplacementGuard {
+        std::sync::Arc::new(|_request| {
+            Ok(schema_replacement::SchemaReplacementAuthorization::new(
+                "test-guard",
+            ))
+        })
+    }
+
+    /// P3-E fail-closed contract: with no guard injected, a detected schema
+    /// mismatch REFUSES the replacement instead of dropping the index. The
+    /// outgoing index, its marker, and its files all survive, which is what
+    /// keeps the last-good lexical and vector views readable.
+    #[test]
+    fn schema_mismatch_with_no_guard_refuses_and_keeps_the_old_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_path = dir.path().join("index");
+        fs::create_dir_all(&index_path).unwrap();
+        fs::write(index_path.join(SCHEMA_VERSION_FILE), "old-schema\n").unwrap();
+        fs::write(index_path.join("stale-file"), "stale").unwrap();
+
+        let error = TranscriptIndex::open_or_create(
+            &index_path,
+            Vec::new(),
+            None,
+            dir.path().join("projects.json"),
+            dir.path().join("knowledge.json"),
+            dir.path().join("threads.json"),
+            dir.path().join("roadmap.json"),
+        )
+        .err()
+        .expect("an unguarded replacement must be refused");
+        assert!(
+            format!("{error:#}").contains("error.schema_replacement_unguarded"),
+            "{error:#}"
+        );
+        assert!(index_path.join("stale-file").exists());
+        assert_eq!(
+            fs::read_to_string(index_path.join(SCHEMA_VERSION_FILE))
+                .unwrap()
+                .trim(),
+            "old-schema"
+        );
+    }
+
+    /// A guard that REFUSES aborts the reset with everything intact. This is
+    /// the shape every refusal-matrix row shares (missing generation, corrupt
+    /// manifest, commitment mismatch): the guard errors, nothing is dropped.
+    #[test]
+    fn a_refusing_guard_aborts_the_reset_and_keeps_the_old_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_path = dir.path().join("index");
+        fs::create_dir_all(&index_path).unwrap();
+        fs::write(index_path.join(SCHEMA_VERSION_FILE), "old-schema\n").unwrap();
+        fs::write(index_path.join("stale-file"), "stale").unwrap();
+
+        let guard: schema_replacement::SchemaReplacementGuard = std::sync::Arc::new(|_request| {
+            Err(anyhow::anyhow!(
+                "error.history_commitment_mismatch: namespace proof failed"
+            ))
+        });
+        let error = TranscriptIndex::open_or_create_guarded(
+            &index_path,
+            Vec::new(),
+            None,
+            dir.path().join("projects.json"),
+            dir.path().join("knowledge.json"),
+            dir.path().join("threads.json"),
+            dir.path().join("roadmap.json"),
+            Some(guard),
+        )
+        .err()
+        .expect("a refusing guard must abort the replacement");
+        assert!(
+            format!("{error:#}").contains("error.history_commitment_mismatch"),
+            "{error:#}"
+        );
+        assert!(index_path.join("stale-file").exists());
+        assert_eq!(
+            fs::read_to_string(index_path.join(SCHEMA_VERSION_FILE))
+                .unwrap()
+                .trim(),
+            "old-schema"
+        );
+    }
+
+    /// The guard observes the OUTGOING marker and the incoming target, so a
+    /// materializer can prove the population it is about to carry against the
+    /// schema that produced it.
+    #[test]
+    fn the_guard_observes_both_schema_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_path = dir.path().join("index");
+        fs::create_dir_all(&index_path).unwrap();
+        fs::write(index_path.join(SCHEMA_VERSION_FILE), "old-schema\n").unwrap();
+        fs::write(index_path.join("stale-file"), "stale").unwrap();
+        let observed = std::sync::Arc::new(Mutex::new(None));
+        let captured = observed.clone();
+        let guard: schema_replacement::SchemaReplacementGuard =
+            std::sync::Arc::new(move |request| {
+                *captured.lock() = Some((
+                    request.observed_schema_version.clone(),
+                    request.target_schema_version.to_string(),
+                ));
+                Ok(schema_replacement::SchemaReplacementAuthorization::new(
+                    "test-guard",
+                ))
+            });
+        TranscriptIndex::open_or_create_guarded(
+            &index_path,
+            Vec::new(),
+            None,
+            dir.path().join("projects.json"),
+            dir.path().join("knowledge.json"),
+            dir.path().join("threads.json"),
+            dir.path().join("roadmap.json"),
+            Some(guard),
+        )
+        .unwrap();
+        assert_eq!(
+            observed.lock().clone(),
+            Some((
+                Some("old-schema".to_string()),
+                INDEX_SCHEMA_VERSION.to_string()
+            ))
+        );
+    }
+
+    /// A fresh index directory is NOT a mismatch, so the guard never runs and
+    /// the no-guard path stays usable for every ordinary open.
+    #[test]
+    fn a_fresh_index_never_invokes_the_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let invoked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = invoked.clone();
+        let guard: schema_replacement::SchemaReplacementGuard =
+            std::sync::Arc::new(move |_request| {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(schema_replacement::SchemaReplacementAuthorization::new(
+                    "test-guard",
+                ))
+            });
+        TranscriptIndex::open_or_create_guarded(
+            &dir.path().join("index"),
+            Vec::new(),
+            None,
+            dir.path().join("projects.json"),
+            dir.path().join("knowledge.json"),
+            dir.path().join("threads.json"),
+            dir.path().join("roadmap.json"),
+            Some(guard),
+        )
+        .unwrap();
+        assert!(!invoked.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
@@ -1495,7 +1806,7 @@ mod tests {
         let doc = project_files::build_project_file_doc(
             &chunk,
             &project,
-            Path::new("/tmp/repo/src/lib.rs"),
+            "test-project-display",
             Some("a".repeat(40).as_str()),
             None,
             index.field_handles(),
@@ -1521,7 +1832,13 @@ mod tests {
                 exclude_self: None,
             })
             .unwrap();
-        assert!(result.contains("/tmp/repo/src/lib.rs"), "{result}");
+        // P3-E: the rendered result carries the RELATIVE path and the display
+        // name; no host root appears anywhere in it.
+        assert!(result.contains("src/lib.rs"), "{result}");
+        assert!(
+            !result.contains("/tmp/repo"),
+            "a rendered project-file result must carry no host root: {result}"
+        );
     }
 
     /// gap-72fd5932 plus the phase-2 B1 retirement: the two filter lanes
@@ -1685,7 +2002,7 @@ mod tests {
         let doc = project_files::build_project_file_doc(
             &chunk,
             &project,
-            Path::new("/tmp/repo/src/lib.rs"),
+            "test-project-display",
             None,
             None,
             index.field_handles(),
@@ -1771,7 +2088,7 @@ mod tests {
         let doc = project_files::build_project_file_doc(
             &chunk,
             &project,
-            Path::new("/tmp/repo/src/lib.rs"),
+            "test-project-display",
             None,
             None,
             index.field_handles(),
@@ -1803,6 +2120,7 @@ pub mod history_generations;
 pub mod migration_inventory;
 pub mod passes;
 pub mod project_files;
+pub mod schema_replacement;
 pub mod search;
 pub mod tool_edges;
 

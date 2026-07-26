@@ -41,7 +41,7 @@ use bbox_stores::roadmap::RoadmapItem;
 use bbox_threads::threads::Thread;
 
 use super::knowledge_docs::KnowledgeIndexDocument;
-use super::reindex::{conservative_log_merge_policy, execute_reindex_pass};
+use super::reindex::{FullRebuildCause, conservative_log_merge_policy, execute_reindex_pass};
 use super::{FieldHandles, ReindexConfig, StatsCache, TranscriptIndex};
 use crate::checkout_access::{
     CheckoutAccessBroker, CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest,
@@ -90,6 +90,9 @@ pub enum IndexWriteOp {
     ReindexPass {
         full: bool,
         dirty: bool,
+        /// WHY this pass is running. Never inferred: see
+        /// [`FullRebuildCause`] for the asymmetry it selects.
+        cause: FullRebuildCause,
         /// Operator-named projects whose H3 empty-scan refusal is waived for
         /// THIS pass (Phase 3 plan section 7 item 2). Operator authority,
         /// passed through and never defaulted (RX-V1): no code path may add
@@ -132,6 +135,11 @@ pub enum IndexWriteOp {
     /// hands it here for the walk, and treats every failure as best effort.
     StageGitCurrentOverlay {
         project: Box<ProjectRecord>,
+        /// The identity's display name. P3-E: the commit documents this walk
+        /// emits carry it in `project` instead of the checkout path, so it must
+        /// travel with the op rather than be re-derived from the compat record
+        /// (whose alias set is not the catalog display name).
+        project_display: String,
         lease: Box<ValidatedCheckoutLease>,
         snapshot_id: String,
         current_chunk_targets: HashMap<String, bbox_corpus_core::entity_ref::EntityRef>,
@@ -936,8 +944,21 @@ impl IndexWriterActor {
 
     /// Run a reindex pass on the actor thread and wait for its outcome.
     /// Returns the human-readable summary line on commit/no-op.
+    ///
+    /// ORDINARY cause: this is the periodic/triggered pass over a populated
+    /// index, where the preservation gates are load-bearing. The post-reset
+    /// rebuild uses [`Self::run_reindex_pass_for_schema_migration`] instead.
     pub fn run_reindex_pass(&self, full: bool, dirty: bool) -> Result<String> {
         self.run_reindex_pass_accepting_empty(full, dirty, Vec::new())
+    }
+
+    /// The synchronous full rebuild that follows a destructive schema
+    /// replacement (P3-E). Distinguished from an ordinary full pass by an
+    /// explicit cause rather than by observing that the index is empty: an
+    /// empty index on an ORDINARY pass must still fail the preservation gates,
+    /// because that is exactly the property they exist to enforce.
+    pub fn run_reindex_pass_for_schema_migration(&self) -> Result<String> {
+        self.dispatch_reindex_pass(true, true, FullRebuildCause::SchemaMigration, Vec::new())
     }
 
     /// Reindex pass with the operator's H3 acknowledgement list. Only
@@ -949,11 +970,27 @@ impl IndexWriterActor {
         dirty: bool,
         accept_empty_projects: Vec<String>,
     ) -> Result<String> {
+        self.dispatch_reindex_pass(
+            full,
+            dirty,
+            FullRebuildCause::Ordinary,
+            accept_empty_projects,
+        )
+    }
+
+    fn dispatch_reindex_pass(
+        &self,
+        full: bool,
+        dirty: bool,
+        cause: FullRebuildCause,
+        accept_empty_projects: Vec<String>,
+    ) -> Result<String> {
         let (ack, ack_rx) = mpsc::sync_channel(1);
         self.tx
             .send(IndexWriteOp::ReindexPass {
                 full,
                 dirty,
+                cause,
                 accept_empty_projects,
                 ack,
             })
@@ -1058,6 +1095,7 @@ impl IndexWriterActor {
     pub fn stage_git_current_overlay(
         &self,
         project: ProjectRecord,
+        project_display: String,
         lease: ValidatedCheckoutLease,
         snapshot_id: String,
         current_chunk_targets: HashMap<String, bbox_corpus_core::entity_ref::EntityRef>,
@@ -1066,6 +1104,7 @@ impl IndexWriterActor {
         self.tx
             .send(IndexWriteOp::StageGitCurrentOverlay {
                 project: Box::new(project),
+                project_display,
                 lease: Box::new(lease),
                 snapshot_id,
                 current_chunk_targets,
@@ -1128,10 +1167,11 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
             IndexWriteOp::ReindexPass {
                 full,
                 dirty,
+                cause,
                 accept_empty_projects,
                 ack,
             } => {
-                let result = run_pass(&ctx, &rx, full, dirty, &accept_empty_projects);
+                let result = run_pass(&ctx, &rx, full, dirty, cause, &accept_empty_projects);
                 let _ = ack.send(result);
             }
             IndexWriteOp::StageCollectedGeneration {
@@ -1185,6 +1225,7 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
             }
             IndexWriteOp::StageGitCurrentOverlay {
                 project,
+                project_display,
                 lease,
                 snapshot_id,
                 current_chunk_targets,
@@ -1193,6 +1234,7 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
                 let result = run_git_current_overlay(
                     &ctx,
                     &project,
+                    &project_display,
                     &lease,
                     &snapshot_id,
                     &current_chunk_targets,
@@ -1354,7 +1396,6 @@ fn run_collected_stage(
         identity,
         super::project_files::ProjectFileCompatFields {
             repo_id: compat.as_ref().and_then(|record| record.repo_id.as_deref()),
-            project_display: None,
         },
         descriptor,
         generation_id,
@@ -1454,10 +1495,6 @@ fn run_local_stage(
         identity,
         super::project_files::ProjectFileCompatFields {
             repo_id: compat.as_ref().and_then(|record| record.repo_id.as_deref()),
-            // Local documents keep the registered display root this
-            // milestone; only collected documents go path-free at P3-B
-            // (plan section 4.3 item 2).
-            project_display: compat.as_ref().map(|record| record.canonical_path.as_str()),
         },
         scope,
         local_lease.project_root(),
@@ -1480,6 +1517,7 @@ fn run_local_stage(
         Some(record) => stage_git_current_edges(
             ctx,
             record,
+            identity.display_name.as_str(),
             Some(git_lease.checkout_root()),
             &result,
             &mut writer,
@@ -1509,6 +1547,7 @@ fn run_local_stage(
 fn run_git_current_overlay(
     ctx: &ActorCtx,
     project: &ProjectRecord,
+    project_display: &str,
     lease: &ValidatedCheckoutLease,
     snapshot_id: &str,
     current_chunk_targets: &HashMap<String, bbox_corpus_core::entity_ref::EntityRef>,
@@ -1529,6 +1568,7 @@ fn run_git_current_overlay(
         git_meta_dir: &git_meta_dir,
         force_full: true,
         publication: &mut publication,
+        project_display,
     };
     super::git_history::index_git_history_for_project(
         project,
@@ -1548,6 +1588,7 @@ fn run_git_current_overlay(
 fn stage_git_current_edges(
     ctx: &ActorCtx,
     project: &ProjectRecord,
+    project_display: &str,
     git_root: Option<&Path>,
     result: &super::project_files::CollectedIndexResult,
     writer: &mut IndexWriter,
@@ -1574,6 +1615,7 @@ fn stage_git_current_edges(
         git_meta_dir: &git_meta_dir,
         force_full: true,
         publication,
+        project_display,
     };
     super::git_history::index_git_history_for_project(
         project,
@@ -1685,6 +1727,7 @@ fn run_pass(
     rx: &mpsc::Receiver<IndexWriteOp>,
     full: bool,
     dirty: bool,
+    cause: FullRebuildCause,
     accept_empty_projects: &[String],
 ) -> Result<String> {
     let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
@@ -1732,6 +1775,7 @@ fn run_pass(
             ctx.fields,
             full,
             dirty,
+            cause,
             &mut writer,
             &mut drain,
             &ctx.records_provider,
@@ -2290,6 +2334,264 @@ mod tests {
         assert!(
             !snapshot_dir.join("git-current.jsonl").exists(),
             "the Git overlay member is staged post-activation, not in the transaction"
+        );
+    }
+
+    /// Fabricate the OUTGOING durable state for an active collected
+    /// generation: a manifest entry and activation record naming a synthetic
+    /// old materialization suffix and snapshot id, exactly as a pre-bump daemon
+    /// left them. `validate_collected_materialization_selector` is shape-only,
+    /// so any historic 16-hex suffix is a legitimate past selector.
+    ///
+    /// `document_count` is 0 by construction: the pass's preservation check
+    /// verifies the live document count under the OUTGOING selector against the
+    /// activation record, and a fixture cannot mint documents under a
+    /// materialization version this binary no longer computes. The migration
+    /// logic under test is unaffected - it re-stages from store blobs and
+    /// records whatever count the re-stage produces.
+    fn install_outgoing_collected_state(
+        root: &std::path::Path,
+        store: &bbox_code_source_store::CodeSourceStore,
+        project_id: &str,
+        generation_id: &str,
+        descriptor: &bbox_code_source::GenerationDescriptor,
+    ) -> (String, String) {
+        let outgoing_selector = format!(
+            "{}:m{}",
+            bbox_code_source::source_selector(project_id, generation_id),
+            "0123456789abcdef"
+        );
+        let outgoing_snapshot = format!("collected-{}", "9".repeat(32));
+        let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
+            &root.join("projects.json"),
+        );
+        let snapshot_dir =
+            bbox_edge_sidecar::snapshot::snapshot_dir(&edges_dir, project_id, &outgoing_snapshot);
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        std::fs::write(snapshot_dir.join("project.jsonl"), b"").unwrap();
+        let empty_inventory = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b""));
+        store
+            .record_materialization(&descriptor.scope, generation_id, 0, empty_inventory.clone())
+            .unwrap();
+        store
+            .save_activation(&bbox_code_source_store::ActivationRecord {
+                version: 1,
+                project_id: project_id.to_string(),
+                generation_id: generation_id.to_string(),
+                selector: outgoing_selector.clone(),
+                snapshot_id: outgoing_snapshot.clone(),
+                document_count: 0,
+                entity_inventory_sha256: empty_inventory,
+                current_chunk_targets: Default::default(),
+                activated_unix_secs: 1,
+                cutback_pending: false,
+                diagnostic: None,
+            })
+            .unwrap();
+        bbox_edge_sidecar::snapshot::activate_collected_snapshot_with(
+            &edges_dir,
+            project_id,
+            descriptor.scope.repo_id(),
+            &descriptor.head_commit,
+            generation_id,
+            &outgoing_selector,
+            &outgoing_snapshot,
+            || Ok(()),
+        )
+        .unwrap();
+        (outgoing_selector, outgoing_snapshot)
+    }
+
+    /// P3-E materialization migration (plan section 9): a full rebuild after
+    /// the paired version bump CONVERGES an active collected generation onto the
+    /// current materialization instead of refusing it.
+    ///
+    /// Before this arm the pass bailed with
+    /// `active collected selector requires materialization migration`, which
+    /// failed the synchronous schema-migration rebuild and therefore boot -
+    /// for exactly the remote-only shape the Phase 3 exit gate asserts.
+    #[test]
+    fn a_full_rebuild_migrates_an_outgoing_collected_materialization_with_zero_leases() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = test_index(&root);
+        let fields = index.field_handles();
+        let fixture = collected_fixture(&root);
+        let project_id = "collected-project";
+        let (outgoing_selector, outgoing_snapshot) = install_outgoing_collected_state(
+            &root,
+            &fixture.store,
+            project_id,
+            &fixture.generation_id,
+            &fixture.descriptor,
+        );
+        let (actor, broker) = deny_all_actor(
+            &index,
+            vec![attached_record(project_id, Some("repo-family"))],
+        );
+
+        actor
+            .run_reindex_pass(true, true)
+            .expect("the full rebuild must converge, not refuse");
+
+        let expected_selector =
+            bbox_corpus_index::index::project_files::collected_materialization_selector(
+                project_id,
+                &fixture.generation_id,
+            );
+        let expected_snapshot =
+            bbox_edge_sidecar::snapshot::collected_snapshot_id(project_id, &fixture.generation_id);
+        assert_ne!(expected_selector, outgoing_selector);
+        assert_ne!(expected_snapshot, outgoing_snapshot);
+
+        // Documents are served under the NEW selector.
+        index.reader_reload_for_test();
+        let live = |selector: &str| {
+            index
+                .searcher()
+                .search(
+                    &TermQuery::new(
+                        Term::from_field_text(fields.code_source_selector, selector),
+                        IndexRecordOption::Basic,
+                    ),
+                    &Count,
+                )
+                .unwrap()
+        };
+        assert!(
+            live(&expected_selector) > 0,
+            "the re-staged generation must be served under the current selector"
+        );
+        assert_eq!(
+            live(&outgoing_selector),
+            0,
+            "no document may remain under the outgoing selector"
+        );
+
+        // The activation record moved with it, and carries the NEW inventory.
+        let activation = fixture
+            .store
+            .load_activation(project_id)
+            .unwrap()
+            .expect("an activation record");
+        assert_eq!(activation.selector, expected_selector);
+        assert_eq!(activation.snapshot_id, expected_snapshot);
+        assert_eq!(activation.generation_id, fixture.generation_id);
+        assert!(activation.document_count > 0);
+        let generation = fixture
+            .store
+            .find_generation(&fixture.generation_id)
+            .unwrap();
+        assert_eq!(
+            generation.entity_inventory_sha256.as_deref(),
+            Some(activation.entity_inventory_sha256.as_str()),
+            "the re-staged inventory must be recorded, or the next full rebuild refuses the project"
+        );
+        assert_eq!(
+            generation.materialized_doc_count,
+            Some(activation.document_count)
+        );
+
+        // The manifest entry flipped.
+        let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
+            &root.join("projects.json"),
+        );
+        let entry = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)
+            .unwrap()
+            .workspaces
+            .remove(project_id)
+            .expect("a workspace entry");
+        assert_eq!(
+            entry.code_source_selector.as_deref(),
+            Some(expected_selector.as_str())
+        );
+
+        // The outgoing selector's retirement is queued.
+        assert!(
+            fixture
+                .store
+                .retirement_pending(&outgoing_selector)
+                .unwrap(),
+            "the outgoing selector must be enqueued for retirement"
+        );
+        assert!(
+            !fixture
+                .store
+                .retirement_pending(&expected_selector)
+                .unwrap(),
+            "the incoming selector must never be retired"
+        );
+
+        // ZERO GRANTS: the migration read verified store blobs only and never
+        // obtained checkout access, which is what lets the remote-only
+        // exit-gate shape (a project with no usable attachment at all) migrate.
+        // Denials are non-zero and expected: this fixture keeps an attached
+        // compat record so the project is planned, and source planning probes
+        // its local/Git/publisher/overlay leases before the collected arm runs.
+        // The migration itself asks for nothing.
+        let health = broker.health();
+        let granted: u64 = health
+            .operations
+            .iter()
+            .map(|operation| operation.granted)
+            .sum();
+        assert_eq!(
+            granted, 0,
+            "the materialization migration must acquire no checkout lease: {:?}",
+            health.operations
+        );
+    }
+
+    /// The refusals that are NOT a version bump survive the migration arm: an
+    /// activation record disagreeing with the manifest still fails the pass.
+    #[test]
+    fn a_full_rebuild_still_refuses_an_inconsistent_collected_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = test_index(&root);
+        let fixture = collected_fixture(&root);
+        let project_id = "collected-project";
+        let (_outgoing_selector, outgoing_snapshot) = install_outgoing_collected_state(
+            &root,
+            &fixture.store,
+            project_id,
+            &fixture.generation_id,
+            &fixture.descriptor,
+        );
+        // Repoint the MANIFEST at a different generation while the activation
+        // record keeps naming the original: internally inconsistent, not merely
+        // outgoing. (The store's own activation validator rejects a tampered
+        // selector, so the manifest is the tamperable side.)
+        let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
+            &root.join("projects.json"),
+        );
+        bbox_edge_sidecar::snapshot::activate_collected_snapshot_with(
+            &edges_dir,
+            project_id,
+            fixture.descriptor.scope.repo_id(),
+            &fixture.descriptor.head_commit,
+            "gen-a-different-generation",
+            &format!(
+                "{}:m{}",
+                bbox_code_source::source_selector(project_id, "gen-a-different-generation"),
+                "0123456789abcdef"
+            ),
+            &outgoing_snapshot,
+            || Ok(()),
+        )
+        .unwrap();
+
+        let (actor, _broker) = deny_all_actor(
+            &index,
+            vec![attached_record(project_id, Some("repo-family"))],
+        );
+        let error = actor
+            .run_reindex_pass(true, true)
+            .err()
+            .expect("an inconsistent activation record must still fail closed");
+        assert!(
+            format!("{error:#}").contains("disagrees with its activation record"),
+            "{error:#}"
         );
     }
 
@@ -3294,8 +3596,16 @@ mod source_planning_tests {
         }
         index.reader_reload_for_test();
 
+        // P3-E: project freshness rows are keyed by the composite
+        // `pf\0<project_id>\0<source_kind>\0<relative_path>`, never by the
+        // checkout absolute path (plan section 4.6).
+        let meta_key = bbox_code_source::project_file_meta_key(
+            REMOTE,
+            bbox_code_source::SOURCE_KIND_LOCAL,
+            "src/lib.rs",
+        );
         let meta: HashMap<String, super::super::FileMeta> = [(
-            "/gone/src/lib.rs".to_string(),
+            meta_key.clone(),
             super::super::FileMeta {
                 mtime: 1,
                 size: 1,
@@ -3342,9 +3652,193 @@ mod source_planning_tests {
         assert!(
             bbox_corpus_index::index::passes::load_meta(&index.reindex_config().meta_path)
                 .unwrap()
-                .contains_key("/gone/src/lib.rs"),
+                .contains_key(&meta_key),
             "the freshness inventory that verified the preservation must survive it"
         );
+    }
+
+    /// P3-E convergence row (plan section 9 gate): for a LegacyLocal bridge
+    /// fixture, the document set after an incremental tick equals the set a
+    /// full rebuild produces, and both are path-free.
+    ///
+    /// This is the row that catches a composite-rekey mistake. The purge loop
+    /// diffs meta keys against the pass's current key set; if the scan emitted
+    /// composite keys while the meta map still held absolute ones (or the other
+    /// way round), every project row would look stale and the incremental tick
+    /// would delete the whole project. Equality across the two pass shapes is
+    /// the only assertion that fails loudly for that.
+    #[test]
+    fn incremental_equals_full_for_a_legacy_local_fixture() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project_root = root.join("project");
+        std::fs::create_dir_all(project_root.join("src")).unwrap();
+        std::fs::create_dir_all(project_root.join(".bbox")).unwrap();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@example.test"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&project_root)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+        std::fs::write(
+            project_root.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"repo-family\"\naliases = [\"acme-service\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project_root.join("src/lib.rs"),
+            "pub struct Helper;\n\npub fn helper() {}\n",
+        )
+        .unwrap();
+        std::fs::write(project_root.join("README.md"), "# fixture\n\nprose\n").unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-m", "fixture"]] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&project_root)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+
+        let projects = Arc::new(parking_lot::RwLock::new(
+            ProjectRegistry::open(root.join("projects.json")).unwrap(),
+        ));
+        projects.write().register_path(&project_root).unwrap();
+        let checkouts = Arc::new(parking_lot::RwLock::new(
+            crate::checkout_registry::CheckoutRegistry::open(&root.join("checkout-registry.json"))
+                .unwrap(),
+        ));
+        let broker = Arc::new(CheckoutAccessBroker::new(
+            Arc::new(crate::checkout_access_v1::V1CheckoutAccessAuthority::new(
+                projects.clone(),
+                checkouts,
+            )),
+            crate::checkout_access::CheckoutAccessObservations::in_memory(),
+        ));
+        let index = TranscriptIndex::open_or_create(
+            &root.join("idx"),
+            Vec::new(),
+            None,
+            root.join("projects.json"),
+            root.join("kb.json"),
+            root.join("threads.json"),
+            root.join("roadmap.json"),
+        )
+        .unwrap();
+        let fields = index.field_handles();
+        let records_provider: Arc<dyn ProjectRecordsProvider> = Arc::new(
+            crate::projects::BridgeProjectRecordsProvider::new(projects.clone()),
+        );
+        let actor = IndexWriterActor::spawn_for_with_checkout_access(
+            &index,
+            records_provider,
+            broker.clone(),
+        );
+
+        // (entity_id, project, relative_path) for every project-file document,
+        // sorted. The triple is the whole point: identity plus the two fields
+        // the cut redefined.
+        let snapshot = |index: &TranscriptIndex| -> Vec<(String, String, String)> {
+            index.reader_reload_for_test();
+            let searcher = index.searcher();
+            let query = TermQuery::new(
+                Term::from_field_text(fields.doc_type, "project_file"),
+                IndexRecordOption::Basic,
+            );
+            let count = searcher.search(&query, &Count).unwrap();
+            if count == 0 {
+                return Vec::new();
+            }
+            let mut rows = searcher
+                .search(&query, &tantivy::collector::TopDocs::with_limit(count))
+                .unwrap()
+                .into_iter()
+                .map(|(_, address)| {
+                    let doc: tantivy::TantivyDocument = searcher.doc(address).unwrap();
+                    (
+                        bbox_corpus_index::index::first_text(&doc, fields.entity_id),
+                        bbox_corpus_index::index::first_text(&doc, fields.project),
+                        bbox_corpus_index::index::first_text(&doc, fields.relative_path),
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort();
+            rows
+        };
+
+        actor.run_reindex_pass(true, true).unwrap();
+        let full = snapshot(&index);
+        assert!(!full.is_empty(), "the full rebuild indexed the fixture");
+
+        // Two incremental ticks: the first exercises the skip path against the
+        // freshness rows the full pass wrote, the second proves idempotence.
+        actor.run_reindex_pass(false, true).unwrap();
+        actor.run_reindex_pass(false, true).unwrap();
+        assert_eq!(snapshot(&index), full, "incremental must equal full");
+
+        // And a second full rebuild reproduces the same set.
+        actor.run_reindex_pass(true, true).unwrap();
+        assert_eq!(snapshot(&index), full, "a repeat full rebuild is stable");
+
+        for (entity_id, project, relative_path) in &full {
+            assert!(
+                !project.starts_with('/') && !project.contains(root.to_str().unwrap()),
+                "`project` must be the display value, not a host path: {project}"
+            );
+            assert!(
+                !relative_path.starts_with('/'),
+                "`relative_path` must be relative: {relative_path}"
+            );
+            assert!(
+                !entity_id.contains('/') || entity_id.starts_with("project_file"),
+                "unexpected entity id shape: {entity_id}"
+            );
+        }
+        assert!(
+            full.iter().any(|(_, _, path)| path == "src/lib.rs"),
+            "the fixture's source file is present by relative path: {full:?}"
+        );
+
+        // Every project freshness row is composite-keyed, and none is an
+        // absolute path.
+        let meta =
+            bbox_corpus_index::index::passes::load_meta(&index.reindex_config().meta_path).unwrap();
+        let project_rows = meta
+            .iter()
+            .filter(|(_, row)| {
+                matches!(
+                    row.source,
+                    super::super::FileMetaSource::LocalProjectFile { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(!project_rows.is_empty(), "freshness rows were written");
+        for (key, _row) in project_rows {
+            assert!(
+                bbox_code_source::parse_project_file_meta_key(key).is_some(),
+                "a project freshness row must carry the composite key: {key}"
+            );
+            assert!(
+                !key.starts_with('/'),
+                "a project freshness row must not be keyed by an absolute path: {key}"
+            );
+        }
     }
 
     #[test]

@@ -70,7 +70,8 @@ use crate::project_catalog_inventory_adapters::{
     AttachmentCandidateIdentityPlanV1, AttachmentCandidateKeyV1,
     ProjectCatalogAttachmentCandidateDiscoveryRequestV1, ProjectCatalogMigrationInventoryFacadeV1,
     ProjectCatalogMigrationInventoryRequestV1, ProjectCatalogOwnerInventoryLimitsV1,
-    ProjectCatalogOwnerInventoryPathsV1, attachment_observation_id,
+    ProjectCatalogOwnerInventoryPathsV1, aggregate_inventory_states, attachment_observation_id,
+    corpus_source_state, vector_source_state,
 };
 use crate::project_catalog_migration_lock::project_catalog_migration_lock_path;
 use crate::project_catalog_store::{
@@ -3993,6 +3994,19 @@ fn legacy_commit_namespace_source_fingerprint(
     let tantivy = git_metadata_owner_fingerprint(inventory, ImmutableInventoryOwnerKindV1::Tantivy);
     let vectors =
         git_metadata_owner_fingerprint(inventory, ImmutableInventoryOwnerKindV1::VectorMetadata);
+    fold_legacy_commit_namespace_source_fingerprint(tantivy.as_ref(), vectors.as_ref())
+}
+
+/// The fold itself, shared by the asset WRITE path above and the
+/// materializer's READ-BACK recomputation below.
+///
+/// It exists as its own function so the recorded fingerprint and the
+/// recomputed one can never drift apart through two copies of one recipe.
+/// Do not inline it back into either caller.
+fn fold_legacy_commit_namespace_source_fingerprint(
+    tantivy: Option<&Sha256ValueV1>,
+    vectors: Option<&Sha256ValueV1>,
+) -> Sha256ValueV1 {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(LEGACY_COMMIT_NAMESPACE_SOURCE_FINGERPRINT_DOMAIN);
     for fingerprint in [tantivy, vectors] {
@@ -4003,6 +4017,73 @@ fn legacy_commit_namespace_source_fingerprint(
         bytes.extend_from_slice(value.as_bytes());
     }
     Sha256ValueV1::digest(&bytes)
+}
+
+/// Recompute the asset's `source_index_fingerprint` over the CURRENT owner
+/// state, so the history materializer can tell "index unchanged since
+/// migration" from "index has been live-indexed since migration".
+///
+/// This runs the same Phase 1 capture recipe against the live paths and
+/// folds it through the same helper the asset was written with: the
+/// aggregate of the corpus index and code-metadata source fingerprints, plus
+/// the vector source fingerprint. It deliberately invents nothing.
+///
+/// Returns `None` when the recipe cannot produce a comparable value, which
+/// the caller must treat as drift (the safe direction) rather than as
+/// equality. Two cases reach it: an `Unavailable` owner state, which the
+/// migration path rejects before lane projection and which the shared state
+/// helpers therefore refuse to fold; and a capture that panicked nothing but
+/// produced no fingerprint at all.
+///
+/// Note for consumers requiring equality mode: `capture_index` treats a
+/// schema marker that is not the RUNNING `INDEX_SCHEMA_VERSION` as corrupt,
+/// so an index observed across a schema bump can never fold to the recorded
+/// fingerprint. Equality mode is therefore reachable only at the same schema
+/// the migration captured, which is the offline-rebuild shape, not a live
+/// bump.
+pub fn recompute_legacy_commit_namespace_source_fingerprint(
+    index_path: &Path,
+    git_meta_dir: &Path,
+    vector_root: &Path,
+) -> Option<Sha256ValueV1> {
+    let corpus =
+        bbox_corpus_index::index::migration_inventory::capture_owner_migration_snapshot_no_create(
+            index_path,
+            git_meta_dir,
+            Default::default(),
+        );
+    let vectors = bbox_vectors::migration_inventory::capture_migration_snapshot_no_create(
+        vector_root,
+        Default::default(),
+    );
+    if matches!(
+        corpus.index.state,
+        bbox_corpus_index::index::migration_inventory::CorpusMigrationSourceStateV1::Unavailable { .. }
+    ) || matches!(
+        corpus.code_metadata.state,
+        bbox_corpus_index::index::migration_inventory::CorpusMigrationSourceStateV1::Unavailable { .. }
+    ) || matches!(
+        vectors.state,
+        bbox_vectors::migration_inventory::VectorMigrationSourceStateV1::Unavailable { .. }
+    ) {
+        return None;
+    }
+    let index_state = corpus_source_state(
+        "tantivy",
+        &corpus.index.state,
+        corpus.index.source_fingerprint_sha256.as_deref(),
+    );
+    let code_metadata_state = corpus_source_state(
+        "tantivy-code-metadata",
+        &corpus.code_metadata.state,
+        corpus.code_metadata.source_fingerprint_sha256.as_deref(),
+    );
+    let tantivy_state = aggregate_inventory_states("tantivy", &[index_state, code_metadata_state]);
+    let vector_state = vector_source_state(&vectors);
+    Some(fold_legacy_commit_namespace_source_fingerprint(
+        Some(source_state_fingerprint(&tantivy_state)),
+        Some(source_state_fingerprint(&vector_state)),
+    ))
 }
 
 fn git_metadata_owner_fingerprint(

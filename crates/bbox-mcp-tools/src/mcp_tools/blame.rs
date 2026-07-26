@@ -64,11 +64,15 @@ pub fn target_identity(p: &BlameParams, ctx: &ProviderContext<'_>) -> Result<Bla
         };
         let entity = entity_loader::load(ctx, &r)
             .with_context(|| format!("loading project_file entity {entity_ref}"))?;
+        // P3-E: `relative_path` is the authority. `file_path` remains only as
+        // the pre-bump compat source for a ref resolved against a document
+        // written under the old schema.
         let indexed_path_hint = entity
             .properties
-            .get("file_path")
+            .get("relative_path")
+            .or_else(|| entity.properties.get("file_path"))
             .map(PathBuf::from)
-            .ok_or_else(|| anyhow::anyhow!("project_file entity has no file_path property"))?;
+            .ok_or_else(|| anyhow::anyhow!("project_file entity has no relative_path property"))?;
         let byte_offset = entity
             .properties
             .get("byte_offset")

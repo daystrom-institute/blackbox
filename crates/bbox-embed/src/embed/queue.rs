@@ -870,6 +870,39 @@ impl EmbedQueueHandle {
         })
     }
 
+    /// Is an ACTIVE vector already stored at this `(entity_id, content_hash)`
+    /// on the route this bucket resolves to?
+    ///
+    /// `None` means "cannot prove it": no route table, no vector store, an
+    /// unresolvable route, or a probe error. Callers verifying coverage must
+    /// treat `None` as uncovered and re-enqueue - enqueue is idempotent and
+    /// dedup-skipped, so an unnecessary push is cheap, while trusting an
+    /// unprovable "covered" would commit a lexical-only view whose vector view
+    /// was promised.
+    pub fn vector_is_active(
+        &self,
+        bucket: Bucket,
+        entity_id: &str,
+        content_hash: &str,
+    ) -> Option<bool> {
+        let vector_store = self.inner.vector_store.as_ref()?;
+        self.inner.router.as_ref()?;
+        let resolved = self
+            .resolve_route(&EmbedRequest {
+                bucket,
+                project_id: None,
+                entity_id: entity_id.to_string(),
+                chunk_hash: content_hash.to_string(),
+                text: String::new(),
+                visual_kind: None,
+                visual_payload: None,
+            })
+            .ok()?;
+        vector_store
+            .contains_active(&resolved.vector_route, entity_id, content_hash)
+            .ok()
+    }
+
     fn should_embed(&self, request: &EmbedRequest, vector_route: &str) -> bool {
         let Some(vector_store) = &self.inner.vector_store else {
             return true;

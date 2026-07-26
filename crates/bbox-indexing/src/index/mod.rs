@@ -15,6 +15,7 @@ pub mod history_materializer;
 mod knowledge_docs;
 mod reindex;
 mod roadmap_docs;
+pub mod schema_rebuild;
 #[cfg(test)]
 mod store_integration_tests;
 mod thread_docs;

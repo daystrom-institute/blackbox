@@ -97,12 +97,25 @@ pub fn register_index_embed_hooks() {
         bbox_indexing::index::embed_hook::EmbedHooks {
             project_file: enqueue_project_file_hook,
             git_message: enqueue_git_message_hook,
+            git_message_vector_active: git_message_vector_is_active,
         },
     );
 }
 
-fn enqueue_project_file_hook(chunk: &Chunk, entity_id: &str) {
-    let _ = enqueue_project_file(chunk, entity_id);
+/// Coverage probe for the P3-E history re-emission. `false` whenever coverage
+/// cannot be PROVED (no queue installed, no route table, no vector store, probe
+/// error), which makes the caller re-enqueue rather than promise a vector view
+/// it never verified.
+fn git_message_vector_is_active(entity_id: &str, content_hash: &str) -> bool {
+    queue_slot()
+        .read()
+        .as_ref()
+        .and_then(|handle| handle.vector_is_active(Bucket::GitMessage, entity_id, content_hash))
+        .unwrap_or(false)
+}
+
+fn enqueue_project_file_hook(chunk: &Chunk, project_display: &str, entity_id: &str) {
+    let _ = enqueue_project_file(chunk, project_display, entity_id);
 }
 
 fn enqueue_git_message_hook(entity_id: &str, chunk_hash: &str, message: &str) {
@@ -148,7 +161,51 @@ pub fn is_visual_chunk_kind(chunk_kind: &str) -> bool {
     VISUAL_CHUNK_KINDS.contains(&chunk_kind)
 }
 
-pub fn enqueue_project_file(chunk: &Chunk, entity_id: &str) -> bool {
+/// Version of the project-file TEXT embedding-input assembly
+/// (`project_file_embed_text`). Bumping it misses the enqueue dedup for every
+/// project-file text row exactly once, which is the ONLY mechanism that
+/// re-embeds unchanged chunks: `should_embed` keys on
+/// `(entity_id, content_hash)`, so a prepend change with an unchanged
+/// `chunk_hash` would otherwise be silently skipped forever. Folding the
+/// prepend into `chunk.content` instead is forbidden - that would change
+/// `chunk_hash` and therefore `ProjectFileV2` ref identity (plan section 4.6).
+///
+/// Bumped to v2 at P3-E for the display-name + relative-path prepend
+/// (governing section 10.2). Operationally this is a one-time full re-embed of
+/// project-file text vectors, enumerated as a bridge-window deploy event in
+/// plan section 4.3 item 3 beside the one-time index rebuild.
+pub const EMBED_TEXT_VERSION: &str = "project-file-embed-text-v2-display-relpath";
+
+/// The versioned envelope hash passed as the embed queue's `content_hash` for
+/// project-file TEXT rows: `sha256(EMBED_TEXT_VERSION || chunk_hash)`. The
+/// document's own `chunk_hash` and every entity-ref component stay
+/// byte-untouched; only the queue's dedup key and the vector record's
+/// freshness hash move. Every boundary that compares project-file vector
+/// hashes must apply this same envelope or coverage reads a permanent phantom
+/// zero (see `record_index_doc_coverage`'s Code/Docs arm).
+pub fn project_file_text_content_hash(chunk_hash: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(EMBED_TEXT_VERSION.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(chunk_hash.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Embedding input for a project-file TEXT chunk: the stable display name and
+/// the project-relative path, then the chunk body. Never a host root
+/// (governing section 10.2).
+pub fn project_file_embed_text(chunk: &Chunk, project_display: &str) -> String {
+    let relative_path = chunk
+        .file_path
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    format!("{project_display} {relative_path}\n\n{}", chunk.content)
+}
+
+pub fn enqueue_project_file(chunk: &Chunk, project_display: &str, entity_id: &str) -> bool {
+    // Lane split (plan section 9 item 5): the visual lane's embedding input is
+    // an image payload with no text prepend, so it is OUTSIDE the envelope and
+    // keeps the raw `chunk_hash`. Only the text lanes are enveloped.
     if is_visual_chunk_kind(&chunk.chunk_kind) {
         return enqueue_visual_project_file(chunk, entity_id);
     }
@@ -157,16 +214,21 @@ pub fn enqueue_project_file(chunk: &Chunk, entity_id: &str) -> bool {
     } else {
         Bucket::Docs
     };
-    enqueue_project_file_as(chunk, entity_id, bucket)
+    enqueue_project_file_as(chunk, project_display, entity_id, bucket)
 }
 
-pub fn enqueue_project_file_as(chunk: &Chunk, entity_id: &str, bucket: Bucket) -> bool {
+pub fn enqueue_project_file_as(
+    chunk: &Chunk,
+    project_display: &str,
+    entity_id: &str,
+    bucket: Bucket,
+) -> bool {
     enqueue(EmbedRequest {
         bucket,
         project_id: Some(chunk.project_id.clone()),
         entity_id: entity_id.to_string(),
-        chunk_hash: chunk.chunk_hash.clone(),
-        text: chunk.content.clone(),
+        chunk_hash: project_file_text_content_hash(&chunk.chunk_hash),
+        text: project_file_embed_text(chunk, project_display),
         visual_kind: None,
         visual_payload: None,
     })
@@ -481,6 +543,80 @@ pub fn enqueue(request: queue::EmbedRequest) -> bool {
 mod tests {
     use super::*;
 
+    fn text_chunk(relative_path: &str, chunk_hash: &str) -> Chunk {
+        let mut chunk = bbox_chunker::placeholder_chunk(
+            std::path::Path::new(relative_path),
+            "code_block",
+            Some("rust"),
+            "pub struct Helper;",
+            0,
+            18,
+            0,
+        );
+        chunk.project_id = "proj1234".into();
+        chunk.rel_path_hash = "abcd1234".into();
+        chunk.chunk_hash = chunk_hash.to_string();
+        chunk
+    }
+
+    /// P3-E embed row: the embedding INPUT carries the display name and the
+    /// project-relative path, and never a host root.
+    #[test]
+    fn project_file_embed_text_prepends_the_display_name_and_relative_path() {
+        let chunk = text_chunk("src/helper.rs", &"f".repeat(64));
+        let text = project_file_embed_text(&chunk, "acme-service");
+        assert!(text.starts_with("acme-service src/helper.rs\n\n"), "{text}");
+        assert!(text.ends_with("pub struct Helper;"), "{text}");
+        assert!(!text.contains("/host-checkouts"), "{text}");
+    }
+
+    /// P3-E embed row: dedup HIT within one version. The envelope is a pure
+    /// function of `(EMBED_TEXT_VERSION, chunk_hash)`, so two enqueues of the
+    /// same unchanged chunk key identically and `should_embed` skips the second.
+    #[test]
+    fn the_envelope_is_stable_within_one_version() {
+        let hash = "f".repeat(64);
+        assert_eq!(
+            project_file_text_content_hash(&hash),
+            project_file_text_content_hash(&hash)
+        );
+    }
+
+    /// P3-E embed row: dedup MISS across the version bump. The envelope must
+    /// differ from the raw `chunk_hash` it wraps, or the version bump would not
+    /// miss the dedup and the prepend would never reach any vector.
+    #[test]
+    fn the_envelope_differs_from_the_raw_chunk_hash_it_wraps() {
+        let hash = "f".repeat(64);
+        let enveloped = project_file_text_content_hash(&hash);
+        assert_ne!(enveloped, hash);
+        assert_eq!(enveloped.len(), 64, "still a sha256 hex digest");
+        // Distinct chunks stay distinct through the envelope: it adds a version
+        // dimension, it does not collapse content identity.
+        assert_ne!(
+            project_file_text_content_hash(&hash),
+            project_file_text_content_hash(&"e".repeat(64))
+        );
+    }
+
+    /// P3-E embed row: the document's `chunk_hash` and every entity-ref
+    /// component stay BYTE-UNTOUCHED across the bump. Only the queue's dedup key
+    /// moves; folding the prepend into `chunk.content` would change
+    /// `chunk_hash` and therefore `ProjectFileV2` ref identity, which plan
+    /// section 4.6 forbids.
+    #[test]
+    fn ref_bytes_are_unchanged_by_the_envelope() {
+        let hash = "f".repeat(64);
+        let chunk = text_chunk("src/helper.rs", &hash);
+        let before = chunk.chunk_hash.clone();
+        let _ = project_file_text_content_hash(&chunk.chunk_hash);
+        let _ = project_file_embed_text(&chunk, "acme-service");
+        assert_eq!(chunk.chunk_hash, before);
+        assert_eq!(chunk.rel_path_hash, "abcd1234");
+        assert_eq!(chunk.project_id, "proj1234");
+        assert_eq!(chunk.occurrence_idx, 0);
+    }
+
     #[test]
     fn code_chunk_rule_treats_markdown_labels_as_prose() {
         assert!(is_code_chunk(Some("rust"), "code_block"));
@@ -534,6 +670,7 @@ mod tests {
         let chunk = image_chunk(None);
         assert!(!enqueue_project_file(
             &chunk,
+            "acme",
             "project_file:proj1234:abcd1234:hash:0"
         ));
     }

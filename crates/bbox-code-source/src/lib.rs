@@ -501,6 +501,54 @@ pub fn source_entry_key(selector: &str, relative_path: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Source kind for a materialization selector, as the stored `source_kind`
+/// document field and the `FileMeta` composite key carry it (Phase 3 plan
+/// section 4.6). Derived from the selector rather than stored a second time
+/// so a document's `source_kind` and its selector can never disagree; the
+/// two selector constructors above are the only shapes that exist.
+pub const SOURCE_KIND_LOCAL: &str = "local";
+pub const SOURCE_KIND_COLLECTED: &str = "collected";
+pub const SOURCE_KIND_UNKNOWN: &str = "unknown";
+
+pub fn source_kind_for_selector(selector: &str) -> &'static str {
+    if selector.starts_with("local:") {
+        SOURCE_KIND_LOCAL
+    } else if selector.starts_with("collected:") {
+        SOURCE_KIND_COLLECTED
+    } else {
+        SOURCE_KIND_UNKNOWN
+    }
+}
+
+/// The `FileMeta` map key for one project-file freshness row.
+///
+/// NUL-delimited so no component can forge a boundary: relative paths reject
+/// NUL and control bytes in [`validate_relative_path`], and project ids and
+/// source kinds are both NUL-free by construction. The `pf` tag keeps the
+/// project lane disjoint from the absolute-path keys transcripts, adapter
+/// rows, and the `git:<project_id>` history source key still use, which is
+/// what lets the purge loops split their delete arms on the key itself.
+pub fn project_file_meta_key(project_id: &str, source_kind: &str, relative_path: &str) -> String {
+    format!("pf\0{project_id}\0{source_kind}\0{relative_path}")
+}
+
+/// Split a key produced by [`project_file_meta_key`] back into its parts.
+/// `None` for any key from another lane, which is exactly the discriminator
+/// the purge loops and the edge-purge relative-path read need.
+pub fn parse_project_file_meta_key(key: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = key.split('\0');
+    if parts.next()? != "pf" {
+        return None;
+    }
+    let project_id = parts.next()?;
+    let source_kind = parts.next()?;
+    let relative_path = parts.next()?;
+    if parts.next().is_some() || project_id.is_empty() || relative_path.is_empty() {
+        return None;
+    }
+    Some((project_id, source_kind, relative_path))
+}
+
 const SOURCE_URI_PREFIX: &str = "bbox://project/";
 
 /// Bounded defense-in-depth check on the `source_uri` codec's own boundary:

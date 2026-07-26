@@ -1018,9 +1018,52 @@ pub struct RepoHistoryRebuildNamespaceV1 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepoHistoryRebuildDispositionV1 {
+    /// The namespace is a repo-history record's PRIMARY namespace, and that
+    /// record's `materialization` names this generation.
     Owned,
+    /// The namespace is a repo-history record's COMPATIBILITY namespace: a
+    /// legacy-lookup surface the record still answers for, but not the one
+    /// its single `materialization` field names.
+    ///
+    /// Its generation is catalog-ATTRIBUTED (so it carries an `rhg_` id, not
+    /// a quarantine id) but manifest-OWNED: no catalog record names it, so
+    /// like an unclaimed generation its only durable identity is this
+    /// manifest. It gets its own bucket rather than sharing `Owned` because
+    /// an auditor asking "which generations are reachable from the catalog?"
+    /// would otherwise be told yes about a generation that is not.
+    OwnedCompatibility,
     Ambiguous,
     Unclaimed,
+}
+
+/// Which proof the materializer was able to run against the persisted Phase 1
+/// namespace-inventory asset.
+///
+/// The asset is a POINT-IN-TIME migration record. It is an exact description
+/// of the index only while the index is unchanged since migration; an index
+/// that has been live-indexed since then legitimately outgrows it, both by
+/// gaining namespaces (a `local_` mint for a new project) and by growing
+/// within recorded ones (append-only history). Equality is therefore the
+/// right contract for exactly one shape, and the mode records which one ran.
+///
+/// CONSUMER CONTRACT: an offline rebuild that needs the asset to be an exact
+/// description of what it is rebuilding (the Phase 6 path-free-rebuild
+/// subcommand) must REQUIRE `Equality` and refuse `Drift`. `Drift` proves
+/// only that no recorded history was lost, not that the asset enumerates
+/// everything present. A consumer that treats the two as interchangeable is
+/// reading a weaker proof than it needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryProofModeV1 {
+    /// The recomputed source fingerprint equals the recorded one: the index
+    /// is unchanged since migration, so per-namespace count AND commitment
+    /// equality is provable and is enforced.
+    Equality,
+    /// The fingerprints differ, or no comparable fingerprint could be
+    /// recomputed. Recorded namespaces must still be present and must not
+    /// have shrunk; commitments are not compared, because a fold hash cannot
+    /// prove subset containment.
+    Drift,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1028,16 +1071,49 @@ pub enum RepoHistoryRebuildDispositionV1 {
 pub struct RepoHistoryRebuildPreparedV1 {
     pub source_index_fingerprint_sha256: String,
     pub source_schema_version: String,
+    /// Which asset proof ran for this rebuild. See [`HistoryProofModeV1`] for
+    /// the consumer contract; a reader that requires an exact asset must
+    /// refuse anything but `Equality`.
+    pub proof_mode: HistoryProofModeV1,
+    /// The `source_index_fingerprint` the migration asset recorded, and the
+    /// one recomputed over the index this rebuild observed. Both are stored
+    /// even in `Equality` mode so a later audit can re-derive the mode
+    /// decision instead of trusting it. `None` means no asset was consulted
+    /// (a fresh v2 store) or no comparable value could be recomputed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_source_index_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_source_index_fingerprint: Option<String>,
     /// The COMPLETE namespace inventory observed at prepare time, including
     /// unclaimed namespaces. This manifest is the only durable owner of an
     /// unclaimed generation's identity.
     pub namespace_inventory: Vec<RepoHistoryRebuildNamespaceV1>,
     pub catalog_epoch: u64,
     pub owned_generation_ids: BTreeSet<String>,
+    /// Generations for records' compatibility namespaces. Defaulted so a
+    /// manifest written before this bucket existed still decodes; absent
+    /// means "none recorded", and a reader must not read the empty set as
+    /// proof that no compatibility namespace existed.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub compatibility_generation_ids: BTreeSet<String>,
     pub ambiguous_generation_ids: BTreeSet<String>,
     pub unclaimed_generation_ids: BTreeSet<String>,
     pub planned_lexical_generation_label: String,
     pub planned_vector_generation_label: String,
+}
+
+/// Per-generation vector-coverage evidence for one committed replacement
+/// (governing section 10.3): how many of the generation's vector-input rows were
+/// PROVED to have an active vector, and how many were re-enqueued because they
+/// were not. A replacement must never commit a lexical-only history view whose
+/// vector view was promised, so the manifest records which of the two happened
+/// per generation rather than leaving it in the log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepoHistoryRebuildVectorRowV1 {
+    pub generation_id: String,
+    pub vector_inputs_verified: u64,
+    pub vector_inputs_reenqueued: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1046,6 +1122,11 @@ pub struct RepoHistoryRebuildCommittedV1 {
     pub verified_lexical_view: String,
     pub verified_vector_view: String,
     pub resulting_catalog_epoch: u64,
+    /// Defaulted so a manifest committed before this field existed still
+    /// decodes. Absent means "no inventory recorded", never "nothing to
+    /// record": a reader must not treat the empty vector as proof of coverage.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vector_inventory: Vec<RepoHistoryRebuildVectorRowV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1082,6 +1163,10 @@ impl RepoHistoryRebuildManifestV1 {
     pub fn pinned_generation_ids(&self) -> BTreeSet<String> {
         let mut ids = BTreeSet::new();
         ids.extend(self.prepared.owned_generation_ids.iter().cloned());
+        // Load-bearing: a compatibility generation has NO catalog record
+        // naming it, so this manifest is its only GC root. Dropping it from
+        // this union makes it sweepable.
+        ids.extend(self.prepared.compatibility_generation_ids.iter().cloned());
         ids.extend(self.prepared.ambiguous_generation_ids.iter().cloned());
         ids.extend(self.prepared.unclaimed_generation_ids.iter().cloned());
         ids
@@ -1115,7 +1200,11 @@ impl RepoHistoryRebuildManifestV1 {
         let mut named = BTreeSet::new();
         for row in &self.prepared.namespace_inventory {
             let id = HistoryGenerationIdV1::parse(&row.generation_id)?;
-            let owned = matches!(row.disposition, RepoHistoryRebuildDispositionV1::Owned);
+            let owned = matches!(
+                row.disposition,
+                RepoHistoryRebuildDispositionV1::Owned
+                    | RepoHistoryRebuildDispositionV1::OwnedCompatibility
+            );
             if owned != id.owned().is_some() {
                 return Err(identity_error(
                     "rebuild manifest namespace disposition disagrees with its generation id shape",
@@ -1126,6 +1215,9 @@ impl RepoHistoryRebuildManifestV1 {
             }
             let bucket = match row.disposition {
                 RepoHistoryRebuildDispositionV1::Owned => &self.prepared.owned_generation_ids,
+                RepoHistoryRebuildDispositionV1::OwnedCompatibility => {
+                    &self.prepared.compatibility_generation_ids
+                }
                 RepoHistoryRebuildDispositionV1::Ambiguous => {
                     &self.prepared.ambiguous_generation_ids
                 }
@@ -1140,6 +1232,7 @@ impl RepoHistoryRebuildManifestV1 {
             }
         }
         let bucketed = self.prepared.owned_generation_ids.len()
+            + self.prepared.compatibility_generation_ids.len()
             + self.prepared.ambiguous_generation_ids.len()
             + self.prepared.unclaimed_generation_ids.len();
         if bucketed != self.prepared.namespace_inventory.len() {
@@ -1671,6 +1764,9 @@ mod tests {
         RepoHistoryRebuildPreparedV1 {
             source_index_fingerprint_sha256: "1".repeat(64),
             source_schema_version: INDEX_SCHEMA_VERSION.to_string(),
+            proof_mode: HistoryProofModeV1::Equality,
+            recorded_source_index_fingerprint: None,
+            observed_source_index_fingerprint: None,
             namespace_inventory: vec![RepoHistoryRebuildNamespaceV1 {
                 namespace: record.manifest.body.namespace.clone(),
                 generation_id: record.id.as_str().to_string(),
@@ -1684,6 +1780,7 @@ mod tests {
             }],
             catalog_epoch: 4,
             owned_generation_ids: [record.id.as_str().to_string()].into_iter().collect(),
+            compatibility_generation_ids: BTreeSet::new(),
             ambiguous_generation_ids: BTreeSet::new(),
             unclaimed_generation_ids: BTreeSet::new(),
             planned_lexical_generation_label: "lexical-1".to_string(),
@@ -1716,6 +1813,7 @@ mod tests {
                 verified_lexical_view: "lexical-1".to_string(),
                 verified_vector_view: "vector-1".to_string(),
                 resulting_catalog_epoch: 5,
+                vector_inventory: Vec::new(),
             })
             .unwrap();
         assert_eq!(committed.state, RepoHistoryRebuildStateV1::Committed);

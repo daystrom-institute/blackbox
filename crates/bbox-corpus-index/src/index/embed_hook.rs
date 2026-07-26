@@ -22,10 +22,19 @@ use super::{FieldHandles, FileMeta, ReindexConfig};
 
 /// Daemon-side embed enqueue functions, registered once at startup.
 pub struct EmbedHooks {
-    /// Queue a project-file chunk for embedding: `(chunk, entity_id)`.
-    pub project_file: fn(&Chunk, &str),
+    /// Queue a project-file chunk for embedding:
+    /// `(chunk, project_display, entity_id)`. `project_display` is the
+    /// identity's display name, which the text lanes prepend alongside the
+    /// relative path (governing section 10.2) - never a host root.
+    pub project_file: fn(&Chunk, &str, &str),
     /// Queue a git commit message: `(entity_id, chunk_hash, message)`.
     pub git_message: fn(&str, &str, &str),
+    /// Does an ACTIVE commit-message vector already exist at this
+    /// `(entity_id, content_hash)`? The vector store and the embedding route
+    /// table are daemon-side, so the P3-E history re-emission cannot probe
+    /// them directly; it asks through this hook instead
+    /// (`verified-or-re-enqueued`, governing section 10.3).
+    pub git_message_vector_active: fn(&str, &str) -> bool,
 }
 
 static EMBED_HOOKS: OnceLock<EmbedHooks> = OnceLock::new();
@@ -36,9 +45,9 @@ pub fn register_embed_hooks(hooks: EmbedHooks) {
     let _ = EMBED_HOOKS.set(hooks);
 }
 
-pub fn emit_project_file(chunk: &Chunk, entity_id: &str) {
+pub fn emit_project_file(chunk: &Chunk, project_display: &str, entity_id: &str) {
     if let Some(hooks) = EMBED_HOOKS.get() {
-        (hooks.project_file)(chunk, entity_id);
+        (hooks.project_file)(chunk, project_display, entity_id);
     }
 }
 
@@ -46,6 +55,18 @@ pub fn emit_git_message(entity_id: &str, chunk_hash: &str, message: &str) {
     if let Some(hooks) = EMBED_HOOKS.get() {
         (hooks.git_message)(entity_id, chunk_hash, message);
     }
+}
+
+/// `None` when no hook is registered (engine-only tests, standalone use). A
+/// caller verifying vector coverage must treat `None` as "cannot prove
+/// covered" and re-enqueue: enqueue is idempotent and the queue's own
+/// `should_embed` dedup drops a row that is already fresh, so re-enqueueing an
+/// already-covered row costs a queue push, while skipping an uncovered one
+/// would commit a lexical-only history view whose vector view was promised.
+pub fn git_message_vector_is_active(entity_id: &str, content_hash: &str) -> Option<bool> {
+    EMBED_HOOKS
+        .get()
+        .map(|hooks| (hooks.git_message_vector_active)(entity_id, content_hash))
 }
 
 /// Store-document pass injected into the engine's manual rebuild

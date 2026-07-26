@@ -583,6 +583,14 @@ impl SharedState {
             store_dir.join("threads.json"),
             store_dir.join("roadmap.json"),
             records_provider.clone(),
+            // Bridge authority here, so the bridge spill guard: this path opens
+            // real state directories in tests, and an absent guard would refuse
+            // any replacement rather than carrying commit documents across it.
+            Some(
+                bbox_indexing::index::schema_rebuild::bridge_schema_replacement_guard(
+                    records_provider.clone(),
+                ),
+            ),
         )
         .unwrap();
         let index_writer = crate::index::IndexWriterActor::spawn_for_with_checkout_access(

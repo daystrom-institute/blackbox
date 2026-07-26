@@ -16,7 +16,15 @@ use crate::manifest::{
 use bbox_chunker::EdgeProvenance;
 use bbox_corpus_core::entity_ref::EntityRef;
 
-const INDEXER_VERSION: &str = "project-index-v1";
+// Paired with `INDEX_SCHEMA_VERSION` in ONE commit at Phase 3 milestone P3-E:
+// the schema cut adds `relative_path`/`source_uri`/`source_kind` and stops
+// storing absolute values, and this bump invalidates every `FileMeta`
+// freshness row and mints new snapshot ids so no document survives under the
+// old materialization. Bumping either alone is a defect (the schema drop
+// would leave stale per-file freshness rows claiming current materialization,
+// or the new snapshot ids would be written into a schema that cannot hold the
+// new fields).
+const INDEXER_VERSION: &str = "project-index-v2-path-free";
 const CHUNKER_VERSION: &str = "chunker-v1";
 const DIRTY_OVERLAY_DIRNAME: &str = "dirty-current";
 const PENDING_LOCAL_ACTIVATIONS_FILENAME: &str = "pending-local-activations.json";

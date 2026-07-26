@@ -34,6 +34,10 @@ pub struct GitIndexContext<'a> {
     pub git_meta_dir: &'a Path,
     pub force_full: bool,
     pub publication: &'a mut super::project_files::ProjectIndexPublicationBundle,
+    /// The identity's display name. P3-E: a commit document's `project` field
+    /// drops `canonical_path` for this value while its namespace/sha identity
+    /// (`repo_id`, `commit_sha`, `entity_id`) stays byte-identical.
+    pub project_display: &'a str,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -153,8 +157,13 @@ pub fn index_git_history_for_project(
         let entity_id = commit_entity_id(repo_id, &commit.sha);
         ctx.writer
             .delete_term(Term::from_field_text(ctx.f.entity_id, &entity_id));
-        ctx.writer
-            .add_document(build_commit_doc(&commit, repo_id, project, ctx.f))?;
+        ctx.writer.add_document(build_commit_doc(
+            &commit,
+            repo_id,
+            &project.project_id,
+            ctx.project_display,
+            ctx.f,
+        ))?;
         super::embed_hook::emit_git_message(
             &entity_id,
             &commit_message_hash(&commit.message),
@@ -190,7 +199,8 @@ pub fn index_git_history_for_project(
 pub fn build_commit_doc(
     commit: &GitCommit,
     repo_id: &str,
-    project: &ProjectRecord,
+    project_id: &str,
+    project_display: &str,
     f: FieldHandles,
 ) -> TantivyDocument {
     let entity_id = commit_entity_id(repo_id, &commit.sha);
@@ -216,9 +226,11 @@ pub fn build_commit_doc(
     doc.add_text(f.commit_author_email, &commit.author_email);
     doc.add_text(f.session_id, "");
     doc.add_text(f.account, "git");
-    doc.add_text(f.project, &project.canonical_path);
+    doc.add_text(f.project, project_display);
     doc.add_text(f.role, "commit");
-    doc.add_text(f.file_path, git_source_key(&project.project_id));
+    // Not a filesystem path: the per-project history source key, which is the
+    // delete term the purge loops' absolute-path arm uses for this lane.
+    doc.add_text(f.file_path, git_source_key(project_id));
     doc.add_u64(f.byte_offset, 0);
     doc.add_u64(f.is_subagent, 0);
     doc
@@ -380,7 +392,13 @@ mod tests {
             author_email: "a@example.test".into(),
             message: "phase S4: EdgeIndex projection".into(),
         };
-        let doc = build_commit_doc(&commit, "repo1234", &project(), fields);
+        let doc = build_commit_doc(
+            &commit,
+            "repo1234",
+            &project().project_id,
+            "test-display",
+            fields,
+        );
         assert_eq!(text(&doc, fields.doc_type), "commit");
         assert_eq!(text(&doc, fields.chunk_kind), "git_message");
         assert_eq!(text(&doc, fields.repo_id), "repo1234");
@@ -428,7 +446,13 @@ mod tests {
             author_email: "a@example.test".into(),
             message: "x".repeat(20 * 1024),
         };
-        let doc = build_commit_doc(&commit, "repo1234", &project(), fields);
+        let doc = build_commit_doc(
+            &commit,
+            "repo1234",
+            &project().project_id,
+            "test-display",
+            fields,
+        );
         let content = text(&doc, fields.content);
         assert!(content.len() <= MAX_COMMIT_MESSAGE_BYTES);
         assert!(content.ends_with(TRUNCATED_COMMIT_MESSAGE_SUFFIX));
@@ -480,6 +504,7 @@ mod tests {
             git_meta_dir: &git_meta_dir,
             force_full: true,
             publication: &mut publication,
+            project_display: "test-display",
         };
         let stats = index_git_history_for_project(&project, repo.path(), &HashMap::new(), &mut ctx)
             .unwrap();

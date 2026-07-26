@@ -207,7 +207,14 @@ fn project_file_label(ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String
     let (_, snapshot_id, rel_path_hash, _, occurrence_idx) = project_file_parts(r)?;
     if ctx.stores().is_some() {
         if let Ok(Some(properties)) = ctx.indexed_entity_properties(&r.to_string()) {
-            if let Some(path) = properties.get("file_path") {
+            // P3-E: the compact graph label is the relative path (or the
+            // rendered `display_path` when the response boundary produced one),
+            // never a host absolute path.
+            if let Some(path) = properties
+                .get("display_path")
+                .or_else(|| properties.get("relative_path"))
+                .or_else(|| properties.get("file_path"))
+            {
                 return Some(truncate_label(path));
             }
             if let Some(preview) = properties.get("content_preview") {

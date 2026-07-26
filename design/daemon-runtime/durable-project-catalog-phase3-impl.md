@@ -353,7 +353,11 @@ observable stays at parity, enforced by the parity harness:
    this phase: commit documents are carried over across the reset by the
    bridge spill lane (section 9 item 2) instead of being dropped and re-walked,
    so bridge projects with unavailable checkouts no longer lose history at
-   a schema reset. The same deploy also performs a one-time full re-embed
+   a schema reset. This is additionally the first INDEXER_VERSION bump
+   since the collected lane shipped: active collected projects migrate
+   their materialization selectors in place during that rebuild (section 9
+   item 2, D-035) instead of wedging boot, which the original wording here
+   silently assumed could not happen. The same deploy also performs a one-time full re-embed
    of project-file vectors through the embedding-envelope version bump
    (section 9 item 5): behavior-neutral for results, operationally heavy on
    large corpora, enumerated here for the same visibility as the rebuild.
@@ -694,14 +698,30 @@ into the replacement boundary is P3-E.
 2. Materializer: streams the legacy index's commit documents by exact
    namespace (reusing the Phase 1 capture's row shape and commitment
    function), classifies each namespace against the pinned catalog snapshot
-   (owned via record namespaces, ambiguous via ambiguous records, else
-   unclaimed per section 4.4), proves count and commitment equality against
-   the persisted namespace-inventory asset for `MigratedV1` stores (typed
-   refusals `history_inventory_missing` / `history_commitment_mismatch`),
-   creates and verifies the generation, then advances
-   `materialization: NotBuilt -> Ready` through one regular catalog transact
-   per proved/ambiguous namespace set. Fresh v2 stores with no legacy
-   residue produce no generations and stay `NotBuilt` legally.
+   (owned via record primary namespaces, owned-compatibility via record
+   compatibility namespaces, ambiguous via ambiguous records, else
+   unclaimed per section 4.4), proves against the persisted
+   namespace-inventory asset for `MigratedV1` stores in TWO MODES gated by
+   a recomputed source fingerprint (amended per the live P3-E smoke,
+   D-036): Equality mode, when the index is unchanged since migration,
+   keeps exact per-namespace count and commitment equality; Drift mode, in
+   every other case, constrains only that recorded namespaces survive with
+   at least their recorded counts (an ordered fold cannot prove subset
+   containment, so commitments are not compared under drift), while
+   namespaces absent from the asset classify normally; a cross-namespace
+   survival check runs in both modes, the proof mode plus both
+   fingerprints are recorded in the outcome and the rebuild manifest, and
+   the Phase 6 offline rebuild must require Equality mode (typed refusals
+   `history_inventory_missing` / `history_commitment_mismatch` in both
+   modes). The materializer creates and verifies the generation, then
+   advances `materialization: NotBuilt -> Ready` through one regular
+   catalog transact per proved namespace set, where Ready names the
+   PRIMARY namespace's generation only: compatibility-namespace
+   generations mint owned ids but are durably owned by the rebuild
+   manifest's dedicated compatibility bucket, like unclaimed ones (D-037),
+   and the double-advancement refusal is keyed to the primary namespace.
+   Fresh v2 stores with no legacy residue produce no generations and stay
+   `NotBuilt` legally.
 3. `RepoHistoryRebuildManifestV1`: durable prepared/committed manifest under
    the same family root; prepared binds source index fingerprint, complete
    namespace inventory, catalog epoch, every owned/ambiguous/unclaimed
@@ -787,7 +807,31 @@ can change stored document identity.
    stable. An absent guard refuses the reset outright: after this milestone
    no open path can reach the destructive drop without an injected guard,
    which converts today's unconditional drop into fail-closed behavior for
-   every caller.
+   every caller. The bump also owns its own survivability, added per the
+   P3-E cell's stop-and-report (the plan originally missed both defects
+   below): a version bump changes every collected materialization selector
+   and snapshot id by construction, so the full-rebuild collected path
+   gains a materialization-migration arm. A persisted selector that is
+   shape-valid for the same project and generation with a different
+   materialization suffix, whose activation record agrees, re-stages from
+   store blobs under the current version with zero leases, saves the new
+   activation record preserving cutback state verbatim, flips the manifest
+   entry under the coordinator, and enqueues the outgoing selector's
+   retirement; every other mismatch shape keeps its fail-closed bail, and
+   incremental passes preserve rather than migrate (D-035). Separately,
+   the first post-reset rebuild runs against an empty index, which
+   surfaced a missing zero guard on the unavailable-git document collector
+   (a zero-limit top-docs query panics); the guard now matches its
+   siblings. The rebuild pass itself carries a typed cause: the strict
+   collected-preservation collectors verify live counts and are
+   load-bearing on an ordinary full pass, but meaningless on a freshly
+   reset index, so the schema-migration rebuild (and only it, threaded
+   explicitly from the open path, never inferred from observed emptiness)
+   skips exactly those two collectors and relies on re-staging from
+   verified store blobs; every document class the ordinary collectors
+   protect is either re-materialized from durable sources post-reset or
+   was already lost at every prior schema bump by the pre-existing
+   contract.
 3. Keying: `FileMeta` composite rekey and meta version marker per
    section 4.6; both purge loops split their delete arms (project rows by
    entry key, non-project rows by absolute path); edge purge reads the

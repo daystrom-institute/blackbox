@@ -22,7 +22,10 @@ use self::hnsw::{HnswIndex, HnswMetrics, HnswOptions, SearchHit};
 use self::slab::VectorSlab;
 use self::wal::WalRecord;
 
-const VECTOR_SCHEMA_VERSION: &str = "agentic-corpus-e3";
+/// Public because the P3-E rebuild manifest names the vector view it verified
+/// (governing section 10.3): a committed manifest that could not name the
+/// vector schema would be unable to prove which view its promise applied to.
+pub const VECTOR_SCHEMA_VERSION: &str = "agentic-corpus-e3";
 const VECTOR_SNAPSHOT_VERSION: &str = "agentic-corpus-e3-snapshot-v1";
 const VECTOR_SNAPSHOT_MAGIC: &[u8; 16] = b"BBOXVSNAPv1\0\0\0\0\0";
 const SNAPSHOT_FILE: &str = "snapshot.bin";

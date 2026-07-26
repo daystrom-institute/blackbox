@@ -101,6 +101,37 @@ pub(super) fn needs_reindex(
     Ok(false)
 }
 
+/// WHY a full rebuild is running, which selects whether the preservation gates
+/// apply (Phase 3 milestone P3-E).
+///
+/// The asymmetry: preservation exists to stop a DESTRUCTIVE pass from losing
+/// what the index currently holds, so on an ordinary full rebuild its strict
+/// live-count and inventory verification is load-bearing and must stay
+/// byte-unchanged. On the rebuild that follows a schema replacement the index
+/// was already legitimately emptied - under the pre-replacement guard's
+/// authority, which proved the recovery sources first - so there is nothing to
+/// preserve and verifying against the emptied index is meaningless. The
+/// authority there is re-staging: `index_active_collected_project` rebuilds the
+/// collected generation from verified store blobs later in the same pass
+/// (through the materialization-migration arm when the suffix is outgoing).
+///
+/// This is threaded from the caller, never inferred from observed emptiness. An
+/// empty index on an ORDINARY pass must still fail the gate: that is precisely
+/// the property the gate enforces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FullRebuildCause {
+    #[default]
+    Ordinary,
+    SchemaMigration,
+}
+
+impl FullRebuildCause {
+    /// Preservation applies only to an ordinary pass.
+    fn preserves_existing_documents(self) -> bool {
+        matches!(self, Self::Ordinary)
+    }
+}
+
 /// Restores the reindex-dirty flag when a *triggered* pass exits before
 /// committing (writer lock busy, or any phase/commit error via `?`/panic).
 /// Disarmed on a committed pass or a genuine no-op, so a satisfied trigger is
@@ -170,6 +201,7 @@ pub(super) fn execute_reindex_pass(
     fields: FieldHandles,
     full: bool,
     dirty: bool,
+    cause: FullRebuildCause,
     writer: &mut IndexWriter,
     drain: &mut dyn FnMut(&mut IndexWriter),
     records_provider: &Arc<dyn ProjectRecordsProvider>,
@@ -276,7 +308,13 @@ pub(super) fn execute_reindex_pass(
         .filter(|access| access.local.is_none() && access.local_denial.is_some())
         .map(|access| access.project.project_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
-    let preserved_collected = if full {
+    // Preservation is gated on the CAUSE, not on `full` alone (P3-E). See
+    // `FullRebuildCause` for the asymmetry; the short version is that this
+    // collector's strict live-count verification is the whole point on an
+    // ordinary pass and is meaningless against a just-emptied index, where
+    // re-staging from store blobs is the authority instead.
+    let preserve_existing = full && cause.preserves_existing_documents();
+    let preserved_collected = if preserve_existing {
         project_files::collect_preserved_collected_documents(index, config, fields)?
     } else {
         project_files::PreservedCollectedDocuments::default()
@@ -292,7 +330,7 @@ pub(super) fn execute_reindex_pass(
     // are excluded here (the strict collected arm above owns them) and so are
     // the lease-denied projects the legacy `unavailable_local` arm already
     // preserves, so no document is collected twice.
-    let detached_preserved_ids = if full {
+    let detached_preserved_ids = if preserve_existing {
         plans
             .iter()
             .filter(|plan| !plan.is_local_scanned())
@@ -309,7 +347,11 @@ pub(super) fn execute_reindex_pass(
     } else {
         std::collections::BTreeSet::new()
     };
-    let preserved_detached = if full {
+    // Paired verify for the local lane. Same gate for the same reason: its
+    // authority is the per-project freshness inventory, and the schema
+    // replacement discarded those rows along with the documents they described
+    // (the `FileMeta` version marker), so there is nothing to verify against.
+    let preserved_detached = if preserve_existing {
         project_files::collect_verified_detached_documents(
             index,
             config,
@@ -370,9 +412,44 @@ pub(super) fn execute_reindex_pass(
         prior_meta.clone()
     };
 
+    // 3b. Commit-document re-emission from the pinned history generations
+    // (P3-E, plan section 9 item 2). Deliberately here: after the destructive
+    // `delete_all_documents` and BEFORE any checkout walk below, so an
+    // attachment-less project's history is restored from its immutable
+    // generation regardless of whether any checkout turns out to be reachable.
+    // A manifest naming an unloadable generation or one whose bytes no longer
+    // re-derive their commitment fails the pass here, with the delete not yet
+    // committed, so the last-good view survives.
+    let history_reemission = if full {
+        let owners = project_access
+            .iter()
+            .filter_map(|access| {
+                let repo_id = access.project.and_then(|project| project.repo_id.clone())?;
+                Some((
+                    repo_id,
+                    bbox_corpus_index::index::schema_replacement::CommitDocumentOwnerV1 {
+                        project_id: Some(access.project_id().to_string()),
+                        project_display: access.identity.display_name.clone(),
+                    },
+                ))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        super::schema_rebuild::reemit_prepared_history_generations(
+            &index_path_from_config(config),
+            writer,
+            fields,
+            &owners,
+        )?
+    } else {
+        None
+    };
+
     // 4. Index changed files
     let mut indexed_files = 0u64;
-    let mut indexed_docs = 0u64;
+    let mut indexed_docs = history_reemission
+        .as_ref()
+        .map(|outcome| outcome.commit_documents)
+        .unwrap_or_default();
     let mut skipped = 0u64;
     let tool_edges = ToolEdgeContext::with_project_access(
         leased
@@ -438,6 +515,16 @@ pub(super) fn execute_reindex_pass(
         indexed_commits = project_stats.indexed_commits,
         "auto-reindex: project phase complete"
     );
+    if !project_stats.migrated_collected_selectors.is_empty() {
+        // The pinned selector map was seeded from the pre-flip manifest, so a
+        // reader would filter out the freshly staged documents until it is
+        // refreshed. The boot path refreshes immediately after this pass; a
+        // background pass converges on the next edge-index rebuild.
+        tracing::info!(
+            migrated = ?project_stats.migrated_collected_selectors,
+            "auto-reindex: migrated collected generations to the current materialization version"
+        );
+    }
     if project_stats.emitted_edges > 0 {
         tracing::debug!(
             emitted_edges = project_stats.emitted_edges,
@@ -680,6 +767,30 @@ pub(super) fn execute_reindex_pass(
         bbox_edge_sidecar::snapshot::clear_pending_local_activation_journal(&edges_dir)?;
     }
     save_meta(&config.meta_path, &meta)?;
+    // The manifest is promoted to COMMITTED only now: the population it
+    // promises is durable in the index, so the committed evidence can name the
+    // views that actually resulted. A crash before this point leaves the
+    // manifest prepared and `classify_rebuild_recovery` resumes it at the next
+    // open (the index is post-drop, so there is nothing to roll back to).
+    if let Some(outcome) = &history_reemission {
+        let committed = super::schema_rebuild::commit_prepared_rebuild_manifest(
+            &index_path_from_config(config),
+            format!("lexical:{}", bbox_corpus_index::index::INDEX_SCHEMA_VERSION),
+            format!("vector:{}", bbox_vectors::VECTOR_SCHEMA_VERSION),
+            records_provider.records_snapshot().authority_epoch,
+            outcome.vector_inventory.clone(),
+        )?;
+        if let Some(manifest) = committed {
+            tracing::info!(
+                rebuild_id = %manifest.rebuild_id,
+                namespaces = outcome.namespaces,
+                commit_documents = outcome.commit_documents,
+                vectors_verified = outcome.vectors_verified,
+                vectors_reenqueued = outcome.vectors_reenqueued,
+                "committed the repo-history rebuild manifest"
+            );
+        }
+    }
     tracing::info!(
         full,
         elapsed_ms = commit_phase.elapsed().as_millis(),
@@ -698,6 +809,18 @@ pub(super) fn execute_reindex_pass(
     );
     tracing::info!("{}", summary);
     Ok(summary)
+}
+
+/// The index directory, derived from the pass config's `_meta.json` path. The
+/// history generations root and the commit spill root are both siblings of it,
+/// so the derivation has to agree with `TranscriptIndex`'s own or the rebuild
+/// would look for its manifest in the wrong family root.
+fn index_path_from_config(config: &ReindexConfig) -> std::path::PathBuf {
+    config
+        .meta_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
 fn collect_provisional_documents(
@@ -803,6 +926,15 @@ fn collect_unavailable_git_documents(
         IndexRecordOption::Basic,
     );
     let count = searcher.search(&query, &Count)?;
+    // `TopDocs::with_limit(0)` PANICS. Every sibling collector guards this; this
+    // one did not, and the first full rebuild after the P3-E schema reset is
+    // exactly the reachable case: the reset leaves a brand-new empty index, so
+    // there are zero commit documents while any Git-lease-denied project puts a
+    // non-empty set in `unavailable_projects`. The panic killed the writer
+    // actor, which surfaced only as "index writer actor dropped the reindex ack".
+    if count == 0 {
+        return Ok(Vec::new());
+    }
     let mut documents = Vec::new();
     for (_, address) in searcher.search(&query, &TopDocs::with_limit(count))? {
         let document = searcher.doc::<TantivyDocument>(address)?;
