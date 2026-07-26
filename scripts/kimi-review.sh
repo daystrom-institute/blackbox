@@ -100,6 +100,11 @@ git -C "$repo_root" merge-base --is-ancestor "$BASE_REF" HEAD ||
 
 cd "$repo_root"
 
+# Reviewer fan-outs routinely outlive the 600s print-mode background-wait
+# ceiling, which kills the round with no verdict issued. Disable the ceiling
+# for every claudew invocation here; an explicit caller value still wins.
+export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:-0}"
+
 verb="${1:-}"
 case "$verb" in
   review)
