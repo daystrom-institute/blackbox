@@ -3552,24 +3552,50 @@ impl CodeSourceStore {
         }
         let metadata_path = generation_dir.join("metadata.json");
         if metadata_path.is_file() {
-            let stored = read_stored_generation_v1(&metadata_path)?;
-            if stored.producer_id != producer_id || stored.descriptor != record.descriptor {
+            let mixed = read_mixed_stored_generation(&metadata_path)?;
+            let (stored_producer, stored_descriptor) = match &mixed {
+                MixedStoredGeneration::LegacyV1(record) => {
+                    (&record.producer_id, &record.descriptor)
+                }
+                MixedStoredGeneration::CurrentV2(record) => {
+                    (&record.producer_id, &record.descriptor)
+                }
+            };
+            if stored_producer != producer_id || stored_descriptor != &record.descriptor {
                 return Err(StoreRequestError::InvalidInput.into());
             }
         } else {
-            let stored = StoredGeneration {
-                version: STORE_VERSION,
-                generation_id: generation.clone(),
-                producer_id: producer_id.to_string(),
-                ordinal: record.ordinal,
-                descriptor: record.descriptor.clone(),
-                state: GenerationState::MissingBlobs,
-                diagnostic: None,
-                created_unix_secs: now_unix_secs(),
-                materialized_doc_count: None,
-                entity_inventory_sha256: None,
-            };
-            atomic_write_json(&metadata_path, &stored)?;
+            let created_unix_secs = now_unix_secs();
+            if self.shared.record_mode == RuntimeRecordMode::CatalogV2 {
+                let stored_v2 = StoredGenerationV2 {
+                    version: MIGRATION_STORE_VERSION,
+                    generation_id: generation.clone(),
+                    producer_id: producer_id.to_string(),
+                    ordinal: record.ordinal,
+                    descriptor: record.descriptor.clone(),
+                    published_scope: record.descriptor.scope.clone(),
+                    state: GenerationState::MissingBlobs,
+                    diagnostic: None,
+                    created_unix_secs,
+                    materialized_doc_count: None,
+                    entity_inventory_sha256: None,
+                };
+                atomic_write_json(&metadata_path, &stored_v2)?;
+            } else {
+                let stored = StoredGeneration {
+                    version: STORE_VERSION,
+                    generation_id: generation.clone(),
+                    producer_id: producer_id.to_string(),
+                    ordinal: record.ordinal,
+                    descriptor: record.descriptor.clone(),
+                    state: GenerationState::MissingBlobs,
+                    diagnostic: None,
+                    created_unix_secs,
+                    materialized_doc_count: None,
+                    entity_inventory_sha256: None,
+                };
+                atomic_write_json(&metadata_path, &stored)?;
+            }
         }
         let missing_path = self.upload_dir(producer_id, upload_id).join("missing.json");
         let missing = if missing_path.is_file() {
@@ -3770,6 +3796,94 @@ impl CodeSourceStore {
             atomic_write_json(&desired_path, &stored)?;
         }
         Ok(stored)
+    }
+
+    /// Mode-aware upload finalization (section 7.1 item 3).
+    ///
+    /// In catalog mode (`RuntimeRecordMode::CatalogV2`), the writer reads,
+    /// mutates, and writes `StoredGenerationV2` records, including the
+    /// desired pointer. In bridge mode, it delegates to the existing
+    /// v1 `finalize_upload`. The caller receives the `MixedStoredGeneration`
+    /// so it can branch on the record shape without a separate read.
+    pub fn finalize_upload_mixed(
+        &self,
+        producer_id: &str,
+        upload_id: &str,
+    ) -> Result<MixedStoredGeneration> {
+        if self.shared.record_mode == RuntimeRecordMode::BridgeV1 {
+            let stored = self.finalize_upload(producer_id, upload_id)?;
+            return Ok(MixedStoredGeneration::LegacyV1(stored));
+        }
+
+        let _guard = self.lock_mutation()?;
+        let mut record = self.load_upload(producer_id, upload_id)?;
+        let generation = record
+            .generation_id
+            .clone()
+            .ok_or(StoreRequestError::InvalidState)?;
+        let entries = self.load_generation_entries(&record.descriptor.scope, &generation)?;
+        let missing = self.missing_hashes(&entries)?;
+        if !missing.is_empty() {
+            return Err(StoreRequestError::InvalidState.into());
+        }
+        let mut stored = match self.load_generation_mixed(&record.descriptor.scope, &generation)? {
+            MixedStoredGeneration::CurrentV2(rec) => rec,
+            MixedStoredGeneration::LegacyV1(_) => {
+                bail!("error.code_source_record_mode: catalog store found a v1 stored generation")
+            }
+        };
+        let desired_path = self
+            .root()
+            .join("desired")
+            .join(format!("{}.json", scope_hash(&record.descriptor.scope)));
+        let previous_desired = if desired_path.is_file() {
+            match read_mixed_stored_generation(&desired_path)? {
+                MixedStoredGeneration::CurrentV2(rec) => Some(rec),
+                MixedStoredGeneration::LegacyV1(_) => {
+                    bail!(
+                        "error.code_source_record_mode: catalog desired pointer is a v1 stored generation"
+                    )
+                }
+            }
+        } else {
+            None
+        };
+        let superseded = previous_desired
+            .as_ref()
+            .is_some_and(|desired| desired.ordinal > stored.ordinal);
+        let already_activated = self.generation_is_activated(&generation)?;
+        stored.state = if already_activated {
+            GenerationState::Active
+        } else if superseded {
+            GenerationState::Superseded
+        } else {
+            GenerationState::Ready
+        };
+        stored.diagnostic = None;
+        self.save_generation_v2_locked(&stored)?;
+        record.state = stored.state;
+        record.updated_unix_secs = now_unix_secs();
+        self.save_upload(&record)?;
+        if !superseded {
+            if let Some(mut previous) = previous_desired
+                && previous.generation_id != stored.generation_id
+                && !self.generation_is_activated(&previous.generation_id)?
+            {
+                if self
+                    .paths
+                    .generation_manifest(&previous.published_scope, &previous.generation_id)?
+                    .is_file()
+                {
+                    previous.state = GenerationState::Superseded;
+                    previous.diagnostic = None;
+                    self.save_generation_v2_locked(&previous)?;
+                } else {
+                    tracing_reclaimed_desired_generation(&previous.generation_id);
+                }
+            }
+            atomic_write_json(&desired_path, &stored)?;
+        }
+        Ok(MixedStoredGeneration::CurrentV2(stored))
     }
 
     pub fn upload_scope(&self, producer_id: &str, upload_id: &str) -> Result<PublishedScope> {
@@ -5155,9 +5269,10 @@ impl CodeSourceStore {
         if offset > missing.len() {
             bail!("missing-blob cursor is out of range");
         }
-        let stored = self.find_generation(generation)?;
+        let mixed = self.find_generation_mixed(generation)?;
+        let scope = mixed.descriptor().scope.clone();
         let sizes = self
-            .load_generation_entries(&stored.descriptor.scope, generation)?
+            .load_generation_entries(&scope, generation)?
             .into_iter()
             .map(|entry| (entry.content_sha256, entry.size))
             .collect::<BTreeMap<_, _>>();
@@ -9641,5 +9756,94 @@ mod blob_gc_mode_tests {
         let stats = store.gc_blobs_for_scopes(&BTreeSet::from([scope])).unwrap();
         assert_eq!(stats.reclaimed_generations, 0);
         assert!(generation_dir.exists());
+    }
+
+    /// Section 7.1 item 3: catalog-mode upload finalization emits a
+    /// `StoredGenerationV2` readable by the mixed read path. The
+    /// desired pointer is also v2.
+    #[test]
+    fn catalog_mode_finalize_upload_emits_v2_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = CodeSourceStore::open_with_mode(
+            root.join("code-sources"),
+            StoreLimits::default(),
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap();
+        let descriptor = descriptor(&[]);
+        let scope = descriptor.scope.clone();
+
+        let upload = store.begin_upload("host-a", descriptor.clone()).unwrap();
+        store
+            .complete_manifest("host-a", &upload.upload_id)
+            .unwrap();
+        let mixed = store
+            .finalize_upload_mixed("host-a", &upload.upload_id)
+            .unwrap();
+
+        // The finalized generation must be v2 in catalog mode.
+        match &mixed {
+            MixedStoredGeneration::CurrentV2(record) => {
+                assert_eq!(record.state, GenerationState::Ready);
+                assert_eq!(record.published_scope, scope);
+            }
+            MixedStoredGeneration::LegacyV1(_) => {
+                panic!("catalog-mode finalize_upload must emit v2, not v1")
+            }
+        }
+
+        let generation_id = mixed.generation_id();
+
+        // find_generation_mixed reads it as v2.
+        let found = store.find_generation_mixed(generation_id).unwrap();
+        assert!(matches!(found, MixedStoredGeneration::CurrentV2(_)));
+
+        // desired_generation_mixed reads the pointer as v2.
+        let desired = store
+            .desired_generation_mixed(&scope)
+            .unwrap()
+            .expect("desired pointer must exist after finalize");
+        assert!(matches!(desired, MixedStoredGeneration::CurrentV2(_)));
+        assert_eq!(desired.generation_id(), generation_id);
+    }
+
+    /// Section 7.1 item 3: bridge-mode upload finalization is
+    /// byte-identical to the pre-P4C v1 path.
+    #[test]
+    fn bridge_mode_finalize_upload_emits_v1_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store =
+            CodeSourceStore::open(root.join("code-sources"), StoreLimits::default()).unwrap();
+        let descriptor = descriptor(&[]);
+        let scope = descriptor.scope.clone();
+
+        let upload = store.begin_upload("host-a", descriptor.clone()).unwrap();
+        store
+            .complete_manifest("host-a", &upload.upload_id)
+            .unwrap();
+        let mixed = store
+            .finalize_upload_mixed("host-a", &upload.upload_id)
+            .unwrap();
+
+        // The finalized generation must be v1 in bridge mode.
+        match &mixed {
+            MixedStoredGeneration::LegacyV1(record) => {
+                assert_eq!(record.state, GenerationState::Ready);
+                assert_eq!(record.descriptor.scope, scope);
+            }
+            MixedStoredGeneration::CurrentV2(_) => {
+                panic!("bridge-mode finalize_upload must emit v1, not v2")
+            }
+        }
+
+        // The existing v1 finalize_upload returns the same record.
+        let v1 = store
+            .desired_generation(&scope)
+            .unwrap()
+            .expect("desired pointer must exist");
+        assert_eq!(v1.generation_id, mixed.generation_id());
+        assert_eq!(v1.state, GenerationState::Ready);
     }
 }
