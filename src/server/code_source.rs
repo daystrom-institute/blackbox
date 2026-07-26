@@ -7303,4 +7303,240 @@ mod tests {
             "DoubleMigrationRepair"
         );
     }
+
+    // P4-E commit (d): reduction-table integration and lifecycle tests
+    // (section 9.8).
+
+    #[test]
+    fn p4e_transient_retry_budget_exhausts_to_manual_retry() {
+        // When attempts exceed cutback_max_attempts, the reducer's
+        // schedule_cutback_catalog path would persist
+        // ManualRetryRequired. Test the reduction-table cell directly:
+        // after ManualRetryRequired is persisted, the reducer returns
+        // NoOp (steady-state, explicit retry only).
+        let mr = CutbackStateV2::ManualRetryRequired {
+            error_class: CutbackErrorClass::WriterContention,
+            attempt: 8,
+        };
+        // Even with a selected attachment, ManualRetryRequired is NoOp.
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            Some(&mr),
+            LadderResult::Selected,
+            false,
+        );
+        assert!(
+            matches!(action, ReducerAction::NoOp),
+            "ManualRetryRequired must be steady-state NoOp"
+        );
+    }
+
+    #[test]
+    fn p4e_terminal_state_never_auto_retries() {
+        let terminal = CutbackStateV2::Terminal {
+            error_class: CutbackErrorClass::SecurityFailure,
+        };
+        // Terminal never auto-retries, regardless of ladder.
+        for ladder in [
+            LadderResult::Selected,
+            LadderResult::None,
+            LadderResult::Ambiguous,
+            LadderResult::ScopeInvalid,
+        ] {
+            let action = evaluate_reduction(
+                DesiredAssignment::Local,
+                EffectiveSource::Collected,
+                Some(&terminal),
+                ladder,
+                false,
+            );
+            assert!(
+                matches!(action, ReducerAction::NoOp),
+                "Terminal must be steady-state NoOp for ladder={:?}",
+                ladder
+            );
+        }
+    }
+
+    #[test]
+    fn p4e_readd_assignment_cancels_cutback() {
+        // A re-added assignment cancels any pending cutback and retains
+        // collected authority (the collected/collected/any-non-None cell).
+        let structural = CutbackStateV2::Structural {
+            reason: CutbackReason::NoLocalAttachment,
+        };
+        let action = evaluate_reduction(
+            DesiredAssignment::Collected,
+            EffectiveSource::Collected,
+            Some(&structural),
+            LadderResult::None,
+            false,
+        );
+        assert!(
+            matches!(action, ReducerAction::CancelCutback),
+            "re-add must cancel cutback"
+        );
+    }
+
+    #[test]
+    fn p4e_local_local_stale_state_is_cleared() {
+        // local/local/any-non-None: clear stale state (crash between
+        // local activation publication and state clear).
+        let transient = CutbackStateV2::Transient {
+            attempt: 3,
+            error_class: CutbackErrorClass::IoPressure,
+            deadline_unix_secs: unix_now() + 30,
+        };
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Local,
+            Some(&transient),
+            LadderResult::None,
+            false,
+        );
+        assert!(
+            matches!(action, ReducerAction::CancelCutback),
+            "local/local with stale state must clear"
+        );
+    }
+
+    #[test]
+    fn p4e_open_bridge_predicate_newest_by_catalog_epoch() {
+        use bbox_corpus_core::project_catalog::ScopeMigrationRecord;
+
+        // When multiple bridge records exist, newest by catalog_epoch is
+        // authority (section 9.3).
+        let scope = PublishedScope::try_new("old-repo", ".").unwrap();
+        let mut older = ScopeMigrationRecord {
+            scope_migration_id: bbox_corpus_core::project_catalog::ScopeMigrationId::mint(),
+            project_id: ProjectId::parse("p_multi_bridge_000000000001").unwrap(),
+            catalog_epoch: 5,
+            authority_provenance:
+                bbox_corpus_core::project_catalog::ScopeMigrationAuthorityProvenance::AttachmentProved,
+            operator_invocation: "test".into(),
+            operator_reason: None,
+            old_scope: ProjectScope::Published(scope.clone()),
+            new_scope: ProjectScope::Published(
+                PublishedScope::try_new("new-repo", ".").unwrap(),
+            ),
+            kind: bbox_corpus_core::project_catalog::ScopeMigrationKind::RelpathMove,
+            migrated_at: "2024-01-01T00:00:00Z".into(),
+            code_bridge_generation: Some("gen-older".into()),
+            publication_bridge_generation: None,
+            pending_capabilities: Default::default(),
+        };
+        let mut newer = older.clone();
+        newer.scope_migration_id = bbox_corpus_core::project_catalog::ScopeMigrationId::mint();
+        newer.catalog_epoch = 10;
+        newer.code_bridge_generation = Some("gen-newer".into());
+        // The newer record has a different old_scope that does NOT match.
+        newer.old_scope =
+            ProjectScope::Published(PublishedScope::try_new("wrong-repo", ".").unwrap());
+
+        let records: Vec<&ScopeMigrationRecord> = vec![&older, &newer];
+        // Newest (epoch 10) is authority: gen-newer with wrong-repo scope.
+        // Since the newest record's old_scope is wrong-repo and its
+        // code_bridge_generation is gen-newer, the bridge IS open when
+        // the effective generation is gen-newer and the effective scope
+        // matches wrong-repo.
+        let wrong_scope = PublishedScope::try_new("wrong-repo", ".").unwrap();
+        assert!(is_bridge_open(&records, "gen-newer", Some(&wrong_scope)));
+        // But NOT open when the effective scope is the older record's scope.
+        assert!(!is_bridge_open(&records, "gen-newer", Some(&scope)));
+        // The older record's generation is not checked (newest is authority).
+        assert!(!is_bridge_open(&records, "gen-older", Some(&scope)));
+    }
+
+    #[test]
+    fn p4e_warming_with_selected_ladder_attempts_cutback() {
+        // local/Warming/any with a valid local source: re-stage.
+        // local/Unavailable/any with a valid local source: re-stage.
+        for eff in [EffectiveSource::Warming, EffectiveSource::Unavailable] {
+            let action = evaluate_reduction(
+                DesiredAssignment::Local,
+                eff,
+                None,
+                LadderResult::Selected,
+                false,
+            );
+            assert!(
+                matches!(action, ReducerAction::AttemptCutback),
+                "warming/unavailable with selected ladder should attempt cutback (eff={:?})",
+                eff
+            );
+        }
+    }
+
+    #[test]
+    fn p4e_warming_without_selected_ladder_is_noop() {
+        // local/Warming/any without a valid local source: no-op.
+        for ladder in [
+            LadderResult::None,
+            LadderResult::Ambiguous,
+            LadderResult::ScopeInvalid,
+        ] {
+            let action = evaluate_reduction(
+                DesiredAssignment::Local,
+                EffectiveSource::Warming,
+                None,
+                ladder,
+                false,
+            );
+            assert!(
+                matches!(action, ReducerAction::NoOp),
+                "warming without selected ladder should be NoOp (ladder={:?})",
+                ladder
+            );
+        }
+    }
+
+    #[test]
+    fn p4e_config_event_re_entry_for_structural() {
+        // Config-event re-entry: a config reload re-evaluates Structural
+        // states. If the ladder now shows selected, it re-attempts.
+        let structural = CutbackStateV2::Structural {
+            reason: CutbackReason::ScopeMismatch,
+        };
+        // Before config fix: no selected attachment, stays structural.
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            Some(&structural),
+            LadderResult::ScopeInvalid,
+            false,
+        );
+        assert!(matches!(action, ReducerAction::NoOp));
+
+        // After config fix: attachment now selected, re-attempt fires.
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            Some(&structural),
+            LadderResult::Selected,
+            false,
+        );
+        assert!(matches!(action, ReducerAction::ReattemptCutback));
+    }
+
+    #[test]
+    fn p4e_observer_clone_is_independent() {
+        use bbox_indexing::project_catalog_store::{CatalogCommitObserver, CatalogCommittedEvent};
+        let observer = CatalogCommitObserver::new();
+        let cloned = observer.clone();
+        let mut ids = std::collections::BTreeSet::new();
+        ids.insert("p_clone_test".to_string());
+        observer.push_for_test(CatalogCommittedEvent {
+            epoch: 1,
+            changed_project_ids: ids,
+        });
+        // Clone sees the same events (shared internal queue).
+        assert!(cloned.has_events());
+        let drained = cloned.drain_events();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].epoch, 1);
+        // Both handles now show no events.
+        assert!(!observer.has_events());
+        assert!(!cloned.has_events());
+    }
 }
