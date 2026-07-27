@@ -164,10 +164,10 @@ EOF
     ;;
   s5)
     stop_daemon
-    SMOKE="$SMOKE" python3 - <<'EOF'
+    SMOKE="$SMOKE" WINNER="$WINNER_PROJECT" python3 - <<'EOF'
 import json, glob, os
 import sys
-recs = glob.glob(os.environ["SMOKE"] + "/rehearsal/state/code-sources/activations/*.json")
+recs = [q for q in glob.glob(os.environ["SMOKE"] + "/rehearsal/state/code-sources/activations/*.json") if os.environ["WINNER"] in os.path.basename(q)]
 if not recs:
     print("S5 FAIL: no activation record available to drift"); sys.exit(1)
 p = recs[0]; r = json.load(open(p))
@@ -189,7 +189,8 @@ for o in glob.glob(os.environ["SMOKE"] + "/rehearsal/state/code-sources/activati
     shutil.move(o, o[:-5])
 print("restored")
 EOF
-    cp "$SMOKE/daemon-config.toml.bak" "$SMOKE/daemon-config.toml" ;;
+    : > "$SMOKE/daemon.log"; start_daemon
+    if wait_bind; then echo "S5 restore-boot OK (daemon left running)"; else echo "S5 FAIL: restore boot"; tail -3 "$SMOKE/daemon.log"; return 1; fi ;;
   s6)
     : > "$SMOKE/daemon.log"; start_daemon
     if wait_bind; then echo "S6 boot OK"; else echo "S6 FAIL"; tail -5 "$SMOKE/daemon.log"; return 1; fi
@@ -200,7 +201,7 @@ esac
 }
 
 if [ "$cmd" = "all" ]; then
-  for row in s1 s2 s3 s4 s5 s6; do run_row "$row" || exit 1; done
+  for row in s1 s2 s3 s5 s4 s6; do run_row "$row" || exit 1; done
 else
   run_row "$cmd"
 fi
