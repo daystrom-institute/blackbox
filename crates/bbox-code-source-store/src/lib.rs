@@ -398,6 +398,20 @@ pub struct RetirementGenerationInventory {
     pub blob_hashes: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetirementDesiredPointerInventory {
+    pub published_scope: PublishedScope,
+    pub generation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetirementUploadInventory {
+    pub producer_id: String,
+    pub upload_id: String,
+    pub published_scope: PublishedScope,
+    pub blob_hashes: BTreeSet<String>,
+}
+
 impl StoredGenerationV2 {
     pub fn from_v1_for_migration(
         legacy: StoredGeneration,
@@ -4839,6 +4853,15 @@ impl CodeSourceStore {
     ) -> Result<()> {
         validate_sha256(generation_id)?;
         let _guard = self.lock_mutation()?;
+        if self
+            .retirement_desired_pointer_inventory_locked()?
+            .iter()
+            .any(|pointer| pointer.generation_id == generation_id)
+        {
+            bail!(
+                "error.code_source_retirement_desired_root: generation is still named by a desired pointer"
+            );
+        }
         let directory = self.paths.generation_directory(scope, generation_id)?;
         if !directory.exists() {
             return Ok(());
@@ -4855,6 +4878,153 @@ impl CodeSourceStore {
         fs::remove_dir_all(&directory)?;
         sync_parent(&directory)?;
         Ok(())
+    }
+
+    /// Enumerate every canonical desired pointer using the store's mixed
+    /// record codec. Malformed or non-regular entries refuse retirement.
+    pub fn retirement_desired_pointer_inventory(
+        &self,
+    ) -> Result<Vec<RetirementDesiredPointerInventory>> {
+        let _guard = self.lock_mutation()?;
+        self.retirement_desired_pointer_inventory_locked()
+    }
+
+    fn retirement_desired_pointer_inventory_locked(
+        &self,
+    ) -> Result<Vec<RetirementDesiredPointerInventory>> {
+        let mut inventory = Vec::new();
+        for entry in fs::read_dir(self.root().join("desired"))? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if !file_type.is_file() {
+                bail!("desired pointer directory contains a non-regular entry");
+            }
+            if !is_canonical_record_file(&entry) {
+                continue;
+            }
+            let record = read_mixed_stored_generation(&entry.path())?;
+            record.validate()?;
+            let expected_name = format!("{}.json", scope_hash(record.published_scope()));
+            if entry.file_name() != std::ffi::OsStr::new(&expected_name) {
+                bail!("desired pointer filename does not match its published scope");
+            }
+            inventory.push(RetirementDesiredPointerInventory {
+                published_scope: record.published_scope().clone(),
+                generation_id: record.generation_id().to_string(),
+            });
+        }
+        inventory.sort_by(|left, right| {
+            scope_hash(&left.published_scope)
+                .cmp(&scope_hash(&right.published_scope))
+                .then_with(|| left.generation_id.cmp(&right.generation_id))
+        });
+        Ok(inventory)
+    }
+
+    /// Remove one exact desired pointer. A missing pointer is idempotent, but
+    /// a replacement pointer refuses instead of deleting newer authority.
+    pub fn delete_retirement_desired_pointer(
+        &self,
+        scope: &PublishedScope,
+        generation_id: &str,
+    ) -> Result<()> {
+        validate_sha256(generation_id)?;
+        let _guard = self.lock_mutation()?;
+        let path = self
+            .root()
+            .join("desired")
+            .join(format!("{}.json", scope_hash(scope)));
+        if !path.exists() {
+            return Ok(());
+        }
+        let record = read_mixed_stored_generation(&path)?;
+        record.validate()?;
+        if record.published_scope() != scope || record.generation_id() != generation_id {
+            bail!("desired pointer does not match exact retirement identity");
+        }
+        remove_file_if_exists(&path)
+    }
+
+    /// Enumerate upload records and their manifest blobs using the owning
+    /// store format. Any malformed upload refuses retirement.
+    pub fn retirement_upload_inventory(&self) -> Result<Vec<RetirementUploadInventory>> {
+        let _guard = self.lock_mutation()?;
+        self.retirement_upload_inventory_locked()
+    }
+
+    fn retirement_upload_inventory_locked(&self) -> Result<Vec<RetirementUploadInventory>> {
+        let mut inventory = Vec::new();
+        for producer in fs::read_dir(self.root().join("uploads"))? {
+            let producer = producer?;
+            if !producer.file_type()?.is_dir() {
+                bail!("upload root contains a non-directory producer entry");
+            }
+            for upload in fs::read_dir(producer.path())? {
+                let upload = upload?;
+                if !upload.file_type()?.is_dir() {
+                    bail!("upload producer directory contains a non-directory entry");
+                }
+                let record: UploadRecord = read_json(&upload.path().join("upload.json"))?;
+                validate_upload_id(&record.upload_id)?;
+                validate_producer_id(&record.producer_id)?;
+                record.descriptor.validate_header()?;
+                if record.version != STORE_VERSION
+                    || producer.file_name()
+                        != std::ffi::OsStr::new(&producer_hash(&record.producer_id))
+                    || upload.file_name() != std::ffi::OsStr::new(&record.upload_id)
+                {
+                    bail!("upload record does not match its store identity");
+                }
+                if !matches!(
+                    record.state,
+                    GenerationState::ReceivingManifest | GenerationState::MissingBlobs
+                ) {
+                    continue;
+                }
+                let blob_hashes = self
+                    .load_upload_entries(&record)?
+                    .into_iter()
+                    .map(|entry| entry.content_sha256)
+                    .collect();
+                inventory.push(RetirementUploadInventory {
+                    producer_id: record.producer_id,
+                    upload_id: record.upload_id,
+                    published_scope: record.descriptor.scope,
+                    blob_hashes,
+                });
+            }
+        }
+        inventory.sort_by(|left, right| {
+            scope_hash(&left.published_scope)
+                .cmp(&scope_hash(&right.published_scope))
+                .then_with(|| left.producer_id.cmp(&right.producer_id))
+                .then_with(|| left.upload_id.cmp(&right.upload_id))
+        });
+        Ok(inventory)
+    }
+
+    /// Remove one exact upload directory after revalidating its owner and
+    /// published scope. Missing uploads are idempotent.
+    pub fn delete_retirement_upload(
+        &self,
+        producer_id: &str,
+        upload_id: &str,
+        scope: &PublishedScope,
+    ) -> Result<()> {
+        validate_producer_id(producer_id)?;
+        validate_upload_id(upload_id)?;
+        let _guard = self.lock_mutation()?;
+        let directory = self.upload_dir(producer_id, upload_id);
+        if !directory.exists() {
+            return Ok(());
+        }
+        let record = self.load_upload(producer_id, upload_id)?;
+        record.descriptor.validate_header()?;
+        if record.version != STORE_VERSION || &record.descriptor.scope != scope {
+            bail!("upload record does not match exact retirement identity");
+        }
+        fs::remove_dir_all(&directory)?;
+        sync_parent(&directory)
     }
 
     pub fn retirement_generation_exists(
@@ -4897,12 +5067,28 @@ impl CodeSourceStore {
                 }
             }
         }
+        self.mark_live_upload_blobs(&mut retained, Some(candidates))?;
         for hash in candidates.difference(&retained) {
             let path = self.blob_path(hash);
             match fs::remove_file(&path) {
                 Ok(()) => sync_parent(&path)?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn mark_live_upload_blobs(
+        &self,
+        marked: &mut BTreeSet<String>,
+        filter: Option<&BTreeSet<String>>,
+    ) -> Result<()> {
+        for upload in self.retirement_upload_inventory_locked()? {
+            for hash in upload.blob_hashes {
+                if filter.is_none_or(|candidates| candidates.contains(&hash)) {
+                    marked.insert(hash);
+                }
             }
         }
         Ok(())
@@ -5164,32 +5350,7 @@ impl CodeSourceStore {
                 );
             }
         }
-        for producer in fs::read_dir(self.root().join("uploads"))? {
-            let producer = producer?;
-            if !producer.file_type()?.is_dir() {
-                continue;
-            }
-            for upload in fs::read_dir(producer.path())? {
-                let upload = upload?;
-                if !upload.file_type()?.is_dir() {
-                    continue;
-                }
-                let metadata = upload.path().join("upload.json");
-                let Ok(record) = read_json::<UploadRecord>(&metadata) else {
-                    continue;
-                };
-                if matches!(
-                    record.state,
-                    GenerationState::ReceivingManifest | GenerationState::MissingBlobs
-                ) {
-                    marked.extend(
-                        self.load_upload_entries(&record)?
-                            .into_iter()
-                            .map(|entry| entry.content_sha256),
-                    );
-                }
-            }
-        }
+        self.mark_live_upload_blobs(&mut marked, None)?;
         let cutoff = SystemTime::now()
             .checked_sub(std::time::Duration::from_secs(
                 limits.unreferenced_blob_grace_hours.saturating_mul(3_600),
@@ -6661,6 +6822,104 @@ mod tests {
                 .unwrap()
                 .is_dir()
         );
+    }
+
+    #[test]
+    fn retirement_requires_exact_desired_pointer_discharge_before_generation_delete() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = open_store(&root);
+        let scope = PublishedScope::try_new("owner-a", ".").unwrap();
+        let generation_id =
+            install_retirement_generation(&store, &scope, "producer-a", &[format!("{:064x}", 3)]);
+        let generation_dir = store
+            .paths
+            .generation_directory(&scope, &generation_id)
+            .unwrap();
+        let desired_path = store
+            .root()
+            .join("desired")
+            .join(format!("{}.json", scope_hash(&scope)));
+        atomic_write(
+            &desired_path,
+            &fs::read(generation_dir.join("metadata.json")).unwrap(),
+        )
+        .unwrap();
+
+        let error = store
+            .delete_retirement_generation(&scope, &generation_id)
+            .unwrap_err();
+        assert!(error.to_string().contains("retirement_desired_root"));
+
+        let inventory = store.retirement_desired_pointer_inventory().unwrap();
+        assert_eq!(
+            inventory,
+            vec![RetirementDesiredPointerInventory {
+                published_scope: scope.clone(),
+                generation_id: generation_id.clone(),
+            }]
+        );
+        store
+            .delete_retirement_desired_pointer(&scope, &generation_id)
+            .unwrap();
+        store
+            .delete_retirement_generation(&scope, &generation_id)
+            .unwrap();
+        store
+            .delete_retirement_desired_pointer(&scope, &generation_id)
+            .unwrap();
+        assert!(!desired_path.exists());
+        assert!(!generation_dir.exists());
+    }
+
+    #[test]
+    fn retirement_upload_inventory_is_exact_and_keeps_live_upload_blob_rooted() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = open_store(&root);
+        let scope = PublishedScope::try_new("owner-a", ".").unwrap();
+        let bytes = b"upload root";
+        let hash = sha256_hex(bytes);
+        let entries = vec![ManifestEntry {
+            relative_path: "src/lib.rs".into(),
+            content_sha256: hash.clone(),
+            size: bytes.len() as u64,
+        }];
+        let mut upload_descriptor = descriptor(&entries);
+        upload_descriptor.scope = scope.clone();
+        let upload = store.begin_upload("producer-a", upload_descriptor).unwrap();
+        store
+            .put_manifest_page("producer-a", &upload.upload_id, 0, &entries)
+            .unwrap();
+        let blob = store.blob_path(&hash);
+        fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        fs::write(&blob, bytes).unwrap();
+
+        let inventory = store.retirement_upload_inventory().unwrap();
+        assert_eq!(
+            inventory,
+            vec![RetirementUploadInventory {
+                producer_id: "producer-a".into(),
+                upload_id: upload.upload_id.clone(),
+                published_scope: scope.clone(),
+                blob_hashes: BTreeSet::from([hash.clone()]),
+            }]
+        );
+        store
+            .sweep_retirement_blobs(&BTreeSet::from([hash.clone()]))
+            .unwrap();
+        assert!(blob.is_file());
+
+        store
+            .delete_retirement_upload("producer-a", &upload.upload_id, &scope)
+            .unwrap();
+        store
+            .delete_retirement_upload("producer-a", &upload.upload_id, &scope)
+            .unwrap();
+        store
+            .sweep_retirement_blobs(&BTreeSet::from([hash]))
+            .unwrap();
+        assert!(!blob.exists());
     }
 
     #[test]

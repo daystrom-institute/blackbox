@@ -571,6 +571,20 @@ mod tests {
     }
 
     #[test]
+    fn durable_publication_delete_is_idempotent_across_resume() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let pointers = root.join("accepted-publications").join("pointers");
+        std::fs::create_dir_all(&pointers).unwrap();
+        let pointer = pointers.join("project-a.json");
+        std::fs::write(&pointer, b"{}").unwrap();
+
+        durable_remove_file_if_exists(&pointer).unwrap();
+        assert!(!pointer.exists());
+        durable_remove_file_if_exists(&pointer).unwrap();
+    }
+
+    #[test]
     fn parser_selects_each_documented_command() {
         let preflight = Cli::try_parse_from([
             "blackbox",
@@ -1346,11 +1360,51 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
+        let expected_desired = evidence
+            .desired_pointers
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let current_desired = current
+            .desired_pointers
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let expected_uploads = evidence
+            .owned_uploads
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let current_uploads = current
+            .owned_uploads
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let expected_blobs = evidence
+            .owned_blob_hashes
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let current_blobs = current
+            .owned_blob_hashes
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
         if evidence.owner_project_id.as_ref() != Some(project_id)
             || current.owner_project_id != evidence.owner_project_id
             || current.catalog_scope != evidence.catalog_scope
-            || current_generations != expected_generations
-            || current.owned_blob_hashes != evidence.owned_blob_hashes
+            || !current_generations.is_subset(&expected_generations)
+            || !current_desired.is_subset(&expected_desired)
+            || !current_uploads.is_subset(&expected_uploads)
+            || !current_blobs.is_subset(&expected_blobs)
         {
             return Err(project_catalog_admin::admin_error(
                 "error.project_catalog_retire_evidence_drift",
@@ -1383,13 +1437,41 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             )
         })?;
 
-        // Clear the activation record (single-attempt, idempotent).
-        store.clear_activation(project_id.as_str()).map_err(|e| {
+        for pointer in evidence.desired_pointers.as_deref().ok_or_else(|| {
             project_catalog_admin::admin_error(
-                "error.project_catalog_retire_discharge_activation",
-                format!("failed to clear activation record: {e}"),
+                "error.project_catalog_retire_evidence_incomplete",
+                "retirement evidence is missing desired-pointer identities",
             )
-        })?;
+        })? {
+            store
+                .delete_retirement_desired_pointer(&pointer.published_scope, &pointer.generation_id)
+                .map_err(|e| {
+                    project_catalog_admin::admin_error(
+                        "error.project_catalog_retire_discharge_desired",
+                        format!("failed to delete exact desired pointer: {e}"),
+                    )
+                })?;
+        }
+
+        for upload in evidence.owned_uploads.as_deref().ok_or_else(|| {
+            project_catalog_admin::admin_error(
+                "error.project_catalog_retire_evidence_incomplete",
+                "retirement evidence is missing upload identities",
+            )
+        })? {
+            store
+                .delete_retirement_upload(
+                    &upload.producer_id,
+                    &upload.upload_id,
+                    &upload.published_scope,
+                )
+                .map_err(|e| {
+                    project_catalog_admin::admin_error(
+                        "error.project_catalog_retire_discharge_upload",
+                        format!("failed to delete exact upload: {e}"),
+                    )
+                })?;
+        }
 
         for generation in &evidence.owned_generations {
             store
@@ -1404,6 +1486,15 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
                     )
                 })?;
         }
+
+        // Keep activation ownership available until every exact generation
+        // identity is gone so a crash between deletions can be resumed.
+        store.clear_activation(project_id.as_str()).map_err(|e| {
+            project_catalog_admin::admin_error(
+                "error.project_catalog_retire_discharge_activation",
+                format!("failed to clear activation record: {e}"),
+            )
+        })?;
 
         let catalog_store =
             ProjectCatalogStore::open_existing(self.projects_path).map_err(|e| {
@@ -1464,16 +1555,12 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
         project_id: &ProjectId,
     ) -> project_catalog_admin::AdminResult<()> {
         if let Some(pointer) = accepted_publication_pointer(self.projects_path, project_id) {
-            match std::fs::remove_file(&pointer) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(project_catalog_admin::admin_error(
-                        "error.project_catalog_retire_discharge_publication",
-                        format!("failed to delete accepted-publication pointer: {e}"),
-                    ));
-                }
-            }
+            durable_remove_file_if_exists(&pointer).map_err(|e| {
+                project_catalog_admin::admin_error(
+                    "error.project_catalog_retire_discharge_publication",
+                    format!("failed to durably delete accepted-publication pointer: {e}"),
+                )
+            })?;
         }
         Ok(())
     }
@@ -2032,9 +2119,45 @@ fn capture_retirement_evidence(
                 .insert(migration.project_id.as_str().to_string());
         }
     }
+    let desired_inventory = store.retirement_desired_pointer_inventory().map_err(|e| {
+        project_catalog_admin::admin_error(
+            "error.project_catalog_retire_evidence_desired",
+            format!("failed to enumerate desired-pointer ownership: {e}"),
+        )
+    })?;
+    let mut desired_pointers = Vec::new();
+    for pointer in desired_inventory {
+        if current_scope == Some(&pointer.published_scope) {
+            durable_generation_owners
+                .entry(pointer.generation_id.clone())
+                .or_default()
+                .insert(project_id.as_str().to_string());
+            desired_pointers.push(project_catalog_admin::RetirementGenerationEvidence {
+                published_scope: pointer.published_scope,
+                generation_id: pointer.generation_id,
+            });
+        }
+    }
+
+    let mut owned_blob_hashes = BTreeSet::new();
+    let mut owned_uploads = Vec::new();
+    for upload in store.retirement_upload_inventory().map_err(|e| {
+        project_catalog_admin::admin_error(
+            "error.project_catalog_retire_evidence_uploads",
+            format!("failed to enumerate upload ownership: {e}"),
+        )
+    })? {
+        if current_scope == Some(&upload.published_scope) {
+            owned_blob_hashes.extend(upload.blob_hashes);
+            owned_uploads.push(project_catalog_admin::RetirementUploadEvidence {
+                producer_id: upload.producer_id,
+                upload_id: upload.upload_id,
+                published_scope: upload.published_scope,
+            });
+        }
+    }
 
     let mut owned_generations = Vec::new();
-    let mut owned_blob_hashes = BTreeSet::new();
     for generation in store.retirement_generation_inventory().map_err(|e| {
         project_catalog_admin::admin_error(
             "error.project_catalog_retire_evidence_generations",
@@ -2065,6 +2188,8 @@ fn capture_retirement_evidence(
         owner_project_id: Some(project_id.clone()),
         catalog_scope: current_scope.cloned(),
         owned_generations,
+        desired_pointers: Some(desired_pointers),
+        owned_uploads: Some(owned_uploads),
         blob_inventory: None,
         owned_blob_hashes: owned_blob_hashes.into_iter().collect(),
     })
@@ -2432,6 +2557,19 @@ fn accepted_publication_pointer(projects_path: &Path, project_id: &ProjectId) ->
             .join("pointers")
             .join(format!("{project_id}.json"))
     })
+}
+
+fn durable_remove_file_if_exists(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Collect coordination row store paths and their key fields. Each tuple

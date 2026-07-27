@@ -2164,6 +2164,8 @@ impl ProjectRetirementJournal {
             completed_steps: Vec::new(),
             evidence: RetirementJournalEvidence {
                 owner_project_id: Some(project_id.clone()),
+                desired_pointers: Some(Vec::new()),
+                owned_uploads: Some(Vec::new()),
                 ..RetirementJournalEvidence::default()
             },
         }
@@ -2218,6 +2220,14 @@ pub struct RetirementJournalEvidence {
     /// will be deleted in stage CollectedGenerationsDischarged.
     pub owned_generations: Vec<RetirementGenerationEvidence>,
 
+    /// Exact desired pointers discharged before their generation directories.
+    /// `None` is rejected as incomplete v2 evidence.
+    pub desired_pointers: Option<Vec<RetirementGenerationEvidence>>,
+
+    /// Exact in-progress uploads owned by the retiring project's current
+    /// published scope. `None` is rejected as incomplete v2 evidence.
+    pub owned_uploads: Option<Vec<RetirementUploadEvidence>>,
+
     /// Hash-linked blob inventory persisted in a bounded sidecar.
     pub blob_inventory: Option<RetirementBlobInventoryRef>,
 
@@ -2245,6 +2255,13 @@ struct RetirementBlobInventorySidecar {
 pub struct RetirementGenerationEvidence {
     pub published_scope: PublishedScope,
     pub generation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RetirementUploadEvidence {
+    pub producer_id: String,
+    pub upload_id: String,
+    pub published_scope: PublishedScope,
 }
 
 /// Error type for retirement journal operations.
@@ -2438,6 +2455,40 @@ fn validate_journal_evidence_shape(
         {
             return Err(RetirementJournalError::other(
                 "retirement journal generation evidence is invalid or duplicated",
+            ));
+        }
+    }
+    let desired_pointers = journal.evidence.desired_pointers.as_ref().ok_or_else(|| {
+        RetirementJournalError::other("retirement journal is missing its desired-pointer evidence")
+    })?;
+    let mut desired_identities = std::collections::BTreeSet::new();
+    for pointer in desired_pointers {
+        if !validate_sha256_text(&pointer.generation_id)
+            || !desired_identities.insert((
+                pointer.published_scope.clone(),
+                pointer.generation_id.clone(),
+            ))
+        {
+            return Err(RetirementJournalError::other(
+                "retirement journal desired-pointer evidence is invalid or duplicated",
+            ));
+        }
+    }
+    let owned_uploads = journal.evidence.owned_uploads.as_ref().ok_or_else(|| {
+        RetirementJournalError::other("retirement journal is missing its upload evidence")
+    })?;
+    let mut upload_identities = std::collections::BTreeSet::new();
+    for upload in owned_uploads {
+        if upload.producer_id.is_empty()
+            || upload.upload_id.is_empty()
+            || !upload_identities.insert((
+                upload.producer_id.clone(),
+                upload.upload_id.clone(),
+                upload.published_scope.clone(),
+            ))
+        {
+            return Err(RetirementJournalError::other(
+                "retirement journal upload evidence is invalid or duplicated",
             ));
         }
     }
@@ -2751,6 +2802,8 @@ pub trait RetirementDischargeWorkers {
     ) -> AdminResult<RetirementJournalEvidence> {
         Ok(RetirementJournalEvidence {
             owner_project_id: Some(project_id.clone()),
+            desired_pointers: Some(Vec::new()),
+            owned_uploads: Some(Vec::new()),
             ..RetirementJournalEvidence::default()
         })
     }
@@ -2866,6 +2919,8 @@ impl RetirementDischargeWorkers for NoopDischargeWorkers {
     ) -> AdminResult<RetirementJournalEvidence> {
         Ok(RetirementJournalEvidence {
             owner_project_id: Some(project_id.clone()),
+            desired_pointers: Some(Vec::new()),
+            owned_uploads: Some(Vec::new()),
             ..RetirementJournalEvidence::default()
         })
     }
