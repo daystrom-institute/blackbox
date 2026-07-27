@@ -345,6 +345,8 @@ enum PreparedArtifactAction {
         local: bool,
         kind: crate::artifacts::ArtifactKind,
         source: PathBuf,
+        expected_name: String,
+        expected_version: String,
     },
 }
 
@@ -387,13 +389,17 @@ impl PreparedArtifactAction {
                 local,
                 kind,
                 source,
-            } => match catalog.mark_removed_by_source(
+                expected_name,
+                expected_version,
+            } => match catalog.mark_removed_by_source_if_identity(
                 ArtifactScope::Project {
                     project_id: &project_id,
                     local,
                 },
                 kind,
                 &source,
+                &expected_name,
+                &expected_version,
             ) {
                 Ok(Some(meta)) => tracing::info!(
                     "watcher: marked removed {}/{} (project {})",
@@ -420,6 +426,7 @@ fn prepare_artifact_event(
     project_id: &str,
     bbox_root: &Path,
     read: &dyn ArtifactWatchRead,
+    catalog: &ArtifactCatalog,
 ) -> Vec<PreparedArtifactAction> {
     let is_create_or_rename_to = matches!(
         event.kind,
@@ -456,7 +463,7 @@ fn prepare_artifact_event(
             if let Some(action) = prepare_create(path, project_id, bbox_root, read) {
                 actions.push(action);
             }
-        } else if let Some(action) = prepare_remove(path, project_id, bbox_root) {
+        } else if let Some(action) = prepare_remove(path, project_id, bbox_root, catalog) {
             actions.push(action);
         }
     }
@@ -499,6 +506,7 @@ fn handle_event_batch(
                         &registration.carrier.project_id,
                         &bbox_root,
                         read,
+                        catalog,
                     );
                 }
                 event_repo_store_dirty =
@@ -578,6 +586,7 @@ fn prepare_remove(
     path: &Path,
     project_id: &str,
     bbox_root: &Path,
+    catalog: &ArtifactCatalog,
 ) -> Option<PreparedArtifactAction> {
     let Ok(relative) = path.strip_prefix(bbox_root) else {
         return None;
@@ -600,11 +609,26 @@ fn prepare_remove(
         Some(k) => k,
         None => return None,
     };
+    let scope = ArtifactScope::Project { project_id, local };
+    let metadata = match catalog.active_artifact_by_source(scope, kind, &source) {
+        Ok(Some(metadata)) => metadata,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(
+                artifact_kind = %kind.as_str(),
+                error = %error,
+                "watcher: could not bind removal to active artifact identity"
+            );
+            return None;
+        }
+    };
     Some(PreparedArtifactAction::Remove {
         project_id: project_id.to_owned(),
         local,
         kind,
         source,
+        expected_name: metadata.name,
+        expected_version: metadata.version,
     })
 }
 
@@ -919,6 +943,68 @@ mod tests {
             scoped.is_some(),
             "artifact JSON must be preserved after deletion (audit trail)"
         );
+    }
+
+    #[test]
+    fn prepared_remove_does_not_deactivate_newer_reinstall() {
+        let directory = tempdir().unwrap();
+        let project_dir = directory.path().canonicalize().unwrap().join("project");
+        let bbox_dir = project_dir.join(".bbox");
+        let workflow_dir = bbox_dir.join("workflows");
+        std::fs::create_dir_all(&workflow_dir).unwrap();
+        let catalog = ArtifactCatalog::open(directory.path().join("catalog")).unwrap();
+        let source = PathBuf::from(".bbox/workflows/reinstall.json");
+        catalog
+            .install_value_scoped(
+                ArtifactScope::Project {
+                    project_id: "p1",
+                    local: false,
+                },
+                crate::artifacts::ArtifactKind::Workflow,
+                source.to_string_lossy().into_owned(),
+                &serde_json::json!({"name": "reinstall", "version": "1", "steps": []}),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let action = prepare_remove(
+            &workflow_dir.join("reinstall.json"),
+            "p1",
+            &bbox_dir,
+            &catalog,
+        )
+        .unwrap();
+
+        catalog
+            .install_value_scoped(
+                ArtifactScope::Project {
+                    project_id: "p1",
+                    local: false,
+                },
+                crate::artifacts::ArtifactKind::Workflow,
+                source.to_string_lossy().into_owned(),
+                &serde_json::json!({"name": "reinstall", "version": "2", "steps": []}),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        action.publish(&catalog);
+
+        let active = catalog
+            .active_artifact_by_source(
+                ArtifactScope::Project {
+                    project_id: "p1",
+                    local: false,
+                },
+                crate::artifacts::ArtifactKind::Workflow,
+                &source,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(active.active);
+        assert_eq!(active.version, "2");
     }
 
     #[test]

@@ -2272,14 +2272,57 @@ impl ArtifactCatalog {
         })
     }
 
+    pub fn active_artifact_by_source(
+        &self,
+        scope: ArtifactScope<'_>,
+        kind: ArtifactKind,
+        source_path: &Path,
+    ) -> anyhow::Result<Option<ArtifactMetadata>> {
+        with_artifact_mutation_lock(&self.root, || {
+            self.active_artifact_by_source_locked(&scope, kind, source_path)
+        })
+    }
+
+    pub fn mark_removed_by_source_if_identity(
+        &self,
+        scope: ArtifactScope<'_>,
+        kind: ArtifactKind,
+        source_path: &Path,
+        expected_name: &str,
+        expected_version: &str,
+    ) -> anyhow::Result<Option<ArtifactMetadata>> {
+        with_artifact_mutation_lock(&self.root, || {
+            let Some(meta) = self.active_artifact_by_source_locked(&scope, kind, source_path)?
+            else {
+                return Ok(None);
+            };
+            if meta.name != expected_name || meta.version != expected_version {
+                return Ok(None);
+            }
+            self.mark_removed_metadata_locked(scope, meta)
+        })
+    }
+
     fn mark_removed_by_source_locked(
         &self,
         scope: ArtifactScope<'_>,
         kind: ArtifactKind,
         source_path: &Path,
     ) -> anyhow::Result<Option<ArtifactMetadata>> {
+        let Some(meta) = self.active_artifact_by_source_locked(&scope, kind, source_path)? else {
+            return Ok(None);
+        };
+        self.mark_removed_metadata_locked(scope, meta)
+    }
+
+    fn active_artifact_by_source_locked(
+        &self,
+        scope: &ArtifactScope<'_>,
+        kind: ArtifactKind,
+        source_path: &Path,
+    ) -> anyhow::Result<Option<ArtifactMetadata>> {
         let source_str = source_path.to_string_lossy();
-        let kind_dir = self.scoped_root(&scope).join(kind.as_str());
+        let kind_dir = self.scoped_root(scope).join(kind.as_str());
         match fs::symlink_metadata(&kind_dir) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
             Ok(_) => bail!("artifact kind directory is not a safe directory"),
@@ -2296,22 +2339,29 @@ impl ArtifactCatalog {
                 continue;
             }
             let raw = fs::read_to_string(path)?;
-            let mut meta: ArtifactMetadata = serde_json::from_str(&raw)?;
+            let meta: ArtifactMetadata = serde_json::from_str(&raw)?;
             if !meta.active || meta.source != source_str {
                 continue;
-            }
-            meta.active = false;
-            meta.superseded_by = Some("file_removed".to_string());
-            self.save_metadata_scoped(&scope, &meta)?;
-            // Also update version snapshot metadata.
-            let version_meta_path =
-                self.version_metadata_path_scoped(&scope, kind, &meta.name, &meta.version)?;
-            if version_meta_path.exists() {
-                atomic_write_json(&version_meta_path, &meta)?;
             }
             return Ok(Some(meta));
         }
         Ok(None)
+    }
+
+    fn mark_removed_metadata_locked(
+        &self,
+        scope: ArtifactScope<'_>,
+        mut meta: ArtifactMetadata,
+    ) -> anyhow::Result<Option<ArtifactMetadata>> {
+        meta.active = false;
+        meta.superseded_by = Some("file_removed".to_string());
+        self.save_metadata_scoped(&scope, &meta)?;
+        let version_meta_path =
+            self.version_metadata_path_scoped(&scope, meta.kind, &meta.name, &meta.version)?;
+        if version_meta_path.exists() {
+            atomic_write_json(&version_meta_path, &meta)?;
+        }
+        Ok(Some(meta))
     }
 }
 

@@ -1100,12 +1100,7 @@ pub fn write_dirty_overlay(
     let all_empty = files.iter().all(|(_, edges)| edges.is_empty());
     if all_empty {
         if overlay_dir.is_dir() {
-            for entry in fs::read_dir(&overlay_dir)? {
-                let entry = entry?;
-                if entry.path().extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                    fs::remove_file(entry.path())?;
-                }
-            }
+            fs::remove_dir_all(&overlay_dir)?;
         }
         return Ok(());
     }
@@ -1310,6 +1305,20 @@ pub fn switch_to_dirty_overlay(
         ("symbols.jsonl", &symbol_edges),
         ("git-current.jsonl", &git_current_edges),
     ];
+    if overlay_files.iter().all(|(_, edges)| edges.is_empty()) {
+        update_manifest_for_snapshot(
+            edges_dir,
+            project_id,
+            repo_id,
+            branch,
+            Some(head_sha),
+            false,
+            None,
+            &snap_id,
+            None,
+        )?;
+        return Ok(());
+    }
     write_dirty_overlay(edges_dir, project_id, &overlay_files)?;
 
     update_manifest_for_snapshot(
@@ -1374,6 +1383,9 @@ fn update_manifest_for_snapshot(
         },
     );
     idx.write_atomic(edges_dir)?;
+    if !dirty && dirty_overlay_rel.is_none() {
+        clear_dirty_overlay(edges_dir, project_id)?;
+    }
 
     Ok(())
 }
@@ -2272,13 +2284,83 @@ mod tests {
 
         write_dirty_overlay(edges_dir, "p1", &[]).unwrap();
         let overlay = dirty_overlay_dir(edges_dir, "p1");
-        if overlay.is_dir() {
-            let has_jsonl = fs::read_dir(&overlay)
+        assert!(
+            !overlay.exists(),
+            "empty overlay write must remove the complete overlay directory"
+        );
+    }
+
+    #[test]
+    fn fresh_empty_dirty_publication_keeps_clean_selector() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+
+        switch_to_dirty_overlay(
+            &edges_dir,
+            "p1",
+            "repo1",
+            Some("main"),
+            &"a".repeat(40),
+            "dirty-empty",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let index = ManifestIndex::load(&edges_dir).unwrap();
+        let entry = index.workspaces.get("p1").unwrap();
+        assert!(entry.dirty_overlay.is_none());
+        assert!(!dirty_overlay_dir(&edges_dir, "p1").exists());
+        index.active_paths_for_loader(&edges_dir).unwrap();
+    }
+
+    #[test]
+    fn nonempty_to_empty_dirty_publication_clears_selector_and_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let dirty_edges = vec![derived_edge("dirty", "DESCRIBES", "target")];
+
+        switch_to_dirty_overlay(
+            &edges_dir,
+            "p1",
+            "repo1",
+            Some("main"),
+            &"a".repeat(40),
+            "dirty-1",
+            dirty_edges,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(dirty_overlay_dir(&edges_dir, "p1").is_dir());
+        assert!(
+            ManifestIndex::load(&edges_dir)
                 .unwrap()
-                .filter_map(Result::ok)
-                .any(|e| e.path().extension().and_then(|e| e.to_str()) == Some("jsonl"));
-            assert!(!has_jsonl, "empty overlay write must remove jsonl files");
-        }
+                .workspaces
+                .get("p1")
+                .unwrap()
+                .dirty_overlay
+                .is_some()
+        );
+
+        switch_to_dirty_overlay(
+            &edges_dir,
+            "p1",
+            "repo1",
+            Some("main"),
+            &"a".repeat(40),
+            "dirty-2",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let index = ManifestIndex::load(&edges_dir).unwrap();
+        assert!(index.workspaces.get("p1").unwrap().dirty_overlay.is_none());
+        assert!(!dirty_overlay_dir(&edges_dir, "p1").exists());
+        index.active_paths_for_loader(&edges_dir).unwrap();
     }
 
     #[test]
