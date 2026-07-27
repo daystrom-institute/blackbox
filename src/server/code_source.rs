@@ -9834,4 +9834,25 @@ mod tests {
             "manifest read must check size before allocation (R2F3)"
         );
     }
+
+    /// R2F2 regression: activate_pending_local_snapshots must check for an
+    /// existing collected: entry and skip overwriting it with local:.
+    /// Without this guard the background reindex overwrites the collected
+    /// selector that reconstruction placed, breaking the restart chain.
+    #[test]
+    fn r2f2_reindex_preserves_collected_entry() {
+        let snapshot_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/bbox-edge-sidecar/src/snapshot.rs");
+        let src = std::fs::read_to_string(&snapshot_path)
+            .unwrap_or_else(|_| panic!("failed to read {}", snapshot_path.display()));
+        let body = extract_fn_body_again(&src, "activate_pending_local_snapshots");
+        assert!(
+            body.contains("starts_with(\"collected:\")"),
+            "activate_pending_local_snapshots must check for existing collected: selector"
+        );
+        assert!(
+            body.contains("continue"),
+            "activate_pending_local_snapshots must skip (continue) collected entries"
+        );
+    }
 }

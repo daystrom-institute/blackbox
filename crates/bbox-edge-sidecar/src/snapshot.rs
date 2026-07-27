@@ -559,6 +559,22 @@ pub fn activate_pending_local_snapshots(
 
         let mut index = ManifestIndex::load_or_new(edges_dir)?;
         for activation in activations {
+            // Preserve an existing collected: entry: a project whose
+            // effective source is collected must not be overwritten by a
+            // local reindex pass. The reindex scans local checkouts and
+            // stages local snapshots, but the manifest entry reflects the
+            // activation record's authoritative selector. Overwriting a
+            // collected entry with local breaks the relationship chain on
+            // restart.
+            if let Some(existing) = index.workspaces.get(&activation.project_id) {
+                if existing
+                    .code_source_selector
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("collected:"))
+                {
+                    continue;
+                }
+            }
             index.upsert_workspace(
                 &activation.project_id,
                 WorkspaceIndexEntry {
@@ -2160,6 +2176,104 @@ mod tests {
             load_pending_local_activation_journal(edges_dir)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// Regression: a background reindex that stages a local snapshot for a
+    /// project whose effective source is collected must NOT overwrite the
+    /// manifest index entry with a `local:` selector. If it does, the
+    /// restart chain validation (`validate_relationship_chain`) catches the
+    /// selector mismatch and refuses boot. The fix is in
+    /// `activate_pending_local_snapshots`: it preserves any existing
+    /// `collected:` entry rather than blindly upserting `local:`.
+    #[test]
+    fn reindex_preserves_collected_entry_against_local_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        let project_id = "neutral-collision-winner";
+        let generation = "gen-collected-1";
+        let collected_snap = collected_snapshot_id(project_id, generation);
+        let collected_sel = format!("collected:{project_id}:{generation}");
+
+        // Step 1: simulate a collected activation (as reconstruction would
+        // produce during pre-bind recovery). This writes a collected entry
+        // into the manifest index.
+        write_snapshot_files(
+            edges_dir,
+            project_id,
+            &collected_snap,
+            &[("project.jsonl", &[])],
+        )
+        .unwrap();
+
+        let mut index = ManifestIndex::new();
+        index.upsert_workspace(
+            project_id,
+            WorkspaceIndexEntry {
+                manifest: format!("workspace/{project_id}/manifest.json"),
+                active_snapshot: Some(active_snapshot_rel(project_id, &collected_snap)),
+                dirty_overlay: None,
+                repo_materialization: None,
+                code_source_selector: Some(collected_sel.clone()),
+                code_source_generation: Some(generation.to_string()),
+                git_overlay: None,
+                git_overlay_managed: false,
+            },
+        );
+        index.write_atomic(edges_dir).unwrap();
+
+        // Step 2: simulate the background reindex staging a local snapshot
+        // for the same project and calling activate_pending_local_snapshots.
+        let local_snap = clean_snapshot_id("repo-1", project_id, "aaaa");
+        let activation = stage_local_snapshot_activation(
+            edges_dir,
+            project_id,
+            "repo-1",
+            Some("main"),
+            "aaaa",
+            false,
+            None,
+            &local_snap,
+            &[derived_edge("k_local", "DESCRIBES", "k_target")],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        activate_pending_local_snapshots(edges_dir, &[activation]).unwrap();
+
+        // Step 3: assert the manifest entry still carries the collected
+        // selector (not overwritten with local:).
+        let manifest = ManifestIndex::load(edges_dir).unwrap();
+        let entry = manifest
+            .workspaces
+            .get(project_id)
+            .expect("project entry must exist after reindex");
+        assert_eq!(
+            entry.code_source_selector.as_deref(),
+            Some(collected_sel.as_str()),
+            "collected entry must survive a local reindex pass"
+        );
+        assert_eq!(
+            entry.code_source_generation.as_deref(),
+            Some(generation),
+            "collected generation must survive a local reindex pass"
+        );
+
+        // Step 4: simulate restart - load the manifest fresh and verify the
+        // entry is still collected (chain validation would pass).
+        let reloaded = ManifestIndex::load(edges_dir).unwrap();
+        let entry_after = reloaded
+            .workspaces
+            .get(project_id)
+            .expect("project entry must exist after reload");
+        assert!(
+            entry_after
+                .code_source_selector
+                .as_deref()
+                .is_some_and(|s| s.starts_with("collected:")),
+            "persisted entry must carry collected selector across restart"
         );
     }
 }
