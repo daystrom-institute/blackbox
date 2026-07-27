@@ -823,6 +823,7 @@ fn retire_refuses_on_a_producer_assignment() {
         "2026-07-27T00:00:00Z",
     );
     prepared.evidence.catalog_scope = Some(PublishedScope::try_new("producerfamily", ".").unwrap());
+    prepared.seal_retirement_evidence();
     bbox_indexing::project_catalog_admin::save_retirement_journal(&bro_home, &prepared).unwrap();
 
     let resume_refused = run_with_isolated_index(

@@ -2207,13 +2207,17 @@ pub struct ProjectRetirementJournal {
     /// sweep so they do not depend on the catalog row being present.
     #[serde(default)]
     pub evidence: RetirementJournalEvidence,
+
+    /// Commitment to the exact Prepared evidence, including decoded blob
+    /// identities. It never changes as stages advance.
+    pub prepared_evidence_sha256: Option<String>,
 }
 
 impl ProjectRetirementJournal {
     pub const VERSION: u32 = 2;
 
     pub fn new(project_id: ProjectId, catalog_epoch: u64, now: &str) -> Self {
-        Self {
+        let mut journal = Self {
             version: Self::VERSION,
             project_id: project_id.clone(),
             started_at: now.to_string(),
@@ -2228,7 +2232,14 @@ impl ProjectRetirementJournal {
                 owned_uploads: Some(Vec::new()),
                 ..RetirementJournalEvidence::default()
             },
-        }
+            prepared_evidence_sha256: None,
+        };
+        journal.seal_retirement_evidence();
+        journal
+    }
+
+    pub fn seal_retirement_evidence(&mut self) {
+        self.prepared_evidence_sha256 = Some(retirement_evidence_sha256(&self.evidence));
     }
 
     /// Advance to the next stage, recording the step. Panics if already
@@ -2484,8 +2495,8 @@ fn load_retirement_journal_from_path(
     // before current_stage. This prevents stage forgery where an
     // attacker edits current_stage to skip work.
     validate_journal_stage_history(&journal)?;
-    validate_journal_evidence_shape(&journal)?;
     journal.evidence.owned_blob_hashes = load_retirement_blob_inventory(&path, &journal)?;
+    validate_journal_evidence_shape(&journal)?;
     Ok(Some(journal))
 }
 
@@ -2573,7 +2584,33 @@ fn validate_journal_evidence_shape(
             ));
         }
     }
+    let expected_hash = journal.prepared_evidence_sha256.as_ref().ok_or_else(|| {
+        RetirementJournalError::other(
+            "retirement journal is missing its Prepared evidence commitment",
+        )
+    })?;
+    if !validate_sha256_text(expected_hash)
+        || retirement_evidence_sha256(&journal.evidence) != *expected_hash
+    {
+        return Err(RetirementJournalError::other(
+            "retirement journal Prepared evidence commitment does not match",
+        ));
+    }
     Ok(())
+}
+
+fn retirement_evidence_sha256(evidence: &RetirementJournalEvidence) -> String {
+    let bytes = serde_json::to_vec(&(
+        &evidence.owner_project_id,
+        &evidence.catalog_scope,
+        &evidence.project_selectors,
+        &evidence.owned_generations,
+        &evidence.desired_pointers,
+        &evidence.owned_uploads,
+        &evidence.owned_blob_hashes,
+    ))
+    .expect("retirement evidence serialization is infallible");
+    bbox_corpus_core::project_catalog_snapshot::sha256_hex(&bytes)
 }
 
 fn load_retirement_blob_inventory(
@@ -2582,7 +2619,39 @@ fn load_retirement_blob_inventory(
 ) -> Result<Vec<String>, RetirementJournalError> {
     const MAX_BLOB_INVENTORY_BYTES: usize = 64 * 1024 * 1024;
     let path = retirement_blob_inventory_path(journal_path);
-    let bytes = std::fs::read(&path)?;
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(RetirementJournalError::other(
+            "retirement blob evidence is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_BLOB_INVENTORY_BYTES as u64 {
+        return Err(RetirementJournalError::other(
+            "retirement blob evidence exceeds its byte limit",
+        ));
+    }
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|error| {
+                if error.raw_os_error() == Some(libc::ELOOP) {
+                    RetirementJournalError::other(
+                        "retirement blob evidence is a symlink; refusing to follow",
+                    )
+                } else {
+                    RetirementJournalError::from(error)
+                }
+            })?
+    };
+    #[cfg(not(unix))]
+    let mut file = std::fs::File::open(&path)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let mut bounded = std::io::Read::take(&mut file, MAX_BLOB_INVENTORY_BYTES as u64 + 1);
+    std::io::Read::read_to_end(&mut bounded, &mut bytes)?;
     if bytes.len() > MAX_BLOB_INVENTORY_BYTES {
         return Err(RetirementJournalError::other(
             "retirement blob evidence exceeds its byte limit",
@@ -2895,6 +2964,7 @@ pub trait RetirementDischargeWorkers {
         _store: &ProjectCatalogStore,
         project_id: &ProjectId,
         evidence: &RetirementJournalEvidence,
+        _stage: RetirementJournalStage,
     ) -> AdminResult<()> {
         if evidence.owner_project_id.as_ref() != Some(project_id) {
             return Err(admin_error(
@@ -3188,6 +3258,7 @@ pub fn retire_project_journaled_with(
             let mut j =
                 ProjectRetirementJournal::new(project_id.clone(), catalog_epoch, &journal_now());
             j.evidence = workers.capture_retirement_evidence(project_id)?;
+            j.seal_retirement_evidence();
             save_retirement_journal(bro_home, &j).map_err(|e| {
                 admin_error("error.project_catalog_retire_journal_io", e.to_string())
             })?;
@@ -3199,6 +3270,12 @@ pub fn retire_project_journaled_with(
 
     // Producer grants are configuration authority, so every resume checks
     // them again before any destructive stage can run.
+    workers.validate_retirement_evidence(
+        store,
+        project_id,
+        &journal.evidence,
+        journal.current_stage,
+    )?;
     workers.verify_source_authority_quiesced(store, project_id, &journal.evidence)?;
 
     // Stage: SourceAuthorityQuiesced (step 2). The worker must verify
@@ -3222,7 +3299,12 @@ pub fn retire_project_journaled_with(
         .current_stage
         .is_at_least(RetirementJournalStage::CollectedGenerationsDischarged)
     {
-        workers.validate_retirement_evidence(store, project_id, &journal.evidence)?;
+        workers.validate_retirement_evidence(
+            store,
+            project_id,
+            &journal.evidence,
+            journal.current_stage,
+        )?;
         workers.discharge_collected_generations(project_id, &journal.evidence)?;
         journal.advance(&now());
         save_retirement_journal(bro_home, &journal)
@@ -3268,6 +3350,12 @@ pub fn retire_project_journaled_with(
         .current_stage
         .is_at_least(RetirementJournalStage::CatalogPairRemoved)
     {
+        workers.validate_retirement_evidence(
+            store,
+            project_id,
+            &journal.evidence,
+            journal.current_stage,
+        )?;
         let current_state = store.snapshot()?;
         if current_state.catalog().projects.contains_key(project_id) {
             let reprobed_evidence =
@@ -3306,6 +3394,12 @@ pub fn retire_project_journaled_with(
         .current_stage
         .is_at_least(RetirementJournalStage::MaterializationSwept)
     {
+        workers.validate_retirement_evidence(
+            store,
+            project_id,
+            &journal.evidence,
+            journal.current_stage,
+        )?;
         workers.sweep_materialization(project_id, &journal.evidence)?;
         journal.advance(&now());
         save_retirement_journal(bro_home, &journal)
@@ -4855,6 +4949,7 @@ mod tests {
         journal.evidence.owned_blob_hashes = (0_u64..250_000)
             .map(|index| format!("{index:064x}"))
             .collect();
+        journal.seal_retirement_evidence();
         save_retirement_journal(tmp.path(), &journal).unwrap();
         assert!(
             std::fs::metadata(retirement_journal_path(tmp.path(), &pid))
@@ -4864,6 +4959,67 @@ mod tests {
         );
         let loaded = load_retirement_journal(tmp.path(), &pid).unwrap().unwrap();
         assert_eq!(loaded.evidence.owned_blob_hashes.len(), 250_000);
+    }
+
+    #[test]
+    fn retirement_journal_rejects_added_target_after_stage_advance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = ProjectId::parse(PROJECT).unwrap();
+        let mut journal = ProjectRetirementJournal::new(pid.clone(), 1, "1");
+        journal.advance("2");
+        journal.advance("3");
+        save_retirement_journal(tmp.path(), &journal).unwrap();
+        let path = retirement_journal_path(tmp.path(), &pid);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["evidence"]["owned_generations"] = serde_json::json!([{
+            "published_scope": {
+                "repo_id": "other-owner",
+                "bbox_root_relpath": "."
+            },
+            "generation_id": "a".repeat(64)
+        }]);
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(load_retirement_journal(tmp.path(), &pid).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retirement_blob_sidecar_refuses_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = ProjectId::parse(PROJECT).unwrap();
+        let journal = ProjectRetirementJournal::new(pid.clone(), 1, "1");
+        save_retirement_journal(tmp.path(), &journal).unwrap();
+        let journal_path = retirement_journal_path(tmp.path(), &pid);
+        let sidecar = retirement_blob_inventory_path(&journal_path);
+        let target = tmp.path().join("outside.json");
+        std::fs::write(&target, b"{}").unwrap();
+        std::fs::remove_file(&sidecar).unwrap();
+        symlink(&target, &sidecar).unwrap();
+
+        let error = load_retirement_journal(tmp.path(), &pid).unwrap_err();
+        assert!(error.to_string().contains("regular file"));
+    }
+
+    #[test]
+    fn retirement_blob_sidecar_refuses_oversized_file_before_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = ProjectId::parse(PROJECT).unwrap();
+        let journal = ProjectRetirementJournal::new(pid.clone(), 1, "1");
+        save_retirement_journal(tmp.path(), &journal).unwrap();
+        let journal_path = retirement_journal_path(tmp.path(), &pid);
+        let sidecar = retirement_blob_inventory_path(&journal_path);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&sidecar)
+            .unwrap()
+            .set_len(64 * 1024 * 1024 + 1)
+            .unwrap();
+
+        let error = load_retirement_journal(tmp.path(), &pid).unwrap_err();
+        assert!(error.to_string().contains("exceeds its byte limit"));
     }
 
     #[test]

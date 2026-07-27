@@ -1335,7 +1335,22 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
         _store: &ProjectCatalogStore,
         project_id: &ProjectId,
         evidence: &project_catalog_admin::RetirementJournalEvidence,
+        stage: project_catalog_admin::RetirementJournalStage,
     ) -> project_catalog_admin::AdminResult<()> {
+        if stage.is_at_least(project_catalog_admin::RetirementJournalStage::CatalogPairRemoved) {
+            if _store
+                .snapshot()?
+                .catalog()
+                .projects
+                .contains_key(project_id)
+            {
+                return Err(project_catalog_admin::admin_error(
+                    "error.project_catalog_retire_evidence_drift",
+                    "retirement journal claims the catalog pair was removed but the project remains",
+                ));
+            }
+            return validate_retirement_targets_absent(self.config, evidence);
+        }
         let current = capture_retirement_evidence(self.config, self.projects_path, project_id)?;
         let expected_generations = evidence
             .owned_generations
@@ -1385,18 +1400,106 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
+        let selectors_match = stage
+            .is_at_least(project_catalog_admin::RetirementJournalStage::AttachmentsDetached)
+            || current.project_selectors == evidence.project_selectors;
+        let before_generation_discharge = !stage.is_at_least(
+            project_catalog_admin::RetirementJournalStage::CollectedGenerationsDischarged,
+        );
         if evidence.owner_project_id.as_ref() != Some(project_id)
             || current.owner_project_id != evidence.owner_project_id
             || current.catalog_scope != evidence.catalog_scope
+            || !selectors_match
             || !current_generations.is_subset(&expected_generations)
             || !current_desired.is_subset(&expected_desired)
             || !current_uploads.is_subset(&expected_uploads)
-            || !current_blobs.is_subset(&expected_blobs)
+            || (before_generation_discharge
+                && (current_generations != expected_generations
+                    || current_desired != expected_desired
+                    || current_uploads != expected_uploads
+                    || current_blobs != expected_blobs))
         {
             return Err(project_catalog_admin::admin_error(
                 "error.project_catalog_retire_evidence_drift",
                 "retirement evidence no longer matches owner-validated store state",
             ));
+        }
+        if !before_generation_discharge {
+            let code_sources = self.config.paths.state_dir.join("code-sources");
+            let code_store = bbox_code_source_store::CodeSourceStore::open(
+                &code_sources,
+                bbox_indexing::project_catalog_migration::project_catalog_migration_store_limits(
+                    self.config,
+                ),
+            )
+            .map_err(|error| {
+                project_catalog_admin::admin_error(
+                    "error.project_catalog_retire_code_source_open",
+                    format!("failed to open code-source store for evidence validation: {error}"),
+                )
+            })?;
+            let all_generations = code_store
+                .retirement_generation_inventory()
+                .map_err(|error| {
+                    project_catalog_admin::admin_error(
+                        "error.project_catalog_retire_evidence_generations",
+                        format!("failed to validate generation evidence: {error}"),
+                    )
+                })?
+                .into_iter()
+                .map(
+                    |generation| project_catalog_admin::RetirementGenerationEvidence {
+                        published_scope: generation.published_scope,
+                        generation_id: generation.generation_id,
+                    },
+                )
+                .collect::<BTreeSet<_>>();
+            let all_desired = code_store
+                .retirement_desired_pointer_inventory()
+                .map_err(|error| {
+                    project_catalog_admin::admin_error(
+                        "error.project_catalog_retire_evidence_desired",
+                        format!("failed to validate desired-pointer evidence: {error}"),
+                    )
+                })?
+                .into_iter()
+                .map(
+                    |pointer| project_catalog_admin::RetirementGenerationEvidence {
+                        published_scope: pointer.published_scope,
+                        generation_id: pointer.generation_id,
+                    },
+                )
+                .collect::<BTreeSet<_>>();
+            let all_uploads = code_store
+                .retirement_upload_inventory()
+                .map_err(|error| {
+                    project_catalog_admin::admin_error(
+                        "error.project_catalog_retire_evidence_uploads",
+                        format!("failed to validate upload evidence: {error}"),
+                    )
+                })?
+                .into_iter()
+                .map(|upload| project_catalog_admin::RetirementUploadEvidence {
+                    producer_id: upload.producer_id,
+                    upload_id: upload.upload_id,
+                    published_scope: upload.published_scope,
+                })
+                .collect::<BTreeSet<_>>();
+            let still_present_but_not_owner_bound = expected_generations
+                .difference(&current_generations)
+                .any(|generation| all_generations.contains(generation))
+                || expected_desired
+                    .difference(&current_desired)
+                    .any(|pointer| all_desired.contains(pointer))
+                || expected_uploads
+                    .difference(&current_uploads)
+                    .any(|upload| all_uploads.contains(upload));
+            if still_present_but_not_owner_bound {
+                return Err(project_catalog_admin::admin_error(
+                    "error.project_catalog_retire_evidence_owner",
+                    "persisted retirement target is present but no longer owner-bound to the retiring project",
+                ));
+            }
         }
         Ok(())
     }
@@ -1775,6 +1878,79 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
         }
         Ok(())
     }
+}
+
+fn validate_retirement_targets_absent(
+    config: &config::Config,
+    evidence: &project_catalog_admin::RetirementJournalEvidence,
+) -> project_catalog_admin::AdminResult<()> {
+    let code_sources = config.paths.state_dir.join("code-sources");
+    let store = bbox_code_source_store::CodeSourceStore::open(
+        &code_sources,
+        bbox_indexing::project_catalog_migration::project_catalog_migration_store_limits(config),
+    )
+    .map_err(|error| {
+        project_catalog_admin::admin_error(
+            "error.project_catalog_retire_code_source_open",
+            format!("failed to open code-source store for evidence validation: {error}"),
+        )
+    })?;
+    let generations = store.retirement_generation_inventory().map_err(|error| {
+        project_catalog_admin::admin_error(
+            "error.project_catalog_retire_evidence_generations",
+            format!("failed to validate generation evidence: {error}"),
+        )
+    })?;
+    let desired = store
+        .retirement_desired_pointer_inventory()
+        .map_err(|error| {
+            project_catalog_admin::admin_error(
+                "error.project_catalog_retire_evidence_desired",
+                format!("failed to validate desired-pointer evidence: {error}"),
+            )
+        })?;
+    let uploads = store.retirement_upload_inventory().map_err(|error| {
+        project_catalog_admin::admin_error(
+            "error.project_catalog_retire_evidence_uploads",
+            format!("failed to validate upload evidence: {error}"),
+        )
+    })?;
+    let generation_present = evidence.owned_generations.iter().any(|expected| {
+        generations.iter().any(|actual| {
+            actual.published_scope == expected.published_scope
+                && actual.generation_id == expected.generation_id
+        })
+    });
+    let desired_present = evidence
+        .desired_pointers
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|expected| {
+            desired.iter().any(|actual| {
+                actual.published_scope == expected.published_scope
+                    && actual.generation_id == expected.generation_id
+            })
+        });
+    let upload_present = evidence
+        .owned_uploads
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|expected| {
+            uploads.iter().any(|actual| {
+                actual.producer_id == expected.producer_id
+                    && actual.upload_id == expected.upload_id
+                    && actual.published_scope == expected.published_scope
+            })
+        });
+    if generation_present || desired_present || upload_present {
+        return Err(project_catalog_admin::admin_error(
+            "error.project_catalog_retire_evidence_owner",
+            "persisted retirement target remains present after its discharge stage",
+        ));
+    }
+    Ok(())
 }
 
 /// Every external-reference class the offline retire probe covers (plan
