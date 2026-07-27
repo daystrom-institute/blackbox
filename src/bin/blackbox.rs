@@ -1423,6 +1423,20 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
+        let expected_edge_paths = evidence
+            .edge_paths
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let current_edge_paths = current
+            .edge_paths
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let selectors_match = stage
             .is_at_least(project_catalog_admin::RetirementJournalStage::AttachmentsDetached)
             || current.project_selectors == evidence.project_selectors;
@@ -1436,10 +1450,12 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             || !current_generations.is_subset(&expected_generations)
             || !current_desired.is_subset(&expected_desired)
             || !current_uploads.is_subset(&expected_uploads)
+            || !current_edge_paths.is_subset(&expected_edge_paths)
             || (before_generation_discharge
                 && (current_generations != expected_generations
                     || current_desired != expected_desired
                     || current_uploads != expected_uploads
+                    || current_edge_paths != expected_edge_paths
                     || current_blobs != expected_blobs))
         {
             return Err(project_catalog_admin::admin_error(
@@ -1682,9 +1698,19 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             &selectors,
         )
         .map_err(|error| discharge_error("packet_rows", error))?;
-        bbox_edge_sidecar::manifest::ManifestIndex::discharge_project_workspace(
+        let edge_inventory = bbox_edge_sidecar::migration_inventory::EdgeRetirementInventory {
+            version: 1,
+            project_id: project_id.as_str().to_string(),
+            relative_paths: evidence.edge_paths.clone().ok_or_else(|| {
+                project_catalog_admin::admin_error(
+                    "error.project_catalog_retire_edge_evidence",
+                    "retirement evidence is missing its exact edge inventory",
+                )
+            })?,
+        };
+        bbox_edge_sidecar::migration_inventory::discharge_project_retirement_inventory(
             &self.config.paths.state_dir.join("edges"),
-            project_id.as_str(),
+            &edge_inventory,
         )
         .map_err(|error| discharge_error("edge_sidecar_rows", error))?;
         bbox_corpus_index::index::migration_inventory::discharge_project_rows(
@@ -1981,7 +2007,31 @@ fn validate_retirement_targets_absent(
                     && actual.published_scope == expected.published_scope
             })
         });
-    if generation_present || desired_present || upload_present {
+    let edge_present =
+        bbox_edge_sidecar::migration_inventory::capture_project_retirement_inventory(
+            &config.paths.state_dir.join("edges"),
+            evidence
+                .owner_project_id
+                .as_ref()
+                .map(ProjectId::as_str)
+                .unwrap_or_default(),
+        )
+        .map_err(|error| {
+            project_catalog_admin::admin_error(
+                "error.project_catalog_retire_edge_evidence",
+                format!("failed to validate edge retirement evidence: {error}"),
+            )
+        })?
+        .relative_paths
+        .iter()
+        .any(|path| {
+            evidence
+                .edge_paths
+                .as_deref()
+                .unwrap_or_default()
+                .contains(path)
+        });
+    if generation_present || desired_present || upload_present || edge_present {
         return Err(project_catalog_admin::admin_error(
             "error.project_catalog_retire_evidence_owner",
             "persisted retirement target remains present after its discharge stage",
@@ -2467,6 +2517,18 @@ fn capture_retirement_evidence(
         });
     }
 
+    let edge_inventory =
+        bbox_edge_sidecar::migration_inventory::capture_project_retirement_inventory(
+            &config.paths.state_dir.join("edges"),
+            project_id.as_str(),
+        )
+        .map_err(|error| {
+            project_catalog_admin::admin_error(
+                "error.project_catalog_retire_edge_evidence",
+                format!("failed to capture exact edge retirement inventory: {error}"),
+            )
+        })?;
+
     Ok(project_catalog_admin::RetirementJournalEvidence {
         owner_project_id: Some(project_id.clone()),
         catalog_scope: current_scope.cloned(),
@@ -2474,6 +2536,7 @@ fn capture_retirement_evidence(
         owned_generations,
         desired_pointers: Some(desired_pointers),
         owned_uploads: Some(owned_uploads),
+        edge_paths: Some(edge_inventory.relative_paths),
         blob_inventory: None,
         owned_blob_hashes: owned_blob_hashes.into_iter().collect(),
     })
@@ -2599,15 +2662,13 @@ fn probe_code_source_generations_store_owned(
 /// one JSONL file per project id, so presence and line count answer the class
 /// exactly.
 fn probe_edge_sidecar(edges_dir: &Path, project_id: &ProjectId) -> ClassProbe {
-    let bytes = match read_regular_nofollow(&edges_dir.join(format!("{project_id}.jsonl"))) {
-        Ok(None) => return ClassProbe::Counted(0),
-        Ok(Some(bytes)) => bytes,
-        Err(()) => return ClassProbe::Unprobeable,
-    };
-    let Ok(body) = String::from_utf8(bytes) else {
-        return ClassProbe::Unprobeable;
-    };
-    ClassProbe::Counted(body.lines().filter(|line| !line.trim().is_empty()).count() as u64)
+    match bbox_edge_sidecar::migration_inventory::capture_project_retirement_inventory(
+        edges_dir,
+        project_id.as_str(),
+    ) {
+        Ok(inventory) => ClassProbe::Counted(inventory.relative_paths.len() as u64),
+        Err(_) => ClassProbe::Unprobeable,
+    }
 }
 
 /// Rows naming the project in one Phase 1 owner snapshot. The capture

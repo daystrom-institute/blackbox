@@ -228,6 +228,8 @@ pub const GIT_CURRENT_MEMBER: &str = "git-current.jsonl";
 pub struct ManifestIndex {
     pub version: u32,
     pub workspaces: std::collections::BTreeMap<String, WorkspaceIndexEntry>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub retirement_tombstones: std::collections::BTreeMap<String, WorkspaceIndexEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
 }
@@ -237,6 +239,7 @@ impl ManifestIndex {
         Self {
             version: MANIFEST_VERSION,
             workspaces: std::collections::BTreeMap::new(),
+            retirement_tombstones: std::collections::BTreeMap::new(),
             updated_at: None,
         }
     }
@@ -290,54 +293,11 @@ impl ManifestIndex {
         self.workspaces.insert(project_id.to_string(), entry);
     }
 
-    /// Remove one workspace from the manifest index and delete every
-    /// materialized directory named by that entry.
     pub fn discharge_project_workspace(edges_dir: &Path, project_id: &str) -> Result<bool> {
-        let path = manifest_index_path(edges_dir);
-        if !path.exists() {
-            return Ok(false);
-        }
-        let mut index = Self::load(edges_dir)?;
-        let Some(entry) = index.workspaces.remove(project_id) else {
-            return Ok(false);
-        };
-        let relative_dirs = [
-            entry.active_snapshot,
-            entry.dirty_overlay,
-            entry.repo_materialization,
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-        if relative_dirs.iter().any(|relative| {
-            Path::new(relative)
-                .components()
-                .any(|component| !matches!(component, std::path::Component::Normal(_)))
-        }) {
-            anyhow::bail!("edge workspace path is not a safe relative directory");
-        }
-        index.updated_at = Some(chrono_now_rfc3339());
-        index.write_atomic(edges_dir)?;
-        for relative in relative_dirs {
-            let path = materialized_dir(edges_dir).join(&relative);
-            match fs::remove_dir_all(&path) {
-                Ok(()) => fs::File::open(materialized_dir(edges_dir))?.sync_all()?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        let workspace = workspace_manifest_dir(edges_dir, project_id);
-        match fs::remove_dir_all(&workspace) {
-            Ok(()) => fs::File::open(
-                workspace
-                    .parent()
-                    .ok_or_else(|| anyhow::anyhow!("workspace has no parent"))?,
-            )?
-            .sync_all()?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        Ok(true)
+        let inventory = crate::migration_inventory::capture_project_retirement_inventory(
+            edges_dir, project_id,
+        )?;
+        crate::migration_inventory::discharge_project_retirement_inventory(edges_dir, &inventory)
     }
 
     pub fn active_materialized_paths(&self, edges_dir: &Path) -> Vec<PathBuf> {
@@ -672,7 +632,7 @@ pub fn try_load_manifest_index(edges_dir: &Path) -> Result<ManifestIndex, Manife
     }
 }
 
-fn chrono_now_rfc3339() -> String {
+pub(crate) fn chrono_now_rfc3339() -> String {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

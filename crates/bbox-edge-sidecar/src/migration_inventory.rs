@@ -5,12 +5,16 @@
 
 use std::fs;
 use std::io::Read;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::edge_sidecar::managed_derived_edges_dir;
 use crate::manifest::{
-    MANIFEST_VERSION, ManifestIndex, WorkspaceManifest, manifest_index_path, materialized_dir,
+    MANIFEST_VERSION, ManifestIndex, WorkspaceIndexEntry, WorkspaceManifest, chrono_now_rfc3339,
+    manifest_index_path, materialized_dir, workspace_manifest_dir,
 };
 use crate::snapshot::with_manifest_coordinator;
 
@@ -18,6 +22,229 @@ const SNAPSHOT_VERSION_V1: u32 = 1;
 const SCHEMA_HASH_DOMAIN: &[u8] = b"blackbox.edge-manifest.schema.v1\0";
 const ROW_HASH_DOMAIN: &[u8] = b"blackbox.edge-manifest.workspace-rows.v1\0";
 const SOURCE_HASH_DOMAIN: &[u8] = b"blackbox.edge-manifest.source.v1\0";
+const RETIREMENT_INVENTORY_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeRetirementInventory {
+    pub version: u32,
+    pub project_id: String,
+    pub relative_paths: Vec<String>,
+}
+
+pub fn capture_project_retirement_inventory(
+    edges_dir: &Path,
+    project_id: &str,
+) -> Result<EdgeRetirementInventory> {
+    if project_id.is_empty()
+        || Path::new(project_id)
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        anyhow::bail!("edge retirement project id is invalid");
+    }
+    match fs::symlink_metadata(edges_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(EdgeRetirementInventory {
+                version: RETIREMENT_INVENTORY_VERSION,
+                project_id: project_id.to_string(),
+                relative_paths: Vec::new(),
+            });
+        }
+        Err(error) => return Err(error.into()),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            anyhow::bail!("edge retirement root is not a strict directory");
+        }
+        Ok(_) => {}
+    }
+
+    let mut paths = std::collections::BTreeSet::new();
+    for relative in [
+        PathBuf::from(format!("{project_id}.jsonl")),
+        PathBuf::from("explicit").join(format!("{project_id}.jsonl")),
+        PathBuf::from("observed").join(format!("{project_id}.jsonl")),
+    ] {
+        insert_existing_retirement_path(edges_dir, relative, &mut paths)?;
+    }
+    let derived = managed_derived_edges_dir(edges_dir);
+    if derived.exists() {
+        for namespace in fs::read_dir(&derived)? {
+            let namespace = namespace?;
+            if namespace.file_type()?.is_symlink() || !namespace.file_type()?.is_dir() {
+                anyhow::bail!("edge derived lane contains a non-directory namespace");
+            }
+            insert_existing_retirement_path(
+                edges_dir,
+                PathBuf::from("derived")
+                    .join(namespace.file_name())
+                    .join(format!("{project_id}.jsonl")),
+                &mut paths,
+            )?;
+        }
+    }
+
+    let index_path = manifest_index_path(edges_dir);
+    if index_path.exists() {
+        let index = ManifestIndex::load(edges_dir)?;
+        let active = index.workspaces.get(project_id);
+        let tombstone = index.retirement_tombstones.get(project_id);
+        if active.is_some() && tombstone.is_some() {
+            anyhow::bail!("edge workspace has both an active entry and a retirement tombstone");
+        }
+        if let Some(entry) = active.or(tombstone) {
+            for relative in workspace_entry_paths(edges_dir, project_id, entry)? {
+                insert_existing_retirement_path(edges_dir, relative, &mut paths)?;
+            }
+        }
+    }
+
+    Ok(EdgeRetirementInventory {
+        version: RETIREMENT_INVENTORY_VERSION,
+        project_id: project_id.to_string(),
+        relative_paths: paths.into_iter().collect(),
+    })
+}
+
+pub fn discharge_project_retirement_inventory(
+    edges_dir: &Path,
+    inventory: &EdgeRetirementInventory,
+) -> Result<bool> {
+    if inventory.version != RETIREMENT_INVENTORY_VERSION {
+        anyhow::bail!("unsupported edge retirement inventory version");
+    }
+    let expected = inventory
+        .relative_paths
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if expected.len() != inventory.relative_paths.len()
+        || expected
+            .iter()
+            .any(|path| !strict_relative_path(Path::new(path)))
+    {
+        anyhow::bail!("edge retirement inventory contains an invalid path");
+    }
+
+    let current = capture_project_retirement_inventory(edges_dir, &inventory.project_id)?;
+    if current
+        .relative_paths
+        .iter()
+        .any(|path| !expected.contains(path))
+    {
+        anyhow::bail!("edge retirement inventory drifted after Prepared");
+    }
+
+    let index_path = manifest_index_path(edges_dir);
+    let mut changed = false;
+    if index_path.exists() {
+        let mut index = ManifestIndex::load(edges_dir)?;
+        if let Some(entry) = index.workspaces.remove(&inventory.project_id) {
+            if index
+                .retirement_tombstones
+                .insert(inventory.project_id.clone(), entry)
+                .is_some()
+            {
+                anyhow::bail!("edge retirement tombstone already conflicts with active workspace");
+            }
+            index.updated_at = Some(chrono_now_rfc3339());
+            index.write_atomic(edges_dir)?;
+            changed = true;
+        }
+    }
+
+    for relative in &inventory.relative_paths {
+        changed |= durable_remove_path(&edges_dir.join(relative))?;
+    }
+
+    if index_path.exists() {
+        let mut index = ManifestIndex::load(edges_dir)?;
+        if index
+            .retirement_tombstones
+            .remove(&inventory.project_id)
+            .is_some()
+        {
+            index.updated_at = Some(chrono_now_rfc3339());
+            index.write_atomic(edges_dir)?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+fn insert_existing_retirement_path(
+    edges_dir: &Path,
+    relative: PathBuf,
+    paths: &mut std::collections::BTreeSet<String>,
+) -> Result<()> {
+    if !strict_relative_path(&relative) {
+        anyhow::bail!("edge retirement path is unsafe");
+    }
+    let absolute = edges_dir.join(&relative);
+    match fs::symlink_metadata(&absolute) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!("edge retirement path is symlinked");
+        }
+        Ok(_) => {}
+    }
+    paths.insert(
+        relative
+            .to_str()
+            .context("edge retirement path is not UTF-8")?
+            .to_string(),
+    );
+    Ok(())
+}
+
+fn workspace_entry_paths(
+    edges_dir: &Path,
+    project_id: &str,
+    entry: &WorkspaceIndexEntry,
+) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for relative in [
+        Some(entry.manifest.as_str()),
+        entry.active_snapshot.as_deref(),
+        entry.dirty_overlay.as_deref(),
+        entry.repo_materialization.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let relative = Path::new(relative);
+        if !strict_relative_path(relative) {
+            anyhow::bail!("edge workspace path is not a safe relative path");
+        }
+        paths.push(PathBuf::from("materialized").join(relative));
+    }
+    let workspace = workspace_manifest_dir(edges_dir, project_id);
+    paths.push(
+        workspace
+            .strip_prefix(edges_dir)
+            .context("edge workspace escaped the edge root")?
+            .to_path_buf(),
+    );
+    Ok(paths)
+}
+
+fn durable_remove_path(path: &Path) -> Result<bool> {
+    let parent = path
+        .parent()
+        .context("edge retirement path has no parent")?;
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!("edge retirement target is symlinked");
+        }
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path)?,
+        Ok(metadata) if metadata.is_file() => fs::remove_file(path)?,
+        Ok(_) => anyhow::bail!("edge retirement target is not a regular file or directory"),
+    }
+    fs::File::open(parent)?.sync_all()?;
+    Ok(true)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EdgeMigrationSnapshotLimitsV1 {
@@ -506,6 +733,121 @@ mod tests {
             snapshot.workspaces[0].code_source_selector.as_deref(),
             Some("selector-a")
         );
+    }
+
+    #[test]
+    fn retirement_inventory_covers_legacy_modern_and_materialized_lanes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        for relative in [
+            "project-a.jsonl",
+            "explicit/project-a.jsonl",
+            "observed/project-a.jsonl",
+            "derived/code/project-a.jsonl",
+        ] {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"{}\n").unwrap();
+        }
+        for relative in [
+            "materialized/workspace/project-a",
+            "materialized/snapshots/snapshot-a",
+            "materialized/overlays/overlay-a",
+            "materialized/repos/repo-a",
+        ] {
+            fs::create_dir_all(root.join(relative)).unwrap();
+        }
+        fs::write(
+            root.join("materialized/workspace/project-a/manifest.json"),
+            b"{}",
+        )
+        .unwrap();
+        let mut index = ManifestIndex::new();
+        index.workspaces.insert(
+            "project-a".to_string(),
+            WorkspaceIndexEntry {
+                manifest: "workspace/project-a/manifest.json".to_string(),
+                active_snapshot: Some("snapshots/snapshot-a".to_string()),
+                dirty_overlay: Some("overlays/overlay-a".to_string()),
+                repo_materialization: Some("repos/repo-a".to_string()),
+                code_source_selector: None,
+                code_source_generation: None,
+                git_overlay: None,
+                git_overlay_managed: false,
+            },
+        );
+        index.write_atomic(&root).unwrap();
+
+        let inventory = capture_project_retirement_inventory(&root, "project-a").unwrap();
+        assert_eq!(inventory.relative_paths.len(), 9);
+        assert!(inventory.relative_paths.contains(&"project-a.jsonl".into()));
+        assert!(
+            inventory
+                .relative_paths
+                .contains(&"explicit/project-a.jsonl".into())
+        );
+        assert!(
+            inventory
+                .relative_paths
+                .contains(&"observed/project-a.jsonl".into())
+        );
+        assert!(
+            inventory
+                .relative_paths
+                .contains(&"derived/code/project-a.jsonl".into())
+        );
+        assert!(discharge_project_retirement_inventory(&root, &inventory).unwrap());
+        assert!(
+            capture_project_retirement_inventory(&root, "project-a")
+                .unwrap()
+                .relative_paths
+                .is_empty()
+        );
+        assert!(
+            !ManifestIndex::load(&root)
+                .unwrap()
+                .workspaces
+                .contains_key("project-a")
+        );
+    }
+
+    #[test]
+    fn retirement_tombstone_resumes_after_publication_crash() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("materialized/snapshots/snapshot-a")).unwrap();
+        let entry = WorkspaceIndexEntry {
+            manifest: "workspace/project-a/manifest.json".to_string(),
+            active_snapshot: Some("snapshots/snapshot-a".to_string()),
+            dirty_overlay: None,
+            repo_materialization: None,
+            code_source_selector: None,
+            code_source_generation: None,
+            git_overlay: None,
+            git_overlay_managed: false,
+        };
+        fs::create_dir_all(root.join("materialized/workspace/project-a")).unwrap();
+        fs::write(
+            root.join("materialized/workspace/project-a/manifest.json"),
+            b"{}",
+        )
+        .unwrap();
+        let mut index = ManifestIndex::new();
+        index
+            .retirement_tombstones
+            .insert("project-a".to_string(), entry);
+        index.write_atomic(&root).unwrap();
+
+        let inventory = capture_project_retirement_inventory(&root, "project-a").unwrap();
+        assert!(!inventory.relative_paths.is_empty());
+        assert!(discharge_project_retirement_inventory(&root, &inventory).unwrap());
+        assert!(
+            !ManifestIndex::load(&root)
+                .unwrap()
+                .retirement_tombstones
+                .contains_key("project-a")
+        );
+        assert!(!discharge_project_retirement_inventory(&root, &inventory).unwrap());
     }
 
     #[test]

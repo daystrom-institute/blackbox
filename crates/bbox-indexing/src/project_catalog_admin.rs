@@ -2230,6 +2230,7 @@ impl ProjectRetirementJournal {
                 project_selectors: Some(vec![project_id.as_str().to_string()]),
                 desired_pointers: Some(Vec::new()),
                 owned_uploads: Some(Vec::new()),
+                edge_paths: Some(Vec::new()),
                 ..RetirementJournalEvidence::default()
             },
             prepared_evidence_sha256: None,
@@ -2302,6 +2303,10 @@ pub struct RetirementJournalEvidence {
     /// Exact in-progress uploads owned by the retiring project's current
     /// published scope. `None` is rejected as incomplete v2 evidence.
     pub owned_uploads: Option<Vec<RetirementUploadEvidence>>,
+
+    /// Exact project-owned edge lanes and materialized paths captured at
+    /// Prepared. Paths are relative to the configured edge root.
+    pub edge_paths: Option<Vec<String>>,
 
     /// Hash-linked blob inventory persisted in a bounded sidecar.
     pub blob_inventory: Option<RetirementBlobInventoryRef>,
@@ -2584,6 +2589,24 @@ fn validate_journal_evidence_shape(
             ));
         }
     }
+    let edge_paths = journal.evidence.edge_paths.as_ref().ok_or_else(|| {
+        RetirementJournalError::other("retirement journal is missing its edge-path evidence")
+    })?;
+    let mut unique_edge_paths = std::collections::BTreeSet::new();
+    for path in edge_paths {
+        let relative = std::path::Path::new(path);
+        if relative.as_os_str().is_empty()
+            || relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            || !unique_edge_paths.insert(path)
+        {
+            return Err(RetirementJournalError::other(
+                "retirement journal edge-path evidence is invalid or duplicated",
+            ));
+        }
+    }
     let expected_hash = journal.prepared_evidence_sha256.as_ref().ok_or_else(|| {
         RetirementJournalError::other(
             "retirement journal is missing its Prepared evidence commitment",
@@ -2607,6 +2630,7 @@ fn retirement_evidence_sha256(evidence: &RetirementJournalEvidence) -> String {
         &evidence.owned_generations,
         &evidence.desired_pointers,
         &evidence.owned_uploads,
+        &evidence.edge_paths,
         &evidence.owned_blob_hashes,
     ))
     .expect("retirement evidence serialization is infallible");
@@ -2955,6 +2979,7 @@ pub trait RetirementDischargeWorkers {
             project_selectors: Some(vec![project_id.as_str().to_string()]),
             desired_pointers: Some(Vec::new()),
             owned_uploads: Some(Vec::new()),
+            edge_paths: Some(Vec::new()),
             ..RetirementJournalEvidence::default()
         })
     }
@@ -3075,6 +3100,7 @@ impl RetirementDischargeWorkers for NoopDischargeWorkers {
             project_selectors: Some(vec![project_id.as_str().to_string()]),
             desired_pointers: Some(Vec::new()),
             owned_uploads: Some(Vec::new()),
+            edge_paths: Some(Vec::new()),
             ..RetirementJournalEvidence::default()
         })
     }
