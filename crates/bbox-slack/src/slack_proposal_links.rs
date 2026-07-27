@@ -104,7 +104,7 @@ pub fn capture_project_catalog_owner_snapshot(
     bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotError,
 > {
     use bbox_corpus_core::project_catalog_snapshot::{
-        LegacyProjectSelectorKindV1, OwnerSnapshotRowV1, capture_json_owner,
+        LegacyProjectSelectorKindV1, OwnerSnapshotRowV1, capture_json_owner, sha256_hex,
     };
 
     capture_json_owner(
@@ -117,15 +117,32 @@ pub fn capture_project_catalog_owner_snapshot(
             Ok(store
                 .links
                 .into_values()
-                .filter_map(|link| {
+                .flat_map(|link| {
+                    let mut rows = Vec::new();
+                    if let Some(project_id) = link
+                        .project_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|project_id| !project_id.is_empty())
+                    {
+                        rows.push(OwnerSnapshotRowV1::inventory_target(
+                            format!(
+                                "{}:{}:{}:target",
+                                link.team_id, link.channel_id, link.msg_ts
+                            ),
+                            project_id,
+                            sha256_hex(bytes),
+                        ));
+                    }
                     let selector = link.project_dir.trim().to_string();
-                    (!selector.is_empty()).then(|| {
-                        OwnerSnapshotRowV1::legacy_selector(
+                    if !selector.is_empty() {
+                        rows.push(OwnerSnapshotRowV1::legacy_selector(
                             format!("{}:{}:{}", link.team_id, link.channel_id, link.msg_ts),
                             LegacyProjectSelectorKindV1::Project,
                             selector,
-                        )
-                    })
+                        ));
+                    }
+                    rows
                 })
                 .collect())
         },
@@ -300,6 +317,40 @@ impl SlackProposalLinks {
         Ok(updated)
     }
 
+    /// Delete every proposal link owned by the project id or one of its
+    /// recorded legacy directory selectors. Persists once and is idempotent.
+    pub fn discharge_project_refs(&self, project_id: &str, selectors: &[String]) -> Result<usize> {
+        let removed = {
+            let mut data = self.inner.write();
+            let keys = data
+                .links
+                .iter()
+                .filter(|(_, link)| {
+                    link.project_id.as_deref() == Some(project_id)
+                        || selectors
+                            .iter()
+                            .any(|selector| selector == &link.project_dir)
+                })
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            for key in &keys {
+                if let Some(link) = data.links.remove(key) {
+                    data.by_proposal.remove(&compose_proposal_key(
+                        &link.team_id,
+                        &link.channel_id,
+                        &link.proposal_id,
+                    ));
+                }
+            }
+            data.order.retain(|key| !keys.contains(key));
+            keys.len()
+        };
+        if removed > 0 {
+            self.save()?;
+        }
+        Ok(removed)
+    }
+
     fn save(&self) -> Result<()> {
         // Hold save_lock for the full read-snapshot → write-tmp →
         // rename sequence. This blocks concurrent saves and ensures
@@ -318,6 +369,9 @@ impl SlackProposalLinks {
         file.sync_all()?;
         drop(file);
         fs::rename(&tmp, &self.path)?;
+        if let Some(parent) = self.path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
         Ok(())
     }
 }
@@ -633,5 +687,38 @@ mod tests {
         let found = reopened.lookup_by_msg("T01", "C01", "ts-legacy").unwrap();
         assert_eq!(found.project_id, None);
         assert_eq!(found.project_dir, "/repo/old");
+    }
+
+    #[test]
+    fn retirement_discharge_removes_owned_links_and_reverse_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SlackProposalLinks::open(dir.path()).unwrap();
+        let mut owned = sample("ts-owned", "proposal-owned", None);
+        owned.project_dir = "/repo/a".into();
+        owned.project_id = Some("project-a".into());
+        let mut other = sample("ts-other", "proposal-other", None);
+        other.project_dir = "/repo/b".into();
+        other.project_id = Some("project-b".into());
+        store.record(owned).unwrap();
+        store.record(other).unwrap();
+
+        assert_eq!(
+            store
+                .discharge_project_refs("project-a", &["/repo/a".into()])
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .discharge_project_refs("project-a", &["/repo/a".into()])
+                .unwrap(),
+            0
+        );
+        assert!(
+            store
+                .lookup_by_proposal("T01", "C01", "proposal-owned")
+                .is_none()
+        );
+        assert!(store.lookup_by_msg("T01", "C01", "ts-other").is_some());
     }
 }

@@ -307,18 +307,30 @@ pub fn capture_project_catalog_owner_snapshot(
                 );
             }
         };
-        let subsource_rows = packet
+        let mut subsource_rows = Vec::new();
+        if let Some(project_id) = packet
+            .project_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|project_id| !project_id.is_empty())
+        {
+            subsource_rows.push(OwnerSnapshotRowV1::inventory_target(
+                format!("{}:target", packet.id),
+                project_id,
+                sha256_hex(&bytes),
+            ));
+        }
+        if let Some(project) = packet
             .project
             .map(|project| project.trim().to_string())
             .filter(|project| !project.is_empty())
-            .map(|project| {
-                vec![OwnerSnapshotRowV1::legacy_selector(
-                    packet.id,
-                    LegacyProjectSelectorKindV1::Project,
-                    project,
-                )]
-            })
-            .unwrap_or_default();
+        {
+            subsource_rows.push(OwnerSnapshotRowV1::legacy_selector(
+                packet.id,
+                LegacyProjectSelectorKindV1::Project,
+                project,
+            ));
+        }
         subsources.push(owner_subsource(
             subsource_id,
             captured.state,
@@ -327,6 +339,62 @@ pub fn capture_project_catalog_owner_snapshot(
         rows.extend(subsource_rows);
     }
     finalize_owner_snapshot("packet", "packet:root", subsources, rows, limits)
+}
+
+/// Remove packet files owned by one project through the packet codec.
+/// Missing stores are empty and malformed files refuse retirement.
+pub fn discharge_project_catalog_rows(
+    packets_dir: &Path,
+    project_id: &str,
+    selectors: &[String],
+) -> Result<usize> {
+    let metadata = match fs::symlink_metadata(packets_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!("packet store root is not a safe directory");
+    }
+    let mut removals = Vec::new();
+    for scope in ["global", "project"] {
+        let directory = packets_dir.join(scope);
+        if !directory.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                anyhow::bail!("packet store contains a non-canonical entry");
+            }
+            if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".json.lock"))
+                {
+                    continue;
+                }
+                anyhow::bail!("packet store contains a non-canonical entry");
+            }
+            let packet: Packet = serde_json::from_slice(&fs::read(entry.path())?)?;
+            if packet.project_id.as_deref() == Some(project_id)
+                || packet
+                    .project
+                    .as_ref()
+                    .is_some_and(|project| selectors.iter().any(|selector| selector == project))
+            {
+                removals.push(entry.path());
+            }
+        }
+    }
+    for path in &removals {
+        fs::remove_file(path)?;
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+    }
+    Ok(removals.len())
 }
 
 impl Packets {
@@ -1283,5 +1351,50 @@ mod store_tests {
         // Unknown domain errors clearly.
         let err = store.load("domain:does-not-exist").unwrap_err().to_string();
         assert!(err.contains("no packet found for domain"), "got: {err}");
+    }
+
+    #[test]
+    fn retirement_discharge_removes_only_owned_packets_and_is_idempotent() {
+        let (directory, store) = tmp_packets();
+        let params = |project_id: &str, project: &str| CompileParams {
+            domain: format!("demo/{project_id}"),
+            rules: json!([{
+                "id": "fail_default",
+                "antecedent": {"op": "True"},
+                "consequent": "REJECT"
+            }]),
+            classification_lattice: None,
+            prefix_inference: None,
+            rank_table: None,
+            threshold_table: None,
+            rank_lookup_key: None,
+            threshold_lookup_key: None,
+            source_ids: None,
+            scope: Some("project".into()),
+            project: Some(project.into()),
+            project_id: Some(project_id.into()),
+        };
+        store.compile(&params("project-a", "/repo/a")).unwrap();
+        store.compile(&params("project-b", "/repo/b")).unwrap();
+
+        assert_eq!(
+            super::discharge_project_catalog_rows(
+                directory.path(),
+                "project-a",
+                &["/repo/a".into()]
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            super::discharge_project_catalog_rows(
+                directory.path(),
+                "project-a",
+                &["/repo/a".into()]
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(store.list_all().unwrap().len(), 1);
     }
 }

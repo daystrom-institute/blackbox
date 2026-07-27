@@ -33,7 +33,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
@@ -750,16 +750,27 @@ pub fn capture_project_catalog_owner_snapshot(
                 );
             }
         };
+        let mut subsource_rows = Vec::new();
+        if let Some(project_id) = board
+            .project_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|project_id| !project_id.is_empty())
+        {
+            subsource_rows.push(OwnerSnapshotRowV1::inventory_target(
+                format!("{}:target", board.id),
+                project_id,
+                sha256_hex(&bytes),
+            ));
+        }
         let selector = board.project.trim().to_string();
-        let subsource_rows = (!selector.is_empty())
-            .then(|| {
-                vec![OwnerSnapshotRowV1::legacy_selector(
-                    board.id,
-                    LegacyProjectSelectorKindV1::Project,
-                    selector,
-                )]
-            })
-            .unwrap_or_default();
+        if !selector.is_empty() {
+            subsource_rows.push(OwnerSnapshotRowV1::legacy_selector(
+                board.id,
+                LegacyProjectSelectorKindV1::Project,
+                selector,
+            ));
+        }
         subsources.push(owner_subsource(
             subsource_id,
             captured.state,
@@ -768,6 +779,43 @@ pub fn capture_project_catalog_owner_snapshot(
         rows.extend(subsource_rows);
     }
     finalize_owner_snapshot("whiteboard", "whiteboard:root", subsources, rows, limits)
+}
+
+/// Remove persisted boards owned by one project. Missing stores are empty;
+/// malformed or unsafe entries refuse instead of being treated as absent.
+pub fn discharge_project_catalog_rows(
+    storage_dir: &Path,
+    project_id: &str,
+    selectors: &[String],
+) -> Result<usize> {
+    let metadata = match std::fs::symlink_metadata(storage_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("whiteboard store root is not a safe directory");
+    }
+    let mut removals = Vec::new();
+    for entry in std::fs::read_dir(storage_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() || entry.path().extension() != Some(OsStr::new("json")) {
+            bail!("whiteboard store contains a non-canonical entry");
+        }
+        let board: Board = serde_json::from_slice(&std::fs::read(entry.path())?)?;
+        if board.project_id.as_deref() == Some(project_id)
+            || selectors.iter().any(|selector| selector == &board.project)
+        {
+            removals.push(entry.path());
+        }
+    }
+    for path in &removals {
+        std::fs::remove_file(path)?;
+    }
+    if !removals.is_empty() {
+        std::fs::File::open(storage_dir)?.sync_all()?;
+    }
+    Ok(removals.len())
 }
 
 pub type SharedRegistry = Arc<WhiteboardRegistry>;
@@ -2391,5 +2439,44 @@ mod tests {
         r.open("b-legacy-open", "topic", "/repo/x", None, None, "alice")
             .unwrap();
         assert_eq!(r.get("b-legacy-open").unwrap().read().project_id, None);
+    }
+
+    #[test]
+    fn retirement_discharge_removes_only_owned_boards_and_is_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("whiteboards");
+        let registry = WhiteboardRegistry::new();
+        registry.set_storage_dir(root.clone()).unwrap();
+        registry
+            .open(
+                "owned",
+                "topic",
+                "/repo/a",
+                Some("project-a"),
+                None,
+                "alice",
+            )
+            .unwrap();
+        registry
+            .open(
+                "other",
+                "topic",
+                "/repo/b",
+                Some("project-b"),
+                None,
+                "alice",
+            )
+            .unwrap();
+
+        assert_eq!(
+            discharge_project_catalog_rows(&root, "project-a", &["/repo/a".into()]).unwrap(),
+            1
+        );
+        assert_eq!(
+            discharge_project_catalog_rows(&root, "project-a", &["/repo/a".into()]).unwrap(),
+            0
+        );
+        assert!(!root.join("owned.json").exists());
+        assert!(root.join("other.json").is_file());
     }
 }

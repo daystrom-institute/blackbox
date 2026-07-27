@@ -1914,6 +1914,7 @@ impl bbox_indexing::project_catalog_admin::RetirementDischargeWorkers for Counti
         _store: &bbox_indexing::project_catalog_store::ProjectCatalogStore,
         _project_id: &ProjectId,
         _original_evidence: &bbox_indexing::project_catalog_admin::RetireEvidence,
+        _retirement_evidence: &bbox_indexing::project_catalog_admin::RetirementJournalEvidence,
     ) -> bbox_indexing::project_catalog_admin::AdminResult<
         bbox_indexing::project_catalog_admin::RetireEvidence,
     > {
@@ -2219,6 +2220,7 @@ fn acceptance_discharge_nonzero_reprobe_refuses_at_final_cut() {
             _store: &bbox_indexing::project_catalog_store::ProjectCatalogStore,
             _project_id: &ProjectId,
             _original_evidence: &RetireEvidence,
+            _retirement_evidence: &bbox_indexing::project_catalog_admin::RetirementJournalEvidence,
         ) -> bbox_indexing::project_catalog_admin::AdminResult<RetireEvidence> {
             self.reprobe_calls += 1;
             // Return evidence with a nonzero class: the discharge did NOT
@@ -2351,6 +2353,7 @@ fn f5_source_authority_quiesced_blocks_journal() {
             _store: &ProjectCatalogStore,
             _project_id: &ProjectId,
             _original_evidence: &RetireEvidence,
+            _retirement_evidence: &bbox_indexing::project_catalog_admin::RetirementJournalEvidence,
         ) -> bbox_indexing::project_catalog_admin::AdminResult<RetireEvidence> {
             Ok(RetireEvidence {
                 external_reference_counts: Default::default(),
@@ -2484,6 +2487,7 @@ fn r2f1_unprobeable_classes_block_journal() {
             _store: &ProjectCatalogStore,
             _project_id: &ProjectId,
             _original_evidence: &RetireEvidence,
+            _retirement_evidence: &bbox_indexing::project_catalog_admin::RetirementJournalEvidence,
         ) -> bbox_indexing::project_catalog_admin::AdminResult<RetireEvidence> {
             Ok(RetireEvidence {
                 external_reference_counts: Default::default(),

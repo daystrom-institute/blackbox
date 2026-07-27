@@ -286,6 +286,80 @@ pub fn capture_project_catalog_owner_snapshot(
     finalize_owner_snapshot("artifact", "artifact:root", subsources, rows, limits)
 }
 
+/// Remove every artifact row owned by one project using the catalog metadata
+/// format. Directories are first renamed out of the live tree, then removed.
+pub fn discharge_project_catalog_rows(
+    root: &Path,
+    project_id: &str,
+    selectors: &[String],
+) -> Result<usize> {
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("artifact store root is not a safe directory");
+    }
+    let mut artifact_dirs = std::collections::BTreeSet::new();
+    for entry in WalkDir::new(root).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy();
+        if file_name != "metadata.json" && !file_name.ends_with(".metadata.json") {
+            continue;
+        }
+        let metadata: ArtifactMetadata = serde_json::from_slice(&fs::read(entry.path())?)?;
+        if metadata.project_id.as_deref() != Some(project_id)
+            && !metadata
+                .project_path
+                .as_ref()
+                .is_some_and(|path| selectors.iter().any(|selector| selector == path))
+        {
+            continue;
+        }
+        let directory = if file_name == "metadata.json" {
+            entry.path().parent()
+        } else {
+            entry.path().parent().and_then(Path::parent)
+        }
+        .ok_or_else(|| anyhow!("artifact metadata has no owning directory"))?;
+        artifact_dirs.insert(directory.to_path_buf());
+    }
+    let mut removed = 0usize;
+    for (index, directory) in artifact_dirs.into_iter().enumerate() {
+        if !directory.exists() {
+            continue;
+        }
+        let parent = directory
+            .parent()
+            .ok_or_else(|| anyhow!("artifact directory has no parent"))?;
+        let tombstone = parent.join(format!(
+            ".retiring-{}-{index}",
+            directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("artifact")
+        ));
+        if tombstone.exists() {
+            bail!("artifact retirement tombstone already exists");
+        }
+        fs::rename(&directory, &tombstone)?;
+        fs::File::open(parent)?.sync_all()?;
+        fs::remove_dir_all(&tombstone)?;
+        fs::File::open(parent)?.sync_all()?;
+        let artifact_file = directory.with_extension("json");
+        if artifact_file.is_file() {
+            fs::remove_file(&artifact_file)?;
+            fs::File::open(parent)?.sync_all()?;
+        }
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 impl ArtifactCatalog {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
@@ -2449,5 +2523,18 @@ mod tests {
                 ..
             } if literal_selector == "/repo/legacy"
         )));
+
+        assert_eq!(
+            discharge_project_catalog_rows(&root, "project1", &["/repo/legacy".into()]).unwrap(),
+            1
+        );
+        assert_eq!(
+            discharge_project_catalog_rows(&root, "project1", &["/repo/legacy".into()]).unwrap(),
+            0
+        );
+        let discharged =
+            capture_project_catalog_owner_snapshot(&root, OwnerSnapshotLimitsV1::default())
+                .unwrap();
+        assert_eq!(discharged.row_count, 0);
     }
 }

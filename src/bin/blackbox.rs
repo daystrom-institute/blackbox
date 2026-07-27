@@ -1195,7 +1195,13 @@ fn execute_retire(args: RetireArgs) -> Result<serde_json::Value, CommandFailure>
     let config = load_config(args.config.clone())?;
     let (_lock, store) = open_admin_store(&args.store.projects_path)?;
     let project_id = parse_project_id(&args.project)?;
-    let probe = probe_retire_evidence(&config, &args.store.projects_path, &store, &project_id)?;
+    let probe = probe_retire_evidence(
+        &config,
+        &args.store.projects_path,
+        &store,
+        &project_id,
+        None,
+    )?;
     // An unprobeable class is not a discharged class. Removal is permanent
     // and strict cross-validation forbids partial removal, so a class the
     // probe could not read refuses the destructive arm by name instead of
@@ -1208,23 +1214,6 @@ fn execute_retire(args: RetireArgs) -> Result<serde_json::Value, CommandFailure>
                 probe.unprobeable.join(", ")
             ),
         ));
-    }
-    if args.execute {
-        if let Some(class) = RETIRE_UNDISCHARGEABLE_CLASSES.iter().find(|class| {
-            probe
-                .evidence
-                .external_reference_counts
-                .get(**class)
-                .is_some_and(|count| *count > 0)
-        }) {
-            return Err(CommandFailure::new(
-                "error.project_catalog_retire_undischargeable_class",
-                format!(
-                    "retirement cannot safely discharge offline reference class {class}; \
-                     clear that class before creating or resuming the journal"
-                ),
-            ));
-        }
     }
     let epoch = current_epoch(&store)?;
     let (inventory, commit) = project_catalog_admin::retire_project(
@@ -1267,7 +1256,13 @@ fn execute_retirement_journal(
     let config = load_config(args.config.clone())?;
     let (_lock, store) = open_admin_store(&args.store.projects_path)?;
     let project_id = parse_project_id(&args.project)?;
-    let probe = probe_retire_evidence(&config, &args.store.projects_path, &store, &project_id)?;
+    let probe = probe_retire_evidence(
+        &config,
+        &args.store.projects_path,
+        &store,
+        &project_id,
+        None,
+    )?;
 
     // Unprobeable classes refuse the destructive arm (same rule as retire).
     if args.execute && !probe.unprobeable.is_empty() {
@@ -1496,29 +1491,12 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             )
         })?;
 
-        let catalog_store =
-            ProjectCatalogStore::open_existing(self.projects_path).map_err(|e| {
-                project_catalog_admin::admin_error(
-                    "error.project_catalog_retire_catalog_open",
-                    format!("failed to open catalog for coordination discharge: {e}"),
-                )
-            })?;
-        let state = catalog_store.snapshot().map_err(|e| {
+        let selectors = evidence.project_selectors.as_deref().ok_or_else(|| {
             project_catalog_admin::admin_error(
-                "error.project_catalog_retire_catalog_snapshot",
-                format!("failed to snapshot catalog for coordination discharge: {e}"),
+                "error.project_catalog_retire_evidence_incomplete",
+                "retirement evidence is missing project selectors",
             )
         })?;
-        let selectors = std::iter::once(project_id.as_str().to_string())
-            .chain(
-                state
-                    .attachments()
-                    .attachments
-                    .values()
-                    .filter(|row| &row.project_id == project_id)
-                    .map(|row| row.checkout_project_dir.clone()),
-            )
-            .collect::<Vec<_>>();
 
         for (path, array_fields, keys) in coordination_row_paths(self.config) {
             clear_wrapped_project_rows(&path, array_fields, keys, &selectors).map_err(|e| {
@@ -1545,6 +1523,50 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
                 format!("failed to clear Slack channel bindings: {e}"),
             )
         })?;
+        let discharge_error = |class: &'static str, error: anyhow::Error| {
+            project_catalog_admin::admin_error(
+                "error.project_catalog_retire_discharge_owner_store",
+                format!("failed to discharge {class}: {error}"),
+            )
+        };
+        bbox_slack::slack_proposal_links::SlackProposalLinks::open(&self.config.paths.bro_home)
+            .and_then(|store| store.discharge_project_refs(project_id.as_str(), &selectors))
+            .map_err(|error| discharge_error("slack_proposal_links", error))?;
+        bbox_artifacts::artifacts::discharge_project_catalog_rows(
+            &self.config.paths.artifacts_dir,
+            project_id.as_str(),
+            &selectors,
+        )
+        .map_err(|error| discharge_error("artifact_rows", error))?;
+        bbox_whiteboards::whiteboards::discharge_project_catalog_rows(
+            &self.config.paths.bro_home.join("whiteboards"),
+            project_id.as_str(),
+            &selectors,
+        )
+        .map_err(|error| discharge_error("whiteboard_rows", error))?;
+        bbox_packets::discharge_project_catalog_rows(
+            &self.config.paths.packets_dir,
+            project_id.as_str(),
+            &selectors,
+        )
+        .map_err(|error| discharge_error("packet_rows", error))?;
+        bbox_edge_sidecar::manifest::ManifestIndex::discharge_project_workspace(
+            &self.config.paths.state_dir.join("edges"),
+            project_id.as_str(),
+        )
+        .map_err(|error| discharge_error("edge_sidecar_rows", error))?;
+        bbox_corpus_index::index::migration_inventory::discharge_project_rows(
+            &self.config.paths.index_path,
+            &self.config.paths.state_dir.join("git_meta"),
+            project_id.as_str(),
+            &selectors,
+        )
+        .map_err(|error| discharge_error("corpus_index_rows", error))?;
+        bbox_vectors::migration_inventory::discharge_project_rows(
+            &self.config.paths.state_dir.join("vectors"),
+            project_id.as_str(),
+        )
+        .map_err(|error| discharge_error("vector_entity_refs", error))?;
 
         Ok(())
     }
@@ -1629,14 +1651,30 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
         store: &ProjectCatalogStore,
         project_id: &ProjectId,
         _original_evidence: &project_catalog_admin::RetireEvidence,
+        retirement_evidence: &project_catalog_admin::RetirementJournalEvidence,
     ) -> project_catalog_admin::AdminResult<project_catalog_admin::RetireEvidence> {
-        let probe = probe_retire_evidence(self.config, self.projects_path, store, project_id)
-            .map_err(|e| {
+        let selectors = retirement_evidence
+            .project_selectors
+            .as_deref()
+            .ok_or_else(|| {
                 project_catalog_admin::admin_error(
-                    "error.project_catalog_cli_reprobe_failed",
-                    format!("{}: {}", e.code, e.message),
+                    "error.project_catalog_retire_evidence_incomplete",
+                    "retirement evidence is missing project selectors",
                 )
             })?;
+        let probe = probe_retire_evidence(
+            self.config,
+            self.projects_path,
+            store,
+            project_id,
+            Some(selectors),
+        )
+        .map_err(|e| {
+            project_catalog_admin::admin_error(
+                "error.project_catalog_cli_reprobe_failed",
+                format!("{}: {}", e.code, e.message),
+            )
+        })?;
         // R2F1: carry unprobeable classes through as refusals so they
         // cannot be mistaken for a discharged zero.
         let mut evidence = probe.evidence;
@@ -1786,18 +1824,6 @@ const RETIRE_REFERENCE_CLASSES: [&str; 20] = [
     "vector_entity_refs",
 ];
 
-const RETIRE_UNDISCHARGEABLE_CLASSES: [&str; 9] = [
-    "artifact_rows",
-    "whiteboard_rows",
-    "packet_rows",
-    "slack_proposal_links",
-    "edge_sidecar_rows",
-    "index_entity_refs",
-    "index_code_metadata_rows",
-    "git_ingest_cursors",
-    "vector_entity_refs",
-];
-
 /// JSON keys naming a project in the shared coordination stores.
 const PROJECT_ROW_KEYS: [&str; 2] = ["project", "project_id"];
 
@@ -1862,19 +1888,24 @@ fn probe_retire_evidence(
     projects_path: &Path,
     store: &ProjectCatalogStore,
     project_id: &ProjectId,
+    selector_override: Option<&[String]>,
 ) -> Result<RetireProbe, CommandFailure> {
     let mut probe = RetireProbe::default();
     let state = store.snapshot()?;
-    let selectors: Vec<String> = std::iter::once(project_id.as_str().to_string())
-        .chain(
-            state
-                .attachments()
-                .attachments
-                .values()
-                .filter(|row| &row.project_id == project_id)
-                .map(|row| row.checkout_project_dir.clone()),
-        )
-        .collect();
+    let selectors: Vec<String> = selector_override
+        .map(<[String]>::to_vec)
+        .unwrap_or_else(|| {
+            std::iter::once(project_id.as_str().to_string())
+                .chain(
+                    state
+                        .attachments()
+                        .attachments
+                        .values()
+                        .filter(|row| &row.project_id == project_id)
+                        .map(|row| row.checkout_project_dir.clone()),
+                )
+                .collect()
+        });
 
     // Code-source state roots on the configured state dir (the same
     // derivation the daemon uses), never the projects-path parent.
@@ -2063,6 +2094,18 @@ fn capture_retirement_evidence(
             format!("project {project_id} is not in the catalog"),
         )
     })?;
+    let project_selectors = std::iter::once(project_id.as_str().to_string())
+        .chain(
+            state
+                .attachments()
+                .attachments
+                .values()
+                .filter(|row| &row.project_id == project_id)
+                .map(|row| row.checkout_project_dir.clone()),
+        )
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     let current_scope = match &project.scope {
         ProjectScope::Published(scope) => Some(scope),
         ProjectScope::LegacyLocal => None,
@@ -2187,6 +2230,7 @@ fn capture_retirement_evidence(
     Ok(project_catalog_admin::RetirementJournalEvidence {
         owner_project_id: Some(project_id.clone()),
         catalog_scope: current_scope.cloned(),
+        project_selectors: Some(project_selectors),
         owned_generations,
         desired_pointers: Some(desired_pointers),
         owned_uploads: Some(owned_uploads),

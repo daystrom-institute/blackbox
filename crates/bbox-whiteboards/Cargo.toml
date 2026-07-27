@@ -14,3 +14,6 @@ bbox-corpus-core = { path = "../bbox-corpus-core" }
 parking_lot = "0.12"
 tracing = "0.1"
 chrono = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

@@ -2164,6 +2164,7 @@ impl ProjectRetirementJournal {
             completed_steps: Vec::new(),
             evidence: RetirementJournalEvidence {
                 owner_project_id: Some(project_id.clone()),
+                project_selectors: Some(vec![project_id.as_str().to_string()]),
                 desired_pointers: Some(Vec::new()),
                 owned_uploads: Some(Vec::new()),
                 ..RetirementJournalEvidence::default()
@@ -2215,6 +2216,10 @@ pub struct RetirementJournalEvidence {
     /// Current catalog scope captured before the final authority cut. This is
     /// the only scope producer grants may authorize for retirement checks.
     pub catalog_scope: Option<PublishedScope>,
+
+    /// Project id plus every attachment directory captured before attachment
+    /// detachment. Later reprobes use these durable selectors.
+    pub project_selectors: Option<Vec<String>>,
 
     /// Exact generation inventory that belongs to the retiring project and
     /// will be deleted in stage CollectedGenerationsDischarged.
@@ -2440,6 +2445,23 @@ fn validate_journal_evidence_shape(
     let blob_ref = journal.evidence.blob_inventory.as_ref().ok_or_else(|| {
         RetirementJournalError::other("retirement journal is missing its blob evidence reference")
     })?;
+    let selectors = journal.evidence.project_selectors.as_ref().ok_or_else(|| {
+        RetirementJournalError::other("retirement journal is missing its project selectors")
+    })?;
+    if !selectors
+        .iter()
+        .any(|selector| selector == journal.project_id.as_str())
+        || selectors.iter().any(|selector| selector.is_empty())
+        || selectors
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != selectors.len()
+    {
+        return Err(RetirementJournalError::other(
+            "retirement journal project selectors are invalid",
+        ));
+    }
     if blob_ref.version != 1 || !validate_sha256_text(&blob_ref.sha256) {
         return Err(RetirementJournalError::other(
             "retirement journal blob evidence reference is invalid",
@@ -2802,6 +2824,7 @@ pub trait RetirementDischargeWorkers {
     ) -> AdminResult<RetirementJournalEvidence> {
         Ok(RetirementJournalEvidence {
             owner_project_id: Some(project_id.clone()),
+            project_selectors: Some(vec![project_id.as_str().to_string()]),
             desired_pointers: Some(Vec::new()),
             owned_uploads: Some(Vec::new()),
             ..RetirementJournalEvidence::default()
@@ -2905,6 +2928,7 @@ pub trait RetirementDischargeWorkers {
         store: &ProjectCatalogStore,
         project_id: &ProjectId,
         original_evidence: &RetireEvidence,
+        retirement_evidence: &RetirementJournalEvidence,
     ) -> AdminResult<RetireEvidence>;
 }
 
@@ -2919,6 +2943,7 @@ impl RetirementDischargeWorkers for NoopDischargeWorkers {
     ) -> AdminResult<RetirementJournalEvidence> {
         Ok(RetirementJournalEvidence {
             owner_project_id: Some(project_id.clone()),
+            project_selectors: Some(vec![project_id.as_str().to_string()]),
             desired_pointers: Some(Vec::new()),
             owned_uploads: Some(Vec::new()),
             ..RetirementJournalEvidence::default()
@@ -2963,6 +2988,7 @@ impl RetirementDischargeWorkers for NoopDischargeWorkers {
         _store: &ProjectCatalogStore,
         _project_id: &ProjectId,
         original_evidence: &RetireEvidence,
+        _retirement_evidence: &RetirementJournalEvidence,
     ) -> AdminResult<RetireEvidence> {
         Ok(original_evidence.clone())
     }
@@ -3185,7 +3211,8 @@ pub fn retire_project_journaled_with(
     {
         let current_state = store.snapshot()?;
         if current_state.catalog().projects.contains_key(project_id) {
-            let reprobed_evidence = workers.reprobe_evidence(store, project_id, evidence)?;
+            let reprobed_evidence =
+                workers.reprobe_evidence(store, project_id, evidence, &journal.evidence)?;
             // R2F1: carry unprobeable classes through as refusals. An
             // unprobeable class must not be mistaken for a discharged zero.
             if !reprobed_evidence.unprobeable_classes.is_empty() {

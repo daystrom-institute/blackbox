@@ -166,6 +166,35 @@ pub fn capture_migration_snapshot_no_create(
     assemble_snapshot(captured, limits)
 }
 
+/// Delete every active vector row whose entity reference is owned by the
+/// project. Missing roots are empty; corrupt snapshots refuse mutation.
+pub fn discharge_project_rows(root: &Path, project_id: &str) -> anyhow::Result<usize> {
+    let snapshot =
+        capture_migration_snapshot_no_create(root, VectorMigrationSnapshotLimitsV1::default());
+    match snapshot.state {
+        VectorMigrationSourceStateV1::Missing => return Ok(0),
+        VectorMigrationSourceStateV1::Present => {}
+        VectorMigrationSourceStateV1::Corrupt { diagnostic_code }
+        | VectorMigrationSourceStateV1::Unavailable { diagnostic_code } => {
+            anyhow::bail!("vector retirement inventory unavailable: {diagnostic_code}");
+        }
+    }
+    let rows = snapshot
+        .project_scoped_refs
+        .into_iter()
+        .filter(|row| row.project_id == project_id)
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let store = VectorStore::open(root)?;
+    for row in &rows {
+        store.delete(&row.route, &row.entity_ref)?;
+    }
+    store.flush_all()?;
+    Ok(rows.len())
+}
+
 impl VectorStore {
     /// Capture the installed owner under its existing partition read locks.
     ///
@@ -734,6 +763,13 @@ mod tests {
         assert_eq!(snapshot.project_scoped_ref_count, 1);
         assert_eq!(snapshot.commit_namespaces.len(), 1);
         assert_eq!(snapshot.commit_namespaces[0].vector_key_count, 1);
+
+        assert_eq!(discharge_project_rows(&root, "project-a").unwrap(), 1);
+        assert_eq!(discharge_project_rows(&root, "project-a").unwrap(), 0);
+        let discharged =
+            capture_migration_snapshot_no_create(&root, VectorMigrationSnapshotLimitsV1::default());
+        assert_eq!(discharged.project_scoped_ref_count, 0);
+        assert_eq!(discharged.commit_namespaces.len(), 1);
     }
 
     #[cfg(unix)]

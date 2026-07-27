@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
@@ -181,6 +181,92 @@ pub fn capture_owner_migration_snapshot_no_create(
         code_metadata: capture_code_metadata(index_path, limits),
         git_cursors: capture_git_cursors(git_meta_dir, limits),
     }
+}
+
+/// Delete project-owned Tantivy documents, code metadata rows, and the
+/// project git cursor using each owner's on-disk format.
+pub fn discharge_project_rows(
+    index_path: &Path,
+    git_meta_dir: &Path,
+    project_id: &str,
+    selectors: &[String],
+) -> anyhow::Result<(u64, usize, bool)> {
+    let snapshot = capture_owner_migration_snapshot_no_create(
+        index_path,
+        git_meta_dir,
+        CorpusMigrationSnapshotLimitsV1::default(),
+    );
+    for state in [
+        &snapshot.index.state,
+        &snapshot.code_metadata.state,
+        &snapshot.git_cursors.state,
+    ] {
+        match state {
+            CorpusMigrationSourceStateV1::Present | CorpusMigrationSourceStateV1::Missing => {}
+            CorpusMigrationSourceStateV1::Corrupt { diagnostic_code }
+            | CorpusMigrationSourceStateV1::Unavailable { diagnostic_code } => {
+                anyhow::bail!("corpus retirement inventory unavailable: {diagnostic_code}");
+            }
+        }
+    }
+
+    let document_count = snapshot
+        .index
+        .project_scoped_refs
+        .iter()
+        .filter(|row| row.project_id == project_id)
+        .map(|row| row.document_count)
+        .sum::<u64>();
+    if matches!(snapshot.index.state, CorpusMigrationSourceStateV1::Present) {
+        let index = tantivy::Index::open_in_dir(index_path)?;
+        let project_field = index.schema().get_field("project_id")?;
+        let mut writer: tantivy::IndexWriter<TantivyDocument> = index.writer(50_000_000)?;
+        writer.delete_term(tantivy::Term::from_field_text(project_field, project_id));
+        writer.commit()?;
+    }
+
+    let metadata_path = index_path.join("_meta.json");
+    let mut metadata_removed = 0usize;
+    if metadata_path.exists() {
+        let mut metadata: BTreeMap<String, FileMeta> =
+            serde_json::from_slice(&fs::read(&metadata_path)?)?;
+        metadata.retain(|_, row| {
+            let owned = match &row.source {
+                FileMetaSource::LegacyFilesystem => false,
+                FileMetaSource::LocalProjectFile {
+                    project_id: row_project_id,
+                    selector,
+                    ..
+                } => {
+                    row_project_id == project_id
+                        || selectors.iter().any(|candidate| candidate == selector)
+                }
+            };
+            if owned {
+                metadata_removed += 1;
+            }
+            !owned
+        });
+        let temporary = index_path.join("_meta.json.retire.tmp");
+        let mut file = fs::File::create(&temporary)?;
+        serde_json::to_writer_pretty(&mut file, &metadata)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, &metadata_path)?;
+        fs::File::open(index_path)?.sync_all()?;
+    }
+
+    let cursor = git_meta_dir.join(format!("{project_id}.json"));
+    let cursor_removed = match fs::remove_file(&cursor) {
+        Ok(()) => {
+            fs::File::open(git_meta_dir)?.sync_all()?;
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    Ok((document_count, metadata_removed, cursor_removed))
 }
 
 fn capture_code_metadata(
@@ -1028,6 +1114,27 @@ mod tests {
             snapshot.code_metadata.rows[0].selector.as_deref(),
             Some("selector-a")
         );
+
+        drop(writer);
+        drop(index);
+        assert_eq!(
+            discharge_project_rows(&index_path, &git_meta, "project-a", &["selector-a".into()])
+                .unwrap(),
+            (1, 1, true)
+        );
+        assert_eq!(
+            discharge_project_rows(&index_path, &git_meta, "project-a", &["selector-a".into()])
+                .unwrap(),
+            (0, 0, false)
+        );
+        let discharged = capture_owner_migration_snapshot_no_create(
+            &index_path,
+            &git_meta,
+            CorpusMigrationSnapshotLimitsV1::default(),
+        );
+        assert_eq!(discharged.index.project_scoped_ref_count, 0);
+        assert_eq!(discharged.code_metadata.project_scoped_row_count, 0);
+        assert_eq!(discharged.git_cursors.row_count, 0);
     }
 
     #[test]
