@@ -8677,7 +8677,7 @@ mod tests {
         let generation = observer.pending_rescan_generation().unwrap();
         assert_eq!(observer.pending_rescan_generation(), Some(generation));
         observer.request_rescan();
-        assert!(!observer.complete_rescan(generation));
+        assert!(observer.complete_rescan(generation));
         let retry_generation = observer.pending_rescan_generation().unwrap();
         assert_ne!(retry_generation, generation);
         assert!(observer.complete_rescan(retry_generation));
@@ -8703,6 +8703,44 @@ mod tests {
         }
         assert!(progress.is_complete());
         assert_eq!(delivered, project_ids);
+    }
+
+    #[test]
+    fn p4e_post_commit_observer_finishes_pinned_pages_under_continuous_commits() {
+        use bbox_indexing::project_catalog_store::{CatalogCommitObserver, CatalogCommittedEvent};
+
+        let observer = CatalogCommitObserver::new();
+        for index in 0..4100 {
+            observer.push_for_test(CatalogCommittedEvent {
+                epoch: index,
+                changed_project_ids: BTreeSet::from([format!("p_{index:032x}")]),
+            });
+        }
+        let generation = observer.pending_rescan_generation().unwrap();
+        let project_ids = (0..100_000)
+            .map(|index| format!("p_{index:032x}"))
+            .collect::<Vec<_>>();
+        let mut progress = CatalogObserverRescanProgress {
+            generation,
+            epoch: 19,
+            project_ids,
+            next_index: 0,
+        };
+        let mut pages = 0;
+        while progress.next_event().is_some() {
+            pages += 1;
+            observer.push_for_test(CatalogCommittedEvent {
+                epoch: 20 + pages,
+                changed_project_ids: BTreeSet::from([format!("p_dirty_{pages:032x}")]),
+            });
+            assert_eq!(observer.pending_rescan_generation(), Some(generation));
+        }
+        assert!(pages > 1);
+        assert!(observer.complete_rescan(generation));
+        let followup = observer.pending_rescan_generation().unwrap();
+        assert_ne!(followup, generation);
+        assert!(observer.complete_rescan(followup));
+        assert_eq!(observer.pending_rescan_generation(), None);
     }
 
     // P4-E commit (c): bridge-clear and scope-migrate refusal tests.

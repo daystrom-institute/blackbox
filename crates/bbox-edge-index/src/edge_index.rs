@@ -156,8 +156,6 @@ impl EdgeIndex {
                     edges_dir,
                     admitted_absent_projects,
                 )?;
-                let total_materialized_files = count_materialized_jsonl_files(edges_dir);
-                let skipped_inactive = total_materialized_files.saturating_sub(loadable.len());
                 self.load_manifest_active_paths(&loadable, seen)?;
                 self.load_legacy_explicit_edges(
                     edges_dir,
@@ -167,8 +165,6 @@ impl EdgeIndex {
                 );
                 tracing::info!(
                     active_paths = loadable.len(),
-                    skipped_inactive_refs = skipped_inactive,
-                    total_materialized_files,
                     "loaded edges via manifest-index"
                 );
             }
@@ -858,13 +854,11 @@ impl EdgeIndex {
                         self.insert_sidecar_edge(edge, seen);
                     }
                 }
-                Err(err) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %err,
-                        "failed to parse edge sidecar line (hash-filtered load)"
-                    );
-                }
+                Err(err) => anyhow::bail!(
+                    "selected active edge file {} has malformed JSONL at line {}: {err}",
+                    path.display(),
+                    line_number + 1
+                ),
             }
         }
         Ok(())
@@ -890,13 +884,11 @@ impl EdgeIndex {
             }
             match serde_json::from_str::<Edge>(trimmed) {
                 Ok(edge) => self.insert_sidecar_edge(edge, seen),
-                Err(err) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %err,
-                        "failed to parse edge sidecar line"
-                    );
-                }
+                Err(err) => anyhow::bail!(
+                    "selected active edge file {} has malformed JSONL at line {}: {err}",
+                    path.display(),
+                    line_number + 1
+                ),
             }
         }
         Ok(())
@@ -3691,6 +3683,39 @@ mod tests {
             index
                 .forward_edges(&EntityRef::Knowledge { id: "k3".into() })
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn selected_active_malformed_jsonl_aborts_full_and_filtered_loads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("selected.jsonl");
+        let valid = make_explicit_edge_line("k1", "DESCRIBES", "k2");
+        fs::write(&path, format!("{valid}\n{{malformed\n")).unwrap();
+
+        let mut full = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        assert!(
+            full.project_sidecar_edges_open_file(
+                fs::File::open(&path).unwrap(),
+                &path,
+                &mut seen,
+                false,
+            )
+            .is_err()
+        );
+
+        let mut filtered = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        assert!(
+            filtered
+                .project_sidecar_edges_open_file_with_hash_filter(
+                    fs::File::open(&path).unwrap(),
+                    &path,
+                    &mut seen,
+                    &HashSet::new(),
+                )
+                .is_err()
         );
     }
 }

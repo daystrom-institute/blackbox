@@ -235,6 +235,7 @@ struct CatalogObserverQueue {
     event: Option<CatalogCommittedEvent>,
     rescan_required: bool,
     rescan_generation: u64,
+    rescan_followup_required: bool,
 }
 
 impl CatalogCommitObserver {
@@ -257,7 +258,7 @@ impl CatalogCommitObserver {
             Err(poisoned) => poisoned.into_inner(),
         };
         if guard.rescan_required {
-            guard.rescan_generation = guard.rescan_generation.wrapping_add(1);
+            guard.rescan_followup_required = true;
             return;
         }
         const MAX_PENDING_PROJECTS: usize = 4096;
@@ -299,7 +300,12 @@ impl CatalogCommitObserver {
             Err(poisoned) => poisoned.into_inner(),
         };
         if guard.rescan_required && guard.rescan_generation == generation {
-            guard.rescan_required = false;
+            if guard.rescan_followup_required {
+                guard.rescan_followup_required = false;
+                guard.rescan_generation = guard.rescan_generation.wrapping_add(1);
+            } else {
+                guard.rescan_required = false;
+            }
             true
         } else {
             false
@@ -311,8 +317,12 @@ impl CatalogCommitObserver {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.rescan_required = true;
-        guard.rescan_generation = guard.rescan_generation.wrapping_add(1);
+        if guard.rescan_required {
+            guard.rescan_followup_required = true;
+        } else {
+            guard.rescan_required = true;
+            guard.rescan_generation = guard.rescan_generation.wrapping_add(1);
+        }
     }
 
     /// Returns true if at least one event is pending.
