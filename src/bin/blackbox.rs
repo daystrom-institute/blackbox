@@ -823,6 +823,30 @@ mod tests {
             ClassProbe::Committed(rows) if rows.is_empty()
         ));
     }
+
+    #[test]
+    fn retirement_commitments_preserve_identical_physical_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rows.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "entries": [
+                    {"project_id": "project-a", "value": 1},
+                    {"project_id": "project-a", "value": 1}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let ClassProbe::Committed(rows) =
+            count_project_rows(&path, "project-a", &[], &PROJECT_ROW_KEYS)
+        else {
+            panic!("duplicate rows were not committed");
+        };
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0], rows[1]);
+    }
 }
 
 /// Open a strict v2 store for offline administration: the exclusive
@@ -1219,6 +1243,7 @@ fn execute_retire(args: RetireArgs) -> Result<serde_json::Value, CommandFailure>
         &store,
         &project_id,
         None,
+        None,
     )?;
     // An unprobeable class is not a discharged class. Removal is permanent
     // and strict cross-validation forbids partial removal, so a class the
@@ -1279,6 +1304,7 @@ fn execute_retirement_journal(
         &args.store.projects_path,
         &store,
         &project_id,
+        None,
         None,
     )?;
 
@@ -1957,6 +1983,7 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             store,
             project_id,
             Some(selectors),
+            None,
         )
         .map_err(|e| {
             project_catalog_admin::admin_error(
@@ -2018,6 +2045,34 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
         })?;
         self.verify_source_authority_quiesced(&store, project_id, evidence)?;
         validate_retirement_targets_absent(self.config, evidence)?;
+        let code_store = bbox_code_source_store::CodeSourceStore::open(
+            self.config.paths.state_dir.join("code-sources"),
+            bbox_indexing::project_catalog_migration::project_catalog_migration_store_limits(
+                self.config,
+            ),
+        )
+        .map_err(|error| {
+            project_catalog_admin::admin_error(
+                "error.project_catalog_retire_recovery_reprobe",
+                format!("failed to open code-source state during recovery: {error}"),
+            )
+        })?;
+        if code_store
+            .retained_generation_owner_records()
+            .map_err(|error| {
+                project_catalog_admin::admin_error(
+                    "error.project_catalog_retire_recovery_reprobe",
+                    format!("failed to enumerate retained generation owners: {error}"),
+                )
+            })?
+            .iter()
+            .any(|record| &record.project_id == project_id)
+        {
+            return Err(project_catalog_admin::admin_error(
+                "error.project_catalog_retire_recovery_not_quiescent",
+                "post-cut recovery found a retained generation owner record",
+            ));
+        }
         let selectors = evidence.project_selectors.as_deref().ok_or_else(|| {
             project_catalog_admin::admin_error(
                 "error.project_catalog_retire_evidence_incomplete",
@@ -2030,6 +2085,7 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             &store,
             project_id,
             Some(selectors),
+            Some(&persisted_scope_hashes(evidence)),
         )
         .map_err(|error| {
             project_catalog_admin::admin_error(
@@ -2064,6 +2120,17 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
         }
         Ok(())
     }
+}
+
+fn persisted_scope_hashes(
+    evidence: &project_catalog_admin::RetirementJournalEvidence,
+) -> BTreeSet<String> {
+    evidence
+        .catalog_scope
+        .as_ref()
+        .map(bbox_code_source::scope_hash)
+        .into_iter()
+        .collect()
 }
 
 fn reconcile_completed_retained_owner_deletions(
@@ -2320,7 +2387,6 @@ impl RetireProbe {
             }
             ClassProbe::Committed(mut identities) => {
                 identities.sort();
-                identities.dedup();
                 self.evidence
                     .external_reference_counts
                     .insert(class.to_string(), identities.len() as u64);
@@ -2384,6 +2450,7 @@ fn probe_retire_evidence(
     store: &ProjectCatalogStore,
     project_id: &ProjectId,
     selector_override: Option<&[String]>,
+    scope_override: Option<&BTreeSet<String>>,
 ) -> Result<RetireProbe, CommandFailure> {
     let mut probe = RetireProbe::default();
     let state = store.snapshot()?;
@@ -2408,14 +2475,16 @@ fn probe_retire_evidence(
     match bbox_code_source_store::CodeSourceStorePaths::new(&code_sources) {
         Ok(paths) => {
             let activation = paths.activation(project_id);
-            probe.record("code_source_activation", presence_probe(&activation));
+            probe.record("code_source_activation", file_commitment_probe(&activation));
             // R3F1: producer assignments come from the config grants only.
             // A producer assignment is a config-level grant where a producer
             // is authorized to publish to one of the project's scopes. The
             // migration-era effective-source manifest is NOT read. If the
             // project's scope is no longer in any producer's grant list,
             // the assignment count is zero.
-            let current_scopes = current_scope_hashes(&state, project_id);
+            let current_scopes = scope_override
+                .cloned()
+                .unwrap_or_else(|| current_scope_hashes(&state, project_id));
             let assignment_count = count_config_producer_assignments(config, &current_scopes);
             probe.record("producer_assignments", assignment_count);
             // R3F1: generation evidence comes from the activation record's
@@ -2785,6 +2854,7 @@ fn capture_retirement_evidence(
         &catalog_store,
         project_id,
         Some(&project_selectors),
+        None,
     )
     .map_err(|error| {
         project_catalog_admin::admin_error(
@@ -3149,10 +3219,17 @@ fn count_project_rows(
         return ClassProbe::Unprobeable;
     };
     let mut commitments = Vec::new();
-    let mut stack = vec![&value];
-    while let Some(node) = stack.pop() {
+    let mut stack = vec![("$".to_string(), &value)];
+    while let Some((location, node)) = stack.pop() {
         match node {
-            serde_json::Value::Array(items) => stack.extend(items.iter()),
+            serde_json::Value::Array(items) => {
+                stack.extend(
+                    items
+                        .iter()
+                        .enumerate()
+                        .map(|(index, item)| (format!("{location}[{index}]"), item)),
+                );
+            }
             serde_json::Value::Object(map) => {
                 let hit = match map
                     .get("project_id")
@@ -3167,26 +3244,18 @@ fn count_project_rows(
                     }),
                 };
                 if hit {
-                    commitments.push(retirement_commitment(node));
+                    commitments.push(retirement_commitment(&(location, node)));
                 } else {
-                    stack.extend(map.values());
+                    stack.extend(
+                        map.iter()
+                            .map(|(key, value)| (format!("{location}.{key}"), value)),
+                    );
                 }
             }
             _ => {}
         }
     }
     ClassProbe::Committed(commitments)
-}
-
-/// No-follow presence test for one store-owned record. `Path::exists`
-/// follows symlinks, which would let a link into unrelated state answer an
-/// evidence question about this project's own store.
-fn presence_probe(path: &Path) -> ClassProbe {
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ClassProbe::Counted(0),
-        Ok(metadata) if metadata.is_file() => ClassProbe::Counted(1),
-        _ => ClassProbe::Unprobeable,
-    }
 }
 
 fn file_commitment_probe(path: &Path) -> ClassProbe {

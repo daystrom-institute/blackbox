@@ -1124,6 +1124,41 @@ fn retire_lifecycle_with_collected_activation_converges_and_is_idempotent() {
         recovery_refused["error"]["code"],
         "error.project_catalog_retire_recovery_not_quiescent"
     );
+
+    fs::remove_file(state.join(format!("code-sources/activations/{project_id}.json"))).unwrap();
+    let scope = PublishedScope::try_new("lifecycle", ".").unwrap();
+    fs::create_dir_all(
+        state
+            .join("code-sources/scopes")
+            .join(bbox_code_source::scope_hash(&scope))
+            .join("generations")
+            .join("9".repeat(64)),
+    )
+    .unwrap();
+    let generation_plan_hash =
+        retirement_plan_hash(projects, &project_id, config, None, &index_path);
+    let generation_refused = run_with_isolated_index(
+        &[
+            "project-catalog",
+            "retirement-journal",
+            "--projects-path",
+            projects,
+            "--project",
+            &project_id,
+            "--execute",
+            "--plan-hash",
+            &generation_plan_hash,
+            "--config",
+            config,
+        ],
+        &index_path,
+    );
+    assert!(!generation_refused.status.success());
+    let generation_refused: Value = serde_json::from_slice(&generation_refused.stdout).unwrap();
+    assert_eq!(
+        generation_refused["error"]["code"],
+        "error.project_catalog_retire_evidence_generations"
+    );
 }
 
 #[test]
@@ -1197,6 +1232,41 @@ fn retirement_execute_refuses_when_prepared_plan_hash_drifts() {
             .catalog()
             .projects
             .contains_key(&ProjectId::parse(project_id).unwrap())
+    );
+}
+
+#[test]
+fn retirement_execute_refuses_activation_content_mutation() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (state, projects_path, config_path, index_path) = isolated_state_root(&root);
+    let projects = projects_path.to_str().unwrap();
+    let config = config_path.to_str().unwrap();
+    let project_id = add_published_project(projects, "activationplan", ".", "2026-07-27T00:00:00Z");
+    write_collected_activation(&state, &project_id, &"a".repeat(64));
+    let plan_hash = retirement_plan_hash(projects, &project_id, config, None, &index_path);
+    write_collected_activation(&state, &project_id, &"b".repeat(64));
+    let refused = run_with_isolated_index(
+        &[
+            "project-catalog",
+            "retirement-journal",
+            "--projects-path",
+            projects,
+            "--project",
+            &project_id,
+            "--execute",
+            "--plan-hash",
+            &plan_hash,
+            "--config",
+            config,
+        ],
+        &index_path,
+    );
+    assert!(!refused.status.success());
+    let refused: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(
+        refused["error"]["code"],
+        "error.project_catalog_retire_plan_drift"
     );
 }
 
