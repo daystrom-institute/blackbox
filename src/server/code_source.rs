@@ -1799,7 +1799,45 @@ pub(crate) fn spawn_commit_observer(state: &Arc<SharedState>) {
         .spawn(move || {
             let poll_interval = std::time::Duration::from_secs(2);
             while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
-                let events = observer.drain_events();
+                let mut events = observer.drain_events();
+                if observer.take_rescan_required() {
+                    let mut project_ids = state
+                        .code_sources
+                        .assignments()
+                        .into_iter()
+                        .map(|(_, project_id)| project_id)
+                        .collect::<BTreeSet<_>>();
+                    match state.code_sources.store().activation_records_mixed() {
+                        Ok(records) => {
+                            project_ids.extend(
+                                records
+                                    .into_iter()
+                                    .map(|record| record.project_id().to_string()),
+                            );
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "catalog observer bounded rescan failed");
+                        }
+                    }
+                    if project_ids.len() > 4096 {
+                        project_ids = project_ids.into_iter().take(4096).collect();
+                    }
+                    for project_id in &project_ids {
+                        let _ = state.code_sources.store().record_health_failure(
+                            project_id,
+                            "catalog_observer_rescan",
+                            "observer delivery overflow or read failure required a bounded rescan",
+                        );
+                    }
+                    if !project_ids.is_empty() {
+                        events.push(
+                            bbox_indexing::project_catalog_store::CatalogCommittedEvent {
+                                epoch: 0,
+                                changed_project_ids: project_ids,
+                            },
+                        );
+                    }
+                }
                 for event in events {
                     for project_id in &event.changed_project_ids {
                         // Map each affected id to one reconciler event
@@ -1821,13 +1859,24 @@ pub(crate) fn spawn_commit_observer(state: &Arc<SharedState>) {
                             .find(|(_, pid)| pid == project_id)
                             .map(|(scope, _)| scope)
                             .or_else(|| {
-                                state
-                                    .code_sources
-                                    .store()
-                                    .load_activation_mixed(project_id)
-                                    .ok()
-                                    .flatten()
-                                    .and_then(|a| a.published_scope().cloned())
+                                match state.code_sources.store().load_activation_mixed(project_id) {
+                                    Ok(activation) => activation
+                                        .and_then(|record| record.published_scope().cloned()),
+                                    Err(error) => {
+                                        tracing::error!(
+                                            project_id,
+                                            %error,
+                                            "catalog observer activation read failed"
+                                        );
+                                        let _ = state.code_sources.store().record_health_failure(
+                                            project_id,
+                                            "catalog_observer_read_failed",
+                                            &error.to_string(),
+                                        );
+                                        observer.request_rescan();
+                                        None
+                                    }
+                                }
                             });
                         let Some(scope) = scope else {
                             // No assignment and no activation record: skip.
@@ -8337,6 +8386,20 @@ mod tests {
         assert_eq!(drained[0].epoch, 42);
         assert_eq!(drained[0].changed_project_ids, ids);
         assert!(!observer.has_events());
+    }
+
+    #[test]
+    fn p4e_post_commit_observer_overflow_requests_bounded_rescan() {
+        use bbox_indexing::project_catalog_store::{CatalogCommitObserver, CatalogCommittedEvent};
+        let observer = CatalogCommitObserver::new();
+        for index in 0..4100 {
+            observer.push_for_test(CatalogCommittedEvent {
+                epoch: index,
+                changed_project_ids: BTreeSet::from([format!("p_{index:032x}")]),
+            });
+        }
+        assert!(observer.take_rescan_required());
+        assert!(observer.drain_events().len() <= 1);
     }
 
     // P4-E commit (c): bridge-clear and scope-migrate refusal tests.

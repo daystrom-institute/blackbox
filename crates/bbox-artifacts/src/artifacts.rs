@@ -319,6 +319,7 @@ pub struct ArtifactRetirementTarget {
     pub metadata_sha256: String,
     pub version_metadata: Vec<ArtifactMetadataCommitment>,
     pub payload_sha256: String,
+    pub tree_manifest: Vec<ArtifactMetadataCommitment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -366,6 +367,14 @@ impl ArtifactRetirementTarget {
             {
                 bail!("artifact retirement version metadata commitment is invalid");
             }
+        }
+        if self.tree_manifest.is_empty()
+            || self
+                .tree_manifest
+                .iter()
+                .any(|entry| !strict_sha256(&entry.sha256))
+        {
+            bail!("artifact retirement tree manifest is invalid");
         }
         Ok(())
     }
@@ -489,6 +498,37 @@ pub fn capture_project_catalog_retirement_targets(
             MAX_RETIREMENT_PAYLOAD_BYTES,
             &mut aggregate_bytes,
         )?;
+        let mut tree_manifest = Vec::new();
+        for tree_entry in WalkDir::new(directory).follow_links(false) {
+            let tree_entry = tree_entry?;
+            if tree_entry.file_type().is_symlink() {
+                bail!("artifact retirement tree contains a symlink");
+            }
+            if !tree_entry.file_type().is_file() {
+                continue;
+            }
+            tree_manifest.push(ArtifactMetadataCommitment {
+                path: tree_entry
+                    .path()
+                    .strip_prefix(root)?
+                    .to_str()
+                    .context("artifact tree path is not UTF-8")?
+                    .to_string(),
+                sha256: hash_bounded_regular_nofollow(
+                    tree_entry.path(),
+                    MAX_RETIREMENT_PAYLOAD_BYTES,
+                    &mut aggregate_bytes,
+                )?,
+            });
+        }
+        tree_manifest.push(ArtifactMetadataCommitment {
+            path: payload_relative
+                .to_str()
+                .context("artifact payload path is not UTF-8")?
+                .to_string(),
+            sha256: payload_hash.clone(),
+        });
+        tree_manifest.sort();
         let target = ArtifactRetirementTarget {
             owner_project_id: project_id.to_string(),
             legacy_project_path: metadata.project_id.is_none().then(|| {
@@ -512,6 +552,7 @@ pub fn capture_project_catalog_retirement_targets(
             metadata_sha256: hex::encode(sha2::Sha256::digest(&metadata_bytes)),
             version_metadata,
             payload_sha256: payload_hash,
+            tree_manifest,
         };
         target.validate()?;
         targets.push(target);
@@ -710,6 +751,7 @@ impl AnchoredArtifactRoot {
 
         self.validate_target_state(
             target,
+            &parent_fd,
             parent,
             directory_name,
             &metadata_tombstone,
@@ -739,6 +781,7 @@ impl AnchoredArtifactRoot {
     fn validate_target_state(
         &self,
         target: &ArtifactRetirementTarget,
+        parent_fd: &fs::File,
         parent: &Path,
         directory_name: &std::ffi::OsStr,
         metadata_tombstone: &std::ffi::OsStr,
@@ -793,6 +836,39 @@ impl AnchoredArtifactRoot {
         let payload_path =
             payload_path.context("artifact metadata remains after payload disappeared")?;
         let mut aggregate = 0_u64;
+        let mut current_tree = Vec::new();
+        collect_artifact_tree_at(
+            parent_fd,
+            if live_directory_kind.is_some() {
+                directory_name
+            } else {
+                metadata_tombstone
+            },
+            directory,
+            &mut aggregate,
+            &mut current_tree,
+        )?;
+        let payload_file = open_artifact_at(
+            parent_fd.as_raw_fd(),
+            if live_payload_kind.is_some() {
+                payload_name
+            } else {
+                payload_tombstone
+            },
+            false,
+        )?;
+        current_tree.push(ArtifactMetadataCommitment {
+            path: target.payload_path.clone(),
+            sha256: hash_open_artifact_file(
+                payload_file,
+                MAX_RETIREMENT_PAYLOAD_BYTES,
+                &mut aggregate,
+            )?,
+        });
+        current_tree.sort();
+        if current_tree != target.tree_manifest {
+            bail!("artifact retirement tree drifted after Prepared");
+        }
         let metadata_bytes = self.read_bounded_file(
             &metadata_path,
             MAX_RETIREMENT_METADATA_BYTES,
@@ -1096,6 +1172,70 @@ fn remove_artifact_entry_at(parent: &fs::File, name: &std::ffi::OsStr) -> Result
     }
     parent.sync_all()?;
     Ok(true)
+}
+
+#[cfg(unix)]
+fn collect_artifact_tree_at(
+    parent: &fs::File,
+    name: &std::ffi::OsStr,
+    logical_path: &Path,
+    aggregate: &mut u64,
+    entries: &mut Vec<ArtifactMetadataCommitment>,
+) -> Result<()> {
+    let directory = open_artifact_at(parent.as_raw_fd(), name, true)?;
+    for child_name in list_artifact_directory(&directory)? {
+        let child_logical = logical_path.join(&child_name);
+        match entry_kind_at(&directory, &child_name)? {
+            Some(ArtifactEntryKind::Directory) => collect_artifact_tree_at(
+                &directory,
+                &child_name,
+                &child_logical,
+                aggregate,
+                entries,
+            )?,
+            Some(ArtifactEntryKind::Regular) => {
+                let file = open_artifact_at(directory.as_raw_fd(), &child_name, false)?;
+                entries.push(ArtifactMetadataCommitment {
+                    path: child_logical
+                        .to_str()
+                        .context("artifact tree path is not UTF-8")?
+                        .to_string(),
+                    sha256: hash_open_artifact_file(file, MAX_RETIREMENT_PAYLOAD_BYTES, aggregate)?,
+                });
+            }
+            None => bail!("artifact tree changed during validation"),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn hash_open_artifact_file(mut file: fs::File, limit: u64, aggregate: &mut u64) -> Result<String> {
+    use std::io::Read;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > limit {
+        bail!("artifact tree file exceeds its bound");
+    }
+    *aggregate = aggregate
+        .checked_add(metadata.len())
+        .context("artifact aggregate byte count overflowed")?;
+    if *aggregate > MAX_RETIREMENT_AGGREGATE_BYTES {
+        bail!("artifact tree exceeds its aggregate bound");
+    }
+    let mut remaining = metadata.len();
+    let mut hash = sha2::Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let chunk = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+        let read = file.read(&mut buffer[..chunk])?;
+        if read == 0 {
+            bail!("artifact tree file changed while hashing");
+        }
+        hash.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    Ok(hex::encode(hash.finalize()))
 }
 
 #[cfg(unix)]
@@ -3542,6 +3682,10 @@ mod tests {
             metadata_sha256: "a".repeat(64),
             version_metadata: Vec::new(),
             payload_sha256: "b".repeat(64),
+            tree_manifest: vec![ArtifactMetadataCommitment {
+                path: "projects/project1/local/agent/a/metadata.json".into(),
+                sha256: "a".repeat(64),
+            }],
         };
         assert!(valid.validate().is_ok());
         for invalid in [
@@ -3596,6 +3740,10 @@ mod tests {
             metadata_sha256: hex::encode(sha2::Sha256::digest(b"metadata")),
             version_metadata: Vec::new(),
             payload_sha256: hex::encode(sha2::Sha256::digest(b"payload")),
+            tree_manifest: vec![ArtifactMetadataCommitment {
+                path: "projects/project1/local/agent/a/metadata.json".into(),
+                sha256: hex::encode(sha2::Sha256::digest(b"metadata")),
+            }],
         };
         assert!(discharge_project_catalog_targets(&root, &[target]).is_err());
         assert!(outside.join("project1/local/agent/a.json").exists());
@@ -3687,5 +3835,39 @@ mod tests {
         let result = list_artifact_directory(&handle);
         TEST_ARTIFACT_READDIR_FAIL_AFTER.store(-1, std::sync::atomic::Ordering::SeqCst);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn artifact_retirement_tree_manifest_refuses_added_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let artifact = root.join("projects/project-a/local/agent/tree");
+        fs::create_dir_all(&artifact).unwrap();
+        let metadata = ArtifactMetadata {
+            kind: ArtifactKind::Agent,
+            name: "tree".into(),
+            version: "1".into(),
+            source: "fixture".into(),
+            installed_at: "2026-07-27T00:00:00Z".into(),
+            content_sha256: Some("a".repeat(64)),
+            project_id: Some("project-a".into()),
+            project_path: None,
+            local: true,
+            supersedes: None,
+            supersedes_chain: Vec::new(),
+            superseded_by: None,
+            active: true,
+            install_warnings: Vec::new(),
+        };
+        fs::write(
+            artifact.join("metadata.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        fs::write(artifact.with_extension("json"), b"payload").unwrap();
+        let targets = capture_project_catalog_retirement_targets(&root, "project-a", &[]).unwrap();
+        fs::write(artifact.join("late-version.json"), b"late").unwrap();
+        assert!(discharge_project_catalog_targets(&root, &targets).is_err());
+        assert!(artifact.exists());
     }
 }

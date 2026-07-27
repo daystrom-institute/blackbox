@@ -2214,7 +2214,7 @@ pub struct ProjectRetirementJournal {
 }
 
 impl ProjectRetirementJournal {
-    pub const VERSION: u32 = 4;
+    pub const VERSION: u32 = 5;
 
     pub fn new(project_id: ProjectId, catalog_epoch: u64, now: &str) -> Self {
         let mut journal = Self {
@@ -2533,7 +2533,7 @@ fn load_retirement_journal_from_path(
     let version = u32::try_from(version)
         .map_err(|_| RetirementJournalError::other("retirement journal version is invalid"))?;
     if version != ProjectRetirementJournal::VERSION {
-        if version == 1 || version == 2 || version == 3 {
+        if version == 1 || version == 2 || version == 3 || version == 4 {
             return Err(RetirementJournalError::UpgradeRequired(version));
         }
         return Err(RetirementJournalError::other(format!(
@@ -5205,6 +5205,10 @@ mod tests {
                     metadata_sha256: "a".repeat(64),
                     version_metadata: Vec::new(),
                     payload_sha256: "b".repeat(64),
+                    tree_manifest: vec![bbox_artifacts::artifacts::ArtifactMetadataCommitment {
+                        path: format!("{invalid_directory}/metadata.json"),
+                        sha256: "a".repeat(64),
+                    }],
                 }]);
             journal.seal_retirement_evidence();
             let path = retirement_journal_path(tmp.path(), &pid);

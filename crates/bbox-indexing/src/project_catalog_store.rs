@@ -227,13 +227,19 @@ pub struct CatalogCommittedEvent {
 /// triggers one bounded rescan (R5).
 #[derive(Clone)]
 pub struct CatalogCommitObserver {
-    queue: Arc<std::sync::Mutex<std::collections::VecDeque<CatalogCommittedEvent>>>,
+    queue: Arc<std::sync::Mutex<CatalogObserverQueue>>,
+}
+
+#[derive(Default)]
+struct CatalogObserverQueue {
+    event: Option<CatalogCommittedEvent>,
+    rescan_required: bool,
 }
 
 impl CatalogCommitObserver {
     pub fn new() -> Self {
         Self {
-            queue: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            queue: Arc::new(std::sync::Mutex::new(CatalogObserverQueue::default())),
         }
     }
 
@@ -249,7 +255,19 @@ impl CatalogCommitObserver {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.push_back(event);
+        const MAX_PENDING_PROJECTS: usize = 4096;
+        let pending = guard.event.get_or_insert_with(|| CatalogCommittedEvent {
+            epoch: event.epoch,
+            changed_project_ids: BTreeSet::new(),
+        });
+        pending.epoch = pending.epoch.max(event.epoch);
+        pending
+            .changed_project_ids
+            .extend(event.changed_project_ids);
+        if pending.changed_project_ids.len() > MAX_PENDING_PROJECTS {
+            guard.event = None;
+            guard.rescan_required = true;
+        }
     }
 
     /// Drain all pending commit events (section 9.4).
@@ -258,7 +276,23 @@ impl CatalogCommitObserver {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.drain(..).collect()
+        guard.event.take().into_iter().collect()
+    }
+
+    pub fn take_rescan_required(&self) -> bool {
+        let mut guard = match self.queue.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        std::mem::take(&mut guard.rescan_required)
+    }
+
+    pub fn request_rescan(&self) {
+        let mut guard = match self.queue.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.rescan_required = true;
     }
 
     /// Returns true if at least one event is pending.
@@ -267,14 +301,14 @@ impl CatalogCommitObserver {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        !guard.is_empty()
+        guard.event.is_some()
     }
 }
 
 impl fmt::Debug for CatalogCommitObserver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let len = match self.queue.lock() {
-            Ok(guard) => guard.len(),
+            Ok(guard) => usize::from(guard.event.is_some()),
             Err(_) => 0,
         };
         f.debug_struct("CatalogCommitObserver")

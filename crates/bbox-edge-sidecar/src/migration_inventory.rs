@@ -382,6 +382,7 @@ fn list_directory_names(directory: &fs::File) -> Result<Vec<std::ffi::OsString>>
         return Err(std::io::Error::last_os_error().into());
     }
     let mut names = Vec::new();
+    #[cfg(test)]
     let mut entries_seen = 0_isize;
     loop {
         set_readdir_errno(0);
@@ -400,12 +401,15 @@ fn list_directory_names(directory: &fs::File) -> Result<Vec<std::ffi::OsString>>
         let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
         if name != b"." && name != b".." {
             names.push(std::ffi::OsString::from_vec(name.to_vec()));
-            entries_seen += 1;
             #[cfg(test)]
-            if TEST_READDIR_FAIL_AFTER.load(std::sync::atomic::Ordering::SeqCst) == entries_seen {
-                // SAFETY: stream was returned by fdopendir and is closed once.
-                unsafe { libc::closedir(stream) };
-                return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+            {
+                entries_seen += 1;
+                if TEST_READDIR_FAIL_AFTER.load(std::sync::atomic::Ordering::SeqCst) == entries_seen
+                {
+                    // SAFETY: stream was returned by fdopendir and is closed once.
+                    unsafe { libc::closedir(stream) };
+                    return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+                }
             }
         }
     }

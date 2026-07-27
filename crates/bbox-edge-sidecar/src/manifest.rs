@@ -515,6 +515,9 @@ fn open_materialized_dir(edges_dir: &Path, create: bool) -> Result<fs::File> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::OpenOptionsExt;
 
+    if create {
+        fs::create_dir_all(edges_dir)?;
+    }
     let root = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
