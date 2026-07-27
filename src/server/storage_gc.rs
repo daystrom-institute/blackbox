@@ -85,7 +85,46 @@ fn run_storage_gc_pass(state: &SharedState) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let (deleted, errors) = storage_health::apply_gc(&candidates);
+    let mut ordinary = Vec::new();
+    let mut deleted = Vec::new();
+    let mut errors = Vec::new();
+    for candidate in &candidates {
+        if !candidate.deletable {
+            continue;
+        }
+        if candidate.kind != storage_health::FileKind::InactiveSnapshot {
+            ordinary.push(candidate.clone());
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let path = std::path::Path::new(&candidate.path);
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    match bbox_edge_sidecar::snapshot::remove_inactive_materialization_file(
+                        &edges_dir,
+                        path,
+                        (metadata.dev(), metadata.ino()),
+                    ) {
+                        Ok(true) => deleted.push(candidate.path.clone()),
+                        Ok(false) => {}
+                        Err(error) => errors.push(format!("{}: {error}", candidate.path)),
+                    }
+                }
+                Ok(_) => errors.push(format!(
+                    "{}: inactive snapshot candidate is not a regular nofollow file",
+                    candidate.path
+                )),
+                Err(error) => errors.push(format!("{}: {error}", candidate.path)),
+            }
+        }
+        #[cfg(not(unix))]
+        ordinary.push(candidate.clone());
+    }
+    let (ordinary_deleted, ordinary_errors) = storage_health::apply_gc(&ordinary);
+    deleted.extend(ordinary_deleted);
+    errors.extend(ordinary_errors);
     if errors.is_empty() {
         tracing::info!(
             deleted = deleted.len(),

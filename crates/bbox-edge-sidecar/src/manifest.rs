@@ -145,17 +145,33 @@ impl WorkspaceManifest {
     }
 
     pub fn write_to(edges_dir: &Path, manifest: &Self) -> Result<()> {
-        let dir = workspace_manifest_dir(edges_dir, &manifest.project_id);
-        fs::create_dir_all(&dir)?;
-        let path = dir.join("manifest.json");
-        let tmp_path = path.with_extension("json.tmp");
-        let mut file = fs::File::create(&tmp_path)?;
-        serde_json::to_writer_pretty(&mut file, manifest)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(tmp_path, path)?;
-        fs::File::open(&dir)?.sync_all()?;
-        Ok(())
+        #[cfg(unix)]
+        {
+            validate_single_component(&manifest.project_id, "project id")?;
+            let bytes = serde_json::to_vec_pretty(manifest)?;
+            return crate::snapshot::write_materialized_file_atomic(
+                edges_dir,
+                Path::new("workspace")
+                    .join(&manifest.project_id)
+                    .join("manifest.json")
+                    .as_path(),
+                &bytes,
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            let dir = workspace_manifest_dir(edges_dir, &manifest.project_id);
+            fs::create_dir_all(&dir)?;
+            let path = dir.join("manifest.json");
+            let tmp_path = path.with_extension("json.tmp");
+            let mut file = fs::File::create(&tmp_path)?;
+            serde_json::to_writer_pretty(&mut file, manifest)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(tmp_path, path)?;
+            fs::File::open(&dir)?.sync_all()?;
+            Ok(())
+        }
     }
 
     pub fn read_from(path: &Path) -> Result<Self> {

@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -41,6 +41,195 @@ fn lock_manifest_coordinator() -> Result<MutexGuard<'static, ()>> {
 pub fn with_manifest_coordinator<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
     let _coordinator = lock_manifest_coordinator()?;
     operation()
+}
+
+#[cfg(unix)]
+pub fn remove_inactive_materialization_file(
+    edges_dir: &Path,
+    candidate: &Path,
+    expected_identity: (u64, u64),
+) -> Result<bool> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    with_manifest_coordinator(|| {
+        let index = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
+        if index
+            .active_paths_for_loader(edges_dir)?
+            .iter()
+            .any(|active| active.path == candidate)
+        {
+            anyhow::bail!(
+                "refusing to delete materialization that became active: {}",
+                candidate.display()
+            );
+        }
+        let materialized = crate::manifest::materialized_dir(edges_dir);
+        let relative = candidate
+            .strip_prefix(&materialized)
+            .context("inactive materialization candidate escaped its root")?;
+        let components = relative
+            .components()
+            .map(|component| match component {
+                std::path::Component::Normal(value) => Ok(value.to_os_string()),
+                _ => anyhow::bail!("inactive materialization path is not normalized"),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let Some((leaf, parents)) = components.split_last() else {
+            anyhow::bail!("inactive materialization candidate has no leaf");
+        };
+        let mut directory = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&materialized)?;
+        for parent in parents {
+            let parent = std::ffi::CString::new(parent.as_bytes())?;
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    parent.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            directory = unsafe { fs::File::from_raw_fd(fd) };
+        }
+        let leaf = std::ffi::CString::new(leaf.as_bytes())?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                leaf.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(false);
+            }
+            return Err(error.into());
+        }
+        let file = unsafe { fs::File::from_raw_fd(fd) };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || (metadata.dev(), metadata.ino()) != expected_identity {
+            anyhow::bail!("inactive materialization candidate identity changed before deletion");
+        }
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                leaf.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let stat = unsafe { stat.assume_init() };
+        if (stat.st_dev as u64, stat.st_ino as u64) != expected_identity {
+            anyhow::bail!("inactive materialization candidate was replaced before deletion");
+        }
+        if unsafe { libc::unlinkat(directory.as_raw_fd(), leaf.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        directory.sync_all()?;
+        Ok(true)
+    })
+}
+
+#[cfg(unix)]
+pub(crate) fn write_materialized_file_atomic(
+    edges_dir: &Path,
+    relative: &Path,
+    bytes: &[u8],
+) -> Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let components = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(value) => Ok(value.to_os_string()),
+            _ => anyhow::bail!("materialized write path is not normalized"),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let Some((leaf, parents)) = components.split_last() else {
+        anyhow::bail!("materialized write path has no leaf");
+    };
+    let root = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(edges_dir)?;
+    let mut directory = root;
+    for component in
+        std::iter::once(std::ffi::OsString::from("materialized")).chain(parents.iter().cloned())
+    {
+        let component = std::ffi::CString::new(component.as_bytes())?;
+        if unsafe { libc::mkdirat(directory.as_raw_fd(), component.as_ptr(), 0o755) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(error.into());
+            }
+        }
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        directory = unsafe { fs::File::from_raw_fd(fd) };
+    }
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = std::ffi::OsString::from(format!(
+        ".{}.{}.{}.tmp",
+        leaf.to_string_lossy(),
+        std::process::id(),
+        sequence
+    ));
+    let temp_c = std::ffi::CString::new(temp.as_bytes())?;
+    let leaf_c = std::ffi::CString::new(leaf.as_bytes())?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            temp_c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        unsafe { libc::unlinkat(directory.as_raw_fd(), temp_c.as_ptr(), 0) };
+        return Err(error.into());
+    }
+    drop(file);
+    if unsafe {
+        libc::renameat(
+            directory.as_raw_fd(),
+            temp_c.as_ptr(),
+            directory.as_raw_fd(),
+            leaf_c.as_ptr(),
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        unsafe { libc::unlinkat(directory.as_raw_fd(), temp_c.as_ptr(), 0) };
+        return Err(error.into());
+    }
+    directory.sync_all()?;
+    Ok(())
 }
 
 /// Combined version stamp that gates per-file re-chunk in the project indexer.
@@ -645,31 +834,73 @@ pub fn write_snapshot_files(
     snapshot_id: &str,
     files: &[(&str, &[Edge])],
 ) -> Result<()> {
-    let snap_dir = snapshot_dir(edges_dir, project_id, snapshot_id);
-    if snap_dir.is_dir() {
+    #[cfg(unix)]
+    {
         for (filename, edges) in files {
-            write_edges_file_atomic(&snap_dir, filename, edges)?;
+            validate_snapshot_component(project_id)?;
+            validate_snapshot_component(snapshot_id)?;
+            validate_snapshot_component(filename)?;
+            let mut bytes = Vec::new();
+            for edge in *edges {
+                serde_json::to_writer(&mut bytes, edge)?;
+                bytes.push(b'\n');
+            }
+            write_materialized_file_atomic(
+                edges_dir,
+                Path::new("workspace")
+                    .join(project_id)
+                    .join("snapshots")
+                    .join(snapshot_id)
+                    .join(filename)
+                    .as_path(),
+                &bytes,
+            )?;
         }
-        fs::File::open(&snap_dir)?.sync_all()?;
         return Ok(());
     }
-    let tmp_dir = snap_dir.with_extension("write-tmp");
+    #[cfg(not(unix))]
+    {
+        let snap_dir = snapshot_dir(edges_dir, project_id, snapshot_id);
+        if snap_dir.is_dir() {
+            for (filename, edges) in files {
+                write_edges_file_atomic(&snap_dir, filename, edges)?;
+            }
+            fs::File::open(&snap_dir)?.sync_all()?;
+            return Ok(());
+        }
+        let tmp_dir = snap_dir.with_extension("write-tmp");
 
-    if tmp_dir.is_dir() {
-        let _ = fs::remove_dir_all(&tmp_dir);
+        if tmp_dir.is_dir() {
+            let _ = fs::remove_dir_all(&tmp_dir);
+        }
+        fs::create_dir_all(&tmp_dir)?;
+        for (filename, edges) in files {
+            write_edges_file(&tmp_dir.join(*filename), edges)?;
+        }
+        fs::File::open(&tmp_dir)?.sync_all()?;
+        fs::rename(&tmp_dir, &snap_dir)?;
+        fs::File::open(
+            snap_dir
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("snapshot directory has no parent"))?,
+        )?
+        .sync_all()?;
+        Ok(())
     }
-    fs::create_dir_all(&tmp_dir)?;
-    for (filename, edges) in files {
-        write_edges_file(&tmp_dir.join(*filename), edges)?;
+}
+
+fn validate_snapshot_component(value: &str) -> Result<()> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || path.is_absolute()
+        || path.components().count() != 1
+        || !matches!(
+            path.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        anyhow::bail!("snapshot writer component is not a single normalized name");
     }
-    fs::File::open(&tmp_dir)?.sync_all()?;
-    fs::rename(&tmp_dir, &snap_dir)?;
-    fs::File::open(
-        snap_dir
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("snapshot directory has no parent"))?,
-    )?
-    .sync_all()?;
     Ok(())
 }
 
@@ -733,6 +964,7 @@ pub fn create_snapshot_edge_writer(
     })
 }
 
+#[cfg(not(unix))]
 fn write_edges_file_atomic(directory: &Path, filename: &str, edges: &[Edge]) -> Result<()> {
     let path = directory.join(filename);
     let temporary = path.with_extension("jsonl.tmp");
@@ -741,6 +973,7 @@ fn write_edges_file_atomic(directory: &Path, filename: &str, edges: &[Edge]) -> 
     Ok(())
 }
 
+#[cfg(not(unix))]
 fn write_edges_file(path: &Path, edges: &[Edge]) -> Result<()> {
     let file = fs::File::create(path)?;
     // Buffered: one syscall per ~8KiB instead of one per serialized
@@ -1748,6 +1981,80 @@ mod tests {
             active_snap.contains("sha_bbbb"),
             "active snapshot must be branch-b, got: {active_snap}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_snapshot_and_manifest_writers_refuse_symlinked_parents() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        fs::create_dir_all(edges_dir.join("materialized")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(
+            outside.path(),
+            edges_dir.join("materialized").join("workspace"),
+        )
+        .unwrap();
+        let edges = Vec::<Edge>::new();
+        assert!(
+            write_snapshot_files(&edges_dir, "p1", "snap1", &[("project.jsonl", &edges)]).is_err()
+        );
+        let manifest = WorkspaceManifest {
+            version: 1,
+            project_id: "p1".into(),
+            repo_id: None,
+            canonical_path: None,
+            git_common_dir: None,
+            git_worktree_dir: None,
+            branch: None,
+            head_sha: None,
+            dirty: false,
+            dirty_fingerprint: None,
+            active_snapshot_id: Some("snap1".into()),
+            active_dirty_overlay_id: None,
+            updated_at: None,
+        };
+        assert!(WorkspaceManifest::write_to(&edges_dir, &manifest).is_err());
+        assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inactive_gc_revalidates_activation_before_unlink() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let edges = Vec::<Edge>::new();
+        write_snapshot_files(&edges_dir, "p1", "snap1", &[("project.jsonl", &edges)]).unwrap();
+        let candidate = snapshot_dir(&edges_dir, "p1", "snap1").join("project.jsonl");
+        let metadata = fs::symlink_metadata(&candidate).unwrap();
+        let mut index = ManifestIndex::new();
+        index.upsert_workspace(
+            "p1",
+            WorkspaceIndexEntry {
+                manifest: "workspace/p1/manifest.json".into(),
+                active_snapshot: Some("workspace/p1/snapshots/snap1".into()),
+                dirty_overlay: None,
+                repo_materialization: None,
+                code_source_selector: Some("local:p1".into()),
+                code_source_generation: Some("local".into()),
+                git_overlay: None,
+                git_overlay_managed: false,
+            },
+        );
+        index.write_atomic(&edges_dir).unwrap();
+        assert!(
+            remove_inactive_materialization_file(
+                &edges_dir,
+                &candidate,
+                (metadata.dev(), metadata.ino())
+            )
+            .is_err()
+        );
+        assert!(candidate.is_file());
     }
 
     #[test]

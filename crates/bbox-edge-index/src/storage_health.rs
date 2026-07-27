@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
@@ -162,7 +162,7 @@ pub fn scan_storage_health(
         )?;
     }
 
-    scan_inactive_snapshots(edges_dir, project_filter, &mut totals, &mut files);
+    scan_inactive_snapshots(edges_dir, project_filter, &mut totals, &mut files)?;
     let observed = scan_observed_dir(edges_dir, project_filter, &mut totals, &mut files);
 
     files.sort_by_key(|b| std::cmp::Reverse(b.bytes));
@@ -614,54 +614,61 @@ fn scan_inactive_snapshots(
     project_filter: Option<&str>,
     totals: &mut StorageHealthTotals,
     files: &mut Vec<StorageFileInfo>,
-) {
+) -> Result<()> {
     let active_prefixes = collect_protected_jsonl_prefixes(edges_dir);
     let mat_dir = bbox_edge_sidecar::manifest::materialized_dir(edges_dir);
-    if !mat_dir.is_dir() {
-        return;
+    match fs::symlink_metadata(&mat_dir) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => anyhow::bail!("materialized edge root is not a safe directory"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
     }
-    fn walk_for_inactive(
-        dir: &Path,
-        active_prefixes: &[String],
-        project_filter: Option<&str>,
-        totals: &mut StorageHealthTotals,
-        files: &mut Vec<StorageFileInfo>,
-    ) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if path.is_dir() {
-                walk_for_inactive(&path, active_prefixes, project_filter, totals, files);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                let path_str = match path.to_str() {
-                    Some(s) => s,
-                    None => continue,
-                };
-                if active_prefixes.iter().any(|p| path_str == p) {
-                    continue;
-                }
-                let bytes = match fs::metadata(&path) {
-                    Ok(m) => m.len(),
-                    Err(_) => continue,
-                };
-                let project_id = extract_project_from_workspace_path(&path);
-                if !project_filter_matches(project_id.as_deref(), project_filter) {
-                    continue;
-                }
-                totals.accumulate(FileKind::InactiveSnapshot, bytes);
-                files.push(StorageFileInfo {
-                    path: path_str.to_string(),
-                    kind: FileKind::InactiveSnapshot,
-                    project_id,
-                    bytes,
-                    reason: Some("inactive snapshot not in active manifest paths".into()),
-                });
+    const MAX_MATERIALIZED_ENTRIES: usize = 250_000;
+    let mut entries = 0usize;
+    let mut pending = vec![mat_dir];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            entries += 1;
+            if entries > MAX_MATERIALIZED_ENTRIES {
+                anyhow::bail!("materialized edge inventory exceeds its entry bound");
             }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                anyhow::bail!(
+                    "materialized edge inventory contains a symlink: {}",
+                    path.display()
+                );
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !metadata.is_file() || path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let path_str = path
+                .to_str()
+                .context("materialized edge path is not UTF-8")?;
+            if active_prefixes.iter().any(|p| path_str == p) {
+                continue;
+            }
+            let project_id = extract_project_from_workspace_path(&path);
+            if !project_filter_matches(project_id.as_deref(), project_filter) {
+                continue;
+            }
+            totals.accumulate(FileKind::InactiveSnapshot, metadata.len());
+            files.push(StorageFileInfo {
+                path: path_str.to_string(),
+                kind: FileKind::InactiveSnapshot,
+                project_id,
+                bytes: metadata.len(),
+                reason: Some("inactive snapshot not in active manifest paths".into()),
+            });
         }
     }
-    walk_for_inactive(&mat_dir, &active_prefixes, project_filter, totals, files);
+    Ok(())
 }
 
 fn scan_observed_dir(
