@@ -674,7 +674,41 @@ mod tests {
                 &project_one,
                 &scope_a,
                 &"a".repeat(64),
-                Some("project-two"),
+                &BTreeSet::from(["project-two".to_string()]),
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn retirement_refuses_ownerless_generation_in_current_scope() {
+        let project_two = ProjectId::parse("project-two").unwrap();
+        let scope_a = PublishedScope::try_new("scope-a", ".").unwrap();
+        let error = retirement_generation_is_owned(
+            Some(&scope_a),
+            &project_two,
+            &scope_a,
+            &"b".repeat(64),
+            &BTreeSet::new(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_retire_ownerless_generation"
+        );
+    }
+
+    #[test]
+    fn retiring_new_scope_owner_preserves_prior_owners_retained_generation() {
+        let project_two = ProjectId::parse("project-two").unwrap();
+        let scope_a = PublishedScope::try_new("scope-a", ".").unwrap();
+        assert!(
+            !retirement_generation_is_owned(
+                Some(&scope_a),
+                &project_two,
+                &scope_a,
+                &"c".repeat(64),
+                &BTreeSet::from(["project-one".to_string()]),
             )
             .unwrap()
         );
@@ -1293,6 +1327,37 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
         project_id: &ProjectId,
     ) -> project_catalog_admin::AdminResult<project_catalog_admin::RetirementJournalEvidence> {
         capture_retirement_evidence(self.config, self.projects_path, project_id)
+    }
+
+    fn validate_retirement_evidence(
+        &mut self,
+        _store: &ProjectCatalogStore,
+        project_id: &ProjectId,
+        evidence: &project_catalog_admin::RetirementJournalEvidence,
+    ) -> project_catalog_admin::AdminResult<()> {
+        let current = capture_retirement_evidence(self.config, self.projects_path, project_id)?;
+        let expected_generations = evidence
+            .owned_generations
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let current_generations = current
+            .owned_generations
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if evidence.owner_project_id.as_ref() != Some(project_id)
+            || current.owner_project_id != evidence.owner_project_id
+            || current.catalog_scope != evidence.catalog_scope
+            || current_generations != expected_generations
+            || current.owned_blob_hashes != evidence.owned_blob_hashes
+        {
+            return Err(project_catalog_admin::admin_error(
+                "error.project_catalog_retire_evidence_drift",
+                "retirement evidence no longer matches owner-validated store state",
+            ));
+        }
+        Ok(())
     }
 
     /// Stage CollectedGenerationsDischarged: clear the activation record,
@@ -1952,6 +2017,21 @@ fn capture_retirement_evidence(
             }
         }
     }
+    let mut durable_generation_owners = BTreeMap::<String, BTreeSet<String>>::new();
+    for (generation_id, owner) in &activation_owners {
+        durable_generation_owners
+            .entry(generation_id.clone())
+            .or_default()
+            .insert(owner.clone());
+    }
+    for migration in state.catalog().scope_migrations.values() {
+        if let Some(generation_id) = &migration.code_bridge_generation {
+            durable_generation_owners
+                .entry(generation_id.clone())
+                .or_default()
+                .insert(migration.project_id.as_str().to_string());
+        }
+    }
 
     let mut owned_generations = Vec::new();
     let mut owned_blob_hashes = BTreeSet::new();
@@ -1961,13 +2041,16 @@ fn capture_retirement_evidence(
             format!("failed to enumerate generation ownership: {e}"),
         )
     })? {
-        let activation_owner = activation_owners.get(&generation.generation_id);
+        let owner_claims = durable_generation_owners
+            .get(&generation.generation_id)
+            .cloned()
+            .unwrap_or_default();
         if !retirement_generation_is_owned(
             current_scope,
             project_id,
             &generation.published_scope,
             &generation.generation_id,
-            activation_owner.map(String::as_str),
+            &owner_claims,
         )? {
             continue;
         }
@@ -1979,8 +2062,10 @@ fn capture_retirement_evidence(
     }
 
     Ok(project_catalog_admin::RetirementJournalEvidence {
+        owner_project_id: Some(project_id.clone()),
         catalog_scope: current_scope.cloned(),
         owned_generations,
+        blob_inventory: None,
         owned_blob_hashes: owned_blob_hashes.into_iter().collect(),
     })
 }
@@ -1990,19 +2075,30 @@ fn retirement_generation_is_owned(
     project_id: &ProjectId,
     generation_scope: &PublishedScope,
     generation_id: &str,
-    activation_owner: Option<&str>,
+    owner_claims: &BTreeSet<String>,
 ) -> project_catalog_admin::AdminResult<bool> {
     let current_scope_owned = current_scope == Some(generation_scope);
-    if current_scope_owned && activation_owner.is_some_and(|owner| owner != project_id.as_str()) {
+    if owner_claims.len() > 1 {
         return Err(project_catalog_admin::admin_error(
             "error.project_catalog_retire_ambiguous_generation_owner",
             format!(
-                "generation {generation_id} is in project {project_id} current scope but activated by {}",
-                activation_owner.expect("checked as present")
+                "generation {generation_id} has conflicting durable owner claims: {owner_claims:?}"
             ),
         ));
     }
-    Ok(current_scope_owned || activation_owner == Some(project_id.as_str()))
+    if let Some(owner) = owner_claims.first() {
+        return Ok(owner == project_id.as_str());
+    }
+    if current_scope_owned {
+        return Err(project_catalog_admin::admin_error(
+            "error.project_catalog_retire_ownerless_generation",
+            format!(
+                "generation {generation_id} is retained in project {project_id} current scope \
+                 without durable owner-bound evidence"
+            ),
+        ));
+    }
+    Ok(false)
 }
 
 /// R3F1: count producer assignments from the config grants. A producer

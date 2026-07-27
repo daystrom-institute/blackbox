@@ -2151,18 +2151,21 @@ pub struct ProjectRetirementJournal {
 }
 
 impl ProjectRetirementJournal {
-    pub const VERSION: u32 = 1;
+    pub const VERSION: u32 = 2;
 
     pub fn new(project_id: ProjectId, catalog_epoch: u64, now: &str) -> Self {
         Self {
             version: Self::VERSION,
-            project_id,
+            project_id: project_id.clone(),
             started_at: now.to_string(),
             updated_at: now.to_string(),
             current_stage: RetirementJournalStage::Prepared,
             catalog_epoch_at_start: catalog_epoch,
             completed_steps: Vec::new(),
-            evidence: RetirementJournalEvidence::default(),
+            evidence: RetirementJournalEvidence {
+                owner_project_id: Some(project_id.clone()),
+                ..RetirementJournalEvidence::default()
+            },
         }
     }
 
@@ -2204,6 +2207,9 @@ pub struct RetirementJournalStep {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetirementJournalEvidence {
+    /// Project identity that owns every destructive evidence item.
+    pub owner_project_id: Option<ProjectId>,
+
     /// Current catalog scope captured before the final authority cut. This is
     /// the only scope producer grants may authorize for retirement checks.
     pub catalog_scope: Option<PublishedScope>,
@@ -2212,14 +2218,30 @@ pub struct RetirementJournalEvidence {
     /// will be deleted in stage CollectedGenerationsDischarged.
     pub owned_generations: Vec<RetirementGenerationEvidence>,
 
-    /// Exact blob hash inventory: content_sha256 hashes found in the
-    /// project's owned generation manifests. Used by
-    /// MaterializationSwept to delete unique blobs and preserve
-    /// shared ones.
+    /// Hash-linked blob inventory persisted in a bounded sidecar.
+    pub blob_inventory: Option<RetirementBlobInventoryRef>,
+
+    /// Runtime-only decoded sidecar contents.
+    #[serde(skip)]
     pub owned_blob_hashes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetirementBlobInventoryRef {
+    pub version: u32,
+    pub sha256: String,
+    pub blob_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetirementBlobInventorySidecar {
+    version: u32,
+    project_id: ProjectId,
+    blob_hashes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RetirementGenerationEvidence {
     pub published_scope: PublishedScope,
     pub generation_id: String,
@@ -2231,6 +2253,7 @@ pub enum RetirementJournalError {
     Io(std::io::Error),
     Serde(serde_json::Error),
     Other(String),
+    UpgradeRequired(u32),
 }
 
 impl std::fmt::Display for RetirementJournalError {
@@ -2239,6 +2262,10 @@ impl std::fmt::Display for RetirementJournalError {
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::Serde(e) => write!(f, "serde error: {e}"),
             Self::Other(msg) => write!(f, "{msg}"),
+            Self::UpgradeRequired(version) => write!(
+                f,
+                "retirement journal version {version} requires an explicit upgrade before resume"
+            ),
         }
     }
 }
@@ -2282,6 +2309,10 @@ fn archived_retirement_journal_path(
         .join("retirement-journals")
         .join("archive")
         .join(format!("{project_id}.json"))
+}
+
+fn retirement_blob_inventory_path(journal_path: &std::path::Path) -> std::path::PathBuf {
+    journal_path.with_extension("blobs.json")
 }
 
 /// Load a journal from disk. Returns `Ok(None)` if the file does not exist.
@@ -2347,10 +2378,13 @@ fn load_retirement_journal_from_path(
     #[cfg(not(unix))]
     let bytes = std::fs::read(&path)?;
 
-    let journal: ProjectRetirementJournal = serde_json::from_slice(&bytes)?;
+    let mut journal: ProjectRetirementJournal = serde_json::from_slice(&bytes)?;
 
     // Strict version check.
     if journal.version != ProjectRetirementJournal::VERSION {
+        if journal.version == 1 {
+            return Err(RetirementJournalError::UpgradeRequired(journal.version));
+        }
         return Err(RetirementJournalError::other(format!(
             "retirement journal version mismatch: expected {}, got {}",
             ProjectRetirementJournal::VERSION,
@@ -2369,7 +2403,85 @@ fn load_retirement_journal_from_path(
     // before current_stage. This prevents stage forgery where an
     // attacker edits current_stage to skip work.
     validate_journal_stage_history(&journal)?;
+    validate_journal_evidence_shape(&journal)?;
+    journal.evidence.owned_blob_hashes = load_retirement_blob_inventory(&path, &journal)?;
     Ok(Some(journal))
+}
+
+fn validate_sha256_text(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_journal_evidence_shape(
+    journal: &ProjectRetirementJournal,
+) -> Result<(), RetirementJournalError> {
+    if journal.evidence.owner_project_id.as_ref() != Some(&journal.project_id) {
+        return Err(RetirementJournalError::other(
+            "retirement journal evidence owner does not match the retiring project",
+        ));
+    }
+    let blob_ref = journal.evidence.blob_inventory.as_ref().ok_or_else(|| {
+        RetirementJournalError::other("retirement journal is missing its blob evidence reference")
+    })?;
+    if blob_ref.version != 1 || !validate_sha256_text(&blob_ref.sha256) {
+        return Err(RetirementJournalError::other(
+            "retirement journal blob evidence reference is invalid",
+        ));
+    }
+    let mut identities = std::collections::BTreeSet::new();
+    for generation in &journal.evidence.owned_generations {
+        if !validate_sha256_text(&generation.generation_id)
+            || !identities.insert((
+                generation.published_scope.clone(),
+                generation.generation_id.clone(),
+            ))
+        {
+            return Err(RetirementJournalError::other(
+                "retirement journal generation evidence is invalid or duplicated",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn load_retirement_blob_inventory(
+    journal_path: &std::path::Path,
+    journal: &ProjectRetirementJournal,
+) -> Result<Vec<String>, RetirementJournalError> {
+    const MAX_BLOB_INVENTORY_BYTES: usize = 64 * 1024 * 1024;
+    let path = retirement_blob_inventory_path(journal_path);
+    let bytes = std::fs::read(&path)?;
+    if bytes.len() > MAX_BLOB_INVENTORY_BYTES {
+        return Err(RetirementJournalError::other(
+            "retirement blob evidence exceeds its byte limit",
+        ));
+    }
+    let expected = journal.evidence.blob_inventory.as_ref().ok_or_else(|| {
+        RetirementJournalError::other("retirement journal is missing blob evidence")
+    })?;
+    let actual_sha256 = bbox_corpus_core::project_catalog_snapshot::sha256_hex(&bytes);
+    if actual_sha256 != expected.sha256 {
+        return Err(RetirementJournalError::other(
+            "retirement blob evidence hash does not match the journal",
+        ));
+    }
+    let sidecar: RetirementBlobInventorySidecar = serde_json::from_slice(&bytes)?;
+    if sidecar.version != 1 || sidecar.project_id != journal.project_id {
+        return Err(RetirementJournalError::other(
+            "retirement blob evidence identity is invalid",
+        ));
+    }
+    if sidecar.blob_hashes.len() as u64 != expected.blob_count
+        || sidecar
+            .blob_hashes
+            .iter()
+            .any(|hash| !validate_sha256_text(hash))
+    {
+        return Err(RetirementJournalError::other(
+            "retirement blob evidence count or hash is invalid",
+        ));
+    }
+    Ok(sidecar.blob_hashes)
 }
 
 /// R2F5: validate that completed_steps is an exactly ordered prefix
@@ -2449,6 +2561,12 @@ pub fn save_retirement_journal(
 ) -> Result<(), RetirementJournalError> {
     let dir = bro_home.join("retirement-journals");
     std::fs::create_dir_all(&dir)?;
+    let dir_metadata = std::fs::symlink_metadata(&dir)?;
+    if dir_metadata.file_type().is_symlink() || !dir_metadata.is_dir() {
+        return Err(RetirementJournalError::other(
+            "retirement-journals parent is not a regular directory",
+        ));
+    }
 
     // R3F4: open the parent directory for the post-rename fsync.
     // The directory handle ensures we sync the actual directory, not
@@ -2471,7 +2589,24 @@ pub fn save_retirement_journal(
         ));
     }
 
-    let bytes = serde_json::to_vec_pretty(journal)?;
+    let sidecar = RetirementBlobInventorySidecar {
+        version: 1,
+        project_id: journal.project_id.clone(),
+        blob_hashes: journal.evidence.owned_blob_hashes.clone(),
+    };
+    let sidecar_bytes = serde_json::to_vec(&sidecar)?;
+    let sidecar_path = retirement_blob_inventory_path(&path);
+    bbox_corpus_core::json_store::with_store_lock(&sidecar_path, || {
+        bbox_corpus_core::json_store::atomic_write_bytes_locked(&sidecar_path, &sidecar_bytes)
+    })
+    .map_err(|error| RetirementJournalError::other(error.to_string()))?;
+    let mut persisted = journal.clone();
+    persisted.evidence.blob_inventory = Some(RetirementBlobInventoryRef {
+        version: 1,
+        sha256: bbox_corpus_core::project_catalog_snapshot::sha256_hex(&sidecar_bytes),
+        blob_count: sidecar.blob_hashes.len() as u64,
+    });
+    let bytes = serde_json::to_vec_pretty(&persisted)?;
 
     // Bounded write: refuse oversized journals.
     if bytes.len() > MAX_JOURNAL_BYTES {
@@ -2558,7 +2693,12 @@ pub fn archive_retirement_journal(
         let archive_dir = dir.join("archive");
         std::fs::create_dir_all(&archive_dir)?;
         let archived = archived_retirement_journal_path(bro_home, project_id);
+        let sidecar = retirement_blob_inventory_path(&path);
+        let archived_sidecar = retirement_blob_inventory_path(&archived);
         std::fs::rename(&path, &archived)?;
+        if sidecar.is_file() {
+            std::fs::rename(&sidecar, &archived_sidecar)?;
+        }
         if let Ok(handle) = std::fs::File::open(&archive_dir) {
             let _ = handle.sync_all();
         }
@@ -2607,9 +2747,27 @@ pub trait RetirementDischargeWorkers {
     /// journal and consumed by later stages.
     fn capture_retirement_evidence(
         &mut self,
-        _project_id: &ProjectId,
+        project_id: &ProjectId,
     ) -> AdminResult<RetirementJournalEvidence> {
-        Ok(RetirementJournalEvidence::default())
+        Ok(RetirementJournalEvidence {
+            owner_project_id: Some(project_id.clone()),
+            ..RetirementJournalEvidence::default()
+        })
+    }
+
+    fn validate_retirement_evidence(
+        &mut self,
+        _store: &ProjectCatalogStore,
+        project_id: &ProjectId,
+        evidence: &RetirementJournalEvidence,
+    ) -> AdminResult<()> {
+        if evidence.owner_project_id.as_ref() != Some(project_id) {
+            return Err(admin_error(
+                "error.project_catalog_retire_evidence_owner",
+                "retirement evidence owner does not match the retiring project",
+            ));
+        }
+        Ok(())
     }
 
     /// Stage CollectedGenerationsDischarged: discharge collected
@@ -2704,9 +2862,12 @@ struct NoopDischargeWorkers;
 impl RetirementDischargeWorkers for NoopDischargeWorkers {
     fn capture_retirement_evidence(
         &mut self,
-        _project_id: &ProjectId,
+        project_id: &ProjectId,
     ) -> AdminResult<RetirementJournalEvidence> {
-        Ok(RetirementJournalEvidence::default())
+        Ok(RetirementJournalEvidence {
+            owner_project_id: Some(project_id.clone()),
+            ..RetirementJournalEvidence::default()
+        })
     }
     fn discharge_collected_generations(
         &mut self,
@@ -2756,6 +2917,16 @@ impl RetirementDischargeWorkers for NoopDischargeWorkers {
 /// journal timestamps.
 fn journal_now() -> String {
     unix_now_secs()
+}
+
+fn retirement_journal_admin_error(error: RetirementJournalError) -> ProjectCatalogStoreError {
+    match error {
+        RetirementJournalError::UpgradeRequired(version) => admin_error(
+            "error.project_catalog_retire_journal_upgrade_required",
+            format!("retirement journal version {version} requires an explicit upgrade"),
+        ),
+        other => admin_error("error.project_catalog_retire_journal_io", other.to_string()),
+    }
 }
 
 /// Current seconds since UNIX_EPOCH (falls back to 0 on clock issues).
@@ -2846,7 +3017,7 @@ pub fn retire_project_journaled_with(
 
     // Load or create the journal (recovery: section 11.4).
     let mut journal = match load_retirement_journal(bro_home, project_id)
-        .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?
+        .map_err(retirement_journal_admin_error)?
     {
         Some(j) if j.current_stage == RetirementJournalStage::Complete => {
             // Already complete. Verify quiescence (section 11.4).
@@ -2861,9 +3032,7 @@ pub fn retire_project_journaled_with(
             // skip all stages without calling any discharge workers.
             if !_project_exists {
                 let archived = load_archived_retirement_journal(bro_home, project_id)
-                    .map_err(|e| {
-                        admin_error("error.project_catalog_retire_journal_io", e.to_string())
-                    })?
+                    .map_err(retirement_journal_admin_error)?
                     .ok_or_else(|| {
                         admin_error(
                             "error.project_catalog_retire_missing_recovery_evidence",
@@ -2913,6 +3082,7 @@ pub fn retire_project_journaled_with(
         .current_stage
         .is_at_least(RetirementJournalStage::CollectedGenerationsDischarged)
     {
+        workers.validate_retirement_evidence(store, project_id, &journal.evidence)?;
         workers.discharge_collected_generations(project_id, &journal.evidence)?;
         journal.advance(&now());
         save_retirement_journal(bro_home, &journal)
@@ -4490,6 +4660,72 @@ mod tests {
     }
 
     #[test]
+    fn retirement_journal_v1_requires_explicit_upgrade() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = ProjectId::parse(PROJECT).unwrap();
+        let mut value =
+            serde_json::to_value(ProjectRetirementJournal::new(pid.clone(), 1, "1")).unwrap();
+        value["version"] = serde_json::json!(1);
+        let path = retirement_journal_path(tmp.path(), &pid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(matches!(
+            load_retirement_journal(tmp.path(), &pid),
+            Err(RetirementJournalError::UpgradeRequired(1))
+        ));
+    }
+
+    #[test]
+    fn retirement_journal_rejects_evidence_owner_drift_at_every_resume_stage() {
+        let stages = [
+            RetirementJournalStage::Prepared,
+            RetirementJournalStage::SourceAuthorityQuiesced,
+            RetirementJournalStage::CollectedGenerationsDischarged,
+            RetirementJournalStage::PublicationsCleared,
+            RetirementJournalStage::AttachmentsDetached,
+            RetirementJournalStage::CatalogPairRemoved,
+            RetirementJournalStage::MaterializationSwept,
+        ];
+        for stage in stages {
+            let tmp = tempfile::tempdir().unwrap();
+            let pid = ProjectId::parse(PROJECT).unwrap();
+            let mut journal = ProjectRetirementJournal::new(pid.clone(), 1, "1");
+            while journal.current_stage != stage {
+                journal.advance("2");
+            }
+            save_retirement_journal(tmp.path(), &journal).unwrap();
+            let path = retirement_journal_path(tmp.path(), &pid);
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            value["evidence"]["owner_project_id"] = serde_json::json!("project-drift");
+            std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            assert!(
+                load_retirement_journal(tmp.path(), &pid).is_err(),
+                "stage {stage:?} accepted drifted destructive evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn retirement_blob_sidecar_scales_to_manifest_file_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = ProjectId::parse(PROJECT).unwrap();
+        let mut journal = ProjectRetirementJournal::new(pid.clone(), 1, "1");
+        journal.evidence.owned_blob_hashes = (0_u64..250_000)
+            .map(|index| format!("{index:064x}"))
+            .collect();
+        save_retirement_journal(tmp.path(), &journal).unwrap();
+        assert!(
+            std::fs::metadata(retirement_journal_path(tmp.path(), &pid))
+                .unwrap()
+                .len()
+                < MAX_JOURNAL_BYTES as u64
+        );
+        let loaded = load_retirement_journal(tmp.path(), &pid).unwrap().unwrap();
+        assert_eq!(loaded.evidence.owned_blob_hashes.len(), 250_000);
+    }
+
+    #[test]
     fn retirement_journal_path_convention() {
         let bro_home = std::path::Path::new("/tmp/bro");
         let pid = ProjectId::parse(PROJECT).unwrap();
@@ -5098,9 +5334,7 @@ mod tests {
         // Forge: jump current_stage without recording the step.
         journal.current_stage = RetirementJournalStage::SourceAuthorityQuiesced;
         // completed_steps is still empty.
-        let path = retirement_journal_path(tmp.path(), &pid);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+        save_retirement_journal(tmp.path(), &journal).unwrap();
         let result = load_retirement_journal(tmp.path(), &pid);
         assert!(result.is_err(), "must refuse a forged stage skip");
         let err = format!("{:?}", result.unwrap_err());
@@ -5240,19 +5474,11 @@ mod tests {
 
         let pid = ProjectId::parse(PROJECT).unwrap();
         let journal = ProjectRetirementJournal::new(pid.clone(), 1, "1");
-        // This should still work because create_dir_all follows the symlink
-        // and the actual write goes through the resolved path. The key
-        // protection is that the dir handle opened for sync is also
-        // through the symlink. This test documents the current behavior:
-        // the symlink is followed for the dir, but the temp file itself
-        // uses O_NOFOLLOW. The important assertion is that the save
-        // completes without corruption.
         let result = save_retirement_journal(tmp.path(), &journal);
-        // The save should succeed (symlinked dir is followed, which is
-        // the expected behavior for a symlinked retirement-journals).
-        // The safety guarantee is that individual temp files use
-        // O_NOFOLLOW so they cannot be redirected.
-        assert!(result.is_ok(), "save through symlinked dir: {:?}", result);
+        assert!(
+            result.is_err(),
+            "save followed a symlinked parent directory"
+        );
     }
 
     /// R2F5: load accepts a valid journal with correct stage history.
@@ -5264,9 +5490,7 @@ mod tests {
         // Advance through two stages with monotonic timestamps.
         journal.advance("2024-01-01T00:00:01Z");
         journal.advance("2024-01-01T00:00:02Z");
-        let path = retirement_journal_path(tmp.path(), &pid);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+        save_retirement_journal(tmp.path(), &journal).unwrap();
         let result = load_retirement_journal(tmp.path(), &pid);
         assert!(result.is_ok(), "valid journal must load: {:?}", result);
     }
