@@ -733,7 +733,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let project = "project-retiring".to_string();
-        let selectors = vec![project.clone()];
+        let selectors = vec![project.clone(), "/repo/shared".to_string()];
         for (name, field) in [
             ("knowledge.json", "entries"),
             ("gaps.json", "gaps"),
@@ -748,17 +748,25 @@ mod tests {
                     "version": 1,
                     (field): [
                         {"project_id": project, "id": "remove"},
-                        {"project_id": "project-retained", "id": "keep"}
+                        {
+                            "project_id": "project-retained",
+                            "project": "/repo/shared",
+                            "id": "keep"
+                        }
                     ]
                 }))
                 .unwrap(),
             )
             .unwrap();
-            clear_wrapped_project_rows(&path, &[field], &PROJECT_ROW_KEYS, &selectors).unwrap();
+            clear_wrapped_project_rows(&path, &[field], &PROJECT_ROW_KEYS, &project, &selectors)
+                .unwrap();
             assert!(matches!(
-                count_project_rows(&path, &selectors, &PROJECT_ROW_KEYS),
+                count_project_rows(&path, &project, &selectors, &PROJECT_ROW_KEYS),
                 ClassProbe::Counted(0)
             ));
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(value[field][0]["id"], "keep");
         }
 
         let roadmap = root.join("roadmap.json");
@@ -766,16 +774,28 @@ mod tests {
             &roadmap,
             serde_json::to_vec(&serde_json::json!({
                 "version": 1,
-                "items": [{"project_id": project}, {"project_id": "project-retained"}],
-                "edges": [{"project_id": project}, {"project_id": "project-retained"}]
+                "items": [
+                    {"project_id": project},
+                    {"project_id": "project-retained", "project": "/repo/shared"}
+                ],
+                "edges": [
+                    {"project_id": project},
+                    {"project_id": "project-retained", "project": "/repo/shared"}
+                ]
             }))
             .unwrap(),
         )
         .unwrap();
-        clear_wrapped_project_rows(&roadmap, &["items", "edges"], &PROJECT_ROW_KEYS, &selectors)
-            .unwrap();
+        clear_wrapped_project_rows(
+            &roadmap,
+            &["items", "edges"],
+            &PROJECT_ROW_KEYS,
+            &project,
+            &selectors,
+        )
+        .unwrap();
         assert!(matches!(
-            count_project_rows(&roadmap, &selectors, &PROJECT_ROW_KEYS),
+            count_project_rows(&roadmap, &project, &selectors, &PROJECT_ROW_KEYS),
             ClassProbe::Counted(0)
         ));
 
@@ -785,15 +805,18 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
                 "bindings": {
                     "remove": {"project_id": project},
-                    "keep": {"project_id": "project-retained"}
+                    "keep": {
+                        "project_id": "project-retained",
+                        "project_dir": "/repo/shared"
+                    }
                 }
             }))
             .unwrap(),
         )
         .unwrap();
-        clear_slack_channel_bindings(&slack, &selectors).unwrap();
+        clear_slack_channel_bindings(&slack, &project, &selectors).unwrap();
         assert!(matches!(
-            count_project_rows(&slack, &selectors, &SLACK_ROW_KEYS),
+            count_project_rows(&slack, &project, &selectors, &SLACK_ROW_KEYS),
             ClassProbe::Counted(0)
         ));
     }
@@ -1575,6 +1598,18 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
                         format!("failed to delete exact generation record: {e}"),
                     )
                 })?;
+            store
+                .delete_retained_generation_owner(
+                    project_id,
+                    &generation.published_scope,
+                    &generation.generation_id,
+                )
+                .map_err(|e| {
+                    project_catalog_admin::admin_error(
+                        "error.project_catalog_retire_discharge_generations",
+                        format!("failed to delete retained-generation ownership: {e}"),
+                    )
+                })?;
         }
 
         // Keep activation ownership available until every exact generation
@@ -1594,7 +1629,8 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
         })?;
 
         for (path, array_fields, keys) in coordination_row_paths(self.config) {
-            clear_wrapped_project_rows(&path, array_fields, keys, &selectors).map_err(|e| {
+            clear_wrapped_project_rows(&path, array_fields, keys, project_id.as_str(), selectors)
+                .map_err(|e| {
                 project_catalog_admin::admin_error(
                     "error.project_catalog_retire_discharge_coordination",
                     format!(
@@ -1610,7 +1646,8 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
                 .paths
                 .bro_home
                 .join("slack-channel-bindings.json"),
-            &selectors,
+            project_id.as_str(),
+            selectors,
         )
         .map_err(|e| {
             project_catalog_admin::admin_error(
@@ -2137,7 +2174,7 @@ fn probe_retire_evidence(
     ] {
         probe.record(
             class,
-            count_project_rows(path, &selectors, &PROJECT_ROW_KEYS),
+            count_project_rows(path, project_id.as_str(), &selectors, &PROJECT_ROW_KEYS),
         );
     }
     for (class, path) in [
@@ -2152,7 +2189,7 @@ fn probe_retire_evidence(
     ] {
         probe.record(
             class,
-            count_project_rows(&path, &selectors, &SLACK_ROW_KEYS),
+            count_project_rows(&path, project_id.as_str(), &selectors, &SLACK_ROW_KEYS),
         );
     }
 
@@ -2290,6 +2327,14 @@ fn capture_retirement_evidence(
             format!("failed to open code-source store for retirement evidence: {e}"),
         )
     })?;
+    store
+        .ensure_retained_generation_ownership(project_id)
+        .map_err(|error| {
+            project_catalog_admin::admin_error(
+                "error.project_catalog_retire_retained_owner",
+                format!("failed to persist retained-generation ownership: {error}"),
+            )
+        })?;
 
     let mut activation_owners = BTreeMap::<String, String>::new();
     for activation in store.activation_records_mixed().map_err(|e| {
@@ -2329,6 +2374,33 @@ fn capture_retirement_evidence(
                 .or_default()
                 .insert(migration.project_id.as_str().to_string());
         }
+    }
+    for retained in store.retained_generation_owner_records().map_err(|error| {
+        project_catalog_admin::admin_error(
+            "error.project_catalog_retire_retained_owner",
+            format!("failed to enumerate retained-generation ownership: {error}"),
+        )
+    })? {
+        let generation = store
+            .load_generation_mixed(&retained.published_scope, &retained.generation_id)
+            .map_err(|error| {
+                project_catalog_admin::admin_error(
+                    "error.project_catalog_retire_retained_owner",
+                    format!("retained-generation owner record has no exact generation: {error}"),
+                )
+            })?;
+        if generation.generation_id() != retained.generation_id
+            || generation.published_scope() != &retained.published_scope
+        {
+            return Err(project_catalog_admin::admin_error(
+                "error.project_catalog_retire_retained_owner",
+                "retained-generation owner record does not match generation metadata",
+            ));
+        }
+        durable_generation_owners
+            .entry(retained.generation_id)
+            .or_default()
+            .insert(retained.project_id.as_str().to_string());
     }
     let desired_inventory = store.retirement_desired_pointer_inventory().map_err(|e| {
         project_catalog_admin::admin_error(
@@ -2673,7 +2745,12 @@ fn probe_vector_entity_refs(
 /// Count rows in one JSON coordination store whose project-naming field
 /// (`keys`) names the retiring project. A store that exists but cannot be
 /// read or parsed is unprobeable, never zero.
-fn count_project_rows(path: &Path, selectors: &[String], keys: &[&str]) -> ClassProbe {
+fn count_project_rows(
+    path: &Path,
+    project_id: &str,
+    selectors: &[String],
+    keys: &[&str],
+) -> ClassProbe {
     let bytes = match read_regular_nofollow(path) {
         Ok(None) => return ClassProbe::Counted(0),
         Ok(Some(bytes)) => bytes,
@@ -2688,11 +2765,18 @@ fn count_project_rows(path: &Path, selectors: &[String], keys: &[&str]) -> Class
         match node {
             serde_json::Value::Array(items) => stack.extend(items.iter()),
             serde_json::Value::Object(map) => {
-                let hit = keys.iter().any(|key| {
-                    map.get(*key)
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|v| selectors.iter().any(|s| s == v))
-                });
+                let hit = match map
+                    .get("project_id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(owner) => owner == project_id,
+                    None => keys.iter().filter(|key| **key != "project_id").any(|key| {
+                        map.get(*key)
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|value| selectors.iter().any(|s| s == value))
+                    }),
+                };
                 if hit {
                     count += 1;
                 } else {
@@ -2817,18 +2901,31 @@ fn coordination_row_paths(
     ]
 }
 
-fn row_matches_project(row: &serde_json::Value, keys: &[&str], selectors: &[String]) -> bool {
-    keys.iter().any(|key| {
-        row.get(*key)
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|value| selectors.iter().any(|selector| selector == value))
-    })
+fn row_matches_project(
+    row: &serde_json::Value,
+    keys: &[&str],
+    project_id: &str,
+    selectors: &[String],
+) -> bool {
+    match row
+        .get("project_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        Some(owner) => owner == project_id,
+        None => keys.iter().filter(|key| **key != "project_id").any(|key| {
+            row.get(*key)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| selectors.iter().any(|selector| selector == value))
+        }),
+    }
 }
 
 fn clear_wrapped_project_rows(
     path: &Path,
     array_fields: &[&str],
     keys: &[&str],
+    project_id: &str,
     selectors: &[String],
 ) -> anyhow::Result<()> {
     if !path.exists() {
@@ -2842,13 +2939,17 @@ fn clear_wrapped_project_rows(
                 .get_mut(*field)
                 .and_then(serde_json::Value::as_array_mut)
                 .ok_or_else(|| anyhow::anyhow!("missing array field {field}"))?;
-            rows.retain(|row| !row_matches_project(row, keys, selectors));
+            rows.retain(|row| !row_matches_project(row, keys, project_id, selectors));
         }
         bbox_corpus_core::json_store::atomic_write_json_locked(path, &value)
     })
 }
 
-fn clear_slack_channel_bindings(path: &Path, selectors: &[String]) -> anyhow::Result<()> {
+fn clear_slack_channel_bindings(
+    path: &Path,
+    project_id: &str,
+    selectors: &[String],
+) -> anyhow::Result<()> {
     if !path.exists() {
         return Ok(());
     }
@@ -2859,7 +2960,7 @@ fn clear_slack_channel_bindings(path: &Path, selectors: &[String]) -> anyhow::Re
             .get_mut("bindings")
             .and_then(serde_json::Value::as_object_mut)
             .ok_or_else(|| anyhow::anyhow!("missing object field bindings"))?;
-        bindings.retain(|_, row| !row_matches_project(row, &SLACK_ROW_KEYS, selectors));
+        bindings.retain(|_, row| !row_matches_project(row, &SLACK_ROW_KEYS, project_id, selectors));
         bbox_corpus_core::json_store::atomic_write_json_locked(path, &value)
     })
 }

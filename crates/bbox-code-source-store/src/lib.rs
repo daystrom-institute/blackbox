@@ -412,6 +412,15 @@ pub struct RetirementUploadInventory {
     pub blob_hashes: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedGenerationOwnerRecord {
+    pub version: u32,
+    pub project_id: ProjectId,
+    pub published_scope: PublishedScope,
+    pub generation_id: String,
+}
+
 impl StoredGenerationV2 {
     pub fn from_v1_for_migration(
         legacy: StoredGeneration,
@@ -3245,6 +3254,7 @@ impl CodeSourceStore {
             "desired",
             "activations",
             "health",
+            "retained-owners",
             "retirements",
             "collision-retirements",
             "collision-retirement-work",
@@ -4215,12 +4225,146 @@ impl CodeSourceStore {
             bail!("error.code_source_record_mode: bridge store refuses v2 activation writes");
         }
         let _guard = self.lock_mutation()?;
+        self.backfill_retained_generation_owners_locked(
+            &activation.project_id,
+            &activation.published_scope,
+        )?;
         self.save_activation_v2_locked(activation)
     }
 
     fn save_activation_v2_locked(&self, activation: &ActivationRecordV2) -> Result<()> {
         activation.validate()?;
         atomic_write_json(&self.paths.activation(&activation.project_id), activation)
+    }
+
+    fn retained_owner_path(&self, generation_id: &str) -> PathBuf {
+        self.root()
+            .join("retained-owners")
+            .join(format!("{generation_id}.json"))
+    }
+
+    fn record_retained_generation_owner_locked(
+        &self,
+        project_id: &ProjectId,
+        scope: &PublishedScope,
+        generation_id: &str,
+    ) -> Result<()> {
+        validate_sha256(generation_id)?;
+        let path = self.retained_owner_path(generation_id);
+        if path.exists() {
+            let existing: RetainedGenerationOwnerRecord = read_json(&path)?;
+            if existing.version != STORE_VERSION
+                || existing.project_id != *project_id
+                || existing.published_scope != *scope
+                || existing.generation_id != generation_id
+            {
+                bail!("retained generation has conflicting durable ownership");
+            }
+            return Ok(());
+        }
+        atomic_write_json(
+            &path,
+            &RetainedGenerationOwnerRecord {
+                version: STORE_VERSION,
+                project_id: project_id.clone(),
+                published_scope: scope.clone(),
+                generation_id: generation_id.to_string(),
+            },
+        )
+    }
+
+    fn backfill_retained_generation_owners_locked(
+        &self,
+        project_id: &ProjectId,
+        scope: &PublishedScope,
+    ) -> Result<()> {
+        for generation in self.list_generations()? {
+            if generation.state() == GenerationState::Superseded
+                && generation.published_scope() == scope
+            {
+                self.record_retained_generation_owner_locked(
+                    project_id,
+                    scope,
+                    generation.generation_id(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Persist exact owner records for retained superseded generations using
+    /// the project's strictly loaded current activation as the authority.
+    pub fn ensure_retained_generation_ownership(&self, project_id: &ProjectId) -> Result<()> {
+        let _guard = self.lock_mutation()?;
+        let scope = match self.shared.record_mode {
+            RuntimeRecordMode::CatalogV2 => self
+                .load_activation_v2_locked(project_id.as_str())?
+                .map(|activation| activation.published_scope),
+            RuntimeRecordMode::BridgeV1 => self
+                .load_activation(project_id.as_str())?
+                .map(|activation| {
+                    self.list_generations().map(|generations| {
+                        generations
+                            .into_iter()
+                            .find(|generation| {
+                                generation.generation_id() == activation.generation_id
+                            })
+                            .map(|generation| generation.published_scope().clone())
+                    })
+                })
+                .transpose()?
+                .flatten(),
+        };
+        if let Some(scope) = scope {
+            self.backfill_retained_generation_owners_locked(project_id, &scope)?;
+        }
+        Ok(())
+    }
+
+    pub fn retained_generation_owner_records(&self) -> Result<Vec<RetainedGenerationOwnerRecord>> {
+        let mut records = Vec::new();
+        for entry in fs::read_dir(self.root().join("retained-owners"))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() || !is_canonical_record_file(&entry) {
+                bail!("retained owner store contains a non-canonical entry");
+            }
+            let record: RetainedGenerationOwnerRecord = read_json(&entry.path())?;
+            if record.version != STORE_VERSION
+                || !entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name == format!("{}.json", record.generation_id))
+            {
+                bail!("retained owner record identity is invalid");
+            }
+            validate_sha256(&record.generation_id)?;
+            record.published_scope.validate()?;
+            records.push(record);
+        }
+        records.sort_by(|left, right| left.generation_id.cmp(&right.generation_id));
+        Ok(records)
+    }
+
+    pub fn delete_retained_generation_owner(
+        &self,
+        project_id: &ProjectId,
+        scope: &PublishedScope,
+        generation_id: &str,
+    ) -> Result<()> {
+        validate_sha256(generation_id)?;
+        let _guard = self.lock_mutation()?;
+        let path = self.retained_owner_path(generation_id);
+        if !path.exists() {
+            return Ok(());
+        }
+        let record: RetainedGenerationOwnerRecord = read_json(&path)?;
+        if record.project_id != *project_id
+            || record.published_scope != *scope
+            || record.generation_id != generation_id
+        {
+            bail!("retained owner record does not match exact retirement identity");
+        }
+        remove_file_if_exists(&path)
     }
 
     /// Mode-aware single-project activation read (section 5.2 item 5, 7.2).
@@ -6920,6 +7064,62 @@ mod tests {
             .sweep_retirement_blobs(&BTreeSet::from([hash]))
             .unwrap();
         assert!(!blob.exists());
+    }
+
+    #[test]
+    fn ordinary_activation_backfills_retained_generation_owners() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = CodeSourceStore::open_with_mode(
+            root.join("code-sources"),
+            StoreLimits::default(),
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap();
+        let scope = PublishedScope::try_new("owner-a", ".").unwrap();
+        let generation_ids = (1..=3)
+            .map(|index| {
+                install_retirement_generation(
+                    &store,
+                    &scope,
+                    &format!("producer-{index}"),
+                    &[format!("{index:064x}")],
+                )
+            })
+            .collect::<Vec<_>>();
+        for generation_id in &generation_ids[..2] {
+            let mut generation = match store.load_generation_mixed(&scope, generation_id).unwrap() {
+                MixedStoredGeneration::CurrentV2(generation) => generation,
+                MixedStoredGeneration::LegacyV1(_) => unreachable!(),
+            };
+            generation.state = GenerationState::Superseded;
+            store.save_generation_v2_locked(&generation).unwrap();
+        }
+        let mut active = match store
+            .load_generation_mixed(&scope, &generation_ids[2])
+            .unwrap()
+        {
+            MixedStoredGeneration::CurrentV2(generation) => generation,
+            MixedStoredGeneration::LegacyV1(_) => unreachable!(),
+        };
+        active.state = GenerationState::Active;
+        active.materialized_doc_count = Some(1);
+        active.entity_inventory_sha256 = Some("c".repeat(64));
+        store.save_generation_v2_locked(&active).unwrap();
+        let project_id = ProjectId::parse("project-a").unwrap();
+        let activation = sample_v2_activation(&active);
+        store.save_activation_v2(&activation).unwrap();
+
+        let owners = store.retained_generation_owner_records().unwrap();
+        assert_eq!(owners.len(), StoreLimits::default().retained_generations);
+        assert_eq!(
+            owners
+                .iter()
+                .map(|owner| owner.generation_id.clone())
+                .collect::<BTreeSet<_>>(),
+            generation_ids[..2].iter().cloned().collect()
+        );
+        assert!(owners.iter().all(|owner| owner.project_id == project_id));
     }
 
     #[test]

@@ -320,16 +320,18 @@ pub fn capture_project_catalog_owner_snapshot(
                 sha256_hex(&bytes),
             ));
         }
-        if let Some(project) = packet
-            .project
-            .map(|project| project.trim().to_string())
-            .filter(|project| !project.is_empty())
-        {
-            subsource_rows.push(OwnerSnapshotRowV1::legacy_selector(
-                packet.id,
-                LegacyProjectSelectorKindV1::Project,
-                project,
-            ));
+        if packet.project_id.is_none() {
+            if let Some(project) = packet
+                .project
+                .map(|project| project.trim().to_string())
+                .filter(|project| !project.is_empty())
+            {
+                subsource_rows.push(OwnerSnapshotRowV1::legacy_selector(
+                    packet.id,
+                    LegacyProjectSelectorKindV1::Project,
+                    project,
+                ));
+            }
         }
         subsources.push(owner_subsource(
             subsource_id,
@@ -378,12 +380,14 @@ pub fn discharge_project_catalog_rows(
                 anyhow::bail!("packet store contains a non-canonical entry");
             }
             let packet: Packet = serde_json::from_slice(&fs::read(entry.path())?)?;
-            if packet.project_id.as_deref() == Some(project_id)
-                || packet
+            let owned = match packet.project_id.as_deref() {
+                Some(owner) => owner == project_id,
+                None => packet
                     .project
                     .as_ref()
-                    .is_some_and(|project| selectors.iter().any(|selector| selector == project))
-            {
+                    .is_some_and(|project| selectors.iter().any(|selector| selector == project)),
+            };
+            if owned {
                 removals.push(entry.path());
             }
         }
@@ -1375,7 +1379,7 @@ mod store_tests {
             project_id: Some(project_id.into()),
         };
         store.compile(&params("project-a", "/repo/a")).unwrap();
-        store.compile(&params("project-b", "/repo/b")).unwrap();
+        store.compile(&params("project-b", "/repo/a")).unwrap();
 
         assert_eq!(
             super::discharge_project_catalog_rows(

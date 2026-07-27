@@ -238,8 +238,11 @@ pub fn discharge_project_rows(
                     selector,
                     ..
                 } => {
-                    row_project_id == project_id
-                        || selectors.iter().any(|candidate| candidate == selector)
+                    if row_project_id.is_empty() {
+                        selectors.iter().any(|candidate| candidate == selector)
+                    } else {
+                        row_project_id == project_id
+                    }
                 }
             };
             if owned {
@@ -1135,6 +1138,69 @@ mod tests {
         assert_eq!(discharged.index.project_scoped_ref_count, 0);
         assert_eq!(discharged.code_metadata.project_scoped_row_count, 0);
         assert_eq!(discharged.git_cursors.row_count, 0);
+    }
+
+    #[test]
+    fn metadata_discharge_prefers_explicit_project_id_over_reused_selector() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let index_path = root.join("index");
+        let index = super::super::TranscriptIndex::open_or_create(
+            &index_path,
+            Vec::new(),
+            None,
+            root.join("projects.json"),
+            root.join("knowledge.json"),
+            root.join("threads.json"),
+            root.join("roadmap.json"),
+        )
+        .unwrap();
+        drop(index);
+        let metadata = BTreeMap::from([
+            (
+                "owned".to_string(),
+                FileMeta {
+                    mtime: 1,
+                    size: 1,
+                    mat_version: None,
+                    source: FileMetaSource::LocalProjectFile {
+                        project_id: "project-a".into(),
+                        selector: "shared-selector".into(),
+                        relative_path: "a.rs".into(),
+                        entry_key: "a.rs".into(),
+                    },
+                },
+            ),
+            (
+                "retained".to_string(),
+                FileMeta {
+                    mtime: 1,
+                    size: 1,
+                    mat_version: None,
+                    source: FileMetaSource::LocalProjectFile {
+                        project_id: "project-b".into(),
+                        selector: "shared-selector".into(),
+                        relative_path: "b.rs".into(),
+                        entry_key: "b.rs".into(),
+                    },
+                },
+            ),
+        ]);
+        fs::write(
+            index_path.join("_meta.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        let git = root.join("git");
+
+        let (_, removed, _) =
+            discharge_project_rows(&index_path, &git, "project-a", &["shared-selector".into()])
+                .unwrap();
+        assert_eq!(removed, 1);
+        let remaining: BTreeMap<String, FileMeta> =
+            serde_json::from_slice(&fs::read(index_path.join("_meta.json")).unwrap()).unwrap();
+        assert!(remaining.contains_key("retained"));
+        assert!(!remaining.contains_key("owned"));
     }
 
     #[test]

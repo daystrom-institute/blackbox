@@ -264,17 +264,19 @@ pub fn capture_project_catalog_owner_snapshot(
                 sha256_hex(&bytes),
             ));
         }
-        if let Some(project_path) = metadata
-            .project_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|project_path| !project_path.is_empty())
-        {
-            subsource_rows.push(OwnerSnapshotRowV1::legacy_selector(
-                format!("{subsource_id}:legacy-path"),
-                LegacyProjectSelectorKindV1::Project,
-                project_path,
-            ));
+        if metadata.project_id.is_none() {
+            if let Some(project_path) = metadata
+                .project_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|project_path| !project_path.is_empty())
+            {
+                subsource_rows.push(OwnerSnapshotRowV1::legacy_selector(
+                    format!("{subsource_id}:legacy-path"),
+                    LegacyProjectSelectorKindV1::Project,
+                    project_path,
+                ));
+            }
         }
         subsources.push(owner_subsource(
             subsource_id,
@@ -312,12 +314,14 @@ pub fn discharge_project_catalog_rows(
             continue;
         }
         let metadata: ArtifactMetadata = serde_json::from_slice(&fs::read(entry.path())?)?;
-        if metadata.project_id.as_deref() != Some(project_id)
-            && !metadata
+        let owned = match metadata.project_id.as_deref() {
+            Some(owner) => owner == project_id,
+            None => metadata
                 .project_path
                 .as_ref()
-                .is_some_and(|path| selectors.iter().any(|selector| selector == path))
-        {
+                .is_some_and(|path| selectors.iter().any(|selector| selector == path)),
+        };
+        if !owned {
             continue;
         }
         let directory = if file_name == "metadata.json" {
@@ -2510,19 +2514,31 @@ mod tests {
         let snapshot =
             capture_project_catalog_owner_snapshot(&root, OwnerSnapshotLimitsV1::default())
                 .unwrap();
-        assert_eq!(snapshot.row_count, 2);
+        assert_eq!(snapshot.row_count, 1);
         assert!(snapshot.rows.iter().any(|row| matches!(
             &row.value,
             OwnerSnapshotRowValueV1::InventoryTarget { project_id, .. }
                 if project_id == "project1"
         )));
-        assert!(snapshot.rows.iter().any(|row| matches!(
+        assert!(!snapshot.rows.iter().any(|row| matches!(
             &row.value,
-            OwnerSnapshotRowValueV1::LegacyProjectSelector {
-                literal_selector,
-                ..
-            } if literal_selector == "/repo/legacy"
+            OwnerSnapshotRowValueV1::LegacyProjectSelector { .. }
         )));
+        let retained_dir = root
+            .join("projects")
+            .join("project2")
+            .join("local")
+            .join("agent")
+            .join("retained");
+        std::fs::create_dir_all(&retained_dir).unwrap();
+        let mut retained = metadata.clone();
+        retained.name = "retained".into();
+        retained.project_id = Some("project2".into());
+        std::fs::write(
+            retained_dir.join("metadata.json"),
+            serde_json::to_vec(&retained).unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(
             discharge_project_catalog_rows(&root, "project1", &["/repo/legacy".into()]).unwrap(),
@@ -2535,6 +2551,11 @@ mod tests {
         let discharged =
             capture_project_catalog_owner_snapshot(&root, OwnerSnapshotLimitsV1::default())
                 .unwrap();
-        assert_eq!(discharged.row_count, 0);
+        assert_eq!(discharged.row_count, 1);
+        assert!(discharged.rows.iter().any(|row| matches!(
+            &row.value,
+            OwnerSnapshotRowValueV1::InventoryTarget { project_id, .. }
+                if project_id == "project2"
+        )));
     }
 }

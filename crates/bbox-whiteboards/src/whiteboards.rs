@@ -764,7 +764,7 @@ pub fn capture_project_catalog_owner_snapshot(
             ));
         }
         let selector = board.project.trim().to_string();
-        if !selector.is_empty() {
+        if board.project_id.is_none() && !selector.is_empty() {
             subsource_rows.push(OwnerSnapshotRowV1::legacy_selector(
                 board.id,
                 LegacyProjectSelectorKindV1::Project,
@@ -803,9 +803,11 @@ pub fn discharge_project_catalog_rows(
             bail!("whiteboard store contains a non-canonical entry");
         }
         let board: Board = serde_json::from_slice(&std::fs::read(entry.path())?)?;
-        if board.project_id.as_deref() == Some(project_id)
-            || selectors.iter().any(|selector| selector == &board.project)
-        {
+        let owned = match board.project_id.as_deref() {
+            Some(owner) => owner == project_id,
+            None => selectors.iter().any(|selector| selector == &board.project),
+        };
+        if owned {
             removals.push(entry.path());
         }
     }
@@ -2461,7 +2463,7 @@ mod tests {
             .open(
                 "other",
                 "topic",
-                "/repo/b",
+                "/repo/a",
                 Some("project-b"),
                 None,
                 "alice",

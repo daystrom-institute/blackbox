@@ -135,7 +135,7 @@ pub fn capture_project_catalog_owner_snapshot(
                         ));
                     }
                     let selector = link.project_dir.trim().to_string();
-                    if !selector.is_empty() {
+                    if link.project_id.is_none() && !selector.is_empty() {
                         rows.push(OwnerSnapshotRowV1::legacy_selector(
                             format!("{}:{}:{}", link.team_id, link.channel_id, link.msg_ts),
                             LegacyProjectSelectorKindV1::Project,
@@ -325,11 +325,11 @@ impl SlackProposalLinks {
             let keys = data
                 .links
                 .iter()
-                .filter(|(_, link)| {
-                    link.project_id.as_deref() == Some(project_id)
-                        || selectors
-                            .iter()
-                            .any(|selector| selector == &link.project_dir)
+                .filter(|(_, link)| match link.project_id.as_deref() {
+                    Some(owner) => owner == project_id,
+                    None => selectors
+                        .iter()
+                        .any(|selector| selector == &link.project_dir),
                 })
                 .map(|(key, _)| key.clone())
                 .collect::<Vec<_>>();
@@ -697,7 +697,7 @@ mod tests {
         owned.project_dir = "/repo/a".into();
         owned.project_id = Some("project-a".into());
         let mut other = sample("ts-other", "proposal-other", None);
-        other.project_dir = "/repo/b".into();
+        other.project_dir = "/repo/a".into();
         other.project_id = Some("project-b".into());
         store.record(owned).unwrap();
         store.record(other).unwrap();
