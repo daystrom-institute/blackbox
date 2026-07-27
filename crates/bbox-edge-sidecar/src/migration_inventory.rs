@@ -11,7 +11,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::edge_sidecar::managed_derived_edges_dir;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+
 use crate::manifest::{
     MANIFEST_VERSION, ManifestIndex, WorkspaceIndexEntry, WorkspaceManifest, chrono_now_rfc3339,
     manifest_index_path, materialized_dir, workspace_manifest_dir,
@@ -57,6 +59,7 @@ pub fn capture_project_retirement_inventory(
         }
         Ok(_) => {}
     }
+    let anchored = AnchoredEdgeRoot::open(edges_dir)?;
 
     let mut paths = std::collections::BTreeSet::new();
     for relative in [
@@ -64,27 +67,21 @@ pub fn capture_project_retirement_inventory(
         PathBuf::from("explicit").join(format!("{project_id}.jsonl")),
         PathBuf::from("observed").join(format!("{project_id}.jsonl")),
     ] {
-        insert_existing_retirement_path(edges_dir, relative, &mut paths)?;
+        insert_existing_retirement_path(&anchored, relative, &mut paths)?;
     }
-    let derived = managed_derived_edges_dir(edges_dir);
-    if derived.exists() {
-        for namespace in fs::read_dir(&derived)? {
-            let namespace = namespace?;
-            if namespace.file_type()?.is_symlink() || !namespace.file_type()?.is_dir() {
-                anyhow::bail!("edge derived lane contains a non-directory namespace");
-            }
+    if anchored.path_exists(Path::new("derived"))? {
+        for namespace in anchored.list_directory(Path::new("derived"))? {
+            let namespace_path = PathBuf::from("derived").join(&namespace);
+            anchored.require_directory(&namespace_path)?;
             insert_existing_retirement_path(
-                edges_dir,
-                PathBuf::from("derived")
-                    .join(namespace.file_name())
-                    .join(format!("{project_id}.jsonl")),
+                &anchored,
+                namespace_path.join(format!("{project_id}.jsonl")),
                 &mut paths,
             )?;
         }
     }
 
-    let index_path = manifest_index_path(edges_dir);
-    if index_path.exists() {
+    if anchored.path_exists(Path::new("materialized/manifest-index.json"))? {
         let index = ManifestIndex::load(edges_dir)?;
         let active = index.workspaces.get(project_id);
         let tombstone = index.retirement_tombstones.get(project_id);
@@ -93,7 +90,7 @@ pub fn capture_project_retirement_inventory(
         }
         if let Some(entry) = active.or(tombstone) {
             for relative in workspace_entry_paths(edges_dir, project_id, entry)? {
-                insert_existing_retirement_path(edges_dir, relative, &mut paths)?;
+                insert_existing_retirement_path(&anchored, relative, &mut paths)?;
             }
         }
     }
@@ -153,7 +150,8 @@ pub fn discharge_project_retirement_inventory(
     }
 
     for relative in &inventory.relative_paths {
-        changed |= durable_remove_path(&edges_dir.join(relative))?;
+        let anchored = AnchoredEdgeRoot::open(edges_dir)?;
+        changed |= anchored.remove_relative(Path::new(relative))?;
     }
 
     if index_path.exists() {
@@ -172,21 +170,15 @@ pub fn discharge_project_retirement_inventory(
 }
 
 fn insert_existing_retirement_path(
-    edges_dir: &Path,
+    anchored: &AnchoredEdgeRoot,
     relative: PathBuf,
     paths: &mut std::collections::BTreeSet<String>,
 ) -> Result<()> {
     if !strict_relative_path(&relative) {
         anyhow::bail!("edge retirement path is unsafe");
     }
-    let absolute = edges_dir.join(&relative);
-    match fs::symlink_metadata(&absolute) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            anyhow::bail!("edge retirement path is symlinked");
-        }
-        Ok(_) => {}
+    if !anchored.path_exists(&relative)? {
+        return Ok(());
     }
     paths.insert(
         relative
@@ -228,22 +220,281 @@ fn workspace_entry_paths(
     Ok(paths)
 }
 
-fn durable_remove_path(path: &Path) -> Result<bool> {
-    let parent = path
-        .parent()
-        .context("edge retirement path has no parent")?;
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            anyhow::bail!("edge retirement target is symlinked");
-        }
-        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path)?,
-        Ok(metadata) if metadata.is_file() => fs::remove_file(path)?,
-        Ok(_) => anyhow::bail!("edge retirement target is not a regular file or directory"),
+#[cfg(unix)]
+struct AnchoredEdgeRoot {
+    directory: fs::File,
+}
+
+#[cfg(unix)]
+impl AnchoredEdgeRoot {
+    fn open(root: &Path) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let directory = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(root)
+            .context("failed to open the anchored edge root")?;
+        Ok(Self { directory })
     }
-    fs::File::open(parent)?.sync_all()?;
+
+    fn path_exists(&self, relative: &Path) -> Result<bool> {
+        let components = strict_path_components(relative)?;
+        let Some((name, parents)) = components.split_last() else {
+            anyhow::bail!("edge retirement path is empty");
+        };
+        let parent = match self.open_directory_chain(parents) {
+            Ok(parent) => parent,
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                }) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        match openat_nofollow(parent.as_raw_fd(), name, false) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error).context("edge retirement path failed nofollow validation"),
+        }
+    }
+
+    fn require_directory(&self, relative: &Path) -> Result<()> {
+        let components = strict_path_components(relative)?;
+        self.open_directory_chain(&components)?;
+        Ok(())
+    }
+
+    fn list_directory(&self, relative: &Path) -> Result<Vec<std::ffi::OsString>> {
+        let components = strict_path_components(relative)?;
+        let directory = self.open_directory_chain(&components)?;
+        list_directory_names(&directory)
+    }
+
+    fn remove_relative(&self, relative: &Path) -> Result<bool> {
+        let components = strict_path_components(relative)?;
+        let Some((name, parents)) = components.split_last() else {
+            anyhow::bail!("edge retirement path is empty");
+        };
+        let parent = match self.open_directory_chain(parents) {
+            Ok(parent) => parent,
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                }) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        remove_entry_at(&parent, name)
+    }
+
+    fn open_directory_chain(&self, components: &[std::ffi::OsString]) -> Result<fs::File> {
+        let mut current = self.directory.try_clone()?;
+        for component in components {
+            current = openat_nofollow(current.as_raw_fd(), component, true)
+                .with_context(|| format!("edge path component {component:?} is not confined"))?;
+        }
+        Ok(current)
+    }
+}
+
+#[cfg(unix)]
+fn strict_path_components(path: &Path) -> Result<Vec<std::ffi::OsString>> {
+    if !strict_relative_path(path) {
+        anyhow::bail!("edge retirement path is unsafe");
+    }
+    Ok(path
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => value.to_os_string(),
+            _ => unreachable!("strict_relative_path accepted a non-normal component"),
+        })
+        .collect())
+}
+
+#[cfg(unix)]
+fn openat_nofollow(
+    parent_fd: std::os::fd::RawFd,
+    name: &std::ffi::OsStr,
+    directory: bool,
+) -> std::io::Result<fs::File> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let flags = libc::O_RDONLY
+        | libc::O_CLOEXEC
+        | libc::O_NOFOLLOW
+        | if directory { libc::O_DIRECTORY } else { 0 };
+    // SAFETY: parent_fd is owned by a live File and name is NUL-terminated.
+    let fd = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new owned descriptor.
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn list_directory_names(directory: &fs::File) -> Result<Vec<std::ffi::OsString>> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStringExt;
+    // SAFETY: dup creates an independent descriptor for fdopendir to own.
+    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: duplicate is a valid directory descriptor.
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        // SAFETY: fdopendir did not take ownership on failure.
+        unsafe { libc::close(duplicate) };
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: stream remains valid until closed below.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: d_name is NUL-terminated by readdir.
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name != b"." && name != b".." {
+            names.push(std::ffi::OsString::from_vec(name.to_vec()));
+        }
+    }
+    // SAFETY: stream was returned by fdopendir and is closed exactly once.
+    if unsafe { libc::closedir(stream) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    names.sort();
+    Ok(names)
+}
+
+#[cfg(unix)]
+fn remove_entry_at(parent: &fs::File, name: &std::ffi::OsStr) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let name_c = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| anyhow::anyhow!("edge path contains NUL"))?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: stat points to writable storage and name_c is NUL-terminated.
+    let status = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name_c.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if status != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(false);
+        }
+        return Err(error.into());
+    }
+    // SAFETY: fstatat initialized stat on success.
+    let stat = unsafe { stat.assume_init() };
+    let file_type = stat.st_mode & libc::S_IFMT;
+    if file_type == libc::S_IFLNK {
+        anyhow::bail!("edge retirement target or intermediate component is symlinked");
+    }
+    if file_type == libc::S_IFDIR {
+        let child = openat_nofollow(parent.as_raw_fd(), name, true)
+            .context("edge retirement directory changed during confinement check")?;
+        for child_name in list_directory_names(&child)? {
+            remove_entry_at(&child, &child_name)?;
+        }
+        // SAFETY: parent and name identify the already-drained directory.
+        if unsafe { libc::unlinkat(parent.as_raw_fd(), name_c.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    } else if file_type == libc::S_IFREG {
+        // SAFETY: parent and name identify the regular file checked above.
+        if unsafe { libc::unlinkat(parent.as_raw_fd(), name_c.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    } else {
+        anyhow::bail!("edge retirement target is not a regular file or directory");
+    }
+    parent.sync_all()?;
     Ok(true)
+}
+
+#[cfg(not(unix))]
+struct AnchoredEdgeRoot {
+    root: PathBuf,
+}
+
+#[cfg(not(unix))]
+impl AnchoredEdgeRoot {
+    fn open(root: &Path) -> Result<Self> {
+        Ok(Self {
+            root: root.to_path_buf(),
+        })
+    }
+
+    fn validate(&self, relative: &Path) -> Result<PathBuf> {
+        if !strict_relative_path(relative) {
+            anyhow::bail!("edge retirement path is unsafe");
+        }
+        let mut current = self.root.clone();
+        for component in relative.components() {
+            let Component::Normal(component) = component else {
+                anyhow::bail!("edge retirement path is unsafe");
+            };
+            current.push(component);
+            if current.exists() && fs::symlink_metadata(&current)?.file_type().is_symlink() {
+                anyhow::bail!("edge retirement path is symlinked");
+            }
+        }
+        Ok(current)
+    }
+
+    fn path_exists(&self, relative: &Path) -> Result<bool> {
+        Ok(self.validate(relative)?.exists())
+    }
+
+    fn require_directory(&self, relative: &Path) -> Result<()> {
+        if !self.validate(relative)?.is_dir() {
+            anyhow::bail!("edge retirement path is not a directory");
+        }
+        Ok(())
+    }
+
+    fn list_directory(&self, relative: &Path) -> Result<Vec<std::ffi::OsString>> {
+        let mut names = fs::read_dir(self.validate(relative)?)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        names.sort();
+        Ok(names)
+    }
+
+    fn remove_relative(&self, relative: &Path) -> Result<bool> {
+        let path = self.validate(relative)?;
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+            Ok(metadata) if metadata.is_dir() => {
+                fs::remove_dir_all(&path)?;
+                Ok(true)
+            }
+            Ok(metadata) if metadata.is_file() => {
+                fs::remove_file(&path)?;
+                Ok(true)
+            }
+            Ok(_) => anyhow::bail!("edge retirement target is unsupported"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -848,6 +1099,66 @@ mod tests {
                 .contains_key("project-a")
         );
         assert!(!discharge_project_retirement_inventory(&root, &inventory).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retirement_capture_refuses_symlinked_derived_intermediate() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("derived")).unwrap();
+
+        let error = capture_project_retirement_inventory(&root, "project-a").unwrap_err();
+        assert!(error.to_string().contains("nofollow") || error.to_string().contains("confined"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retirement_delete_refuses_materialized_intermediate_swap() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.join("materialized/snapshots")).unwrap();
+        fs::write(root.join("materialized/snapshots/project-a"), b"owned").unwrap();
+        let inventory = EdgeRetirementInventory {
+            version: RETIREMENT_INVENTORY_VERSION,
+            project_id: "project-a".to_string(),
+            relative_paths: vec!["materialized/snapshots/project-a".to_string()],
+        };
+
+        fs::remove_file(root.join("materialized/snapshots/project-a")).unwrap();
+        fs::remove_dir(root.join("materialized/snapshots")).unwrap();
+        fs::write(outside.path().join("project-a"), b"outside").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("materialized/snapshots")).unwrap();
+
+        assert!(discharge_project_retirement_inventory(&root, &inventory).is_err());
+        assert_eq!(
+            fs::read(outside.path().join("project-a")).unwrap(),
+            b"outside"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retirement_delete_refuses_derived_namespace_swap_after_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.join("derived/code")).unwrap();
+        fs::write(root.join("derived/code/project-a.jsonl"), b"{}\n").unwrap();
+        let inventory = capture_project_retirement_inventory(&root, "project-a").unwrap();
+
+        fs::remove_file(root.join("derived/code/project-a.jsonl")).unwrap();
+        fs::remove_dir(root.join("derived/code")).unwrap();
+        fs::write(outside.path().join("project-a.jsonl"), b"outside").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("derived/code")).unwrap();
+
+        assert!(discharge_project_retirement_inventory(&root, &inventory).is_err());
+        assert_eq!(
+            fs::read(outside.path().join("project-a.jsonl")).unwrap(),
+            b"outside"
+        );
     }
 
     #[test]
