@@ -1615,6 +1615,38 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>, runtime_handle: tokio::
 
                     match action {
                         ReducerAction::NoOp => {
+                            // Crash-window convergence (exit row 12.4): if
+                            // the manifest entry is local:<project_id> but the
+                            // activation record is still collected, the daemon
+                            // crashed between local manifest publication and
+                            // activation-record clear. The local/local cell
+                            // returned NoOp (desired=Local, effective=Local,
+                            // persisted=None), which is correct for a steady
+                            // local project, but the stale collected record is
+                            // the orphaned half of the interrupted transition.
+                            // The distinction from pending-first-republish
+                            // (entry ABSENT) is the manifest entry PRESENT and
+                            // local: publication happened, so the record is
+                            // stale and must be cleared.
+                            if effective == EffectiveSource::Local {
+                                if let Ok(Some(act)) = store.load_activation_mixed(&project_id) {
+                                    if act.selector().starts_with("collected:") {
+                                        tracing::info!(
+                                            project_id = %project_id,
+                                            "reducer: clearing stale collected activation \
+                                             record from cutback crash window"
+                                        );
+                                        if let Err(error) = store.clear_activation(&project_id) {
+                                            tracing::warn!(
+                                                project_id = %project_id,
+                                                %error,
+                                                "reducer: failed to clear stale \
+                                                 collected activation record"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             // Steady-state: guard drops, condvar notified.
                         }
                         ReducerAction::CancelCutback => {
@@ -2753,48 +2785,71 @@ fn validate_relationship_chain(
                 );
             }
             Some(entry) => {
-                if entry.code_source_selector.as_deref() != Some(activation.selector()) {
+                // Crash-window admission (exit row 12.4): if the workspace
+                // entry's selector is the writer's own local shape for THIS
+                // project (local:<project_id>) while the activation record is
+                // collected, the daemon crashed between local manifest
+                // publication and activation-record clear (the sanctioned
+                // crash window in the reduction table: local | local | any
+                // non-None | clear stale state). ADMIT with a tracing::info
+                // so the startup reducer sweep converges it (the stale
+                // collected record is cleared). Every other mismatch shape
+                // still fails closed.
+                let entry_selector = entry.code_source_selector.as_deref();
+                let is_cutback_crash_window = entry_selector
+                    == Some(bbox_code_source::local_selector(project_id).as_str())
+                    && activation.selector().starts_with("collected:");
+                if is_cutback_crash_window {
+                    tracing::info!(
+                        project = %project_id,
+                        "relationship chain link 5: cutback crash window admitted \
+                         (manifest entry is local:{project_id}, activation record is \
+                         collected; reducer will converge by clearing the stale record)"
+                    );
+                } else if entry_selector != Some(activation.selector()) {
                     bail!(
                         "error.code_source_relationship_chain: \
                          workspace selector mismatch for project {project_id}"
                     );
                 }
-                if entry.code_source_generation.as_deref() != Some(generation_id) {
-                    bail!(
-                        "error.code_source_relationship_chain: \
-                         workspace generation mismatch for project {project_id}"
+                if !is_cutback_crash_window {
+                    if entry.code_source_generation.as_deref() != Some(generation_id) {
+                        bail!(
+                            "error.code_source_relationship_chain: \
+                             workspace generation mismatch for project {project_id}"
+                        );
+                    }
+                    // Require EXACT equality with the canonical writer-produced
+                    // snapshot path (R2F3). The production writer
+                    // (activate_source_snapshot in bbox_edge_sidecar::snapshot)
+                    // stores active_snapshot as the ManifestIndex-relative path
+                    // "workspace/{project_id}/snapshots/{snapshot_id}" (built by
+                    // active_snapshot_rel). Comparing only the final path segment
+                    // admitted cross-project drift (a path from a different
+                    // project whose snapshot id happened to match). Derive the
+                    // expected string the same way the writer does.
+                    let expected_snapshot = bbox_edge_sidecar::snapshot::active_snapshot_rel(
+                        project_id,
+                        activation.snapshot_id(),
                     );
-                }
-                // Require EXACT equality with the canonical writer-produced
-                // snapshot path (R2F3). The production writer
-                // (activate_source_snapshot in bbox_edge_sidecar::snapshot)
-                // stores active_snapshot as the ManifestIndex-relative path
-                // "workspace/{project_id}/snapshots/{snapshot_id}" (built by
-                // active_snapshot_rel). Comparing only the final path segment
-                // admitted cross-project drift (a path from a different
-                // project whose snapshot id happened to match). Derive the
-                // expected string the same way the writer does.
-                let expected_snapshot = bbox_edge_sidecar::snapshot::active_snapshot_rel(
-                    project_id,
-                    activation.snapshot_id(),
-                );
-                if entry.active_snapshot.as_deref() != Some(expected_snapshot.as_str()) {
-                    bail!(
-                        "error.code_source_relationship_chain: \
-                         workspace snapshot mismatch for project {project_id}"
-                    );
-                }
-                // Require EXACT equality with the canonical writer-produced
-                // manifest path (R2F3). The production writer always writes
-                // "workspace/{project_id}/manifest.json". Checking only
-                // non-emptiness admitted wrong-nonempty paths (including
-                // cross-project paths from a different project's manifest).
-                let expected_manifest = format!("workspace/{project_id}/manifest.json");
-                if entry.manifest != expected_manifest {
-                    bail!(
-                        "error.code_source_relationship_chain: \
-                         workspace manifest path mismatch for project {project_id}"
-                    );
+                    if entry.active_snapshot.as_deref() != Some(expected_snapshot.as_str()) {
+                        bail!(
+                            "error.code_source_relationship_chain: \
+                             workspace snapshot mismatch for project {project_id}"
+                        );
+                    }
+                    // Require EXACT equality with the canonical writer-produced
+                    // manifest path (R2F3). The production writer always writes
+                    // "workspace/{project_id}/manifest.json". Checking only
+                    // non-emptiness admitted wrong-nonempty paths (including
+                    // cross-project paths from a different project's manifest).
+                    let expected_manifest = format!("workspace/{project_id}/manifest.json");
+                    if entry.manifest != expected_manifest {
+                        bail!(
+                            "error.code_source_relationship_chain: \
+                             workspace manifest path mismatch for project {project_id}"
+                        );
+                    }
                 }
             }
         }
@@ -9853,6 +9908,165 @@ mod tests {
         assert!(
             body.contains("continue"),
             "activate_pending_local_snapshots must skip (continue) collected entries"
+        );
+    }
+
+    // ---- Crash-window admission and convergence ----
+
+    /// Exit row 12.4: the cutback crash window. The daemon crashed between
+    /// local manifest publication (activate_local_snapshot_with wrote the
+    /// manifest entry as local:<project_id>) and activation-record clear
+    /// (clear_activation never ran). On restart the workspace entry is
+    /// local:<project_id> while the activation record is collected:....
+    /// The relationship chain must ADMIT this shape so the daemon boots.
+    #[test]
+    fn crash_window_local_manifest_collected_record_passes_chain() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let runtime = CodeSourceRuntime::for_test_catalog(&root);
+        let store = runtime.store();
+
+        let scope = PublishedScope::try_new("crash-win", ".").unwrap();
+        let project_id = "p_0000000000000000000000000000cw1";
+        let generation_id = compute_generation_id(
+            "p4f-producer",
+            &empty_generation_descriptor(scope.clone(), &"a".repeat(40)),
+        );
+
+        p4f_seed_activation(
+            &store,
+            &root.join("code-sources"),
+            project_id,
+            &scope,
+            &generation_id,
+            None,
+            false,
+        );
+
+        let snapshot = p4f_catalog_snapshot(project_id, scope, vec![]);
+
+        // Manifest entry has the writer's own local shape for THIS project.
+        let mut manifest = bbox_edge_sidecar::manifest::ManifestIndex::new();
+        manifest.workspaces.insert(
+            project_id.to_string(),
+            bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
+                manifest: format!("workspace/{project_id}/manifest.json"),
+                active_snapshot: Some(format!("workspace/{project_id}/snapshots/local-cw_snap")),
+                dirty_overlay: None,
+                repo_materialization: None,
+                code_source_selector: Some(bbox_code_source::local_selector(project_id)),
+                code_source_generation: Some("local".to_string()),
+                git_overlay: None,
+                git_overlay_managed: false,
+            },
+        );
+
+        let result = validate_relationship_chain(&store, &snapshot, &manifest);
+        assert!(
+            result.is_ok(),
+            "crash window (local manifest + collected record) must pass chain, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// Crash-window admission is narrow: a local selector for a DIFFERENT
+    /// project id is genuine drift, not the crash window. Must still fail
+    /// closed.
+    #[test]
+    fn crash_window_wrong_project_local_selector_fails_chain() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let runtime = CodeSourceRuntime::for_test_catalog(&root);
+        let store = runtime.store();
+
+        let scope = PublishedScope::try_new("crash-bad", ".").unwrap();
+        let project_id = "p_0000000000000000000000000000cw2";
+        let generation_id = compute_generation_id(
+            "p4f-producer",
+            &empty_generation_descriptor(scope.clone(), &"a".repeat(40)),
+        );
+
+        p4f_seed_activation(
+            &store,
+            &root.join("code-sources"),
+            project_id,
+            &scope,
+            &generation_id,
+            None,
+            false,
+        );
+
+        let snapshot = p4f_catalog_snapshot(project_id, scope, vec![]);
+
+        // Manifest entry is local:<DIFFERENT_PROJECT> - this is cross-project
+        // drift, not the crash window. Must fail closed.
+        let mut manifest = bbox_edge_sidecar::manifest::ManifestIndex::new();
+        manifest.workspaces.insert(
+            project_id.to_string(),
+            bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
+                manifest: format!("workspace/{project_id}/manifest.json"),
+                active_snapshot: Some(format!("workspace/{project_id}/snapshots/local-bad")),
+                dirty_overlay: None,
+                repo_materialization: None,
+                code_source_selector: Some(bbox_code_source::local_selector(
+                    "p_0000000000000000000000000000other",
+                )),
+                code_source_generation: Some("local".to_string()),
+                git_overlay: None,
+                git_overlay_managed: false,
+            },
+        );
+
+        let result = validate_relationship_chain(&store, &snapshot, &manifest);
+        assert!(
+            result.is_err(),
+            "wrong-project local selector must fail chain (genuine drift)"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("selector mismatch"),
+            "error must be selector mismatch, got: {err}"
+        );
+    }
+
+    /// Structural assertion: the chain validation source contains the
+    /// crash-window admission logic, naming the specific selector shape.
+    #[test]
+    fn crash_window_admission_logic_exists() {
+        let src = self_source();
+        let body = extract_fn_body_again(&src, "validate_relationship_chain");
+        assert!(
+            body.contains("is_cutback_crash_window"),
+            "chain must define a cutback crash window predicate"
+        );
+        assert!(
+            body.contains("local_selector(project_id)"),
+            "crash window must check the writer's own local selector for this project"
+        );
+        assert!(
+            body.contains("cutback crash window admitted"),
+            "crash window admission must emit a tracing::info"
+        );
+    }
+
+    /// Structural assertion: the reducer's NoOp arm checks for stale
+    /// collected activation records when effective is Local (the
+    /// convergence half of the crash-window transition).
+    #[test]
+    fn crash_window_reducer_clears_stale_collected_record() {
+        let src = self_source();
+        let body = extract_fn_body_again(&src, "spawn_reconciler");
+        let noop_pos = body
+            .find("ReducerAction::NoOp =>")
+            .expect("reducer must have a NoOp arm");
+        let noop_body = &body[noop_pos..];
+        assert!(
+            noop_body.contains("starts_with(\"collected:\")"),
+            "reducer NoOp arm must check for stale collected activation records"
+        );
+        assert!(
+            noop_body.contains("clear_activation"),
+            "reducer NoOp arm must clear stale collected activation records"
         );
     }
 }
