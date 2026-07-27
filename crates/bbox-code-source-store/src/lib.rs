@@ -4797,13 +4797,57 @@ impl CodeSourceStore {
     /// Read the raw manifest.jsonl bytes for a generation (section 10.2
     /// link 4: bounded manifest verification). Returns the file bytes
     /// for digest verification and entry validation.
+    ///
+    /// Uses a bounded O_NOFOLLOW descriptor read on Unix to prevent
+    /// symlink following and resource exhaustion (R2F3). The file size
+    /// is checked before allocation against the store limits.
     pub fn read_generation_manifest_bytes(
         &self,
         scope: &PublishedScope,
         generation: &str,
     ) -> Result<Vec<u8>> {
         let path = self.paths.generation_manifest(scope, generation)?;
-        std::fs::read(&path).with_context(|| format!("reading manifest at {}", path.display()))
+        let limits = self.limits();
+        // Bounded nofollow read (R2F3).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let metadata = std::fs::metadata(&path)
+                .with_context(|| format!("stat manifest at {}", path.display()))?;
+            let size = metadata.len() as usize;
+            if size > limits.max_manifest_logical_bytes as usize {
+                anyhow::bail!(
+                    "manifest at {} exceeds byte limit ({} > {})",
+                    path.display(),
+                    size,
+                    limits.max_manifest_logical_bytes
+                );
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)
+                .with_context(|| format!("opening manifest at {}", path.display()))?;
+            let mut buf = Vec::with_capacity(size);
+            std::io::Read::read_to_end(&mut file, &mut buf)
+                .with_context(|| format!("reading manifest at {}", path.display()))?;
+            Ok(buf)
+        }
+        #[cfg(not(unix))]
+        {
+            let metadata = std::fs::metadata(&path)
+                .with_context(|| format!("stat manifest at {}", path.display()))?;
+            let size = metadata.len() as usize;
+            if size > limits.max_manifest_logical_bytes as usize {
+                anyhow::bail!(
+                    "manifest at {} exceeds byte limit ({} > {})",
+                    path.display(),
+                    size,
+                    limits.max_manifest_logical_bytes
+                );
+            }
+            std::fs::read(&path).with_context(|| format!("reading manifest at {}", path.display()))
+        }
     }
 
     pub fn desired_generation(&self, scope: &PublishedScope) -> Result<Option<StoredGeneration>> {

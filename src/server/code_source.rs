@@ -2765,35 +2765,35 @@ fn validate_relationship_chain(
                          workspace generation mismatch for project {project_id}"
                     );
                 }
-                // Compare snapshot by the final path segment: the production
-                // republish writer (activate_source_snapshot in
-                // bbox_edge_sidecar::snapshot) stores active_snapshot as the
-                // ManifestIndex-relative path
+                // Require EXACT equality with the canonical writer-produced
+                // snapshot path (R2F3). The production writer
+                // (activate_source_snapshot in bbox_edge_sidecar::snapshot)
+                // stores active_snapshot as the ManifestIndex-relative path
                 // "workspace/{project_id}/snapshots/{snapshot_id}" (built by
-                // active_snapshot_rel), while the activation record stores the
-                // bare snapshot id. Comparing the final segment matches the
-                // production format; real drift (a different id in the final
-                // segment) still fails closed.
-                let snapshot_matches = entry.active_snapshot.as_deref().is_some_and(|stored| {
-                    std::path::Path::new(stored)
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        == Some(activation.snapshot_id())
-                });
-                if !snapshot_matches {
+                // active_snapshot_rel). Comparing only the final path segment
+                // admitted cross-project drift (a path from a different
+                // project whose snapshot id happened to match). Derive the
+                // expected string the same way the writer does.
+                let expected_snapshot = bbox_edge_sidecar::snapshot::active_snapshot_rel(
+                    project_id,
+                    activation.snapshot_id(),
+                );
+                if entry.active_snapshot.as_deref() != Some(expected_snapshot.as_str()) {
                     bail!(
                         "error.code_source_relationship_chain: \
                          workspace snapshot mismatch for project {project_id}"
                     );
                 }
-                // Verify the manifest path is present and non-empty.
-                // The production writer always writes a manifest path
-                // (activate_source_snapshot in bbox_edge_sidecar::snapshot).
-                // An empty or missing manifest path is drift.
-                if entry.manifest.trim().is_empty() {
+                // Require EXACT equality with the canonical writer-produced
+                // manifest path (R2F3). The production writer always writes
+                // "workspace/{project_id}/manifest.json". Checking only
+                // non-emptiness admitted wrong-nonempty paths (including
+                // cross-project paths from a different project's manifest).
+                let expected_manifest = format!("workspace/{project_id}/manifest.json");
+                if entry.manifest != expected_manifest {
                     bail!(
                         "error.code_source_relationship_chain: \
-                         workspace manifest path missing for project {project_id}"
+                         workspace manifest path mismatch for project {project_id}"
                     );
                 }
             }
@@ -2858,6 +2858,69 @@ fn detect_incomplete_retirement_journal(bro_home: &std::path::Path) -> Result<()
     Ok(())
 }
 
+/// Reconstruct WorkspaceIndexEntry rows from validated activation records
+/// for collected projects whose workspace manifest entries are absent
+/// (R2F2). The relationship chain has already validated every activation
+/// record against its generation, so the record's selector, generation,
+/// snapshot, and manifest path are trustworthy. Without this step,
+/// `load_active_code_selectors` defaults every catalog project to
+/// `local:<project_id>` and collected documents vanish from search.
+///
+/// The reconstructed entry mirrors exactly what the production writer
+/// (`activate_source_snapshot`) would produce: manifest path
+/// `workspace/{project_id}/manifest.json`, active_snapshot
+/// `workspace/{project_id}/snapshots/{snapshot_id}`, selector and
+/// generation from the activation record.
+fn reconstruct_workspace_entries_from_activations(
+    store: &CodeSourceStore,
+    edges_dir: &std::path::Path,
+    manifest: &bbox_edge_sidecar::manifest::ManifestIndex,
+) -> Result<()> {
+    let records = store
+        .activation_records_mixed()
+        .context("loading activation records for workspace reconstruction")?;
+    let mut index = manifest.clone();
+    let mut reconstructed = 0u32;
+    for activation in &records {
+        let project_id = activation.project_id();
+        // Only reconstruct for collected projects missing a workspace entry.
+        if index.workspaces.contains_key(project_id) {
+            continue;
+        }
+        // Only collected records carry a selector that is not local.
+        let selector = activation.selector();
+        if !selector.starts_with("collected:") {
+            continue;
+        }
+        let snapshot_rel =
+            bbox_edge_sidecar::snapshot::active_snapshot_rel(project_id, activation.snapshot_id());
+        index.upsert_workspace(
+            project_id,
+            bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
+                manifest: format!("workspace/{project_id}/manifest.json"),
+                active_snapshot: Some(snapshot_rel),
+                dirty_overlay: None,
+                repo_materialization: None,
+                code_source_selector: Some(selector.to_string()),
+                code_source_generation: Some(activation.generation_id().to_string()),
+                git_overlay: None,
+                git_overlay_managed: false,
+            },
+        );
+        reconstructed += 1;
+    }
+    if reconstructed > 0 {
+        tracing::info!(
+            reconstructed,
+            "pre-bind: reconstructed workspace entries from validated activation records"
+        );
+        index
+            .write_atomic(edges_dir)
+            .context("writing reconstructed workspace entries to manifest index")?;
+    }
+    Ok(())
+}
+
 /// Pre-bind catalog-mode recovery: steps 5-8 of the startup order
 /// (section 10.1). Runs in `open_shared_state` BEFORE the listener
 /// binds. Bridge mode is a no-op (byte-compatible).
@@ -2899,6 +2962,18 @@ pub(crate) fn pre_bind_catalog_recovery(
     // Step 6: validate the relationship chain.
     validate_relationship_chain(store, catalog, &manifest)
         .context("pre-bind: relationship chain validation")?;
+
+    // Step 6b: reconstruct workspace manifest entries from validated
+    // activation records for projects whose entries are absent (the
+    // pending-first-republish state for a migrated or never-booted root).
+    // Without this step, load_active_code_selectors defaults every catalog
+    // project to local:<project_id> and the collected generation's
+    // documents vanish from search. The chain has already validated every
+    // activation record against its generation (selector, generation id,
+    // snapshot id, manifest path), so reconstructing the entry from the
+    // validated record is safe (R2F2).
+    reconstruct_workspace_entries_from_activations(store, &edges_dir, &manifest)
+        .context("pre-bind: workspace entry reconstruction")?;
 
     // Step 7: detect incomplete retirement journals.
     detect_incomplete_retirement_journal(bro_home)
@@ -9485,14 +9560,15 @@ mod tests {
         );
     }
 
-    /// F3: link 5 checks the manifest path field.
+    /// F3: link 5 checks the manifest path field (R2F3: now checks exact
+    /// equality with the canonical writer-produced path, not just non-emptiness).
     #[test]
     fn f3_link5_checks_manifest_path() {
         let src = self_source();
         let body = extract_fn_body(&src, "validate_relationship_chain");
         assert!(
-            body.contains("manifest path missing"),
-            "link 5 must check workspace manifest path (F3 fix)"
+            body.contains("workspace/{project_id}/manifest.json"),
+            "link 5 must check exact workspace manifest path equality (R2F3)"
         );
     }
 
@@ -9654,6 +9730,106 @@ mod tests {
         assert!(
             !snippet.contains("clear_activation"),
             "CancelCutback dispatch must NOT call clear_activation"
+        );
+    }
+
+    // ---- R2F2: workspace entry reconstruction from activation records ----
+
+    /// R2F2: pre_bind_catalog_recovery reconstructs workspace entries from
+    /// validated activation records for collected projects missing entries,
+    /// before the read-view is constructed.
+    #[test]
+    fn r2f2_reconstructs_workspace_entries_from_activations() {
+        let src = self_source();
+        let body = extract_fn_body_again(&src, "reconstruct_workspace_entries_from_activations");
+        assert!(
+            body.contains("activation.selector()"),
+            "reconstruct must consult the activation record selector"
+        );
+        assert!(
+            body.contains("collected:"),
+            "reconstruct must only handle collected selectors"
+        );
+        assert!(
+            body.contains("active_snapshot_rel"),
+            "reconstruct must derive the exact writer-produced snapshot path"
+        );
+        assert!(
+            body.contains("workspace/{project_id}/manifest.json"),
+            "reconstruct must derive the exact writer-produced manifest path"
+        );
+    }
+
+    /// R2F2: the reconstruction step is called in pre_bind_catalog_recovery
+    /// after the relationship chain validation.
+    #[test]
+    fn r2f2_reconstruction_runs_after_chain_validation() {
+        let src = self_source();
+        let body = extract_fn_body_again(&src, "pre_bind_catalog_recovery");
+        let chain_pos = body
+            .find("validate_relationship_chain")
+            .expect("chain validation must exist in pre_bind");
+        let reconstruct_pos = body
+            .find("reconstruct_workspace_entries_from_activations")
+            .expect("reconstruction must exist in pre_bind");
+        assert!(
+            chain_pos < reconstruct_pos,
+            "reconstruction must run AFTER chain validation (entries are reconstructed from validated records)"
+        );
+    }
+
+    // ---- R2F3: exact path equality in chain validation ----
+
+    /// R2F3: link 5 requires EXACT equality with the canonical snapshot path,
+    /// not just the final path segment.
+    #[test]
+    fn r2f3_link5_exact_snapshot_equality() {
+        let src = self_source();
+        let body = extract_fn_body_again(&src, "validate_relationship_chain");
+        assert!(
+            body.contains("active_snapshot_rel"),
+            "link 5 must derive the expected snapshot path from active_snapshot_rel"
+        );
+        assert!(
+            !body.contains("file_name()"),
+            "link 5 must NOT compare by final path segment (R2F3: exact equality)"
+        );
+    }
+
+    /// R2F3: link 5 requires EXACT equality with the canonical manifest path,
+    /// not just non-emptiness.
+    #[test]
+    fn r2f3_link5_exact_manifest_path() {
+        let src = self_source();
+        let body = extract_fn_body_again(&src, "validate_relationship_chain");
+        assert!(
+            body.contains("workspace/{project_id}/manifest.json"),
+            "link 5 must check exact manifest path equality"
+        );
+        assert!(
+            !body.contains("manifest path missing"),
+            "link 5 must NOT check only non-emptiness (R2F3: exact equality)"
+        );
+    }
+
+    /// R2F3: manifest read uses bounded O_NOFOLLOW descriptor.
+    #[test]
+    fn r2f3_manifest_read_is_bounded_nofollow() {
+        let store_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/bbox-code-source-store/src/lib.rs");
+        let src = std::fs::read_to_string(&store_path)
+            .unwrap_or_else(|_| panic!("failed to read {}", store_path.display()));
+        let body_pos = src
+            .find("fn read_generation_manifest_bytes")
+            .expect("read_generation_manifest_bytes must exist");
+        let body = &src[body_pos..body_pos + 1500];
+        assert!(
+            body.contains("O_NOFOLLOW"),
+            "manifest read must use O_NOFOLLOW (R2F3)"
+        );
+        assert!(
+            body.contains("max_manifest_logical_bytes"),
+            "manifest read must check size before allocation (R2F3)"
         );
     }
 }
