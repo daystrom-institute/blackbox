@@ -1365,6 +1365,7 @@ fn execute_retirement_journal(
             "edge_paths": planned_evidence.edge_paths,
             "artifact_targets": planned_evidence.artifact_targets,
             "reference_class_counts": planned_evidence.reference_class_counts,
+            "reference_class_commitments": planned_evidence.reference_class_commitments,
             "blob_count": planned_evidence.owned_blob_hashes.len(),
         },
         "journal": journal.as_ref().map(|j| serde_json::json!({
@@ -1540,6 +1541,30 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
         let reference_count_increased = current_reference_counts.iter().any(|(class, count)| {
             *count > expected_reference_counts.get(class).copied().unwrap_or(0)
         });
+        let expected_commitments =
+            evidence.reference_class_commitments.as_ref().ok_or_else(|| {
+                project_catalog_admin::admin_error(
+                    "error.project_catalog_retire_evidence_incomplete",
+                    "retirement evidence is missing reference-class commitments",
+                )
+            })?;
+        let current_commitments =
+            current.reference_class_commitments.as_ref().ok_or_else(|| {
+                project_catalog_admin::admin_error(
+                    "error.project_catalog_retire_evidence_incomplete",
+                    "current retirement evidence is missing reference-class commitments",
+                )
+            })?;
+        let reference_commitment_drifted = current_commitments.iter().any(|(class, identities)| {
+            let expected = expected_commitments
+                .get(class)
+                .into_iter()
+                .flatten()
+                .collect::<BTreeSet<_>>();
+            identities
+                .iter()
+                .any(|identity| !expected.contains(identity))
+        });
         let selectors_match = stage
             .is_at_least(project_catalog_admin::RetirementJournalStage::AttachmentsDetached)
             || current.project_selectors == evidence.project_selectors;
@@ -1554,6 +1579,7 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             || !current_artifacts.is_subset(&expected_artifacts)
             || !current_blobs.is_subset(&expected_blobs)
             || reference_count_increased
+            || reference_commitment_drifted
         {
             return Err(project_catalog_admin::admin_error(
                 "error.project_catalog_retire_evidence_drift",
@@ -2250,6 +2276,7 @@ const SLACK_ROW_KEYS: [&str; 3] = ["project", "project_id", "project_dir"];
 /// genuinely discharged zero.
 enum ClassProbe {
     Counted(u64),
+    Committed(Vec<String>),
     Unprobeable,
 }
 
@@ -2257,6 +2284,7 @@ impl ClassProbe {
     #[allow(dead_code)]
     fn is_present(&self) -> bool {
         matches!(self, ClassProbe::Counted(n) if *n > 0)
+            || matches!(self, ClassProbe::Committed(rows) if !rows.is_empty())
     }
 }
 
@@ -2265,20 +2293,67 @@ impl ClassProbe {
 #[derive(Default)]
 struct RetireProbe {
     evidence: project_catalog_admin::RetireEvidence,
+    commitments: BTreeMap<String, Vec<String>>,
     unprobeable: Vec<String>,
 }
 
 impl RetireProbe {
     fn record(&mut self, class: &str, probe: ClassProbe) {
         match probe {
-            ClassProbe::Counted(0) => {}
+            ClassProbe::Counted(0) => {
+                self.commitments.insert(class.to_string(), Vec::new());
+            }
             ClassProbe::Counted(count) => {
                 self.evidence
                     .external_reference_counts
                     .insert(class.to_string(), count);
+                self.commitments.insert(
+                    class.to_string(),
+                    vec![retirement_commitment(&(class, count))],
+                );
+            }
+            ClassProbe::Committed(mut identities) => {
+                identities.sort();
+                identities.dedup();
+                self.evidence
+                    .external_reference_counts
+                    .insert(class.to_string(), identities.len() as u64);
+                self.commitments.insert(class.to_string(), identities);
             }
             ClassProbe::Unprobeable => self.unprobeable.push(class.to_string()),
         }
+    }
+}
+
+fn retirement_commitment(value: &impl serde::Serialize) -> String {
+    let bytes = serde_json::to_vec(value).expect("retirement commitment serialization is infallible");
+    bbox_corpus_core::project_catalog_snapshot::sha256_hex(&bytes)
+}
+
+fn owner_snapshot_row_commitment(
+    row: &bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotRowV1,
+) -> String {
+    use bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotRowValueV1;
+
+    match &row.value {
+        OwnerSnapshotRowValueV1::InventoryTarget {
+            project_id,
+            target_sha256,
+        } => retirement_commitment(&(
+            row.stable_row_id.as_str(),
+            "inventory_target",
+            project_id,
+            target_sha256,
+        )),
+        OwnerSnapshotRowValueV1::LegacyProjectSelector {
+            selector_kind,
+            literal_selector,
+        } => retirement_commitment(&(
+            row.stable_row_id.as_str(),
+            "legacy_project_selector",
+            format!("{selector_kind:?}"),
+            literal_selector,
+        )),
     }
 }
 
@@ -2367,7 +2442,7 @@ fn probe_retire_evidence(
     probe.record(
         "accepted_publication_pointer",
         match accepted_publication_pointer(projects_path, project_id) {
-            Some(pointer) => presence_probe(&pointer),
+            Some(pointer) => file_commitment_probe(&pointer),
             None => ClassProbe::Unprobeable,
         },
     );
@@ -2744,6 +2819,7 @@ fn capture_retirement_evidence(
         edge_paths: Some(edge_inventory.relative_paths),
         artifact_targets: Some(artifact_targets),
         reference_class_counts: Some(reference_class_counts),
+        reference_class_commitments: Some(reference_probe.commitments),
         blob_inventory: None,
         owned_blob_hashes: owned_blob_hashes.into_iter().collect(),
     })
@@ -2873,7 +2949,13 @@ fn probe_edge_sidecar(edges_dir: &Path, project_id: &ProjectId) -> ClassProbe {
         edges_dir,
         project_id.as_str(),
     ) {
-        Ok(inventory) => ClassProbe::Counted(inventory.relative_paths.len() as u64),
+        Ok(inventory) => ClassProbe::Committed(
+            inventory
+                .relative_paths
+                .iter()
+                .map(retirement_commitment)
+                .collect(),
+        ),
         Err(_) => ClassProbe::Unprobeable,
     }
 }
@@ -2897,12 +2979,12 @@ fn probe_owner_snapshot_rows(
     };
     match snapshot.state {
         OwnerSnapshotStateV1::Missing { .. } if snapshot.rows.is_empty() => {
-            return ClassProbe::Counted(0);
+            return ClassProbe::Committed(Vec::new());
         }
         OwnerSnapshotStateV1::Present { .. } => {}
         _ => return ClassProbe::Unprobeable,
     }
-    ClassProbe::Counted(
+    ClassProbe::Committed(
         snapshot
             .rows
             .iter()
@@ -2916,7 +2998,8 @@ fn probe_owner_snapshot_rows(
                     .iter()
                     .any(|selector| selector == literal_selector),
             })
-            .count() as u64,
+            .map(owner_snapshot_row_commitment)
+            .collect(),
     )
 }
 
@@ -2930,14 +3013,20 @@ fn probe_index_entity_refs(
     use corpus_inventory::CorpusMigrationSourceStateV1;
 
     match index.state {
-        CorpusMigrationSourceStateV1::Missing => ClassProbe::Counted(0),
-        CorpusMigrationSourceStateV1::Present => ClassProbe::Counted(
+        CorpusMigrationSourceStateV1::Missing => ClassProbe::Committed(Vec::new()),
+        CorpusMigrationSourceStateV1::Present => ClassProbe::Committed(
             index
                 .project_scoped_refs
                 .iter()
                 .filter(|row| selectors.iter().any(|selector| selector == &row.project_id))
-                .map(|row| row.document_count)
-                .sum(),
+                .map(|row| {
+                    retirement_commitment(&(
+                        &row.project_id,
+                        &row.entity_ref,
+                        row.document_count,
+                    ))
+                })
+                .collect(),
         ),
         _ => ClassProbe::Unprobeable,
     }
@@ -2951,8 +3040,8 @@ fn probe_index_code_metadata_rows(
     use corpus_inventory::CorpusMigrationSourceStateV1;
 
     match metadata.state {
-        CorpusMigrationSourceStateV1::Missing => ClassProbe::Counted(0),
-        CorpusMigrationSourceStateV1::Present => ClassProbe::Counted(
+        CorpusMigrationSourceStateV1::Missing => ClassProbe::Committed(Vec::new()),
+        CorpusMigrationSourceStateV1::Present => ClassProbe::Committed(
             metadata
                 .rows
                 .iter()
@@ -2964,7 +3053,27 @@ fn probe_index_code_metadata_rows(
                     };
                     named(&row.project_id) || named(&row.selector)
                 })
-                .count() as u64,
+                .map(|row| {
+                    retirement_commitment(&(
+                        &row.source_key_sha256,
+                        match row.source_kind {
+                            corpus_inventory::CodeIndexMetadataSourceKindV1::LegacyFilesystem => {
+                                "legacy_filesystem"
+                            }
+                            corpus_inventory::CodeIndexMetadataSourceKindV1::LocalProjectFile => {
+                                "local_project_file"
+                            }
+                        },
+                        row.mtime,
+                        row.size,
+                        &row.materialization_version,
+                        &row.project_id,
+                        &row.selector,
+                        &row.relative_path,
+                        &row.entry_key,
+                    ))
+                })
+                .collect(),
         ),
         _ => ClassProbe::Unprobeable,
     }
@@ -2978,13 +3087,14 @@ fn probe_git_ingest_cursors(
     use corpus_inventory::CorpusMigrationSourceStateV1;
 
     match cursors.state {
-        CorpusMigrationSourceStateV1::Missing => ClassProbe::Counted(0),
-        CorpusMigrationSourceStateV1::Present => ClassProbe::Counted(
+        CorpusMigrationSourceStateV1::Missing => ClassProbe::Committed(Vec::new()),
+        CorpusMigrationSourceStateV1::Present => ClassProbe::Committed(
             cursors
                 .rows
                 .iter()
                 .filter(|row| selectors.iter().any(|selector| selector == &row.project_id))
-                .count() as u64,
+                .map(|row| retirement_commitment(&(&row.project_id, &row.last_ingested_sha)))
+                .collect(),
         ),
         _ => ClassProbe::Unprobeable,
     }
@@ -2998,13 +3108,21 @@ fn probe_vector_entity_refs(
     use vector_inventory::VectorMigrationSourceStateV1;
 
     match snapshot.state {
-        VectorMigrationSourceStateV1::Missing => ClassProbe::Counted(0),
-        VectorMigrationSourceStateV1::Present => ClassProbe::Counted(
+        VectorMigrationSourceStateV1::Missing => ClassProbe::Committed(Vec::new()),
+        VectorMigrationSourceStateV1::Present => ClassProbe::Committed(
             snapshot
                 .project_scoped_refs
                 .iter()
                 .filter(|row| selectors.iter().any(|selector| selector == &row.project_id))
-                .count() as u64,
+                .map(|row| {
+                    retirement_commitment(&(
+                        &row.route,
+                        &row.project_id,
+                        &row.entity_ref,
+                        &row.content_hash,
+                    ))
+                })
+                .collect(),
         ),
         _ => ClassProbe::Unprobeable,
     }
@@ -3020,14 +3138,14 @@ fn count_project_rows(
     keys: &[&str],
 ) -> ClassProbe {
     let bytes = match read_regular_nofollow(path) {
-        Ok(None) => return ClassProbe::Counted(0),
+        Ok(None) => return ClassProbe::Committed(Vec::new()),
         Ok(Some(bytes)) => bytes,
         Err(()) => return ClassProbe::Unprobeable,
     };
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return ClassProbe::Unprobeable;
     };
-    let mut count = 0_u64;
+    let mut commitments = Vec::new();
     let mut stack = vec![&value];
     while let Some(node) = stack.pop() {
         match node {
@@ -3046,7 +3164,7 @@ fn count_project_rows(
                     }),
                 };
                 if hit {
-                    count += 1;
+                    commitments.push(retirement_commitment(node));
                 } else {
                     stack.extend(map.values());
                 }
@@ -3054,7 +3172,7 @@ fn count_project_rows(
             _ => {}
         }
     }
-    ClassProbe::Counted(count)
+    ClassProbe::Committed(commitments)
 }
 
 /// No-follow presence test for one store-owned record. `Path::exists`
@@ -3065,6 +3183,14 @@ fn presence_probe(path: &Path) -> ClassProbe {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => ClassProbe::Counted(0),
         Ok(metadata) if metadata.is_file() => ClassProbe::Counted(1),
         _ => ClassProbe::Unprobeable,
+    }
+}
+
+fn file_commitment_probe(path: &Path) -> ClassProbe {
+    match read_regular_nofollow(path) {
+        Ok(None) => ClassProbe::Committed(Vec::new()),
+        Ok(Some(bytes)) => ClassProbe::Committed(vec![retirement_commitment(&bytes)]),
+        Err(()) => ClassProbe::Unprobeable,
     }
 }
 

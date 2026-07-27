@@ -1118,8 +1118,6 @@ fn retirement_execute_refuses_when_prepared_plan_hash_drifts() {
     let projects = projects_path.to_str().unwrap();
     let config = config_path.to_str().unwrap();
     let project_id = add_published_project(projects, "planfamily", ".", "2026-07-27T00:00:00Z");
-    let plan_hash = retirement_plan_hash(projects, &project_id, config, None, &index_path);
-
     write(
         &state.join("bro/slack-channel-bindings.json"),
         serde_json::to_vec(&serde_json::json!({
@@ -1130,6 +1128,23 @@ fn retirement_execute_refuses_when_prepared_plan_hash_drifts() {
                 "project_id": project_id,
                 "project_dir": "/late/checkout",
                 "registered_at": "2026-07-27T00:00:00Z"
+              }
+            }
+        }))
+        .unwrap()
+        .as_slice(),
+    );
+    let plan_hash = retirement_plan_hash(projects, &project_id, config, None, &index_path);
+    write(
+        &state.join("bro/slack-channel-bindings.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "bindings": {
+              "T1:C2": {
+                "team_id": "T1",
+                "channel_id": "C2",
+                "project_id": project_id,
+                "project_dir": "/replacement/checkout",
+                "registered_at": "2026-07-27T00:00:01Z"
               }
             }
         }))
