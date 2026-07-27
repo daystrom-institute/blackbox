@@ -1873,6 +1873,7 @@ impl bbox_indexing::project_catalog_admin::RetirementDischargeWorkers for Counti
     fn discharge_collected_generations(
         &mut self,
         _project_id: &ProjectId,
+        _evidence: &bbox_indexing::project_catalog_admin::RetirementJournalEvidence,
     ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
         self.collected_generations_calls += 1;
         Ok(())
@@ -1895,6 +1896,7 @@ impl bbox_indexing::project_catalog_admin::RetirementDischargeWorkers for Counti
     fn sweep_materialization(
         &mut self,
         _project_id: &ProjectId,
+        _evidence: &bbox_indexing::project_catalog_admin::RetirementJournalEvidence,
     ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
         self.sweep_calls += 1;
         Ok(())
@@ -2179,6 +2181,7 @@ fn acceptance_discharge_nonzero_reprobe_refuses_at_final_cut() {
         fn discharge_collected_generations(
             &mut self,
             _project_id: &ProjectId,
+            _evidence: &bbox_indexing::project_catalog_admin::RetirementJournalEvidence,
         ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
             Ok(())
         }
@@ -2198,6 +2201,7 @@ fn acceptance_discharge_nonzero_reprobe_refuses_at_final_cut() {
         fn sweep_materialization(
             &mut self,
             _project_id: &ProjectId,
+            _evidence: &bbox_indexing::project_catalog_admin::RetirementJournalEvidence,
         ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
             Ok(())
         }
@@ -2305,6 +2309,7 @@ fn f5_source_authority_quiesced_blocks_journal() {
         fn discharge_collected_generations(
             &mut self,
             _project_id: &ProjectId,
+            _evidence: &bbox_indexing::project_catalog_admin::RetirementJournalEvidence,
         ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
             Ok(())
         }
@@ -2324,6 +2329,7 @@ fn f5_source_authority_quiesced_blocks_journal() {
         fn sweep_materialization(
             &mut self,
             _project_id: &ProjectId,
+            _evidence: &bbox_indexing::project_catalog_admin::RetirementJournalEvidence,
         ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
             Ok(())
         }
@@ -2438,6 +2444,7 @@ fn r2f1_unprobeable_classes_block_journal() {
         fn discharge_collected_generations(
             &mut self,
             _project_id: &ProjectId,
+            _evidence: &bbox_indexing::project_catalog_admin::RetirementJournalEvidence,
         ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
             Ok(())
         }
@@ -2457,6 +2464,7 @@ fn r2f1_unprobeable_classes_block_journal() {
         fn sweep_materialization(
             &mut self,
             _project_id: &ProjectId,
+            _evidence: &bbox_indexing::project_catalog_admin::RetirementJournalEvidence,
         ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
             Ok(())
         }

@@ -2085,6 +2085,12 @@ pub struct ProjectRetirementJournal {
     /// audit.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completed_steps: Vec<RetirementJournalStep>,
+
+    /// R4F1+R4F6: Owner-validated generation and blob inventory
+    /// captured at Prepared time. Drives generation deletion and blob
+    /// sweep so they do not depend on the catalog row being present.
+    #[serde(default)]
+    pub evidence: RetirementJournalEvidence,
 }
 
 impl ProjectRetirementJournal {
@@ -2099,6 +2105,7 @@ impl ProjectRetirementJournal {
             current_stage: RetirementJournalStage::Prepared,
             catalog_epoch_at_start: catalog_epoch,
             completed_steps: Vec::new(),
+            evidence: RetirementJournalEvidence::default(),
         }
     }
 
@@ -2125,6 +2132,36 @@ impl ProjectRetirementJournal {
 pub struct RetirementJournalStep {
     pub stage: RetirementJournalStage,
     pub completed_at: String,
+}
+
+/// R4F1+R4F6: Owner-validated evidence captured at Prepared time.
+/// This block persists the EXACT generation ids and blob hashes
+/// attributable to the retiring project, so later stages (generation
+/// deletion, blob sweep) consume the snapshot rather than re-deriving
+/// ownership from a catalog row that may already be removed.
+///
+/// Generation ownership is exact: each generation id is paired with
+/// the scope hash it lives under and the project id validated from
+/// the generation metadata record. Ambiguous ownership (two projects
+/// claim the same generation) is refused at capture time.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RetirementJournalEvidence {
+    /// Exact generation inventory that belongs to the retiring project and
+    /// will be deleted in stage CollectedGenerationsDischarged.
+    pub owned_generations: Vec<RetirementGenerationEvidence>,
+
+    /// Exact blob hash inventory: content_sha256 hashes found in the
+    /// project's owned generation manifests. Used by
+    /// MaterializationSwept to delete unique blobs and preserve
+    /// shared ones.
+    pub owned_blob_hashes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetirementGenerationEvidence {
+    pub published_scope: PublishedScope,
+    pub generation_id: String,
 }
 
 /// Error type for retirement journal operations.
@@ -2472,13 +2509,33 @@ pub struct RetirementPreflight {
 /// can record what was discharged. Each method is idempotent: calling it
 /// again after a successful discharge is a no-op.
 pub trait RetirementDischargeWorkers {
+    /// R4F1+R4F6: Capture owner-validated generation and blob inventory
+    /// at Prepared time. Returns the exact generation ids (with scope
+    /// hash) and blob hashes that belong to this project. Called once
+    /// before SourceAuthorityQuiesced; the result is persisted in the
+    /// journal and consumed by later stages.
+    fn capture_retirement_evidence(
+        &mut self,
+        _project_id: &ProjectId,
+    ) -> AdminResult<RetirementJournalEvidence> {
+        Ok(RetirementJournalEvidence::default())
+    }
+
     /// Stage CollectedGenerationsDischarged: discharge collected
     /// generations for the project. This retires the project's
     /// collected selectors (single-attempt, no retry budget), deletes
     /// source-owned records (activation record, generation records),
     /// and clears entity references and project-scoped rows. After
     /// this stage, those blocking classes are zero.
-    fn discharge_collected_generations(&mut self, project_id: &ProjectId) -> AdminResult<()>;
+    ///
+    /// R4F1: `evidence` carries the exact owner-validated generation
+    /// inventory captured at Prepared time. The worker deletes ONLY
+    /// those exact generation ids, not every generation under a scope.
+    fn discharge_collected_generations(
+        &mut self,
+        project_id: &ProjectId,
+        evidence: &RetirementJournalEvidence,
+    ) -> AdminResult<()>;
 
     /// Stage PublicationsCleared: clear accepted publication state for
     /// the project. The accepted-publication blocking class reaches
@@ -2499,7 +2556,15 @@ pub trait RetirementDischargeWorkers {
     /// reference accounting reaches zero. When other projects still
     /// reference shared blobs, the sweep verifiably skips them. No
     /// catalog or auth lock held during blob deletion.
-    fn sweep_materialization(&mut self, project_id: &ProjectId) -> AdminResult<()>;
+    ///
+    /// R4F6: `evidence` carries the exact blob hash inventory captured
+    /// at Prepared time, so the sweep does not depend on the catalog
+    /// row being present (it is already removed by this stage).
+    fn sweep_materialization(
+        &mut self,
+        project_id: &ProjectId,
+        evidence: &RetirementJournalEvidence,
+    ) -> AdminResult<()>;
 
     /// Verify that source authority has quiesced for the project before
     /// the journal advances past SourceAuthorityQuiesced (F5). The worker
@@ -2534,7 +2599,17 @@ pub trait RetirementDischargeWorkers {
 struct NoopDischargeWorkers;
 
 impl RetirementDischargeWorkers for NoopDischargeWorkers {
-    fn discharge_collected_generations(&mut self, _project_id: &ProjectId) -> AdminResult<()> {
+    fn capture_retirement_evidence(
+        &mut self,
+        _project_id: &ProjectId,
+    ) -> AdminResult<RetirementJournalEvidence> {
+        Ok(RetirementJournalEvidence::default())
+    }
+    fn discharge_collected_generations(
+        &mut self,
+        _project_id: &ProjectId,
+        _evidence: &RetirementJournalEvidence,
+    ) -> AdminResult<()> {
         Ok(())
     }
     fn discharge_publications(&mut self, _project_id: &ProjectId) -> AdminResult<()> {
@@ -2547,7 +2622,11 @@ impl RetirementDischargeWorkers for NoopDischargeWorkers {
     ) -> AdminResult<()> {
         Ok(())
     }
-    fn sweep_materialization(&mut self, _project_id: &ProjectId) -> AdminResult<()> {
+    fn sweep_materialization(
+        &mut self,
+        _project_id: &ProjectId,
+        _evidence: &RetirementJournalEvidence,
+    ) -> AdminResult<()> {
         Ok(())
     }
 
@@ -2675,8 +2754,9 @@ pub fn retire_project_journaled_with(
                 }
                 return Ok((preflight, Some(j)));
             }
-            let j =
+            let mut j =
                 ProjectRetirementJournal::new(project_id.clone(), catalog_epoch, &journal_now());
+            j.evidence = workers.capture_retirement_evidence(project_id)?;
             save_retirement_journal(bro_home, &j).map_err(|e| {
                 admin_error("error.project_catalog_retire_journal_io", e.to_string())
             })?;
@@ -2708,7 +2788,7 @@ pub fn retire_project_journaled_with(
         .current_stage
         .is_at_least(RetirementJournalStage::CollectedGenerationsDischarged)
     {
-        workers.discharge_collected_generations(project_id)?;
+        workers.discharge_collected_generations(project_id, &journal.evidence)?;
         journal.advance(&now());
         save_retirement_journal(bro_home, &journal)
             .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
@@ -2790,7 +2870,7 @@ pub fn retire_project_journaled_with(
         .current_stage
         .is_at_least(RetirementJournalStage::MaterializationSwept)
     {
-        workers.sweep_materialization(project_id)?;
+        workers.sweep_materialization(project_id, &journal.evidence)?;
         journal.advance(&now());
         save_retirement_journal(bro_home, &journal)
             .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;

@@ -2,7 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use bbox_code_source_store::CodeSourceStore;
+use bbox_code_source::source_selector;
+use bbox_code_source_store::{ActivationRecord, CodeSourceStore};
 use bbox_config::config::{self, LoadOptions};
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_catalog::ProjectId;
@@ -18,6 +19,29 @@ use tempfile::tempdir;
 fn write(path: &Path, bytes: &[u8]) {
     fs::create_dir_all(path.parent().expect("fixture path has a parent")).unwrap();
     fs::write(path, bytes).unwrap();
+}
+
+fn write_collected_activation(state: &Path, project_id: &str, generation_id: &str) {
+    let activation = ActivationRecord {
+        version: 1,
+        project_id: project_id.to_string(),
+        generation_id: generation_id.to_string(),
+        selector: format!(
+            "{}:m0123456789abcdef",
+            source_selector(project_id, generation_id)
+        ),
+        snapshot_id: format!("collected-{}", "a".repeat(32)),
+        document_count: 0,
+        entity_inventory_sha256: "b".repeat(64),
+        current_chunk_targets: Default::default(),
+        activated_unix_secs: 1,
+        cutback_pending: false,
+        diagnostic: None,
+    };
+    write(
+        &state.join(format!("code-sources/activations/{project_id}.json")),
+        &serde_json::to_vec(&activation).unwrap(),
+    );
 }
 
 fn initialize_empty_owner_state(root: &Path, config_path: &Path) {
@@ -868,10 +892,7 @@ fn retire_lifecycle_with_collected_activation_converges_and_is_idempotent() {
 
     // Retain a collected activation record (normal collected state).
     let generation = "e".repeat(64);
-    write(
-        &state.join(format!("code-sources/activations/{project_id}.json")),
-        format!(r#"{{"generation_id":"{generation}"}}"#).as_bytes(),
-    );
+    write_collected_activation(&state, &project_id, &generation);
 
     // No producer assignment in config (config has no code_collection
     // section).

@@ -391,6 +391,13 @@ pub struct StoredGenerationV2 {
     pub entity_inventory_sha256: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetirementGenerationInventory {
+    pub published_scope: PublishedScope,
+    pub generation_id: String,
+    pub blob_hashes: BTreeSet<String>,
+}
+
 impl StoredGenerationV2 {
     pub fn from_v1_for_migration(
         legacy: StoredGeneration,
@@ -4794,6 +4801,91 @@ impl CodeSourceStore {
         read_manifest_jsonl(&self.paths.generation_manifest(scope, generation)?)
     }
 
+    /// Enumerate the exact stored generations and blob references used by
+    /// offline project retirement. The mutation lock keeps metadata and
+    /// manifests coherent for the complete snapshot.
+    pub fn retirement_generation_inventory(&self) -> Result<Vec<RetirementGenerationInventory>> {
+        let _guard = self.lock_mutation()?;
+        let mut inventory = Vec::new();
+        for generation in self.list_generations()? {
+            generation.validate()?;
+            let published_scope = generation.published_scope().clone();
+            let generation_id = generation.generation_id().to_string();
+            let blob_hashes = self
+                .load_generation_entries(&published_scope, &generation_id)?
+                .into_iter()
+                .map(|entry| entry.content_sha256)
+                .collect();
+            inventory.push(RetirementGenerationInventory {
+                published_scope,
+                generation_id,
+                blob_hashes,
+            });
+        }
+        inventory.sort_by(|left, right| {
+            scope_hash(&left.published_scope)
+                .cmp(&scope_hash(&right.published_scope))
+                .then_with(|| left.generation_id.cmp(&right.generation_id))
+        });
+        Ok(inventory)
+    }
+
+    /// Delete one owner-validated generation by exact scope and generation
+    /// identity. Missing generations are an idempotent success.
+    pub fn delete_retirement_generation(
+        &self,
+        scope: &PublishedScope,
+        generation_id: &str,
+    ) -> Result<()> {
+        validate_sha256(generation_id)?;
+        let _guard = self.lock_mutation()?;
+        let directory = self.paths.generation_directory(scope, generation_id)?;
+        if !directory.exists() {
+            return Ok(());
+        }
+        let metadata = fs::symlink_metadata(&directory)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("generation path is not a regular directory");
+        }
+        let stored = read_mixed_stored_generation(&directory.join("metadata.json"))?;
+        stored.validate()?;
+        if stored.generation_id() != generation_id || stored.published_scope() != scope {
+            bail!("generation metadata does not match exact retirement identity");
+        }
+        fs::remove_dir_all(&directory)?;
+        sync_parent(&directory)?;
+        Ok(())
+    }
+
+    /// Delete candidate blobs only when no remaining generation manifest
+    /// references them. Missing blobs are an idempotent success.
+    pub fn sweep_retirement_blobs(&self, candidates: &BTreeSet<String>) -> Result<()> {
+        for hash in candidates {
+            validate_sha256(hash)?;
+        }
+        let _guard = self.lock_mutation()?;
+        let mut retained = BTreeSet::new();
+        for generation in self.list_generations()? {
+            generation.validate()?;
+            for entry in self
+                .load_generation_entries(generation.published_scope(), generation.generation_id())?
+            {
+                if candidates.contains(&entry.content_sha256) {
+                    retained.insert(entry.content_sha256);
+                }
+            }
+        }
+        for hash in candidates.difference(&retained) {
+            let path = self.blob_path(hash);
+            match fs::remove_file(&path) {
+                Ok(()) => sync_parent(&path)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
     /// Read the raw manifest.jsonl bytes for a generation (section 10.2
     /// link 4: bounded manifest verification). Returns the file bytes
     /// for digest verification and entry validation.
@@ -6472,6 +6564,114 @@ mod tests {
 
     fn open_store(root: &Path) -> CodeSourceStore {
         CodeSourceStore::open(root.join("code-sources"), StoreLimits::default()).unwrap()
+    }
+
+    fn install_retirement_generation(
+        store: &CodeSourceStore,
+        scope: &PublishedScope,
+        producer_id: &str,
+        blob_hashes: &[String],
+    ) -> String {
+        let entries = blob_hashes
+            .iter()
+            .enumerate()
+            .map(|(index, hash)| ManifestEntry {
+                relative_path: format!("src/{index}.rs"),
+                content_sha256: hash.clone(),
+                size: 1,
+            })
+            .collect::<Vec<_>>();
+        let mut descriptor = descriptor(&entries);
+        descriptor.scope = scope.clone();
+        let generation_id = generation_id(producer_id, &descriptor);
+        let generation = StoredGenerationV2 {
+            version: MIGRATION_STORE_VERSION,
+            generation_id: generation_id.clone(),
+            producer_id: producer_id.to_string(),
+            ordinal: 1,
+            descriptor,
+            published_scope: scope.clone(),
+            state: GenerationState::Ready,
+            diagnostic: None,
+            created_unix_secs: 1,
+            materialized_doc_count: None,
+            entity_inventory_sha256: None,
+        };
+        let directory = store
+            .paths
+            .generation_directory(scope, &generation_id)
+            .unwrap();
+        fs::create_dir_all(&directory).unwrap();
+        write_manifest_jsonl(&directory.join("manifest.jsonl"), &entries).unwrap();
+        atomic_write_json(&directory.join("metadata.json"), &generation).unwrap();
+        for hash in blob_hashes {
+            let blob = store.blob_path(hash);
+            fs::create_dir_all(blob.parent().unwrap()).unwrap();
+            fs::write(blob, b"x").unwrap();
+        }
+        generation_id
+    }
+
+    #[test]
+    fn retirement_exact_generation_delete_preserves_other_generation_in_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = open_store(&root);
+        let scope = PublishedScope::try_new("owner-a", ".").unwrap();
+        let first =
+            install_retirement_generation(&store, &scope, "producer-a", &[format!("{:064x}", 1)]);
+        let second =
+            install_retirement_generation(&store, &scope, "producer-b", &[format!("{:064x}", 2)]);
+
+        store.delete_retirement_generation(&scope, &first).unwrap();
+
+        assert!(
+            !store
+                .paths
+                .generation_directory(&scope, &first)
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            store
+                .paths
+                .generation_directory(&scope, &second)
+                .unwrap()
+                .is_dir()
+        );
+    }
+
+    #[test]
+    fn retirement_blob_sweep_deletes_unique_and_preserves_shared() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = open_store(&root);
+        let retiring_scope = PublishedScope::try_new("owner-a", ".").unwrap();
+        let retained_scope = PublishedScope::try_new("owner-b", ".").unwrap();
+        let shared = format!("{:064x}", 10);
+        let unique = format!("{:064x}", 11);
+        let retiring = install_retirement_generation(
+            &store,
+            &retiring_scope,
+            "producer-a",
+            &[shared.clone(), unique.clone()],
+        );
+        install_retirement_generation(
+            &store,
+            &retained_scope,
+            "producer-b",
+            std::slice::from_ref(&shared),
+        );
+
+        store
+            .delete_retirement_generation(&retiring_scope, &retiring)
+            .unwrap();
+        store
+            .sweep_retirement_blobs(&BTreeSet::from([shared.clone(), unique.clone()]))
+            .unwrap();
+
+        assert!(store.blob_path(&shared).is_file());
+        assert!(!store.blob_path(&unique).exists());
     }
 
     pub(super) fn manifest_bytes(entries: &[ManifestEntry]) -> Vec<u8> {
