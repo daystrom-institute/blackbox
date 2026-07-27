@@ -1363,6 +1363,8 @@ fn execute_retirement_journal(
             "desired_pointers": planned_evidence.desired_pointers,
             "owned_uploads": planned_evidence.owned_uploads,
             "edge_paths": planned_evidence.edge_paths,
+            "artifact_targets": planned_evidence.artifact_targets,
+            "reference_class_counts": planned_evidence.reference_class_counts,
             "blob_count": planned_evidence.owned_blob_hashes.len(),
         },
         "journal": journal.as_ref().map(|j| serde_json::json!({
@@ -1507,6 +1509,37 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
+        let expected_artifacts = evidence
+            .artifact_targets
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let current_artifacts = current
+            .artifact_targets
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let expected_reference_counts =
+            evidence.reference_class_counts.as_ref().ok_or_else(|| {
+                project_catalog_admin::admin_error(
+                    "error.project_catalog_retire_evidence_incomplete",
+                    "retirement evidence is missing reference-class counts",
+                )
+            })?;
+        let current_reference_counts =
+            current.reference_class_counts.as_ref().ok_or_else(|| {
+                project_catalog_admin::admin_error(
+                    "error.project_catalog_retire_evidence_incomplete",
+                    "current retirement evidence is missing reference-class counts",
+                )
+            })?;
+        let reference_count_increased = current_reference_counts.iter().any(|(class, count)| {
+            *count > expected_reference_counts.get(class).copied().unwrap_or(0)
+        });
         let selectors_match = stage
             .is_at_least(project_catalog_admin::RetirementJournalStage::AttachmentsDetached)
             || current.project_selectors == evidence.project_selectors;
@@ -1518,7 +1551,9 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             || !current_desired.is_subset(&expected_desired)
             || !current_uploads.is_subset(&expected_uploads)
             || !current_edge_paths.is_subset(&expected_edge_paths)
+            || !current_artifacts.is_subset(&expected_artifacts)
             || !current_blobs.is_subset(&expected_blobs)
+            || reference_count_increased
         {
             return Err(project_catalog_admin::admin_error(
                 "error.project_catalog_retire_evidence_drift",
@@ -1740,10 +1775,14 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
         bbox_slack::slack_proposal_links::SlackProposalLinks::open(&self.config.paths.bro_home)
             .and_then(|store| store.discharge_project_refs(project_id.as_str(), &selectors))
             .map_err(|error| discharge_error("slack_proposal_links", error))?;
-        bbox_artifacts::artifacts::discharge_project_catalog_rows(
+        bbox_artifacts::artifacts::discharge_project_catalog_targets(
             &self.config.paths.artifacts_dir,
-            project_id.as_str(),
-            &selectors,
+            evidence.artifact_targets.as_deref().ok_or_else(|| {
+                project_catalog_admin::admin_error(
+                    "error.project_catalog_retire_artifact_evidence",
+                    "retirement evidence is missing exact artifact targets",
+                )
+            })?,
         )
         .map_err(|error| discharge_error("artifact_rows", error))?;
         bbox_whiteboards::whiteboards::discharge_project_catalog_rows(
@@ -2647,6 +2686,53 @@ fn capture_retirement_evidence(
                 format!("failed to capture exact edge retirement inventory: {error}"),
             )
         })?;
+    let artifact_targets = bbox_artifacts::artifacts::capture_project_catalog_retirement_targets(
+        &config.paths.artifacts_dir,
+        project_id.as_str(),
+        &project_selectors,
+    )
+    .map_err(|error| {
+        project_catalog_admin::admin_error(
+            "error.project_catalog_retire_artifact_evidence",
+            format!("failed to capture exact artifact retirement targets: {error}"),
+        )
+    })?;
+    let reference_probe = probe_retire_evidence(
+        config,
+        projects_path,
+        &catalog_store,
+        project_id,
+        Some(&project_selectors),
+    )
+    .map_err(|error| {
+        project_catalog_admin::admin_error(
+            "error.project_catalog_retire_plan_evidence",
+            format!("{}: {}", error.code, error.message),
+        )
+    })?;
+    if !reference_probe.unprobeable.is_empty() {
+        return Err(project_catalog_admin::admin_error(
+            "error.project_catalog_retire_plan_evidence",
+            format!(
+                "cannot capture a complete retirement plan; unprobeable classes: {}",
+                reference_probe.unprobeable.join(", ")
+            ),
+        ));
+    }
+    let reference_class_counts = RETIRE_REFERENCE_CLASSES
+        .iter()
+        .map(|class| {
+            (
+                (*class).to_string(),
+                reference_probe
+                    .evidence
+                    .external_reference_counts
+                    .get(*class)
+                    .copied()
+                    .unwrap_or(0),
+            )
+        })
+        .collect();
 
     Ok(project_catalog_admin::RetirementJournalEvidence {
         owner_project_id: Some(project_id.clone()),
@@ -2656,6 +2742,8 @@ fn capture_retirement_evidence(
         desired_pointers: Some(desired_pointers),
         owned_uploads: Some(owned_uploads),
         edge_paths: Some(edge_inventory.relative_paths),
+        artifact_targets: Some(artifact_targets),
+        reference_class_counts: Some(reference_class_counts),
         blob_inventory: None,
         owned_blob_hashes: owned_blob_hashes.into_iter().collect(),
     })

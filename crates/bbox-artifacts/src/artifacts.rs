@@ -295,15 +295,25 @@ pub fn discharge_project_catalog_rows(
     project_id: &str,
     selectors: &[String],
 ) -> Result<usize> {
+    let targets = capture_project_catalog_retirement_targets(root, project_id, selectors)?;
+    discharge_project_catalog_targets(root, &targets)
+}
+
+pub fn capture_project_catalog_retirement_targets(
+    root: &Path,
+    project_id: &str,
+    selectors: &[String],
+) -> Result<Vec<String>> {
+    let hash_bytes = |bytes: &[u8]| hex::encode(sha2::Sha256::digest(bytes));
     let metadata = match fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error.into()),
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         bail!("artifact store root is not a safe directory");
     }
-    let mut artifact_dirs = std::collections::BTreeSet::new();
+    let mut targets = Vec::new();
     for entry in WalkDir::new(root).follow_links(false) {
         let entry = entry?;
         if !entry.file_type().is_file() {
@@ -330,33 +340,73 @@ pub fn discharge_project_catalog_rows(
             entry.path().parent().and_then(Path::parent)
         }
         .ok_or_else(|| anyhow!("artifact metadata has no owning directory"))?;
-        artifact_dirs.insert(directory.to_path_buf());
+        let relative = directory
+            .strip_prefix(root)
+            .context("artifact directory escaped its store root")?;
+        let payload = directory.with_extension("json");
+        let payload_hash = if payload.is_file() {
+            hash_bytes(&fs::read(&payload)?)
+        } else {
+            "missing".to_string()
+        };
+        targets.push(format!(
+            "{}:{}:{}",
+            relative.to_string_lossy(),
+            hash_bytes(&fs::read(entry.path())?),
+            payload_hash
+        ));
     }
+    targets.sort();
+    targets.dedup();
+    Ok(targets)
+}
+
+pub fn discharge_project_catalog_targets(root: &Path, targets: &[String]) -> Result<usize> {
     let mut removed = 0usize;
-    for (index, directory) in artifact_dirs.into_iter().enumerate() {
-        if !directory.exists() {
-            continue;
-        }
+    for target in targets {
+        let relative = target
+            .split_once(':')
+            .map(|(relative, _)| relative)
+            .ok_or_else(|| anyhow!("artifact retirement target is invalid"))?;
+        let directory = root.join(relative);
         let parent = directory
             .parent()
             .ok_or_else(|| anyhow!("artifact directory has no parent"))?;
-        let tombstone = parent.join(format!(
-            ".retiring-{}-{index}",
+        let metadata_tombstone = parent.join(format!(
+            ".retiring-metadata-{}",
             directory
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("artifact")
         ));
-        if tombstone.exists() {
-            bail!("artifact retirement tombstone already exists");
-        }
-        fs::rename(&directory, &tombstone)?;
-        fs::File::open(parent)?.sync_all()?;
-        fs::remove_dir_all(&tombstone)?;
-        fs::File::open(parent)?.sync_all()?;
         let artifact_file = directory.with_extension("json");
+        let payload_tombstone = parent.join(format!(
+            ".retiring-payload-{}",
+            artifact_file
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("artifact.json")
+        ));
         if artifact_file.is_file() {
-            fs::remove_file(&artifact_file)?;
+            if payload_tombstone.exists() {
+                bail!("artifact payload retirement tombstone already exists");
+            }
+            fs::rename(&artifact_file, &payload_tombstone)?;
+            fs::File::open(parent)?.sync_all()?;
+        }
+        if directory.is_dir() {
+            if metadata_tombstone.exists() {
+                bail!("artifact metadata retirement tombstone already exists");
+            }
+            fs::rename(&directory, &metadata_tombstone)?;
+            fs::File::open(parent)?.sync_all()?;
+        }
+        if metadata_tombstone.is_dir() {
+            fs::remove_dir_all(&metadata_tombstone)?;
+            fs::File::open(parent)?.sync_all()?;
+        }
+        if payload_tombstone.is_file() {
+            fs::remove_file(&payload_tombstone)?;
             fs::File::open(parent)?.sync_all()?;
         }
         removed += 1;
@@ -440,7 +490,8 @@ impl ArtifactCatalog {
                 local: true,
             };
             let path = self.artifact_path_scoped(&local_scope, kind, name)?;
-            if path.exists() {
+            let metadata = self.metadata_path_scoped(&local_scope, kind, name)?;
+            if metadata.is_file() && path.exists() {
                 let raw = fs::read_to_string(&path)
                     .with_context(|| format!("reading {}", path.display()))?;
                 return Ok(Some(
@@ -454,7 +505,8 @@ impl ArtifactCatalog {
                 local: false,
             };
             let path = self.artifact_path_scoped(&committed_scope, kind, name)?;
-            if path.exists() {
+            let metadata = self.metadata_path_scoped(&committed_scope, kind, name)?;
+            if metadata.is_file() && path.exists() {
                 let raw = fs::read_to_string(&path)
                     .with_context(|| format!("reading {}", path.display()))?;
                 return Ok(Some(
@@ -2510,6 +2562,11 @@ mod tests {
             serde_json::to_vec(&metadata).unwrap(),
         )
         .unwrap();
+        std::fs::write(
+            metadata_dir.with_extension("json"),
+            serde_json::to_vec(&serde_json::json!({"name": "owner-test"})).unwrap(),
+        )
+        .unwrap();
 
         let snapshot =
             capture_project_catalog_owner_snapshot(&root, OwnerSnapshotLimitsV1::default())
@@ -2557,5 +2614,69 @@ mod tests {
             OwnerSnapshotRowValueV1::InventoryTarget { project_id, .. }
                 if project_id == "project2"
         )));
+    }
+
+    #[test]
+    fn artifact_retirement_recovers_payload_and_metadata_tombstone_boundaries() {
+        for metadata_hidden in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let metadata_dir = root
+                .join("projects")
+                .join("project1")
+                .join("local")
+                .join("agent")
+                .join("owner-test");
+            fs::create_dir_all(&metadata_dir).unwrap();
+            let metadata = ArtifactMetadata {
+                kind: ArtifactKind::Agent,
+                name: "owner-test".into(),
+                version: "1".into(),
+                source: "fixture".into(),
+                installed_at: "2026-01-01T00:00:00Z".into(),
+                content_sha256: Some("a".repeat(64)),
+                project_id: Some("project1".into()),
+                project_path: None,
+                local: true,
+                supersedes: None,
+                supersedes_chain: Vec::new(),
+                superseded_by: None,
+                active: true,
+                install_warnings: Vec::new(),
+            };
+            fs::write(
+                metadata_dir.join("metadata.json"),
+                serde_json::to_vec(&metadata).unwrap(),
+            )
+            .unwrap();
+            let payload = metadata_dir.with_extension("json");
+            fs::write(
+                &payload,
+                serde_json::to_vec(&serde_json::json!({"name": "owner-test"})).unwrap(),
+            )
+            .unwrap();
+            let targets =
+                capture_project_catalog_retirement_targets(&root, "project1", &[]).unwrap();
+            let parent = metadata_dir.parent().unwrap();
+            let payload_tombstone = parent.join(".retiring-payload-owner-test.json");
+            fs::rename(&payload, &payload_tombstone).unwrap();
+            if metadata_hidden {
+                fs::rename(&metadata_dir, parent.join(".retiring-metadata-owner-test")).unwrap();
+            }
+
+            let catalog = ArtifactCatalog::open(&root).unwrap();
+            assert!(
+                catalog
+                    .load_artifact_value_scoped(Some("project1"), ArtifactKind::Agent, "owner-test")
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                discharge_project_catalog_targets(&root, &targets).unwrap(),
+                1
+            );
+            assert!(!payload_tombstone.exists());
+            assert!(!metadata_dir.exists());
+        }
     }
 }

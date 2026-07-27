@@ -1121,8 +1121,20 @@ fn retirement_execute_refuses_when_prepared_plan_hash_drifts() {
     let plan_hash = retirement_plan_hash(projects, &project_id, config, None, &index_path);
 
     write(
-        &state.join("edges").join(format!("{project_id}.jsonl")),
-        b"{}\n",
+        &state.join("bro/slack-channel-bindings.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "bindings": {
+              "T1:C1": {
+                "team_id": "T1",
+                "channel_id": "C1",
+                "project_id": project_id,
+                "project_dir": "/late/checkout",
+                "registered_at": "2026-07-27T00:00:00Z"
+              }
+            }
+        }))
+        .unwrap()
+        .as_slice(),
     );
     let refused = run_with_isolated_index(
         &[

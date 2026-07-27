@@ -2231,6 +2231,8 @@ impl ProjectRetirementJournal {
                 desired_pointers: Some(Vec::new()),
                 owned_uploads: Some(Vec::new()),
                 edge_paths: Some(Vec::new()),
+                artifact_targets: Some(Vec::new()),
+                reference_class_counts: Some(std::collections::BTreeMap::new()),
                 ..RetirementJournalEvidence::default()
             },
             prepared_evidence_sha256: None,
@@ -2307,6 +2309,14 @@ pub struct RetirementJournalEvidence {
     /// Exact project-owned edge lanes and materialized paths captured at
     /// Prepared. Paths are relative to the configured edge root.
     pub edge_paths: Option<Vec<String>>,
+
+    /// Exact artifact payload plus metadata targets captured at Prepared.
+    pub artifact_targets: Option<Vec<String>>,
+
+    /// Prepared owner-row counts for every declared blocking class. Counts may
+    /// only decrease while a stage is replayed; any increase is new authority
+    /// outside the prepared plan.
+    pub reference_class_counts: Option<std::collections::BTreeMap<String, u64>>,
 
     /// Hash-linked blob inventory persisted in a bounded sidecar.
     pub blob_inventory: Option<RetirementBlobInventoryRef>,
@@ -2617,6 +2627,28 @@ fn validate_journal_evidence_shape(
             ));
         }
     }
+    let artifact_targets = journal.evidence.artifact_targets.as_ref().ok_or_else(|| {
+        RetirementJournalError::other("retirement journal is missing artifact target evidence")
+    })?;
+    if artifact_targets
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        != artifact_targets.len()
+    {
+        return Err(RetirementJournalError::other(
+            "retirement journal artifact target evidence is duplicated",
+        ));
+    }
+    journal
+        .evidence
+        .reference_class_counts
+        .as_ref()
+        .ok_or_else(|| {
+            RetirementJournalError::other(
+                "retirement journal is missing reference-class plan evidence",
+            )
+        })?;
     let expected_hash = journal.prepared_evidence_sha256.as_ref().ok_or_else(|| {
         RetirementJournalError::other(
             "retirement journal is missing its Prepared evidence commitment",
@@ -2641,6 +2673,8 @@ pub fn retirement_evidence_sha256(evidence: &RetirementJournalEvidence) -> Strin
         &evidence.desired_pointers,
         &evidence.owned_uploads,
         &evidence.edge_paths,
+        &evidence.artifact_targets,
+        &evidence.reference_class_counts,
         &evidence.owned_blob_hashes,
     ))
     .expect("retirement evidence serialization is infallible");
@@ -3013,6 +3047,8 @@ pub trait RetirementDischargeWorkers {
             desired_pointers: Some(Vec::new()),
             owned_uploads: Some(Vec::new()),
             edge_paths: Some(Vec::new()),
+            artifact_targets: Some(Vec::new()),
+            reference_class_counts: Some(std::collections::BTreeMap::new()),
             ..RetirementJournalEvidence::default()
         })
     }
@@ -3134,6 +3170,8 @@ impl RetirementDischargeWorkers for NoopDischargeWorkers {
             desired_pointers: Some(Vec::new()),
             owned_uploads: Some(Vec::new()),
             edge_paths: Some(Vec::new()),
+            artifact_targets: Some(Vec::new()),
+            reference_class_counts: Some(std::collections::BTreeMap::new()),
             ..RetirementJournalEvidence::default()
         })
     }
