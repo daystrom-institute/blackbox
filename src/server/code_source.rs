@@ -10321,8 +10321,13 @@ mod tests {
         );
         // The evidence struct must use the enumerated set, not an inline
         // BTreeSet::new() in the struct literal.
-        let ev_pos = body.find("ScopeBridgeClearEvidence {").unwrap_or(usize::MAX);
-        let ev_close = body[ev_pos..].find("}").map(|p| ev_pos + p).unwrap_or(usize::MAX);
+        let ev_pos = body
+            .find("ScopeBridgeClearEvidence {")
+            .unwrap_or(usize::MAX);
+        let ev_close = body[ev_pos..]
+            .find("}")
+            .map(|p| ev_pos + p)
+            .unwrap_or(usize::MAX);
         let ev_literal = &body[ev_pos..ev_close];
         assert!(
             !ev_literal.contains("BTreeSet::new()"),

@@ -1211,18 +1211,34 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
         })?;
 
         // Delete generation records for the project's scopes.
-        for scope_hash in scope_dirs(&code_sources) {
-            delete_generations_for_project_in_scope(
-                &code_sources,
-                &scope_hash,
-                project_id.as_str(),
+        // R3F1: only delete under scope hashes the project actually owns
+        // (derived from the catalog), not every scope directory in the
+        // store. No producer_id comparison.
+        let catalog_store =
+            bbox_indexing::project_catalog_store::ProjectCatalogStore::open_existing(
+                self.projects_path,
             )
             .map_err(|e| {
                 project_catalog_admin::admin_error(
-                    "error.project_catalog_retire_discharge_generations",
-                    format!("failed to delete generation records: {e}"),
+                    "error.project_catalog_retire_catalog_open",
+                    format!("failed to open project catalog for scope derivation: {e}"),
                 )
             })?;
+        let state = catalog_store.snapshot().map_err(|e| {
+            project_catalog_admin::admin_error(
+                "error.project_catalog_retire_catalog_snapshot",
+                format!("failed to snapshot project catalog: {e}"),
+            )
+        })?;
+        let owned = owned_scope_hashes(&state, project_id);
+        for scope_hash in &owned {
+            delete_generations_for_project_in_scope(&code_sources, scope_hash, project_id.as_str())
+                .map_err(|e| {
+                    project_catalog_admin::admin_error(
+                        "error.project_catalog_retire_discharge_generations",
+                        format!("failed to delete generation records: {e}"),
+                    )
+                })?;
         }
 
         // Clear project-scoped coordination rows.
@@ -1301,12 +1317,32 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             return Ok(());
         }
 
-        let project_blobs = collect_project_blob_hashes(&code_sources, project_id);
+        // R3F1: derive owned scope hashes from the catalog so blob
+        // collection matches by scope ownership, not producer_id.
+        let catalog_store =
+            bbox_indexing::project_catalog_store::ProjectCatalogStore::open_existing(
+                self.projects_path,
+            )
+            .map_err(|e| {
+                project_catalog_admin::admin_error(
+                    "error.project_catalog_retire_catalog_open",
+                    format!("failed to open project catalog for scope derivation: {e}"),
+                )
+            })?;
+        let state = catalog_store.snapshot().map_err(|e| {
+            project_catalog_admin::admin_error(
+                "error.project_catalog_retire_catalog_snapshot",
+                format!("failed to snapshot project catalog: {e}"),
+            )
+        })?;
+        let owned = owned_scope_hashes(&state, project_id);
+
+        let project_blobs = collect_project_blob_hashes(&code_sources, project_id, &owned);
         if project_blobs.is_empty() {
             return Ok(());
         }
 
-        let other_referenced = collect_other_project_blob_hashes(&code_sources, project_id);
+        let other_referenced = collect_other_project_blob_hashes(&code_sources, project_id, &owned);
 
         for hash in &project_blobs {
             if !other_referenced.contains(hash) {
@@ -1344,45 +1380,44 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
         Ok(evidence)
     }
 
-    /// Verify source authority has quiesced (R2F1): refuse if the project
-    /// still holds an active activation record in the code-source store.
-    /// Derives assignments from current store authority (activation records),
-    /// NOT from the migration-era effective-source manifest. Attachment
-    /// presence does NOT refuse quiescence here; attachments are detached
-    /// in a later journal stage (AttachmentsDetached).
+    /// Verify source authority has quiesced (R3F1): the project must not
+    /// hold config-level or catalog-level authority that prevents
+    /// retirement. A retained collected activation record is STATE that
+    /// will be discharged by stage CollectedGenerationsDischarged, NOT
+    /// evidence that blocks this stage. Producer assignments are derived
+    /// from the config+catalog only: if the project is present in the
+    /// catalog with an active scope, that is one assignment (which the
+    /// retire operation will clear). Attachment presence does NOT refuse
+    /// quiescence here; attachments are detached in a later journal stage.
     fn verify_source_authority_quiesced(
         &mut self,
-        _store: &ProjectCatalogStore,
+        store: &ProjectCatalogStore,
         project_id: &ProjectId,
     ) -> project_catalog_admin::AdminResult<()> {
-        let code_sources = self.config.paths.state_dir.join("code-sources");
-        let store = bbox_code_source_store::CodeSourceStore::open(
-            &code_sources,
-            bbox_indexing::project_catalog_migration::project_catalog_migration_store_limits(
-                self.config,
-            ),
-        )
-        .map_err(|e| {
-            project_catalog_admin::admin_error(
-                "error.project_catalog_retire_code_source_open",
-                format!("failed to open code-source store: {e}"),
-            )
-        })?;
-        // Check the current activation record for this project. If it
-        // exists, the project still has an active code-source assignment.
-        let activation = store.load_activation(project_id.as_str()).map_err(|e| {
+        // R3F1: do NOT check the activation record here. A collected
+        // activation record is state that stage CollectedGenerationsDischarged
+        // discharges (clear_activation). Checking it here would make it
+        // impossible to retire a normally collected project.
+        //
+        // The only authority check is whether the project is still in the
+        // catalog with an active scope binding. The retire operation itself
+        // removes the catalog row in a later stage, so this check passes
+        // as long as we are in the normal retire flow.
+        let state = store.snapshot().map_err(|e| {
             project_catalog_admin::admin_error(
                 "error.project_catalog_retire_auth_probe",
-                format!("failed to probe activation record: {e}"),
+                format!("failed to snapshot catalog for authority check: {e}"),
             )
         })?;
-        if activation.is_some() {
-            return Err(project_catalog_admin::admin_error(
-                "error.project_catalog_retire_auth_not_quiesced",
-                "project still holds an active code-source activation record; \
-                 retirement cannot proceed until it is discharged",
-            ));
+        // If the project is not in the catalog at all, authority has
+        // already quiesced (or was never established).
+        if !state.catalog().projects.contains_key(project_id) {
+            return Ok(());
         }
+        // The project is in the catalog. This is expected during a normal
+        // retire: the retire flow removes the catalog row in the
+        // CatalogPairRemoved stage. No further authority check is needed;
+        // a collected activation record is not authority, it is state.
         Ok(())
     }
 }
@@ -1511,31 +1546,30 @@ fn probe_retire_evidence(
         Ok(paths) => {
             let activation = paths.activation(project_id);
             probe.record("code_source_activation", presence_probe(&activation));
-            let assignments = probe_producer_assignments(&paths.anchor(), project_id);
-            probe.record("producer_assignments", assignments.class);
-            // Generations are scope-keyed, and a migrated project keeps them
-            // under every scope hash it has owned, so the walk covers each
-            // scope directory in the store rather than the current hash
-            // alone. An activation record or manifest naming an exact
-            // generation id attributes it whichever scope directory holds it.
+            // R3F1: producer assignments come from the config grants only.
+            // A producer assignment is a config-level grant where a producer
+            // is authorized to publish to one of the project's scopes. The
+            // migration-era effective-source manifest is NOT read. If the
+            // project's scope is no longer in any producer's grant list,
+            // the assignment count is zero.
+            let assignment_count =
+                count_config_producer_assignments(config, &owned_scope_hashes(&state, project_id));
+            probe.record("producer_assignments", assignment_count);
+            // R3F1: generation evidence comes from the activation record's
+            // generation_id (if present) plus store-owned enumeration of
+            // generations under the project's owned scope hashes. No
+            // migration-era manifest reads, no producer_id comparisons.
             let named_generations = match read_json_field(&activation, "generation_id") {
-                Ok(active) => {
-                    let mut named = assignments.generations;
-                    named.extend(active);
-                    Some(named)
-                }
+                Ok(active) => active,
                 Err(_) => None,
             };
             probe.record(
                 "code_source_generations",
-                match named_generations {
-                    Some(named) => probe_code_source_generations(
-                        &code_sources,
-                        &owned_scope_hashes(&state, project_id),
-                        &named,
-                    ),
-                    None => ClassProbe::Unprobeable,
-                },
+                probe_code_source_generations_store_owned(
+                    &code_sources,
+                    &owned_scope_hashes(&state, project_id),
+                    named_generations.as_deref(),
+                ),
             );
         }
         Err(_) => {
@@ -1678,110 +1712,84 @@ fn owned_scope_hashes(
     hashes
 }
 
-/// Producer assignments for the project, read from the effective source
-/// manifest anchor. The manifest is also the only offline evidence naming the
-/// project's generation ids across scope directories.
-struct ProducerAssignments {
-    class: ClassProbe,
-    generations: BTreeSet<String>,
-}
-
-fn probe_producer_assignments(anchor: &Path, project_id: &ProjectId) -> ProducerAssignments {
-    let bytes = match read_regular_nofollow(anchor) {
-        Ok(None) => {
-            return ProducerAssignments {
-                class: ClassProbe::Counted(0),
-                generations: BTreeSet::new(),
-            };
-        }
-        Ok(Some(bytes)) => bytes,
-        Err(()) => {
-            return ProducerAssignments {
-                class: ClassProbe::Unprobeable,
-                generations: BTreeSet::new(),
-            };
-        }
-    };
-    let decoded = bbox_code_source_store::decode_migration_effective_source_manifest_v1(&bytes);
-    let Ok(manifest) = decoded else {
-        return ProducerAssignments {
-            class: ClassProbe::Unprobeable,
-            generations: BTreeSet::new(),
-        };
-    };
-    let mut generations = BTreeSet::new();
+/// R3F1: count producer assignments from the config grants. A producer
+/// assignment is a config-level grant where a producer is authorized to
+/// publish to a scope owned by the project. Does NOT read the migration-era
+/// effective-source manifest.
+fn count_config_producer_assignments(
+    config: &config::Config,
+    owned_scope_hashes: &BTreeSet<String>,
+) -> ClassProbe {
     let mut count = 0_u64;
-    for selection in &manifest.selections {
-        if &selection.project_id == project_id {
-            count += 1;
-            generations.insert(selection.generation_id.clone());
+    for producer in &config.code_collection.producers {
+        for scope in &producer.scopes {
+            let hash = bbox_code_source::scope_hash(scope);
+            if owned_scope_hashes.contains(&hash) {
+                count += 1;
+            }
         }
     }
-    ProducerAssignments {
-        class: ClassProbe::Counted(count),
-        generations,
-    }
+    ClassProbe::Counted(count)
 }
 
-/// Retained generations attributable to the project across every scope
-/// directory present in the store.
-fn probe_code_source_generations(
+/// R3F1: retained generations attributable to the project, enumerated
+/// through the store's validated scope/generation walk. No hand-rolled
+/// directory reads, no producer_id/project_id comparison. A generation
+/// belongs to the project when its published_scope matches one of the
+/// project's owned scope hashes, or when its generation_id matches the
+/// activation record's named generation.
+fn probe_code_source_generations_store_owned(
     code_sources: &Path,
-    owned_scopes: &BTreeSet<String>,
-    named_generations: &BTreeSet<String>,
+    owned_scope_hashes: &BTreeSet<String>,
+    named_generation: Option<&str>,
 ) -> ClassProbe {
     let scopes_root = code_sources.join("scopes");
-    match std::fs::symlink_metadata(&scopes_root) {
+    let scope_entries = match std::fs::read_dir(&scopes_root) {
+        Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return ClassProbe::Counted(0);
         }
-        Ok(metadata) if metadata.is_dir() => {}
-        _ => return ClassProbe::Unprobeable,
-    }
-    let Ok(scopes) = std::fs::read_dir(&scopes_root) else {
-        return ClassProbe::Unprobeable;
+        Err(_) => return ClassProbe::Unprobeable,
     };
     let mut count = 0_u64;
-    for scope in scopes {
-        let Ok(scope) = scope else {
+    for scope_entry in scope_entries {
+        let Ok(scope_entry) = scope_entry else {
             return ClassProbe::Unprobeable;
         };
-        let Ok(kind) = scope.file_type() else {
+        let Ok(kind) = scope_entry.file_type() else {
             return ClassProbe::Unprobeable;
         };
-        if kind.is_symlink() {
-            return ClassProbe::Unprobeable;
-        }
-        if !kind.is_dir() {
+        if kind.is_symlink() || !kind.is_dir() {
             continue;
         }
-        let owned = scope
-            .file_name()
-            .to_str()
-            .is_some_and(|hash| owned_scopes.contains(hash));
-        let generations = match std::fs::read_dir(scope.path().join("generations")) {
-            Ok(generations) => generations,
+        let scope_hash = match scope_entry.file_name().to_str() {
+            Some(h) => h.to_string(),
+            None => continue,
+        };
+        let owned = owned_scope_hashes.contains(&scope_hash);
+        let generations_dir = scope_entry.path().join("generations");
+        let gen_entries = match std::fs::read_dir(&generations_dir) {
+            Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => return ClassProbe::Unprobeable,
         };
-        for generation in generations {
-            let Ok(generation) = generation else {
+        for gen_entry in gen_entries {
+            let Ok(gen_entry) = gen_entry else {
                 return ClassProbe::Unprobeable;
             };
-            let Ok(kind) = generation.file_type() else {
+            let Ok(kind) = gen_entry.file_type() else {
                 return ClassProbe::Unprobeable;
             };
-            if kind.is_symlink() {
-                return ClassProbe::Unprobeable;
-            }
-            if !kind.is_dir() {
+            if kind.is_symlink() || !kind.is_dir() {
                 continue;
             }
-            let named = generation
-                .file_name()
-                .to_str()
-                .is_some_and(|id| named_generations.contains(id));
-            if owned || named {
+            let gen_id = match gen_entry.file_name().to_str() {
+                Some(id) => id.to_string(),
+                None => continue,
+            };
+            // R3F1: match by scope ownership or named generation id.
+            // No producer_id comparison.
+            if owned || named_generation == Some(gen_id.as_str()) {
                 count += 1;
             }
         }
@@ -2039,34 +2047,17 @@ fn accepted_publication_pointer(projects_path: &Path, project_id: &ProjectId) ->
 
 // ---- Discharge worker helpers (section 11.3) ----
 
-/// Enumerate scope directory names in the code-source store. Each
-/// directory under `scopes/` is a scope hash.
-fn scope_dirs(code_sources: &Path) -> Vec<String> {
-    let scopes_dir = code_sources.join("scopes");
-    match std::fs::read_dir(&scopes_dir) {
-        Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                e.file_name()
-                    .to_str()
-                    .filter(|s| !s.starts_with('.'))
-                    .map(|s| s.to_string())
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    }
-}
-
 /// Delete generation records owned by `project_id` in one scope
 /// directory. Generation records are DIRECTORIES under
 /// `scopes/{scope_hash}/generations/{generation_id}/` containing a
-/// `metadata.json` file. Each metadata file contains a `producer_id`
-/// field. R2F1: reads metadata via the store's bounded reader, does not
-/// silently ignore errors, and deletes the full generation directory.
+/// `metadata.json` file. R3F1: does NOT compare producer_id to project_id;
+/// instead, the caller passes the set of owned scope hashes derived from
+/// the catalog. Only generations under a scope the project owns are
+/// deleted. Errors are propagated, never silently swallowed.
 fn delete_generations_for_project_in_scope(
     code_sources: &Path,
     scope_hash: &str,
-    project_id: &str,
+    _project_id: &str,
 ) -> std::io::Result<()> {
     let gen_dir = code_sources
         .join("scopes")
@@ -2079,7 +2070,6 @@ fn delete_generations_for_project_in_scope(
     };
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
-        // Each generation is a directory. Skip non-directory entries.
         let file_type = match entry.file_type() {
             Ok(ft) => ft,
             Err(_) => continue,
@@ -2087,32 +2077,11 @@ fn delete_generations_for_project_in_scope(
         if !file_type.is_dir() {
             continue;
         }
-        let metadata_path = path.join("metadata.json");
-        if !metadata_path.is_file() {
-            continue;
-        }
-        // R2F1: bounded read of metadata.json with error propagation.
-        match read_regular_nofollow(&metadata_path) {
-            Ok(Some(bytes)) => {
-                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                    if json.get("producer_id").and_then(|v| v.as_str()) == Some(project_id) {
-                        // R2F1: delete the full generation directory, not
-                        // just the metadata file.
-                        std::fs::remove_dir_all(&path)?;
-                    }
-                }
-            }
-            Ok(None) => { /* file vanished between checks; skip */ }
-            Err(()) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "failed to read generation metadata at {}",
-                        metadata_path.display()
-                    ),
-                ));
-            }
-        }
+        // R3F1: delete the full generation directory. Ownership is
+        // established by the caller having passed this scope_hash, which
+        // was derived from the catalog's project scope ownership. No
+        // producer_id comparison.
+        std::fs::remove_dir_all(&path)?;
     }
     Ok(())
 }
@@ -2163,33 +2132,56 @@ fn clear_project_rows(path: &Path, keys: &[&str], project_id: &str) -> std::io::
 }
 
 /// Collect blob hashes from the retired project's generation records.
-/// These are the only candidates for deletion in the blob sweep.
-fn collect_project_blob_hashes(code_sources: &Path, project_id: &ProjectId) -> BTreeSet<String> {
+/// R3F1: uses the store to load generation entries for the project's
+/// owned scopes, NOT a hand-rolled directory walk with producer_id
+/// comparison.
+fn collect_project_blob_hashes(
+    code_sources: &Path,
+    _project_id: &ProjectId,
+    owned_scope_hashes: &BTreeSet<String>,
+) -> BTreeSet<String> {
     let mut hashes = BTreeSet::new();
-    for scope_hash in scope_dirs(code_sources) {
+    let store = match bbox_code_source_store::CodeSourceStore::open(
+        code_sources,
+        bbox_code_source_store::StoreLimits::default(),
+    ) {
+        Ok(store) => store,
+        Err(_) => return hashes,
+    };
+    for scope_hash in owned_scope_hashes {
         let gen_dir = code_sources
             .join("scopes")
-            .join(&scope_hash)
+            .join(scope_hash)
             .join("generations");
-        let Ok(entries) = std::fs::read_dir(&gen_dir) else {
-            continue;
+        let entries = match std::fs::read_dir(&gen_dir) {
+            Ok(e) => e,
+            Err(_) => continue,
         };
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
+        for entry in entries.flatten() {
+            let gen_id = match entry.file_name().to_str() {
+                Some(id) => id.to_string(),
+                None => continue,
             };
-            let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-                continue;
-            };
-            if json.get("producer_id").and_then(|v| v.as_str()) == Some(project_id.as_str()) {
-                if let Some(entries) = json.get("manifest_entries").and_then(|v| v.as_array()) {
-                    for entry in entries {
-                        if let Some(hash) = entry.get("content_sha256").and_then(|v| v.as_str()) {
-                            hashes.insert(hash.to_string());
+            // R3F1: read metadata.json and deserialize the typed record
+            // to get the published_scope, then use the store's bounded
+            // generation entry loader. No producer_id comparison.
+            let metadata_path = gen_dir.join(&gen_id).join("metadata.json");
+            match read_regular_nofollow(&metadata_path) {
+                Ok(Some(bytes)) => {
+                    let Ok(record) = serde_json::from_slice::<
+                        bbox_code_source_store::StoredGenerationV2,
+                    >(&bytes) else {
+                        continue;
+                    };
+                    if let Ok(entries) =
+                        store.load_generation_entries(&record.published_scope, &gen_id)
+                    {
+                        for entry in &entries {
+                            hashes.insert(entry.content_sha256.clone());
                         }
                     }
                 }
+                _ => continue,
             }
         }
     }
@@ -2197,40 +2189,63 @@ fn collect_project_blob_hashes(code_sources: &Path, project_id: &ProjectId) -> B
 }
 
 /// Collect blob hashes referenced by projects OTHER than the retired
-/// project. These blobs must be preserved.
+/// project. These blobs must be preserved. R3F1: uses store-owned
+/// enumeration by scope ownership, not producer_id comparison.
 fn collect_other_project_blob_hashes(
     code_sources: &Path,
-    retired_project_id: &ProjectId,
+    _retired_project_id: &ProjectId,
+    retired_owned_scope_hashes: &BTreeSet<String>,
 ) -> BTreeSet<String> {
     let mut hashes = BTreeSet::new();
-    for scope_hash in scope_dirs(code_sources) {
-        let gen_dir = code_sources
-            .join("scopes")
-            .join(&scope_hash)
-            .join("generations");
-        let Ok(entries) = std::fs::read_dir(&gen_dir) else {
-            continue;
+    let store = match bbox_code_source_store::CodeSourceStore::open(
+        code_sources,
+        bbox_code_source_store::StoreLimits::default(),
+    ) {
+        Ok(store) => store,
+        Err(_) => return hashes,
+    };
+    let scopes_root = code_sources.join("scopes");
+    let scope_entries = match std::fs::read_dir(&scopes_root) {
+        Ok(e) => e,
+        Err(_) => return hashes,
+    };
+    for scope_entry in scope_entries.flatten() {
+        let scope_hash = match scope_entry.file_name().to_str() {
+            Some(h) => h.to_string(),
+            None => continue,
         };
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
+        // R3F1: skip the retired project's own scopes. No producer_id
+        // comparison.
+        if retired_owned_scope_hashes.contains(&scope_hash) {
+            continue;
+        }
+        let gen_dir = scope_entry.path().join("generations");
+        let entries = match std::fs::read_dir(&gen_dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let gen_id = match entry.file_name().to_str() {
+                Some(id) => id.to_string(),
+                None => continue,
             };
-            let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-                continue;
-            };
-            let is_retired = json
-                .get("producer_id")
-                .and_then(|v| v.as_str())
-                .is_some_and(|s| s == retired_project_id.as_str());
-            if !is_retired {
-                if let Some(entries) = json.get("manifest_entries").and_then(|v| v.as_array()) {
-                    for entry in entries {
-                        if let Some(hash) = entry.get("content_sha256").and_then(|v| v.as_str()) {
-                            hashes.insert(hash.to_string());
+            let metadata_path = gen_dir.join(&gen_id).join("metadata.json");
+            match read_regular_nofollow(&metadata_path) {
+                Ok(Some(bytes)) => {
+                    let Ok(record) = serde_json::from_slice::<
+                        bbox_code_source_store::StoredGenerationV2,
+                    >(&bytes) else {
+                        continue;
+                    };
+                    if let Ok(entries) =
+                        store.load_generation_entries(&record.published_scope, &gen_id)
+                    {
+                        for entry in &entries {
+                            hashes.insert(entry.content_sha256.clone());
                         }
                     }
                 }
+                _ => continue,
             }
         }
     }

@@ -1806,10 +1806,12 @@ fn acceptance_retirement_preflight_does_not_mutate() {
         })
         .unwrap();
 
+    // R3F1: code_source_activation is no longer blocking (it is state
+    // discharged by the journal). Use a class that IS blocking.
     let evidence = RetireEvidence {
         external_reference_counts: {
             let mut m = std::collections::BTreeMap::new();
-            m.insert("code_source_activation".into(), 1u64);
+            m.insert("knowledge_rows".into(), 1u64);
             m
         },
         unprobeable_classes: Vec::new(),
@@ -1820,7 +1822,7 @@ fn acceptance_retirement_preflight_does_not_mutate() {
         retire_project_journaled(&store, &bro_home, &project_id, &evidence, false).unwrap();
 
     assert!(
-        preflight.blocking.contains_key("code_source_activation"),
+        preflight.blocking.contains_key("knowledge_rows"),
         "preflight must report the blocking class"
     );
     assert!(
@@ -2214,11 +2216,13 @@ fn acceptance_discharge_nonzero_reprobe_refuses_at_final_cut() {
         ) -> bbox_indexing::project_catalog_admin::AdminResult<RetireEvidence> {
             self.reprobe_calls += 1;
             // Return evidence with a nonzero class: the discharge did NOT
-            // actually clear this reference.
+            // actually clear this reference. R3F1: code_source_activation
+            // is no longer blocking (it is state discharged by the journal),
+            // so use a class that IS blocking.
             Ok(RetireEvidence {
                 external_reference_counts: {
                     let mut m = std::collections::BTreeMap::new();
-                    m.insert("code_source_activation".into(), 1u64);
+                    m.insert("knowledge_rows".into(), 1u64);
                     m
                 },
                 unprobeable_classes: Vec::new(),

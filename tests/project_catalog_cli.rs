@@ -2,10 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use bbox_code_source_store::{
-    CodeSourceStore, MigrationEffectiveSourceManifestV1, MigrationEffectiveSourceSelectionV1,
-    encode_migration_effective_source_manifest_v1,
-};
+use bbox_code_source_store::CodeSourceStore;
 use bbox_config::config::{self, LoadOptions};
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_catalog::ProjectId;
@@ -689,21 +686,21 @@ fn retire_refuses_on_a_producer_assignment() {
     let config = config_path.to_str().unwrap();
     let project_id = add_published_project(projects, "producerfamily", ".", "2026-07-24T00:00:00Z");
 
-    // A producer assignment lives in the effective source manifest, which no
-    // path-shaped probe reaches: it must be decoded to be counted.
-    let generation = "c".repeat(64);
-    let manifest = MigrationEffectiveSourceManifestV1 {
-        version: 1,
-        selections: vec![MigrationEffectiveSourceSelectionV1 {
-            project_id: ProjectId::parse(project_id.clone()).unwrap(),
-            published_scope: PublishedScope::try_new("producerfamily", ".").unwrap(),
-            generation_id: generation.clone(),
-            selector: format!("collected:{project_id}:{generation}:m{}", "0".repeat(16)),
-        }],
-    };
+    // R3F1: producer assignments come from the config grants, not the
+    // migration-era effective-source manifest. Write a producer grant
+    // for the project's scope in the config file.
+    let token_file = root.join("producer.token");
+    write(&token_file, b"producer-secret-token");
     write(
-        &state.join("code-sources/effective-source-manifest.json"),
-        &encode_migration_effective_source_manifest_v1(&manifest).unwrap(),
+        &config_path,
+        format!(
+            "[paths]\nstate_dir = {state:?}\n\
+             [[code_collection.producers]]\n\
+             producer_id = \"producerfamily-producer\"\n\
+             token_file = {token_file:?}\n\
+             scopes = [{{ repo_id = \"producerfamily\", bbox_root_relpath = \".\" }}]\n"
+        )
+        .as_bytes(),
     );
 
     let reported = success_json(&run_with_isolated_index(
@@ -852,6 +849,101 @@ fn retire_probes_generations_under_a_previously_owned_scope() {
         refused["error"]["code"],
         "error.project_catalog_admin_retire_blocked"
     );
+}
+
+/// R3F1 lifecycle test: a normally collected project with a retained
+/// activation record (but no config-level producer assignment) must
+/// retire end-to-end through the journal path. The activation record
+/// is collected state that gets discharged by stage
+/// CollectedGenerationsDischarged, NOT authority that blocks stage
+/// SourceAuthorityQuiesced. The second run is idempotent.
+#[test]
+fn retire_lifecycle_with_collected_activation_converges_and_is_idempotent() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (state, projects_path, config_path, index_path) = isolated_state_root(&root);
+    let projects = projects_path.to_str().unwrap();
+    let config = config_path.to_str().unwrap();
+    let project_id = add_published_project(projects, "lifecycle", ".", "2026-07-24T00:00:00Z");
+
+    // Retain a collected activation record (normal collected state).
+    let generation = "e".repeat(64);
+    write(
+        &state.join(format!("code-sources/activations/{project_id}.json")),
+        format!(r#"{{"generation_id":"{generation}"}}"#).as_bytes(),
+    );
+
+    // No producer assignment in config (config has no code_collection
+    // section).
+
+    // Execute retire end-to-end through the journal path.
+    let retired = success_json(&run_with_isolated_index(
+        &[
+            "project-catalog",
+            "retirement-journal",
+            "--projects-path",
+            projects,
+            "--project",
+            &project_id,
+            "--execute",
+            "--config",
+            config,
+        ],
+        &index_path,
+    ));
+    assert!(
+        retired["result"]["unprobeable_reference_classes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // Verify the project is gone from the catalog.
+    let listed = success_json(&run(&[
+        "project-catalog",
+        "list",
+        "--projects-path",
+        projects,
+    ]));
+    let remaining = listed["result"]["projects"].as_array().unwrap();
+    assert!(
+        remaining.is_empty(),
+        "project should be retired from catalog"
+    );
+
+    // Verify the activation record was discharged.
+    assert!(
+        !state
+            .join(format!("code-sources/activations/{project_id}.json"))
+            .exists(),
+        "activation record should be cleared after discharge"
+    );
+
+    // Second run is idempotent: retiring an already-retired project
+    // should succeed without error (no-op).
+    let second = success_json(&run_with_isolated_index(
+        &[
+            "project-catalog",
+            "retirement-journal",
+            "--projects-path",
+            projects,
+            "--project",
+            &project_id,
+            "--execute",
+            "--config",
+            config,
+        ],
+        &index_path,
+    ));
+    // Journal should already be at Complete.
+    if let Some(journal) = second["result"]["journal"].as_object() {
+        if let Some(stage) = journal["current_stage"].as_str() {
+            assert!(
+                stage.contains("Complete"),
+                "second run journal should be Complete, got: {stage}"
+            );
+        }
+    }
 }
 
 #[test]
