@@ -2267,24 +2267,36 @@ impl ArtifactCatalog {
         kind: ArtifactKind,
         source_path: &Path,
     ) -> anyhow::Result<Option<ArtifactMetadata>> {
+        with_artifact_mutation_lock(&self.root, || {
+            self.mark_removed_by_source_locked(scope, kind, source_path)
+        })
+    }
+
+    fn mark_removed_by_source_locked(
+        &self,
+        scope: ArtifactScope<'_>,
+        kind: ArtifactKind,
+        source_path: &Path,
+    ) -> anyhow::Result<Option<ArtifactMetadata>> {
         let source_str = source_path.to_string_lossy();
         let kind_dir = self.scoped_root(&scope).join(kind.as_str());
-        if !kind_dir.exists() {
-            return Ok(None);
+        match fs::symlink_metadata(&kind_dir) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => bail!("artifact kind directory is not a safe directory"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
         }
-        for entry in WalkDir::new(&kind_dir).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(&kind_dir).follow_links(false) {
+            let entry = entry?;
+            if entry.file_type().is_symlink() {
+                bail!("artifact watcher traversal encountered a symlink");
+            }
             let path = entry.path();
             if path.file_name().and_then(|s| s.to_str()) != Some("metadata.json") {
                 continue;
             }
-            let raw = match fs::read_to_string(path) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            let mut meta: ArtifactMetadata = match serde_json::from_str(&raw) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
+            let raw = fs::read_to_string(path)?;
+            let mut meta: ArtifactMetadata = serde_json::from_str(&raw)?;
             if !meta.active || meta.source != source_str {
                 continue;
             }
@@ -4036,6 +4048,36 @@ mod tests {
                 None,
             );
             sent.send(result.is_ok()).unwrap();
+        });
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        drop(guard);
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+        );
+        handle.join().unwrap();
+
+        let guard = bbox_corpus_core::json_store::acquire_store_lock_nofollow(
+            &root.join(".artifact-root-mutation"),
+        )
+        .unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let watcher_catalog = catalog.clone();
+        let handle = std::thread::spawn(move || {
+            let result = watcher_catalog.mark_removed_by_source(
+                ArtifactScope::Project {
+                    project_id: "p1",
+                    local: true,
+                },
+                ArtifactKind::Workflow,
+                Path::new("fixture"),
+            );
+            sent.send(result.unwrap().is_some()).unwrap();
         });
         assert!(
             received
