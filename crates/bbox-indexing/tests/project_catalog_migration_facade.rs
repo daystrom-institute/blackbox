@@ -1894,8 +1894,16 @@ impl bbox_indexing::project_catalog_admin::RetirementDischargeWorkers for Counti
         self.sweep_calls += 1;
         Ok(())
     }
+    fn verify_source_authority_quiesced(
+        &mut self,
+        _store: &bbox_indexing::project_catalog_store::ProjectCatalogStore,
+        _project_id: &ProjectId,
+    ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
+        Ok(())
+    }
     fn reprobe_evidence(
         &mut self,
+        _store: &bbox_indexing::project_catalog_store::ProjectCatalogStore,
         _project_id: &ProjectId,
         _original_evidence: &bbox_indexing::project_catalog_admin::RetireEvidence,
     ) -> bbox_indexing::project_catalog_admin::AdminResult<
@@ -2184,8 +2192,16 @@ fn acceptance_discharge_nonzero_reprobe_refuses_at_final_cut() {
         ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
             Ok(())
         }
+        fn verify_source_authority_quiesced(
+            &mut self,
+            _store: &bbox_indexing::project_catalog_store::ProjectCatalogStore,
+            _project_id: &ProjectId,
+        ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
+            Ok(())
+        }
         fn reprobe_evidence(
             &mut self,
+            _store: &bbox_indexing::project_catalog_store::ProjectCatalogStore,
             _project_id: &ProjectId,
             _original_evidence: &RetireEvidence,
         ) -> bbox_indexing::project_catalog_admin::AdminResult<RetireEvidence> {
@@ -2253,5 +2269,137 @@ fn acceptance_discharge_nonzero_reprobe_refuses_at_final_cut() {
     assert!(
         state.catalog().projects.contains_key(&project_id),
         "project must remain in catalog after refused final cut"
+    );
+}
+
+/// F5: verify_source_authority_quiesced is called before the journal
+/// advances past SourceAuthorityQuiesced. A worker that refuses (returns
+/// Err) blocks the journal at Prepared.
+#[test]
+fn f5_source_authority_quiesced_blocks_journal() {
+    use bbox_corpus_core::project_catalog::{
+        CatalogSnapshotV2, CorpusProject, ProjectId, ProjectScope,
+    };
+    use bbox_indexing::project_catalog_admin::{
+        RetireEvidence, RetirementJournalStage, retire_project_journaled_with,
+    };
+    use bbox_indexing::project_catalog_store::ProjectCatalogStore;
+    use std::sync::Arc;
+
+    struct RefusingQuiesceWorker;
+
+    impl bbox_indexing::project_catalog_admin::RetirementDischargeWorkers
+        for RefusingQuiesceWorker
+    {
+        fn discharge_collected_generations(
+            &mut self,
+            _project_id: &ProjectId,
+        ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
+            Ok(())
+        }
+        fn discharge_publications(
+            &mut self,
+            _project_id: &ProjectId,
+        ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
+            Ok(())
+        }
+        fn discharge_attachments(
+            &mut self,
+            _store: &ProjectCatalogStore,
+            _project_id: &ProjectId,
+        ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
+            Ok(())
+        }
+        fn sweep_materialization(
+            &mut self,
+            _project_id: &ProjectId,
+        ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
+            Ok(())
+        }
+        fn verify_source_authority_quiesced(
+            &mut self,
+            _store: &ProjectCatalogStore,
+            _project_id: &ProjectId,
+        ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
+            Err(bbox_indexing::project_catalog_admin::admin_error(
+                "error.project_catalog_retire_auth_not_quiesced",
+                "active assignments remain",
+            ))
+        }
+        fn reprobe_evidence(
+            &mut self,
+            _store: &ProjectCatalogStore,
+            _project_id: &ProjectId,
+            _original_evidence: &RetireEvidence,
+        ) -> bbox_indexing::project_catalog_admin::AdminResult<RetireEvidence> {
+            Ok(RetireEvidence {
+                external_reference_counts: Default::default(),
+            })
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let bro_home = root.join("bro-home");
+    fs::create_dir_all(&bro_home).unwrap();
+
+    let store =
+        Arc::new(ProjectCatalogStore::initialize_empty(root.join("projects.json")).unwrap());
+
+    let project_id = ProjectId::parse("p_000000000000000000000000000000a1").unwrap();
+    let epoch = store.snapshot().unwrap().epoch();
+    store
+        .transact(epoch, |catalog: &mut CatalogSnapshotV2, _| {
+            catalog.projects.insert(
+                project_id.clone(),
+                CorpusProject {
+                    project_id: project_id.clone(),
+                    scope: ProjectScope::LegacyLocal,
+                    operator_aliases: Default::default(),
+                    nominated_aliases: Default::default(),
+                    display_name: "f5 project".into(),
+                    created_at: "2026-07-24T00:00:00Z".into(),
+                    registered_at_compat: None,
+                    repo_history: None,
+                    languages: Default::default(),
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+
+    let evidence = RetireEvidence {
+        external_reference_counts: Default::default(),
+    };
+
+    let mut workers = RefusingQuiesceWorker;
+    let result = retire_project_journaled_with(
+        &store,
+        &bro_home,
+        &project_id,
+        &evidence,
+        true,
+        &mut workers,
+    );
+
+    assert!(
+        result.is_err(),
+        "journal must refuse when source authority is not quiesced"
+    );
+    let err_code = result.unwrap_err().code();
+    assert!(
+        err_code.contains("auth_not_quiesced"),
+        "error must name auth_not_quiesced, got: {err_code}"
+    );
+
+    // The journal must NOT have advanced past Prepared.
+    let journal =
+        bbox_indexing::project_catalog_admin::load_retirement_journal(&bro_home, &project_id)
+            .unwrap()
+            .expect("journal should persist on disk");
+    assert_eq!(
+        journal.current_stage,
+        RetirementJournalStage::Prepared,
+        "journal must stay at Prepared when source authority is not quiesced"
     );
 }

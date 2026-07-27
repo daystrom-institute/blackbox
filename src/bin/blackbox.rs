@@ -1130,21 +1130,39 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             ),
         ) {
             // Clear the activation record (single-attempt, idempotent).
-            let _ = store.clear_activation(project_id.as_str());
+            store
+                .clear_activation(project_id.as_str())
+                .map_err(|e| {
+                    project_catalog_admin::admin_error(
+                        "error.project_catalog_retire_discharge_activation",
+                        format!("failed to clear activation record: {e}"),
+                    )
+                })?;
 
             // Delete generation records for the project's scopes.
             for scope_hash in scope_dirs(&code_sources) {
-                let _ = delete_generations_for_project_in_scope(
+                delete_generations_for_project_in_scope(
                     &code_sources,
                     &scope_hash,
                     project_id.as_str(),
-                );
+                )
+                .map_err(|e| {
+                    project_catalog_admin::admin_error(
+                        "error.project_catalog_retire_discharge_generations",
+                        format!("failed to delete generation records: {e}"),
+                    )
+                })?;
             }
         }
 
         // Clear project-scoped coordination rows.
         for (path, keys) in coordination_row_paths(self.config) {
-            let _ = clear_project_rows(&path, keys, project_id.as_str());
+            clear_project_rows(&path, keys, project_id.as_str()).map_err(|e| {
+                project_catalog_admin::admin_error(
+                    "error.project_catalog_retire_discharge_coordination",
+                    format!("failed to clear coordination rows at {}: {e}", path.display()),
+                )
+            })?;
         }
 
         Ok(())
@@ -1230,19 +1248,16 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
 
     /// Re-inventory cross-store reference classes from current state after
     /// all discharge stages. Re-runs the existing probe machinery against
-    /// live stores (section 11.3 step 7).
+    /// live stores (section 11.3 step 7). Uses the already-open store
+    /// handle instead of reopening with an exclusive lock, which would
+    /// deadlock against the command's own lifetime lock (F5).
     fn reprobe_evidence(
         &mut self,
+        store: &ProjectCatalogStore,
         project_id: &ProjectId,
         _original_evidence: &project_catalog_admin::RetireEvidence,
     ) -> project_catalog_admin::AdminResult<project_catalog_admin::RetireEvidence> {
-        let (_lock, store) = open_admin_store(&self.projects_path.to_path_buf()).map_err(|e| {
-            project_catalog_admin::admin_error(
-                "error.project_catalog_cli_reprobe_store_open",
-                format!("{}: {}", e.code, e.message),
-            )
-        })?;
-        let probe = probe_retire_evidence(self.config, self.projects_path, &store, project_id)
+        let probe = probe_retire_evidence(self.config, self.projects_path, store, project_id)
             .map_err(|e| {
                 project_catalog_admin::admin_error(
                     "error.project_catalog_cli_reprobe_failed",
@@ -1250,6 +1265,56 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
                 )
             })?;
         Ok(probe.evidence)
+    }
+
+    /// Verify source authority has quiesced: refuse if the project still
+    /// holds active producer assignments (F5). The journal must not advance
+    /// past SourceAuthorityQuiesced while auth assignments remain.
+    fn verify_source_authority_quiesced(
+        &mut self,
+        store: &ProjectCatalogStore,
+        project_id: &ProjectId,
+    ) -> project_catalog_admin::AdminResult<()> {
+        let code_sources = self.config.paths.state_dir.join("code-sources");
+        if let Ok(paths) = bbox_code_source_store::CodeSourceStorePaths::new(&code_sources) {
+            let assignments = probe_producer_assignments(&paths.anchor(), project_id);
+            if assignments.class.is_present() {
+                return Err(project_catalog_admin::admin_error(
+                    "error.project_catalog_retire_auth_not_quiesced",
+                    format!(
+                        "project still holds active producer assignments; \
+                         retirement cannot proceed until they are revoked"
+                    ),
+                ));
+            }
+        }
+        // Also verify the catalog has no active attachments for this project.
+        let state = store.snapshot().map_err(|e| {
+            project_catalog_admin::admin_error(
+                "error.project_catalog_cli_snapshot",
+                format!("snapshot error: {e}"),
+            )
+        })?;
+        let active = state
+            .attachments()
+            .attachments
+            .values()
+            .filter(|row| {
+                &row.project_id == project_id
+                    && row.status
+                        == bbox_corpus_core::project_catalog::AttachmentStatus::Attached
+            })
+            .count();
+        if active > 0 {
+            return Err(project_catalog_admin::admin_error(
+                "error.project_catalog_retire_auth_not_quiesced",
+                format!(
+                    "project still has {active} active attachment(s); \
+                     retirement cannot proceed until they are detached"
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1306,6 +1371,12 @@ const SLACK_ROW_KEYS: [&str; 3] = ["project", "project_id", "project_dir"];
 enum ClassProbe {
     Counted(u64),
     Unprobeable,
+}
+
+impl ClassProbe {
+    fn is_present(&self) -> bool {
+        matches!(self, ClassProbe::Counted(n) if *n > 0)
+    }
 }
 
 /// Bounded external-reference evidence plus the classes this host could not
@@ -1940,7 +2011,7 @@ fn delete_generations_for_project_in_scope(
         if let Ok(bytes) = std::fs::read(&path) {
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                 if json.get("producer_id").and_then(|v| v.as_str()) == Some(project_id) {
-                    let _ = std::fs::remove_file(&path);
+                    std::fs::remove_file(&path)?;
                 }
             }
         }

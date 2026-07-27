@@ -2122,6 +2122,14 @@ pub fn retirement_journal_path(
 }
 
 /// Load a journal from disk. Returns `Ok(None)` if the file does not exist.
+///
+/// F6: Strict bounded nofollow decoding. Validates:
+/// - File size within the migration byte limit.
+/// - Filename matches the expected project id convention.
+/// - Deserialized journal has the correct version.
+/// - Journal's project_id matches the expected project_id.
+/// - current_stage is a valid known stage.
+/// - No symlink following (opens via O_NOFOLLOW on Unix).
 pub fn load_retirement_journal(
     bro_home: &std::path::Path,
     project_id: &ProjectId,
@@ -2130,13 +2138,64 @@ pub fn load_retirement_journal(
     if !path.is_file() {
         return Ok(None);
     }
+    // Bounded read: refuse oversized journals.
+    let metadata = std::fs::metadata(&path)?;
+    if metadata.len() as usize > MAX_JOURNAL_BYTES {
+        return Err(RetirementJournalError::other(
+            "retirement journal exceeds its byte limit",
+        ));
+    }
+    // Nofollow read: open the file without following symlinks (F6).
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|e| {
+                if e.raw_os_error() == Some(libc::ELOOP) {
+                    RetirementJournalError::other(
+                        "retirement journal is a symlink; refusing to follow",
+                    )
+                } else {
+                    RetirementJournalError::from(e)
+                }
+            })?;
+        let mut buf = Vec::with_capacity(metadata.len() as usize);
+        std::io::Read::read_to_end(&mut file, &mut buf)?;
+        buf
+    };
+    #[cfg(not(unix))]
     let bytes = std::fs::read(&path)?;
+
     let journal: ProjectRetirementJournal = serde_json::from_slice(&bytes)?;
+
+    // Strict version check.
+    if journal.version != ProjectRetirementJournal::VERSION {
+        return Err(RetirementJournalError::other(format!(
+            "retirement journal version mismatch: expected {}, got {}",
+            ProjectRetirementJournal::VERSION,
+            journal.version
+        )));
+    }
+    // Filename/project_id consistency: the journal's embedded project_id
+    // must match the filename-derived project_id.
+    if journal.project_id != *project_id {
+        return Err(RetirementJournalError::other(
+            "retirement journal project_id does not match the filename",
+        ));
+    }
     Ok(Some(journal))
 }
 
-/// Persist a journal to disk, syncing the directory after the write
-/// (section 11.3: "each advance synced to disk").
+/// Maximum byte size for a retirement journal (F6: bounded read).
+const MAX_JOURNAL_BYTES: usize = 64 * 1024;
+
+/// Persist a journal to disk, syncing the file AND directory after the
+/// write (section 11.3: "each advance synced to disk"). F6: uses an
+/// anchored atomic write with fsync on both the temp file and the
+/// directory, and refuses to follow symlinks.
 pub fn save_retirement_journal(
     bro_home: &std::path::Path,
     journal: &ProjectRetirementJournal,
@@ -2144,10 +2203,31 @@ pub fn save_retirement_journal(
     let dir = bro_home.join("retirement-journals");
     std::fs::create_dir_all(&dir)?;
     let path = retirement_journal_path(bro_home, &journal.project_id);
+
+    // F6: refuse if the target path is a symlink (nofollow write).
+    if path.is_symlink() {
+        return Err(RetirementJournalError::other(
+            "retirement journal target is a symlink; refusing to write through it",
+        ));
+    }
+
     let bytes = serde_json::to_vec_pretty(journal)?;
-    // Atomic write: temp file then rename.
+
+    // Bounded write: refuse oversized journals.
+    if bytes.len() > MAX_JOURNAL_BYTES {
+        return Err(RetirementJournalError::other(
+            "retirement journal exceeds its byte limit",
+        ));
+    }
+
+    // Atomic write with fsync: write to temp, fsync, rename, fsync dir.
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &bytes)?;
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut file, &bytes)?;
+        // Fsync the file before rename so the data is durable.
+        file.sync_all()?;
+    }
     std::fs::rename(&tmp, &path)?;
     // Sync the directory so the rename is durable.
     if let Ok(handle) = std::fs::File::open(&dir) {
@@ -2235,6 +2315,17 @@ pub trait RetirementDischargeWorkers {
     /// catalog or auth lock held during blob deletion.
     fn sweep_materialization(&mut self, project_id: &ProjectId) -> AdminResult<()>;
 
+    /// Verify that source authority has quiesced for the project before
+    /// the journal advances past SourceAuthorityQuiesced (F5). The worker
+    /// must refuse (return Err) if the project still holds active auth
+    /// assignments or un-revoked producer bindings. Only when this returns
+    /// Ok may the journal advance.
+    fn verify_source_authority_quiesced(
+        &mut self,
+        store: &ProjectCatalogStore,
+        project_id: &ProjectId,
+    ) -> AdminResult<()>;
+
     /// Re-inventory the cross-store reference classes from CURRENT state
     /// after all discharge stages have run. Called at CatalogPairRemoved
     /// (section 11.3 step 7) to verify that the discharge workers actually
@@ -2246,6 +2337,7 @@ pub trait RetirementDischargeWorkers {
     /// project refuses at the final cut instead of orphaning records.
     fn reprobe_evidence(
         &mut self,
+        store: &ProjectCatalogStore,
         project_id: &ProjectId,
         original_evidence: &RetireEvidence,
     ) -> AdminResult<RetireEvidence>;
@@ -2273,8 +2365,17 @@ impl RetirementDischargeWorkers for NoopDischargeWorkers {
         Ok(())
     }
 
+    fn verify_source_authority_quiesced(
+        &mut self,
+        _store: &ProjectCatalogStore,
+        _project_id: &ProjectId,
+    ) -> AdminResult<()> {
+        Ok(())
+    }
+
     fn reprobe_evidence(
         &mut self,
+        _store: &ProjectCatalogStore,
         _project_id: &ProjectId,
         original_evidence: &RetireEvidence,
     ) -> AdminResult<RetireEvidence> {
@@ -2394,11 +2495,15 @@ pub fn retire_project_journaled_with(
 
     let now = || journal_now();
 
-    // Stage: SourceAuthorityQuiesced (step 2).
+    // Stage: SourceAuthorityQuiesced (step 2). The worker must verify
+    // that the project no longer holds active auth assignments or
+    // un-revoked producer bindings before the journal may advance (F5).
+    // A worker that returns Err blocks the journal at this stage.
     if !journal
         .current_stage
         .is_at_least(RetirementJournalStage::SourceAuthorityQuiesced)
     {
+        workers.verify_source_authority_quiesced(store, project_id)?;
         journal.advance(&now());
         save_retirement_journal(bro_home, &journal)
             .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
@@ -2459,7 +2564,7 @@ pub fn retire_project_journaled_with(
     {
         let current_state = store.snapshot()?;
         if current_state.catalog().projects.contains_key(project_id) {
-            let reprobed_evidence = workers.reprobe_evidence(project_id, evidence)?;
+            let reprobed_evidence = workers.reprobe_evidence(store, project_id, evidence)?;
             let (_inventory, _commit) = retire_project(
                 store,
                 current_state.epoch(),
@@ -4170,6 +4275,146 @@ mod tests {
         assert!(
             err.contains("no_double_migration"),
             "must refuse with no_double_migration, got: {err}"
+        );
+    }
+
+    // ---- F6: retirement journal strict decoding tests ----
+
+    /// F6: load_retirement_journal refuses a journal whose embedded
+    /// project_id does not match the filename.
+    #[test]
+    fn f6_load_refuses_mismatched_project_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_a = ProjectId::parse("p_00000000000000000000000000000a1").unwrap();
+        let pid_b = ProjectId::parse("p_000000000000000000000000000000b2").unwrap();
+        // Write a journal for pid_b at pid_a's path.
+        let journal = ProjectRetirementJournal::new(pid_b, 1, "1");
+        let path = retirement_journal_path(tmp.path(), &pid_a);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+        let result = load_retirement_journal(tmp.path(), &pid_a);
+        assert!(result.is_err());
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("does not match the filename"),
+            "must refuse mismatched project_id, got: {err}"
+        );
+    }
+
+    /// F6: load_retirement_journal refuses a journal with the wrong
+    /// version number.
+    #[test]
+    fn f6_load_refuses_wrong_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = ProjectId::parse(PROJECT).unwrap();
+        let path = retirement_journal_path(tmp.path(), &pid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Write a journal with version 999.
+        let raw = serde_json::json!({
+            "version": 999,
+            "project_id": pid,
+            "started_at": "1",
+            "updated_at": "1",
+            "current_stage": "prepared",
+            "catalog_epoch_at_start": 1
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+        let result = load_retirement_journal(tmp.path(), &pid);
+        assert!(result.is_err());
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("version mismatch"),
+            "must refuse wrong version, got: {err}"
+        );
+    }
+
+    /// F6: load_retirement_journal refuses malformed JSON.
+    #[test]
+    fn f6_load_refuses_malformed_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = ProjectId::parse(PROJECT).unwrap();
+        let path = retirement_journal_path(tmp.path(), &pid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{not valid json").unwrap();
+        let result = load_retirement_journal(tmp.path(), &pid);
+        assert!(result.is_err(), "must refuse malformed JSON");
+    }
+
+    /// F6: load_retirement_journal refuses a journal with an unknown
+    /// stage value.
+    #[test]
+    fn f6_load_refuses_unknown_stage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = ProjectId::parse(PROJECT).unwrap();
+        let path = retirement_journal_path(tmp.path(), &pid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = serde_json::json!({
+            "version": 1,
+            "project_id": pid,
+            "started_at": "1",
+            "updated_at": "1",
+            "current_stage": "nonexistent_stage",
+            "catalog_epoch_at_start": 1
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+        let result = load_retirement_journal(tmp.path(), &pid);
+        assert!(result.is_err(), "must refuse unknown stage");
+    }
+
+    /// F6: save_retirement_journal uses atomic write with fsync (the
+    /// .json.tmp file must not remain after save).
+    #[test]
+    fn f6_save_no_tmp_remains() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = ProjectId::parse(PROJECT).unwrap();
+        let journal = ProjectRetirementJournal::new(pid.clone(), 1, "1");
+        save_retirement_journal(tmp.path(), &journal).unwrap();
+        let dir = tmp.path().join("retirement-journals");
+        let tmp_file = dir.join(format!("{pid}.json.tmp"));
+        assert!(
+            !tmp_file.exists(),
+            "temp file must be renamed (no .json.tmp remains)"
+        );
+        let journal_file = dir.join(format!("{pid}.json"));
+        assert!(journal_file.exists(), "journal file must exist");
+    }
+
+    /// F6: save_retirement_journal refuses to write through a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn f6_save_refuses_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = ProjectId::parse(PROJECT).unwrap();
+        let dir = tmp.path().join("retirement-journals");
+        std::fs::create_dir_all(&dir).unwrap();
+        let real_file = dir.join("real.json");
+        std::fs::write(&real_file, b"{}").unwrap();
+        let link = dir.join(format!("{pid}.json"));
+        std::os::unix::fs::symlink(&real_file, &link).unwrap();
+        let journal = ProjectRetirementJournal::new(pid, 1, "1");
+        let result = save_retirement_journal(tmp.path(), &journal);
+        assert!(result.is_err(), "must refuse to write through a symlink");
+    }
+
+    /// F6: load_retirement_journal refuses to follow a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn f6_load_refuses_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = ProjectId::parse(PROJECT).unwrap();
+        let dir = tmp.path().join("retirement-journals");
+        std::fs::create_dir_all(&dir).unwrap();
+        let real_file = dir.join("real.json");
+        let journal = ProjectRetirementJournal::new(pid.clone(), 1, "1");
+        std::fs::write(&real_file, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+        let link = dir.join(format!("{pid}.json"));
+        std::os::unix::fs::symlink(&real_file, &link).unwrap();
+        let result = load_retirement_journal(tmp.path(), &pid);
+        assert!(result.is_err(), "must refuse to follow a symlink");
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("symlink"),
+            "must refuse symlink with a clear message, got: {err}"
         );
     }
 }
