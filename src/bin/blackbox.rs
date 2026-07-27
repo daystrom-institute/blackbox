@@ -679,6 +679,76 @@ mod tests {
             .unwrap()
         );
     }
+
+    #[test]
+    fn retirement_clears_every_dischargeable_coordination_store_shape() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let project = "project-retiring".to_string();
+        let selectors = vec![project.clone()];
+        for (name, field) in [
+            ("knowledge.json", "entries"),
+            ("gaps.json", "gaps"),
+            ("threads.json", "threads"),
+            ("notes.json", "notes"),
+            ("pins.json", "pins"),
+        ] {
+            let path = root.join(name);
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({
+                    "version": 1,
+                    (field): [
+                        {"project_id": project, "id": "remove"},
+                        {"project_id": "project-retained", "id": "keep"}
+                    ]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            clear_wrapped_project_rows(&path, &[field], &PROJECT_ROW_KEYS, &selectors).unwrap();
+            assert!(matches!(
+                count_project_rows(&path, &selectors, &PROJECT_ROW_KEYS),
+                ClassProbe::Counted(0)
+            ));
+        }
+
+        let roadmap = root.join("roadmap.json");
+        std::fs::write(
+            &roadmap,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "items": [{"project_id": project}, {"project_id": "project-retained"}],
+                "edges": [{"project_id": project}, {"project_id": "project-retained"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        clear_wrapped_project_rows(&roadmap, &["items", "edges"], &PROJECT_ROW_KEYS, &selectors)
+            .unwrap();
+        assert!(matches!(
+            count_project_rows(&roadmap, &selectors, &PROJECT_ROW_KEYS),
+            ClassProbe::Counted(0)
+        ));
+
+        let slack = root.join("slack-channel-bindings.json");
+        std::fs::write(
+            &slack,
+            serde_json::to_vec(&serde_json::json!({
+                "bindings": {
+                    "remove": {"project_id": project},
+                    "keep": {"project_id": "project-retained"}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        clear_slack_channel_bindings(&slack, &selectors).unwrap();
+        assert!(matches!(
+            count_project_rows(&slack, &selectors, &SLACK_ROW_KEYS),
+            ClassProbe::Counted(0)
+        ));
+    }
 }
 
 /// Open a strict v2 store for offline administration: the exclusive
@@ -1088,6 +1158,23 @@ fn execute_retire(args: RetireArgs) -> Result<serde_json::Value, CommandFailure>
             ),
         ));
     }
+    if args.execute {
+        if let Some(class) = RETIRE_UNDISCHARGEABLE_CLASSES.iter().find(|class| {
+            probe
+                .evidence
+                .external_reference_counts
+                .get(**class)
+                .is_some_and(|count| *count > 0)
+        }) {
+            return Err(CommandFailure::new(
+                "error.project_catalog_retire_undischargeable_class",
+                format!(
+                    "retirement cannot safely discharge offline reference class {class}; \
+                     clear that class before creating or resuming the journal"
+                ),
+            ));
+        }
+    }
     let epoch = current_epoch(&store)?;
     let (inventory, commit) = project_catalog_admin::retire_project(
         &store,
@@ -1250,9 +1337,32 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
                 })?;
         }
 
-        // Clear project-scoped coordination rows.
-        for (path, keys) in coordination_row_paths(self.config) {
-            clear_project_rows(&path, keys, project_id.as_str()).map_err(|e| {
+        let catalog_store =
+            ProjectCatalogStore::open_existing(self.projects_path).map_err(|e| {
+                project_catalog_admin::admin_error(
+                    "error.project_catalog_retire_catalog_open",
+                    format!("failed to open catalog for coordination discharge: {e}"),
+                )
+            })?;
+        let state = catalog_store.snapshot().map_err(|e| {
+            project_catalog_admin::admin_error(
+                "error.project_catalog_retire_catalog_snapshot",
+                format!("failed to snapshot catalog for coordination discharge: {e}"),
+            )
+        })?;
+        let selectors = std::iter::once(project_id.as_str().to_string())
+            .chain(
+                state
+                    .attachments()
+                    .attachments
+                    .values()
+                    .filter(|row| &row.project_id == project_id)
+                    .map(|row| row.checkout_project_dir.clone()),
+            )
+            .collect::<Vec<_>>();
+
+        for (path, array_fields, keys) in coordination_row_paths(self.config) {
+            clear_wrapped_project_rows(&path, array_fields, keys, &selectors).map_err(|e| {
                 project_catalog_admin::admin_error(
                     "error.project_catalog_retire_discharge_coordination",
                     format!(
@@ -1262,6 +1372,20 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
                 )
             })?;
         }
+        clear_slack_channel_bindings(
+            &self
+                .config
+                .paths
+                .bro_home
+                .join("slack-channel-bindings.json"),
+            &selectors,
+        )
+        .map_err(|e| {
+            project_catalog_admin::admin_error(
+                "error.project_catalog_retire_discharge_coordination",
+                format!("failed to clear Slack channel bindings: {e}"),
+            )
+        })?;
 
         Ok(())
     }
@@ -1499,6 +1623,18 @@ const RETIRE_REFERENCE_CLASSES: [&str; 20] = [
     "whiteboard_rows",
     "packet_rows",
     "slack_channel_bindings",
+    "slack_proposal_links",
+    "edge_sidecar_rows",
+    "index_entity_refs",
+    "index_code_metadata_rows",
+    "git_ingest_cursors",
+    "vector_entity_refs",
+];
+
+const RETIRE_UNDISCHARGEABLE_CLASSES: [&str; 9] = [
+    "artifact_rows",
+    "whiteboard_rows",
+    "packet_rows",
     "slack_proposal_links",
     "edge_sidecar_rows",
     "index_entity_refs",
@@ -2203,45 +2339,80 @@ fn accepted_publication_pointer(projects_path: &Path, project_id: &ProjectId) ->
 /// is `(path, [key_fields])` where `key_fields` are the JSON field names
 /// that carry a project id or selector. The discharge worker reads each
 /// file and removes rows matching the retired project.
-fn coordination_row_paths(config: &config::Config) -> Vec<(PathBuf, &'static [&'static str])> {
+fn coordination_row_paths(
+    config: &config::Config,
+) -> Vec<(PathBuf, &'static [&'static str], &'static [&'static str])> {
     vec![
-        (config.paths.knowledge_path.clone(), &PROJECT_ROW_KEYS[..]),
-        (config.paths.gaps_path.clone(), &PROJECT_ROW_KEYS[..]),
-        (config.paths.threads_path.clone(), &PROJECT_ROW_KEYS[..]),
-        (config.paths.notes_path.clone(), &PROJECT_ROW_KEYS[..]),
-        (config.paths.pins_path.clone(), &PROJECT_ROW_KEYS[..]),
-        (config.paths.roadmap_path.clone(), &PROJECT_ROW_KEYS[..]),
+        (
+            config.paths.knowledge_path.clone(),
+            &["entries"],
+            &PROJECT_ROW_KEYS,
+        ),
+        (config.paths.gaps_path.clone(), &["gaps"], &PROJECT_ROW_KEYS),
+        (
+            config.paths.threads_path.clone(),
+            &["threads"],
+            &PROJECT_ROW_KEYS,
+        ),
+        (
+            config.paths.notes_path.clone(),
+            &["notes"],
+            &PROJECT_ROW_KEYS,
+        ),
+        (config.paths.pins_path.clone(), &["pins"], &PROJECT_ROW_KEYS),
+        (
+            config.paths.roadmap_path.clone(),
+            &["items", "edges"],
+            &PROJECT_ROW_KEYS,
+        ),
     ]
 }
 
-/// Clear project rows from a JSON-lines or JSON-array file. Reads the
-/// file, filters out rows matching the project id in any of the key
-/// fields, and writes the remaining rows back. If the file does not
-/// exist, this is a no-op.
-fn clear_project_rows(path: &Path, keys: &[&str], project_id: &str) -> std::io::Result<()> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    // If the file is a JSON array of objects, filter it.
-    if let Ok(arr) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) {
-        let original_len = arr.len();
-        let filtered: Vec<_> = arr
-            .into_iter()
-            .filter(|row| {
-                !keys.iter().any(|key| {
-                    row.get(*key)
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|s| s == project_id)
-                })
-            })
-            .collect();
-        if filtered.len() < original_len {
-            std::fs::write(path, serde_json::to_vec(&filtered).unwrap_or_default())?;
-        }
+fn row_matches_project(row: &serde_json::Value, keys: &[&str], selectors: &[String]) -> bool {
+    keys.iter().any(|key| {
+        row.get(*key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| selectors.iter().any(|selector| selector == value))
+    })
+}
+
+fn clear_wrapped_project_rows(
+    path: &Path,
+    array_fields: &[&str],
+    keys: &[&str],
+    selectors: &[String],
+) -> anyhow::Result<()> {
+    if !path.exists() {
+        return Ok(());
     }
-    Ok(())
+    bbox_corpus_core::json_store::with_store_lock(path, || {
+        let bytes = std::fs::read(path)?;
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        for field in array_fields {
+            let rows = value
+                .get_mut(*field)
+                .and_then(serde_json::Value::as_array_mut)
+                .ok_or_else(|| anyhow::anyhow!("missing array field {field}"))?;
+            rows.retain(|row| !row_matches_project(row, keys, selectors));
+        }
+        bbox_corpus_core::json_store::atomic_write_json_locked(path, &value)
+    })
+}
+
+fn clear_slack_channel_bindings(path: &Path, selectors: &[String]) -> anyhow::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    bbox_corpus_core::json_store::with_store_lock(path, || {
+        let bytes = std::fs::read(path)?;
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let bindings = value
+            .get_mut("bindings")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| anyhow::anyhow!("missing object field bindings"))?;
+        bindings.retain(|_, row| !row_matches_project(row, &SLACK_ROW_KEYS, selectors));
+        bbox_corpus_core::json_store::atomic_write_json_locked(path, &value)
+    })
 }
 
 /// Accepted publication generation for the project, read from the pointer

@@ -1128,4 +1128,24 @@ fn retire_refuses_on_a_slack_channel_binding() {
         refused["error"]["code"],
         "error.project_catalog_admin_retire_blocked"
     );
+
+    let journaled = run_with_isolated_index(
+        &[
+            "project-catalog",
+            "retirement-journal",
+            "--projects-path",
+            projects,
+            "--project",
+            &project_id,
+            "--execute",
+            "--config",
+            config,
+        ],
+        &index_path,
+    );
+    assert!(journaled.status.success());
+    let bindings: Value =
+        serde_json::from_slice(&fs::read(state.join("bro/slack-channel-bindings.json")).unwrap())
+            .unwrap();
+    assert!(bindings["bindings"].as_object().unwrap().is_empty());
 }
