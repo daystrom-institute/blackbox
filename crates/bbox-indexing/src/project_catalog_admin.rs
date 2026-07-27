@@ -2432,6 +2432,7 @@ fn retirement_archive_marker_path(
         .join(format!("{project_id}.archive-pending"))
 }
 
+#[cfg(any(not(unix), test))]
 fn retirement_blob_inventory_path(journal_path: &std::path::Path) -> std::path::PathBuf {
     journal_path.with_extension("blobs.json")
 }
@@ -3235,47 +3236,233 @@ pub fn archive_retirement_journal(
     bro_home: &std::path::Path,
     project_id: &ProjectId,
 ) -> Result<(), RetirementJournalError> {
-    let path = retirement_journal_path(bro_home, project_id);
-    let dir = bro_home.join("retirement-journals");
-    let archive_dir = dir.join("archive");
-    std::fs::create_dir_all(&archive_dir)?;
-    let archived = archived_retirement_journal_path(bro_home, project_id);
-    let sidecar = retirement_blob_inventory_path(&path);
-    let archived_sidecar = retirement_blob_inventory_path(&archived);
-    let marker = retirement_archive_marker_path(bro_home, project_id);
-    if path.is_file() || marker.is_file() {
-        bbox_corpus_core::json_store::with_store_lock(&marker, || {
-            bbox_corpus_core::json_store::atomic_write_bytes_locked(
-                &marker,
-                project_id.as_str().as_bytes(),
+    #[cfg(unix)]
+    {
+        return archive_retirement_journal_anchored(bro_home, project_id);
+    }
+    #[cfg(not(unix))]
+    {
+        let path = retirement_journal_path(bro_home, project_id);
+        let dir = bro_home.join("retirement-journals");
+        let archive_dir = dir.join("archive");
+        std::fs::create_dir_all(&archive_dir)?;
+        let archived = archived_retirement_journal_path(bro_home, project_id);
+        let sidecar = retirement_blob_inventory_path(&path);
+        let archived_sidecar = retirement_blob_inventory_path(&archived);
+        let marker = retirement_archive_marker_path(bro_home, project_id);
+        if path.is_file() || marker.is_file() {
+            bbox_corpus_core::json_store::with_store_lock(&marker, || {
+                bbox_corpus_core::json_store::atomic_write_bytes_locked(
+                    &marker,
+                    project_id.as_str().as_bytes(),
+                )
+            })
+            .map_err(|error| RetirementJournalError::other(error.to_string()))?;
+            if sidecar.is_file() {
+                if archived_sidecar.exists() {
+                    return Err(RetirementJournalError::other(
+                        "retirement archive has conflicting blob sidecars",
+                    ));
+                }
+                std::fs::rename(&sidecar, &archived_sidecar)?;
+                std::fs::File::open(&archive_dir)?.sync_all()?;
+                std::fs::File::open(&dir)?.sync_all()?;
+            }
+            if path.is_file() {
+                if archived.exists() {
+                    return Err(RetirementJournalError::other(
+                        "retirement archive has conflicting journals",
+                    ));
+                }
+                std::fs::rename(&path, &archived)?;
+                std::fs::File::open(&archive_dir)?.sync_all()?;
+                std::fs::File::open(&dir)?.sync_all()?;
+            }
+            match std::fs::remove_file(&marker) {
+                Ok(()) => std::fs::File::open(&archive_dir)?.sync_all()?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn archive_retirement_journal_anchored(
+    bro_home: &std::path::Path,
+    project_id: &ProjectId,
+) -> Result<(), RetirementJournalError> {
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fn open_dir_at(
+        parent: &std::fs::File,
+        name: &str,
+    ) -> Result<std::fs::File, RetirementJournalError> {
+        let name = std::ffi::CString::new(name).map_err(|_| {
+            RetirementJournalError::other("retirement archive directory contains NUL")
+        })?;
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(error.into());
+            }
+        }
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
-        })
-        .map_err(|error| RetirementJournalError::other(error.to_string()))?;
-        if sidecar.is_file() {
-            if archived_sidecar.exists() {
-                return Err(RetirementJournalError::other(
-                    "retirement archive has conflicting blob sidecars",
-                ));
+        };
+        if fd < 0 {
+            return Err(RetirementJournalError::other(format!(
+                "retirement archive directory is unavailable: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+
+    fn regular_leaf(
+        directory: &std::fs::File,
+        name: &std::ffi::OsStr,
+    ) -> Result<bool, RetirementJournalError> {
+        let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            RetirementJournalError::other("retirement archive filename contains NUL")
+        })?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(false);
             }
-            std::fs::rename(&sidecar, &archived_sidecar)?;
-            std::fs::File::open(&archive_dir)?.sync_all()?;
-            std::fs::File::open(&dir)?.sync_all()?;
+            return Err(error.into());
         }
-        if path.is_file() {
-            if archived.exists() {
-                return Err(RetirementJournalError::other(
-                    "retirement archive has conflicting journals",
-                ));
-            }
-            std::fs::rename(&path, &archived)?;
-            std::fs::File::open(&archive_dir)?.sync_all()?;
-            std::fs::File::open(&dir)?.sync_all()?;
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(RetirementJournalError::other(
+                "retirement archive leaf is not a regular file",
+            ));
         }
-        match std::fs::remove_file(&marker) {
-            Ok(()) => std::fs::File::open(&archive_dir)?.sync_all()?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        Ok(true)
+    }
+
+    fn rename_leaf(
+        active: &std::fs::File,
+        archive: &std::fs::File,
+        name: &std::ffi::OsStr,
+    ) -> Result<(), RetirementJournalError> {
+        use std::os::unix::ffi::OsStrExt;
+        let source_present = regular_leaf(active, name)?;
+        let archived_present = regular_leaf(archive, name)?;
+        if source_present && archived_present {
+            return Err(RetirementJournalError::other(
+                "retirement archive has conflicting active and archived leaves",
+            ));
         }
+        if !source_present {
+            return Ok(());
+        }
+        let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            RetirementJournalError::other("retirement archive filename contains NUL")
+        })?;
+        if unsafe {
+            libc::renameat(
+                active.as_raw_fd(),
+                name.as_ptr(),
+                archive.as_raw_fd(),
+                name.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        active.sync_all()?;
+        archive.sync_all()?;
+        Ok(())
+    }
+
+    let home = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(bro_home)
+        .map_err(|error| {
+            RetirementJournalError::other(format!("retirement home is unavailable: {error}"))
+        })?;
+    let active = open_dir_at(&home, "retirement-journals")?;
+    let archive = open_dir_at(&active, "archive")?;
+    home.sync_all()?;
+    active.sync_all()?;
+
+    let journal_name = std::ffi::OsString::from(format!("{project_id}.json"));
+    let sidecar_name = std::ffi::OsString::from(format!("{project_id}.blobs.json"));
+    let marker_name = std::ffi::OsString::from(format!("{project_id}.archive-pending"));
+    let any_work = regular_leaf(&active, &journal_name)?
+        || regular_leaf(&active, &sidecar_name)?
+        || regular_leaf(&archive, &marker_name)?;
+    if !any_work {
+        return Ok(());
+    }
+
+    if !regular_leaf(&archive, &marker_name)? {
+        let marker_c = std::ffi::CString::new(marker_name.as_bytes())
+            .map_err(|_| RetirementJournalError::other("retirement archive marker contains NUL"))?;
+        let fd = unsafe {
+            libc::openat(
+                archive.as_raw_fd(),
+                marker_c.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut marker = unsafe { std::fs::File::from_raw_fd(fd) };
+        marker.write_all(project_id.as_str().as_bytes())?;
+        marker.sync_all()?;
+        archive.sync_all()?;
+    }
+    retirement_archive_fault("marker_committed")?;
+    rename_leaf(&active, &archive, &sidecar_name)?;
+    retirement_archive_fault("sidecar_archived")?;
+    rename_leaf(&active, &archive, &journal_name)?;
+    retirement_archive_fault("journal_archived")?;
+
+    let marker_c = std::ffi::CString::new(marker_name.as_bytes())
+        .map_err(|_| RetirementJournalError::other("retirement archive marker contains NUL"))?;
+    if unsafe { libc::unlinkat(archive.as_raw_fd(), marker_c.as_ptr(), 0) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error.into());
+        }
+    }
+    archive.sync_all()?;
+    Ok(())
+}
+
+fn retirement_archive_fault(boundary: &str) -> Result<(), RetirementJournalError> {
+    if cfg!(debug_assertions)
+        && std::env::var("BLACKBOX_TEST_RETIREMENT_ARCHIVE_FAULT")
+            .ok()
+            .as_deref()
+            == Some(boundary)
+    {
+        return Err(RetirementJournalError::other(format!(
+            "injected retirement archive fault at {boundary}"
+        )));
     }
     Ok(())
 }
@@ -6213,6 +6400,32 @@ mod tests {
             assert!(archived.exists());
             assert!(archived_sidecar.exists());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_refuses_symlinked_directory_or_destination_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let pid = ProjectId::parse(PROJECT).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let journal = ProjectRetirementJournal::new(pid.clone(), 1, "1");
+        save_retirement_journal(&root, &journal).unwrap();
+        let active_dir = root.join("retirement-journals");
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), active_dir.join("archive")).unwrap();
+        assert!(archive_retirement_journal(&root, &pid).is_err());
+
+        std::fs::remove_file(active_dir.join("archive")).unwrap();
+        std::fs::create_dir(active_dir.join("archive")).unwrap();
+        symlink(
+            outside.path().join("journal"),
+            archived_retirement_journal_path(&root, &pid),
+        )
+        .unwrap();
+        assert!(archive_retirement_journal(&root, &pid).is_err());
+        assert!(retirement_journal_path(&root, &pid).is_file());
     }
 
     /// F6: save_retirement_journal refuses to write through a symlink.

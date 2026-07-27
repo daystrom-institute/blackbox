@@ -749,12 +749,25 @@ impl AnchoredArtifactRoot {
             payload_name.to_string_lossy()
         ));
 
+        self.validate_target_state(
+            target,
+            &parent_fd,
+            parent,
+            directory_name,
+            &metadata_tombstone,
+            payload_name,
+            &payload_tombstone,
+        )?;
+        artifact_retirement_fault("before_payload_hide")?;
         if entry_kind_at(&parent_fd, payload_name)? == Some(ArtifactEntryKind::Regular) {
             if entry_kind_at(&parent_fd, &payload_tombstone)?.is_some() {
                 bail!("artifact payload retirement tombstone already exists");
             }
             let live = open_artifact_at(parent_fd.as_raw_fd(), payload_name, false)?;
             let live_identity = artifact_file_identity(&live)?;
+            if artifact_entry_identity_at(&parent_fd, payload_name)? != Some(live_identity) {
+                bail!("artifact payload inode changed before being hidden");
+            }
             rename_entry_at(&parent_fd, payload_name, &payload_tombstone)?;
             let hidden = open_artifact_at(parent_fd.as_raw_fd(), &payload_tombstone, false)?;
             if artifact_file_identity(&hidden)? != live_identity {
@@ -768,6 +781,9 @@ impl AnchoredArtifactRoot {
             }
             let live = open_artifact_at(parent_fd.as_raw_fd(), directory_name, true)?;
             let live_identity = artifact_file_identity(&live)?;
+            if artifact_entry_identity_at(&parent_fd, directory_name)? != Some(live_identity) {
+                bail!("artifact metadata inode changed before being hidden");
+            }
             rename_entry_at(&parent_fd, directory_name, &metadata_tombstone)?;
             let hidden = open_artifact_at(parent_fd.as_raw_fd(), &metadata_tombstone, true)?;
             if artifact_file_identity(&hidden)? != live_identity {
@@ -796,7 +812,21 @@ impl AnchoredArtifactRoot {
             &payload_tombstone,
         )?;
         remove_committed_artifact_directory(&parent_fd, &metadata_tombstone, target)?;
-        remove_artifact_entry_at(&parent_fd, &payload_tombstone)?;
+        if entry_kind_at(&parent_fd, &payload_tombstone)? == Some(ArtifactEntryKind::Regular) {
+            let payload = open_artifact_at(parent_fd.as_raw_fd(), &payload_tombstone, false)?;
+            let identity = artifact_file_identity(&payload)?;
+            let mut aggregate = 0_u64;
+            if hash_open_artifact_file(payload, MAX_RETIREMENT_PAYLOAD_BYTES, &mut aggregate)?
+                != target.payload_sha256
+            {
+                bail!("artifact retirement payload changed before deletion");
+            }
+            if artifact_entry_identity_at(&parent_fd, &payload_tombstone)? != Some(identity) {
+                bail!("artifact retirement payload inode changed before deletion");
+            }
+            remove_artifact_entry_at(&parent_fd, &payload_tombstone)?;
+            artifact_retirement_fault("payload_tombstone_removed")?;
+        }
         Ok(())
     }
 
@@ -836,12 +866,20 @@ impl AnchoredArtifactRoot {
             bail!("artifact has both live and tombstoned payloads");
         }
 
-        let metadata_path = if live_directory_kind.is_some() {
+        let metadata_candidate = if live_directory_kind.is_some() {
             Some(live_metadata)
         } else if tombstone_directory_kind.is_some() {
             Some(tombstone_metadata)
         } else {
             None
+        };
+        let metadata_path = match metadata_candidate {
+            Some(path) => match self.entry_kind(path.clone())? {
+                Some(ArtifactEntryKind::Regular) => Some(path),
+                Some(_) => bail!("artifact canonical metadata is not a regular file"),
+                None => None,
+            },
+            None => None,
         };
         let payload_path = if live_payload_kind.is_some() {
             Some(live_payload)
@@ -853,55 +891,73 @@ impl AnchoredArtifactRoot {
         if metadata_path.is_none() && payload_path.is_none() {
             return Ok(());
         }
-        let metadata_path =
-            metadata_path.context("artifact payload remains after metadata disappeared")?;
-        let payload_path =
-            payload_path.context("artifact metadata remains after payload disappeared")?;
+        if metadata_path.is_some() && payload_path.is_none() {
+            bail!("artifact metadata remains after payload disappeared");
+        }
         let mut aggregate = 0_u64;
         let mut current_tree = Vec::new();
-        collect_artifact_tree_at(
-            parent_fd,
-            if live_directory_kind.is_some() {
-                directory_name
-            } else {
-                metadata_tombstone
-            },
-            directory,
-            &mut aggregate,
-            &mut current_tree,
-        )?;
-        let payload_file = open_artifact_at(
-            parent_fd.as_raw_fd(),
-            if live_payload_kind.is_some() {
-                payload_name
-            } else {
-                payload_tombstone
-            },
-            false,
-        )?;
-        current_tree.push(ArtifactMetadataCommitment {
-            path: target.payload_path.clone(),
-            sha256: hash_open_artifact_file(
-                payload_file,
-                MAX_RETIREMENT_PAYLOAD_BYTES,
+        if metadata_path.is_some() {
+            collect_artifact_tree_at(
+                parent_fd,
+                if live_directory_kind.is_some() {
+                    directory_name
+                } else {
+                    metadata_tombstone
+                },
+                directory,
                 &mut aggregate,
-            )?,
-        });
-        current_tree.sort();
-        if current_tree != target.tree_manifest {
-            bail!("artifact retirement tree drifted after Prepared");
+                &mut current_tree,
+            )?;
         }
-        let metadata_bytes = self.read_bounded_file(
-            &metadata_path,
-            MAX_RETIREMENT_METADATA_BYTES,
-            &mut aggregate,
-        )?;
-        let metadata: ArtifactMetadata = serde_json::from_slice(&metadata_bytes)?;
-        validate_artifact_target_owner(target, &metadata)?;
-        if hex::encode(sha2::Sha256::digest(&metadata_bytes)) != target.metadata_sha256 {
-            bail!("artifact retirement target fingerprint drifted after Prepared");
+        if payload_path.is_some() {
+            let payload_file = open_artifact_at(
+                parent_fd.as_raw_fd(),
+                if live_payload_kind.is_some() {
+                    payload_name
+                } else {
+                    payload_tombstone
+                },
+                false,
+            )?;
+            current_tree.push(ArtifactMetadataCommitment {
+                path: target.payload_path.clone(),
+                sha256: hash_open_artifact_file(
+                    payload_file,
+                    MAX_RETIREMENT_PAYLOAD_BYTES,
+                    &mut aggregate,
+                )?,
+            });
+        }
+        current_tree.sort();
+        let expected = target
+            .tree_manifest
+            .iter()
+            .map(|entry| (&entry.path, &entry.sha256))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for current in &current_tree {
+            if expected.get(&current.path) != Some(&&current.sha256) {
+                bail!("artifact retirement tree drifted after Prepared");
+            }
+        }
+        if let Some(metadata_path) = &metadata_path {
+            let metadata_bytes = self.read_bounded_file(
+                metadata_path,
+                MAX_RETIREMENT_METADATA_BYTES,
+                &mut aggregate,
+            )?;
+            let metadata: ArtifactMetadata = serde_json::from_slice(&metadata_bytes)?;
+            validate_artifact_target_owner(target, &metadata)?;
+            if hex::encode(sha2::Sha256::digest(&metadata_bytes)) != target.metadata_sha256 {
+                bail!("artifact retirement target fingerprint drifted after Prepared");
+            }
         }
         for commitment in &target.version_metadata {
+            if !current_tree
+                .iter()
+                .any(|current| current.path == commitment.path)
+            {
+                continue;
+            }
             let relative = Path::new(&commitment.path);
             let suffix = relative
                 .strip_prefix(directory)
@@ -919,10 +975,12 @@ impl AnchoredArtifactRoot {
                 bail!("artifact retirement version metadata drifted after Prepared");
             }
         }
-        if self.sha256_file(&payload_path, MAX_RETIREMENT_PAYLOAD_BYTES, &mut aggregate)?
-            != target.payload_sha256
-        {
-            bail!("artifact retirement payload drifted after Prepared");
+        if let Some(payload_path) = &payload_path {
+            if self.sha256_file(payload_path, MAX_RETIREMENT_PAYLOAD_BYTES, &mut aggregate)?
+                != target.payload_sha256
+            {
+                bail!("artifact retirement payload drifted after Prepared");
+            }
         }
         Ok(())
     }
@@ -1170,6 +1228,35 @@ fn artifact_file_identity(file: &fs::File) -> Result<(u64, u64)> {
 }
 
 #[cfg(unix)]
+fn artifact_entry_identity_at(
+    parent: &fs::File,
+    name: &std::ffi::OsStr,
+) -> Result<Option<(u64, u64)>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| anyhow!("artifact path contains NUL"))?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    if unsafe {
+        libc::fstatat(
+            std::os::fd::AsRawFd::as_raw_fd(parent),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(error.into());
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok(Some((stat.st_dev as u64, stat.st_ino as u64)))
+}
+
+#[cfg(unix)]
 fn remove_committed_artifact_directory(
     parent: &fs::File,
     tombstone: &std::ffi::OsStr,
@@ -1185,17 +1272,19 @@ fn remove_committed_artifact_directory(
         bail!("artifact metadata tombstone is not a directory");
     }
     let logical_root = Path::new(&target.artifact_directory);
-    let mut expected = target
+    let expected = target
         .tree_manifest
         .iter()
         .filter(|commitment| commitment.path != target.payload_path)
-        .map(|commitment| PathBuf::from(&commitment.path))
-        .collect::<std::collections::BTreeSet<_>>();
+        .map(|commitment| (PathBuf::from(&commitment.path), commitment.sha256.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let directory = open_artifact_at(parent.as_raw_fd(), tombstone, true)?;
     artifact_retirement_fault("before_committed_tree_delete")?;
-    remove_committed_artifact_children(&directory, logical_root, &mut expected)?;
-    if !expected.is_empty() {
-        bail!("artifact retirement tombstone is missing committed files");
+    let mut aggregate = 0_u64;
+    remove_committed_artifact_children(&directory, logical_root, &expected, &mut aggregate)?;
+    let directory_identity = artifact_file_identity(&directory)?;
+    if artifact_entry_identity_at(parent, tombstone)? != Some(directory_identity) {
+        bail!("artifact retirement metadata tombstone inode changed before deletion");
     }
     let name = std::ffi::CString::new(tombstone.as_bytes())
         .map_err(|_| anyhow!("artifact path contains NUL"))?;
@@ -1203,6 +1292,7 @@ fn remove_committed_artifact_directory(
         return Err(std::io::Error::last_os_error().into());
     }
     parent.sync_all()?;
+    artifact_retirement_fault("metadata_tombstone_removed")?;
     Ok(true)
 }
 
@@ -1210,7 +1300,8 @@ fn remove_committed_artifact_directory(
 fn remove_committed_artifact_children(
     directory: &fs::File,
     logical_directory: &Path,
-    expected: &mut std::collections::BTreeSet<PathBuf>,
+    expected: &std::collections::BTreeMap<PathBuf, String>,
+    aggregate: &mut u64,
 ) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -1218,18 +1309,33 @@ fn remove_committed_artifact_children(
         let logical_path = logical_directory.join(&name);
         match entry_kind_at(directory, &name)? {
             Some(ArtifactEntryKind::Regular) => {
-                if !expected.remove(&logical_path) {
-                    bail!("artifact retirement tombstone contains an uncommitted file");
+                let expected_hash = expected
+                    .get(&logical_path)
+                    .context("artifact retirement tombstone contains an uncommitted file")?;
+                let file = open_artifact_at(directory.as_raw_fd(), &name, false)?;
+                let identity = artifact_file_identity(&file)?;
+                let hash = hash_open_artifact_file(file, MAX_RETIREMENT_PAYLOAD_BYTES, aggregate)?;
+                if &hash != expected_hash {
+                    bail!("artifact retirement committed file changed after Prepared");
+                }
+                if artifact_entry_identity_at(directory, &name)? != Some(identity) {
+                    bail!("artifact retirement committed file inode changed before deletion");
                 }
                 let name_c = std::ffi::CString::new(name.as_bytes())
                     .map_err(|_| anyhow!("artifact path contains NUL"))?;
                 if unsafe { libc::unlinkat(directory.as_raw_fd(), name_c.as_ptr(), 0) } != 0 {
                     return Err(std::io::Error::last_os_error().into());
                 }
+                directory.sync_all()?;
+                artifact_retirement_fault("committed_file_unlinked")?;
             }
             Some(ArtifactEntryKind::Directory) => {
                 let child = open_artifact_at(directory.as_raw_fd(), &name, true)?;
-                remove_committed_artifact_children(&child, &logical_path, expected)?;
+                remove_committed_artifact_children(&child, &logical_path, expected, aggregate)?;
+                let identity = artifact_file_identity(&child)?;
+                if artifact_entry_identity_at(directory, &name)? != Some(identity) {
+                    bail!("artifact retirement directory inode changed before deletion");
+                }
                 let name_c = std::ffi::CString::new(name.as_bytes())
                     .map_err(|_| anyhow!("artifact path contains NUL"))?;
                 if unsafe {
@@ -1238,6 +1344,8 @@ fn remove_committed_artifact_children(
                 {
                     return Err(std::io::Error::last_os_error().into());
                 }
+                directory.sync_all()?;
+                artifact_retirement_fault("committed_directory_removed")?;
             }
             None => bail!("artifact retirement tombstone changed during deletion"),
         }
@@ -3779,6 +3887,111 @@ mod tests {
     }
 
     #[test]
+    fn artifact_retirement_resumes_after_partial_committed_tree_unlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let metadata_dir = root
+            .join("projects")
+            .join("project1")
+            .join("local")
+            .join("agent")
+            .join("partial");
+        let versions = metadata_dir.join(".versions");
+        fs::create_dir_all(&versions).unwrap();
+        let metadata = ArtifactMetadata {
+            kind: ArtifactKind::Agent,
+            name: "partial".into(),
+            version: "1".into(),
+            source: "fixture".into(),
+            installed_at: "2026-01-01T00:00:00Z".into(),
+            content_sha256: Some("a".repeat(64)),
+            project_id: Some("project1".into()),
+            project_path: None,
+            local: true,
+            supersedes: None,
+            supersedes_chain: Vec::new(),
+            superseded_by: None,
+            active: true,
+            install_warnings: Vec::new(),
+        };
+        let metadata_bytes = serde_json::to_vec(&metadata).unwrap();
+        fs::write(metadata_dir.join("metadata.json"), &metadata_bytes).unwrap();
+        fs::write(versions.join("1.metadata.json"), &metadata_bytes).unwrap();
+        let payload = metadata_dir.with_extension("json");
+        fs::write(&payload, br#"{"name":"partial"}"#).unwrap();
+        let targets = capture_project_catalog_retirement_targets(&root, "project1", &[]).unwrap();
+
+        let parent = metadata_dir.parent().unwrap();
+        let metadata_tombstone = parent.join(".retiring-metadata-partial");
+        let payload_tombstone = parent.join(".retiring-payload-partial.json");
+        fs::rename(&metadata_dir, &metadata_tombstone).unwrap();
+        fs::rename(&payload, &payload_tombstone).unwrap();
+        fs::remove_file(metadata_tombstone.join("metadata.json")).unwrap();
+
+        assert_eq!(
+            discharge_project_catalog_targets(&root, &targets).unwrap(),
+            1
+        );
+        assert!(!metadata_tombstone.exists());
+        assert!(!payload_tombstone.exists());
+        assert_eq!(
+            discharge_project_catalog_targets(&root, &targets).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn artifact_retirement_partial_progress_rejects_changed_survivors_and_additions() {
+        for mutation in ["changed", "addition"] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let metadata_dir = root
+                .join("projects")
+                .join("project1")
+                .join("local")
+                .join("agent")
+                .join("drift");
+            fs::create_dir_all(&metadata_dir).unwrap();
+            let metadata = ArtifactMetadata {
+                kind: ArtifactKind::Agent,
+                name: "drift".into(),
+                version: "1".into(),
+                source: "fixture".into(),
+                installed_at: "2026-01-01T00:00:00Z".into(),
+                content_sha256: Some("a".repeat(64)),
+                project_id: Some("project1".into()),
+                project_path: None,
+                local: true,
+                supersedes: None,
+                supersedes_chain: Vec::new(),
+                superseded_by: None,
+                active: true,
+                install_warnings: Vec::new(),
+            };
+            fs::write(
+                metadata_dir.join("metadata.json"),
+                serde_json::to_vec(&metadata).unwrap(),
+            )
+            .unwrap();
+            let payload = metadata_dir.with_extension("json");
+            fs::write(&payload, br#"{"name":"drift"}"#).unwrap();
+            let targets =
+                capture_project_catalog_retirement_targets(&root, "project1", &[]).unwrap();
+            let parent = metadata_dir.parent().unwrap();
+            let metadata_tombstone = parent.join(".retiring-metadata-drift");
+            let payload_tombstone = parent.join(".retiring-payload-drift.json");
+            fs::rename(&metadata_dir, &metadata_tombstone).unwrap();
+            fs::rename(&payload, &payload_tombstone).unwrap();
+            if mutation == "changed" {
+                fs::write(metadata_tombstone.join("metadata.json"), b"changed").unwrap();
+            } else {
+                fs::write(metadata_tombstone.join("foreign"), b"foreign").unwrap();
+            }
+            assert!(discharge_project_catalog_targets(&root, &targets).is_err());
+        }
+    }
+
+    #[test]
     fn artifact_retirement_target_rejects_unsafe_or_malformed_identity() {
         let valid = ArtifactRetirementTarget {
             owner_project_id: "project1".into(),
@@ -3975,20 +4188,21 @@ mod tests {
         let targets = capture_project_catalog_retirement_targets(&root, "project-a", &[]).unwrap();
         fs::write(artifact.join("late-version.json"), b"late").unwrap();
         assert!(discharge_project_catalog_targets(&root, &targets).is_err());
-        assert!(!artifact.exists());
+        assert!(artifact.exists());
         assert!(
-            artifact
+            !artifact
                 .parent()
                 .unwrap()
                 .join(".retiring-metadata-tree")
                 .exists()
         );
         assert!(
-            artifact
+            !artifact
                 .parent()
                 .unwrap()
                 .join(".retiring-payload-tree.json")
                 .exists()
         );
+        assert!(artifact.with_extension("json").exists());
     }
 }

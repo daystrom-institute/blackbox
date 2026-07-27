@@ -1273,11 +1273,16 @@ fn retirement_execute_refuses_activation_content_mutation() {
 #[test]
 fn retirement_journal_resumes_each_artifact_tombstone_boundary() {
     for boundary in [
+        "before_payload_hide",
         "payload_hidden",
         "metadata_hidden",
         "before_tombstone_validation",
         "after_tombstone_validation",
         "before_committed_tree_delete",
+        "committed_file_unlinked",
+        "committed_directory_removed",
+        "metadata_tombstone_removed",
+        "payload_tombstone_removed",
     ] {
         let directory = tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
@@ -1292,6 +1297,26 @@ fn retirement_journal_resumes_each_artifact_tombstone_boundary() {
             .join("local/agent/retire-me");
         write(
             &artifact_dir.join("metadata.json"),
+            &serde_json::to_vec(&serde_json::json!({
+                "kind": "agent",
+                "name": "retire-me",
+                "version": "1",
+                "source": "fixture",
+                "installed_at": "2026-07-27T00:00:00Z",
+                "content_sha256": "a".repeat(64),
+                "project_id": project_id,
+                "project_path": null,
+                "local": true,
+                "supersedes": null,
+                "supersedes_chain": [],
+                "superseded_by": null,
+                "active": true,
+                "install_warnings": []
+            }))
+            .unwrap(),
+        );
+        write(
+            &artifact_dir.join(".versions/1.metadata.json"),
             &serde_json::to_vec(&serde_json::json!({
                 "kind": "agent",
                 "name": "retire-me",
