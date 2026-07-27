@@ -370,6 +370,13 @@ impl ManifestIndex {
                     "active snapshot directory is missing for workspace {project_id}: {snapshot}"
                 );
             }
+            if let Some(snapshot) = entry.active_snapshot.as_deref()
+                && confined_regular_file(edges_dir, &format!("{snapshot}/.staging"))?.is_some()
+            {
+                anyhow::bail!(
+                    "active snapshot is still marked as an incomplete publication for workspace {project_id}"
+                );
+            }
             let has_overlay = match entry.dirty_overlay.as_deref() {
                 Some(relative) if confined_directory_exists(edges_dir, relative)? => true,
                 Some(relative) => anyhow::bail!(

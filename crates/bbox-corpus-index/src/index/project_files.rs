@@ -264,7 +264,7 @@ impl ProjectIndexPublicationBundle {
                     } else {
                         Vec::new()
                     };
-                    bbox_edge_sidecar::snapshot::write_snapshot_files(
+                    bbox_edge_sidecar::snapshot::write_snapshot_members_transaction(
                         &edges_dir,
                         &project_id,
                         &snapshot_id,

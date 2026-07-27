@@ -109,6 +109,8 @@ pub struct StorageHealthReport {
     pub observed: Vec<ObservedProjectUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_policy_warning: Option<String>,
+    #[serde(skip)]
+    file_identities: HashMap<String, (u64, u64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +141,7 @@ pub fn scan_storage_health(
 ) -> Result<StorageHealthReport> {
     let mut totals = StorageHealthTotals::default();
     let mut files: Vec<StorageFileInfo> = Vec::new();
+    let mut file_identities = HashMap::new();
     let project_facts = collect_project_storage_facts(edges_dir)?;
 
     scan_legacy_dir(
@@ -162,7 +165,13 @@ pub fn scan_storage_health(
         )?;
     }
 
-    scan_inactive_snapshots(edges_dir, project_filter, &mut totals, &mut files)?;
+    scan_inactive_snapshots(
+        edges_dir,
+        project_filter,
+        &mut totals,
+        &mut files,
+        &mut file_identities,
+    )?;
     let observed = scan_observed_dir(edges_dir, project_filter, &mut totals, &mut files);
 
     files.sort_by_key(|b| std::cmp::Reverse(b.bytes));
@@ -180,6 +189,7 @@ pub fn scan_storage_health(
         manifest_status,
         observed_policy_warning: observed_policy_warning(&observed),
         observed,
+        file_identities,
     })
 }
 
@@ -621,6 +631,7 @@ fn scan_inactive_snapshots(
     project_filter: Option<&str>,
     totals: &mut StorageHealthTotals,
     files: &mut Vec<StorageFileInfo>,
+    file_identities: &mut HashMap<String, (u64, u64)>,
 ) -> Result<()> {
     let active_prefixes = collect_protected_jsonl_prefixes(edges_dir);
     let mat_dir = bbox_edge_sidecar::manifest::materialized_dir(edges_dir);
@@ -676,6 +687,7 @@ fn scan_inactive_snapshots(
                 continue;
             }
             totals.accumulate(FileKind::InactiveSnapshot, metadata.len());
+            record_file_identity(file_identities, path_str, &metadata);
             files.push(StorageFileInfo {
                 path: path_str.to_string(),
                 kind: FileKind::InactiveSnapshot,
@@ -686,6 +698,25 @@ fn scan_inactive_snapshots(
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn record_file_identity(
+    identities: &mut HashMap<String, (u64, u64)>,
+    path: &str,
+    metadata: &fs::Metadata,
+) {
+    use std::os::unix::fs::MetadataExt;
+
+    identities.insert(path.to_string(), (metadata.dev(), metadata.ino()));
+}
+
+#[cfg(not(unix))]
+fn record_file_identity(
+    _identities: &mut HashMap<String, (u64, u64)>,
+    _path: &str,
+    _metadata: &fs::Metadata,
+) {
 }
 
 fn scan_observed_dir(
@@ -1064,6 +1095,21 @@ pub fn plan_gc_with_policy(
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 anyhow::bail!("GC candidate is not a regular nofollow file");
             }
+            if candidate.kind == FileKind::InactiveSnapshot {
+                validate_inactive_snapshot_identity(&report, candidate, &metadata)?;
+                let staging = path
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("snapshot candidate has no parent"))?
+                    .join(".staging");
+                match fs::symlink_metadata(&staging) {
+                    Ok(marker) if marker.is_file() && !marker.file_type().is_symlink() => {
+                        anyhow::bail!("inactive snapshot became staged before identity commitment");
+                    }
+                    Ok(_) => anyhow::bail!("snapshot staging marker is not a regular file"),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
             candidate.root_relative_path = Some(relative.to_string_lossy().into_owned());
             candidate.planned_device = Some(metadata.dev());
             candidate.planned_inode = Some(metadata.ino());
@@ -1071,6 +1117,26 @@ pub fn plan_gc_with_policy(
     }
     candidates.sort_by(|a, b| a.rule.cmp(&b.rule).then(a.path.cmp(&b.path)));
     Ok(candidates)
+}
+
+#[cfg(unix)]
+fn validate_inactive_snapshot_identity(
+    report: &StorageHealthReport,
+    candidate: &GcCandidate,
+    metadata: &fs::Metadata,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let expected_identity = report
+        .file_identities
+        .get(&candidate.path)
+        .context("inactive snapshot lost its scan-time identity")?;
+    if *expected_identity != (metadata.dev(), metadata.ino()) {
+        anyhow::bail!(
+            "inactive snapshot changed between policy classification and identity commitment"
+        );
+    }
+    Ok(())
 }
 
 fn plan_backup_gc(
@@ -2556,6 +2622,83 @@ mod tests {
         )
         .unwrap();
         assert!(member.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inactive_snapshot_replacement_after_classification_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let _active = write_snapshot_jsonl(&edges_dir, "p1", "head-active");
+        let member = write_snapshot_jsonl(&edges_dir, "p1", "head-inactive");
+        let snapshot_dir = member.parent().unwrap().to_path_buf();
+        write_workspace_manifest(
+            &edges_dir,
+            "p1",
+            Some("repo"),
+            Some(directory.path()),
+            "head-active",
+        );
+        write_manifest_index(&edges_dir, "p1", "head-active");
+        let report = scan_storage_health(&edges_dir, &HashSet::new(), None, true).unwrap();
+        let file = report
+            .files
+            .iter()
+            .find(|file| file.path == member.to_string_lossy())
+            .unwrap();
+        let candidate = GcCandidate {
+            path: file.path.clone(),
+            root_relative_path: None,
+            planned_device: None,
+            planned_inode: None,
+            kind: file.kind,
+            bytes: file.bytes,
+            project_id: file.project_id.clone(),
+            rule: "test".into(),
+            deletable: true,
+        };
+
+        fs::rename(&member, snapshot_dir.join("replaced.jsonl")).unwrap();
+        fs::write(&member, b"replacement").unwrap();
+        fs::write(snapshot_dir.join(".staging"), b"pending\n").unwrap();
+        let metadata = fs::symlink_metadata(&member).unwrap();
+
+        let error =
+            validate_inactive_snapshot_identity(&report, &candidate, &metadata).unwrap_err();
+        assert!(error.to_string().contains("changed between policy"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_apply_refuses_snapshot_staged_after_planning() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_dir = edges_dir.join("workspace/p1/snapshots/snap1");
+        fs::create_dir_all(&snapshot_dir).unwrap();
+        let member = snapshot_dir.join("project.jsonl");
+        fs::write(&member, b"candidate").unwrap();
+        let metadata = fs::symlink_metadata(&member).unwrap();
+        let candidate = GcCandidate {
+            path: member.to_string_lossy().into_owned(),
+            root_relative_path: Some("workspace/p1/snapshots/snap1/project.jsonl".into()),
+            planned_device: Some(metadata.dev()),
+            planned_inode: Some(metadata.ino()),
+            kind: FileKind::InactiveSnapshot,
+            bytes: metadata.len(),
+            project_id: Some("p1".into()),
+            rule: "test".into(),
+            deletable: true,
+        };
+
+        fs::write(snapshot_dir.join(".staging"), b"pending\n").unwrap();
+        let (deleted, errors) = apply_gc(&edges_dir, &[candidate]);
+
+        assert!(deleted.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("staged snapshot"));
+        assert_eq!(fs::read(&member).unwrap(), b"candidate");
     }
 
     #[test]

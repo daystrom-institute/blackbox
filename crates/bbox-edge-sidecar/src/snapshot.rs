@@ -109,6 +109,25 @@ pub fn remove_gc_candidate_file(
             }
             directory = unsafe { fs::File::from_raw_fd(fd) };
         }
+        if require_inactive {
+            let staging = std::ffi::CString::new(".staging").unwrap();
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            if unsafe {
+                libc::fstatat(
+                    directory.as_raw_fd(),
+                    staging.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } == 0
+            {
+                anyhow::bail!("refusing to delete a staged snapshot member");
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error.into());
+            }
+        }
         let leaf = std::ffi::CString::new(leaf.as_bytes())?;
         let fd = unsafe {
             libc::openat(
@@ -919,6 +938,16 @@ pub fn write_snapshot_files(
     }
 }
 
+pub fn write_snapshot_members_transaction(
+    edges_dir: &Path,
+    project_id: &str,
+    snapshot_id: &str,
+    files: &[(&str, &[Edge])],
+) -> Result<()> {
+    write_snapshot_files(edges_dir, project_id, snapshot_id, files)?;
+    with_manifest_coordinator(|| clear_snapshot_staging_marker(edges_dir, project_id, snapshot_id))
+}
+
 fn validate_snapshot_component(value: &str) -> Result<()> {
     let path = Path::new(value);
     if value.is_empty()
@@ -1520,6 +1549,50 @@ mod tests {
             !git_current_is_loaded(&edges_dir),
             "gen-a's COMMIT_TOUCHED_FILE targets name a retired snapshot id"
         );
+    }
+
+    #[test]
+    fn standalone_snapshot_member_transaction_clears_staging_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
+
+        write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+
+        assert!(
+            !snapshot_dir(&edges_dir, "p_1", &snapshot_id)
+                .join(".staging")
+                .exists()
+        );
+        ManifestIndex::load(&edges_dir)
+            .unwrap()
+            .active_paths_for_loader(&edges_dir)
+            .unwrap();
+    }
+
+    #[test]
+    fn active_snapshot_with_staging_marker_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        fs::write(
+            snapshot_dir(&edges_dir, "p_1", &snapshot_id).join(".staging"),
+            b"pending\n",
+        )
+        .unwrap();
+
+        let error = ManifestIndex::load(&edges_dir)
+            .unwrap()
+            .active_paths_for_loader(&edges_dir)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("incomplete publication"));
     }
 
     #[test]
