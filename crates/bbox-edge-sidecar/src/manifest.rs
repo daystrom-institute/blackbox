@@ -363,6 +363,13 @@ impl ManifestIndex {
             validate_workspace_entry_shape(project_id, entry)?;
             confined_regular_file(edges_dir, &entry.manifest)?
                 .ok_or_else(|| anyhow::anyhow!("workspace manifest is missing for {project_id}"))?;
+            if let Some(snapshot) = entry.active_snapshot.as_deref()
+                && !confined_directory_exists(edges_dir, snapshot)?
+            {
+                anyhow::bail!(
+                    "active snapshot directory is missing for workspace {project_id}: {snapshot}"
+                );
+            }
             let has_overlay = match entry.dirty_overlay.as_deref() {
                 Some(relative) => confined_directory_exists(edges_dir, relative)?,
                 None => false,
@@ -382,21 +389,19 @@ impl ManifestIndex {
                 // is a clean snapshot, load snapshot filtered by covered hashes.
                 if let Some(om) = read_overlay_manifest_confined(edges_dir, overlay)? {
                     if let Some(ref snapshot) = entry.active_snapshot {
-                        if confined_directory_exists(edges_dir, snapshot)? {
-                            let suppressed: HashSet<String> =
-                                om.covered_rel_path_hashes.into_iter().collect();
-                            if !suppressed.is_empty() {
-                                for (path, file) in
-                                    confined_snapshot_members(edges_dir, snapshot, entry)?
-                                {
-                                    result.push(LoadablePath {
-                                        path,
-                                        file,
-                                        mode: PathLoadMode::FilteredByHash {
-                                            suppressed_hashes: suppressed.clone(),
-                                        },
-                                    });
-                                }
+                        let suppressed: HashSet<String> =
+                            om.covered_rel_path_hashes.into_iter().collect();
+                        if !suppressed.is_empty() {
+                            for (path, file) in
+                                confined_snapshot_members(edges_dir, snapshot, entry)?
+                            {
+                                result.push(LoadablePath {
+                                    path,
+                                    file,
+                                    mode: PathLoadMode::FilteredByHash {
+                                        suppressed_hashes: suppressed.clone(),
+                                    },
+                                });
                             }
                         }
                     }
@@ -404,14 +409,12 @@ impl ManifestIndex {
                 // Legacy overlay (no overlay_manifest): snapshot is completely
                 // replaced, nothing else to add for this project.
             } else if let Some(ref snapshot) = entry.active_snapshot {
-                if confined_directory_exists(edges_dir, snapshot)? {
-                    for (path, file) in confined_snapshot_members(edges_dir, snapshot, entry)? {
-                        result.push(LoadablePath {
-                            path,
-                            file,
-                            mode: PathLoadMode::Full,
-                        });
-                    }
+                for (path, file) in confined_snapshot_members(edges_dir, snapshot, entry)? {
+                    result.push(LoadablePath {
+                        path,
+                        file,
+                        mode: PathLoadMode::Full,
+                    });
                 }
             }
 
@@ -1423,6 +1426,61 @@ mod tests {
                 .any(|p| p.to_str().unwrap().contains("head-old-branch")),
             "inactive snapshot must NOT be in paths"
         );
+    }
+
+    #[test]
+    fn active_loader_refuses_manifest_only_and_snapshot_only_partial_states() {
+        for state in ["manifest-only", "snapshot-only"] {
+            let directory = tempfile::tempdir().unwrap();
+            let edges_dir = directory.path();
+            let manifest = WorkspaceManifest {
+                version: 1,
+                project_id: "p1".into(),
+                repo_id: None,
+                canonical_path: None,
+                git_common_dir: None,
+                git_worktree_dir: None,
+                branch: None,
+                head_sha: None,
+                dirty: false,
+                dirty_fingerprint: None,
+                active_snapshot_id: Some("snap1".into()),
+                active_dirty_overlay_id: None,
+                updated_at: None,
+            };
+            if state == "manifest-only" {
+                WorkspaceManifest::write_to(edges_dir, &manifest).unwrap();
+            } else {
+                fs::create_dir_all(
+                    materialized_dir(edges_dir).join("workspace/p1/snapshots/snap1"),
+                )
+                .unwrap();
+            }
+            let mut index = ManifestIndex::new();
+            index.upsert_workspace(
+                "p1",
+                WorkspaceIndexEntry {
+                    manifest: "workspace/p1/manifest.json".into(),
+                    active_snapshot: Some("workspace/p1/snapshots/snap1".into()),
+                    dirty_overlay: None,
+                    repo_materialization: None,
+                    code_source_selector: Some("collected:repo:.:generation".into()),
+                    code_source_generation: Some("generation".into()),
+                    git_overlay: None,
+                    git_overlay_managed: true,
+                },
+            );
+            assert!(index.active_paths_for_loader(edges_dir).is_err(), "{state}");
+            assert!(
+                index
+                    .active_paths_for_loader_admitting_fully_absent(
+                        edges_dir,
+                        &std::collections::BTreeSet::from(["p1".to_string()]),
+                    )
+                    .is_err(),
+                "{state}"
+            );
+        }
     }
 
     #[test]
