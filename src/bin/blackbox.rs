@@ -729,7 +729,10 @@ fn probe_bridge_clear_evidence(
     .map_err(|e| {
         CommandFailure::new(
             "error.project_catalog_cli_code_source_open",
-            format!("failed to open code-source store at {}: {e}", code_source_dir.display()),
+            format!(
+                "failed to open code-source store at {}: {e}",
+                code_source_dir.display()
+            ),
         )
     })?;
     let effective_generation_id = code_store
@@ -1130,14 +1133,12 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             ),
         ) {
             // Clear the activation record (single-attempt, idempotent).
-            store
-                .clear_activation(project_id.as_str())
-                .map_err(|e| {
-                    project_catalog_admin::admin_error(
-                        "error.project_catalog_retire_discharge_activation",
-                        format!("failed to clear activation record: {e}"),
-                    )
-                })?;
+            store.clear_activation(project_id.as_str()).map_err(|e| {
+                project_catalog_admin::admin_error(
+                    "error.project_catalog_retire_discharge_activation",
+                    format!("failed to clear activation record: {e}"),
+                )
+            })?;
 
             // Delete generation records for the project's scopes.
             for scope_hash in scope_dirs(&code_sources) {
@@ -1160,7 +1161,10 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             clear_project_rows(&path, keys, project_id.as_str()).map_err(|e| {
                 project_catalog_admin::admin_error(
                     "error.project_catalog_retire_discharge_coordination",
-                    format!("failed to clear coordination rows at {}: {e}", path.display()),
+                    format!(
+                        "failed to clear coordination rows at {}: {e}",
+                        path.display()
+                    ),
                 )
             })?;
         }
@@ -1301,8 +1305,7 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             .values()
             .filter(|row| {
                 &row.project_id == project_id
-                    && row.status
-                        == bbox_corpus_core::project_catalog::AttachmentStatus::Attached
+                    && row.status == bbox_corpus_core::project_catalog::AttachmentStatus::Attached
             })
             .count();
         if active > 0 {

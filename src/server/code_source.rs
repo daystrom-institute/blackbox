@@ -225,10 +225,8 @@ impl CutbackReconciler {
                 // Sleep until the deadline, but use the condvar so a
                 // newly registered earlier deadline can preempt.
                 let wait_dur = std::time::Duration::from_secs(min - now);
-                let (_guard, _timeout) = self
-                    .scheduler_notify
-                    .wait_timeout(state, wait_dur)
-                    .unwrap();
+                let (_guard, _timeout) =
+                    self.scheduler_notify.wait_timeout(state, wait_dur).unwrap();
                 if shutdown.load(std::sync::atomic::Ordering::Acquire) {
                     return None;
                 }
@@ -1880,8 +1878,10 @@ fn schedule_cutback(
             match cutback_to_local(&state, &scope, &project_id) {
                 Ok(()) => break,
                 Err(error) => {
-                    let _ = store
-                        .mark_cutback_pending_mixed(&project_id, "cutback failed; inspect daemon logs");
+                    let _ = store.mark_cutback_pending_mixed(
+                        &project_id,
+                        "cutback failed; inspect daemon logs",
+                    );
                     let _ = store.record_health_failure(
                         &project_id,
                         "cutback_pending",
@@ -3144,8 +3144,18 @@ fn determine_effective_source(state: &Arc<SharedState>, project_id: &str) -> Eff
     match selector {
         Some(s) if s.starts_with("collected:") => EffectiveSource::Collected,
         Some(_) => EffectiveSource::Local,
+        // When the workspace entry is absent (the pending-first-republish
+        // state for a migrated or never-booted root), the activation record
+        // itself is the durable evidence of the project's effective source.
+        // A collected activation record must be classified as Collected so
+        // the reducer never lands in a local/local cell and deletes the
+        // record as stale state (the record is the GC root and recovery
+        // root for a live collected generation).
         None => {
-            if activation.document_count() > 0 {
+            let activation_selector = activation.selector();
+            if activation_selector.starts_with("collected:") {
+                EffectiveSource::Collected
+            } else if activation.document_count() > 0 {
                 EffectiveSource::Warming
             } else {
                 EffectiveSource::Unavailable
@@ -3630,6 +3640,21 @@ fn cutback_to_local_single_attempt(
         .and_then(|entry| entry.code_source_selector.as_deref())
         .is_some_and(|selector| selector.starts_with("collected:"));
     if !active_is_collected {
+        // The workspace manifest does not mark this project as collected.
+        // Before clearing the activation record, check the activation
+        // record itself: a collected activation record with no workspace
+        // entry is the pending-first-republish state for a migrated or
+        // never-booted root. Clearing it would delete the GC root and
+        // recovery record for a live collected generation (property 2:
+        // the local/local stale-state cell clears cutback state only,
+        // never the activation record). Activation records are removed
+        // only by activation replacement or explicit retirement discharge.
+        if let Ok(Some(activation)) = store.load_activation_mixed(project_id) {
+            if activation.selector().starts_with("collected:") {
+                let _ = store.clear_cutback_state(project_id);
+                return Ok(());
+            }
+        }
         store.clear_activation(project_id)?;
         return Ok(());
     }
@@ -3882,6 +3907,16 @@ fn cutback_to_local(
         .and_then(|entry| entry.code_source_selector.as_deref())
         .is_some_and(|selector| selector.starts_with("collected:"));
     if !active_is_collected {
+        // Property 2: the local/local stale-state cell clears cutback state
+        // only, never the activation record. A collected activation record
+        // with no workspace entry is pending-first-republish state; deleting
+        // it would orphan a live collected generation.
+        if let Ok(Some(activation)) = store.load_activation_mixed(project_id) {
+            if activation.selector().starts_with("collected:") {
+                let _ = store.clear_cutback_state(project_id);
+                return Ok(());
+            }
+        }
         store.clear_activation(project_id)?;
         return Ok(());
     }
@@ -9234,7 +9269,9 @@ mod tests {
             "determine_desired_assignment must map unassigned to Local (F1 fix)"
         );
         // The mapping must NOT be inverted: assigned -> Collected.
-        let assigned_pos = body.find("if assigned").expect("must have 'if assigned' check");
+        let assigned_pos = body
+            .find("if assigned")
+            .expect("must have 'if assigned' check");
         let collected_pos = body[assigned_pos..]
             .find("Collected")
             .expect("Collected must appear after 'if assigned'");
@@ -9351,7 +9388,8 @@ mod tests {
         .unwrap();
         let observer = store.commit_observer();
 
-        let project_id = ProjectId::parse("p_00000000000000000000000000000f20".to_string()).unwrap();
+        let project_id =
+            ProjectId::parse("p_00000000000000000000000000000f20".to_string()).unwrap();
         let scope = PublishedScope::try_new("f2-transact", ".").unwrap();
 
         // First transaction: add the project to the catalog.
@@ -9385,9 +9423,13 @@ mod tests {
         store
             .transact(epoch, |_catalog, attachments| {
                 attachments.attachments.insert(
-                    AttachmentId::parse("att_11111111111111111111111111111111".to_string()).unwrap(),
+                    AttachmentId::parse("att_11111111111111111111111111111111".to_string())
+                        .unwrap(),
                     CheckoutAttachment {
-                        attachment_id: AttachmentId::parse("att_11111111111111111111111111111111".to_string()).unwrap(),
+                        attachment_id: AttachmentId::parse(
+                            "att_11111111111111111111111111111111".to_string(),
+                        )
+                        .unwrap(),
                         project_id: project_id.clone(),
                         checkout_id: "22222222222222222222222222222222".to_string(),
                         checkout_dir: "/tmp/f2/checkout".to_string(),
@@ -9459,8 +9501,7 @@ mod tests {
     /// rebuild block in open.rs.
     #[test]
     fn f3_pre_bind_runs_before_schema_rebuild() {
-        let open_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/open.rs");
+        let open_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/open.rs");
         let src = std::fs::read_to_string(&open_path)
             .unwrap_or_else(|_| panic!("failed to read {}", open_path.display()));
         let pre_bind_pos = src
@@ -9472,6 +9513,147 @@ mod tests {
         assert!(
             pre_bind_pos < schema_rebuild_pos,
             "pre_bind_catalog_recovery must run BEFORE schema rebuild (F3 fix)"
+        );
+    }
+
+    // ---- Activation-record preservation regression tests ----
+
+    /// Helper: extract the source text of a top-level fn from this file.
+    fn extract_fn_body_again(src: &str, name: &str) -> String {
+        let marker = format!("fn {name}");
+        let start = src
+            .find(&marker)
+            .unwrap_or_else(|| panic!("fn {name} not found in source"));
+        let mut depth = 0i32;
+        let mut found_open = false;
+        let bytes = src.as_bytes();
+        let mut end = start;
+        for (i, &b) in bytes[start..].iter().enumerate() {
+            match b {
+                b'{' => {
+                    depth += 1;
+                    found_open = true;
+                }
+                b'}' => {
+                    depth -= 1;
+                    if found_open && depth == 0 {
+                        end = start + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        src[start..end].to_string()
+    }
+
+    /// Property 1: determine_effective_source checks the activation
+    /// record's own selector when the workspace manifest entry is absent.
+    /// A collected activation record must be classified as Collected,
+    /// not as Warming or Unavailable, even when the workspace entry has
+    /// not yet been republished.
+    #[test]
+    fn regression_effective_source_uses_activation_selector_when_workspace_absent() {
+        let src = self_source();
+        let body = extract_fn_body_again(&src, "determine_effective_source");
+        assert!(
+            body.contains("activation.selector()"),
+            "determine_effective_source must consult the activation record's own selector when the workspace entry is absent (property 1)"
+        );
+        assert!(
+            body.contains("activation_selector.starts_with(\"collected:\")"),
+            "determine_effective_source must classify a collected activation record as EffectiveSource::Collected when the workspace entry is absent"
+        );
+    }
+
+    /// Property 2: cutback_to_local_single_attempt preserves a collected
+    /// activation record when the workspace manifest does not mark the
+    /// project as collected. The local/local stale-state cell clears
+    /// cutback state only, never the activation record.
+    #[test]
+    fn regression_cutback_preserves_collected_activation_record() {
+        let src = self_source();
+        let body = extract_fn_body_again(&src, "cutback_to_local_single_attempt");
+        assert!(
+            body.contains("activation.selector().starts_with(\"collected:\")"),
+            "cutback_to_local_single_attempt must check the activation record's selector before clearing it (property 2)"
+        );
+        assert!(
+            body.contains("clear_cutback_state"),
+            "cutback_to_local_single_attempt must clear cutback state only, not the activation record, for collected records (property 2)"
+        );
+    }
+
+    /// Property 2 (second path): cutback_to_local also preserves a
+    /// collected activation record when the workspace entry is absent.
+    #[test]
+    fn regression_cutback_to_local_preserves_collected_activation_record() {
+        let src = self_source();
+        let body = extract_fn_body_again(&src, "cutback_to_local");
+        assert!(
+            body.contains("activation.selector().starts_with(\"collected:\")"),
+            "cutback_to_local must check the activation record's selector before clearing it (property 2)"
+        );
+    }
+
+    /// Reduction table: desired=Local, effective=Collected, no persisted
+    /// state, ladder=None (no scope-matching attachment) must yield
+    /// PersistStructural(NoLocalAttachment), NOT clear the activation.
+    /// This is the correct outcome for a collected project with no
+    /// attachment per the reduction table row local/collected/None/none.
+    #[test]
+    fn regression_local_collected_no_attachment_persists_structural() {
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            None,
+            LadderResult::None,
+            false,
+        );
+        assert!(
+            matches!(
+                action,
+                ReducerAction::PersistStructural(CutbackReason::NoLocalAttachment)
+            ),
+            "local/collected with no attachment and no persisted state must persist Structural(NoLocalAttachment), got {action:?}"
+        );
+    }
+
+    /// Reduction table: desired=Local, effective=Local, persisted
+    /// cutback state -> CancelCutback (clears cutback state only).
+    /// This confirms the local/local stale-state cell clears state,
+    /// not activation records.
+    #[test]
+    fn regression_local_local_clears_cutback_state_not_activation() {
+        let transient = CutbackStateV2::Transient {
+            attempt: 1,
+            error_class: CutbackErrorClass::IoPressure,
+            deadline_unix_secs: unix_now() + 30,
+        };
+        let action = evaluate_reduction(
+            DesiredAssignment::Local,
+            EffectiveSource::Local,
+            Some(&transient),
+            LadderResult::None,
+            false,
+        );
+        assert!(
+            matches!(action, ReducerAction::CancelCutback),
+            "local/local with stale state must cancel cutback (clear state only)"
+        );
+        // CancelCutback dispatches clear_cutback_state, not clear_activation.
+        let src = self_source();
+        let cancel_block = src
+            .find("ReducerAction::CancelCutback =>")
+            .expect("CancelCutback dispatch must exist");
+        let snippet = &src[cancel_block..cancel_block + 200];
+        assert!(
+            snippet.contains("clear_cutback_state"),
+            "CancelCutback dispatch must call clear_cutback_state, not clear_activation"
+        );
+        assert!(
+            !snippet.contains("clear_activation"),
+            "CancelCutback dispatch must NOT call clear_activation"
         );
     }
 }

@@ -4107,7 +4107,8 @@ mod tests {
         let epoch = base.epoch();
         let new_scope = ProjectScope::Published(PublishedScope::try_new("f4-scope", ".").unwrap());
         let new_scope_for_closure = new_scope.clone();
-        let att_id = AttachmentId::parse("att_11111111111111111111111111111111".to_string()).unwrap();
+        let att_id =
+            AttachmentId::parse("att_11111111111111111111111111111111".to_string()).unwrap();
         store
             .transact(epoch, |catalog, attachments| {
                 catalog.projects.insert(
@@ -4150,8 +4151,8 @@ mod tests {
         // Add a scope migration record with a bridge generation.
         let base = store.snapshot().unwrap();
         let epoch = base.epoch();
-        let migration_id = ScopeMigrationId::parse("sm_11111111111111111111111111111111".to_string())
-            .unwrap();
+        let migration_id =
+            ScopeMigrationId::parse("sm_11111111111111111111111111111111".to_string()).unwrap();
         let new_scope = ProjectScope::Published(PublishedScope::try_new("f4-scope", ".").unwrap());
         store
             .transact(epoch, |catalog, attachments| {

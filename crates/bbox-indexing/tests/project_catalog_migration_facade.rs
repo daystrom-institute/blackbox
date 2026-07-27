@@ -2288,9 +2288,7 @@ fn f5_source_authority_quiesced_blocks_journal() {
 
     struct RefusingQuiesceWorker;
 
-    impl bbox_indexing::project_catalog_admin::RetirementDischargeWorkers
-        for RefusingQuiesceWorker
-    {
+    impl bbox_indexing::project_catalog_admin::RetirementDischargeWorkers for RefusingQuiesceWorker {
         fn discharge_collected_generations(
             &mut self,
             _project_id: &ProjectId,

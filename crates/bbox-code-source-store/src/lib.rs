@@ -4339,11 +4339,7 @@ impl CodeSourceStore {
     /// activation record. In catalog mode this writes through the v2
     /// activation path; in bridge mode it falls back to the v1 record
     /// (the only mode where mark_cutback_pending is valid).
-    pub fn mark_cutback_pending_mixed(
-        &self,
-        project_id: &str,
-        diagnostic: &str,
-    ) -> Result<()> {
+    pub fn mark_cutback_pending_mixed(&self, project_id: &str, diagnostic: &str) -> Result<()> {
         if self.shared.record_mode != RuntimeRecordMode::BridgeV1 {
             // Catalog v2 path
             let _guard = self.lock_mutation()?;
@@ -4807,8 +4803,7 @@ impl CodeSourceStore {
         generation: &str,
     ) -> Result<Vec<u8>> {
         let path = self.paths.generation_manifest(scope, generation)?;
-        std::fs::read(&path)
-            .with_context(|| format!("reading manifest at {}", path.display()))
+        std::fs::read(&path).with_context(|| format!("reading manifest at {}", path.display()))
     }
 
     pub fn desired_generation(&self, scope: &PublishedScope) -> Result<Option<StoredGeneration>> {
