@@ -192,9 +192,23 @@ EOF
     : > "$SMOKE/daemon.log"; start_daemon
     if wait_bind; then echo "S5 restore-boot OK (daemon left running)"; else echo "S5 FAIL: restore boot"; tail -3 "$SMOKE/daemon.log"; return 1; fi ;;
   s6)
-    : > "$SMOKE/daemon.log"; start_daemon
-    if wait_bind; then echo "S6 boot OK"; else echo "S6 FAIL"; tail -5 "$SMOKE/daemon.log"; return 1; fi
-    if stop_daemon; then echo "S6 PASS: graceful shutdown"; else echo "S6 FAIL: shutdown hang"; return 1; fi ;;
+    # Stop and verify the CURRENTLY SERVING daemon (S4 leaves one running):
+    # the row proves graceful shutdown of the serving process, not a fresh
+    # boot racing the old process for the port.
+    pid=$(cat "$SMOKE/daemon.pid" 2>/dev/null)
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+      : > "$SMOKE/daemon.log"; start_daemon
+      if wait_bind; then echo "S6 boot OK"; else echo "S6 FAIL"; tail -5 "$SMOKE/daemon.log"; return 1; fi
+      pid=$(cat "$SMOKE/daemon.pid")
+    fi
+    if stop_daemon && ! kill -0 "$pid" 2>/dev/null; then
+      if curl -s -m 2 -o /dev/null "http://127.0.0.1:$PORT/roster" 2>/dev/null; then
+        echo "S6 FAIL: port still serving after shutdown"; return 1
+      fi
+      echo "S6 PASS: graceful shutdown of the serving daemon (pid $pid, port released)"
+    else
+      echo "S6 FAIL: shutdown hang (pid $pid)"; return 1
+    fi ;;
   stop) stop_daemon ;;
   *) echo "usage: catalog-smoke.sh {produce|setup|s1|s2|s3|s4|s5|s6|all|stop}" >&2; return 64 ;;
 esac
