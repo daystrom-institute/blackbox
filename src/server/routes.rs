@@ -2008,7 +2008,7 @@ pub(crate) fn build_edge_index_from_shared(
         })
         // all store read-guards drop here
     };
-    rebuilt.load_sidecar_edges(&edges_dir, Some(&registered_project_ids), &mut seen, true);
+    rebuilt.load_sidecar_edges(&edges_dir, Some(&registered_project_ids), &mut seen, true)?;
     rebuilt.log_rebuilt(include_tantivy_projection, started);
     Ok(rebuilt)
 }

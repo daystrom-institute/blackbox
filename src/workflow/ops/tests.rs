@@ -1350,7 +1350,8 @@ async fn write_semantic_edge_projects_describes_sidecar() {
         registered_project_ids: None,
         include_tantivy_projection: true,
         include_observed: true,
-    });
+    })
+    .unwrap();
     let source_ref = entity_ref::EntityRef::parse(source).unwrap();
     let target_ref = entity_ref::EntityRef::parse(target).unwrap();
     assert!(

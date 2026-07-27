@@ -553,7 +553,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         &roadmap_store.read(),
         &store_dir,
         &records_provider.records_snapshot(),
-    );
+    )?;
     let code_read_view = super::CodeReadView {
         active_selectors: idx.active_code_selectors(),
         searcher: idx.searcher(),
@@ -778,7 +778,7 @@ fn build_startup_edge_index(
     roadmap_store: &Roadmap,
     store_dir: &Path,
     records: &bbox_corpus_core::project_record::ProjectRecordsSnapshot,
-) -> edge_index::EdgeIndex {
+) -> anyhow::Result<edge_index::EdgeIndex> {
     if cfg.index.edge_index_boot_rebuild {
         edge_index::EdgeIndex::rebuild(&edge_index::EdgeStoreRefs {
             index: idx,
@@ -796,7 +796,7 @@ fn build_startup_edge_index(
         tracing::info!(
             "startup EdgeIndex rebuild deferred (set BLACKBOX_EDGE_INDEX_BOOT_REBUILD=1 to restore eager rebuild)"
         );
-        edge_index::EdgeIndex::default()
+        Ok(edge_index::EdgeIndex::default())
     }
 }
 

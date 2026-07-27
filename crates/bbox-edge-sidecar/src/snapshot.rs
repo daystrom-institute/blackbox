@@ -1169,6 +1169,7 @@ mod tests {
         ManifestIndex::load_or_new(edges_dir)
             .unwrap()
             .active_paths_for_loader(edges_dir)
+            .unwrap()
             .iter()
             .any(|loadable| {
                 loadable.path.file_name().and_then(|name| name.to_str())

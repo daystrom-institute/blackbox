@@ -3247,6 +3247,10 @@ pub(crate) fn pre_bind_catalog_recovery(
     // validated record is safe (R2F2).
     reconstruct_workspace_entries_from_activations(store, &edges_dir, &manifest)
         .context("pre-bind: workspace entry reconstruction")?;
+    bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)
+        .context("pre-bind: reloading reconstructed workspace entries")?
+        .active_paths_for_loader(&edges_dir)
+        .context("pre-bind: validating active workspace materializations")?;
 
     // Step 7: detect incomplete retirement journals.
     detect_incomplete_retirement_journal(bro_home)

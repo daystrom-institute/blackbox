@@ -826,7 +826,9 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = std::collections::HashSet::new();
-        index.load_sidecar_edges(edges_dir, None, &mut seen, true);
+        index
+            .load_sidecar_edges(edges_dir, None, &mut seen, true)
+            .unwrap();
 
         let source_exp = EntityRef::Knowledge { id: "k_exp".into() };
         let source_der = EntityRef::Knowledge { id: "k_der".into() };

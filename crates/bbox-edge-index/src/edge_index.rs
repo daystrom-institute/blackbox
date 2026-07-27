@@ -15,6 +15,29 @@ use bbox_stores::roadmap::Roadmap;
 use bbox_threads::notes::Notes;
 use bbox_threads::threads::{EdgeKind, EdgeTarget, Threads};
 
+#[cfg(test)]
+thread_local! {
+    static TEST_ACTIVE_READ_FAIL_AFTER_LINES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(usize::MAX) };
+}
+
+#[cfg(test)]
+fn maybe_fail_active_read(line_number: usize) -> Result<()> {
+    if TEST_ACTIVE_READ_FAIL_AFTER_LINES.get() == line_number {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "injected active materialization read failure",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn maybe_fail_active_read(_line_number: usize) -> Result<()> {
+    Ok(())
+}
+
 #[derive(Default)]
 pub struct EdgeIndex {
     edges: Vec<Edge>,
@@ -44,7 +67,7 @@ pub struct EdgeStoreRefs<'a> {
 }
 
 impl EdgeIndex {
-    pub fn rebuild(stores: &EdgeStoreRefs<'_>) -> Self {
+    pub fn rebuild(stores: &EdgeStoreRefs<'_>) -> Result<Self> {
         let started = Instant::now();
         let (mut index, mut seen) = Self::project_store_edges(stores);
 
@@ -53,10 +76,10 @@ impl EdgeIndex {
             stores.registered_project_ids.as_ref(),
             &mut seen,
             stores.include_observed,
-        );
+        )?;
 
         index.log_rebuilt(stores.include_tantivy_projection, started);
-        index
+        Ok(index)
     }
 
     /// Store-projection half of `rebuild`: walks the in-memory stores only.
@@ -101,13 +124,13 @@ impl EdgeIndex {
         registered_project_ids: Option<&HashSet<String>>,
         seen: &mut HashSet<EdgeKey>,
         include_observed: bool,
-    ) {
+    ) -> Result<()> {
         match bbox_edge_sidecar::manifest::try_load_manifest_index(edges_dir) {
             Ok(manifest_index) => {
-                let loadable = manifest_index.active_paths_for_loader(edges_dir);
+                let loadable = manifest_index.active_paths_for_loader(edges_dir)?;
                 let total_materialized_files = count_materialized_jsonl_files(edges_dir);
                 let skipped_inactive = total_materialized_files.saturating_sub(loadable.len());
-                self.load_manifest_active_paths(&loadable, seen);
+                self.load_manifest_active_paths(&loadable, seen)?;
                 self.load_legacy_explicit_edges(
                     edges_dir,
                     registered_project_ids,
@@ -121,13 +144,7 @@ impl EdgeIndex {
                     "loaded edges via manifest-index"
                 );
             }
-            Err(reason) => {
-                if !matches!(
-                    reason,
-                    bbox_edge_sidecar::manifest::ManifestFallbackReason::MissingNotMigrated
-                ) {
-                    tracing::warn!(?reason, "manifest-index fallback to legacy sidecar loading");
-                }
+            Err(bbox_edge_sidecar::manifest::ManifestFallbackReason::MissingNotMigrated) => {
                 self.project_sidecar_edges(
                     edges_dir,
                     registered_project_ids,
@@ -135,7 +152,9 @@ impl EdgeIndex {
                     include_observed,
                 );
             }
+            Err(reason) => anyhow::bail!("active edge manifest is unavailable: {reason:?}"),
         }
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -766,34 +785,41 @@ impl EdgeIndex {
         &mut self,
         paths: &[bbox_edge_sidecar::manifest::LoadablePath],
         seen: &mut HashSet<EdgeKey>,
-    ) {
+    ) -> Result<()> {
         for loadable in paths {
             match &loadable.mode {
                 bbox_edge_sidecar::manifest::PathLoadMode::Full => {
-                    self.project_sidecar_edges_file(&loadable.path, seen, false);
+                    self.project_sidecar_edges_open_file(
+                        loadable.file.try_clone()?,
+                        &loadable.path,
+                        seen,
+                        false,
+                    )?;
                 }
                 bbox_edge_sidecar::manifest::PathLoadMode::FilteredByHash { suppressed_hashes } => {
-                    self.project_sidecar_edges_file_with_hash_filter(
+                    self.project_sidecar_edges_open_file_with_hash_filter(
+                        loadable.file.try_clone()?,
                         &loadable.path,
                         seen,
                         suppressed_hashes,
-                    );
+                    )?;
                 }
             }
         }
+        Ok(())
     }
 
-    fn project_sidecar_edges_file_with_hash_filter(
+    fn project_sidecar_edges_open_file_with_hash_filter(
         &mut self,
+        file: fs::File,
         path: &Path,
         seen: &mut HashSet<EdgeKey>,
         suppressed_hashes: &HashSet<String>,
-    ) {
-        let Ok(file) = fs::File::open(path) else {
-            return;
-        };
+    ) -> Result<()> {
         let reader = std::io::BufReader::new(file);
-        for line in reader.lines().map_while(Result::ok) {
+        for (line_number, line) in reader.lines().enumerate() {
+            let line = line?;
+            maybe_fail_active_read(line_number + 1)?;
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -813,6 +839,39 @@ impl EdgeIndex {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn project_sidecar_edges_open_file(
+        &mut self,
+        file: fs::File,
+        path: &Path,
+        seen: &mut HashSet<EdgeKey>,
+        skip_derived: bool,
+    ) -> Result<()> {
+        let reader = std::io::BufReader::new(file);
+        for (line_number, line) in reader.lines().enumerate() {
+            let line = line?;
+            maybe_fail_active_read(line_number + 1)?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if skip_derived && line_provenance_is_derived(trimmed) {
+                continue;
+            }
+            match serde_json::from_str::<Edge>(trimmed) {
+                Ok(edge) => self.insert_sidecar_edge(edge, seen),
+                Err(err) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "failed to parse edge sidecar line"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     fn load_legacy_explicit_edges(
@@ -2600,7 +2659,9 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.load_sidecar_edges(edges_dir, None, &mut seen, true);
+        index
+            .load_sidecar_edges(edges_dir, None, &mut seen, true)
+            .unwrap();
 
         let active_source = EntityRef::Knowledge {
             id: "k_active".into(),
@@ -2621,7 +2682,7 @@ mod tests {
     }
 
     #[test]
-    fn load_sidecar_corrupt_index_falls_back_to_legacy() {
+    fn load_sidecar_corrupt_index_refuses_publication() {
         let dir = tempfile::tempdir().unwrap();
         let edges_dir = dir.path();
 
@@ -2638,15 +2699,10 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.load_sidecar_edges(edges_dir, None, &mut seen, true);
-
-        let source = EntityRef::Knowledge {
-            id: "k_legacy".into(),
-        };
-        assert_eq!(
-            index.forward_edges(&source).len(),
-            1,
-            "corrupt manifest must fall back to legacy loading via load_sidecar_edges"
+        assert!(
+            index
+                .load_sidecar_edges(edges_dir, None, &mut seen, true)
+                .is_err()
         );
     }
 
@@ -2660,7 +2716,9 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.load_sidecar_edges(edges_dir, None, &mut seen, true);
+        index
+            .load_sidecar_edges(edges_dir, None, &mut seen, true)
+            .unwrap();
 
         let source = EntityRef::Knowledge {
             id: "k_explicit".into(),
@@ -2673,7 +2731,7 @@ mod tests {
     }
 
     #[test]
-    fn load_sidecar_stale_manifest_falls_back_to_legacy() {
+    fn load_sidecar_stale_manifest_refuses_publication() {
         let dir = tempfile::tempdir().unwrap();
         let edges_dir = dir.path();
 
@@ -2686,7 +2744,7 @@ mod tests {
             bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
                 manifest: "workspace/p1/manifest.json".into(),
                 active_snapshot: None,
-                dirty_overlay: Some("workspace/p1/dirty-overlay/does-not-exist".into()),
+                dirty_overlay: Some("workspace/p1/dirty-overlay".into()),
                 repo_materialization: None,
                 code_source_selector: None,
                 code_source_generation: None,
@@ -2698,15 +2756,10 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.load_sidecar_edges(edges_dir, None, &mut seen, true);
-
-        let source = EntityRef::Knowledge {
-            id: "k_stale_test".into(),
-        };
-        assert_eq!(
-            index.forward_edges(&source).len(),
-            1,
-            "stale manifest (missing dirty_overlay) must fall back to legacy loading"
+        assert!(
+            index
+                .load_sidecar_edges(edges_dir, None, &mut seen, true)
+                .is_err()
         );
     }
 
@@ -2769,7 +2822,9 @@ mod tests {
         fn load_active(edges_dir: &Path) -> EdgeIndex {
             let mut index = EdgeIndex::default();
             let mut seen = HashSet::new();
-            index.load_sidecar_edges(edges_dir, None, &mut seen, true);
+            index
+                .load_sidecar_edges(edges_dir, None, &mut seen, true)
+                .unwrap();
             index
         }
 
@@ -3235,7 +3290,9 @@ mod tests {
 
             let mut index = EdgeIndex::default();
             let mut seen = HashSet::new();
-            index.load_sidecar_edges(edges_dir, None, &mut seen, true);
+            index
+                .load_sidecar_edges(edges_dir, None, &mut seen, true)
+                .unwrap();
 
             let source = EntityRef::Knowledge {
                 id: "sym_active".into(),
@@ -3452,7 +3509,9 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.load_sidecar_edges(edges_dir, None, &mut seen, true);
+        index
+            .load_sidecar_edges(edges_dir, None, &mut seen, true)
+            .unwrap();
 
         // h1 overlay edge (DESCRIBES) must win over snapshot edge (IN_FILE)
         let h1_source = EntityRef::ProjectFile {
@@ -3515,7 +3574,9 @@ mod tests {
         // Load with include_observed=false
         let mut index_no_obs = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index_no_obs.load_sidecar_edges(edges_dir, None, &mut seen, false);
+        index_no_obs
+            .load_sidecar_edges(edges_dir, None, &mut seen, false)
+            .unwrap();
 
         let explicit_source = EntityRef::Knowledge {
             id: "k_explicit".into(),
@@ -3540,11 +3601,68 @@ mod tests {
         // Load with include_observed=true — observed edge must appear
         let mut index_with_obs = EdgeIndex::default();
         let mut seen2 = HashSet::new();
-        index_with_obs.load_sidecar_edges(edges_dir, None, &mut seen2, true);
+        index_with_obs
+            .load_sidecar_edges(edges_dir, None, &mut seen2, true)
+            .unwrap();
         assert_eq!(
             index_with_obs.forward_edges(&transcript_source).len(),
             1,
             "observed edge must load when include_observed=true"
+        );
+    }
+
+    #[test]
+    fn active_materialization_mid_line_failure_aborts_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+        let snapshot = bbox_edge_sidecar::manifest::materialized_dir(edges_dir)
+            .join("workspace/p1/snapshots/local-a");
+        let first = make_explicit_edge_line("k1", "DESCRIBES", "k2");
+        let second = make_explicit_edge_line("k3", "DESCRIBES", "k4");
+        write_jsonl(&snapshot.join("project.jsonl"), &[&first, &second]);
+        let manifest = bbox_edge_sidecar::manifest::WorkspaceManifest {
+            version: 1,
+            project_id: "p1".to_string(),
+            repo_id: None,
+            canonical_path: None,
+            git_common_dir: None,
+            git_worktree_dir: None,
+            branch: None,
+            head_sha: None,
+            dirty: false,
+            dirty_fingerprint: None,
+            active_snapshot_id: Some("local-a".to_string()),
+            active_dirty_overlay_id: None,
+            updated_at: None,
+        };
+        bbox_edge_sidecar::manifest::WorkspaceManifest::write_to(edges_dir, &manifest).unwrap();
+        let mut manifest_index = bbox_edge_sidecar::manifest::ManifestIndex::new();
+        manifest_index.upsert_workspace(
+            "p1",
+            bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
+                manifest: "workspace/p1/manifest.json".to_string(),
+                active_snapshot: Some("workspace/p1/snapshots/local-a".to_string()),
+                dirty_overlay: None,
+                repo_materialization: None,
+                code_source_selector: Some("local:p1".to_string()),
+                code_source_generation: Some("local".to_string()),
+                git_overlay: None,
+                git_overlay_managed: false,
+            },
+        );
+        manifest_index.write_atomic(edges_dir).unwrap();
+
+        TEST_ACTIVE_READ_FAIL_AFTER_LINES.set(2);
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        let result = index.load_sidecar_edges(edges_dir, None, &mut seen, true);
+        TEST_ACTIVE_READ_FAIL_AFTER_LINES.set(usize::MAX);
+
+        assert!(result.is_err());
+        assert!(
+            index
+                .forward_edges(&EntityRef::Knowledge { id: "k3".into() })
+                .is_empty()
         );
     }
 }

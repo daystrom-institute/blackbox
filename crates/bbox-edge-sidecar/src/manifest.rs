@@ -19,6 +19,7 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -73,6 +74,7 @@ impl OverlayManifest {
 // ---------------------------------------------------------------------------
 
 /// Describes how to load a sidecar path during EdgeIndex rebuild.
+#[derive(Debug)]
 pub enum PathLoadMode {
     /// Load all edges without filtering.
     Full,
@@ -83,8 +85,10 @@ pub enum PathLoadMode {
 }
 
 /// A path and the mode in which the edge loader should process it.
+#[derive(Debug)]
 pub struct LoadablePath {
     pub path: PathBuf,
+    pub file: fs::File,
     pub mode: PathLoadMode,
 }
 
@@ -337,44 +341,41 @@ impl ManifestIndex {
     ///
     /// Legacy overlays (no overlay_manifest.json) replace the whole workspace
     /// as before (only overlay files returned, `Full`).
-    pub fn active_paths_for_loader(&self, edges_dir: &Path) -> Vec<LoadablePath> {
+    pub fn active_paths_for_loader(&self, edges_dir: &Path) -> Result<Vec<LoadablePath>> {
         let mut result = Vec::new();
         for (project_id, entry) in &self.workspaces {
-            let has_overlay = entry.dirty_overlay.is_some()
-                && materialized_dir(edges_dir)
-                    .join(entry.dirty_overlay.as_ref().unwrap())
-                    .is_dir();
+            validate_workspace_entry_shape(project_id, entry)?;
+            confined_regular_file(edges_dir, &entry.manifest)?
+                .ok_or_else(|| anyhow::anyhow!("workspace manifest is missing for {project_id}"))?;
+            let has_overlay = match entry.dirty_overlay.as_deref() {
+                Some(relative) => confined_directory_exists(edges_dir, relative)?,
+                None => false,
+            };
 
             if has_overlay {
-                let overlay_dir =
-                    materialized_dir(edges_dir).join(entry.dirty_overlay.as_ref().unwrap());
-                let mut overlay_paths = Vec::new();
-                append_jsonl_files_excluding_overlay_manifest(&overlay_dir, &mut overlay_paths);
-                for path in overlay_paths {
+                let overlay = entry.dirty_overlay.as_deref().unwrap();
+                for (path, file) in confined_jsonl_files(edges_dir, overlay)? {
                     result.push(LoadablePath {
                         path,
+                        file,
                         mode: PathLoadMode::Full,
                     });
                 }
 
                 // Per-file overlay: if overlay_manifest.json present and there
                 // is a clean snapshot, load snapshot filtered by covered hashes.
-                if let Some(om) = OverlayManifest::read_from(&overlay_dir) {
+                if let Some(om) = read_overlay_manifest_confined(edges_dir, overlay)? {
                     if let Some(ref snapshot) = entry.active_snapshot {
-                        let snap_dir = materialized_dir(edges_dir).join(snapshot);
-                        if snap_dir.is_dir() {
+                        if confined_directory_exists(edges_dir, snapshot)? {
                             let suppressed: HashSet<String> =
                                 om.covered_rel_path_hashes.into_iter().collect();
                             if !suppressed.is_empty() {
-                                let mut snap_paths = Vec::new();
-                                append_snapshot_members_gated_on_overlay(
-                                    &snap_dir,
-                                    entry,
-                                    &mut snap_paths,
-                                );
-                                for path in snap_paths {
+                                for (path, file) in
+                                    confined_snapshot_members(edges_dir, snapshot, entry)?
+                                {
                                     result.push(LoadablePath {
                                         path,
+                                        file,
                                         mode: PathLoadMode::FilteredByHash {
                                             suppressed_hashes: suppressed.clone(),
                                         },
@@ -387,13 +388,11 @@ impl ManifestIndex {
                 // Legacy overlay (no overlay_manifest): snapshot is completely
                 // replaced, nothing else to add for this project.
             } else if let Some(ref snapshot) = entry.active_snapshot {
-                let snapshot_dir = materialized_dir(edges_dir).join(snapshot);
-                if snapshot_dir.is_dir() {
-                    let mut snap_paths = Vec::new();
-                    append_snapshot_members_gated_on_overlay(&snapshot_dir, entry, &mut snap_paths);
-                    for path in snap_paths {
+                if confined_directory_exists(edges_dir, snapshot)? {
+                    for (path, file) in confined_snapshot_members(edges_dir, snapshot, entry)? {
                         result.push(LoadablePath {
                             path,
+                            file,
                             mode: PathLoadMode::Full,
                         });
                     }
@@ -401,32 +400,30 @@ impl ManifestIndex {
             }
 
             if let Some(ref repo_mat) = entry.repo_materialization {
-                let repo_dir = materialized_dir(edges_dir).join(repo_mat);
-                if repo_dir.is_dir() {
-                    let mut repo_paths = Vec::new();
-                    append_jsonl_files(&repo_dir, &mut repo_paths);
-                    for path in repo_paths {
+                if confined_directory_exists(edges_dir, repo_mat)? {
+                    for (path, file) in confined_jsonl_files(edges_dir, repo_mat)? {
                         result.push(LoadablePath {
                             path,
+                            file,
                             mode: PathLoadMode::Full,
                         });
                     }
                 }
             }
             if entry.active_snapshot.is_none() && !has_overlay {
-                let managed_path = edges_dir
-                    .join("derived")
-                    .join("project")
-                    .join(format!("{}.jsonl", project_id));
-                if managed_path.exists() {
+                let managed_rel = format!("derived/project/{project_id}.jsonl");
+                if let Some((path, file)) =
+                    confined_regular_file_under_root(edges_dir, &managed_rel)?
+                {
                     result.push(LoadablePath {
-                        path: managed_path,
+                        path,
+                        file,
                         mode: PathLoadMode::Full,
                     });
                 }
             }
         }
-        result
+        Ok(result)
     }
 
     pub fn protected_materialized_paths(&self, edges_dir: &Path) -> Vec<PathBuf> {
@@ -473,26 +470,26 @@ impl ManifestIndex {
         let mut missing_manifests = Vec::new();
         let mut missing_paths = Vec::new();
         for (project_id, entry) in &self.workspaces {
-            let manifest_path = materialized_dir(edges_dir).join(&entry.manifest);
-            if !manifest_path.exists() {
+            if let Err(error) = validate_workspace_entry_shape(project_id, entry) {
+                missing_paths.push(format!("{project_id}: {error}"));
+                continue;
+            }
+            if !confined_regular_file(edges_dir, &entry.manifest).is_ok_and(|file| file.is_some()) {
                 missing_manifests.push(project_id.clone());
                 continue;
             }
             if let Some(ref snapshot) = entry.active_snapshot {
-                let snap_dir = materialized_dir(edges_dir).join(snapshot);
-                if !snap_dir.is_dir() {
+                if !confined_directory_exists(edges_dir, snapshot).unwrap_or(false) {
                     missing_paths.push(snapshot.clone());
                 }
             }
             if let Some(ref overlay) = entry.dirty_overlay {
-                let overlay_dir = materialized_dir(edges_dir).join(overlay);
-                if !overlay_dir.is_dir() {
+                if !confined_directory_exists(edges_dir, overlay).unwrap_or(false) {
                     missing_paths.push(overlay.clone());
                 }
             }
             if let Some(ref repo_mat) = entry.repo_materialization {
-                let repo_dir = materialized_dir(edges_dir).join(repo_mat);
-                if !repo_dir.is_dir() {
+                if !confined_directory_exists(edges_dir, repo_mat).unwrap_or(false) {
                     missing_paths.push(repo_mat.clone());
                 }
             }
@@ -626,6 +623,403 @@ fn write_manifest_index_confined(edges_dir: &Path, index: &ManifestIndex) -> Res
     Ok(())
 }
 
+const MAX_ACTIVE_MATERIALIZATION_FILES: usize = 100_000;
+const MAX_OVERLAY_MANIFEST_BYTES: usize = 1024 * 1024;
+
+fn validate_workspace_entry_shape(project_id: &str, entry: &WorkspaceIndexEntry) -> Result<()> {
+    validate_single_component(project_id, "project id")?;
+    let expected_manifest = format!("workspace/{project_id}/manifest.json");
+    if entry.manifest != expected_manifest {
+        anyhow::bail!(
+            "workspace manifest path `{}` does not match writer path `{expected_manifest}`",
+            entry.manifest
+        );
+    }
+    if let Some(snapshot) = entry.active_snapshot.as_deref() {
+        validate_snapshot_path(project_id, snapshot)?;
+    }
+    if let Some(overlay) = entry.dirty_overlay.as_deref()
+        && overlay != crate::snapshot::dirty_overlay_rel(project_id)
+    {
+        anyhow::bail!("workspace dirty overlay path `{overlay}` is not writer-normalized");
+    }
+    if let Some(repo) = entry.repo_materialization.as_deref() {
+        validate_relative_path(repo)?;
+    }
+    Ok(())
+}
+
+fn validate_snapshot_path(project_id: &str, relative: &str) -> Result<()> {
+    let components = normal_components(relative)?;
+    if components.len() != 4
+        || components[0] != "workspace"
+        || components[1] != project_id
+        || components[2] != "snapshots"
+    {
+        anyhow::bail!("workspace snapshot path `{relative}` is not writer-normalized");
+    }
+    validate_single_component(&components[3], "snapshot id")
+}
+
+fn validate_relative_path(relative: &str) -> Result<()> {
+    normal_components(relative).map(|_| ())
+}
+
+fn validate_single_component(value: &str, label: &str) -> Result<()> {
+    if value.is_empty()
+        || Path::new(value).components().count() != 1
+        || !matches!(
+            Path::new(value).components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        anyhow::bail!("{label} is not a non-empty normal path component");
+    }
+    Ok(())
+}
+
+fn normal_components(relative: &str) -> Result<Vec<String>> {
+    let path = Path::new(relative);
+    if relative.is_empty() || path.is_absolute() {
+        anyhow::bail!("workspace path is not a non-empty relative path");
+    }
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(value) => {
+                let value = value
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("workspace path is not UTF-8"))?;
+                if value.is_empty() {
+                    anyhow::bail!("workspace path contains an empty component");
+                }
+                components.push(value.to_string());
+            }
+            _ => anyhow::bail!("workspace path contains a non-normal component"),
+        }
+    }
+    if components.is_empty() {
+        anyhow::bail!("workspace path has no components");
+    }
+    Ok(components)
+}
+
+#[cfg(unix)]
+fn open_confined_directory(base: &fs::File, relative: &str) -> Result<fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let mut current = base.try_clone()?;
+    for component in normal_components(relative)? {
+        let component = std::ffi::CString::new(component)?;
+        let fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        current = unsafe { fs::File::from_raw_fd(fd) };
+    }
+    Ok(current)
+}
+
+#[cfg(unix)]
+fn open_confined_regular(base: &fs::File, relative: &str) -> Result<Option<fs::File>> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let components = normal_components(relative)?;
+    let (leaf, parents) = components.split_last().unwrap();
+    let parent = if parents.is_empty() {
+        base.try_clone()?
+    } else {
+        open_confined_directory(base, &parents.join("/"))?
+    };
+    let leaf = std::ffi::CString::new(leaf.as_str())?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            leaf.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(error.into());
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    if !file.metadata()?.is_file() {
+        anyhow::bail!("workspace member is not a regular file");
+    }
+    Ok(Some(file))
+}
+
+#[cfg(unix)]
+fn read_directory_names(directory: &fs::File) -> Result<Vec<std::ffi::OsString>> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStringExt;
+
+    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        unsafe { libc::close(duplicate) };
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut names = Vec::new();
+    loop {
+        set_readdir_errno(0);
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let error = readdir_errno();
+            unsafe { libc::closedir(stream) };
+            if error != 0 {
+                return Err(std::io::Error::from_raw_os_error(error).into());
+            }
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name != b"." && name != b".." {
+            names.push(std::ffi::OsString::from_vec(name.to_vec()));
+            if names.len() > MAX_ACTIVE_MATERIALIZATION_FILES {
+                unsafe { libc::closedir(stream) };
+                anyhow::bail!("workspace materialization exceeds its file limit");
+            }
+        }
+    }
+    Ok(names)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_readdir_errno(value: libc::c_int) {
+    unsafe { *libc::__errno_location() = value };
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn set_readdir_errno(value: libc::c_int) {
+    unsafe { *libc::__error() = value };
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn readdir_errno() -> libc::c_int {
+    unsafe { *libc::__errno_location() }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn readdir_errno() -> libc::c_int {
+    unsafe { *libc::__error() }
+}
+
+#[cfg(unix)]
+fn confined_directory_exists(edges_dir: &Path, relative: &str) -> Result<bool> {
+    let materialized = open_materialized_dir(edges_dir, false)?;
+    match open_confined_directory(&materialized, relative) {
+        Ok(_) => Ok(true),
+        Err(error)
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|io| io.kind() == io::ErrorKind::NotFound)
+            }) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn confined_regular_file(edges_dir: &Path, relative: &str) -> Result<Option<(PathBuf, fs::File)>> {
+    let materialized = open_materialized_dir(edges_dir, false)?;
+    Ok(open_confined_regular(&materialized, relative)?
+        .map(|file| (materialized_dir(edges_dir).join(relative), file)))
+}
+
+#[cfg(unix)]
+fn confined_regular_file_under_root(
+    edges_dir: &Path,
+    relative: &str,
+) -> Result<Option<(PathBuf, fs::File)>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let root = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(edges_dir)?;
+    Ok(open_confined_regular(&root, relative)?.map(|file| (edges_dir.join(relative), file)))
+}
+
+#[cfg(unix)]
+fn confined_jsonl_files(edges_dir: &Path, relative: &str) -> Result<Vec<(PathBuf, fs::File)>> {
+    let materialized = open_materialized_dir(edges_dir, false)?;
+    let directory = open_confined_directory(&materialized, relative)?;
+    let mut files = Vec::new();
+    for name in read_directory_names(&directory)? {
+        if Path::new(&name)
+            .extension()
+            .and_then(|value| value.to_str())
+            != Some("jsonl")
+        {
+            continue;
+        }
+        let name = name
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("workspace member name is not UTF-8"))?;
+        let file = open_confined_regular(&directory, name)?
+            .ok_or_else(|| anyhow::anyhow!("workspace member disappeared during enumeration"))?;
+        files.push((materialized_dir(edges_dir).join(relative).join(name), file));
+    }
+    Ok(files)
+}
+
+#[cfg(unix)]
+fn read_overlay_manifest_confined(
+    edges_dir: &Path,
+    overlay: &str,
+) -> Result<Option<OverlayManifest>> {
+    use std::io::Read;
+
+    let materialized = open_materialized_dir(edges_dir, false)?;
+    let directory = open_confined_directory(&materialized, overlay)?;
+    let Some(mut file) = open_confined_regular(&directory, OVERLAY_MANIFEST_FILENAME)? else {
+        return Ok(None);
+    };
+    let metadata = file.metadata()?;
+    if metadata.len() > MAX_OVERLAY_MANIFEST_BYTES as u64 {
+        anyhow::bail!("overlay manifest exceeds its byte limit");
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(MAX_OVERLAY_MANIFEST_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != metadata.len() {
+        anyhow::bail!("overlay manifest changed while being read");
+    }
+    Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
+#[cfg(unix)]
+fn confined_snapshot_members(
+    edges_dir: &Path,
+    snapshot: &str,
+    entry: &WorkspaceIndexEntry,
+) -> Result<Vec<(PathBuf, fs::File)>> {
+    let overlay_admits_git_current = !entry.git_overlay_managed
+        || entry.git_overlay.as_ref().is_some_and(|overlay| {
+            entry
+                .code_source_generation
+                .as_deref()
+                .is_some_and(|generation| overlay.matches_code_generation(generation))
+        });
+    let mut files = confined_jsonl_files(edges_dir, snapshot)?;
+    if !overlay_admits_git_current {
+        files.retain(|(path, _)| {
+            path.file_name().and_then(|name| name.to_str()) != Some(GIT_CURRENT_MEMBER)
+        });
+    }
+    Ok(files)
+}
+
+#[cfg(not(unix))]
+fn confined_directory_exists(edges_dir: &Path, relative: &str) -> Result<bool> {
+    validate_relative_path(relative)?;
+    Ok(materialized_dir(edges_dir).join(relative).is_dir())
+}
+
+#[cfg(not(unix))]
+fn confined_regular_file(edges_dir: &Path, relative: &str) -> Result<Option<(PathBuf, fs::File)>> {
+    validate_relative_path(relative)?;
+    let path = materialized_dir(edges_dir).join(relative);
+    match fs::File::open(&path) {
+        Ok(file) if file.metadata()?.is_file() => Ok(Some((path, file))),
+        Ok(_) => anyhow::bail!("workspace member is not a regular file"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(unix))]
+fn confined_regular_file_under_root(
+    edges_dir: &Path,
+    relative: &str,
+) -> Result<Option<(PathBuf, fs::File)>> {
+    validate_relative_path(relative)?;
+    let path = edges_dir.join(relative);
+    match fs::File::open(&path) {
+        Ok(file) if file.metadata()?.is_file() => Ok(Some((path, file))),
+        Ok(_) => anyhow::bail!("workspace member is not a regular file"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(unix))]
+fn confined_jsonl_files(edges_dir: &Path, relative: &str) -> Result<Vec<(PathBuf, fs::File)>> {
+    validate_relative_path(relative)?;
+    let directory = materialized_dir(edges_dir).join(relative);
+    let mut files = Vec::new();
+    for entry in fs::read_dir(&directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
+            let file = fs::File::open(&path)?;
+            if !file.metadata()?.is_file() {
+                anyhow::bail!("workspace member is not a regular file");
+            }
+            files.push((path, file));
+        }
+    }
+    Ok(files)
+}
+
+#[cfg(not(unix))]
+fn read_overlay_manifest_confined(
+    edges_dir: &Path,
+    overlay: &str,
+) -> Result<Option<OverlayManifest>> {
+    validate_relative_path(overlay)?;
+    let path = materialized_dir(edges_dir)
+        .join(overlay)
+        .join(OVERLAY_MANIFEST_FILENAME);
+    match fs::read(path) {
+        Ok(bytes) if bytes.len() <= MAX_OVERLAY_MANIFEST_BYTES => {
+            Ok(Some(serde_json::from_slice(&bytes)?))
+        }
+        Ok(_) => anyhow::bail!("overlay manifest exceeds its byte limit"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(unix))]
+fn confined_snapshot_members(
+    edges_dir: &Path,
+    snapshot: &str,
+    entry: &WorkspaceIndexEntry,
+) -> Result<Vec<(PathBuf, fs::File)>> {
+    let overlay_admits_git_current = !entry.git_overlay_managed
+        || entry.git_overlay.as_ref().is_some_and(|overlay| {
+            entry
+                .code_source_generation
+                .as_deref()
+                .is_some_and(|generation| overlay.matches_code_generation(generation))
+        });
+    let mut files = confined_jsonl_files(edges_dir, snapshot)?;
+    if !overlay_admits_git_current {
+        files.retain(|(path, _)| {
+            path.file_name().and_then(|name| name.to_str()) != Some(GIT_CURRENT_MEMBER)
+        });
+    }
+    Ok(files)
+}
+
 #[cfg(not(unix))]
 fn read_manifest_index_confined(edges_dir: &Path) -> Result<Vec<u8>> {
     let bytes = fs::read(manifest_index_path(edges_dir))?;
@@ -660,51 +1054,6 @@ fn append_jsonl_files(dir: &Path, paths: &mut Vec<PathBuf>) {
             paths.push(path);
         }
     }
-}
-
-/// Append a snapshot directory's members, admitting the Git current-file
-/// member only when the workspace entry selects an overlay for THIS
-/// snapshot's code generation (Phase 3 plan section 10 item 1).
-///
-/// The gate is what makes overlay clearing meaningful. Activating a new code
-/// generation clears the selector but does not, and must not, rewrite the
-/// snapshot directory: a stale `git-current.jsonl` left behind by an earlier
-/// walk would otherwise keep loading `COMMIT_TOUCHED_FILE` edges whose
-/// targets name a retired snapshot id. Gating on the selector means the
-/// clear is atomic with the activation (one manifest write) instead of
-/// racing a directory rewrite.
-fn append_snapshot_members_gated_on_overlay(
-    dir: &Path,
-    entry: &WorkspaceIndexEntry,
-    paths: &mut Vec<PathBuf>,
-) {
-    if !entry.git_overlay_managed {
-        append_jsonl_files(dir, paths);
-        return;
-    }
-    let overlay_admits_git_current = entry.git_overlay.as_ref().is_some_and(|overlay| {
-        entry
-            .code_source_generation
-            .as_deref()
-            .is_some_and(|generation| overlay.matches_code_generation(generation))
-    });
-    let mut candidates = Vec::new();
-    append_jsonl_files(dir, &mut candidates);
-    for path in candidates {
-        let is_git_current =
-            path.file_name().and_then(|name| name.to_str()) == Some(GIT_CURRENT_MEMBER);
-        if is_git_current && !overlay_admits_git_current {
-            continue;
-        }
-        paths.push(path);
-    }
-}
-
-/// Like `append_jsonl_files` but also skips the overlay_manifest.json
-/// (a JSON file, not JSONL, so the extension filter already excludes it —
-/// this helper exists for clarity and future-proofing).
-fn append_jsonl_files_excluding_overlay_manifest(dir: &Path, paths: &mut Vec<PathBuf>) {
-    append_jsonl_files(dir, paths);
 }
 
 // ---------------------------------------------------------------------------
@@ -1067,5 +1416,82 @@ mod tests {
             }
             other => panic!("expected Corrupt, got {:?}", other),
         }
+    }
+
+    fn local_workspace_entry(project_id: &str, snapshot: &str) -> WorkspaceIndexEntry {
+        WorkspaceIndexEntry {
+            manifest: format!("workspace/{project_id}/manifest.json"),
+            active_snapshot: Some(snapshot.to_string()),
+            dirty_overlay: None,
+            repo_materialization: None,
+            code_source_selector: Some(bbox_code_source::local_selector(project_id)),
+            code_source_generation: Some("local".to_string()),
+            git_overlay: None,
+            git_overlay_managed: false,
+        }
+    }
+
+    #[test]
+    fn active_loader_rejects_non_writer_workspace_shapes_for_local_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = ManifestIndex::new();
+        index
+            .workspaces
+            .insert("p1".to_string(), local_workspace_entry("p1", "../outside"));
+        assert!(index.active_paths_for_loader(dir.path()).is_err());
+
+        let mut entry = local_workspace_entry("p1", "workspace/p1/snapshots/local-a");
+        entry.manifest = "/tmp/outside.json".to_string();
+        index.workspaces.insert("p1".to_string(), entry);
+        assert!(index.active_paths_for_loader(dir.path()).is_err());
+
+        let mut entry = local_workspace_entry("p1", "workspace/p1/snapshots/local-a");
+        entry.dirty_overlay = Some("workspace/p1/../outside".to_string());
+        index.workspaces.insert("p1".to_string(), entry);
+        assert!(index.active_paths_for_loader(dir.path()).is_err());
+
+        let mut entry = local_workspace_entry("p1", "workspace/p1/snapshots/local-a");
+        entry.repo_materialization = Some("../../outside".to_string());
+        index.workspaces.insert("p1".to_string(), entry);
+        assert!(index.active_paths_for_loader(dir.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_loader_rejects_symlinked_snapshot_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("external.jsonl"), b"{}\n").unwrap();
+        let workspace = workspace_manifest_dir(dir.path(), "p1");
+        fs::create_dir_all(workspace.join("snapshots")).unwrap();
+        fs::write(workspace.join("manifest.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.join("snapshots").join("local-a"))
+            .unwrap();
+        let mut index = ManifestIndex::new();
+        index.workspaces.insert(
+            "p1".to_string(),
+            local_workspace_entry("p1", "workspace/p1/snapshots/local-a"),
+        );
+
+        assert!(index.active_paths_for_loader(dir.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_loader_rejects_symlinked_jsonl_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let workspace = workspace_manifest_dir(dir.path(), "p1");
+        let snapshot = workspace.join("snapshots").join("local-a");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(workspace.join("manifest.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink(outside.path(), snapshot.join("external.jsonl")).unwrap();
+        let mut index = ManifestIndex::new();
+        index.workspaces.insert(
+            "p1".to_string(),
+            local_workspace_entry("p1", "workspace/p1/snapshots/local-a"),
+        );
+
+        assert!(index.active_paths_for_loader(dir.path()).is_err());
     }
 }
