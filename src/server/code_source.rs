@@ -3351,12 +3351,12 @@ fn reconstruct_workspace_entries_from_activations(
     store: &CodeSourceStore,
     edges_dir: &std::path::Path,
     manifest: &bbox_edge_sidecar::manifest::ManifestIndex,
-) -> Result<()> {
+) -> Result<BTreeSet<String>> {
     let records = store
         .activation_records_mixed()
         .context("loading activation records for workspace reconstruction")?;
     let mut index = manifest.clone();
-    let mut reconstructed = 0u32;
+    let mut reconstructed = BTreeSet::new();
     for activation in &records {
         let project_id = activation.project_id();
         // Only reconstruct for collected projects missing a workspace entry.
@@ -3390,17 +3390,46 @@ fn reconstruct_workspace_entries_from_activations(
                 git_overlay_managed: true,
             },
         );
-        reconstructed += 1;
+        reconstructed.insert(project_id.to_string());
     }
-    if reconstructed > 0 {
+    if !reconstructed.is_empty() {
         tracing::info!(
-            reconstructed,
+            reconstructed = reconstructed.len(),
             "pre-bind: reconstructed workspace entries from validated activation records"
         );
         index
             .write_atomic(edges_dir)
             .context("writing reconstructed workspace entries to manifest index")?;
     }
+    Ok(reconstructed)
+}
+
+fn validate_pre_bind_workspace_materializations(
+    manifest: &bbox_edge_sidecar::manifest::ManifestIndex,
+    edges_dir: &std::path::Path,
+    reconstructed: &BTreeSet<String>,
+) -> Result<()> {
+    let mut strict = manifest.clone();
+    for project_id in reconstructed {
+        let entry = manifest.workspaces.get(project_id).ok_or_else(|| {
+            anyhow!("reconstructed workspace entry disappeared for project {project_id}")
+        })?;
+        if !entry
+            .code_source_selector
+            .as_deref()
+            .is_some_and(|selector| selector.starts_with("collected:"))
+        {
+            bail!("reconstructed workspace entry is not collected for project {project_id}");
+        }
+        if manifest.workspace_materialization_is_fully_absent(edges_dir, project_id)? {
+            tracing::info!(
+                project_id,
+                "pre-bind: admitting absent collected workspace materialization pending first republish"
+            );
+            strict.workspaces.remove(project_id);
+        }
+    }
+    strict.active_paths_for_loader(edges_dir)?;
     Ok(())
 }
 
@@ -3455,12 +3484,18 @@ pub(crate) fn pre_bind_catalog_recovery(
     // activation record against its generation (selector, generation id,
     // snapshot id, manifest path), so reconstructing the entry from the
     // validated record is safe (R2F2).
-    reconstruct_workspace_entries_from_activations(store, &edges_dir, &manifest)
-        .context("pre-bind: workspace entry reconstruction")?;
-    bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)
-        .context("pre-bind: reloading reconstructed workspace entries")?
-        .active_paths_for_loader(&edges_dir)
-        .context("pre-bind: validating active workspace materializations")?;
+    let reconstructed =
+        reconstruct_workspace_entries_from_activations(store, &edges_dir, &manifest)
+            .context("pre-bind: workspace entry reconstruction")?;
+    let reconstructed_manifest =
+        bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)
+            .context("pre-bind: reloading reconstructed workspace entries")?;
+    validate_pre_bind_workspace_materializations(
+        &reconstructed_manifest,
+        &edges_dir,
+        &reconstructed,
+    )
+    .context("pre-bind: validating active workspace materializations")?;
 
     // Step 7: detect incomplete retirement journals.
     detect_incomplete_retirement_journal(bro_home)
@@ -9236,7 +9271,7 @@ mod tests {
             vec![],
         );
         let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(
-            &crate::edge_index::edges_dir_from_bro_store(&root),
+            &crate::edge_index::edges_dir_from_bro_store(&root.join("bro")),
         )
         .unwrap();
         // No activation records in the store: chain must pass.
@@ -9304,7 +9339,7 @@ mod tests {
         // Catalog has a DIFFERENT scope than the activation.
         let snapshot = p4f_catalog_snapshot(project_id, catalog_scope, vec![]);
         let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(
-            &crate::edge_index::edges_dir_from_bro_store(&root),
+            &crate::edge_index::edges_dir_from_bro_store(&root.join("bro")),
         )
         .unwrap();
 
@@ -9353,7 +9388,7 @@ mod tests {
         // Manifest is fresh/empty: no workspace entry for the project.
         // This is the migrated-root shape: chain must PASS.
         let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(
-            &crate::edge_index::edges_dir_from_bro_store(&root),
+            &crate::edge_index::edges_dir_from_bro_store(&root.join("bro")),
         )
         .unwrap();
 
@@ -9362,6 +9397,126 @@ mod tests {
             result.is_ok(),
             "absent workspace entry must pass as pending-first-republish, got: {:?}",
             result.err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p4f_reconstructed_absence_boots_then_republish_makes_second_boot_strict() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let runtime = CodeSourceRuntime::for_test_catalog(&root);
+        let store = runtime.store();
+        let scope = PublishedScope::try_new("p4f-two-boot", ".").unwrap();
+        let project_id = "p_000000000000000000000000000004f4";
+        let generation_id = compute_generation_id(
+            "p4f-producer",
+            &empty_generation_descriptor(scope.clone(), &"a".repeat(40)),
+        );
+        let activation = p4f_seed_activation(
+            &store,
+            &root.join("code-sources"),
+            project_id,
+            &scope,
+            &generation_id,
+            None,
+            false,
+        );
+        let catalog = p4f_catalog_snapshot(project_id, scope.clone(), vec![]);
+        let edges_dir = crate::edge_index::edges_dir_from_bro_store(&root.join("bro"));
+        let initial = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir).unwrap();
+        validate_relationship_chain(&store, &catalog, &initial).unwrap();
+
+        let reconstructed =
+            reconstruct_workspace_entries_from_activations(&store, &edges_dir, &initial).unwrap();
+        assert_eq!(reconstructed, BTreeSet::from([project_id.to_string()]));
+        let reconstructed_manifest =
+            bbox_edge_sidecar::manifest::ManifestIndex::load(&edges_dir).unwrap();
+        validate_pre_bind_workspace_materializations(
+            &reconstructed_manifest,
+            &edges_dir,
+            &reconstructed,
+        )
+        .unwrap();
+
+        let snapshot_path = bbox_edge_sidecar::snapshot::snapshot_dir(
+            &edges_dir,
+            project_id,
+            &activation.snapshot_id,
+        );
+        fs::create_dir_all(snapshot_path.parent().unwrap()).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), &snapshot_path).unwrap();
+        assert!(
+            validate_pre_bind_workspace_materializations(
+                &reconstructed_manifest,
+                &edges_dir,
+                &reconstructed,
+            )
+            .is_err()
+        );
+        fs::remove_file(&snapshot_path).unwrap();
+
+        let mut traversal = reconstructed_manifest.clone();
+        traversal
+            .workspaces
+            .get_mut(project_id)
+            .unwrap()
+            .active_snapshot = Some("../outside".to_string());
+        assert!(
+            validate_pre_bind_workspace_materializations(&traversal, &edges_dir, &reconstructed,)
+                .is_err()
+        );
+
+        let empty_edges: Vec<bbox_edge_sidecar::edge_sidecar::Edge> = Vec::new();
+        bbox_edge_sidecar::snapshot::write_snapshot_files(
+            &edges_dir,
+            project_id,
+            &activation.snapshot_id,
+            &[("project.jsonl", &empty_edges)],
+        )
+        .unwrap();
+        bbox_edge_sidecar::snapshot::activate_collected_snapshot(
+            &edges_dir,
+            project_id,
+            "repo-two-boot",
+            &"a".repeat(40),
+            &generation_id,
+            &activation.selector,
+            &activation.snapshot_id,
+        )
+        .unwrap();
+
+        let second_boot = bbox_edge_sidecar::manifest::ManifestIndex::load(&edges_dir).unwrap();
+        validate_relationship_chain(&store, &catalog, &second_boot).unwrap();
+        validate_pre_bind_workspace_materializations(&second_boot, &edges_dir, &BTreeSet::new())
+            .unwrap();
+    }
+
+    #[test]
+    fn p4f_absent_local_materialization_remains_drift() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let edges_dir = crate::edge_index::edges_dir_from_bro_store(&root.join("bro"));
+        let project_id = "p_000000000000000000000000000004f5";
+        let mut manifest = bbox_edge_sidecar::manifest::ManifestIndex::new();
+        manifest.workspaces.insert(
+            project_id.to_string(),
+            bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
+                manifest: format!("workspace/{project_id}/manifest.json"),
+                active_snapshot: Some(format!("workspace/{project_id}/snapshots/local-missing")),
+                dirty_overlay: None,
+                repo_materialization: None,
+                code_source_selector: Some(bbox_code_source::local_selector(project_id)),
+                code_source_generation: Some("local".to_string()),
+                git_overlay: None,
+                git_overlay_managed: false,
+            },
+        );
+        manifest.write_atomic(&edges_dir).unwrap();
+        assert!(
+            validate_pre_bind_workspace_materializations(&manifest, &edges_dir, &BTreeSet::new(),)
+                .is_err()
         );
     }
 
@@ -9568,7 +9723,7 @@ mod tests {
         // pending-first-republish so the chain reaches link 6.
         let snapshot = p4f_catalog_snapshot(project_id, scope, vec![]);
         let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(
-            &crate::edge_index::edges_dir_from_bro_store(&root),
+            &crate::edge_index::edges_dir_from_bro_store(&root.join("bro")),
         )
         .unwrap();
 

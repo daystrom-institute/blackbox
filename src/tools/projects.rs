@@ -1099,7 +1099,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
-        BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
+        BlackboxServer::new(Arc::new(SharedState::for_test(&tmp.path().join("bro"))))
     }
 
     #[tokio::test]

@@ -3404,7 +3404,7 @@ mod tests {
         use std::time::Duration;
 
         let tmp = tempfile::tempdir().unwrap();
-        let state = Arc::new(SharedState::for_test(tmp.path()));
+        let state = Arc::new(SharedState::for_test(&tmp.path().join("bro")));
 
         // Hold a reader on the combined view so the rebuild's final write blocks.
         let held = state.code_read_view.read();

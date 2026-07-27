@@ -426,6 +426,36 @@ impl ManifestIndex {
         Ok(result)
     }
 
+    /// Returns true only when every filesystem object referenced by one
+    /// writer-shaped workspace entry is absent. Any malformed path, symlink,
+    /// unsupported type, or partial presence is either an error or `false`.
+    ///
+    /// This supports the catalog migration pending-first-republish state:
+    /// migration may reconstruct a collected entry before the daemon's first
+    /// republish stages its snapshot and manifest objects.
+    pub fn workspace_materialization_is_fully_absent(
+        &self,
+        edges_dir: &Path,
+        project_id: &str,
+    ) -> Result<bool> {
+        let entry = self
+            .workspaces
+            .get(project_id)
+            .ok_or_else(|| anyhow::anyhow!("workspace entry is missing for {project_id}"))?;
+        validate_workspace_entry_shape(project_id, entry)?;
+        let mut any_present = confined_regular_file(edges_dir, &entry.manifest)?.is_some();
+        if let Some(snapshot) = entry.active_snapshot.as_deref() {
+            any_present |= confined_directory_exists(edges_dir, snapshot)?;
+        }
+        if let Some(overlay) = entry.dirty_overlay.as_deref() {
+            any_present |= confined_directory_exists(edges_dir, overlay)?;
+        }
+        if let Some(repo) = entry.repo_materialization.as_deref() {
+            any_present |= confined_directory_exists(edges_dir, repo)?;
+        }
+        Ok(!any_present)
+    }
+
     pub fn protected_materialized_paths(&self, edges_dir: &Path) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         for (project_id, entry) in &self.workspaces {
@@ -838,8 +868,19 @@ fn confined_directory_exists(edges_dir: &Path, relative: &str) -> Result<bool> {
 #[cfg(unix)]
 fn confined_regular_file(edges_dir: &Path, relative: &str) -> Result<Option<(PathBuf, fs::File)>> {
     let materialized = open_materialized_dir(edges_dir, false)?;
-    Ok(open_confined_regular(&materialized, relative)?
-        .map(|file| (materialized_dir(edges_dir).join(relative), file)))
+    match open_confined_regular(&materialized, relative) {
+        Ok(file) => Ok(file.map(|file| (materialized_dir(edges_dir).join(relative), file))),
+        Err(error)
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|io| io.kind() == io::ErrorKind::NotFound)
+            }) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(unix)]
