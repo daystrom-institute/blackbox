@@ -382,16 +382,31 @@ fn list_directory_names(directory: &fs::File) -> Result<Vec<std::ffi::OsString>>
         return Err(std::io::Error::last_os_error().into());
     }
     let mut names = Vec::new();
+    let mut entries_seen = 0_isize;
     loop {
+        set_readdir_errno(0);
         // SAFETY: stream remains valid until closed below.
         let entry = unsafe { libc::readdir(stream) };
         if entry.is_null() {
-            break;
+            let errno = readdir_errno();
+            if errno == 0 {
+                break;
+            }
+            // SAFETY: stream was returned by fdopendir and is closed once.
+            unsafe { libc::closedir(stream) };
+            return Err(std::io::Error::from_raw_os_error(errno).into());
         }
         // SAFETY: d_name is NUL-terminated by readdir.
         let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
         if name != b"." && name != b".." {
             names.push(std::ffi::OsString::from_vec(name.to_vec()));
+            entries_seen += 1;
+            #[cfg(test)]
+            if TEST_READDIR_FAIL_AFTER.load(std::sync::atomic::Ordering::SeqCst) == entries_seen {
+                // SAFETY: stream was returned by fdopendir and is closed once.
+                unsafe { libc::closedir(stream) };
+                return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+            }
         }
     }
     // SAFETY: stream was returned by fdopendir and is closed exactly once.
@@ -400,6 +415,39 @@ fn list_directory_names(directory: &fs::File) -> Result<Vec<std::ffi::OsString>>
     }
     names.sort();
     Ok(names)
+}
+
+#[cfg(test)]
+static TEST_READDIR_FAIL_AFTER: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(-1);
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+fn readdir_errno_location() -> *mut libc::c_int {
+    // SAFETY: libc returns the calling thread's errno pointer.
+    unsafe { libc::__error() }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn readdir_errno_location() -> *mut libc::c_int {
+    // SAFETY: libc returns the calling thread's errno pointer.
+    unsafe { libc::__errno_location() }
+}
+
+fn set_readdir_errno(value: libc::c_int) {
+    // SAFETY: the pointer is the current thread's writable errno slot.
+    unsafe { *readdir_errno_location() = value };
+}
+
+fn readdir_errno() -> libc::c_int {
+    // SAFETY: the pointer is the current thread's readable errno slot.
+    unsafe { *readdir_errno_location() }
 }
 
 #[cfg(unix)]
@@ -1227,6 +1275,31 @@ mod tests {
         if unsafe { libc::mknod(device_c.as_ptr(), libc::S_IFCHR | 0o600, 0) } == 0 {
             assert!(capture_project_retirement_inventory(&root, "project-a").is_err());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retirement_capture_propagates_mid_enumeration_readdir_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        for namespace in ["a", "b"] {
+            fs::create_dir_all(root.join("derived").join(namespace)).unwrap();
+            fs::write(
+                root.join("derived").join(namespace).join("project-a.jsonl"),
+                b"{}\n",
+            )
+            .unwrap();
+        }
+        TEST_READDIR_FAIL_AFTER.store(1, std::sync::atomic::Ordering::SeqCst);
+        let result = capture_project_retirement_inventory(&root, "project-a");
+        TEST_READDIR_FAIL_AFTER.store(-1, std::sync::atomic::Ordering::SeqCst);
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .chain()
+                .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                .any(|error| error.raw_os_error() == Some(libc::EIO))
+        );
     }
 
     #[test]

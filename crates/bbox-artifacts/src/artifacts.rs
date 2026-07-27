@@ -431,19 +431,6 @@ pub fn capture_project_catalog_retirement_targets(
         let payload_relative = payload
             .strip_prefix(root)
             .context("artifact payload escaped its store root")?;
-        let payload_tombstone = artifact_payload_tombstone(directory)?;
-        let payload_path = if payload.is_file() {
-            payload.clone()
-        } else if payload_tombstone.is_file() {
-            payload_tombstone
-        } else {
-            bail!("owned artifact metadata has no payload");
-        };
-        let payload_hash = hash_bounded_regular_nofollow(
-            &payload_path,
-            MAX_RETIREMENT_PAYLOAD_BYTES,
-            &mut aggregate_bytes,
-        )?;
         let canonical_owner = artifact_owner_identity(&metadata)?;
         let mut version_metadata = Vec::new();
         let versions = directory.join(".versions");
@@ -489,6 +476,19 @@ pub fn capture_project_catalog_retirement_targets(
         if !expected_owner {
             continue;
         }
+        let payload_tombstone = artifact_payload_tombstone(directory)?;
+        let payload_path = if payload.is_file() {
+            payload.clone()
+        } else if payload_tombstone.is_file() {
+            payload_tombstone
+        } else {
+            bail!("owned artifact metadata has no payload");
+        };
+        let payload_hash = hash_bounded_regular_nofollow(
+            &payload_path,
+            MAX_RETIREMENT_PAYLOAD_BYTES,
+            &mut aggregate_bytes,
+        )?;
         let target = ArtifactRetirementTarget {
             owner_project_id: project_id.to_string(),
             legacy_project_path: metadata.project_id.is_none().then(|| {
