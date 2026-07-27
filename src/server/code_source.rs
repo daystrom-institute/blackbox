@@ -3414,20 +3414,44 @@ fn try_automatic_bridge_clear(state: &Arc<SharedState>, project_id: &str) -> boo
     if !bridge_is_stale {
         return false;
     }
-    // Gather verified evidence: the current effective generation id
-    // from the activation record (F4: automatic path must verify the
-    // bridge is actually stale, not just compare catalog scope).
-    let effective_generation_id = state
-        .code_sources
-        .store()
-        .load_activation_mixed(project_id)
-        .ok()
-        .flatten()
-        .map(|a| a.generation_id().to_string());
+    // Gather verified evidence from the activation record (F4: automatic
+    // path must verify the bridge is actually stale). R3F3: enumerate the
+    // actual retained generation set from the store instead of passing an
+    // empty set (which would make mode 1 treat any bridge generation as
+    // absent without proof). Also pass the effective scope for completeness.
+    let store = state.code_sources.store();
+    let activation = store.load_activation_mixed(project_id).ok().flatten();
+    let effective_generation_id = activation.as_ref().map(|a| a.generation_id().to_string());
+    let effective_scope = activation
+        .as_ref()
+        .and_then(|a| a.published_scope().cloned());
+    // Enumerate retained generation ids from the store's scope directories.
+    let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
+    let code_source_dir = edges_dir
+        .parent()
+        .unwrap_or(&state.store_dir)
+        .join("code-sources");
+    let mut retained_generation_ids = std::collections::BTreeSet::new();
+    if let Ok(paths) = bbox_code_source_store::CodeSourceStorePaths::new(&code_source_dir) {
+        let scopes_dir = paths.root().join("scopes");
+        if let Ok(scope_entries) = std::fs::read_dir(&scopes_dir) {
+            for scope_entry in scope_entries.flatten() {
+                let gen_dir = scope_entry.path().join("generations");
+                if let Ok(gen_entries) = std::fs::read_dir(&gen_dir) {
+                    for gen_entry in gen_entries.flatten() {
+                        if let Some(name) = gen_entry.file_name().to_str() {
+                            retained_generation_ids
+                                .insert(name.trim_end_matches(".json").to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
     let evidence = bbox_indexing::project_catalog_admin::ScopeBridgeClearEvidence {
         effective_generation_id,
-        effective_scope: None,
-        retained_generation_ids: std::collections::BTreeSet::new(),
+        effective_scope,
+        retained_generation_ids,
     };
     // Trigger the bridge-clear transaction.
     match clear_scope_bridge(
@@ -10271,6 +10295,38 @@ mod tests {
         assert!(
             body.contains("git_overlay_managed: true"),
             "reconstruction must set git_overlay_managed: true to match the collected writer"
+        );
+    }
+
+    // ---- R3F3: automatic bridge-clear evidence ----
+
+    #[test]
+    fn r3f3_automatic_bridge_clear_enumerates_retained_set() {
+        let src = self_source();
+        let body = extract_fn_body_again(&src, "try_automatic_bridge_clear");
+        // R3F3: the automatic path must enumerate the actual store
+        // contents to build the retained set, not fabricate an empty set
+        // in the evidence struct.
+        assert!(
+            body.contains("retained_generation_ids"),
+            "automatic bridge-clear must build retained_generation_ids from store enumeration"
+        );
+        assert!(
+            body.contains("read_dir"),
+            "automatic bridge-clear must read directories to enumerate generations"
+        );
+        assert!(
+            body.contains("effective_scope"),
+            "automatic bridge-clear must pass effective_scope evidence"
+        );
+        // The evidence struct must use the enumerated set, not an inline
+        // BTreeSet::new() in the struct literal.
+        let ev_pos = body.find("ScopeBridgeClearEvidence {").unwrap_or(usize::MAX);
+        let ev_close = body[ev_pos..].find("}").map(|p| ev_pos + p).unwrap_or(usize::MAX);
+        let ev_literal = &body[ev_pos..ev_close];
+        assert!(
+            !ev_literal.contains("BTreeSet::new()"),
+            "evidence struct must not inline an empty retained set"
         );
     }
 }

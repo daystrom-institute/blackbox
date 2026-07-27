@@ -1859,18 +1859,19 @@ pub fn clear_scope_bridge(
                     "newest record has no bridge generation",
                 )
             })?;
-            let Some(effective_gen) = &evidence.effective_generation_id else {
-                return Err(admin_error(
-                    "error.project_catalog_scope_bridge_clear_missing_evidence",
-                    "mode 1 requires effective_generation_id evidence from a verified code-source probe",
-                ));
-            };
-            // The bridge generation must not be the effective generation.
-            if bridge_gen == effective_gen {
-                return Err(admin_error(
-                    "error.project_catalog_scope_bridge_clear_bridge_still_live",
-                    "the bridge generation is still the effective activation; cannot clear a live bridge",
-                ));
+            // R3F3: support the no-activation dangling-bridge case. When
+            // there is no effective activation (None), the bridge is
+            // genuinely dangling and can be cleared if the bridge generation
+            // is absent from the retained set. When there IS an effective
+            // activation, the bridge generation must not be the effective
+            // generation (it must have been superseded).
+            if let Some(effective_gen) = &evidence.effective_generation_id {
+                if bridge_gen == effective_gen {
+                    return Err(admin_error(
+                        "error.project_catalog_scope_bridge_clear_bridge_still_live",
+                        "the bridge generation is still the effective activation; cannot clear a live bridge",
+                    ));
+                }
             }
             // R2F4: the bridge generation must be absent from the retained
             // set (proves retirement via store enumeration, not id inequality).
@@ -4355,12 +4356,46 @@ mod tests {
         (tmp, store, pid)
     }
 
-    /// R2F4 mode 1: refuses when evidence (effective_generation_id) is missing.
+    /// R3F3 mode 1: the no-activation dangling-bridge case succeeds when
+    /// the bridge generation is absent from the retained set. Previously
+    /// mode 1 required effective_generation_id unconditionally, making a
+    /// dangling bridge with no activation unrecoverable.
     #[test]
-    fn r2f4_mode1_refuses_missing_evidence() {
-        let (_tmp, store, pid) = f4_store_with_bridge(Some("abc123"));
+    fn r3f3_mode1_dangling_bridge_no_activation_succeeds() {
+        let (_tmp, store, pid) = f4_store_with_bridge(Some("dangling_gen"));
         let epoch = store.snapshot().unwrap().epoch();
+        // No effective activation (dangling bridge), empty retained set
+        // proves the bridge generation is absent from the store.
         let evidence = ScopeBridgeClearEvidence::default();
+        let result = clear_scope_bridge(
+            &store,
+            epoch,
+            &pid,
+            ScopeBridgeClearMode::DanglingReference,
+            &evidence,
+        );
+        assert!(
+            result.is_ok(),
+            "dangling bridge with no activation and absent generation must clear, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// R3F3 mode 1: dangling bridge still refuses when the bridge
+    /// generation IS in the retained set (not actually retired).
+    #[test]
+    fn r3f3_mode1_dangling_bridge_retained_generation_refuses() {
+        let (_tmp, store, pid) = f4_store_with_bridge(Some("still_retained"));
+        let epoch = store.snapshot().unwrap().epoch();
+        let evidence = ScopeBridgeClearEvidence {
+            effective_generation_id: None,
+            effective_scope: None,
+            retained_generation_ids: {
+                let mut s = std::collections::BTreeSet::new();
+                s.insert("still_retained".to_string());
+                s
+            },
+        };
         let result = clear_scope_bridge(
             &store,
             epoch,
@@ -4371,8 +4406,8 @@ mod tests {
         assert!(result.is_err());
         let err = format!("{:?}", result.unwrap_err());
         assert!(
-            err.contains("missing_evidence"),
-            "must refuse with missing_evidence, got: {err}"
+            err.contains("bridge_retained"),
+            "must refuse when bridge gen is in retained set, got: {err}"
         );
     }
 

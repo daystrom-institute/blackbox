@@ -741,25 +741,62 @@ fn probe_bridge_clear_evidence(
         ),
         None => (None, None),
     };
-    // R2F4: enumerate retained generation ids from the store to prove
-    // absence for mode 1. Walk every scope directory and collect all
-    // generation ids that exist on disk.
+    // R3F3: enumerate retained generation ids from the store to prove
+    // absence for mode 1. Every read error must propagate as a missing-
+    // evidence failure, NOT be silently ignored. Silently ignoring a
+    // read error on a scope or generation directory makes mode 1 treat
+    // the generation as absent (fail-open), which admits clearing a
+    // bridge that still has a retained generation.
     let mut retained_generation_ids = std::collections::BTreeSet::new();
-    if let Ok(paths) = bbox_code_source_store::CodeSourceStorePaths::new(&code_source_dir) {
-        let scopes_dir = paths.root().join("scopes");
-        if let Ok(scope_entries) = std::fs::read_dir(&scopes_dir) {
-            for scope_entry in scope_entries.filter_map(|e| e.ok()) {
+    let paths =
+        bbox_code_source_store::CodeSourceStorePaths::new(&code_source_dir).map_err(|e| {
+            CommandFailure::new(
+                "error.project_catalog_cli_bridge_clear_evidence",
+                format!("failed to resolve code-source store paths: {e}"),
+            )
+        })?;
+    let scopes_dir = paths.root().join("scopes");
+    match std::fs::read_dir(&scopes_dir) {
+        Ok(scope_entries) => {
+            for scope_entry in scope_entries {
+                let scope_entry = scope_entry.map_err(|e| {
+                    CommandFailure::new(
+                        "error.project_catalog_cli_bridge_clear_evidence",
+                        format!("failed to read scope directory entry: {e}"),
+                    )
+                })?;
                 let gen_dir = scope_entry.path().join("generations");
-                if let Ok(gen_entries) = std::fs::read_dir(&gen_dir) {
-                    for gen_entry in gen_entries.filter_map(|e| e.ok()) {
-                        if let Some(name) = gen_entry.file_name().to_str() {
-                            // Strip .json extension if present.
-                            let gen_id = name.trim_end_matches(".json");
-                            retained_generation_ids.insert(gen_id.to_string());
+                match std::fs::read_dir(&gen_dir) {
+                    Ok(gen_entries) => {
+                        for gen_entry in gen_entries {
+                            let gen_entry = gen_entry.map_err(|e| {
+                                CommandFailure::new(
+                                    "error.project_catalog_cli_bridge_clear_evidence",
+                                    format!("failed to read generation directory entry: {e}"),
+                                )
+                            })?;
+                            if let Some(name) = gen_entry.file_name().to_str() {
+                                let gen_id = name.trim_end_matches(".json");
+                                retained_generation_ids.insert(gen_id.to_string());
+                            }
                         }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(CommandFailure::new(
+                            "error.project_catalog_cli_bridge_clear_evidence",
+                            format!("failed to read generation directory: {e}"),
+                        ));
                     }
                 }
             }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(CommandFailure::new(
+                "error.project_catalog_cli_bridge_clear_evidence",
+                format!("failed to read scopes directory: {e}"),
+            ));
         }
     }
     Ok(project_catalog_admin::ScopeBridgeClearEvidence {
