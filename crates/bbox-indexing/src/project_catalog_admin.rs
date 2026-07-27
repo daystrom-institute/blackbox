@@ -2408,6 +2408,16 @@ fn archived_retirement_journal_path(
         .join(format!("{project_id}.json"))
 }
 
+fn retirement_archive_marker_path(
+    bro_home: &std::path::Path,
+    project_id: &ProjectId,
+) -> std::path::PathBuf {
+    bro_home
+        .join("retirement-journals")
+        .join("archive")
+        .join(format!("{project_id}.archive-pending"))
+}
+
 fn retirement_blob_inventory_path(journal_path: &std::path::Path) -> std::path::PathBuf {
     journal_path.with_extension("blobs.json")
 }
@@ -2429,7 +2439,7 @@ pub fn load_retirement_journal(
     load_retirement_journal_from_path(&path, project_id)
 }
 
-fn load_archived_retirement_journal(
+pub fn load_archived_retirement_journal(
     bro_home: &std::path::Path,
     project_id: &ProjectId,
 ) -> Result<Option<ProjectRetirementJournal>, RetirementJournalError> {
@@ -2622,7 +2632,7 @@ fn validate_journal_evidence_shape(
     Ok(())
 }
 
-fn retirement_evidence_sha256(evidence: &RetirementJournalEvidence) -> String {
+pub fn retirement_evidence_sha256(evidence: &RetirementJournalEvidence) -> String {
     let bytes = serde_json::to_vec(&(
         &evidence.owner_project_id,
         &evidence.catalog_scope,
@@ -2913,22 +2923,45 @@ pub fn archive_retirement_journal(
     project_id: &ProjectId,
 ) -> Result<(), RetirementJournalError> {
     let path = retirement_journal_path(bro_home, project_id);
-    if path.is_file() {
-        let dir = bro_home.join("retirement-journals");
-        let archive_dir = dir.join("archive");
-        std::fs::create_dir_all(&archive_dir)?;
-        let archived = archived_retirement_journal_path(bro_home, project_id);
-        let sidecar = retirement_blob_inventory_path(&path);
-        let archived_sidecar = retirement_blob_inventory_path(&archived);
-        std::fs::rename(&path, &archived)?;
+    let dir = bro_home.join("retirement-journals");
+    let archive_dir = dir.join("archive");
+    std::fs::create_dir_all(&archive_dir)?;
+    let archived = archived_retirement_journal_path(bro_home, project_id);
+    let sidecar = retirement_blob_inventory_path(&path);
+    let archived_sidecar = retirement_blob_inventory_path(&archived);
+    let marker = retirement_archive_marker_path(bro_home, project_id);
+    if path.is_file() || marker.is_file() {
+        bbox_corpus_core::json_store::with_store_lock(&marker, || {
+            bbox_corpus_core::json_store::atomic_write_bytes_locked(
+                &marker,
+                project_id.as_str().as_bytes(),
+            )
+        })
+        .map_err(|error| RetirementJournalError::other(error.to_string()))?;
         if sidecar.is_file() {
+            if archived_sidecar.exists() {
+                return Err(RetirementJournalError::other(
+                    "retirement archive has conflicting blob sidecars",
+                ));
+            }
             std::fs::rename(&sidecar, &archived_sidecar)?;
+            std::fs::File::open(&archive_dir)?.sync_all()?;
+            std::fs::File::open(&dir)?.sync_all()?;
         }
-        if let Ok(handle) = std::fs::File::open(&archive_dir) {
-            let _ = handle.sync_all();
+        if path.is_file() {
+            if archived.exists() {
+                return Err(RetirementJournalError::other(
+                    "retirement archive has conflicting journals",
+                ));
+            }
+            std::fs::rename(&path, &archived)?;
+            std::fs::File::open(&archive_dir)?.sync_all()?;
+            std::fs::File::open(&dir)?.sync_all()?;
         }
-        if let Ok(handle) = std::fs::File::open(&dir) {
-            let _ = handle.sync_all();
+        match std::fs::remove_file(&marker) {
+            Ok(()) => std::fs::File::open(&archive_dir)?.sync_all()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
     }
     Ok(())
@@ -3215,6 +3248,9 @@ pub fn retire_project_journaled_with(
     execute: bool,
     workers: &mut dyn RetirementDischargeWorkers,
 ) -> AdminResult<(RetirementPreflight, Option<ProjectRetirementJournal>)> {
+    if retirement_archive_marker_path(bro_home, project_id).is_file() {
+        archive_retirement_journal(bro_home, project_id).map_err(retirement_journal_admin_error)?;
+    }
     // Step 1: preflight (section 11.2).
     let state = store.snapshot()?;
     let catalog_epoch = state.epoch();
@@ -3258,6 +3294,8 @@ pub fn retire_project_journaled_with(
         Some(j) if j.current_stage == RetirementJournalStage::Complete => {
             // Already complete. Verify quiescence (section 11.4).
             workers.verify_retirement_quiescent(project_id, &j.evidence)?;
+            archive_retirement_journal(bro_home, project_id)
+                .map_err(retirement_journal_admin_error)?;
             return Ok((preflight, Some(j)));
         }
         Some(j) => j,
@@ -5616,6 +5654,64 @@ mod tests {
         );
         let journal_file = dir.join(format!("{pid}.json"));
         assert!(journal_file.exists(), "journal file must exist");
+    }
+
+    #[test]
+    fn complete_active_journal_is_verified_and_archived_on_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects.json");
+        let store = ProjectCatalogStore::initialize_empty(&projects).unwrap();
+        let pid = ProjectId::parse(PROJECT).unwrap();
+        let mut journal = ProjectRetirementJournal::new(pid.clone(), 1, "1");
+        while journal.current_stage != RetirementJournalStage::Complete {
+            journal.advance("2");
+        }
+        save_retirement_journal(tmp.path(), &journal).unwrap();
+
+        let mut workers = NoopDischargeWorkers;
+        let evidence = RetireEvidence::default();
+        let (_, resumed) =
+            retire_project_journaled_with(&store, tmp.path(), &pid, &evidence, true, &mut workers)
+                .unwrap();
+        assert_eq!(
+            resumed.unwrap().current_stage,
+            RetirementJournalStage::Complete
+        );
+        assert!(!retirement_journal_path(tmp.path(), &pid).exists());
+        assert!(archived_retirement_journal_path(tmp.path(), &pid).exists());
+    }
+
+    #[test]
+    fn archive_marker_recovers_each_two_file_rename_boundary_twice() {
+        for journal_moved in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let pid = ProjectId::parse(PROJECT).unwrap();
+            let mut journal = ProjectRetirementJournal::new(pid.clone(), 1, "1");
+            while journal.current_stage != RetirementJournalStage::Complete {
+                journal.advance("2");
+            }
+            save_retirement_journal(tmp.path(), &journal).unwrap();
+            let active = retirement_journal_path(tmp.path(), &pid);
+            let archived = archived_retirement_journal_path(tmp.path(), &pid);
+            let active_sidecar = retirement_blob_inventory_path(&active);
+            let archived_sidecar = retirement_blob_inventory_path(&archived);
+            let marker = retirement_archive_marker_path(tmp.path(), &pid);
+            std::fs::create_dir_all(archived.parent().unwrap()).unwrap();
+            std::fs::write(&marker, pid.as_str()).unwrap();
+            if journal_moved {
+                std::fs::rename(&active, &archived).unwrap();
+            } else {
+                std::fs::rename(&active_sidecar, &archived_sidecar).unwrap();
+            }
+
+            archive_retirement_journal(tmp.path(), &pid).unwrap();
+            archive_retirement_journal(tmp.path(), &pid).unwrap();
+            assert!(!active.exists());
+            assert!(!active_sidecar.exists());
+            assert!(!marker.exists());
+            assert!(archived.exists());
+            assert!(archived_sidecar.exists());
+        }
     }
 
     /// F6: save_retirement_journal refuses to write through a symlink.

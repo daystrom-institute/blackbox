@@ -180,6 +180,33 @@ fn success_json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn retirement_plan_hash(
+    projects: &str,
+    project_id: &str,
+    config: &str,
+    bro_home: Option<&Path>,
+    index_path: &Path,
+) -> String {
+    let mut args = vec![
+        "project-catalog",
+        "retirement-journal",
+        "--projects-path",
+        projects,
+        "--project",
+        project_id,
+        "--config",
+        config,
+    ];
+    let bro_home_text = bro_home.map(|path| path.to_str().unwrap());
+    if let Some(path) = bro_home_text {
+        args.extend(["--bro-home", path]);
+    }
+    success_json(&run_with_isolated_index(&args, index_path))["result"]["plan_hash"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 fn assert_redacted(value: &Value, private_root: &Path) {
     let serialized = serde_json::to_string(value).unwrap();
     assert!(
@@ -789,6 +816,8 @@ fn retire_refuses_on_a_producer_assignment() {
     );
 
     let bro_home = root.join("bro-home");
+    let plan_hash =
+        retirement_plan_hash(projects, &project_id, config, Some(&bro_home), &index_path);
     let journal_refused = run_with_isolated_index(
         &[
             "project-catalog",
@@ -798,6 +827,8 @@ fn retire_refuses_on_a_producer_assignment() {
             "--project",
             &project_id,
             "--execute",
+            "--plan-hash",
+            &plan_hash,
             "--config",
             config,
             "--bro-home",
@@ -826,6 +857,8 @@ fn retire_refuses_on_a_producer_assignment() {
     prepared.seal_retirement_evidence();
     bbox_indexing::project_catalog_admin::save_retirement_journal(&bro_home, &prepared).unwrap();
 
+    let resume_plan_hash =
+        retirement_plan_hash(projects, &project_id, config, Some(&bro_home), &index_path);
     let resume_refused = run_with_isolated_index(
         &[
             "project-catalog",
@@ -835,6 +868,8 @@ fn retire_refuses_on_a_producer_assignment() {
             "--project",
             &project_id,
             "--execute",
+            "--plan-hash",
+            &resume_plan_hash,
             "--config",
             config,
             "--bro-home",
@@ -975,6 +1010,7 @@ fn retire_lifecycle_with_collected_activation_converges_and_is_idempotent() {
     // section).
 
     // Execute retire end-to-end through the journal path.
+    let plan_hash = retirement_plan_hash(projects, &project_id, config, None, &index_path);
     let retired = success_json(&run_with_isolated_index(
         &[
             "project-catalog",
@@ -984,6 +1020,8 @@ fn retire_lifecycle_with_collected_activation_converges_and_is_idempotent() {
             "--project",
             &project_id,
             "--execute",
+            "--plan-hash",
+            &plan_hash,
             "--config",
             config,
         ],
@@ -1019,6 +1057,7 @@ fn retire_lifecycle_with_collected_activation_converges_and_is_idempotent() {
 
     // Second run is idempotent: retiring an already-retired project
     // should succeed without error (no-op).
+    let second_plan_hash = retirement_plan_hash(projects, &project_id, config, None, &index_path);
     let second = success_json(&run_with_isolated_index(
         &[
             "project-catalog",
@@ -1028,6 +1067,8 @@ fn retire_lifecycle_with_collected_activation_converges_and_is_idempotent() {
             "--project",
             &project_id,
             "--execute",
+            "--plan-hash",
+            &second_plan_hash,
             "--config",
             config,
         ],
@@ -1044,6 +1085,7 @@ fn retire_lifecycle_with_collected_activation_converges_and_is_idempotent() {
     }
 
     write_collected_activation(&state, &project_id, &"f".repeat(64));
+    let recovery_plan_hash = retirement_plan_hash(projects, &project_id, config, None, &index_path);
     let recovery_refused = run_with_isolated_index(
         &[
             "project-catalog",
@@ -1053,6 +1095,8 @@ fn retire_lifecycle_with_collected_activation_converges_and_is_idempotent() {
             "--project",
             &project_id,
             "--execute",
+            "--plan-hash",
+            &recovery_plan_hash,
             "--config",
             config,
         ],
@@ -1062,7 +1106,54 @@ fn retire_lifecycle_with_collected_activation_converges_and_is_idempotent() {
     let recovery_refused: Value = serde_json::from_slice(&recovery_refused.stdout).unwrap();
     assert_eq!(
         recovery_refused["error"]["code"],
-        "error.project_catalog_retire_recovery_activation"
+        "error.project_catalog_retire_recovery_not_quiescent"
+    );
+}
+
+#[test]
+fn retirement_execute_refuses_when_prepared_plan_hash_drifts() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (state, projects_path, config_path, index_path) = isolated_state_root(&root);
+    let projects = projects_path.to_str().unwrap();
+    let config = config_path.to_str().unwrap();
+    let project_id = add_published_project(projects, "planfamily", ".", "2026-07-27T00:00:00Z");
+    let plan_hash = retirement_plan_hash(projects, &project_id, config, None, &index_path);
+
+    write(
+        &state.join("edges").join(format!("{project_id}.jsonl")),
+        b"{}\n",
+    );
+    let refused = run_with_isolated_index(
+        &[
+            "project-catalog",
+            "retirement-journal",
+            "--projects-path",
+            projects,
+            "--project",
+            &project_id,
+            "--execute",
+            "--plan-hash",
+            &plan_hash,
+            "--config",
+            config,
+        ],
+        &index_path,
+    );
+    assert!(!refused.status.success());
+    let refused: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(
+        refused["error"]["code"],
+        "error.project_catalog_retire_plan_drift"
+    );
+    assert!(
+        ProjectCatalogStore::open_existing(&projects_path)
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .catalog()
+            .projects
+            .contains_key(&ProjectId::parse(project_id).unwrap())
     );
 }
 
@@ -1130,6 +1221,7 @@ fn retire_refuses_on_a_slack_channel_binding() {
         "error.project_catalog_admin_retire_blocked"
     );
 
+    let plan_hash = retirement_plan_hash(projects, &project_id, config, None, &index_path);
     let journaled = run_with_isolated_index(
         &[
             "project-catalog",
@@ -1139,6 +1231,8 @@ fn retire_refuses_on_a_slack_channel_binding() {
             "--project",
             &project_id,
             "--execute",
+            "--plan-hash",
+            &plan_hash,
             "--config",
             config,
         ],

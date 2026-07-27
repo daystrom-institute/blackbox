@@ -217,6 +217,9 @@ struct RetirementJournalArgs {
     /// Resume or execute the journal discharge. Default reports only.
     #[arg(long)]
     execute: bool,
+    /// Prepared plan hash emitted by a prior dry-run.
+    #[arg(long, value_name = "SHA256", requires = "execute")]
+    plan_hash: Option<String>,
     /// Load the same configuration file used by blackboxd.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
@@ -1294,7 +1297,46 @@ fn execute_retirement_journal(
         .bro_home
         .unwrap_or_else(|| config.paths.bro_home.clone());
 
-    let mut workers = CliRetirementDischargeWorkers::new(&config, &args.store.projects_path);
+    let load_journal = |archived: bool| {
+        if archived {
+            project_catalog_admin::load_archived_retirement_journal(&bro_home, &project_id)
+        } else {
+            project_catalog_admin::load_retirement_journal(&bro_home, &project_id)
+        }
+        .map_err(|error| {
+            CommandFailure::new("error.project_catalog_retire_journal_io", error.to_string())
+        })
+    };
+    let planned_evidence = if let Some(journal) = load_journal(false)? {
+        journal.evidence
+    } else if let Some(journal) = load_journal(true)? {
+        journal.evidence
+    } else {
+        capture_retirement_evidence(&config, &args.store.projects_path, &project_id)?
+    };
+    let plan_hash = project_catalog_admin::retirement_evidence_sha256(&planned_evidence);
+    if args.execute {
+        let supplied = args.plan_hash.as_deref().ok_or_else(|| {
+            CommandFailure::new(
+                "error.project_catalog_retire_plan_hash_required",
+                "execute requires --plan-hash from a current dry-run",
+            )
+        })?;
+        if supplied != plan_hash {
+            return Err(CommandFailure::new(
+                "error.project_catalog_retire_plan_drift",
+                format!(
+                    "retirement plan changed: expected {supplied}, current plan is {plan_hash}"
+                ),
+            ));
+        }
+    }
+
+    let mut workers = CliRetirementDischargeWorkers::new(
+        &config,
+        &args.store.projects_path,
+        args.plan_hash.clone(),
+    );
     let (preflight, journal) = project_catalog_admin::retire_project_journaled_with(
         &store,
         &bro_home,
@@ -1314,6 +1356,15 @@ fn execute_retirement_journal(
         "catalog_epoch": preflight.catalog_epoch,
         "probed_reference_classes": RETIRE_REFERENCE_CLASSES,
         "unprobeable_reference_classes": probe.unprobeable,
+        "plan_hash": plan_hash,
+        "plan": {
+            "project_selectors": planned_evidence.project_selectors,
+            "owned_generations": planned_evidence.owned_generations,
+            "desired_pointers": planned_evidence.desired_pointers,
+            "owned_uploads": planned_evidence.owned_uploads,
+            "edge_paths": planned_evidence.edge_paths,
+            "blob_count": planned_evidence.owned_blob_hashes.len(),
+        },
         "journal": journal.as_ref().map(|j| serde_json::json!({
             "current_stage": format!("{:?}", j.current_stage),
             "completed_steps": j.completed_steps.len(),
@@ -1334,13 +1385,19 @@ fn execute_retirement_journal(
 struct CliRetirementDischargeWorkers<'a> {
     config: &'a config::Config,
     projects_path: &'a Path,
+    expected_plan_hash: Option<String>,
 }
 
 impl<'a> CliRetirementDischargeWorkers<'a> {
-    fn new(config: &'a config::Config, projects_path: &'a Path) -> Self {
+    fn new(
+        config: &'a config::Config,
+        projects_path: &'a Path,
+        expected_plan_hash: Option<String>,
+    ) -> Self {
         Self {
             config,
             projects_path,
+            expected_plan_hash,
         }
     }
 }
@@ -1350,7 +1407,19 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
         &mut self,
         project_id: &ProjectId,
     ) -> project_catalog_admin::AdminResult<project_catalog_admin::RetirementJournalEvidence> {
-        capture_retirement_evidence(self.config, self.projects_path, project_id)
+        let evidence = capture_retirement_evidence(self.config, self.projects_path, project_id)?;
+        if let Some(expected) = &self.expected_plan_hash {
+            let actual = project_catalog_admin::retirement_evidence_sha256(&evidence);
+            if &actual != expected {
+                return Err(project_catalog_admin::admin_error(
+                    "error.project_catalog_retire_plan_drift",
+                    format!(
+                        "retirement plan changed after preflight: expected {expected}, current {actual}"
+                    ),
+                ));
+            }
+        }
+        Ok(evidence)
     }
 
     fn validate_retirement_evidence(
@@ -1879,65 +1948,57 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
         project_id: &ProjectId,
         evidence: &project_catalog_admin::RetirementJournalEvidence,
     ) -> project_catalog_admin::AdminResult<()> {
-        self.verify_source_authority_quiesced(
-            &ProjectCatalogStore::open_existing(self.projects_path).map_err(|e| {
-                project_catalog_admin::admin_error(
-                    "error.project_catalog_retire_catalog_open",
-                    format!("failed to open project catalog during recovery: {e}"),
-                )
-            })?,
-            project_id,
-            evidence,
-        )?;
-        let code_sources = self.config.paths.state_dir.join("code-sources");
-        let store = bbox_code_source_store::CodeSourceStore::open(
-            &code_sources,
-            bbox_indexing::project_catalog_migration::project_catalog_migration_store_limits(
-                self.config,
-            ),
-        )
-        .map_err(|e| {
+        let store = ProjectCatalogStore::open_existing(self.projects_path).map_err(|e| {
             project_catalog_admin::admin_error(
-                "error.project_catalog_retire_code_source_open",
-                format!("failed to open code-source store during recovery: {e}"),
+                "error.project_catalog_retire_catalog_open",
+                format!("failed to open project catalog during recovery: {e}"),
             )
         })?;
-        if store
-            .load_activation_mixed(project_id.as_str())
-            .map_err(|e| {
-                project_catalog_admin::admin_error(
-                    "error.project_catalog_retire_recovery_activation",
-                    format!("failed to verify activation absence: {e}"),
-                )
-            })?
-            .is_some()
-        {
+        self.verify_source_authority_quiesced(&store, project_id, evidence)?;
+        validate_retirement_targets_absent(self.config, evidence)?;
+        let selectors = evidence.project_selectors.as_deref().ok_or_else(|| {
+            project_catalog_admin::admin_error(
+                "error.project_catalog_retire_evidence_incomplete",
+                "retirement evidence is missing project selectors",
+            )
+        })?;
+        let probe = probe_retire_evidence(
+            self.config,
+            self.projects_path,
+            &store,
+            project_id,
+            Some(selectors),
+        )
+        .map_err(|error| {
+            project_catalog_admin::admin_error(
+                "error.project_catalog_retire_recovery_reprobe",
+                format!("{}: {}", error.code, error.message),
+            )
+        })?;
+        if !probe.unprobeable.is_empty() {
             return Err(project_catalog_admin::admin_error(
-                "error.project_catalog_retire_recovery_activation",
-                format!("project {project_id} still has an activation record"),
+                "error.project_catalog_retire_recovery_reprobe",
+                format!(
+                    "post-cut recovery could not probe: {}",
+                    probe.unprobeable.join(", ")
+                ),
             ));
         }
-        for generation in &evidence.owned_generations {
-            if store
-                .retirement_generation_exists(
-                    &generation.published_scope,
-                    &generation.generation_id,
-                )
-                .map_err(|e| {
-                    project_catalog_admin::admin_error(
-                        "error.project_catalog_retire_recovery_generation",
-                        format!("failed to verify generation absence: {e}"),
-                    )
-                })?
-            {
-                return Err(project_catalog_admin::admin_error(
-                    "error.project_catalog_retire_recovery_generation",
-                    format!(
-                        "project {project_id} still has generation {}",
-                        generation.generation_id
-                    ),
-                ));
-            }
+        let remaining = probe
+            .evidence
+            .external_reference_counts
+            .iter()
+            .filter(|(_, count)| **count > 0)
+            .map(|(class, count)| format!("{class}={count}"))
+            .collect::<Vec<_>>();
+        if !remaining.is_empty() {
+            return Err(project_catalog_admin::admin_error(
+                "error.project_catalog_retire_recovery_not_quiescent",
+                format!(
+                    "post-cut recovery found owner rows that were not discharged: {}",
+                    remaining.join(", ")
+                ),
+            ));
         }
         Ok(())
     }
