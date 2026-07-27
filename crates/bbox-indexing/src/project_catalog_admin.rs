@@ -1448,6 +1448,10 @@ pub fn alias_decide(
 #[derive(Debug, Clone, Default)]
 pub struct RetireEvidence {
     pub external_reference_counts: std::collections::BTreeMap<String, u64>,
+    /// R2F1: classes that could not be probed. These are carried as
+    /// refusals in the final reprobe so an unprobeable class cannot be
+    /// mistaken for a discharged zero.
+    pub unprobeable_classes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2231,7 +2235,76 @@ pub fn load_retirement_journal(
             "retirement journal project_id does not match the filename",
         ));
     }
+    // R2F5: strict stage validation. The completed_steps vector must be
+    // exactly the ordered prefix from Prepared through the stage just
+    // before current_stage. This prevents stage forgery where an
+    // attacker edits current_stage to skip work.
+    validate_journal_stage_history(&journal)?;
     Ok(Some(journal))
+}
+
+/// R2F5: validate that completed_steps is an exactly ordered prefix
+/// ending at the stage just before current_stage, with monotonic
+/// timestamps and matching epoch.
+fn validate_journal_stage_history(
+    journal: &ProjectRetirementJournal,
+) -> Result<(), RetirementJournalError> {
+    // The expected steps are: Prepared, SourceAuthorityQuiesced, ...,
+    // up to the stage whose .next() == current_stage.
+    let mut expected = Vec::new();
+    let mut cursor = RetirementJournalStage::Prepared;
+    while cursor != journal.current_stage {
+        expected.push(cursor);
+        match cursor.next() {
+            Some(n) => cursor = n,
+            None => {
+                return Err(RetirementJournalError::other(
+                    "retirement journal current_stage has no predecessor in the ordered chain",
+                ));
+            }
+        }
+    }
+
+    if journal.completed_steps.len() != expected.len() {
+        return Err(RetirementJournalError::other(format!(
+            "retirement journal stage forgery detected: expected {} completed_steps for {:?}, got {}",
+            expected.len(),
+            journal.current_stage,
+            journal.completed_steps.len()
+        )));
+    }
+
+    let mut last_ts: Option<&str> = None;
+    for (i, expected_stage) in expected.iter().enumerate() {
+        let step = &journal.completed_steps[i];
+        if step.stage != *expected_stage {
+            return Err(RetirementJournalError::other(format!(
+                "retirement journal stage forgery detected: completed_steps[{}] is {:?}, expected {:?}",
+                i, step.stage, expected_stage
+            )));
+        }
+        // Monotonic timestamps: each completed_at must be >= the previous.
+        if let Some(prev) = last_ts {
+            if step.completed_at.as_str() < prev {
+                return Err(RetirementJournalError::other(format!(
+                    "retirement journal timestamp regression at step {}: {} < {}",
+                    i, step.completed_at, prev
+                )));
+            }
+        }
+        last_ts = Some(&step.completed_at);
+    }
+
+    // updated_at must be >= the last completed_at (or started_at if no steps).
+    let reference_ts = last_ts.unwrap_or(&journal.started_at);
+    if journal.updated_at.as_str() < reference_ts {
+        return Err(RetirementJournalError::other(format!(
+            "retirement journal updated_at {} predates last completed_at {}",
+            journal.updated_at, reference_ts
+        )));
+    }
+
+    Ok(())
 }
 
 /// Maximum byte size for a retirement journal (F6: bounded read).
@@ -2266,18 +2339,48 @@ pub fn save_retirement_journal(
     }
 
     // Atomic write with fsync: write to temp, fsync, rename, fsync dir.
+    // R2F5: use O_NOFOLLOW|O_EXCL to refuse pre-existing symlinks at the
+    // temp path. The parent directory is verified to be the expected
+    // retirement-journals directory (anchored).
     let tmp = path.with_extension("json.tmp");
     {
-        let mut file = std::fs::File::create(&tmp)?;
-        std::io::Write::write_all(&mut file, &bytes)?;
-        // Fsync the file before rename so the data is durable.
-        file.sync_all()?;
+        // R2F5: refuse if the temp path already exists as a symlink.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&tmp)
+                .map_err(|e| {
+                    if e.raw_os_error() == Some(libc::ELOOP) {
+                        RetirementJournalError::other(
+                            "retirement journal temp path is a symlink; refusing to write through it",
+                        )
+                    } else if e.raw_os_error() == Some(libc::EEXIST) {
+                        RetirementJournalError::other(
+                            "retirement journal temp path already exists; refusing to clobber",
+                        )
+                    } else {
+                        RetirementJournalError::from(e)
+                    }
+                })?;
+            std::io::Write::write_all(&mut file, &bytes)?;
+            // Fsync the file before rename so the data is durable.
+            file.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        {
+            let mut file = std::fs::File::create_new(&tmp)?;
+            std::io::Write::write_all(&mut file, &bytes)?;
+            file.sync_all()?;
+        }
     }
     std::fs::rename(&tmp, &path)?;
-    // Sync the directory so the rename is durable.
-    if let Ok(handle) = std::fs::File::open(&dir) {
-        let _ = handle.sync_all();
-    }
+    // R2F5: propagate directory-sync failures instead of silently ignoring.
+    let dir_handle = std::fs::File::open(&dir)?;
+    dir_handle.sync_all()?;
     Ok(())
 }
 
@@ -2610,6 +2713,19 @@ pub fn retire_project_journaled_with(
         let current_state = store.snapshot()?;
         if current_state.catalog().projects.contains_key(project_id) {
             let reprobed_evidence = workers.reprobe_evidence(store, project_id, evidence)?;
+            // R2F1: carry unprobeable classes through as refusals. An
+            // unprobeable class must not be mistaken for a discharged zero.
+            if !reprobed_evidence.unprobeable_classes.is_empty() {
+                return Err(admin_error(
+                    "error.project_catalog_retire_unprobeable_classes",
+                    format!(
+                        "cannot retire: {} class(es) could not be probed: {}; \
+                         investigate the store state before retrying",
+                        reprobed_evidence.unprobeable_classes.len(),
+                        reprobed_evidence.unprobeable_classes.join(", ")
+                    ),
+                ));
+            }
             let (_inventory, _commit) = retire_project(
                 store,
                 current_state.epoch(),
@@ -4623,5 +4739,125 @@ mod tests {
             err.contains("symlink"),
             "must refuse symlink with a clear message, got: {err}"
         );
+    }
+
+    // ---- R2F5: strict journal validation tests ----
+
+    /// R2F5: load refuses a journal whose current_stage claims
+    /// SourceAuthorityQuiesced but completed_steps is empty (forged skip).
+    #[test]
+    fn r2f5_load_refuses_forged_stage_skip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = ProjectId::parse(PROJECT).unwrap();
+        let mut journal = ProjectRetirementJournal::new(pid.clone(), 1, "2024-01-01T00:00:00Z");
+        // Forge: jump current_stage without recording the step.
+        journal.current_stage = RetirementJournalStage::SourceAuthorityQuiesced;
+        // completed_steps is still empty.
+        let path = retirement_journal_path(tmp.path(), &pid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+        let result = load_retirement_journal(tmp.path(), &pid);
+        assert!(result.is_err(), "must refuse a forged stage skip");
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("forgery") || err.contains("completed_steps"),
+            "must detect stage forgery, got: {err}"
+        );
+    }
+
+    /// R2F5: load refuses a journal with a wrong stage in completed_steps.
+    #[test]
+    fn r2f5_load_refuses_wrong_completed_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = ProjectId::parse(PROJECT).unwrap();
+        let mut journal = ProjectRetirementJournal::new(pid.clone(), 1, "2024-01-01T00:00:00Z");
+        // Record a wrong step (CatalogPairRemoved instead of Prepared).
+        journal.completed_steps.push(RetirementJournalStep {
+            stage: RetirementJournalStage::CatalogPairRemoved,
+            completed_at: "2024-01-01T00:00:01Z".into(),
+        });
+        journal.current_stage = RetirementJournalStage::SourceAuthorityQuiesced;
+        journal.updated_at = "2024-01-01T00:00:01Z".into();
+        let path = retirement_journal_path(tmp.path(), &pid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+        let result = load_retirement_journal(tmp.path(), &pid);
+        assert!(result.is_err(), "must refuse a wrong completed step");
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("forgery"),
+            "must detect wrong completed step, got: {err}"
+        );
+    }
+
+    /// R2F5: load refuses a journal with non-monotonic timestamps.
+    #[test]
+    fn r2f5_load_refuses_timestamp_regression() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = ProjectId::parse(PROJECT).unwrap();
+        let mut journal = ProjectRetirementJournal::new(pid.clone(), 1, "2024-01-01T00:00:05Z");
+        journal.completed_steps.push(RetirementJournalStep {
+            stage: RetirementJournalStage::Prepared,
+            completed_at: "2024-01-01T00:00:03Z".into(),
+        });
+        // Second step predates the first.
+        journal.completed_steps.push(RetirementJournalStep {
+            stage: RetirementJournalStage::SourceAuthorityQuiesced,
+            completed_at: "2024-01-01T00:00:02Z".into(),
+        });
+        journal.current_stage = RetirementJournalStage::CollectedGenerationsDischarged;
+        journal.updated_at = "2024-01-01T00:00:04Z".into();
+        let path = retirement_journal_path(tmp.path(), &pid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+        let result = load_retirement_journal(tmp.path(), &pid);
+        assert!(result.is_err(), "must refuse timestamp regression");
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("timestamp regression"),
+            "must detect timestamp regression, got: {err}"
+        );
+    }
+
+    /// R2F5: save refuses to write through a pre-existing temp symlink.
+    #[cfg(unix)]
+    #[test]
+    fn r2f5_save_refuses_tmp_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = ProjectId::parse(PROJECT).unwrap();
+        let dir = tmp.path().join("retirement-journals");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Create a symlink at the temp path.
+        let real_file = dir.join("real_tmp.json");
+        std::fs::write(&real_file, b"{}").unwrap();
+        let tmp_link = dir.join(format!("{pid}.json.tmp"));
+        std::os::unix::fs::symlink(&real_file, &tmp_link).unwrap();
+        let journal = ProjectRetirementJournal::new(pid.clone(), 1, "1");
+        let result = save_retirement_journal(tmp.path(), &journal);
+        assert!(
+            result.is_err(),
+            "must refuse to write through a temp symlink"
+        );
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("symlink") || err.contains("already exists"),
+            "must refuse temp symlink, got: {err}"
+        );
+    }
+
+    /// R2F5: load accepts a valid journal with correct stage history.
+    #[test]
+    fn r2f5_load_accepts_valid_stage_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = ProjectId::parse(PROJECT).unwrap();
+        let mut journal = ProjectRetirementJournal::new(pid.clone(), 1, "2024-01-01T00:00:00Z");
+        // Advance through two stages with monotonic timestamps.
+        journal.advance("2024-01-01T00:00:01Z");
+        journal.advance("2024-01-01T00:00:02Z");
+        let path = retirement_journal_path(tmp.path(), &pid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+        let result = load_retirement_journal(tmp.path(), &pid);
+        assert!(result.is_ok(), "valid journal must load: {:?}", result);
     }
 }

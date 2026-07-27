@@ -1151,34 +1151,41 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
         project_id: &ProjectId,
     ) -> project_catalog_admin::AdminResult<()> {
         let code_sources = self.config.paths.state_dir.join("code-sources");
-        if let Ok(store) = bbox_code_source_store::CodeSourceStore::open(
+        // R2F1: fail on store-open errors instead of silently ignoring them.
+        let store = bbox_code_source_store::CodeSourceStore::open(
             &code_sources,
             bbox_indexing::project_catalog_migration::project_catalog_migration_store_limits(
                 self.config,
             ),
-        ) {
-            // Clear the activation record (single-attempt, idempotent).
-            store.clear_activation(project_id.as_str()).map_err(|e| {
+        )
+        .map_err(|e| {
+            project_catalog_admin::admin_error(
+                "error.project_catalog_retire_code_source_open",
+                format!("failed to open code-source store: {e}"),
+            )
+        })?;
+
+        // Clear the activation record (single-attempt, idempotent).
+        store.clear_activation(project_id.as_str()).map_err(|e| {
+            project_catalog_admin::admin_error(
+                "error.project_catalog_retire_discharge_activation",
+                format!("failed to clear activation record: {e}"),
+            )
+        })?;
+
+        // Delete generation records for the project's scopes.
+        for scope_hash in scope_dirs(&code_sources) {
+            delete_generations_for_project_in_scope(
+                &code_sources,
+                &scope_hash,
+                project_id.as_str(),
+            )
+            .map_err(|e| {
                 project_catalog_admin::admin_error(
-                    "error.project_catalog_retire_discharge_activation",
-                    format!("failed to clear activation record: {e}"),
+                    "error.project_catalog_retire_discharge_generations",
+                    format!("failed to delete generation records: {e}"),
                 )
             })?;
-
-            // Delete generation records for the project's scopes.
-            for scope_hash in scope_dirs(&code_sources) {
-                delete_generations_for_project_in_scope(
-                    &code_sources,
-                    &scope_hash,
-                    project_id.as_str(),
-                )
-                .map_err(|e| {
-                    project_catalog_admin::admin_error(
-                        "error.project_catalog_retire_discharge_generations",
-                        format!("failed to delete generation records: {e}"),
-                    )
-                })?;
-            }
         }
 
         // Clear project-scoped coordination rows.
@@ -1293,53 +1300,50 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
                     format!("{}: {}", e.code, e.message),
                 )
             })?;
-        Ok(probe.evidence)
+        // R2F1: carry unprobeable classes through as refusals so they
+        // cannot be mistaken for a discharged zero.
+        let mut evidence = probe.evidence;
+        evidence.unprobeable_classes = probe.unprobeable.clone();
+        Ok(evidence)
     }
 
-    /// Verify source authority has quiesced: refuse if the project still
-    /// holds active producer assignments (F5). The journal must not advance
-    /// past SourceAuthorityQuiesced while auth assignments remain.
+    /// Verify source authority has quiesced (R2F1): refuse if the project
+    /// still holds an active activation record in the code-source store.
+    /// Derives assignments from current store authority (activation records),
+    /// NOT from the migration-era effective-source manifest. Attachment
+    /// presence does NOT refuse quiescence here; attachments are detached
+    /// in a later journal stage (AttachmentsDetached).
     fn verify_source_authority_quiesced(
         &mut self,
-        store: &ProjectCatalogStore,
+        _store: &ProjectCatalogStore,
         project_id: &ProjectId,
     ) -> project_catalog_admin::AdminResult<()> {
         let code_sources = self.config.paths.state_dir.join("code-sources");
-        if let Ok(paths) = bbox_code_source_store::CodeSourceStorePaths::new(&code_sources) {
-            let assignments = probe_producer_assignments(&paths.anchor(), project_id);
-            if assignments.class.is_present() {
-                return Err(project_catalog_admin::admin_error(
-                    "error.project_catalog_retire_auth_not_quiesced",
-                    format!(
-                        "project still holds active producer assignments; \
-                         retirement cannot proceed until they are revoked"
-                    ),
-                ));
-            }
-        }
-        // Also verify the catalog has no active attachments for this project.
-        let state = store.snapshot().map_err(|e| {
+        let store = bbox_code_source_store::CodeSourceStore::open(
+            &code_sources,
+            bbox_indexing::project_catalog_migration::project_catalog_migration_store_limits(
+                self.config,
+            ),
+        )
+        .map_err(|e| {
             project_catalog_admin::admin_error(
-                "error.project_catalog_cli_snapshot",
-                format!("snapshot error: {e}"),
+                "error.project_catalog_retire_code_source_open",
+                format!("failed to open code-source store: {e}"),
             )
         })?;
-        let active = state
-            .attachments()
-            .attachments
-            .values()
-            .filter(|row| {
-                &row.project_id == project_id
-                    && row.status == bbox_corpus_core::project_catalog::AttachmentStatus::Attached
-            })
-            .count();
-        if active > 0 {
+        // Check the current activation record for this project. If it
+        // exists, the project still has an active code-source assignment.
+        let activation = store.load_activation(project_id.as_str()).map_err(|e| {
+            project_catalog_admin::admin_error(
+                "error.project_catalog_retire_auth_probe",
+                format!("failed to probe activation record: {e}"),
+            )
+        })?;
+        if activation.is_some() {
             return Err(project_catalog_admin::admin_error(
                 "error.project_catalog_retire_auth_not_quiesced",
-                format!(
-                    "project still has {active} active attachment(s); \
-                     retirement cannot proceed until they are detached"
-                ),
+                "project still holds an active code-source activation record; \
+                 retirement cannot proceed until it is discharged",
             ));
         }
         Ok(())
@@ -1402,6 +1406,7 @@ enum ClassProbe {
 }
 
 impl ClassProbe {
+    #[allow(dead_code)]
     fn is_present(&self) -> bool {
         matches!(self, ClassProbe::Counted(n) if *n > 0)
     }
@@ -2016,10 +2021,11 @@ fn scope_dirs(code_sources: &Path) -> Vec<String> {
 }
 
 /// Delete generation records owned by `project_id` in one scope
-/// directory. Generation records are JSON files under
-/// `scopes/{scope_hash}/generations/`. Each contains a `producer_id`
-/// field that identifies the owning project. This is a single-attempt
-/// operation: if the directory or a record is absent, it is skipped.
+/// directory. Generation records are DIRECTORIES under
+/// `scopes/{scope_hash}/generations/{generation_id}/` containing a
+/// `metadata.json` file. Each metadata file contains a `producer_id`
+/// field. R2F1: reads metadata via the store's bounded reader, does not
+/// silently ignore errors, and deletes the full generation directory.
 fn delete_generations_for_project_in_scope(
     code_sources: &Path,
     scope_hash: &str,
@@ -2036,11 +2042,38 @@ fn delete_generations_for_project_in_scope(
     };
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
-        if let Ok(bytes) = std::fs::read(&path) {
-            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                if json.get("producer_id").and_then(|v| v.as_str()) == Some(project_id) {
-                    std::fs::remove_file(&path)?;
+        // Each generation is a directory. Skip non-directory entries.
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let metadata_path = path.join("metadata.json");
+        if !metadata_path.is_file() {
+            continue;
+        }
+        // R2F1: bounded read of metadata.json with error propagation.
+        match read_regular_nofollow(&metadata_path) {
+            Ok(Some(bytes)) => {
+                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if json.get("producer_id").and_then(|v| v.as_str()) == Some(project_id) {
+                        // R2F1: delete the full generation directory, not
+                        // just the metadata file.
+                        std::fs::remove_dir_all(&path)?;
+                    }
                 }
+            }
+            Ok(None) => { /* file vanished between checks; skip */ }
+            Err(()) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "failed to read generation metadata at {}",
+                        metadata_path.display()
+                    ),
+                ));
             }
         }
     }

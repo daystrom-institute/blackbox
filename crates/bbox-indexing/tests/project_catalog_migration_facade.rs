@@ -1640,6 +1640,7 @@ fn acceptance_retirement_journaled_converges_exactly_once() {
 
     let evidence = RetireEvidence {
         external_reference_counts: Default::default(),
+        unprobeable_classes: Vec::new(),
     };
 
     let (preflight, journal) =
@@ -1741,6 +1742,7 @@ fn acceptance_retirement_journaled_refuses_ready_materialization() {
 
     let evidence = RetireEvidence {
         external_reference_counts: Default::default(),
+        unprobeable_classes: Vec::new(),
     };
 
     let result = retire_project_journaled(&store, &bro_home, &project_id, &evidence, true);
@@ -1810,6 +1812,7 @@ fn acceptance_retirement_preflight_does_not_mutate() {
             m.insert("code_source_activation".into(), 1u64);
             m
         },
+        unprobeable_classes: Vec::new(),
     };
 
     let epoch_before = store.snapshot().unwrap().epoch();
@@ -1914,6 +1917,7 @@ impl bbox_indexing::project_catalog_admin::RetirementDischargeWorkers for Counti
         // everything. This is the explicit trust boundary.
         Ok(bbox_indexing::project_catalog_admin::RetireEvidence {
             external_reference_counts: Default::default(),
+            unprobeable_classes: Vec::new(),
         })
     }
 }
@@ -1978,6 +1982,7 @@ fn acceptance_discharge_workers_called_exactly_once_in_order() {
             m.insert("code_source_activation".into(), 1u64);
             m
         },
+        unprobeable_classes: Vec::new(),
     };
 
     let mut workers = CountingDischargeWorkers::new();
@@ -2049,6 +2054,7 @@ fn acceptance_discharge_workers_resume_after_partial_completion() {
 
     let evidence = RetireEvidence {
         external_reference_counts: Default::default(),
+        unprobeable_classes: Vec::new(),
     };
 
     // First pass: run to completion.
@@ -2121,6 +2127,7 @@ fn acceptance_discharge_intermediate_journal_skips_completed_stages() {
 
     let evidence = RetireEvidence {
         external_reference_counts: Default::default(),
+        unprobeable_classes: Vec::new(),
     };
 
     let mut workers = CountingDischargeWorkers::new();
@@ -2214,6 +2221,7 @@ fn acceptance_discharge_nonzero_reprobe_refuses_at_final_cut() {
                     m.insert("code_source_activation".into(), 1u64);
                     m
                 },
+                unprobeable_classes: Vec::new(),
             })
         }
     }
@@ -2228,6 +2236,7 @@ fn acceptance_discharge_nonzero_reprobe_refuses_at_final_cut() {
 
     let evidence = RetireEvidence {
         external_reference_counts: Default::default(),
+        unprobeable_classes: Vec::new(),
     };
 
     let mut workers = NonzeroReprobeWorkers { reprobe_calls: 0 };
@@ -2332,6 +2341,7 @@ fn f5_source_authority_quiesced_blocks_journal() {
         ) -> bbox_indexing::project_catalog_admin::AdminResult<RetireEvidence> {
             Ok(RetireEvidence {
                 external_reference_counts: Default::default(),
+                unprobeable_classes: Vec::new(),
             })
         }
     }
@@ -2368,6 +2378,7 @@ fn f5_source_authority_quiesced_blocks_journal() {
 
     let evidence = RetireEvidence {
         external_reference_counts: Default::default(),
+        unprobeable_classes: Vec::new(),
     };
 
     let mut workers = RefusingQuiesceWorker;
@@ -2399,5 +2410,135 @@ fn f5_source_authority_quiesced_blocks_journal() {
         journal.current_stage,
         RetirementJournalStage::Prepared,
         "journal must stay at Prepared when source authority is not quiesced"
+    );
+}
+
+/// R2F1: the final reprobe must carry unprobeable classes through as
+/// refusals so they cannot be mistaken for a discharged zero. A worker
+/// whose reprobe returns unprobeable_classes must block the journal at
+/// the CatalogPairRemoved stage.
+#[test]
+fn r2f1_unprobeable_classes_block_journal() {
+    use bbox_corpus_core::project_catalog::{
+        CatalogSnapshotV2, CorpusProject, ProjectId, ProjectScope,
+    };
+    use bbox_indexing::project_catalog_admin::{
+        RetireEvidence, RetirementJournalStage, retire_project_journaled_with,
+    };
+    use bbox_indexing::project_catalog_store::ProjectCatalogStore;
+    use std::sync::Arc;
+
+    struct UnprobeableReprobeWorker;
+
+    impl bbox_indexing::project_catalog_admin::RetirementDischargeWorkers for UnprobeableReprobeWorker {
+        fn discharge_collected_generations(
+            &mut self,
+            _project_id: &ProjectId,
+        ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
+            Ok(())
+        }
+        fn discharge_publications(
+            &mut self,
+            _project_id: &ProjectId,
+        ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
+            Ok(())
+        }
+        fn discharge_attachments(
+            &mut self,
+            _store: &ProjectCatalogStore,
+            _project_id: &ProjectId,
+        ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
+            Ok(())
+        }
+        fn sweep_materialization(
+            &mut self,
+            _project_id: &ProjectId,
+        ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
+            Ok(())
+        }
+        fn verify_source_authority_quiesced(
+            &mut self,
+            _store: &ProjectCatalogStore,
+            _project_id: &ProjectId,
+        ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
+            Ok(())
+        }
+        fn reprobe_evidence(
+            &mut self,
+            _store: &ProjectCatalogStore,
+            _project_id: &ProjectId,
+            _original_evidence: &RetireEvidence,
+        ) -> bbox_indexing::project_catalog_admin::AdminResult<RetireEvidence> {
+            Ok(RetireEvidence {
+                external_reference_counts: Default::default(),
+                unprobeable_classes: vec!["code_source_generations".to_string()],
+            })
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let bro_home = root.join("bro-home");
+    fs::create_dir_all(&bro_home).unwrap();
+
+    let store =
+        Arc::new(ProjectCatalogStore::initialize_empty(root.join("projects.json")).unwrap());
+
+    let project_id = ProjectId::parse("p_000000000000000000000000000000a1").unwrap();
+    let epoch = store.snapshot().unwrap().epoch();
+    store
+        .transact(epoch, |catalog: &mut CatalogSnapshotV2, _| {
+            catalog.projects.insert(
+                project_id.clone(),
+                CorpusProject {
+                    project_id: project_id.clone(),
+                    scope: ProjectScope::LegacyLocal,
+                    operator_aliases: Default::default(),
+                    nominated_aliases: Default::default(),
+                    display_name: "r2f1 project".into(),
+                    created_at: "2026-07-24T00:00:00Z".into(),
+                    registered_at_compat: None,
+                    repo_history: None,
+                    languages: Default::default(),
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+
+    let evidence = RetireEvidence {
+        external_reference_counts: Default::default(),
+        unprobeable_classes: Vec::new(),
+    };
+
+    let mut workers = UnprobeableReprobeWorker;
+    let result = retire_project_journaled_with(
+        &store,
+        &bro_home,
+        &project_id,
+        &evidence,
+        true,
+        &mut workers,
+    );
+
+    assert!(
+        result.is_err(),
+        "journal must refuse when reprobe returns unprobeable classes"
+    );
+    let err_code = result.unwrap_err().code();
+    assert!(
+        err_code.contains("unprobeable"),
+        "must refuse with unprobeable_classes error, got: {err_code}"
+    );
+
+    // The journal must NOT have advanced to Complete.
+    let journal =
+        bbox_indexing::project_catalog_admin::load_retirement_journal(&bro_home, &project_id)
+            .unwrap()
+            .expect("journal should persist on disk");
+    assert_ne!(
+        journal.current_stage,
+        RetirementJournalStage::Complete,
+        "journal must not complete when unprobeable classes remain"
     );
 }
