@@ -1836,11 +1836,13 @@ pub fn clear_scope_bridge(
     }
     let target_migration_id = match mode {
         ScopeBridgeClearMode::DanglingReference => {
-            // Mode 1 precondition: the bridge generation is actually
-            // retired. The caller supplies the current effective
-            // generation id from a verified code-source probe. The
-            // bridge generation must NOT equal the effective generation
-            // (if it did, the bridge is still live and cannot be cleared).
+            // Mode 1 precondition (R2F4): the bridge generation is
+            // actually retired, meaning it is ABSENT from the store's
+            // retained/GC-rooted set. The caller supplies the current
+            // effective generation id and the retained set from a store
+            // enumeration. Merely checking id inequality is insufficient
+            // (a different effective generation does not prove the bridge
+            // generation is gone from retained state).
             let newest = bridge_records.last().ok_or_else(|| {
                 admin_error(
                     "error.project_catalog_scope_bridge_clear_no_bridge",
@@ -1859,20 +1861,33 @@ pub fn clear_scope_bridge(
                     "mode 1 requires effective_generation_id evidence from a verified code-source probe",
                 ));
             };
+            // The bridge generation must not be the effective generation.
             if bridge_gen == effective_gen {
                 return Err(admin_error(
                     "error.project_catalog_scope_bridge_clear_bridge_still_live",
                     "the bridge generation is still the effective activation; cannot clear a live bridge",
                 ));
             }
+            // R2F4: the bridge generation must be absent from the retained
+            // set (proves retirement via store enumeration, not id inequality).
+            if evidence.retained_generation_ids.contains(bridge_gen) {
+                return Err(admin_error(
+                    "error.project_catalog_scope_bridge_clear_bridge_retained",
+                    "the bridge generation is still in the retained/GC-rooted set; cannot clear a retained bridge",
+                ));
+            }
             newest.scope_migration_id.clone()
         }
         ScopeBridgeClearMode::DoubleMigrationRepair => {
-            // Mode 2 precondition: at least two bridge-bearing records
-            // exist, AND the older record's new_scope matches the
-            // project's current catalog scope (proving the older
-            // record admits the current scope, so nulling the newer
-            // one is truthful).
+            // Mode 2 precondition (R2F4): implements the exact open-bridge
+            // predicate. At least two bridge-bearing records exist. The
+            // older record ADMITS the effective generation through its
+            // old_scope (old_scope equals the effective activation scope
+            // AND code_bridge_generation equals the effective generation).
+            // The newer record does NOT admit (otherwise there would be no
+            // repair needed). This is the truthful recovery state for a
+            // legacy A->B->C double migration where the effective
+            // generation is still scoped A.
             if bridge_records.len() < 2 {
                 return Err(admin_error(
                     "error.project_catalog_scope_bridge_clear_no_double_migration",
@@ -1880,36 +1895,57 @@ pub fn clear_scope_bridge(
                      at least two bridge-bearing records",
                 ));
             }
-            // Verify the older record admits the current scope.
-            let older = &bridge_records[bridge_records.len() - 2];
-            let project = catalog.projects.get(project_id).ok_or_else(|| {
-                admin_error(
-                    "error.project_catalog_scope_bridge_clear_project_missing",
-                    "project not found in catalog",
-                )
-            })?;
-            let scope_matches = match (&older.new_scope, &project.scope) {
-                (ProjectScope::Published(older_scope), ProjectScope::Published(current_scope)) => {
-                    older_scope == current_scope
-                }
-                _ => false,
+            let Some(effective_scope) = &evidence.effective_scope else {
+                return Err(admin_error(
+                    "error.project_catalog_scope_bridge_clear_missing_evidence",
+                    "mode 2 requires effective_scope evidence from a verified code-source probe",
+                ));
             };
-            if !scope_matches {
+            let Some(effective_gen) = &evidence.effective_generation_id else {
+                return Err(admin_error(
+                    "error.project_catalog_scope_bridge_clear_missing_evidence",
+                    "mode 2 requires effective_generation_id evidence from a verified code-source probe",
+                ));
+            };
+            // The older record must admit: old_scope equals effective scope
+            // AND code_bridge_generation equals effective generation.
+            let older = &bridge_records[bridge_records.len() - 2];
+            let older_gen_matches = older
+                .code_bridge_generation
+                .as_deref()
+                .is_some_and(|bridge_gen| bridge_gen == effective_gen);
+            let older_scope_matches = matches!(
+                &older.old_scope,
+                ProjectScope::Published(s) if s == effective_scope
+            );
+            let older_admits = older_gen_matches && older_scope_matches;
+            if !older_admits {
                 return Err(admin_error(
                     "error.project_catalog_scope_bridge_clear_older_record_does_not_admit",
-                    "the older bridge-bearing record's new_scope does not match \
-                     the project's current catalog scope; cannot truthfully null the newer record",
+                    "the older bridge-bearing record does not admit the effective \
+                     generation (old_scope must equal effective scope AND \
+                     code_bridge_generation must equal effective generation)",
                 ));
             }
-            bridge_records
-                .last()
-                .map(|r| r.scope_migration_id.clone())
-                .ok_or_else(|| {
-                    admin_error(
-                        "error.project_catalog_scope_bridge_clear_no_bridge",
-                        "no newest bridge-bearing record to null",
-                    )
-                })?
+            // The newer record must NOT admit (otherwise no repair is needed).
+            let newer = &bridge_records[bridge_records.len() - 1];
+            let newer_gen_matches = newer
+                .code_bridge_generation
+                .as_deref()
+                .is_some_and(|bridge_gen| bridge_gen == effective_gen);
+            let newer_scope_matches = matches!(
+                &newer.old_scope,
+                ProjectScope::Published(s) if s == effective_scope
+            );
+            let newer_admits = newer_gen_matches && newer_scope_matches;
+            if newer_admits {
+                return Err(admin_error(
+                    "error.project_catalog_scope_bridge_clear_newer_record_admits",
+                    "the newer bridge-bearing record also admits the effective \
+                     generation; no repair is needed",
+                ));
+            }
+            newer.scope_migration_id.clone()
         }
     };
     let project_id_owned = project_id.clone();
@@ -1934,15 +1970,24 @@ pub fn clear_scope_bridge(
     })
 }
 
-/// Verified code-source evidence for a bridge-clear transaction (F4).
+/// Verified code-source evidence for a bridge-clear transaction (R2F4).
 /// The caller must probe the code-source state and supply the current
-/// effective generation id before calling `clear_scope_bridge`.
+/// effective generation id AND effective scope before calling
+/// `clear_scope_bridge`.
 #[derive(Debug, Clone, Default)]
 pub struct ScopeBridgeClearEvidence {
     /// The current effective generation id from a verified code-source
     /// probe (activation record). Required for mode 1 to prove the
-    /// bridge generation is retired.
+    /// bridge generation is retired (absent from retained set).
     pub effective_generation_id: Option<String>,
+    /// The current effective scope from a verified code-source probe
+    /// (activation record's published_scope). Required for mode 2 to
+    /// implement the exact open-bridge predicate.
+    pub effective_scope: Option<PublishedScope>,
+    /// The set of retained/GC-rooted generation ids from a store
+    /// enumeration. Required for mode 1 to prove absence from the
+    /// retained set (not just id inequality).
+    pub retained_generation_ids: std::collections::BTreeSet<String>,
 }
 
 /// Which bridge-clear mode to use (section 9.5).
@@ -4194,9 +4239,9 @@ mod tests {
         (tmp, store, pid)
     }
 
-    /// F4 mode 1: refuses when evidence (effective_generation_id) is missing.
+    /// R2F4 mode 1: refuses when evidence (effective_generation_id) is missing.
     #[test]
-    fn f4_mode1_refuses_missing_evidence() {
+    fn r2f4_mode1_refuses_missing_evidence() {
         let (_tmp, store, pid) = f4_store_with_bridge(Some("abc123"));
         let epoch = store.snapshot().unwrap().epoch();
         let evidence = ScopeBridgeClearEvidence::default();
@@ -4215,14 +4260,15 @@ mod tests {
         );
     }
 
-    /// F4 mode 1: refuses when the bridge generation is still the
+    /// R2F4 mode 1: refuses when the bridge generation is still the
     /// effective activation (bridge is live, not dangling).
     #[test]
-    fn f4_mode1_refuses_live_bridge() {
+    fn r2f4_mode1_refuses_live_bridge() {
         let (_tmp, store, pid) = f4_store_with_bridge(Some("gen_still_live"));
         let epoch = store.snapshot().unwrap().epoch();
         let evidence = ScopeBridgeClearEvidence {
             effective_generation_id: Some("gen_still_live".to_string()),
+            ..Default::default()
         };
         let result = clear_scope_bridge(
             &store,
@@ -4239,14 +4285,43 @@ mod tests {
         );
     }
 
-    /// F4 mode 1: succeeds when evidence proves the bridge generation
-    /// is retired (effective gen differs from bridge gen).
+    /// R2F4 mode 1: refuses when the bridge generation is still in the
+    /// retained set (R2F4: must prove absence from retained/GC-rooted set,
+    /// not just id inequality).
     #[test]
-    fn f4_mode1_succeeds_when_bridge_is_retired() {
+    fn r2f4_mode1_refuses_retained_bridge() {
         let (_tmp, store, pid) = f4_store_with_bridge(Some("old_bridge_gen"));
         let epoch = store.snapshot().unwrap().epoch();
         let evidence = ScopeBridgeClearEvidence {
             effective_generation_id: Some("new_effective_gen".to_string()),
+            retained_generation_ids: ["old_bridge_gen".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        let result = clear_scope_bridge(
+            &store,
+            epoch,
+            &pid,
+            ScopeBridgeClearMode::DanglingReference,
+            &evidence,
+        );
+        assert!(result.is_err());
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("bridge_retained"),
+            "must refuse with bridge_retained, got: {err}"
+        );
+    }
+
+    /// R2F4 mode 1: succeeds when evidence proves the bridge generation
+    /// is retired (absent from retained set AND not the effective gen).
+    #[test]
+    fn r2f4_mode1_succeeds_when_bridge_is_retired() {
+        let (_tmp, store, pid) = f4_store_with_bridge(Some("old_bridge_gen"));
+        let epoch = store.snapshot().unwrap().epoch();
+        let evidence = ScopeBridgeClearEvidence {
+            effective_generation_id: Some("new_effective_gen".to_string()),
+            retained_generation_ids: std::collections::BTreeSet::new(),
+            ..Default::default()
         };
         let result = clear_scope_bridge(
             &store,
@@ -4258,9 +4333,9 @@ mod tests {
         assert!(result.is_ok(), "must succeed when bridge is retired");
     }
 
-    /// F4 mode 2: refuses when only one bridge record exists.
+    /// R2F4 mode 2: refuses when only one bridge record exists.
     #[test]
-    fn f4_mode2_refuses_single_bridge() {
+    fn r2f4_mode2_refuses_single_bridge() {
         let (_tmp, store, pid) = f4_store_with_bridge(Some("gen1"));
         let epoch = store.snapshot().unwrap().epoch();
         let evidence = ScopeBridgeClearEvidence::default();
@@ -4276,6 +4351,137 @@ mod tests {
         assert!(
             err.contains("no_double_migration"),
             "must refuse with no_double_migration, got: {err}"
+        );
+    }
+
+    /// R2F4 mode 2: the exact open-bridge predicate for a legacy
+    /// A->B->C double migration. Uses the existing f4_store_with_bridge
+    /// (LegacyLocal -> f4-scope) and adds a second record (f4-scope ->
+    /// f4-scope-2). The effective scope is LegacyLocal and the effective
+    /// generation matches the first record's bridge generation (so the
+    /// older/first record admits and the newer/second does not).
+    #[test]
+    fn r2f4_mode2_abc_shape_older_admits_newer_does_not() {
+        use bbox_corpus_core::project_catalog::{
+            ProjectScope, ScopeMigrationAuthorityProvenance, ScopeMigrationId, ScopeMigrationKind,
+            ScopeMigrationRecord,
+        };
+        // f4_store_with_bridge creates a project with scope Published("f4-scope", "."),
+        // one attachment with validated_scope=Some("f4-scope",".") and one
+        // migration record: old=LegacyLocal, new=Published("f4-scope","."),
+        // code_bridge_generation=Some("gen_effective").
+        //
+        // For the A->B->C shape: effective activation is scope "f4-scope"
+        // (scope A), gen "gen_effective". We need TWO bridge-bearing records:
+        //   - older: old_scope = Published("f4-scope","."), bridge_gen = "gen_effective" (ADMITS)
+        //   - newer: old_scope = Published("f4-scope-2","."), bridge_gen = "gen_other" (does NOT admit)
+        //
+        // The existing record has old_scope=LegacyLocal. We need to modify it
+        // so old_scope = Published("f4-scope",".").
+        let (_tmp, store, pid) = f4_store_with_bridge(Some("gen_effective"));
+        let f4_scope = PublishedScope::try_new("f4-scope", ".").unwrap();
+        // Same repo, different relpath for RelpathMove.
+        let f4_scope_b = PublishedScope::try_new("f4-scope", "b").unwrap();
+        let f4_scope_2 = PublishedScope::try_new("f4-scope", "c").unwrap();
+
+        let base = store.snapshot().unwrap();
+        let epoch = base.epoch();
+        let pid_clone = pid.clone();
+        let f4_scope_clone = f4_scope.clone();
+        let f4_scope_b_clone = f4_scope_b.clone();
+        let _f4_scope_2_clone = f4_scope_2.clone();
+        store
+            .transact(epoch, move |catalog, attachments| {
+                // Modify the existing record so its old_scope = Published(f4_scope)
+                // and bridge_gen = "gen_effective" (so it ADMITS). The new_scope
+                // is f4_scope_b (same repo, different relpath) to satisfy
+                // RelpathMove validation and avoid equal-scope check.
+                for record in catalog.scope_migrations.values_mut() {
+                    if record.project_id == pid_clone {
+                        record.old_scope = ProjectScope::Published(f4_scope_clone.clone());
+                        record.new_scope = ProjectScope::Published(f4_scope_b_clone.clone());
+                        record.kind = ScopeMigrationKind::RelpathMove;
+                        record.code_bridge_generation = Some("gen_effective".to_string());
+                    }
+                }
+                // Fix the migration proof to match.
+                for proof in attachments.scope_migration_proofs.values_mut() {
+                    proof.old_scope = ProjectScope::Published(f4_scope_clone.clone());
+                    proof.new_scope = ProjectScope::Published(f4_scope_b_clone.clone());
+                }
+                // Insert a newer record that does NOT admit:
+                // old_scope = Published(f4_scope_2), bridge_gen = "gen_other".
+                let newer = ScopeMigrationRecord {
+                    scope_migration_id: ScopeMigrationId::mint(),
+                    project_id: pid_clone.clone(),
+                    catalog_epoch: epoch,
+                    authority_provenance: ScopeMigrationAuthorityProvenance::OperatorAttested,
+                    operator_invocation: "test".into(),
+                    operator_reason: Some("test".into()),
+                    old_scope: ProjectScope::Published(f4_scope_b_clone),
+                    new_scope: ProjectScope::Published(f4_scope_clone),
+                    kind: ScopeMigrationKind::RelpathMove,
+                    migrated_at: "2024-01-01T00:00:00Z".into(),
+                    code_bridge_generation: Some("gen_other".to_string()),
+                    publication_bridge_generation: None,
+                    pending_capabilities: Default::default(),
+                };
+                catalog
+                    .scope_migrations
+                    .insert(newer.scope_migration_id.clone(), newer);
+                Ok(())
+            })
+            .unwrap();
+
+        let epoch = store.snapshot().unwrap().epoch();
+        // Effective scope = f4_scope, effective gen = gen_effective.
+        // The older record ADMITS (old_scope == f4_scope AND gen == gen_effective).
+        // The newer record does NOT admit (old_scope == f4_scope_2 != f4_scope).
+        let evidence = ScopeBridgeClearEvidence {
+            effective_generation_id: Some("gen_effective".to_string()),
+            effective_scope: Some(f4_scope),
+            retained_generation_ids: std::collections::BTreeSet::new(),
+        };
+        let result = clear_scope_bridge(
+            &store,
+            epoch,
+            &pid,
+            ScopeBridgeClearMode::DoubleMigrationRepair,
+            &evidence,
+        );
+        assert!(
+            result.is_ok(),
+            "mode 2 must succeed when older admits and newer does not: {:?}",
+            result
+        );
+    }
+
+    /// R2F4 mode 2: refuses when the older record does NOT admit the
+    /// effective generation (old_scope mismatch).
+    #[test]
+    fn r2f4_mode2_refuses_older_does_not_admit() {
+        let (_tmp, store, pid) = f4_store_with_bridge(Some("gen_effective"));
+        let f4_scope = PublishedScope::try_new("f4-scope", ".").unwrap();
+        let epoch = store.snapshot().unwrap().epoch();
+        // Only one bridge record, but evidence has scope/gen.
+        // This should refuse with no_double_migration (only one record).
+        let evidence = ScopeBridgeClearEvidence {
+            effective_generation_id: Some("gen_effective".to_string()),
+            effective_scope: Some(f4_scope),
+            ..Default::default()
+        };
+        let result = clear_scope_bridge(
+            &store,
+            epoch,
+            &pid,
+            ScopeBridgeClearMode::DoubleMigrationRepair,
+            &evidence,
+        );
+        assert!(result.is_err());
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("no_double_migration"),
+            "must refuse with no_double_migration when only one bridge record, got: {err}"
         );
     }
 

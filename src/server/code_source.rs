@@ -3329,6 +3329,8 @@ fn try_automatic_bridge_clear(state: &Arc<SharedState>, project_id: &str) -> boo
         .map(|a| a.generation_id().to_string());
     let evidence = bbox_indexing::project_catalog_admin::ScopeBridgeClearEvidence {
         effective_generation_id,
+        effective_scope: None,
+        retained_generation_ids: std::collections::BTreeSet::new(),
     };
     // Trigger the bridge-clear transaction.
     match clear_scope_bridge(
