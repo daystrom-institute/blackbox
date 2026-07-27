@@ -569,14 +569,20 @@ pub fn discharge_project_catalog_targets(
     if targets.is_empty() {
         return Ok(0);
     }
-    let anchored = AnchoredArtifactRoot::open(root)?;
-    let mut removed = 0usize;
-    for target in targets {
-        target.validate()?;
-        anchored.discharge(target)?;
-        removed += 1;
-    }
-    Ok(removed)
+    with_artifact_mutation_lock(root, || {
+        let anchored = AnchoredArtifactRoot::open(root)?;
+        let mut removed = 0usize;
+        for target in targets {
+            target.validate()?;
+            anchored.discharge(target)?;
+            removed += 1;
+        }
+        Ok(removed)
+    })
+}
+
+fn with_artifact_mutation_lock<T>(root: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    bbox_corpus_core::json_store::with_store_lock(&root.join(".artifact-root-mutation"), operation)
 }
 
 fn strict_retirement_relative_path(path: &Path) -> bool {
@@ -1659,16 +1665,18 @@ impl ArtifactCatalog {
             })?;
         let meta_path = self.metadata_path_scoped(&scope, kind, &name)?;
 
-        bbox_corpus_core::json_store::with_store_lock(&meta_path, || {
-            self.install_value_locked_scoped(
-                scope,
-                kind,
-                source,
-                value,
-                name_override,
-                version_override,
-                supersedes_override,
-            )
+        with_artifact_mutation_lock(&self.root, || {
+            bbox_corpus_core::json_store::with_store_lock(&meta_path, || {
+                self.install_value_locked_scoped(
+                    scope,
+                    kind,
+                    source,
+                    value,
+                    name_override,
+                    version_override,
+                    supersedes_override,
+                )
+            })
         })
     }
 
@@ -1903,8 +1911,10 @@ impl ArtifactCatalog {
         superseded_by: &str,
     ) -> Result<ArtifactMetadata> {
         let meta_path = self.metadata_path(kind, name)?;
-        bbox_corpus_core::json_store::with_store_lock(&meta_path, || {
-            self.supersede_locked(kind, name, superseded_by)
+        with_artifact_mutation_lock(&self.root, || {
+            bbox_corpus_core::json_store::with_store_lock(&meta_path, || {
+                self.supersede_locked(kind, name, superseded_by)
+            })
         })
     }
 
@@ -1934,8 +1944,10 @@ impl ArtifactCatalog {
         }
 
         let meta_path = self.metadata_path(kind, name)?;
-        bbox_corpus_core::json_store::with_store_lock(&meta_path, || {
-            self.remove_hard_locked(kind, name, dry_run)
+        with_artifact_mutation_lock(&self.root, || {
+            bbox_corpus_core::json_store::with_store_lock(&meta_path, || {
+                self.remove_hard_locked(kind, name, dry_run)
+            })
         })
     }
 
@@ -2056,12 +2068,14 @@ impl ArtifactCatalog {
         warnings: Vec<String>,
     ) -> Result<ArtifactMetadata> {
         let meta_path = self.metadata_path(kind, name)?;
-        bbox_corpus_core::json_store::with_store_lock(&meta_path, || {
-            let mut meta = self.load_metadata(kind, name)?;
-            meta.install_warnings = warnings;
-            self.save_metadata(&meta)?;
-            self.save_version_metadata(&meta)?;
-            Ok(meta)
+        with_artifact_mutation_lock(&self.root, || {
+            bbox_corpus_core::json_store::with_store_lock(&meta_path, || {
+                let mut meta = self.load_metadata(kind, name)?;
+                meta.install_warnings = warnings;
+                self.save_metadata(&meta)?;
+                self.save_version_metadata(&meta)?;
+                Ok(meta)
+            })
         })
     }
 
@@ -3989,6 +4003,76 @@ mod tests {
             }
             assert!(discharge_project_catalog_targets(&root, &targets).is_err());
         }
+    }
+
+    #[test]
+    fn artifact_writers_and_retirement_share_the_root_mutation_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let catalog = ArtifactCatalog::open(&root).unwrap();
+        let guard = bbox_corpus_core::json_store::acquire_store_lock_nofollow(
+            &root.join(".artifact-root-mutation"),
+        )
+        .unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let writer = catalog.clone();
+        let handle = std::thread::spawn(move || {
+            let result = writer.install_value_scoped(
+                ArtifactScope::Project {
+                    project_id: "p1",
+                    local: true,
+                },
+                ArtifactKind::Workflow,
+                "fixture".into(),
+                &serde_json::json!({
+                    "name": "locked",
+                    "version": "1",
+                    "actors": {},
+                    "start": "Done",
+                    "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}
+                }),
+                None,
+                None,
+                None,
+            );
+            sent.send(result.is_ok()).unwrap();
+        });
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        drop(guard);
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+        );
+        handle.join().unwrap();
+
+        let targets = capture_project_catalog_retirement_targets(&root, "p1", &[]).unwrap();
+        let guard = bbox_corpus_core::json_store::acquire_store_lock_nofollow(
+            &root.join(".artifact-root-mutation"),
+        )
+        .unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let root_for_thread = root.clone();
+        let handle = std::thread::spawn(move || {
+            sent.send(discharge_project_catalog_targets(&root_for_thread, &targets).is_ok())
+                .unwrap();
+        });
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        drop(guard);
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+        );
+        handle.join().unwrap();
     }
 
     #[test]
