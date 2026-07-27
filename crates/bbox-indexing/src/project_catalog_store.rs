@@ -479,8 +479,10 @@ impl ProjectCatalogStore {
         // the post-commit observer can compute the changed set
         // (section 9.4: emit changed project ids after durable pair
         // publication and lock release). We keep the base catalog's
-        // project map for per-entry comparison after the build closure.
+        // project map AND attachment map for per-entry comparison after
+        // the build closure.
         let old_projects = base.catalog.projects.clone();
+        let old_attachments = base.attachments.clone();
 
         let mut catalog = (*base.catalog).clone();
         let mut attachments = (*base.attachments).clone();
@@ -509,10 +511,24 @@ impl ProjectCatalogStore {
         // Compute changed project ids before catalog moves into candidate
         // (section 9.4). A project id is "changed" if it was added,
         // removed, or its entry content differs between old and new
-        // catalog snapshots.
+        // catalog snapshots, OR if its attachment entry differs between
+        // old and new attachment snapshots (attachment-only operations
+        // must also emit changed ids).
+        let new_attachment_project_ids: BTreeSet<String> = attachments
+            .attachments
+            .values()
+            .map(|a| a.project_id.as_str().to_string())
+            .collect();
+        let old_attachment_project_ids: BTreeSet<String> = old_attachments
+            .attachments
+            .values()
+            .map(|a| a.project_id.as_str().to_string())
+            .collect();
         let changed_project_ids: BTreeSet<String> = new_project_ids
             .iter()
             .chain(old_project_ids.iter())
+            .chain(new_attachment_project_ids.iter())
+            .chain(old_attachment_project_ids.iter())
             .filter(|pid| {
                 let old_entry = old_projects
                     .iter()
@@ -523,7 +539,25 @@ impl ProjectCatalogStore {
                     .iter()
                     .find(|(k, _)| k.as_str() == pid.as_str())
                     .map(|(_, v)| v);
-                match (old_entry, new_entry) {
+                let catalog_changed = match (old_entry, new_entry) {
+                    (None, Some(_)) => true,
+                    (Some(_), None) => true,
+                    (Some(old), Some(new)) => old != new,
+                    (None, None) => false,
+                };
+                if catalog_changed {
+                    return true;
+                }
+                // Also check attachment snapshot for this project id.
+                let old_att = old_attachments
+                    .attachments
+                    .values()
+                    .find(|a| a.project_id.as_str() == pid.as_str());
+                let new_att = attachments
+                    .attachments
+                    .values()
+                    .find(|a| a.project_id.as_str() == pid.as_str());
+                match (old_att, new_att) {
                     (None, Some(_)) => true,
                     (Some(_), None) => true,
                     (Some(old), Some(new)) => old != new,

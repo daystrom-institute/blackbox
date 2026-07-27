@@ -208,24 +208,45 @@ impl CutbackReconciler {
     /// Wait for the scheduler: blocks until the minimum deadline is due,
     /// or until a new deadline is registered (whichever is earlier).
     /// Returns the minimum deadline or None on shutdown.
+    /// Wait for the scheduler: blocks until the minimum deadline is due,
+    /// or until shutdown. Returns the due deadline or None on shutdown.
+    /// The wait is interruptible: if a new earlier deadline is registered
+    /// via `register_transient`, the condvar is notified and this returns
+    /// early so the caller re-evaluates.
     fn scheduler_wait(&self, shutdown: &std::sync::atomic::AtomicBool) -> Option<u64> {
-        let state = self.scheduler_state.lock().unwrap();
-        if let Some(&min) = state.pending_deadlines.keys().next() {
-            drop(state);
-            return Some(min);
+        loop {
+            let state = self.scheduler_state.lock().unwrap();
+            if let Some(&min) = state.pending_deadlines.keys().next() {
+                let now = unix_now();
+                if min <= now {
+                    drop(state);
+                    return Some(min);
+                }
+                // Sleep until the deadline, but use the condvar so a
+                // newly registered earlier deadline can preempt.
+                let wait_dur = std::time::Duration::from_secs(min - now);
+                let (_guard, _timeout) = self
+                    .scheduler_notify
+                    .wait_timeout(state, wait_dur)
+                    .unwrap();
+                if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                    return None;
+                }
+                // Loop back: re-evaluate min deadline (may have changed).
+                continue;
+            }
+            if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                return None;
+            }
+            // No deadlines: wait for one to be registered.
+            let _guard = self
+                .scheduler_notify
+                .wait_timeout(state, std::time::Duration::from_secs(5))
+                .unwrap();
+            if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                return None;
+            }
         }
-        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
-            return None;
-        }
-        let _guard = self
-            .scheduler_notify
-            .wait_timeout(state, std::time::Duration::from_secs(5))
-            .unwrap();
-        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
-            return None;
-        }
-        let state = self.scheduler_state.lock().unwrap();
-        state.pending_deadlines.keys().next().copied()
     }
 
     /// Enqueue a transition event. Coalesces by `(project_id, kind)`: if
@@ -1677,21 +1698,33 @@ pub(crate) fn spawn_commit_observer(state: &Arc<SharedState>) {
                         // Map each affected id to one reconciler event
                         // (section 9.4). Determine whether to enqueue
                         // Activate or Cutback based on desired assignment.
-                        let scope = state
-                            .code_sources
-                            .assignments()
-                            .into_iter()
-                            .find(|(_, pid)| pid == project_id)
-                            .map(|(scope, _)| scope);
-                        let Some(scope) = scope else {
-                            // No assignment: no reconciler event needed.
-                            continue;
-                        };
                         let desired = determine_desired_assignment(&state, project_id);
                         let kind = match desired {
                             DesiredAssignment::Local => ReconcileKind::Cutback,
                             DesiredAssignment::Collected => ReconcileKind::Activate,
                             DesiredAssignment::Retired => continue,
+                        };
+                        // Derive scope: for Collected, use the auth-table
+                        // assignment scope. For Local (assignment removed),
+                        // fall back to the activation record's scope.
+                        let scope = state
+                            .code_sources
+                            .assignments()
+                            .into_iter()
+                            .find(|(_, pid)| pid == project_id)
+                            .map(|(scope, _)| scope)
+                            .or_else(|| {
+                                state
+                                    .code_sources
+                                    .store()
+                                    .load_activation_mixed(project_id)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|a| a.published_scope().cloned())
+                            });
+                        let Some(scope) = scope else {
+                            // No assignment and no activation record: skip.
+                            continue;
                         };
                         state
                             .code_sources
@@ -1736,24 +1769,28 @@ pub(crate) fn spawn_scheduler(state: &Arc<SharedState>, runtime_handle: tokio::r
                 if shutdown.load(std::sync::atomic::Ordering::Acquire) {
                     break;
                 }
-                let Some(min_deadline) = reconciler.scheduler_wait(&shutdown) else {
+                // scheduler_wait blocks until a deadline is due or
+                // shutdown, using an interruptible condvar wait (no
+                // plain thread::sleep that could miss an earlier
+                // deadline registered while sleeping).
+                let Some(_min_deadline) = reconciler.scheduler_wait(&shutdown) else {
                     break;
                 };
-                let now = unix_now();
-                if min_deadline > now {
-                    let sleep_secs = min_deadline - now;
-                    std::thread::sleep(std::time::Duration::from_secs(sleep_secs));
-                }
                 // Drain all due projects and re-enqueue them through the
                 // reconciler as Cutback events (section 9.2).
                 let due = reconciler.drain_due(unix_now());
                 for project_id in due {
+                    // Derive scope from the activation record, not from
+                    // current auth-table assignments. A transient cutback
+                    // means the assignment was removed (desired=Local);
+                    // the auth table no longer has the scope.
                     let scope = state
                         .code_sources
-                        .assignments()
-                        .into_iter()
-                        .find(|(_, pid)| pid == &project_id)
-                        .map(|(scope, _)| scope);
+                        .store()
+                        .load_activation_mixed(&project_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|a| a.published_scope().cloned());
                     if let Some(scope) = scope {
                         state.code_sources.enqueue_transition(
                             &project_id,
@@ -1763,7 +1800,7 @@ pub(crate) fn spawn_scheduler(state: &Arc<SharedState>, runtime_handle: tokio::r
                     } else {
                         tracing::warn!(
                             project_id = %project_id,
-                            "scheduler: project has a transient deadline but no assignment scope"
+                            "scheduler: project has a transient deadline but no activation scope"
                         );
                     }
                 }
@@ -1844,7 +1881,7 @@ fn schedule_cutback(
                 Ok(()) => break,
                 Err(error) => {
                     let _ = store
-                        .mark_cutback_pending(&project_id, "cutback failed; inspect daemon logs");
+                        .mark_cutback_pending_mixed(&project_id, "cutback failed; inspect daemon logs");
                     let _ = store.record_health_failure(
                         &project_id,
                         "cutback_pending",
@@ -2364,10 +2401,12 @@ fn stage_git_current_overlay_after_activation(
 /// Desired assignment for a project (section 9.3 reduction table input).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DesiredAssignment {
-    /// Project is assigned to a scope in the auth table: wants local.
-    Local,
-    /// Project is no longer assigned: wants collected (cancel cutback).
+    /// Project has a producer assignment in the auth table: wants
+    /// collected (the producer owns the code-source path).
     Collected,
+    /// Project's producer assignment was removed: wants local (local
+    /// walk only, drive collected-to-local cutback).
+    Local,
     /// Project is retired (handoff to retirement, P4-G).
     Retired,
 }
@@ -2657,13 +2696,41 @@ fn validate_relationship_chain(
         }
 
         // Link 4: descriptor validates immutable manifest digest and
-        // entries. The manifest digest is part of validate_header.
+        // entries. validate_header checks the header fields including
+        // the manifest_sha256 format. Additionally, read the manifest
+        // file from disk and run the full bounded manifest verification
+        // (digest match, entry count, byte limits) via the migration
+        // verifier (section 10.2 link 4).
         descriptor.validate_header().map_err(|e| {
             anyhow!(
                 "error.code_source_relationship_chain: \
                  descriptor header validation failed for project {project_id}: {e}"
             )
         })?;
+        {
+            let manifest_bytes = store
+                .read_generation_manifest_bytes(scope, generation_id)
+                .map_err(|e| {
+                    anyhow!(
+                        "error.code_source_relationship_chain: \
+                         manifest file missing or unreadable for project {project_id}: {e}"
+                    )
+                })?;
+            let limits = store.limits();
+            bbox_code_source_store::verify_generation_manifest_for_migration(
+                &manifest_bytes,
+                descriptor,
+                generation.producer_id(),
+                generation_id,
+                &limits,
+            )
+            .map_err(|e| {
+                anyhow!(
+                    "error.code_source_relationship_chain: \
+                     manifest verification failed for project {project_id}: {e}"
+                )
+            })?;
+        }
 
         // Link 5: WorkspaceIndexEntry agrees: project key, selector,
         // generation, snapshot, manifest path.
@@ -2717,6 +2784,16 @@ fn validate_relationship_chain(
                     bail!(
                         "error.code_source_relationship_chain: \
                          workspace snapshot mismatch for project {project_id}"
+                    );
+                }
+                // Verify the manifest path is present and non-empty.
+                // The production writer always writes a manifest path
+                // (activate_source_snapshot in bbox_edge_sidecar::snapshot).
+                // An empty or missing manifest path is drift.
+                if entry.manifest.trim().is_empty() {
+                    bail!(
+                        "error.code_source_relationship_chain: \
+                         workspace manifest path missing for project {project_id}"
                     );
                 }
             }
@@ -3188,12 +3265,17 @@ fn probe_ladder(state: &Arc<SharedState>, project_id: &str) -> LadderResult {
         CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest, CheckoutAccessSourceLane,
         CheckoutAttachmentSelector,
     };
-    let scope = state
-        .code_sources
-        .assignments()
-        .into_iter()
-        .find(|(_, pid)| pid == project_id)
-        .map(|(scope, _)| scope);
+    // Derive scope from the activation record's published_scope, not
+    // from current auth-table assignments. When an assignment is removed
+    // (desired=Local cutback), the auth table no longer has the scope,
+    // but the activation record still carries the previously collected
+    // scope we need to cut back from.
+    let store = state.code_sources.store();
+    let scope = store
+        .load_activation_mixed(project_id)
+        .ok()
+        .flatten()
+        .and_then(|a| a.published_scope().cloned());
     let Some(scope) = scope else {
         return LadderResult::None;
     };
@@ -3201,7 +3283,7 @@ fn probe_ladder(state: &Arc<SharedState>, project_id: &str) -> LadderResult {
         project_id: project_id.to_string(),
         attachment: CheckoutAttachmentSelector::Selected,
         expected_scope: Some(scope),
-        kind: CheckoutAccessKind::GitHistory,
+        kind: CheckoutAccessKind::LocalProjectWalk,
         intent: CheckoutAccessIntent::Read,
         source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
     }) {
@@ -3209,7 +3291,9 @@ fn probe_ladder(state: &Arc<SharedState>, project_id: &str) -> LadderResult {
         Err(error) => {
             use bbox_indexing::checkout_access::CheckoutAccessErrorCode as Code;
             match error.code {
-                Code::AttachmentNotFound | Code::ObservationUnavailable => LadderResult::None,
+                Code::AttachmentNotFound
+                | Code::ObservationUnavailable
+                | Code::DeniedByTestProbe => LadderResult::None,
                 Code::ScopeMismatch
                 | Code::CapabilityDenied
                 | Code::IntentDenied
@@ -3231,9 +3315,9 @@ fn determine_desired_assignment(state: &Arc<SharedState>, project_id: &str) -> D
         .into_iter()
         .any(|(_, pid)| pid == project_id);
     if assigned {
-        DesiredAssignment::Local
-    } else {
         DesiredAssignment::Collected
+    } else {
+        DesiredAssignment::Local
     }
 }
 
@@ -3375,13 +3459,14 @@ fn attempt_cutback_catalog(
     let identity = resolve_code_project_identity(state, project_id, "catalog cutback attempt")?;
 
     // b. Acquire checkout access with Selected attachment selector (R6).
-    //    Validate scope and local-source capability on the selected
-    //    candidate.
+    //    The cutback stages a local generation from a local walk, so
+    //    request LocalProjectWalk (not GitHistory). Validate scope and
+    //    local-source capability on the selected candidate.
     let lease = match state.checkout_access.acquire(CheckoutAccessRequest {
         project_id: project_id.to_string(),
         attachment: CheckoutAttachmentSelector::Selected,
         expected_scope: Some(scope.clone()),
-        kind: CheckoutAccessKind::GitHistory,
+        kind: CheckoutAccessKind::LocalProjectWalk,
         intent: CheckoutAccessIntent::Read,
         source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
     }) {
@@ -3534,7 +3619,7 @@ fn cutback_to_local_single_attempt(
         store.clear_activation(project_id)?;
         return Ok(());
     }
-    store.mark_cutback_pending(project_id, "local cutback is staging")?;
+    store.mark_cutback_pending_mixed(project_id, "local cutback is staging")?;
     ensure_selector_staging_available(
         store.as_ref(),
         &bbox_code_source::local_selector(project_id),
@@ -3786,7 +3871,7 @@ fn cutback_to_local(
         store.clear_activation(project_id)?;
         return Ok(());
     }
-    store.mark_cutback_pending(project_id, "local cutback is staging")?;
+    store.mark_cutback_pending_mixed(project_id, "local cutback is staging")?;
     // Bridge local cutback genuinely needs an attachment (the walk reads the
     // checkout), so its identity comes from the version-1 record and keeps
     // the "registered project disappeared" failure; catalog mode resolves
@@ -8436,6 +8521,11 @@ mod tests {
             encode_stored_generation_v2_for_migration(&generation).unwrap(),
         )
         .unwrap();
+        // Write the manifest.jsonl file so link 4 can verify it. The
+        // descriptor uses manifest_sha256(&[]) for empty entries, so the
+        // file is empty (0 bytes).
+        let manifest_path = paths.generation_manifest(scope, generation_id).unwrap();
+        fs::write(&manifest_path, b"").unwrap();
         let activation = ActivationRecordV2 {
             version: bbox_code_source_store::MIGRATION_STORE_VERSION,
             project_id: ProjectId::parse(project_id).unwrap(),
@@ -9109,6 +9199,265 @@ mod tests {
             ran.load(std::sync::atomic::Ordering::SeqCst),
             "spawn_blocking dispatched from a plain thread via captured \
              runtime handle must actually run"
+        );
+    }
+
+    // ---- F1-F3 closing review tests ----
+
+    /// F1: determine_desired_assignment maps assigned=true to Collected
+    /// and unassigned to Local (not inverted). Verified via source-text
+    /// assertion because the function requires a full Arc<SharedState>.
+    #[test]
+    fn f1_desired_assignment_mapping_is_not_inverted() {
+        let src = self_source();
+        let body = extract_fn_body(&src, "determine_desired_assignment");
+        assert!(
+            body.contains("DesiredAssignment::Collected"),
+            "determine_desired_assignment must map assigned to Collected (F1 fix)"
+        );
+        assert!(
+            body.contains("DesiredAssignment::Local"),
+            "determine_desired_assignment must map unassigned to Local (F1 fix)"
+        );
+        // The mapping must NOT be inverted: assigned -> Collected.
+        let assigned_pos = body.find("if assigned").expect("must have 'if assigned' check");
+        let collected_pos = body[assigned_pos..]
+            .find("Collected")
+            .expect("Collected must appear after 'if assigned'");
+        let local_pos = body[assigned_pos..]
+            .find("Local")
+            .expect("Local must appear in the else branch");
+        assert!(
+            collected_pos < local_pos,
+            "assigned must map to Collected (before Local in the source) (F1 fix)"
+        );
+    }
+
+    /// F1: probe_ladder derives scope from the activation record, not
+    /// from current auth-table assignments.
+    #[test]
+    fn f1_probe_ladder_derives_scope_from_activation_not_assignments() {
+        let src = self_source();
+        let body = extract_fn_body(&src, "probe_ladder");
+        assert!(
+            body.contains("load_activation_mixed"),
+            "probe_ladder must derive scope from load_activation_mixed, not assignments()"
+        );
+        assert!(
+            !body.contains(".assignments()"),
+            "probe_ladder must not derive scope from assignments() (F1 fix)"
+        );
+    }
+
+    /// F1: the cutback staging path uses mark_cutback_pending_mixed
+    /// (mode-aware v2 API), not the v1-only mark_cutback_pending.
+    #[test]
+    fn f1_staging_uses_mixed_mark_cutback_pending() {
+        let src = self_source();
+        let body = extract_fn_body(&src, "cutback_to_local_single_attempt");
+        assert!(
+            body.contains("mark_cutback_pending_mixed"),
+            "cutback_to_local_single_attempt must use mark_cutback_pending_mixed (F1 fix)"
+        );
+    }
+
+    /// F1: attempt_cutback_catalog requests LocalProjectWalk, not
+    /// GitHistory (the cutback stages a local walk).
+    #[test]
+    fn f1_cutback_requests_local_project_walk() {
+        let src = self_source();
+        let body = extract_fn_body(&src, "attempt_cutback_catalog");
+        assert!(
+            body.contains("LocalProjectWalk"),
+            "attempt_cutback_catalog must request LocalProjectWalk (F1 fix)"
+        );
+        // The kind field must be LocalProjectWalk, not GitHistory.
+        // Check that the kind assignment uses LocalProjectWalk.
+        let kind_line = body
+            .lines()
+            .find(|l| l.trim_start().starts_with("kind:"))
+            .expect("attempt_cutback_catalog must have a kind field");
+        assert!(
+            kind_line.contains("LocalProjectWalk"),
+            "kind field must be LocalProjectWalk, got: {kind_line}"
+        );
+    }
+
+    /// F2: the scheduler derives scope from the activation record,
+    /// not from current auth-table assignments.
+    #[test]
+    fn f2_scheduler_derives_scope_from_activation() {
+        let src = self_source();
+        let body = extract_fn_body(&src, "spawn_scheduler");
+        assert!(
+            body.contains("load_activation_mixed"),
+            "scheduler must derive scope from load_activation_mixed (F2 fix)"
+        );
+    }
+
+    /// F2: the scheduler loop has no plain thread::sleep (uses the
+    /// interruptible scheduler_wait condvar instead).
+    #[test]
+    fn f2_scheduler_no_plain_sleep() {
+        let src = self_source();
+        let body = extract_fn_body(&src, "spawn_scheduler");
+        assert!(
+            !body.contains("std::thread::sleep"),
+            "scheduler must not use std::thread::sleep for deadline wait (F2 fix)"
+        );
+    }
+
+    /// F2: the commit observer dispatches events for desired-local
+    /// projects (no assignment) using the activation-record scope.
+    #[test]
+    fn f2_commit_observer_dispatches_for_unassigned_projects() {
+        let src = self_source();
+        let body = extract_fn_body(&src, "spawn_commit_observer");
+        assert!(
+            body.contains("load_activation_mixed"),
+            "commit observer must use activation record scope for unassigned projects (F2 fix)"
+        );
+    }
+
+    /// F2: transact includes attachment-snapshot changes in changed ids.
+    /// An attachment-only operation must emit changed project ids.
+    #[test]
+    fn f2_transact_includes_attachment_changes() {
+        use bbox_corpus_core::identity::PublishedScope;
+        use bbox_corpus_core::project_catalog::{
+            AttachmentCapabilities, AttachmentId, AttachmentKind, AttachmentStatus,
+            CheckoutAttachment, CorpusProject, ProjectId, ProjectScope,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = bbox_indexing::project_catalog_store::ProjectCatalogStore::initialize_empty(
+            root.join("catalog"),
+        )
+        .unwrap();
+        let observer = store.commit_observer();
+
+        let project_id = ProjectId::parse("p_00000000000000000000000000000f20".to_string()).unwrap();
+        let scope = PublishedScope::try_new("f2-transact", ".").unwrap();
+
+        // First transaction: add the project to the catalog.
+        let base = store.snapshot().unwrap();
+        let epoch = base.epoch();
+        store
+            .transact(epoch, |catalog, _attachments| {
+                catalog.projects.insert(
+                    project_id.clone(),
+                    CorpusProject {
+                        project_id: project_id.clone(),
+                        scope: ProjectScope::Published(scope.clone()),
+                        operator_aliases: BTreeSet::new(),
+                        nominated_aliases: BTreeSet::new(),
+                        display_name: "f2-test".to_string(),
+                        created_at: "2024-01-01T00:00:00Z".to_string(),
+                        registered_at_compat: None,
+                        repo_history: None,
+                        languages: BTreeSet::new(),
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        // Drain the first event.
+        let _ = observer.drain_events();
+
+        // Second transaction: attachment-only change (no catalog change).
+        let base = store.snapshot().unwrap();
+        let epoch = base.epoch();
+        store
+            .transact(epoch, |_catalog, attachments| {
+                attachments.attachments.insert(
+                    AttachmentId::parse("att_11111111111111111111111111111111".to_string()).unwrap(),
+                    CheckoutAttachment {
+                        attachment_id: AttachmentId::parse("att_11111111111111111111111111111111".to_string()).unwrap(),
+                        project_id: project_id.clone(),
+                        checkout_id: "22222222222222222222222222222222".to_string(),
+                        checkout_dir: "/tmp/f2/checkout".to_string(),
+                        checkout_project_dir: "/tmp/f2/checkout".to_string(),
+                        project_root_relpath: ".".to_string(),
+                        kind: AttachmentKind::Base,
+                        validated_scope: Some(scope.clone()),
+                        computed_repo_hint: None,
+                        branch_ref: None,
+                        capabilities: AttachmentCapabilities {
+                            local_code_source: true,
+                            git_history: true,
+                            blame: false,
+                            repo_knowledge: false,
+                            repo_mutation: false,
+                            render_output: false,
+                            provenance_note_io: false,
+                            artifact_watching: false,
+                        },
+                        status: AttachmentStatus::Attached,
+                        attached_at: "2024-01-01T00:00:00Z".to_string(),
+                        detached_at: None,
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        // The observer event must include the project id even though
+        // only the attachment snapshot changed (F2 fix).
+        let events = observer.drain_events();
+        let all_changed: BTreeSet<String> = events
+            .iter()
+            .flat_map(|e| e.changed_project_ids.iter().cloned())
+            .collect();
+        assert!(
+            all_changed.contains(&project_id.to_string()),
+            "attachment-only change must emit the project id in changed_project_ids (F2 fix), \
+             got: {:?}",
+            all_changed
+        );
+    }
+
+    /// F3: link 4 verifies the manifest file exists and its digest
+    /// matches (not just validate_header).
+    #[test]
+    fn f3_link4_verifies_manifest_digest() {
+        let src = self_source();
+        let body = extract_fn_body(&src, "validate_relationship_chain");
+        assert!(
+            body.contains("verify_generation_manifest_for_migration"),
+            "link 4 must call verify_generation_manifest_for_migration (F3 fix)"
+        );
+    }
+
+    /// F3: link 5 checks the manifest path field.
+    #[test]
+    fn f3_link5_checks_manifest_path() {
+        let src = self_source();
+        let body = extract_fn_body(&src, "validate_relationship_chain");
+        assert!(
+            body.contains("manifest path missing"),
+            "link 5 must check workspace manifest path (F3 fix)"
+        );
+    }
+
+    /// F3: pre-bind validation runs BEFORE schema rebuild. The
+    /// pre_bind_catalog_recovery call must appear before the schema
+    /// rebuild block in open.rs.
+    #[test]
+    fn f3_pre_bind_runs_before_schema_rebuild() {
+        let open_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/open.rs");
+        let src = std::fs::read_to_string(&open_path)
+            .unwrap_or_else(|_| panic!("failed to read {}", open_path.display()));
+        let pre_bind_pos = src
+            .find("pre_bind_catalog_recovery")
+            .expect("pre_bind_catalog_recovery must be called in open.rs");
+        let schema_rebuild_pos = src
+            .find("schema_was_reset")
+            .expect("schema rebuild must exist in open.rs");
+        assert!(
+            pre_bind_pos < schema_rebuild_pos,
+            "pre_bind_catalog_recovery must run BEFORE schema rebuild (F3 fix)"
         );
     }
 }

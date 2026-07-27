@@ -481,6 +481,20 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         catalog_store.clone(),
         checkout_access.clone(),
     )?);
+
+    // Pre-bind catalog-mode recovery (P4-F section 10.1 steps 5-8):
+    // once-only classification, relationship chain validation,
+    // retirement-journal detection, and startup reducer sweep. All run
+    // BEFORE the schema rebuild, reindex, and CodeReadView construction
+    // so that a broken relationship chain fails closed before the daemon
+    // builds any read view from corrupt state. Bridge mode is a no-op.
+    super::code_source::pre_bind_catalog_recovery(
+        &project_authority,
+        &code_sources,
+        &checkout_access,
+        &store_dir,
+    )?;
+
     // The grant table is built after the writer actor spawns, so the
     // planner's assignment view is installed here rather than passed to
     // `spawn` (same shape as the post-commit searcher hook).
@@ -679,19 +693,6 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     shared
         .roster_view
         .rebuild_from_store(&shared.task_store.read());
-
-    // Pre-bind catalog-mode recovery (P4-F section 10.1 steps 5-8):
-    // once-only classification, relationship chain validation,
-    // retirement-journal detection, and startup reducer sweep. All run
-    // BEFORE the TCP listener binds. Bridge mode is a no-op (byte-
-    // compatible). Any failure is fail-closed: the daemon never reaches
-    // `run()` and never binds.
-    super::code_source::pre_bind_catalog_recovery(
-        &shared.project_authority,
-        &shared.code_sources,
-        &shared.checkout_access,
-        &shared.store_dir,
-    )?;
 
     Ok(OpenedServer {
         cfg,

@@ -3337,6 +3337,16 @@ impl CodeSourceStore {
         Ok(())
     }
 
+    /// Read the current store limits (section 10.2 link 4: bounded
+    /// manifest verification needs the limits for entry/byte caps).
+    pub fn limits(&self) -> StoreLimits {
+        self.shared
+            .limits
+            .read()
+            .map(|l| l.clone())
+            .unwrap_or_default()
+    }
+
     pub fn snapshot_legacy_migration_for_scopes(
         &self,
         catalog_scopes: &BTreeSet<PublishedScope>,
@@ -4323,6 +4333,32 @@ impl CodeSourceStore {
         self.save_activation_v2_locked(&record)
     }
 
+    /// Mode-aware cutback-pending marker (section 9.1 step c).
+    ///
+    /// Sets `cutback_pending = true` and a diagnostic string on the
+    /// activation record. In catalog mode this writes through the v2
+    /// activation path; in bridge mode it falls back to the v1 record
+    /// (the only mode where mark_cutback_pending is valid).
+    pub fn mark_cutback_pending_mixed(
+        &self,
+        project_id: &str,
+        diagnostic: &str,
+    ) -> Result<()> {
+        if self.shared.record_mode != RuntimeRecordMode::BridgeV1 {
+            // Catalog v2 path
+            let _guard = self.lock_mutation()?;
+            let Some(mut record) = self.load_activation_v2_locked(project_id)? else {
+                return Ok(());
+            };
+            record.cutback_pending = true;
+            record.diagnostic = Some(diagnostic.chars().take(512).collect());
+            self.save_activation_v2_locked(&record)
+        } else {
+            // Bridge v1 path (legacy)
+            self.mark_cutback_pending(project_id, diagnostic)
+        }
+    }
+
     /// Clear the typed cutback state on a project's activation record
     /// (section 9.1 step e: success clears state). Sets `cutback` to
     /// `None` and `cutback_pending` to `false` (the coherence clause,
@@ -4760,6 +4796,19 @@ impl CodeSourceStore {
         generation: &str,
     ) -> Result<Vec<ManifestEntry>> {
         read_manifest_jsonl(&self.paths.generation_manifest(scope, generation)?)
+    }
+
+    /// Read the raw manifest.jsonl bytes for a generation (section 10.2
+    /// link 4: bounded manifest verification). Returns the file bytes
+    /// for digest verification and entry validation.
+    pub fn read_generation_manifest_bytes(
+        &self,
+        scope: &PublishedScope,
+        generation: &str,
+    ) -> Result<Vec<u8>> {
+        let path = self.paths.generation_manifest(scope, generation)?;
+        std::fs::read(&path)
+            .with_context(|| format!("reading manifest at {}", path.display()))
     }
 
     pub fn desired_generation(&self, scope: &PublishedScope) -> Result<Option<StoredGeneration>> {
