@@ -787,10 +787,80 @@ fn retire_refuses_on_a_producer_assignment() {
         refused["error"]["code"],
         "error.project_catalog_admin_retire_blocked"
     );
+
+    let bro_home = root.join("bro-home");
+    let journal_refused = run_with_isolated_index(
+        &[
+            "project-catalog",
+            "retirement-journal",
+            "--projects-path",
+            projects,
+            "--project",
+            &project_id,
+            "--execute",
+            "--config",
+            config,
+            "--bro-home",
+            bro_home.to_str().unwrap(),
+        ],
+        &index_path,
+    );
+    assert!(!journal_refused.status.success());
+    let journal_refused: Value = serde_json::from_slice(&journal_refused.stdout).unwrap();
+    assert_eq!(
+        journal_refused["error"]["code"],
+        "error.project_catalog_retire_producer_grant"
+    );
+    assert!(!bro_home.join("retirement-journals").exists());
+
+    let mut prepared = bbox_indexing::project_catalog_admin::ProjectRetirementJournal::new(
+        ProjectId::parse(project_id.clone()).unwrap(),
+        ProjectCatalogStore::open_existing(&projects_path)
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .epoch(),
+        "2026-07-27T00:00:00Z",
+    );
+    prepared.evidence.catalog_scope = Some(PublishedScope::try_new("producerfamily", ".").unwrap());
+    bbox_indexing::project_catalog_admin::save_retirement_journal(&bro_home, &prepared).unwrap();
+
+    let resume_refused = run_with_isolated_index(
+        &[
+            "project-catalog",
+            "retirement-journal",
+            "--projects-path",
+            projects,
+            "--project",
+            &project_id,
+            "--execute",
+            "--config",
+            config,
+            "--bro-home",
+            bro_home.to_str().unwrap(),
+        ],
+        &index_path,
+    );
+    assert!(!resume_refused.status.success());
+    let resume_refused: Value = serde_json::from_slice(&resume_refused.stdout).unwrap();
+    assert_eq!(
+        resume_refused["error"]["code"],
+        "error.project_catalog_retire_producer_grant"
+    );
+    assert_eq!(
+        bbox_indexing::project_catalog_admin::load_retirement_journal(
+            &bro_home,
+            &ProjectId::parse(project_id).unwrap(),
+        )
+        .unwrap()
+        .unwrap()
+        .current_stage,
+        bbox_indexing::project_catalog_admin::RetirementJournalStage::Prepared
+    );
 }
 
 #[test]
-fn retire_probes_generations_under_a_previously_owned_scope() {
+fn retire_treats_historical_scope_generations_as_provenance_only() {
     let directory = tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     let (state, projects_path, config_path, index_path) = isolated_state_root(&root);
@@ -824,10 +894,10 @@ fn retire_probes_generations_under_a_previously_owned_scope() {
         "--config",
         config,
     ]));
+    let _project_two = add_published_project(projects, "scopefamily", ".", "2026-07-24T00:00:02Z");
 
-    // The retained generation sits under the scope the project owned BEFORE
-    // the migration. A probe that only reads the current scope hash reports
-    // zero and lets --execute destroy a still-referenced project.
+    // The retained generation sits under the old scope after another project
+    // has claimed it. Historical migration endpoints are provenance only.
     let old_scope = PublishedScope::try_new("scopefamily", ".").unwrap();
     fs::create_dir_all(
         state
@@ -851,9 +921,12 @@ fn retire_probes_generations_under_a_previously_owned_scope() {
         ],
         &index_path,
     ));
-    assert_eq!(reported["result"]["blocking"]["code_source_generations"], 1);
+    assert!(
+        reported["result"]["blocking"]["code_source_generations"].is_null()
+            || reported["result"]["blocking"]["code_source_generations"] == 0
+    );
 
-    let refused = run_with_isolated_index(
+    let retired = run_with_isolated_index(
         &[
             "project-catalog",
             "retire",
@@ -867,11 +940,14 @@ fn retire_probes_generations_under_a_previously_owned_scope() {
         ],
         &index_path,
     );
-    assert!(!refused.status.success());
-    let refused: Value = serde_json::from_slice(&refused.stdout).unwrap();
-    assert_eq!(
-        refused["error"]["code"],
-        "error.project_catalog_admin_retire_blocked"
+    assert!(retired.status.success());
+    assert!(
+        state
+            .join("code-sources/scopes")
+            .join(bbox_code_source::scope_hash(&old_scope))
+            .join("generations")
+            .join("d".repeat(64))
+            .is_dir()
     );
 }
 
@@ -965,6 +1041,28 @@ fn retire_lifecycle_with_collected_activation_converges_and_is_idempotent() {
             );
         }
     }
+
+    write_collected_activation(&state, &project_id, &"f".repeat(64));
+    let recovery_refused = run_with_isolated_index(
+        &[
+            "project-catalog",
+            "retirement-journal",
+            "--projects-path",
+            projects,
+            "--project",
+            &project_id,
+            "--execute",
+            "--config",
+            config,
+        ],
+        &index_path,
+    );
+    assert!(!recovery_refused.status.success());
+    let recovery_refused: Value = serde_json::from_slice(&recovery_refused.stdout).unwrap();
+    assert_eq!(
+        recovery_refused["error"]["code"],
+        "error.project_catalog_retire_recovery_activation"
+    );
 }
 
 #[test]

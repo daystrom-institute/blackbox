@@ -1491,15 +1491,10 @@ pub fn retire_project(
             format!("project {project_id} is not in the catalog"),
         ));
     }
-    // R3F1: code_source_activation is collected STATE that the journal
-    // discharge stage CollectedGenerationsDischarged clears, NOT a
-    // blocking reference. A normally collected project has an activation
-    // record; excluding it here lets the retire proceed to the journal
-    // flow, which discharges it in stage 2.
     let blocking: std::collections::BTreeMap<String, u64> = evidence
         .external_reference_counts
         .iter()
-        .filter(|(class, count)| **count > 0 && *class != "code_source_activation")
+        .filter(|(_, count)| **count > 0)
         .map(|(class, count)| (class.clone(), *count))
         .collect();
     let active_attachments = state
@@ -2147,6 +2142,10 @@ pub struct RetirementJournalStep {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetirementJournalEvidence {
+    /// Current catalog scope captured before the final authority cut. This is
+    /// the only scope producer grants may authorize for retirement checks.
+    pub catalog_scope: Option<PublishedScope>,
+
     /// Exact generation inventory that belongs to the retiring project and
     /// will be deleted in stage CollectedGenerationsDischarged.
     pub owned_generations: Vec<RetirementGenerationEvidence>,
@@ -2213,6 +2212,16 @@ pub fn retirement_journal_path(
         .join(format!("{project_id}.json"))
 }
 
+fn archived_retirement_journal_path(
+    bro_home: &std::path::Path,
+    project_id: &ProjectId,
+) -> std::path::PathBuf {
+    bro_home
+        .join("retirement-journals")
+        .join("archive")
+        .join(format!("{project_id}.json"))
+}
+
 /// Load a journal from disk. Returns `Ok(None)` if the file does not exist.
 ///
 /// F6: Strict bounded nofollow decoding. Validates:
@@ -2227,6 +2236,21 @@ pub fn load_retirement_journal(
     project_id: &ProjectId,
 ) -> Result<Option<ProjectRetirementJournal>, RetirementJournalError> {
     let path = retirement_journal_path(bro_home, project_id);
+    load_retirement_journal_from_path(&path, project_id)
+}
+
+fn load_archived_retirement_journal(
+    bro_home: &std::path::Path,
+    project_id: &ProjectId,
+) -> Result<Option<ProjectRetirementJournal>, RetirementJournalError> {
+    let path = archived_retirement_journal_path(bro_home, project_id);
+    load_retirement_journal_from_path(&path, project_id)
+}
+
+fn load_retirement_journal_from_path(
+    path: &std::path::Path,
+    project_id: &ProjectId,
+) -> Result<Option<ProjectRetirementJournal>, RetirementJournalError> {
     if !path.is_file() {
         return Ok(None);
     }
@@ -2468,9 +2492,14 @@ pub fn archive_retirement_journal(
 ) -> Result<(), RetirementJournalError> {
     let path = retirement_journal_path(bro_home, project_id);
     if path.is_file() {
-        std::fs::remove_file(&path)?;
-        // Sync the directory after removal.
         let dir = bro_home.join("retirement-journals");
+        let archive_dir = dir.join("archive");
+        std::fs::create_dir_all(&archive_dir)?;
+        let archived = archived_retirement_journal_path(bro_home, project_id);
+        std::fs::rename(&path, &archived)?;
+        if let Ok(handle) = std::fs::File::open(&archive_dir) {
+            let _ = handle.sync_all();
+        }
         if let Ok(handle) = std::fs::File::open(&dir) {
             let _ = handle.sync_all();
         }
@@ -2575,7 +2604,19 @@ pub trait RetirementDischargeWorkers {
         &mut self,
         store: &ProjectCatalogStore,
         project_id: &ProjectId,
+        evidence: &RetirementJournalEvidence,
     ) -> AdminResult<()>;
+
+    /// Verify recovery after the catalog pair is absent. Exact generation
+    /// identities from Prepared evidence must be gone, and activation state
+    /// must remain absent.
+    fn verify_retirement_quiescent(
+        &mut self,
+        _project_id: &ProjectId,
+        _evidence: &RetirementJournalEvidence,
+    ) -> AdminResult<()> {
+        Ok(())
+    }
 
     /// Re-inventory the cross-store reference classes from CURRENT state
     /// after all discharge stages have run. Called at CatalogPairRemoved
@@ -2634,6 +2675,7 @@ impl RetirementDischargeWorkers for NoopDischargeWorkers {
         &mut self,
         _store: &ProjectCatalogStore,
         _project_id: &ProjectId,
+        _evidence: &RetirementJournalEvidence,
     ) -> AdminResult<()> {
         Ok(())
     }
@@ -2726,6 +2768,19 @@ pub fn retire_project_journaled_with(
             ),
         ));
     }
+    if preflight
+        .blocking
+        .get("producer_assignments")
+        .is_some_and(|count| *count > 0)
+    {
+        return Err(admin_error(
+            "error.project_catalog_retire_producer_grant",
+            format!(
+                "project {project_id} still has a configured producer grant; \
+                 revoke it before creating or resuming retirement"
+            ),
+        ));
+    }
 
     // Load or create the journal (recovery: section 11.4).
     let mut journal = match load_retirement_journal(bro_home, project_id)
@@ -2733,6 +2788,7 @@ pub fn retire_project_journaled_with(
     {
         Some(j) if j.current_stage == RetirementJournalStage::Complete => {
             // Already complete. Verify quiescence (section 11.4).
+            workers.verify_retirement_quiescent(project_id, &j.evidence)?;
             return Ok((preflight, Some(j)));
         }
         Some(j) => j,
@@ -2742,17 +2798,21 @@ pub fn retire_project_journaled_with(
             // journal was archived on completion). Treat as already-done:
             // skip all stages without calling any discharge workers.
             if !_project_exists {
-                let j = ProjectRetirementJournal::new(
-                    project_id.clone(),
-                    catalog_epoch,
-                    &journal_now(),
-                );
-                let mut j = j;
-                // Advance through all stages to Complete without working.
-                while j.current_stage != RetirementJournalStage::Complete {
-                    j.advance(&journal_now());
-                }
-                return Ok((preflight, Some(j)));
+                let archived = load_archived_retirement_journal(bro_home, project_id)
+                    .map_err(|e| {
+                        admin_error("error.project_catalog_retire_journal_io", e.to_string())
+                    })?
+                    .ok_or_else(|| {
+                        admin_error(
+                            "error.project_catalog_retire_missing_recovery_evidence",
+                            format!(
+                                "project {project_id} is absent but no completed retirement \
+                                 journal exists to verify recovery"
+                            ),
+                        )
+                    })?;
+                workers.verify_retirement_quiescent(project_id, &archived.evidence)?;
+                return Ok((preflight, Some(archived)));
             }
             let mut j =
                 ProjectRetirementJournal::new(project_id.clone(), catalog_epoch, &journal_now());
@@ -2766,6 +2826,10 @@ pub fn retire_project_journaled_with(
 
     let now = || journal_now();
 
+    // Producer grants are configuration authority, so every resume checks
+    // them again before any destructive stage can run.
+    workers.verify_source_authority_quiesced(store, project_id, &journal.evidence)?;
+
     // Stage: SourceAuthorityQuiesced (step 2). The worker must verify
     // that the project no longer holds active auth assignments or
     // un-revoked producer bindings before the journal may advance (F5).
@@ -2774,7 +2838,6 @@ pub fn retire_project_journaled_with(
         .current_stage
         .is_at_least(RetirementJournalStage::SourceAuthorityQuiesced)
     {
-        workers.verify_source_authority_quiesced(store, project_id)?;
         journal.advance(&now());
         save_retirement_journal(bro_home, &journal)
             .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
@@ -2879,6 +2942,8 @@ pub fn retire_project_journaled_with(
     // Stage: Complete (step 9). Archive the journal.
     if journal.current_stage != RetirementJournalStage::Complete {
         journal.advance(&now());
+        save_retirement_journal(bro_home, &journal)
+            .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
         archive_retirement_journal(bro_home, project_id)
             .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
     }
@@ -2895,13 +2960,10 @@ fn build_preflight(
 ) -> RetirementPreflight {
     use bbox_corpus_core::project_catalog::{RepoHistoryAuthority, RepoHistoryMaterialization};
 
-    // R3F1: code_source_activation is collected STATE discharged by the
-    // journal, not a blocking reference. Exclude it from blocking so the
-    // preflight display agrees with the execute gate.
     let mut blocking: std::collections::BTreeMap<String, u64> = evidence
         .external_reference_counts
         .iter()
-        .filter(|(class, count)| **count > 0 && *class != "code_source_activation")
+        .filter(|(_, count)| **count > 0)
         .map(|(class, count)| (class.clone(), *count))
         .collect();
 
@@ -3596,6 +3658,9 @@ mod tests {
         evidence
             .external_reference_counts
             .insert("knowledge_rows".into(), 2);
+        evidence
+            .external_reference_counts
+            .insert("code_source_activation".into(), 1);
         let (inventory, commit) = retire_project(
             &store,
             current_epoch(&store),
@@ -3605,6 +3670,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(inventory.blocking.get("knowledge_rows"), Some(&2));
+        assert_eq!(inventory.blocking.get("code_source_activation"), Some(&1));
         assert!(commit.is_none());
         let error = retire_project(
             &store,

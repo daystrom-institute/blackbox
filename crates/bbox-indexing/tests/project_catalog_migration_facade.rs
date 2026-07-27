@@ -1905,6 +1905,7 @@ impl bbox_indexing::project_catalog_admin::RetirementDischargeWorkers for Counti
         &mut self,
         _store: &bbox_indexing::project_catalog_store::ProjectCatalogStore,
         _project_id: &ProjectId,
+        _evidence: &bbox_indexing::project_catalog_admin::RetirementJournalEvidence,
     ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
         Ok(())
     }
@@ -2209,6 +2210,7 @@ fn acceptance_discharge_nonzero_reprobe_refuses_at_final_cut() {
             &mut self,
             _store: &bbox_indexing::project_catalog_store::ProjectCatalogStore,
             _project_id: &ProjectId,
+            _evidence: &bbox_indexing::project_catalog_admin::RetirementJournalEvidence,
         ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
             Ok(())
         }
@@ -2337,6 +2339,7 @@ fn f5_source_authority_quiesced_blocks_journal() {
             &mut self,
             _store: &ProjectCatalogStore,
             _project_id: &ProjectId,
+            _evidence: &bbox_indexing::project_catalog_admin::RetirementJournalEvidence,
         ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
             Err(bbox_indexing::project_catalog_admin::admin_error(
                 "error.project_catalog_retire_auth_not_quiesced",
@@ -2472,6 +2475,7 @@ fn r2f1_unprobeable_classes_block_journal() {
             &mut self,
             _store: &ProjectCatalogStore,
             _project_id: &ProjectId,
+            _evidence: &bbox_indexing::project_catalog_admin::RetirementJournalEvidence,
         ) -> bbox_indexing::project_catalog_admin::AdminResult<()> {
             Ok(())
         }

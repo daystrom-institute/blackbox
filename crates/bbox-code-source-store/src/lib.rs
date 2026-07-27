@@ -4857,6 +4857,28 @@ impl CodeSourceStore {
         Ok(())
     }
 
+    pub fn retirement_generation_exists(
+        &self,
+        scope: &PublishedScope,
+        generation_id: &str,
+    ) -> Result<bool> {
+        validate_sha256(generation_id)?;
+        let directory = self.paths.generation_directory(scope, generation_id)?;
+        if !directory.exists() {
+            return Ok(false);
+        }
+        let metadata = fs::symlink_metadata(&directory)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("generation path is not a regular directory");
+        }
+        let stored = read_mixed_stored_generation(&directory.join("metadata.json"))?;
+        stored.validate()?;
+        if stored.generation_id() != generation_id || stored.published_scope() != scope {
+            bail!("generation metadata does not match exact retirement identity");
+        }
+        Ok(true)
+    }
+
     /// Delete candidate blobs only when no remaining generation manifest
     /// references them. Missing blobs are an idempotent success.
     pub fn sweep_retirement_blobs(&self, candidates: &BTreeSet<String>) -> Result<()> {

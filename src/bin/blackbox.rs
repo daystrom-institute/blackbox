@@ -1376,33 +1376,94 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
     /// quiescence here; attachments are detached in a later journal stage.
     fn verify_source_authority_quiesced(
         &mut self,
-        store: &ProjectCatalogStore,
+        _store: &ProjectCatalogStore,
         project_id: &ProjectId,
+        evidence: &project_catalog_admin::RetirementJournalEvidence,
     ) -> project_catalog_admin::AdminResult<()> {
-        // R3F1: do NOT check the activation record here. A collected
-        // activation record is state that stage CollectedGenerationsDischarged
-        // discharges (clear_activation). Checking it here would make it
-        // impossible to retire a normally collected project.
-        //
-        // The only authority check is whether the project is still in the
-        // catalog with an active scope binding. The retire operation itself
-        // removes the catalog row in a later stage, so this check passes
-        // as long as we are in the normal retire flow.
-        let state = store.snapshot().map_err(|e| {
+        let granted = evidence.catalog_scope.as_ref().is_some_and(|scope| {
+            self.config
+                .code_collection
+                .producers
+                .iter()
+                .any(|producer| producer.scopes.iter().any(|grant| grant == scope))
+        });
+        if granted {
+            return Err(project_catalog_admin::admin_error(
+                "error.project_catalog_retire_producer_grant",
+                format!(
+                    "project {project_id} still has a configured producer grant; \
+                     revoke it before retirement can advance"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_retirement_quiescent(
+        &mut self,
+        project_id: &ProjectId,
+        evidence: &project_catalog_admin::RetirementJournalEvidence,
+    ) -> project_catalog_admin::AdminResult<()> {
+        self.verify_source_authority_quiesced(
+            &ProjectCatalogStore::open_existing(self.projects_path).map_err(|e| {
+                project_catalog_admin::admin_error(
+                    "error.project_catalog_retire_catalog_open",
+                    format!("failed to open project catalog during recovery: {e}"),
+                )
+            })?,
+            project_id,
+            evidence,
+        )?;
+        let code_sources = self.config.paths.state_dir.join("code-sources");
+        let store = bbox_code_source_store::CodeSourceStore::open(
+            &code_sources,
+            bbox_indexing::project_catalog_migration::project_catalog_migration_store_limits(
+                self.config,
+            ),
+        )
+        .map_err(|e| {
             project_catalog_admin::admin_error(
-                "error.project_catalog_retire_auth_probe",
-                format!("failed to snapshot catalog for authority check: {e}"),
+                "error.project_catalog_retire_code_source_open",
+                format!("failed to open code-source store during recovery: {e}"),
             )
         })?;
-        // If the project is not in the catalog at all, authority has
-        // already quiesced (or was never established).
-        if !state.catalog().projects.contains_key(project_id) {
-            return Ok(());
+        if store
+            .load_activation_mixed(project_id.as_str())
+            .map_err(|e| {
+                project_catalog_admin::admin_error(
+                    "error.project_catalog_retire_recovery_activation",
+                    format!("failed to verify activation absence: {e}"),
+                )
+            })?
+            .is_some()
+        {
+            return Err(project_catalog_admin::admin_error(
+                "error.project_catalog_retire_recovery_activation",
+                format!("project {project_id} still has an activation record"),
+            ));
         }
-        // The project is in the catalog. This is expected during a normal
-        // retire: the retire flow removes the catalog row in the
-        // CatalogPairRemoved stage. No further authority check is needed;
-        // a collected activation record is not authority, it is state.
+        for generation in &evidence.owned_generations {
+            if store
+                .retirement_generation_exists(
+                    &generation.published_scope,
+                    &generation.generation_id,
+                )
+                .map_err(|e| {
+                    project_catalog_admin::admin_error(
+                        "error.project_catalog_retire_recovery_generation",
+                        format!("failed to verify generation absence: {e}"),
+                    )
+                })?
+            {
+                return Err(project_catalog_admin::admin_error(
+                    "error.project_catalog_retire_recovery_generation",
+                    format!(
+                        "project {project_id} still has generation {}",
+                        generation.generation_id
+                    ),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -1537,8 +1598,8 @@ fn probe_retire_evidence(
             // migration-era effective-source manifest is NOT read. If the
             // project's scope is no longer in any producer's grant list,
             // the assignment count is zero.
-            let assignment_count =
-                count_config_producer_assignments(config, &owned_scope_hashes(&state, project_id));
+            let current_scopes = current_scope_hashes(&state, project_id);
+            let assignment_count = count_config_producer_assignments(config, &current_scopes);
             probe.record("producer_assignments", assignment_count);
             // R3F1: generation evidence comes from the activation record's
             // generation_id (if present) plus store-owned enumeration of
@@ -1552,7 +1613,7 @@ fn probe_retire_evidence(
                 "code_source_generations",
                 probe_code_source_generations_store_owned(
                     &code_sources,
-                    &owned_scope_hashes(&state, project_id),
+                    &current_scopes,
                     named_generations.as_deref(),
                 ),
             );
@@ -1672,29 +1733,20 @@ fn probe_retire_evidence(
     Ok(probe)
 }
 
-/// Every code-source scope hash this project has owned: the scope the catalog
-/// records now plus both endpoints of each of its own migration records.
-fn owned_scope_hashes(
+fn current_scope_hashes(
     state: &bbox_indexing::project_catalog_store::ProjectCatalogState,
     project_id: &ProjectId,
 ) -> BTreeSet<String> {
-    let mut hashes = BTreeSet::new();
-    let add = |scope: &ProjectScope, hashes: &mut BTreeSet<String>| {
-        if let ProjectScope::Published(scope) = scope {
-            hashes.insert(bbox_code_source::scope_hash(scope));
-        }
-    };
-    if let Some(project) = state.catalog().projects.get(project_id) {
-        add(&project.scope, &mut hashes);
-    }
-    for record in state.catalog().scope_migrations.values() {
-        if &record.project_id != project_id {
-            continue;
-        }
-        add(&record.old_scope, &mut hashes);
-        add(&record.new_scope, &mut hashes);
-    }
-    hashes
+    state
+        .catalog()
+        .projects
+        .get(project_id)
+        .and_then(|project| match &project.scope {
+            ProjectScope::Published(scope) => Some(bbox_code_source::scope_hash(scope)),
+            ProjectScope::LegacyLocal => None,
+        })
+        .into_iter()
+        .collect()
 }
 
 fn capture_retirement_evidence(
@@ -1788,6 +1840,7 @@ fn capture_retirement_evidence(
     }
 
     Ok(project_catalog_admin::RetirementJournalEvidence {
+        catalog_scope: current_scope.cloned(),
         owned_generations,
         owned_blob_hashes: owned_blob_hashes.into_iter().collect(),
     })
