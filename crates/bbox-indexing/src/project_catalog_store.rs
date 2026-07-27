@@ -36,10 +36,10 @@ use bbox_corpus_core::json_store::{
 };
 use bbox_corpus_core::project_catalog::{
     AttachmentId, AttachmentSnapshotV1, AttachmentStatus, CatalogOriginV2, CatalogSnapshotV2,
-    MAX_LEGACY_PROJECT_STORE_BYTES, MAX_PROJECT_CATALOG_BYTES, MAX_PROJECT_CATALOG_ENTRIES,
-    ProjectCatalogTransactionId, ProjectId, ProjectScope, decode_attachment_snapshot,
-    decode_catalog_snapshot, decode_legacy_project_store, encode_attachment_snapshot,
-    encode_catalog_snapshot, validate_catalog_attachments,
+    CheckoutAttachment, MAX_LEGACY_PROJECT_STORE_BYTES, MAX_PROJECT_CATALOG_BYTES,
+    MAX_PROJECT_CATALOG_ENTRIES, ProjectCatalogTransactionId, ProjectId, ProjectScope,
+    decode_attachment_snapshot, decode_catalog_snapshot, decode_legacy_project_store,
+    encode_attachment_snapshot, encode_catalog_snapshot, validate_catalog_attachments,
 };
 use parking_lot::RwLock;
 use serde::{Deserialize, Deserializer, Serialize, de};
@@ -548,21 +548,42 @@ impl ProjectCatalogStore {
                 if catalog_changed {
                     return true;
                 }
-                // Also check attachment snapshot for this project id.
-                let old_att = old_attachments
+                // R2F6: compare the COMPLETE set of attachments for this
+                // project, not just the first one found. A project with
+                // multiple attachments where only the second changed must
+                // be detected.
+                let old_atts: BTreeMap<&str, &CheckoutAttachment> = old_attachments
                     .attachments
                     .values()
-                    .find(|a| a.project_id.as_str() == pid.as_str());
-                let new_att = attachments
+                    .filter(|a| a.project_id.as_str() == pid.as_str())
+                    .map(|a| (a.attachment_id.as_str(), a))
+                    .collect();
+                let new_atts: BTreeMap<&str, &CheckoutAttachment> = attachments
                     .attachments
                     .values()
-                    .find(|a| a.project_id.as_str() == pid.as_str());
-                match (old_att, new_att) {
-                    (None, Some(_)) => true,
-                    (Some(_), None) => true,
-                    (Some(old), Some(new)) => old != new,
-                    (None, None) => false,
+                    .filter(|a| a.project_id.as_str() == pid.as_str())
+                    .map(|a| (a.attachment_id.as_str(), a))
+                    .collect();
+                if old_atts.len() != new_atts.len() {
+                    return true;
                 }
+                for (key, old_val) in &old_atts {
+                    match new_atts.get(*key) {
+                        Some(new_val) if old_val != new_val => return true,
+                        None => return true,
+                        _ => {}
+                    }
+                }
+                // R2F6: also compare default_attachments selection.
+                let pid_parsed = ProjectId::parse(pid.as_str()).ok();
+                if let Some(pid_key) = &pid_parsed {
+                    let old_default = old_attachments.default_attachments.get(pid_key);
+                    let new_default = attachments.default_attachments.get(pid_key);
+                    if old_default != new_default {
+                        return true;
+                    }
+                }
+                false
             })
             .cloned()
             .collect();
@@ -15661,6 +15682,10 @@ mod tests {
 #[cfg(test)]
 mod probe_tests {
     use super::*;
+    use bbox_corpus_core::project_catalog::{
+        AttachmentCapabilities, AttachmentKind, AttachmentStatus, CheckoutAttachment,
+        CorpusProject, ProjectId, ProjectScope,
+    };
 
     fn projects_path(root: &Path) -> PathBuf {
         root.join("projects.json")
@@ -15750,5 +15775,189 @@ mod probe_tests {
         std::fs::write(&path, b"not json").unwrap();
         let error = probe_project_store_mode(&path).unwrap_err();
         assert_eq!(error.code(), "error.project_catalog_invalid_snapshot");
+    }
+
+    // ---- R2F6: multi-attachment and default-only changed-project tests ----
+
+    fn r2f6_helper_make_attachment(
+        att_id: &str,
+        project_id: &ProjectId,
+        scope: &PublishedScope,
+    ) -> CheckoutAttachment {
+        let checkout_id = if att_id.starts_with("att_1") {
+            "a".repeat(32)
+        } else {
+            "b".repeat(32)
+        };
+        CheckoutAttachment {
+            attachment_id: AttachmentId::parse(att_id.to_string()).unwrap(),
+            project_id: project_id.clone(),
+            checkout_id,
+            checkout_dir: format!("/tmp/{att_id}"),
+            checkout_project_dir: format!("/tmp/{att_id}"),
+            project_root_relpath: ".".into(),
+            kind: AttachmentKind::Base,
+            validated_scope: Some(scope.clone()),
+            computed_repo_hint: None,
+            branch_ref: None,
+            capabilities: AttachmentCapabilities::default(),
+            status: AttachmentStatus::Attached,
+            attached_at: "2026-07-22T00:00:00Z".into(),
+            detached_at: None,
+        }
+    }
+
+    /// R2F6: when a project has two attachments and only the second one
+    /// changes status, the project must appear in changed_project_ids.
+    #[test]
+    fn r2f6_two_attachments_second_changed_emits_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("projects.json");
+        let store = ProjectCatalogStore::initialize_empty(path).unwrap();
+        let observer = store.commit_observer();
+        let pid = ProjectId::parse("p_000000000000000000000000000000a1").unwrap();
+        let scope = PublishedScope::try_new("r2f6-repo", ".").unwrap();
+        let att1 =
+            r2f6_helper_make_attachment("att_11111111111111111111111111111111", &pid, &scope);
+        let att2 =
+            r2f6_helper_make_attachment("att_22222222222222222222222222222222", &pid, &scope);
+        let pid_clone = pid.clone();
+        let scope_clone = scope.clone();
+        let att1_clone = att1.clone();
+        let att2_clone = att2.clone();
+        store
+            .transact(1, move |catalog, attachments| {
+                catalog.projects.insert(
+                    pid_clone.clone(),
+                    CorpusProject {
+                        project_id: pid_clone.clone(),
+                        scope: ProjectScope::Published(scope_clone.clone()),
+                        operator_aliases: BTreeSet::new(),
+                        nominated_aliases: BTreeSet::new(),
+                        display_name: "r2f6".into(),
+                        created_at: "2026-07-22T00:00:00Z".into(),
+                        registered_at_compat: None,
+                        repo_history: None,
+                        languages: BTreeSet::new(),
+                    },
+                );
+                attachments
+                    .attachments
+                    .insert(att1_clone.attachment_id.clone(), att1_clone);
+                attachments
+                    .attachments
+                    .insert(att2_clone.attachment_id.clone(), att2_clone);
+                Ok(())
+            })
+            .unwrap();
+
+        // Clear the first commit's events.
+        let _ = observer.drain_events();
+
+        // Now change only att2 (detach it).
+        store
+            .transact(2, move |_, attachments| {
+                let entry = attachments
+                    .attachments
+                    .get_mut(
+                        &AttachmentId::parse("att_22222222222222222222222222222222".to_string())
+                            .unwrap(),
+                    )
+                    .unwrap();
+                entry.status = AttachmentStatus::Detached;
+                entry.capabilities = AttachmentCapabilities::default();
+                entry.detached_at = Some("2026-07-23T00:00:00Z".into());
+                Ok(())
+            })
+            .unwrap();
+
+        let events = observer.drain_events();
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0]
+                .changed_project_ids
+                .contains("p_000000000000000000000000000000a1"),
+            "project must be in changed_project_ids when second attachment changes, got: {:?}",
+            events[0].changed_project_ids
+        );
+    }
+
+    /// R2F6: a default_attachments-only change (no attachment content
+    /// change) must emit the project in changed_project_ids.
+    #[test]
+    fn r2f6_default_attachment_only_change_emits_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("projects.json");
+        let store = ProjectCatalogStore::initialize_empty(path).unwrap();
+        let observer = store.commit_observer();
+        let pid = ProjectId::parse("p_000000000000000000000000000000a1").unwrap();
+        let scope = PublishedScope::try_new("r2f6-repo2", ".").unwrap();
+        let att1 =
+            r2f6_helper_make_attachment("att_11111111111111111111111111111111", &pid, &scope);
+        let att2 =
+            r2f6_helper_make_attachment("att_22222222222222222222222222222222", &pid, &scope);
+        let pid_clone = pid.clone();
+        let pid_clone2 = pid.clone();
+        let scope_clone = scope.clone();
+        let att1_clone = att1.clone();
+        let att2_clone = att2.clone();
+        store
+            .transact(1, move |catalog, attachments| {
+                catalog.projects.insert(
+                    pid_clone.clone(),
+                    CorpusProject {
+                        project_id: pid_clone.clone(),
+                        scope: ProjectScope::Published(scope_clone.clone()),
+                        operator_aliases: BTreeSet::new(),
+                        nominated_aliases: BTreeSet::new(),
+                        display_name: "r2f6".into(),
+                        created_at: "2026-07-22T00:00:00Z".into(),
+                        registered_at_compat: None,
+                        repo_history: None,
+                        languages: BTreeSet::new(),
+                    },
+                );
+                attachments
+                    .attachments
+                    .insert(att1_clone.attachment_id.clone(), att1_clone);
+                attachments
+                    .attachments
+                    .insert(att2_clone.attachment_id.clone(), att2_clone);
+                // Set default to att1.
+                attachments.default_attachments.insert(
+                    pid_clone.clone(),
+                    AttachmentId::parse("att_11111111111111111111111111111111".to_string())
+                        .unwrap(),
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        // Clear the first commit's events.
+        let _ = observer.drain_events();
+
+        // Now change only the default attachment to att2 (no attachment
+        // content change).
+        let pid_clone3 = pid_clone2.clone();
+        store
+            .transact(2, move |_, attachments| {
+                attachments.default_attachments.insert(
+                    pid_clone3.clone(),
+                    AttachmentId::parse("att_22222222222222222222222222222222".to_string())
+                        .unwrap(),
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        let events = observer.drain_events();
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0]
+                .changed_project_ids
+                .contains("p_000000000000000000000000000000a1"),
+            "project must be in changed_project_ids when default attachment changes, got: {:?}",
+            events[0].changed_project_ids
+        );
     }
 }
