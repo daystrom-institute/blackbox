@@ -371,7 +371,10 @@ impl ManifestIndex {
                 );
             }
             let has_overlay = match entry.dirty_overlay.as_deref() {
-                Some(relative) => confined_directory_exists(edges_dir, relative)?,
+                Some(relative) if confined_directory_exists(edges_dir, relative)? => true,
+                Some(relative) => anyhow::bail!(
+                    "declared dirty overlay is missing for workspace {project_id}: {relative}"
+                ),
                 None => false,
             };
 
@@ -419,14 +422,23 @@ impl ManifestIndex {
             }
 
             if let Some(ref repo_mat) = entry.repo_materialization {
-                if confined_directory_exists(edges_dir, repo_mat)? {
-                    for (path, file) in confined_jsonl_files(edges_dir, repo_mat)? {
-                        result.push(LoadablePath {
-                            path,
-                            file,
-                            mode: PathLoadMode::Full,
-                        });
-                    }
+                if !confined_directory_exists(edges_dir, repo_mat)? {
+                    anyhow::bail!(
+                        "declared repo materialization is missing for workspace {project_id}: {repo_mat}"
+                    );
+                }
+                let repo_files = confined_jsonl_files(edges_dir, repo_mat)?;
+                if repo_files.is_empty() {
+                    anyhow::bail!(
+                        "declared repo materialization has no JSONL members for workspace {project_id}"
+                    );
+                }
+                for (path, file) in repo_files {
+                    result.push(LoadablePath {
+                        path,
+                        file,
+                        mode: PathLoadMode::Full,
+                    });
                 }
             }
             if entry.active_snapshot.is_none() && !has_overlay {
@@ -998,6 +1010,9 @@ fn confined_snapshot_members(
             path.file_name().and_then(|name| name.to_str()) != Some(GIT_CURRENT_MEMBER)
         });
     }
+    if files.is_empty() {
+        anyhow::bail!("active snapshot has no loadable JSONL members");
+    }
     Ok(files)
 }
 
@@ -1090,6 +1105,9 @@ fn confined_snapshot_members(
         files.retain(|(path, _)| {
             path.file_name().and_then(|name| name.to_str()) != Some(GIT_CURRENT_MEMBER)
         });
+    }
+    if files.is_empty() {
+        anyhow::bail!("active snapshot has no loadable JSONL members");
     }
     Ok(files)
 }
@@ -1464,6 +1482,64 @@ mod tests {
                     active_snapshot: Some("workspace/p1/snapshots/snap1".into()),
                     dirty_overlay: None,
                     repo_materialization: None,
+                    code_source_selector: Some("collected:repo:.:generation".into()),
+                    code_source_generation: Some("generation".into()),
+                    git_overlay: None,
+                    git_overlay_managed: true,
+                },
+            );
+            assert!(index.active_paths_for_loader(edges_dir).is_err(), "{state}");
+            assert!(
+                index
+                    .active_paths_for_loader_admitting_fully_absent(
+                        edges_dir,
+                        &std::collections::BTreeSet::from(["p1".to_string()]),
+                    )
+                    .is_err(),
+                "{state}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_loader_refuses_missing_declared_components_and_empty_snapshot() {
+        for state in ["missing-overlay", "missing-repo", "empty-snapshot"] {
+            let directory = tempfile::tempdir().unwrap();
+            let edges_dir = directory.path();
+            let snapshot = materialized_dir(edges_dir).join("workspace/p1/snapshots/snap1");
+            fs::create_dir_all(&snapshot).unwrap();
+            if state != "empty-snapshot" {
+                fs::write(snapshot.join("project.jsonl"), b"").unwrap();
+            }
+            WorkspaceManifest::write_to(
+                edges_dir,
+                &WorkspaceManifest {
+                    version: 1,
+                    project_id: "p1".into(),
+                    repo_id: None,
+                    canonical_path: None,
+                    git_common_dir: None,
+                    git_worktree_dir: None,
+                    branch: None,
+                    head_sha: None,
+                    dirty: false,
+                    dirty_fingerprint: None,
+                    active_snapshot_id: Some("snap1".into()),
+                    active_dirty_overlay_id: None,
+                    updated_at: None,
+                },
+            )
+            .unwrap();
+            let mut index = ManifestIndex::new();
+            index.upsert_workspace(
+                "p1",
+                WorkspaceIndexEntry {
+                    manifest: "workspace/p1/manifest.json".into(),
+                    active_snapshot: Some("workspace/p1/snapshots/snap1".into()),
+                    dirty_overlay: (state == "missing-overlay")
+                        .then(|| "workspace/p1/overlays/missing".into()),
+                    repo_materialization: (state == "missing-repo")
+                        .then(|| "workspace/p1/repository/missing".into()),
                     code_source_selector: Some("collected:repo:.:generation".into()),
                     code_source_generation: Some("generation".into()),
                     git_overlay: None,
