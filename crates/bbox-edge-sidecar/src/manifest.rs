@@ -245,9 +245,8 @@ impl ManifestIndex {
     }
 
     pub fn load(edges_dir: &Path) -> Result<Self> {
-        let path = manifest_index_path(edges_dir);
-        let data = fs::read_to_string(&path)?;
-        let idx: Self = serde_json::from_str(&data)?;
+        let data = read_manifest_index_confined(edges_dir)?;
+        let idx: Self = serde_json::from_slice(&data)?;
         if idx.version != MANIFEST_VERSION {
             anyhow::bail!(
                 "manifest-index version {} != expected {}",
@@ -275,17 +274,7 @@ impl ManifestIndex {
     }
 
     pub fn write_atomic(&self, edges_dir: &Path) -> Result<()> {
-        let dir = materialized_dir(edges_dir);
-        fs::create_dir_all(&dir)?;
-        let path = manifest_index_path(edges_dir);
-        let tmp_path = path.with_extension("json.tmp");
-        let mut file = fs::File::create(&tmp_path)?;
-        serde_json::to_writer_pretty(&mut file, self)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(tmp_path, path)?;
-        fs::File::open(&dir)?.sync_all()?;
-        Ok(())
+        write_manifest_index_confined(edges_dir, self)
     }
 
     pub fn upsert_workspace(&mut self, project_id: &str, entry: WorkspaceIndexEntry) {
@@ -519,6 +508,145 @@ impl ManifestIndex {
     }
 }
 
+const MAX_MANIFEST_INDEX_BYTES: usize = 16 * 1024 * 1024;
+
+#[cfg(unix)]
+fn open_materialized_dir(edges_dir: &Path, create: bool) -> Result<fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let root = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(edges_dir)?;
+    let name = std::ffi::CString::new("materialized").unwrap();
+    if create {
+        let status = unsafe { libc::mkdirat(root.as_raw_fd(), name.as_ptr(), 0o755) };
+        if status != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(error.into());
+            }
+        }
+    }
+    let fd = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn read_manifest_index_confined(edges_dir: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let dir = open_materialized_dir(edges_dir, false)?;
+    let name = std::ffi::CString::new("manifest-index.json").unwrap();
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() as usize > MAX_MANIFEST_INDEX_BYTES {
+        anyhow::bail!("manifest-index is not a bounded regular file");
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(MAX_MANIFEST_INDEX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != metadata.len() {
+        anyhow::bail!("manifest-index changed while being read");
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn write_manifest_index_confined(edges_dir: &Path, index: &ManifestIndex) -> Result<()> {
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let bytes = serde_json::to_vec_pretty(index)?;
+    if bytes.len() > MAX_MANIFEST_INDEX_BYTES {
+        anyhow::bail!("manifest-index exceeds its byte limit");
+    }
+    let dir = open_materialized_dir(edges_dir, true)?;
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp_name = format!(".manifest-index.{}.{}.tmp", std::process::id(), sequence);
+    let temp = std::ffi::CString::new(temp_name.as_bytes())?;
+    let target = std::ffi::CString::new("manifest-index.json").unwrap();
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            temp.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+        unsafe { libc::unlinkat(dir.as_raw_fd(), temp.as_ptr(), 0) };
+        return Err(error.into());
+    }
+    drop(file);
+    if unsafe {
+        libc::renameat(
+            dir.as_raw_fd(),
+            temp.as_ptr(),
+            dir.as_raw_fd(),
+            target.as_ptr(),
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        unsafe { libc::unlinkat(dir.as_raw_fd(), temp.as_ptr(), 0) };
+        return Err(error.into());
+    }
+    dir.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn read_manifest_index_confined(edges_dir: &Path) -> Result<Vec<u8>> {
+    let bytes = fs::read(manifest_index_path(edges_dir))?;
+    if bytes.len() > MAX_MANIFEST_INDEX_BYTES {
+        anyhow::bail!("manifest-index exceeds its byte limit");
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn write_manifest_index_confined(edges_dir: &Path, index: &ManifestIndex) -> Result<()> {
+    let dir = materialized_dir(edges_dir);
+    fs::create_dir_all(&dir)?;
+    let bytes = serde_json::to_vec_pretty(index)?;
+    if bytes.len() > MAX_MANIFEST_INDEX_BYTES {
+        anyhow::bail!("manifest-index exceeds its byte limit");
+    }
+    let temp = dir.join(format!(".manifest-index.{}.tmp", std::process::id()));
+    fs::write(&temp, bytes)?;
+    fs::rename(temp, manifest_index_path(edges_dir))?;
+    fs::File::open(&dir)?.sync_all()?;
+    Ok(())
+}
+
 fn append_jsonl_files(dir: &Path, paths: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -685,6 +813,26 @@ mod tests {
                 .workspaces
                 .contains_key("proj1234")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_index_load_refuses_symlinked_authority_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        fs::create_dir_all(materialized_dir(dir.path())).unwrap();
+        std::os::unix::fs::symlink(outside.path(), manifest_index_path(dir.path())).unwrap();
+        assert!(ManifestIndex::load(dir.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_index_write_refuses_symlinked_materialized_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), materialized_dir(dir.path())).unwrap();
+        assert!(ManifestIndex::new().write_atomic(dir.path()).is_err());
+        assert!(!outside.path().join(MANIFEST_INDEX_FILENAME).exists());
     }
 
     #[test]

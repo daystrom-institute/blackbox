@@ -3270,11 +3270,33 @@ fn file_commitment_probe(path: &Path) -> ClassProbe {
 /// leaf. An absent record reads as `Ok(None)`; anything present that cannot
 /// be read as a regular file is an error, never an empty read.
 fn read_regular_nofollow(path: &Path) -> Result<Option<Vec<u8>>, ()> {
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Ok(metadata) if metadata.is_file() => std::fs::read(path).map(Some).map_err(|_| ()),
-        _ => Err(()),
+    use std::io::Read;
+    const MAX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let metadata = file.metadata().map_err(|_| ())?;
+    if !metadata.is_file() || metadata.len() > MAX_RECORD_BYTES {
+        return Err(());
     }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).map_err(|_| ())?);
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    if bytes.len() as u64 != metadata.len() {
+        return Err(());
+    }
+    Ok(Some(bytes))
 }
 
 /// Read one JSON field from a small store-owned record. Returns `Ok(None)`

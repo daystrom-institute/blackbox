@@ -2468,13 +2468,6 @@ fn load_retirement_journal_from_path(
     if !path.is_file() {
         return Ok(None);
     }
-    // Bounded read: refuse oversized journals.
-    let metadata = std::fs::metadata(&path)?;
-    if metadata.len() as usize > MAX_JOURNAL_BYTES {
-        return Err(RetirementJournalError::other(
-            "retirement journal exceeds its byte limit",
-        ));
-    }
     // Nofollow read: open the file without following symlinks (F6).
     #[cfg(unix)]
     let bytes = {
@@ -2492,12 +2485,45 @@ fn load_retirement_journal_from_path(
                     RetirementJournalError::from(e)
                 }
             })?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() as usize > MAX_JOURNAL_BYTES {
+            return Err(RetirementJournalError::other(
+                "retirement journal exceeds its byte limit or is not regular",
+            ));
+        }
         let mut buf = Vec::with_capacity(metadata.len() as usize);
-        std::io::Read::read_to_end(&mut file, &mut buf)?;
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(&mut file, MAX_JOURNAL_BYTES as u64 + 1),
+            &mut buf,
+        )?;
+        if buf.len() as u64 != metadata.len() {
+            return Err(RetirementJournalError::other(
+                "retirement journal changed while being read",
+            ));
+        }
         buf
     };
     #[cfg(not(unix))]
-    let bytes = std::fs::read(&path)?;
+    let bytes = {
+        let mut file = std::fs::OpenOptions::new().read(true).open(&path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() as usize > MAX_JOURNAL_BYTES {
+            return Err(RetirementJournalError::other(
+                "retirement journal exceeds its byte limit or is not regular",
+            ));
+        }
+        let mut buf = Vec::with_capacity(metadata.len() as usize);
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(&mut file, MAX_JOURNAL_BYTES as u64 + 1),
+            &mut buf,
+        )?;
+        if buf.len() as u64 != metadata.len() {
+            return Err(RetirementJournalError::other(
+                "retirement journal changed while being read",
+            ));
+        }
+        buf
+    };
 
     let envelope: serde_json::Value = serde_json::from_slice(&bytes)?;
     let version = envelope

@@ -1115,16 +1115,34 @@ fn list_artifact_directory(directory: &fs::File) -> Result<Vec<std::ffi::OsStrin
         return Err(std::io::Error::last_os_error().into());
     }
     let mut names = Vec::new();
+    #[cfg(test)]
+    let mut entries_seen = 0_isize;
     loop {
+        set_artifact_readdir_errno(0);
         // SAFETY: stream remains valid until closed below.
         let entry = unsafe { libc::readdir(stream) };
         if entry.is_null() {
-            break;
+            let errno = artifact_readdir_errno();
+            if errno == 0 {
+                break;
+            }
+            unsafe { libc::closedir(stream) };
+            return Err(std::io::Error::from_raw_os_error(errno).into());
         }
         // SAFETY: d_name is NUL-terminated by readdir.
         let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
         if name != b"." && name != b".." {
             names.push(std::ffi::OsString::from_vec(name.to_vec()));
+            #[cfg(test)]
+            {
+                entries_seen += 1;
+                if TEST_ARTIFACT_READDIR_FAIL_AFTER.load(std::sync::atomic::Ordering::SeqCst)
+                    == entries_seen
+                {
+                    unsafe { libc::closedir(stream) };
+                    return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+                }
+            }
         }
     }
     // SAFETY: stream was returned by fdopendir and is closed once.
@@ -1133,6 +1151,35 @@ fn list_artifact_directory(directory: &fs::File) -> Result<Vec<std::ffi::OsStrin
     }
     names.sort();
     Ok(names)
+}
+
+#[cfg(test)]
+static TEST_ARTIFACT_READDIR_FAIL_AFTER: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(-1);
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+fn artifact_readdir_errno_location() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn artifact_readdir_errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
+fn set_artifact_readdir_errno(value: libc::c_int) {
+    unsafe { *artifact_readdir_errno_location() = value };
+}
+
+fn artifact_readdir_errno() -> libc::c_int {
+    unsafe { *artifact_readdir_errno_location() }
 }
 
 #[cfg(unix)]
@@ -3627,5 +3674,18 @@ mod tests {
         let error =
             capture_project_catalog_retirement_targets(&root, "project-a", &[]).unwrap_err();
         assert!(error.to_string().contains("per-file byte limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_recursive_delete_propagates_mid_enumeration_error() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("a"), b"a").unwrap();
+        fs::write(directory.path().join("b"), b"b").unwrap();
+        let handle = fs::File::open(directory.path()).unwrap();
+        TEST_ARTIFACT_READDIR_FAIL_AFTER.store(1, std::sync::atomic::Ordering::SeqCst);
+        let result = list_artifact_directory(&handle);
+        TEST_ARTIFACT_READDIR_FAIL_AFTER.store(-1, std::sync::atomic::Ordering::SeqCst);
+        assert!(result.is_err());
     }
 }

@@ -2976,15 +2976,40 @@ fn validate_relationship_chain(
 /// `{bro_home}/retirement-journals/{project_id}.json`. The daemon probes
 /// the directory for ANY `.json` file; any presence is a refusal.
 fn detect_incomplete_retirement_journal(bro_home: &std::path::Path) -> Result<()> {
+    const MAX_RETIREMENT_JOURNALS: usize = 4096;
     let journal_dir = bro_home.join("retirement-journals");
-    if !journal_dir.is_dir() {
-        return Ok(());
+    match std::fs::symlink_metadata(&journal_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!(
+                "error.code_source_retirement_journal_unavailable: \
+                 retirement journal path is not a strict directory"
+            );
+        }
+        Ok(_) => {}
     }
-    let mut journals: Vec<_> = std::fs::read_dir(&journal_dir)
+    let mut journals = Vec::new();
+    for entry in std::fs::read_dir(&journal_dir)
         .with_context(|| format!("reading retirement journal dir {}", journal_dir.display()))?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-        .collect();
+    {
+        #[cfg(test)]
+        if TEST_RETIREMENT_JOURNAL_ENUMERATION_ERROR
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+        }
+        let entry = entry?;
+        if entry.path().extension().is_some_and(|ext| ext == "json") {
+            journals.push(entry);
+            if journals.len() > MAX_RETIREMENT_JOURNALS {
+                bail!(
+                    "error.code_source_retirement_journal_unavailable: \
+                     retirement journal scan exceeds its entry limit"
+                );
+            }
+        }
+    }
     journals.sort_by_key(|e| e.path());
     if let Some(first) = journals.first() {
         let path = first.path();
@@ -3001,6 +3026,10 @@ fn detect_incomplete_retirement_journal(bro_home: &std::path::Path) -> Result<()
     }
     Ok(())
 }
+
+#[cfg(test)]
+static TEST_RETIREMENT_JOURNAL_ENUMERATION_ERROR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Reconstruct WorkspaceIndexEntry rows from validated activation records
 /// for collected projects whose workspace manifest entries are absent
@@ -9215,6 +9244,26 @@ mod tests {
         fs::create_dir_all(&journal_dir).unwrap();
         let result = detect_incomplete_retirement_journal(&root);
         assert!(result.is_ok(), "empty journal dir must pass");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p4f_symlinked_retirement_journal_dir_refuses() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("retirement-journals")).unwrap();
+        assert!(detect_incomplete_retirement_journal(&root).is_err());
+    }
+
+    #[test]
+    fn p4f_retirement_journal_enumeration_error_refuses() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("retirement-journals")).unwrap();
+        fs::write(root.join("retirement-journals/a.json"), b"{}").unwrap();
+        TEST_RETIREMENT_JOURNAL_ENUMERATION_ERROR.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(detect_incomplete_retirement_journal(&root).is_err());
     }
 
     /// Section 10.1 step 5: once-only classification clears the mirror
