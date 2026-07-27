@@ -1562,25 +1562,34 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>, runtime_handle: tokio::
                     let desired = determine_desired_assignment(&state_for_task, &project_id);
                     let effective = determine_effective_source(&state_for_task, &project_id);
                     let store = state_for_task.code_sources.store();
-                    let persisted = store
-                        .load_activation_mixed(&project_id)
-                        .ok()
-                        .flatten()
-                        .and_then(|r| r.cutback().cloned());
-                    let ladder = probe_ladder(&state_for_task, &project_id);
-
-                    // Evaluate open-bridge predicate (section 9.3).
-                    let activation = match store.load_activation_mixed(&project_id) {
+                    let activation = match load_reconciler_activation(&store, &project_id) {
                         Ok(activation) => activation,
                         Err(error) => {
                             tracing::warn!(
                                 project_id = %project_id,
                                 %error,
-                                "reducer refused to treat an activation load failure as absence"
+                                "reconciler: project activation load failed"
                             );
-                            return;
+                            if let Err(health_error) = store.record_health_failure(
+                                &project_id,
+                                "reconciler_project_refused",
+                                &format!("activation load failed: {error}"),
+                            ) {
+                                tracing::warn!(
+                                    project_id = %project_id,
+                                    %health_error,
+                                    "reconciler: failed to persist project refusal health"
+                                );
+                            }
+                            continue;
                         }
                     };
+                    let persisted = activation
+                        .as_ref()
+                        .and_then(|record| record.cutback().cloned());
+                    let ladder = probe_ladder(&state_for_task, &project_id);
+
+                    // Evaluate open-bridge predicate (section 9.3).
                     let effective_gen = activation
                         .as_ref()
                         .map(|a| a.generation_id().to_string())
@@ -1608,8 +1617,28 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>, runtime_handle: tokio::
                                 %error,
                                 "automatic bridge-clear evidence failed"
                             );
-                            return;
+                            if let Err(health_error) = store.record_health_failure(
+                                &project_id,
+                                "reconciler_project_refused",
+                                &format!("automatic bridge clear failed: {error}"),
+                            ) {
+                                tracing::warn!(
+                                    project_id = %project_id,
+                                    %health_error,
+                                    "reconciler: failed to persist bridge refusal health"
+                                );
+                            }
+                            continue;
                         }
+                    }
+                    if let Err(error) =
+                        store.clear_health_failure(&project_id, "reconciler_project_refused")
+                    {
+                        tracing::warn!(
+                            project_id = %project_id,
+                            %error,
+                            "reconciler: failed to clear project refusal health"
+                        );
                     }
 
                     let action = evaluate_reduction(
@@ -1719,6 +1748,13 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>, runtime_handle: tokio::
     // exits. The background task is a daemon-lifetime thread; it is NOT
     // a tokio task and does NOT hold any sync lock across slow work.
     *state.reconciler_shutdown.write() = shutdown.clone();
+}
+
+fn load_reconciler_activation(
+    store: &bbox_code_source_store::CodeSourceStore,
+    project_id: &str,
+) -> anyhow::Result<Option<bbox_code_source_store::MixedActivationRecord>> {
+    store.load_activation_mixed(project_id)
 }
 
 /// Spawn the post-commit observer thread (section 9.4).
@@ -3454,9 +3490,14 @@ fn try_automatic_bridge_clear(state: &Arc<SharedState>, project_id: &str) -> Res
         .map(|generation| generation.generation_id)
         .collect();
     let evidence = bbox_indexing::project_catalog_admin::ScopeBridgeClearEvidence {
-        effective_generation_id,
-        effective_scope,
-        retained_generation_ids,
+        activation: bbox_indexing::project_catalog_admin::ScopeBridgeActivationEvidence::Present {
+            generation_id: effective_generation_id.expect("activation generation was loaded"),
+            scope: effective_scope.expect("activation scope was loaded"),
+        },
+        retained_generations:
+            bbox_indexing::project_catalog_admin::ScopeBridgeRetainedEvidence::Enumerated(
+                retained_generation_ids,
+            ),
     };
     // Trigger the bridge-clear transaction.
     match clear_scope_bridge(
@@ -10343,5 +10384,30 @@ mod tests {
             "automatic bridge-clear must propagate activation and enumeration errors"
         );
         assert!(body.contains("AutomaticFirstNewScope"));
+    }
+
+    #[test]
+    fn reconciler_activation_failure_does_not_hide_following_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("code-sources");
+        let store =
+            bbox_code_source_store::CodeSourceStore::open(&root, StoreLimits::default()).unwrap();
+        let paths = bbox_code_source_store::CodeSourceStorePaths::new(&root).unwrap();
+        let project_one =
+            bbox_corpus_core::project_catalog::ProjectId::parse("project-one").unwrap();
+        std::fs::write(paths.activation(&project_one), b"{malformed").unwrap();
+
+        let mut processed = Vec::new();
+        for project_id in ["project-one", "project-two"] {
+            if load_reconciler_activation(&store, project_id).is_ok() {
+                processed.push(project_id);
+            }
+        }
+
+        assert_eq!(processed, vec!["project-two"]);
     }
 }

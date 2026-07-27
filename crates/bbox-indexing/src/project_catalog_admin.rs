@@ -1865,21 +1865,38 @@ pub fn clear_scope_bridge(
             // is absent from the retained set. When there IS an effective
             // activation, the bridge generation must not be the effective
             // generation (it must have been superseded).
-            if let Some(effective_gen) = &evidence.effective_generation_id {
-                if bridge_gen == effective_gen {
+            match &evidence.activation {
+                ScopeBridgeActivationEvidence::Present { generation_id, .. } => {
+                    if bridge_gen == generation_id {
+                        return Err(admin_error(
+                            "error.project_catalog_scope_bridge_clear_bridge_still_live",
+                            "the bridge generation is still the effective activation; cannot clear a live bridge",
+                        ));
+                    }
+                }
+                ScopeBridgeActivationEvidence::VerifiedAbsent => {}
+                ScopeBridgeActivationEvidence::Unavailable { diagnostic } => {
                     return Err(admin_error(
-                        "error.project_catalog_scope_bridge_clear_bridge_still_live",
-                        "the bridge generation is still the effective activation; cannot clear a live bridge",
+                        "error.project_catalog_scope_bridge_clear_evidence_unavailable",
+                        format!("activation evidence is unavailable: {diagnostic}"),
                     ));
                 }
             }
-            // R2F4: the bridge generation must be absent from the retained
-            // set (proves retirement via store enumeration, not id inequality).
-            if evidence.retained_generation_ids.contains(bridge_gen) {
-                return Err(admin_error(
-                    "error.project_catalog_scope_bridge_clear_bridge_retained",
-                    "the bridge generation is still in the retained/GC-rooted set; cannot clear a retained bridge",
-                ));
+            match &evidence.retained_generations {
+                ScopeBridgeRetainedEvidence::Enumerated(generations) => {
+                    if generations.contains(bridge_gen) {
+                        return Err(admin_error(
+                            "error.project_catalog_scope_bridge_clear_bridge_retained",
+                            "the bridge generation is still in the retained/GC-rooted set; cannot clear a retained bridge",
+                        ));
+                    }
+                }
+                ScopeBridgeRetainedEvidence::Unavailable { diagnostic } => {
+                    return Err(admin_error(
+                        "error.project_catalog_scope_bridge_clear_evidence_unavailable",
+                        format!("retained-generation evidence is unavailable: {diagnostic}"),
+                    ));
+                }
             }
             newest.scope_migration_id.clone()
         }
@@ -1909,19 +1926,24 @@ pub fn clear_scope_bridge(
                         "automatic bridge clear requires a published current catalog scope",
                     )
                 })?;
-            let effective_scope = evidence.effective_scope.as_ref().ok_or_else(|| {
-                admin_error(
-                    "error.project_catalog_scope_bridge_clear_missing_evidence",
-                    "automatic bridge clear requires a strictly loaded activation scope",
-                )
-            })?;
-            let effective_generation =
-                evidence.effective_generation_id.as_ref().ok_or_else(|| {
-                    admin_error(
+            let (effective_generation, effective_scope) = match &evidence.activation {
+                ScopeBridgeActivationEvidence::Present {
+                    generation_id,
+                    scope,
+                } => (generation_id, scope),
+                ScopeBridgeActivationEvidence::VerifiedAbsent => {
+                    return Err(admin_error(
                         "error.project_catalog_scope_bridge_clear_missing_evidence",
-                        "automatic bridge clear requires a strictly loaded activation generation",
-                    )
-                })?;
+                        "automatic bridge clear requires a strictly loaded activation",
+                    ));
+                }
+                ScopeBridgeActivationEvidence::Unavailable { diagnostic } => {
+                    return Err(admin_error(
+                        "error.project_catalog_scope_bridge_clear_evidence_unavailable",
+                        format!("activation evidence is unavailable: {diagnostic}"),
+                    ));
+                }
+            };
             if effective_scope != current_scope {
                 return Err(admin_error(
                     "error.project_catalog_scope_bridge_clear_activation_scope_mismatch",
@@ -1934,11 +1956,21 @@ pub fn clear_scope_bridge(
                     "automatic bridge clear activation still names the bridge generation",
                 ));
             }
-            if !evidence.retained_generation_ids.contains(bridge_gen) {
-                return Err(admin_error(
-                    "error.project_catalog_scope_bridge_clear_bridge_not_retained",
-                    "automatic bridge clear expected the GC-pinned bridge generation to remain retained",
-                ));
+            match &evidence.retained_generations {
+                ScopeBridgeRetainedEvidence::Enumerated(generations)
+                    if generations.contains(bridge_gen) => {}
+                ScopeBridgeRetainedEvidence::Enumerated(_) => {
+                    return Err(admin_error(
+                        "error.project_catalog_scope_bridge_clear_bridge_not_retained",
+                        "automatic bridge clear expected the GC-pinned bridge generation to remain retained",
+                    ));
+                }
+                ScopeBridgeRetainedEvidence::Unavailable { diagnostic } => {
+                    return Err(admin_error(
+                        "error.project_catalog_scope_bridge_clear_evidence_unavailable",
+                        format!("retained-generation evidence is unavailable: {diagnostic}"),
+                    ));
+                }
             }
             newest.scope_migration_id.clone()
         }
@@ -1959,17 +1991,23 @@ pub fn clear_scope_bridge(
                      at least two bridge-bearing records",
                 ));
             }
-            let Some(effective_scope) = &evidence.effective_scope else {
-                return Err(admin_error(
-                    "error.project_catalog_scope_bridge_clear_missing_evidence",
-                    "mode 2 requires effective_scope evidence from a verified code-source probe",
-                ));
-            };
-            let Some(effective_gen) = &evidence.effective_generation_id else {
-                return Err(admin_error(
-                    "error.project_catalog_scope_bridge_clear_missing_evidence",
-                    "mode 2 requires effective_generation_id evidence from a verified code-source probe",
-                ));
+            let (effective_gen, effective_scope) = match &evidence.activation {
+                ScopeBridgeActivationEvidence::Present {
+                    generation_id,
+                    scope,
+                } => (generation_id, scope),
+                ScopeBridgeActivationEvidence::VerifiedAbsent => {
+                    return Err(admin_error(
+                        "error.project_catalog_scope_bridge_clear_missing_evidence",
+                        "mode 2 requires a verified effective activation",
+                    ));
+                }
+                ScopeBridgeActivationEvidence::Unavailable { diagnostic } => {
+                    return Err(admin_error(
+                        "error.project_catalog_scope_bridge_clear_evidence_unavailable",
+                        format!("activation evidence is unavailable: {diagnostic}"),
+                    ));
+                }
             };
             // The older record must admit: old_scope equals effective scope
             // AND code_bridge_generation equals effective generation.
@@ -2038,20 +2076,41 @@ pub fn clear_scope_bridge(
 /// The caller must probe the code-source state and supply the current
 /// effective generation id AND effective scope before calling
 /// `clear_scope_bridge`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeBridgeActivationEvidence {
+    Present {
+        generation_id: String,
+        scope: PublishedScope,
+    },
+    VerifiedAbsent,
+    Unavailable {
+        diagnostic: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeBridgeRetainedEvidence {
+    Enumerated(std::collections::BTreeSet<String>),
+    Unavailable { diagnostic: String },
+}
+
+#[derive(Debug, Clone)]
 pub struct ScopeBridgeClearEvidence {
-    /// The current effective generation id from a verified code-source
-    /// probe (activation record). Required for mode 1 to prove the
-    /// bridge generation is retired (absent from retained set).
-    pub effective_generation_id: Option<String>,
-    /// The current effective scope from a verified code-source probe
-    /// (activation record's published_scope). Required for mode 2 to
-    /// implement the exact open-bridge predicate.
-    pub effective_scope: Option<PublishedScope>,
-    /// The set of retained/GC-rooted generation ids from a store
-    /// enumeration. Required for mode 1 to prove absence from the
-    /// retained set (not just id inequality).
-    pub retained_generation_ids: std::collections::BTreeSet<String>,
+    pub activation: ScopeBridgeActivationEvidence,
+    pub retained_generations: ScopeBridgeRetainedEvidence,
+}
+
+impl Default for ScopeBridgeClearEvidence {
+    fn default() -> Self {
+        Self {
+            activation: ScopeBridgeActivationEvidence::Unavailable {
+                diagnostic: "bridge activation evidence was not probed".to_string(),
+            },
+            retained_generations: ScopeBridgeRetainedEvidence::Unavailable {
+                diagnostic: "retained generations were not enumerated".to_string(),
+            },
+        }
+    }
 }
 
 /// Which bridge-clear mode to use (section 9.5).
@@ -4927,6 +4986,33 @@ mod tests {
         (tmp, store, pid)
     }
 
+    fn absent_bridge_evidence(
+        retained: impl IntoIterator<Item = &'static str>,
+    ) -> ScopeBridgeClearEvidence {
+        ScopeBridgeClearEvidence {
+            activation: ScopeBridgeActivationEvidence::VerifiedAbsent,
+            retained_generations: ScopeBridgeRetainedEvidence::Enumerated(
+                retained.into_iter().map(str::to_string).collect(),
+            ),
+        }
+    }
+
+    fn present_bridge_evidence(
+        generation_id: &str,
+        scope: PublishedScope,
+        retained: impl IntoIterator<Item = &'static str>,
+    ) -> ScopeBridgeClearEvidence {
+        ScopeBridgeClearEvidence {
+            activation: ScopeBridgeActivationEvidence::Present {
+                generation_id: generation_id.to_string(),
+                scope,
+            },
+            retained_generations: ScopeBridgeRetainedEvidence::Enumerated(
+                retained.into_iter().map(str::to_string).collect(),
+            ),
+        }
+    }
+
     /// R3F3 mode 1: the no-activation dangling-bridge case succeeds when
     /// the bridge generation is absent from the retained set. Previously
     /// mode 1 required effective_generation_id unconditionally, making a
@@ -4937,7 +5023,7 @@ mod tests {
         let epoch = store.snapshot().unwrap().epoch();
         // No effective activation (dangling bridge), empty retained set
         // proves the bridge generation is absent from the store.
-        let evidence = ScopeBridgeClearEvidence::default();
+        let evidence = absent_bridge_evidence([]);
         let result = clear_scope_bridge(
             &store,
             epoch,
@@ -4956,11 +5042,11 @@ mod tests {
     fn automatic_first_new_scope_clear_expects_retained_bridge() {
         let (_tmp, store, pid) = f4_store_with_bridge(Some("dangling_gen"));
         let epoch = store.snapshot().unwrap().epoch();
-        let evidence = ScopeBridgeClearEvidence {
-            effective_generation_id: Some("new_generation".into()),
-            effective_scope: Some(PublishedScope::try_new("f4-scope", ".").unwrap()),
-            retained_generation_ids: std::collections::BTreeSet::from(["dangling_gen".into()]),
-        };
+        let evidence = present_bridge_evidence(
+            "new_generation",
+            PublishedScope::try_new("f4-scope", ".").unwrap(),
+            ["dangling_gen"],
+        );
         clear_scope_bridge(
             &store,
             epoch,
@@ -4993,7 +5079,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error.code(),
-            "error.project_catalog_scope_bridge_clear_missing_evidence"
+            "error.project_catalog_scope_bridge_clear_evidence_unavailable"
         );
     }
 
@@ -5003,15 +5089,7 @@ mod tests {
     fn r3f3_mode1_dangling_bridge_retained_generation_refuses() {
         let (_tmp, store, pid) = f4_store_with_bridge(Some("still_retained"));
         let epoch = store.snapshot().unwrap().epoch();
-        let evidence = ScopeBridgeClearEvidence {
-            effective_generation_id: None,
-            effective_scope: None,
-            retained_generation_ids: {
-                let mut s = std::collections::BTreeSet::new();
-                s.insert("still_retained".to_string());
-                s
-            },
-        };
+        let evidence = absent_bridge_evidence(["still_retained"]);
         let result = clear_scope_bridge(
             &store,
             epoch,
@@ -5033,10 +5111,11 @@ mod tests {
     fn r2f4_mode1_refuses_live_bridge() {
         let (_tmp, store, pid) = f4_store_with_bridge(Some("gen_still_live"));
         let epoch = store.snapshot().unwrap().epoch();
-        let evidence = ScopeBridgeClearEvidence {
-            effective_generation_id: Some("gen_still_live".to_string()),
-            ..Default::default()
-        };
+        let evidence = present_bridge_evidence(
+            "gen_still_live",
+            PublishedScope::try_new("f4-scope", ".").unwrap(),
+            [],
+        );
         let result = clear_scope_bridge(
             &store,
             epoch,
@@ -5059,11 +5138,11 @@ mod tests {
     fn r2f4_mode1_refuses_retained_bridge() {
         let (_tmp, store, pid) = f4_store_with_bridge(Some("old_bridge_gen"));
         let epoch = store.snapshot().unwrap().epoch();
-        let evidence = ScopeBridgeClearEvidence {
-            effective_generation_id: Some("new_effective_gen".to_string()),
-            retained_generation_ids: ["old_bridge_gen".to_string()].into_iter().collect(),
-            ..Default::default()
-        };
+        let evidence = present_bridge_evidence(
+            "new_effective_gen",
+            PublishedScope::try_new("f4-scope", ".").unwrap(),
+            ["old_bridge_gen"],
+        );
         let result = clear_scope_bridge(
             &store,
             epoch,
@@ -5085,11 +5164,11 @@ mod tests {
     fn r2f4_mode1_succeeds_when_bridge_is_retired() {
         let (_tmp, store, pid) = f4_store_with_bridge(Some("old_bridge_gen"));
         let epoch = store.snapshot().unwrap().epoch();
-        let evidence = ScopeBridgeClearEvidence {
-            effective_generation_id: Some("new_effective_gen".to_string()),
-            retained_generation_ids: std::collections::BTreeSet::new(),
-            ..Default::default()
-        };
+        let evidence = present_bridge_evidence(
+            "new_effective_gen",
+            PublishedScope::try_new("f4-scope", ".").unwrap(),
+            [],
+        );
         let result = clear_scope_bridge(
             &store,
             epoch,
@@ -5204,11 +5283,7 @@ mod tests {
         // Effective scope = f4_scope, effective gen = gen_effective.
         // The older record ADMITS (old_scope == f4_scope AND gen == gen_effective).
         // The newer record does NOT admit (old_scope == f4_scope_2 != f4_scope).
-        let evidence = ScopeBridgeClearEvidence {
-            effective_generation_id: Some("gen_effective".to_string()),
-            effective_scope: Some(f4_scope),
-            retained_generation_ids: std::collections::BTreeSet::new(),
-        };
+        let evidence = present_bridge_evidence("gen_effective", f4_scope, []);
         let result = clear_scope_bridge(
             &store,
             epoch,
@@ -5232,11 +5307,7 @@ mod tests {
         let epoch = store.snapshot().unwrap().epoch();
         // Only one bridge record, but evidence has scope/gen.
         // This should refuse with no_double_migration (only one record).
-        let evidence = ScopeBridgeClearEvidence {
-            effective_generation_id: Some("gen_effective".to_string()),
-            effective_scope: Some(f4_scope),
-            ..Default::default()
-        };
+        let evidence = present_bridge_evidence("gen_effective", f4_scope, []);
         let result = clear_scope_bridge(
             &store,
             epoch,

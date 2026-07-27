@@ -847,12 +847,42 @@ fn probe_bridge_clear_evidence(
     // R2F4: resolve the code-source store path from the supplied config,
     // not from a hardcoded sibling directory derivation.
     let code_source_dir = config.paths.state_dir.join("code-sources");
-    if !code_source_dir.is_dir() {
-        // No code-source store: no evidence available. Both modes will
-        // refuse with missing-evidence.
-        return Ok(project_catalog_admin::ScopeBridgeClearEvidence::default());
+    let root_metadata = match std::fs::symlink_metadata(&code_source_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(project_catalog_admin::ScopeBridgeClearEvidence {
+                activation: project_catalog_admin::ScopeBridgeActivationEvidence::Unavailable {
+                    diagnostic: "code-source store root is missing".to_string(),
+                },
+                retained_generations:
+                    project_catalog_admin::ScopeBridgeRetainedEvidence::Unavailable {
+                        diagnostic: "code-source store root is missing".to_string(),
+                    },
+            });
+        }
+        Err(error) => {
+            return Ok(project_catalog_admin::ScopeBridgeClearEvidence {
+                activation: project_catalog_admin::ScopeBridgeActivationEvidence::Unavailable {
+                    diagnostic: format!("code-source store root cannot be inspected: {error}"),
+                },
+                retained_generations:
+                    project_catalog_admin::ScopeBridgeRetainedEvidence::Unavailable {
+                        diagnostic: format!("code-source store root cannot be inspected: {error}"),
+                    },
+            });
+        }
+    };
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Ok(project_catalog_admin::ScopeBridgeClearEvidence {
+            activation: project_catalog_admin::ScopeBridgeActivationEvidence::Unavailable {
+                diagnostic: "code-source store root is unavailable".to_string(),
+            },
+            retained_generations: project_catalog_admin::ScopeBridgeRetainedEvidence::Unavailable {
+                diagnostic: "code-source store root is unavailable".to_string(),
+            },
+        });
     }
-    let code_store = bbox_code_source_store::CodeSourceStore::open(
+    let code_store = bbox_code_source_store::CodeSourceStore::open_existing_for_migration(
         &code_source_dir,
         bbox_indexing::project_catalog_migration::project_catalog_migration_store_limits(config),
     )
@@ -864,81 +894,43 @@ fn probe_bridge_clear_evidence(
                 code_source_dir.display()
             ),
         )
+    })?
+    .ok_or_else(|| {
+        CommandFailure::new(
+            "error.project_catalog_cli_bridge_clear_evidence",
+            "code-source store disappeared during evidence capture",
+        )
     })?;
     // Load the activation record for effective generation id and scope.
-    let activation = code_store
-        .load_activation_mixed(project_id.as_str())
-        .ok()
-        .flatten();
-    let (effective_generation_id, effective_scope) = match &activation {
-        Some(a) => (
-            Some(a.generation_id().to_string()),
-            a.published_scope().cloned(),
-        ),
-        None => (None, None),
+    let activation = match code_store.load_activation_mixed(project_id.as_str()) {
+        Ok(Some(activation)) => match activation.published_scope().cloned() {
+            Some(scope) => project_catalog_admin::ScopeBridgeActivationEvidence::Present {
+                generation_id: activation.generation_id().to_string(),
+                scope,
+            },
+            None => project_catalog_admin::ScopeBridgeActivationEvidence::Unavailable {
+                diagnostic: "activation record has no published scope".to_string(),
+            },
+        },
+        Ok(None) => project_catalog_admin::ScopeBridgeActivationEvidence::VerifiedAbsent,
+        Err(error) => project_catalog_admin::ScopeBridgeActivationEvidence::Unavailable {
+            diagnostic: format!("activation load failed: {error}"),
+        },
     };
-    // R3F3: enumerate retained generation ids from the store to prove
-    // absence for mode 1. Every read error must propagate as a missing-
-    // evidence failure, NOT be silently ignored. Silently ignoring a
-    // read error on a scope or generation directory makes mode 1 treat
-    // the generation as absent (fail-open), which admits clearing a
-    // bridge that still has a retained generation.
-    let mut retained_generation_ids = std::collections::BTreeSet::new();
-    let paths =
-        bbox_code_source_store::CodeSourceStorePaths::new(&code_source_dir).map_err(|e| {
-            CommandFailure::new(
-                "error.project_catalog_cli_bridge_clear_evidence",
-                format!("failed to resolve code-source store paths: {e}"),
-            )
-        })?;
-    let scopes_dir = paths.root().join("scopes");
-    match std::fs::read_dir(&scopes_dir) {
-        Ok(scope_entries) => {
-            for scope_entry in scope_entries {
-                let scope_entry = scope_entry.map_err(|e| {
-                    CommandFailure::new(
-                        "error.project_catalog_cli_bridge_clear_evidence",
-                        format!("failed to read scope directory entry: {e}"),
-                    )
-                })?;
-                let gen_dir = scope_entry.path().join("generations");
-                match std::fs::read_dir(&gen_dir) {
-                    Ok(gen_entries) => {
-                        for gen_entry in gen_entries {
-                            let gen_entry = gen_entry.map_err(|e| {
-                                CommandFailure::new(
-                                    "error.project_catalog_cli_bridge_clear_evidence",
-                                    format!("failed to read generation directory entry: {e}"),
-                                )
-                            })?;
-                            if let Some(name) = gen_entry.file_name().to_str() {
-                                let gen_id = name.trim_end_matches(".json");
-                                retained_generation_ids.insert(gen_id.to_string());
-                            }
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        return Err(CommandFailure::new(
-                            "error.project_catalog_cli_bridge_clear_evidence",
-                            format!("failed to read generation directory: {e}"),
-                        ));
-                    }
-                }
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(CommandFailure::new(
-                "error.project_catalog_cli_bridge_clear_evidence",
-                format!("failed to read scopes directory: {e}"),
-            ));
-        }
-    }
+    let retained_generations = match code_store.retirement_generation_inventory() {
+        Ok(generations) => project_catalog_admin::ScopeBridgeRetainedEvidence::Enumerated(
+            generations
+                .into_iter()
+                .map(|generation| generation.generation_id)
+                .collect(),
+        ),
+        Err(error) => project_catalog_admin::ScopeBridgeRetainedEvidence::Unavailable {
+            diagnostic: format!("retained-generation enumeration failed: {error}"),
+        },
+    };
     Ok(project_catalog_admin::ScopeBridgeClearEvidence {
-        effective_generation_id,
-        effective_scope,
-        retained_generation_ids,
+        activation,
+        retained_generations,
     })
 }
 
