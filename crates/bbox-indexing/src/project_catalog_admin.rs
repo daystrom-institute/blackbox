@@ -1798,15 +1798,20 @@ pub fn scope_migrate_attested(
 ///
 /// Two precondition-distinct modes:
 /// - Mode 1 (dangling-reference): the named generation is retired.
-///   Null `code_bridge_generation`.
+///   Null `code_bridge_generation`. Requires verified evidence that
+///   the bridge generation is no longer the effective activation
+///   (the caller supplies `effective_generation_id` from a verified
+///   code-source probe).
 /// - Mode 2 (double-migration truthfulness repair): null the newest
 ///   bridge-bearing record, restoring an older admitting record as
-///   the sole bridge.
+///   the sole bridge. Requires verified evidence that the older
+///   record's `new_scope` matches the project's current catalog scope.
 pub fn clear_scope_bridge(
     store: &ProjectCatalogStore,
     expected_epoch: u64,
     project_id: &ProjectId,
     mode: ScopeBridgeClearMode,
+    evidence: &ScopeBridgeClearEvidence,
 ) -> AdminResult<ProjectCatalogCommit> {
     let state = store.snapshot()?;
     if state.epoch() != expected_epoch {
@@ -1831,27 +1836,69 @@ pub fn clear_scope_bridge(
     }
     let target_migration_id = match mode {
         ScopeBridgeClearMode::DanglingReference => {
-            // Mode 1: exactly one bridge-bearing record expected.
-            // If multiple exist, target the newest (the dangling one).
-            bridge_records
-                .last()
-                .map(|r| r.scope_migration_id.clone())
-                .ok_or_else(|| {
-                    admin_error(
-                        "error.project_catalog_scope_bridge_clear_no_bridge",
-                        "no bridge-bearing record to clear",
-                    )
-                })?
+            // Mode 1 precondition: the bridge generation is actually
+            // retired. The caller supplies the current effective
+            // generation id from a verified code-source probe. The
+            // bridge generation must NOT equal the effective generation
+            // (if it did, the bridge is still live and cannot be cleared).
+            let newest = bridge_records.last().ok_or_else(|| {
+                admin_error(
+                    "error.project_catalog_scope_bridge_clear_no_bridge",
+                    "no bridge-bearing record to clear",
+                )
+            })?;
+            let bridge_gen = newest.code_bridge_generation.as_ref().ok_or_else(|| {
+                admin_error(
+                    "error.project_catalog_scope_bridge_clear_no_bridge",
+                    "newest record has no bridge generation",
+                )
+            })?;
+            let Some(effective_gen) = &evidence.effective_generation_id else {
+                return Err(admin_error(
+                    "error.project_catalog_scope_bridge_clear_missing_evidence",
+                    "mode 1 requires effective_generation_id evidence from a verified code-source probe",
+                ));
+            };
+            if bridge_gen == effective_gen {
+                return Err(admin_error(
+                    "error.project_catalog_scope_bridge_clear_bridge_still_live",
+                    "the bridge generation is still the effective activation; cannot clear a live bridge",
+                ));
+            }
+            newest.scope_migration_id.clone()
         }
         ScopeBridgeClearMode::DoubleMigrationRepair => {
-            // Mode 2: null the newest bridge-bearing record, restoring
-            // the older one as the sole bridge. Refuses if only one
-            // bridge record exists (no older admitting record).
+            // Mode 2 precondition: at least two bridge-bearing records
+            // exist, AND the older record's new_scope matches the
+            // project's current catalog scope (proving the older
+            // record admits the current scope, so nulling the newer
+            // one is truthful).
             if bridge_records.len() < 2 {
                 return Err(admin_error(
                     "error.project_catalog_scope_bridge_clear_no_double_migration",
                     "mode 2 requires a pre-refusal double-migration state: \
                      at least two bridge-bearing records",
+                ));
+            }
+            // Verify the older record admits the current scope.
+            let older = &bridge_records[bridge_records.len() - 2];
+            let project = catalog.projects.get(project_id).ok_or_else(|| {
+                admin_error(
+                    "error.project_catalog_scope_bridge_clear_project_missing",
+                    "project not found in catalog",
+                )
+            })?;
+            let scope_matches = match (&older.new_scope, &project.scope) {
+                (ProjectScope::Published(older_scope), ProjectScope::Published(current_scope)) => {
+                    older_scope == current_scope
+                }
+                _ => false,
+            };
+            if !scope_matches {
+                return Err(admin_error(
+                    "error.project_catalog_scope_bridge_clear_older_record_does_not_admit",
+                    "the older bridge-bearing record's new_scope does not match \
+                     the project's current catalog scope; cannot truthfully null the newer record",
                 ));
             }
             bridge_records
@@ -1885,6 +1932,17 @@ pub fn clear_scope_bridge(
         record.code_bridge_generation = None;
         Ok(())
     })
+}
+
+/// Verified code-source evidence for a bridge-clear transaction (F4).
+/// The caller must probe the code-source state and supply the current
+/// effective generation id before calling `clear_scope_bridge`.
+#[derive(Debug, Clone, Default)]
+pub struct ScopeBridgeClearEvidence {
+    /// The current effective generation id from a verified code-source
+    /// probe (activation record). Required for mode 1 to prove the
+    /// bridge generation is retired.
+    pub effective_generation_id: Option<String>,
 }
 
 /// Which bridge-clear mode to use (section 9.5).
@@ -2505,7 +2563,9 @@ fn build_preflight(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use bbox_corpus_core::project_catalog::{CatalogSnapshotV2, CorpusProject};
+    use bbox_corpus_core::project_catalog::{
+        CatalogSnapshotV2, CorpusProject, ScopeMigrationId, ScopeMigrationRecord,
+    };
     use std::path::Path;
     use std::sync::Arc;
 
@@ -3926,5 +3986,190 @@ mod tests {
         assert!(retirement_journal_path(tmp.path(), &pid).is_file());
         archive_retirement_journal(tmp.path(), &pid).unwrap();
         assert!(!retirement_journal_path(tmp.path(), &pid).is_file());
+    }
+
+    // ---- F4: bridge-clear precondition tests ----
+
+    fn f4_store_with_bridge(
+        bridge_gen: Option<&str>,
+    ) -> (tempfile::TempDir, ProjectCatalogStore, ProjectId) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ProjectCatalogStore::initialize_empty(tmp.path().join("catalog")).unwrap();
+        let pid = ProjectId::parse(PROJECT).unwrap();
+
+        // Add the project to the catalog with a matching attachment.
+        let base = store.snapshot().unwrap();
+        let epoch = base.epoch();
+        let new_scope = ProjectScope::Published(PublishedScope::try_new("f4-scope", ".").unwrap());
+        let new_scope_for_closure = new_scope.clone();
+        let att_id = AttachmentId::parse("att_11111111111111111111111111111111".to_string()).unwrap();
+        store
+            .transact(epoch, |catalog, attachments| {
+                catalog.projects.insert(
+                    pid.clone(),
+                    CorpusProject {
+                        project_id: pid.clone(),
+                        scope: new_scope_for_closure,
+                        operator_aliases: Default::default(),
+                        nominated_aliases: Default::default(),
+                        display_name: "f4-test".into(),
+                        created_at: "2026-07-24T00:00:00Z".into(),
+                        registered_at_compat: None,
+                        repo_history: None,
+                        languages: Default::default(),
+                    },
+                );
+                attachments.attachments.insert(
+                    att_id.clone(),
+                    CheckoutAttachment {
+                        attachment_id: att_id.clone(),
+                        project_id: pid.clone(),
+                        checkout_id: "22222222222222222222222222222222".into(),
+                        checkout_dir: "/tmp/f4".into(),
+                        checkout_project_dir: "/tmp/f4".into(),
+                        project_root_relpath: ".".into(),
+                        kind: AttachmentKind::Base,
+                        validated_scope: Some(PublishedScope::try_new("f4-scope", ".").unwrap()),
+                        computed_repo_hint: None,
+                        branch_ref: None,
+                        capabilities: AttachmentCapabilities::default(),
+                        status: AttachmentStatus::Attached,
+                        attached_at: "2026-07-24T00:00:00Z".into(),
+                        detached_at: None,
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        // Add a scope migration record with a bridge generation.
+        let base = store.snapshot().unwrap();
+        let epoch = base.epoch();
+        let migration_id = ScopeMigrationId::parse("sm_11111111111111111111111111111111".to_string())
+            .unwrap();
+        let new_scope = ProjectScope::Published(PublishedScope::try_new("f4-scope", ".").unwrap());
+        store
+            .transact(epoch, |catalog, attachments| {
+                catalog.scope_migrations.insert(
+                    migration_id.clone(),
+                    ScopeMigrationRecord {
+                        scope_migration_id: migration_id.clone(),
+                        project_id: pid.clone(),
+                        catalog_epoch: epoch,
+                        authority_provenance:
+                            bbox_corpus_core::project_catalog::ScopeMigrationAuthorityProvenance::AttachmentProved,
+                        operator_invocation: "f4-test".to_string(),
+                        operator_reason: None,
+                        old_scope: ProjectScope::LegacyLocal,
+                        new_scope: new_scope.clone(),
+                        kind: bbox_corpus_core::project_catalog::ScopeMigrationKind::Promotion,
+                        migrated_at: "2026-07-24T00:00:00Z".to_string(),
+                        code_bridge_generation: bridge_gen.map(|g| g.to_string()),
+                        publication_bridge_generation: None,
+                        pending_capabilities: Default::default(),
+                    },
+                );
+                // The migration validation requires a matching attachment proof.
+                attachments.scope_migration_proofs.insert(
+                    migration_id,
+                    bbox_corpus_core::project_catalog::ScopeMigrationAttachmentProof {
+                        scope_migration_id: ScopeMigrationId::parse("sm_11111111111111111111111111111111".to_string()).unwrap(),
+                        attachment_id: AttachmentId::parse("att_11111111111111111111111111111111".to_string()).unwrap(),
+                        checkout_id: "22222222222222222222222222222222".to_string(),
+                        old_scope: ProjectScope::LegacyLocal,
+                        new_scope,
+                        proved_at: "2026-07-24T00:00:00Z".to_string(),
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        (tmp, store, pid)
+    }
+
+    /// F4 mode 1: refuses when evidence (effective_generation_id) is missing.
+    #[test]
+    fn f4_mode1_refuses_missing_evidence() {
+        let (_tmp, store, pid) = f4_store_with_bridge(Some("abc123"));
+        let epoch = store.snapshot().unwrap().epoch();
+        let evidence = ScopeBridgeClearEvidence::default();
+        let result = clear_scope_bridge(
+            &store,
+            epoch,
+            &pid,
+            ScopeBridgeClearMode::DanglingReference,
+            &evidence,
+        );
+        assert!(result.is_err());
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("missing_evidence"),
+            "must refuse with missing_evidence, got: {err}"
+        );
+    }
+
+    /// F4 mode 1: refuses when the bridge generation is still the
+    /// effective activation (bridge is live, not dangling).
+    #[test]
+    fn f4_mode1_refuses_live_bridge() {
+        let (_tmp, store, pid) = f4_store_with_bridge(Some("gen_still_live"));
+        let epoch = store.snapshot().unwrap().epoch();
+        let evidence = ScopeBridgeClearEvidence {
+            effective_generation_id: Some("gen_still_live".to_string()),
+        };
+        let result = clear_scope_bridge(
+            &store,
+            epoch,
+            &pid,
+            ScopeBridgeClearMode::DanglingReference,
+            &evidence,
+        );
+        assert!(result.is_err());
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("bridge_still_live"),
+            "must refuse with bridge_still_live, got: {err}"
+        );
+    }
+
+    /// F4 mode 1: succeeds when evidence proves the bridge generation
+    /// is retired (effective gen differs from bridge gen).
+    #[test]
+    fn f4_mode1_succeeds_when_bridge_is_retired() {
+        let (_tmp, store, pid) = f4_store_with_bridge(Some("old_bridge_gen"));
+        let epoch = store.snapshot().unwrap().epoch();
+        let evidence = ScopeBridgeClearEvidence {
+            effective_generation_id: Some("new_effective_gen".to_string()),
+        };
+        let result = clear_scope_bridge(
+            &store,
+            epoch,
+            &pid,
+            ScopeBridgeClearMode::DanglingReference,
+            &evidence,
+        );
+        assert!(result.is_ok(), "must succeed when bridge is retired");
+    }
+
+    /// F4 mode 2: refuses when only one bridge record exists.
+    #[test]
+    fn f4_mode2_refuses_single_bridge() {
+        let (_tmp, store, pid) = f4_store_with_bridge(Some("gen1"));
+        let epoch = store.snapshot().unwrap().epoch();
+        let evidence = ScopeBridgeClearEvidence::default();
+        let result = clear_scope_bridge(
+            &store,
+            epoch,
+            &pid,
+            ScopeBridgeClearMode::DoubleMigrationRepair,
+            &evidence,
+        );
+        assert!(result.is_err());
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("no_double_migration"),
+            "must refuse with no_double_migration, got: {err}"
+        );
     }
 }

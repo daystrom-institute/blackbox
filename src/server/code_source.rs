@@ -3232,12 +3232,26 @@ fn try_automatic_bridge_clear(state: &Arc<SharedState>, project_id: &str) -> boo
     if !bridge_is_stale {
         return false;
     }
+    // Gather verified evidence: the current effective generation id
+    // from the activation record (F4: automatic path must verify the
+    // bridge is actually stale, not just compare catalog scope).
+    let effective_generation_id = state
+        .code_sources
+        .store()
+        .load_activation_mixed(project_id)
+        .ok()
+        .flatten()
+        .map(|a| a.generation_id().to_string());
+    let evidence = bbox_indexing::project_catalog_admin::ScopeBridgeClearEvidence {
+        effective_generation_id,
+    };
     // Trigger the bridge-clear transaction.
     match clear_scope_bridge(
         catalog_store,
         epoch,
         &pid,
         ScopeBridgeClearMode::DanglingReference,
+        &evidence,
     ) {
         Ok(_) => {
             tracing::info!(

@@ -699,6 +699,49 @@ fn current_epoch(store: &ProjectCatalogStore) -> Result<u64, CommandFailure> {
     Ok(store.snapshot()?.epoch())
 }
 
+/// Probe the code-source store for bridge-clear evidence (F4).
+///
+/// Opens the code-source store (sibling of the catalog path) and reads
+/// the activation record's effective generation id. For mode 1
+/// (dangling-reference), this proves the bridge generation is retired.
+fn probe_bridge_clear_evidence(
+    projects_path: &PathBuf,
+    project_id: &bbox_corpus_core::project_catalog::ProjectId,
+) -> Result<project_catalog_admin::ScopeBridgeClearEvidence, CommandFailure> {
+    let code_source_dir = projects_path
+        .parent()
+        .ok_or_else(|| {
+            CommandFailure::new(
+                "error.project_catalog_cli_store_path",
+                "cannot resolve code-source directory from the catalog path",
+            )
+        })?
+        .join("code-sources");
+    if !code_source_dir.is_dir() {
+        // No code-source store: no evidence available. Mode 1 will
+        // refuse with missing-evidence; mode 2 does not need it.
+        return Ok(project_catalog_admin::ScopeBridgeClearEvidence::default());
+    }
+    let code_store = bbox_code_source_store::CodeSourceStore::open(
+        &code_source_dir,
+        bbox_code_source_store::StoreLimits::default(),
+    )
+    .map_err(|e| {
+        CommandFailure::new(
+            "error.project_catalog_cli_code_source_open",
+            format!("failed to open code-source store at {}: {e}", code_source_dir.display()),
+        )
+    })?;
+    let effective_generation_id = code_store
+        .load_activation_mixed(project_id.as_str())
+        .ok()
+        .flatten()
+        .map(|a| a.generation_id().to_string());
+    Ok(project_catalog_admin::ScopeBridgeClearEvidence {
+        effective_generation_id,
+    })
+}
+
 fn parse_project_id(raw: &str) -> Result<ProjectId, CommandFailure> {
     ProjectId::parse(raw)
         .map_err(|error| CommandFailure::new(error.code(), "project id is malformed"))
@@ -926,7 +969,12 @@ fn execute_scope_bridge_clear(
         }
     };
     let epoch = current_epoch(&store)?;
-    let commit = project_catalog_admin::clear_scope_bridge(&store, epoch, &project_id, mode)?;
+    // F4: probe code-source evidence for the bridge-clear precondition.
+    // For mode 1 (dangling-reference), the effective generation id must
+    // differ from the bridge generation (proving the bridge is retired).
+    let evidence = probe_bridge_clear_evidence(&args.store.projects_path, &project_id)?;
+    let commit =
+        project_catalog_admin::clear_scope_bridge(&store, epoch, &project_id, mode, &evidence)?;
     Ok(serde_json::json!({
         "project_id": project_id.as_str(),
         "mode": match mode {
