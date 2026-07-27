@@ -4649,14 +4649,40 @@ impl CodeSourceStore {
             bail!("code-source retirement queue row changed before completion");
         }
         if let Some(generation_id) = &record.generation_id {
-            let mut generation = self.find_generation(generation_id)?;
-            let is_still_desired = self
-                .desired_generation(&generation.descriptor.scope)?
-                .is_some_and(|desired| desired.generation_id == generation_id.as_str());
-            if !is_still_desired && generation.state != GenerationState::Failed {
-                generation.state = GenerationState::Superseded;
-                generation.diagnostic = None;
-                self.save_generation_locked(&generation)?;
+            match self.shared.record_mode {
+                RuntimeRecordMode::BridgeV1 => {
+                    let mut generation = self.find_generation(generation_id)?;
+                    let is_still_desired = self
+                        .desired_generation(&generation.descriptor.scope)?
+                        .is_some_and(|desired| desired.generation_id == generation_id.as_str());
+                    if !is_still_desired && generation.state != GenerationState::Failed {
+                        generation.state = GenerationState::Superseded;
+                        generation.diagnostic = None;
+                        self.save_generation_locked(&generation)?;
+                    }
+                }
+                RuntimeRecordMode::CatalogV2 => {
+                    let mut generation = match self.find_generation_mixed(generation_id)? {
+                        MixedStoredGeneration::CurrentV2(generation) => generation,
+                        MixedStoredGeneration::LegacyV1(_) => bail!(
+                            "error.code_source_record_mode: catalog retirement found a v1 generation"
+                        ),
+                    };
+                    let is_still_desired = self
+                        .desired_generation_mixed(&generation.published_scope)?
+                        .is_some_and(|desired| desired.generation_id() == generation_id.as_str());
+                    if !is_still_desired && generation.state != GenerationState::Failed {
+                        generation.state = GenerationState::Superseded;
+                        generation.diagnostic = None;
+                        self.save_generation_v2_locked(&generation)?;
+                        let project_id = ProjectId::parse(record.project_id.clone())?;
+                        self.record_retained_generation_owner_locked(
+                            &project_id,
+                            &generation.published_scope,
+                            generation_id,
+                        )?;
+                    }
+                }
             }
         }
         remove_file_if_exists(&path)
@@ -7524,6 +7550,105 @@ mod tests {
                 .to_string()
                 .contains("protected current generation retains scopeless legacy metadata")
         );
+    }
+
+    #[test]
+    fn catalog_v2_retirement_completion_is_replayable_and_records_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store_root = root.join("code-sources");
+        let store = CodeSourceStore::open_with_mode(
+            &store_root,
+            StoreLimits::default(),
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap();
+        let scope = PublishedScope::try_new("owner-a", ".").unwrap();
+        let generation_id =
+            install_retirement_generation(&store, &scope, "producer-a", &[format!("{:064x}", 9)]);
+        let record = RetirementRecord {
+            version: STORE_VERSION,
+            project_id: "project-a".to_string(),
+            selector: materialized_selector("project-a", &generation_id),
+            snapshot_id: format!("collected-{}", "a".repeat(32)),
+            generation_id: Some(generation_id.clone()),
+        };
+        store.enqueue_retirement(&record).unwrap();
+
+        store.complete_retirement(&record).unwrap();
+        let generation = store.load_generation_mixed(&scope, &generation_id).unwrap();
+        assert_eq!(generation.state(), GenerationState::Superseded);
+        assert!(!store.retirement_pending(&record.selector).unwrap());
+        assert_eq!(
+            store.retained_generation_owner_records().unwrap(),
+            vec![RetainedGenerationOwnerRecord {
+                version: STORE_VERSION,
+                project_id: ProjectId::parse("project-a").unwrap(),
+                published_scope: scope.clone(),
+                generation_id: generation_id.clone(),
+            }]
+        );
+
+        let reopened = CodeSourceStore::open_with_mode(
+            &store_root,
+            StoreLimits::default(),
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap();
+        reopened.complete_retirement(&record).unwrap();
+        assert_eq!(
+            reopened.retained_generation_owner_records().unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn catalog_v2_retirement_recovers_each_completion_crash_boundary() {
+        for owner_written in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let store = CodeSourceStore::open_with_mode(
+                root.join("code-sources"),
+                StoreLimits::default(),
+                RuntimeRecordMode::CatalogV2,
+            )
+            .unwrap();
+            let scope = PublishedScope::try_new("owner-a", ".").unwrap();
+            let generation_id = install_retirement_generation(
+                &store,
+                &scope,
+                "producer-a",
+                &[format!("{:064x}", 10)],
+            );
+            let record = RetirementRecord {
+                version: STORE_VERSION,
+                project_id: "project-a".to_string(),
+                selector: materialized_selector("project-a", &generation_id),
+                snapshot_id: format!("collected-{}", "b".repeat(32)),
+                generation_id: Some(generation_id.clone()),
+            };
+            store.enqueue_retirement(&record).unwrap();
+            let mut generation = match store.load_generation_mixed(&scope, &generation_id).unwrap()
+            {
+                MixedStoredGeneration::CurrentV2(generation) => generation,
+                MixedStoredGeneration::LegacyV1(_) => unreachable!(),
+            };
+            generation.state = GenerationState::Superseded;
+            store.save_generation_v2_locked(&generation).unwrap();
+            if owner_written {
+                store
+                    .record_retained_generation_owner_locked(
+                        &ProjectId::parse("project-a").unwrap(),
+                        &scope,
+                        &generation_id,
+                    )
+                    .unwrap();
+            }
+
+            store.complete_retirement(&record).unwrap();
+            assert!(!store.retirement_pending(&record.selector).unwrap());
+            assert_eq!(store.retained_generation_owner_records().unwrap().len(), 1);
+        }
     }
 
     #[test]
