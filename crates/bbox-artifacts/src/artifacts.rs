@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
 use anyhow::{Context, Result, anyhow, bail};
 use rmcp::schemars;
@@ -299,11 +302,46 @@ pub fn discharge_project_catalog_rows(
     discharge_project_catalog_targets(root, &targets)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactRetirementTarget {
+    pub artifact_directory: String,
+    pub metadata_path: String,
+    pub payload_path: String,
+    pub metadata_sha256: String,
+    pub payload_sha256: String,
+}
+
+impl ArtifactRetirementTarget {
+    pub fn validate(&self) -> Result<()> {
+        for (label, value) in [
+            ("artifact directory", self.artifact_directory.as_str()),
+            ("metadata path", self.metadata_path.as_str()),
+            ("payload path", self.payload_path.as_str()),
+        ] {
+            if !strict_retirement_relative_path(Path::new(value)) {
+                bail!("artifact retirement {label} is not a strict relative path");
+            }
+        }
+        if !strict_sha256(&self.metadata_sha256) || !strict_sha256(&self.payload_sha256) {
+            bail!("artifact retirement target contains a malformed sha256");
+        }
+        let directory = Path::new(&self.artifact_directory);
+        if !Path::new(&self.metadata_path).starts_with(directory) {
+            bail!("artifact retirement metadata is outside its artifact directory");
+        }
+        if Path::new(&self.payload_path).parent() != directory.parent() {
+            bail!("artifact retirement payload is outside its artifact parent");
+        }
+        Ok(())
+    }
+}
+
 pub fn capture_project_catalog_retirement_targets(
     root: &Path,
     project_id: &str,
     selectors: &[String],
-) -> Result<Vec<String>> {
+) -> Result<Vec<ArtifactRetirementTarget>> {
     let hash_bytes = |bytes: &[u8]| hex::encode(sha2::Sha256::digest(bytes));
     let metadata = match fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
@@ -317,6 +355,21 @@ pub fn capture_project_catalog_retirement_targets(
     for entry in WalkDir::new(root).follow_links(false) {
         let entry = entry?;
         if !entry.file_type().is_file() {
+            continue;
+        }
+        if entry
+            .path()
+            .strip_prefix(root)
+            .context("artifact entry escaped its store root")?
+            .components()
+            .any(|component| {
+                matches!(
+                    component,
+                    Component::Normal(value)
+                        if value.to_string_lossy().starts_with(".retiring-")
+                )
+            })
+        {
             continue;
         }
         let file_name = entry.file_name().to_string_lossy();
@@ -343,32 +396,471 @@ pub fn capture_project_catalog_retirement_targets(
         let relative = directory
             .strip_prefix(root)
             .context("artifact directory escaped its store root")?;
+        let metadata_relative = entry
+            .path()
+            .strip_prefix(root)
+            .context("artifact metadata escaped its store root")?;
         let payload = directory.with_extension("json");
-        let payload_hash = if payload.is_file() {
-            hash_bytes(&fs::read(&payload)?)
+        let payload_relative = payload
+            .strip_prefix(root)
+            .context("artifact payload escaped its store root")?;
+        let payload_tombstone = artifact_payload_tombstone(directory)?;
+        let payload_bytes = if payload.is_file() {
+            fs::read(&payload)?
+        } else if payload_tombstone.is_file() {
+            fs::read(&payload_tombstone)?
         } else {
-            "missing".to_string()
+            bail!("owned artifact metadata has no payload");
         };
-        targets.push(format!(
-            "{}:{}:{}",
-            relative.to_string_lossy(),
-            hash_bytes(&fs::read(entry.path())?),
-            payload_hash
-        ));
+        let target = ArtifactRetirementTarget {
+            artifact_directory: relative
+                .to_str()
+                .context("artifact directory is not UTF-8")?
+                .to_string(),
+            metadata_path: metadata_relative
+                .to_str()
+                .context("artifact metadata path is not UTF-8")?
+                .to_string(),
+            payload_path: payload_relative
+                .to_str()
+                .context("artifact payload path is not UTF-8")?
+                .to_string(),
+            metadata_sha256: hash_bytes(&fs::read(entry.path())?),
+            payload_sha256: hash_bytes(&payload_bytes),
+        };
+        target.validate()?;
+        targets.push(target);
     }
     targets.sort();
     targets.dedup();
     Ok(targets)
 }
 
-pub fn discharge_project_catalog_targets(root: &Path, targets: &[String]) -> Result<usize> {
+pub fn discharge_project_catalog_targets(
+    root: &Path,
+    targets: &[ArtifactRetirementTarget],
+) -> Result<usize> {
+    let anchored = AnchoredArtifactRoot::open(root)?;
     let mut removed = 0usize;
     for target in targets {
-        let relative = target
-            .split_once(':')
-            .map(|(relative, _)| relative)
-            .ok_or_else(|| anyhow!("artifact retirement target is invalid"))?;
-        let directory = root.join(relative);
+        target.validate()?;
+        anchored.discharge(target)?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+fn strict_retirement_relative_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn strict_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn artifact_payload_tombstone(directory: &Path) -> Result<PathBuf> {
+    let payload = directory.with_extension("json");
+    let parent = directory
+        .parent()
+        .ok_or_else(|| anyhow!("artifact directory has no parent"))?;
+    let name = payload
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("artifact payload name is not UTF-8")?;
+    Ok(parent.join(format!(".retiring-payload-{name}")))
+}
+
+#[cfg(unix)]
+struct AnchoredArtifactRoot {
+    directory: fs::File,
+}
+
+#[cfg(unix)]
+impl AnchoredArtifactRoot {
+    fn open(root: &Path) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(root)
+            .context("failed to open anchored artifact root")?;
+        Ok(Self { directory })
+    }
+
+    fn discharge(&self, target: &ArtifactRetirementTarget) -> Result<()> {
+        let directory = Path::new(&target.artifact_directory);
+        let payload = Path::new(&target.payload_path);
+        let parent = directory
+            .parent()
+            .ok_or_else(|| anyhow!("artifact directory has no parent"))?;
+        let parent_components = strict_artifact_components(parent)?;
+        let parent_fd = self.open_directory_chain(&parent_components)?;
+        let directory_name = directory
+            .file_name()
+            .ok_or_else(|| anyhow!("artifact directory has no final component"))?;
+        let payload_name = payload
+            .file_name()
+            .ok_or_else(|| anyhow!("artifact payload has no final component"))?;
+        let metadata_tombstone =
+            std::ffi::OsString::from(format!(".retiring-metadata-{}", directory_name.to_string_lossy()));
+        let payload_tombstone =
+            std::ffi::OsString::from(format!(".retiring-payload-{}", payload_name.to_string_lossy()));
+
+        self.validate_target_state(
+            target,
+            parent,
+            directory_name,
+            &metadata_tombstone,
+            payload_name,
+            &payload_tombstone,
+        )?;
+
+        if entry_kind_at(&parent_fd, payload_name)? == Some(ArtifactEntryKind::Regular) {
+            if entry_kind_at(&parent_fd, &payload_tombstone)?.is_some() {
+                bail!("artifact payload retirement tombstone already exists");
+            }
+            rename_entry_at(&parent_fd, payload_name, &payload_tombstone)?;
+        }
+        if entry_kind_at(&parent_fd, directory_name)? == Some(ArtifactEntryKind::Directory) {
+            if entry_kind_at(&parent_fd, &metadata_tombstone)?.is_some() {
+                bail!("artifact metadata retirement tombstone already exists");
+            }
+            rename_entry_at(&parent_fd, directory_name, &metadata_tombstone)?;
+        }
+        remove_artifact_entry_at(&parent_fd, &metadata_tombstone)?;
+        remove_artifact_entry_at(&parent_fd, &payload_tombstone)?;
+        Ok(())
+    }
+
+    fn validate_target_state(
+        &self,
+        target: &ArtifactRetirementTarget,
+        parent: &Path,
+        directory_name: &std::ffi::OsStr,
+        metadata_tombstone: &std::ffi::OsStr,
+        payload_name: &std::ffi::OsStr,
+        payload_tombstone: &std::ffi::OsStr,
+    ) -> Result<()> {
+        let directory = Path::new(&target.artifact_directory);
+        let metadata = Path::new(&target.metadata_path);
+        let metadata_suffix = metadata
+            .strip_prefix(directory)
+            .context("artifact metadata is outside its artifact directory")?;
+        let live_metadata = metadata.to_path_buf();
+        let tombstone_metadata = parent.join(metadata_tombstone).join(metadata_suffix);
+        let live_payload = Path::new(&target.payload_path).to_path_buf();
+        let tombstone_payload = parent.join(payload_tombstone);
+
+        let live_directory_kind = self.entry_kind(parent.join(directory_name))?;
+        let tombstone_directory_kind = self.entry_kind(parent.join(metadata_tombstone))?;
+        let live_payload_kind = self.entry_kind(parent.join(payload_name))?;
+        let tombstone_payload_kind = self.entry_kind(parent.join(payload_tombstone))?;
+
+        reject_wrong_artifact_kind("metadata directory", live_directory_kind, true)?;
+        reject_wrong_artifact_kind(
+            "metadata tombstone",
+            tombstone_directory_kind,
+            true,
+        )?;
+        reject_wrong_artifact_kind("payload", live_payload_kind, false)?;
+        reject_wrong_artifact_kind("payload tombstone", tombstone_payload_kind, false)?;
+        if live_directory_kind.is_some() && tombstone_directory_kind.is_some() {
+            bail!("artifact has both live and tombstoned metadata");
+        }
+        if live_payload_kind.is_some() && tombstone_payload_kind.is_some() {
+            bail!("artifact has both live and tombstoned payloads");
+        }
+
+        let metadata_path = if live_directory_kind.is_some() {
+            Some(live_metadata)
+        } else if tombstone_directory_kind.is_some() {
+            Some(tombstone_metadata)
+        } else {
+            None
+        };
+        let payload_path = if live_payload_kind.is_some() {
+            Some(live_payload)
+        } else if tombstone_payload_kind.is_some() {
+            Some(tombstone_payload)
+        } else {
+            None
+        };
+        if metadata_path.is_none() && payload_path.is_none() {
+            return Ok(());
+        }
+        let metadata_path =
+            metadata_path.context("artifact payload remains after metadata disappeared")?;
+        let payload_path =
+            payload_path.context("artifact metadata remains after payload disappeared")?;
+        if self.sha256_file(&metadata_path)? != target.metadata_sha256
+            || self.sha256_file(&payload_path)? != target.payload_sha256
+        {
+            bail!("artifact retirement target fingerprint drifted after Prepared");
+        }
+        Ok(())
+    }
+
+    fn entry_kind(&self, relative: PathBuf) -> Result<Option<ArtifactEntryKind>> {
+        let components = strict_artifact_components(&relative)?;
+        let Some((name, parents)) = components.split_last() else {
+            bail!("artifact retirement path is empty");
+        };
+        let parent = match self.open_directory_chain(parents) {
+            Ok(parent) => parent,
+            Err(error) if is_not_found_error(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        entry_kind_at(&parent, name)
+    }
+
+    fn sha256_file(&self, relative: &Path) -> Result<String> {
+        use std::io::Read;
+
+        let components = strict_artifact_components(relative)?;
+        let Some((name, parents)) = components.split_last() else {
+            bail!("artifact retirement file path is empty");
+        };
+        let parent = self.open_directory_chain(parents)?;
+        let mut file = open_artifact_at(parent.as_raw_fd(), name, false)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            bail!("artifact retirement fingerprint target is not a regular file");
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(hex::encode(sha2::Sha256::digest(&bytes)))
+    }
+
+    fn open_directory_chain(&self, components: &[std::ffi::OsString]) -> Result<fs::File> {
+        let mut current = self.directory.try_clone()?;
+        for component in components {
+            current = open_artifact_at(current.as_raw_fd(), component, true)
+                .with_context(|| format!("artifact path component {component:?} is not confined"))?;
+        }
+        Ok(current)
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArtifactEntryKind {
+    Regular,
+    Directory,
+}
+
+#[cfg(unix)]
+fn reject_wrong_artifact_kind(
+    label: &str,
+    kind: Option<ArtifactEntryKind>,
+    directory: bool,
+) -> Result<()> {
+    let expected = if directory {
+        ArtifactEntryKind::Directory
+    } else {
+        ArtifactEntryKind::Regular
+    };
+    if kind.is_some_and(|kind| kind != expected) {
+        bail!("artifact retirement {label} has an unsupported file type");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn strict_artifact_components(path: &Path) -> Result<Vec<std::ffi::OsString>> {
+    if path.as_os_str().is_empty() {
+        return Ok(Vec::new());
+    }
+    if !strict_retirement_relative_path(path) {
+        bail!("artifact retirement path is unsafe");
+    }
+    Ok(path
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => value.to_os_string(),
+            _ => unreachable!("strict path validation accepted a non-normal component"),
+        })
+        .collect())
+}
+
+#[cfg(unix)]
+fn open_artifact_at(
+    parent_fd: std::os::fd::RawFd,
+    name: &std::ffi::OsStr,
+    directory: bool,
+) -> std::io::Result<fs::File> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let flags = libc::O_RDONLY
+        | libc::O_CLOEXEC
+        | libc::O_NOFOLLOW
+        | libc::O_NONBLOCK
+        | if directory { libc::O_DIRECTORY } else { 0 };
+    // SAFETY: parent_fd is owned by a live File and name is NUL-terminated.
+    let fd = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new owned descriptor.
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn entry_kind_at(parent: &fs::File, name: &std::ffi::OsStr) -> Result<Option<ArtifactEntryKind>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| anyhow!("artifact path contains NUL"))?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: stat is writable and name is NUL-terminated.
+    let status = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if status != 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(error.into())
+        };
+    }
+    // SAFETY: fstatat initialized stat.
+    let stat = unsafe { stat.assume_init() };
+    match stat.st_mode & libc::S_IFMT {
+        libc::S_IFREG => Ok(Some(ArtifactEntryKind::Regular)),
+        libc::S_IFDIR => Ok(Some(ArtifactEntryKind::Directory)),
+        libc::S_IFLNK => bail!("artifact retirement target is symlinked"),
+        _ => bail!("artifact retirement target has an unsupported file type"),
+    }
+}
+
+#[cfg(unix)]
+fn rename_entry_at(parent: &fs::File, from: &std::ffi::OsStr, to: &std::ffi::OsStr) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = std::ffi::CString::new(from.as_bytes())
+        .map_err(|_| anyhow!("artifact path contains NUL"))?;
+    let to = std::ffi::CString::new(to.as_bytes())
+        .map_err(|_| anyhow!("artifact path contains NUL"))?;
+    // SAFETY: parent is live and both names are NUL-terminated.
+    if unsafe { libc::renameat(parent.as_raw_fd(), from.as_ptr(), parent.as_raw_fd(), to.as_ptr()) }
+        != 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    parent.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_artifact_entry_at(parent: &fs::File, name: &std::ffi::OsStr) -> Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let kind = match entry_kind_at(parent, name)? {
+        Some(kind) => kind,
+        None => return Ok(false),
+    };
+    let name_c =
+        std::ffi::CString::new(name.as_bytes()).map_err(|_| anyhow!("artifact path contains NUL"))?;
+    match kind {
+        ArtifactEntryKind::Directory => {
+            let child = open_artifact_at(parent.as_raw_fd(), name, true)
+                .context("artifact directory changed during confinement check")?;
+            for child_name in list_artifact_directory(&child)? {
+                remove_artifact_entry_at(&child, &child_name)?;
+            }
+            // SAFETY: parent and name identify the drained directory.
+            if unsafe { libc::unlinkat(parent.as_raw_fd(), name_c.as_ptr(), libc::AT_REMOVEDIR) } != 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        ArtifactEntryKind::Regular => {
+            // SAFETY: parent and name identify the regular file checked above.
+            if unsafe { libc::unlinkat(parent.as_raw_fd(), name_c.as_ptr(), 0) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+    }
+    parent.sync_all()?;
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn list_artifact_directory(directory: &fs::File) -> Result<Vec<std::ffi::OsString>> {
+    use std::os::unix::ffi::OsStringExt;
+
+    // SAFETY: dup creates an independent descriptor for fdopendir.
+    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: duplicate is a valid directory descriptor.
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        // SAFETY: fdopendir did not consume duplicate on failure.
+        unsafe { libc::close(duplicate) };
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: stream remains valid until closed below.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: d_name is NUL-terminated by readdir.
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name != b"." && name != b".." {
+            names.push(std::ffi::OsString::from_vec(name.to_vec()));
+        }
+    }
+    // SAFETY: stream was returned by fdopendir and is closed once.
+    if unsafe { libc::closedir(stream) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    names.sort();
+    Ok(names)
+}
+
+#[cfg(unix)]
+fn is_not_found_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+#[cfg(not(unix))]
+struct AnchoredArtifactRoot {
+    root: PathBuf,
+}
+
+#[cfg(not(unix))]
+impl AnchoredArtifactRoot {
+    fn open(root: &Path) -> Result<Self> {
+        Ok(Self {
+            root: root.to_path_buf(),
+        })
+    }
+
+    fn discharge(&self, target: &ArtifactRetirementTarget) -> Result<()> {
+        target.validate()?;
+        let directory = self.validate(Path::new(&target.artifact_directory))?;
+        let payload = self.validate(Path::new(&target.payload_path))?;
         let parent = directory
             .parent()
             .ok_or_else(|| anyhow!("artifact directory has no parent"))?;
@@ -377,41 +869,43 @@ pub fn discharge_project_catalog_targets(root: &Path, targets: &[String]) -> Res
             directory
                 .file_name()
                 .and_then(|name| name.to_str())
-                .unwrap_or("artifact")
+                .context("artifact directory name is not UTF-8")?
         ));
-        let artifact_file = directory.with_extension("json");
-        let payload_tombstone = parent.join(format!(
-            ".retiring-payload-{}",
-            artifact_file
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("artifact.json")
-        ));
-        if artifact_file.is_file() {
-            if payload_tombstone.exists() {
-                bail!("artifact payload retirement tombstone already exists");
-            }
-            fs::rename(&artifact_file, &payload_tombstone)?;
+        let payload_tombstone = artifact_payload_tombstone(&directory)?;
+        if payload.is_file() {
+            fs::rename(&payload, &payload_tombstone)?;
             fs::File::open(parent)?.sync_all()?;
         }
         if directory.is_dir() {
-            if metadata_tombstone.exists() {
-                bail!("artifact metadata retirement tombstone already exists");
-            }
             fs::rename(&directory, &metadata_tombstone)?;
             fs::File::open(parent)?.sync_all()?;
         }
         if metadata_tombstone.is_dir() {
             fs::remove_dir_all(&metadata_tombstone)?;
-            fs::File::open(parent)?.sync_all()?;
         }
         if payload_tombstone.is_file() {
             fs::remove_file(&payload_tombstone)?;
-            fs::File::open(parent)?.sync_all()?;
         }
-        removed += 1;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
     }
-    Ok(removed)
+
+    fn validate(&self, relative: &Path) -> Result<PathBuf> {
+        if !strict_retirement_relative_path(relative) {
+            bail!("artifact retirement path is unsafe");
+        }
+        let mut current = self.root.clone();
+        for component in relative.components() {
+            let Component::Normal(component) = component else {
+                bail!("artifact retirement path is unsafe");
+            };
+            current.push(component);
+            if current.exists() && fs::symlink_metadata(&current)?.file_type().is_symlink() {
+                bail!("artifact retirement path is symlinked");
+            }
+        }
+        Ok(current)
+    }
 }
 
 impl ArtifactCatalog {
@@ -2662,6 +3156,16 @@ mod tests {
             fs::rename(&payload, &payload_tombstone).unwrap();
             if metadata_hidden {
                 fs::rename(&metadata_dir, parent.join(".retiring-metadata-owner-test")).unwrap();
+                assert!(
+                    capture_project_catalog_retirement_targets(&root, "project1", &[])
+                        .unwrap()
+                        .is_empty()
+                );
+            } else {
+                assert_eq!(
+                    capture_project_catalog_retirement_targets(&root, "project1", &[]).unwrap(),
+                    targets
+                );
             }
 
             let catalog = ArtifactCatalog::open(&root).unwrap();
@@ -2678,5 +3182,69 @@ mod tests {
             assert!(!payload_tombstone.exists());
             assert!(!metadata_dir.exists());
         }
+    }
+
+    #[test]
+    fn artifact_retirement_target_rejects_unsafe_or_malformed_identity() {
+        let valid = ArtifactRetirementTarget {
+            artifact_directory: "projects/project1/local/agent/a".into(),
+            metadata_path: "projects/project1/local/agent/a/metadata.json".into(),
+            payload_path: "projects/project1/local/agent/a.json".into(),
+            metadata_sha256: "a".repeat(64),
+            payload_sha256: "b".repeat(64),
+        };
+        assert!(valid.validate().is_ok());
+        for invalid in [
+            ArtifactRetirementTarget {
+                artifact_directory: String::new(),
+                ..valid.clone()
+            },
+            ArtifactRetirementTarget {
+                artifact_directory: "/tmp/victim".into(),
+                ..valid.clone()
+            },
+            ArtifactRetirementTarget {
+                artifact_directory: "../victim".into(),
+                ..valid.clone()
+            },
+            ArtifactRetirementTarget {
+                metadata_sha256: "not-a-hash".into(),
+                ..valid.clone()
+            },
+            ArtifactRetirementTarget {
+                metadata_path: "other/metadata.json".into(),
+                ..valid.clone()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_retirement_refuses_symlinked_intermediate_component() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("artifacts");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(outside.join("project1/local/agent/a")).unwrap();
+        fs::write(
+            outside.join("project1/local/agent/a/metadata.json"),
+            b"metadata",
+        )
+        .unwrap();
+        fs::write(outside.join("project1/local/agent/a.json"), b"payload").unwrap();
+        symlink(&outside, root.join("projects")).unwrap();
+        let target = ArtifactRetirementTarget {
+            artifact_directory: "projects/project1/local/agent/a".into(),
+            metadata_path: "projects/project1/local/agent/a/metadata.json".into(),
+            payload_path: "projects/project1/local/agent/a.json".into(),
+            metadata_sha256: hex::encode(sha2::Sha256::digest(b"metadata")),
+            payload_sha256: hex::encode(sha2::Sha256::digest(b"payload")),
+        };
+        assert!(discharge_project_catalog_targets(&root, &[target]).is_err());
+        assert!(outside.join("project1/local/agent/a.json").exists());
     }
 }

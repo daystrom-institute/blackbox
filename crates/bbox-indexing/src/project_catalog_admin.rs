@@ -2214,7 +2214,7 @@ pub struct ProjectRetirementJournal {
 }
 
 impl ProjectRetirementJournal {
-    pub const VERSION: u32 = 2;
+    pub const VERSION: u32 = 3;
 
     pub fn new(project_id: ProjectId, catalog_epoch: u64, now: &str) -> Self {
         let mut journal = Self {
@@ -2311,7 +2311,7 @@ pub struct RetirementJournalEvidence {
     pub edge_paths: Option<Vec<String>>,
 
     /// Exact artifact payload plus metadata targets captured at Prepared.
-    pub artifact_targets: Option<Vec<String>>,
+    pub artifact_targets: Option<Vec<bbox_artifacts::artifacts::ArtifactRetirementTarget>>,
 
     /// Prepared owner-row counts for every declared blocking class. Counts may
     /// only decrease while a stage is replayed; any increase is new authority
@@ -2495,19 +2495,24 @@ fn load_retirement_journal_from_path(
     #[cfg(not(unix))]
     let bytes = std::fs::read(&path)?;
 
-    let mut journal: ProjectRetirementJournal = serde_json::from_slice(&bytes)?;
-
-    // Strict version check.
-    if journal.version != ProjectRetirementJournal::VERSION {
-        if journal.version == 1 {
-            return Err(RetirementJournalError::UpgradeRequired(journal.version));
+    let envelope: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let version = envelope
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| RetirementJournalError::other("retirement journal version is missing"))?;
+    let version = u32::try_from(version)
+        .map_err(|_| RetirementJournalError::other("retirement journal version is invalid"))?;
+    if version != ProjectRetirementJournal::VERSION {
+        if version == 1 || version == 2 {
+            return Err(RetirementJournalError::UpgradeRequired(version));
         }
         return Err(RetirementJournalError::other(format!(
             "retirement journal version mismatch: expected {}, got {}",
             ProjectRetirementJournal::VERSION,
-            journal.version
+            version
         )));
     }
+    let mut journal: ProjectRetirementJournal = serde_json::from_value(envelope)?;
     // Filename/project_id consistency: the journal's embedded project_id
     // must match the filename-derived project_id.
     if journal.project_id != *project_id {
@@ -2639,6 +2644,13 @@ fn validate_journal_evidence_shape(
         return Err(RetirementJournalError::other(
             "retirement journal artifact target evidence is duplicated",
         ));
+    }
+    for target in artifact_targets {
+        target.validate().map_err(|error| {
+            RetirementJournalError::other(format!(
+                "retirement journal artifact target evidence is invalid: {error}"
+            ))
+        })?;
     }
     journal
         .evidence
@@ -5010,6 +5022,50 @@ mod tests {
             load_retirement_journal(tmp.path(), &pid),
             Err(RetirementJournalError::UpgradeRequired(1))
         ));
+    }
+
+    #[test]
+    fn retirement_journal_v2_requires_explicit_upgrade_before_typed_evidence_decode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = ProjectId::parse(PROJECT).unwrap();
+        let mut value =
+            serde_json::to_value(ProjectRetirementJournal::new(pid.clone(), 1, "1")).unwrap();
+        value["version"] = serde_json::json!(2);
+        value["evidence"]["artifact_targets"] =
+            serde_json::json!(["/tmp/victim:aaaaaaaa:bbbbbbbb"]);
+        let path = retirement_journal_path(tmp.path(), &pid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(matches!(
+            load_retirement_journal(tmp.path(), &pid),
+            Err(RetirementJournalError::UpgradeRequired(2))
+        ));
+    }
+
+    #[test]
+    fn retirement_journal_rejects_self_consistent_unsafe_artifact_targets() {
+        let invalid_directories = ["", "/tmp/victim", "../victim", "safe/../victim"];
+        for invalid_directory in invalid_directories {
+            let tmp = tempfile::tempdir().unwrap();
+            let pid = ProjectId::parse(PROJECT).unwrap();
+            let mut journal = ProjectRetirementJournal::new(pid.clone(), 1, "1");
+            journal.evidence.artifact_targets =
+                Some(vec![bbox_artifacts::artifacts::ArtifactRetirementTarget {
+                    artifact_directory: invalid_directory.into(),
+                    metadata_path: format!("{invalid_directory}/metadata.json"),
+                    payload_path: format!("{invalid_directory}.json"),
+                    metadata_sha256: "a".repeat(64),
+                    payload_sha256: "b".repeat(64),
+                }]);
+            journal.seal_retirement_evidence();
+            let path = retirement_journal_path(tmp.path(), &pid);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+            assert!(
+                load_retirement_journal(tmp.path(), &pid).is_err(),
+                "unsafe artifact directory {invalid_directory:?} was accepted"
+            );
+        }
     }
 
     #[test]
