@@ -311,15 +311,32 @@ pub fn discharge_project_catalog_rows(
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactRetirementTarget {
+    pub owner_project_id: String,
+    pub legacy_project_path: Option<String>,
     pub artifact_directory: String,
     pub metadata_path: String,
     pub payload_path: String,
     pub metadata_sha256: String,
+    pub version_metadata: Vec<ArtifactMetadataCommitment>,
     pub payload_sha256: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactMetadataCommitment {
+    pub path: String,
+    pub sha256: String,
+}
+
+const MAX_RETIREMENT_METADATA_BYTES: u64 = 1024 * 1024;
+const MAX_RETIREMENT_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_RETIREMENT_AGGREGATE_BYTES: u64 = 256 * 1024 * 1024;
+
 impl ArtifactRetirementTarget {
     pub fn validate(&self) -> Result<()> {
+        if self.owner_project_id.is_empty() {
+            bail!("artifact retirement owner project id is empty");
+        }
         for (label, value) in [
             ("artifact directory", self.artifact_directory.as_str()),
             ("metadata path", self.metadata_path.as_str()),
@@ -339,6 +356,17 @@ impl ArtifactRetirementTarget {
         if Path::new(&self.payload_path).parent() != directory.parent() {
             bail!("artifact retirement payload is outside its artifact parent");
         }
+        let mut metadata_paths = std::collections::BTreeSet::new();
+        for commitment in &self.version_metadata {
+            let path = Path::new(&commitment.path);
+            if !strict_retirement_relative_path(path)
+                || !path.starts_with(directory)
+                || !strict_sha256(&commitment.sha256)
+                || !metadata_paths.insert(&commitment.path)
+            {
+                bail!("artifact retirement version metadata commitment is invalid");
+            }
+        }
         Ok(())
     }
 }
@@ -348,7 +376,6 @@ pub fn capture_project_catalog_retirement_targets(
     project_id: &str,
     selectors: &[String],
 ) -> Result<Vec<ArtifactRetirementTarget>> {
-    let hash_bytes = |bytes: &[u8]| hex::encode(sha2::Sha256::digest(bytes));
     let metadata = match fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -358,6 +385,7 @@ pub fn capture_project_catalog_retirement_targets(
         bail!("artifact store root is not a safe directory");
     }
     let mut targets = Vec::new();
+    let mut aggregate_bytes = 0_u64;
     for entry in WalkDir::new(root).follow_links(false) {
         let entry = entry?;
         if !entry.file_type().is_file() {
@@ -379,26 +407,19 @@ pub fn capture_project_catalog_retirement_targets(
             continue;
         }
         let file_name = entry.file_name().to_string_lossy();
-        if file_name != "metadata.json" && !file_name.ends_with(".metadata.json") {
+        if file_name != "metadata.json" {
             continue;
         }
-        let metadata: ArtifactMetadata = serde_json::from_slice(&fs::read(entry.path())?)?;
-        let owned = match metadata.project_id.as_deref() {
-            Some(owner) => owner == project_id,
-            None => metadata
-                .project_path
-                .as_ref()
-                .is_some_and(|path| selectors.iter().any(|selector| selector == path)),
-        };
-        if !owned {
-            continue;
-        }
-        let directory = if file_name == "metadata.json" {
-            entry.path().parent()
-        } else {
-            entry.path().parent().and_then(Path::parent)
-        }
-        .ok_or_else(|| anyhow!("artifact metadata has no owning directory"))?;
+        let metadata_bytes = read_bounded_regular_nofollow(
+            entry.path(),
+            MAX_RETIREMENT_METADATA_BYTES,
+            &mut aggregate_bytes,
+        )?;
+        let metadata: ArtifactMetadata = serde_json::from_slice(&metadata_bytes)?;
+        let directory = entry
+            .path()
+            .parent()
+            .ok_or_else(|| anyhow!("artifact metadata has no owning directory"))?;
         let relative = directory
             .strip_prefix(root)
             .context("artifact directory escaped its store root")?;
@@ -411,14 +432,71 @@ pub fn capture_project_catalog_retirement_targets(
             .strip_prefix(root)
             .context("artifact payload escaped its store root")?;
         let payload_tombstone = artifact_payload_tombstone(directory)?;
-        let payload_bytes = if payload.is_file() {
-            fs::read(&payload)?
+        let payload_path = if payload.is_file() {
+            payload.clone()
         } else if payload_tombstone.is_file() {
-            fs::read(&payload_tombstone)?
+            payload_tombstone
         } else {
             bail!("owned artifact metadata has no payload");
         };
+        let payload_hash = hash_bounded_regular_nofollow(
+            &payload_path,
+            MAX_RETIREMENT_PAYLOAD_BYTES,
+            &mut aggregate_bytes,
+        )?;
+        let canonical_owner = artifact_owner_identity(&metadata)?;
+        let mut version_metadata = Vec::new();
+        let versions = directory.join(".versions");
+        if versions.is_dir() {
+            for version in WalkDir::new(&versions).follow_links(false) {
+                let version = version?;
+                if !version.file_type().is_file()
+                    || !version
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.ends_with(".metadata.json"))
+                {
+                    continue;
+                }
+                let bytes = read_bounded_regular_nofollow(
+                    version.path(),
+                    MAX_RETIREMENT_METADATA_BYTES,
+                    &mut aggregate_bytes,
+                )?;
+                let version_record: ArtifactMetadata = serde_json::from_slice(&bytes)?;
+                if artifact_owner_identity(&version_record)? != canonical_owner {
+                    bail!("artifact version metadata owner disagrees with canonical metadata");
+                }
+                version_metadata.push(ArtifactMetadataCommitment {
+                    path: version
+                        .path()
+                        .strip_prefix(root)?
+                        .to_str()
+                        .context("artifact version metadata path is not UTF-8")?
+                        .to_string(),
+                    sha256: hex::encode(sha2::Sha256::digest(&bytes)),
+                });
+            }
+        }
+        version_metadata.sort();
+        let expected_owner = match metadata.project_id.as_deref() {
+            Some(owner) => owner == project_id,
+            None => metadata
+                .project_path
+                .as_ref()
+                .is_some_and(|path| selectors.iter().any(|selector| selector == path)),
+        };
+        if !expected_owner {
+            continue;
+        }
         let target = ArtifactRetirementTarget {
+            owner_project_id: project_id.to_string(),
+            legacy_project_path: metadata.project_id.is_none().then(|| {
+                metadata
+                    .project_path
+                    .clone()
+                    .expect("legacy artifact owner has a project path")
+            }),
             artifact_directory: relative
                 .to_str()
                 .context("artifact directory is not UTF-8")?
@@ -431,8 +509,9 @@ pub fn capture_project_catalog_retirement_targets(
                 .to_str()
                 .context("artifact payload path is not UTF-8")?
                 .to_string(),
-            metadata_sha256: hash_bytes(&fs::read(entry.path())?),
-            payload_sha256: hash_bytes(&payload_bytes),
+            metadata_sha256: hex::encode(sha2::Sha256::digest(&metadata_bytes)),
+            version_metadata,
+            payload_sha256: payload_hash,
         };
         target.validate()?;
         targets.push(target);
@@ -469,6 +548,111 @@ fn strict_retirement_relative_path(path: &Path) -> bool {
 
 fn strict_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArtifactOwnerIdentity {
+    ProjectId(String),
+    LegacyProjectPath(String),
+}
+
+fn artifact_owner_identity(metadata: &ArtifactMetadata) -> Result<ArtifactOwnerIdentity> {
+    if let Some(project_id) = metadata
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(ArtifactOwnerIdentity::ProjectId(project_id.to_string()));
+    }
+    metadata
+        .project_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| ArtifactOwnerIdentity::LegacyProjectPath(value.to_string()))
+        .context("artifact metadata has no project owner")
+}
+
+fn validate_artifact_target_owner(
+    target: &ArtifactRetirementTarget,
+    metadata: &ArtifactMetadata,
+) -> Result<()> {
+    let expected = match &target.legacy_project_path {
+        Some(path) => ArtifactOwnerIdentity::LegacyProjectPath(path.clone()),
+        None => ArtifactOwnerIdentity::ProjectId(target.owner_project_id.clone()),
+    };
+    if artifact_owner_identity(metadata)? != expected {
+        bail!("artifact metadata owner drifted after Prepared");
+    }
+    Ok(())
+}
+
+fn checked_retirement_file_len(path: &Path, limit: u64, aggregate: &mut u64) -> Result<u64> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("artifact retirement input is not a regular nofollow file");
+    }
+    if metadata.len() > limit {
+        bail!("artifact retirement input exceeds its per-file byte limit");
+    }
+    *aggregate = aggregate
+        .checked_add(metadata.len())
+        .context("artifact retirement aggregate byte count overflowed")?;
+    if *aggregate > MAX_RETIREMENT_AGGREGATE_BYTES {
+        bail!("artifact retirement inputs exceed their aggregate byte limit");
+    }
+    Ok(metadata.len())
+}
+
+fn read_bounded_regular_nofollow(path: &Path, limit: u64, aggregate: &mut u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+
+    let length = checked_retirement_file_len(path, limit, aggregate)?;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(path)?;
+    let capacity = usize::try_from(length).context("artifact retirement file is too large")?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.by_ref().take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != length {
+        bail!("artifact retirement input changed while being read");
+    }
+    Ok(bytes)
+}
+
+fn hash_bounded_regular_nofollow(path: &Path, limit: u64, aggregate: &mut u64) -> Result<String> {
+    use std::io::Read;
+
+    let length = checked_retirement_file_len(path, limit, aggregate)?;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(path)?;
+    let mut remaining = length;
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut hash = sha2::Sha256::new();
+    while remaining > 0 {
+        let chunk = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+        let read = file.read(&mut buffer[..chunk])?;
+        if read == 0 {
+            bail!("artifact retirement input changed while being hashed");
+        }
+        hash.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    let mut extra = [0_u8; 1];
+    if file.read(&mut extra)? != 0 {
+        bail!("artifact retirement input changed while being hashed");
+    }
+    Ok(hex::encode(hash.finalize()))
 }
 
 fn artifact_payload_tombstone(directory: &Path) -> Result<PathBuf> {
@@ -608,10 +792,39 @@ impl AnchoredArtifactRoot {
             metadata_path.context("artifact payload remains after metadata disappeared")?;
         let payload_path =
             payload_path.context("artifact metadata remains after payload disappeared")?;
-        if self.sha256_file(&metadata_path)? != target.metadata_sha256
-            || self.sha256_file(&payload_path)? != target.payload_sha256
-        {
+        let mut aggregate = 0_u64;
+        let metadata_bytes = self.read_bounded_file(
+            &metadata_path,
+            MAX_RETIREMENT_METADATA_BYTES,
+            &mut aggregate,
+        )?;
+        let metadata: ArtifactMetadata = serde_json::from_slice(&metadata_bytes)?;
+        validate_artifact_target_owner(target, &metadata)?;
+        if hex::encode(sha2::Sha256::digest(&metadata_bytes)) != target.metadata_sha256 {
             bail!("artifact retirement target fingerprint drifted after Prepared");
+        }
+        for commitment in &target.version_metadata {
+            let relative = Path::new(&commitment.path);
+            let suffix = relative
+                .strip_prefix(directory)
+                .context("artifact version metadata escaped its directory")?;
+            let state_path = if live_directory_kind.is_some() {
+                relative.to_path_buf()
+            } else {
+                parent.join(metadata_tombstone).join(suffix)
+            };
+            let bytes =
+                self.read_bounded_file(&state_path, MAX_RETIREMENT_METADATA_BYTES, &mut aggregate)?;
+            let version: ArtifactMetadata = serde_json::from_slice(&bytes)?;
+            validate_artifact_target_owner(target, &version)?;
+            if hex::encode(sha2::Sha256::digest(&bytes)) != commitment.sha256 {
+                bail!("artifact retirement version metadata drifted after Prepared");
+            }
+        }
+        if self.sha256_file(&payload_path, MAX_RETIREMENT_PAYLOAD_BYTES, &mut aggregate)?
+            != target.payload_sha256
+        {
+            bail!("artifact retirement payload drifted after Prepared");
         }
         Ok(())
     }
@@ -629,7 +842,12 @@ impl AnchoredArtifactRoot {
         entry_kind_at(&parent, name)
     }
 
-    fn sha256_file(&self, relative: &Path) -> Result<String> {
+    fn read_bounded_file(
+        &self,
+        relative: &Path,
+        limit: u64,
+        aggregate: &mut u64,
+    ) -> Result<Vec<u8>> {
         use std::io::Read;
 
         let components = strict_artifact_components(relative)?;
@@ -642,9 +860,61 @@ impl AnchoredArtifactRoot {
         if !metadata.is_file() {
             bail!("artifact retirement fingerprint target is not a regular file");
         }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        Ok(hex::encode(sha2::Sha256::digest(&bytes)))
+        if metadata.len() > limit {
+            bail!("artifact retirement input exceeds its per-file byte limit");
+        }
+        *aggregate = aggregate
+            .checked_add(metadata.len())
+            .context("artifact retirement aggregate byte count overflowed")?;
+        if *aggregate > MAX_RETIREMENT_AGGREGATE_BYTES {
+            bail!("artifact retirement inputs exceed their aggregate byte limit");
+        }
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(metadata.len()).context("artifact retirement file is too large")?,
+        );
+        file.by_ref().take(limit + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 != metadata.len() {
+            bail!("artifact retirement input changed while being read");
+        }
+        Ok(bytes)
+    }
+
+    fn sha256_file(&self, relative: &Path, limit: u64, aggregate: &mut u64) -> Result<String> {
+        use std::io::Read;
+
+        let components = strict_artifact_components(relative)?;
+        let Some((name, parents)) = components.split_last() else {
+            bail!("artifact retirement file path is empty");
+        };
+        let parent = self.open_directory_chain(parents)?;
+        let mut file = open_artifact_at(parent.as_raw_fd(), name, false)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > limit {
+            bail!("artifact retirement fingerprint target exceeds its file bound");
+        }
+        *aggregate = aggregate
+            .checked_add(metadata.len())
+            .context("artifact retirement aggregate byte count overflowed")?;
+        if *aggregate > MAX_RETIREMENT_AGGREGATE_BYTES {
+            bail!("artifact retirement inputs exceed their aggregate byte limit");
+        }
+        let mut remaining = metadata.len();
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut hash = sha2::Sha256::new();
+        while remaining > 0 {
+            let chunk = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+            let read = file.read(&mut buffer[..chunk])?;
+            if read == 0 {
+                bail!("artifact retirement input changed while being hashed");
+            }
+            hash.update(&buffer[..read]);
+            remaining -= read as u64;
+        }
+        let mut extra = [0_u8; 1];
+        if file.read(&mut extra)? != 0 {
+            bail!("artifact retirement input changed while being hashed");
+        }
+        Ok(hex::encode(hash.finalize()))
     }
 
     fn open_directory_chain(&self, components: &[std::ffi::OsString]) -> Result<fs::File> {
@@ -3217,10 +3487,13 @@ mod tests {
     #[test]
     fn artifact_retirement_target_rejects_unsafe_or_malformed_identity() {
         let valid = ArtifactRetirementTarget {
+            owner_project_id: "project1".into(),
+            legacy_project_path: None,
             artifact_directory: "projects/project1/local/agent/a".into(),
             metadata_path: "projects/project1/local/agent/a/metadata.json".into(),
             payload_path: "projects/project1/local/agent/a.json".into(),
             metadata_sha256: "a".repeat(64),
+            version_metadata: Vec::new(),
             payload_sha256: "b".repeat(64),
         };
         assert!(valid.validate().is_ok());
@@ -3268,13 +3541,91 @@ mod tests {
         fs::write(outside.join("project1/local/agent/a.json"), b"payload").unwrap();
         symlink(&outside, root.join("projects")).unwrap();
         let target = ArtifactRetirementTarget {
+            owner_project_id: "project1".into(),
+            legacy_project_path: None,
             artifact_directory: "projects/project1/local/agent/a".into(),
             metadata_path: "projects/project1/local/agent/a/metadata.json".into(),
             payload_path: "projects/project1/local/agent/a.json".into(),
             metadata_sha256: hex::encode(sha2::Sha256::digest(b"metadata")),
+            version_metadata: Vec::new(),
             payload_sha256: hex::encode(sha2::Sha256::digest(b"payload")),
         };
         assert!(discharge_project_catalog_targets(&root, &[target]).is_err());
         assert!(outside.join("project1/local/agent/a.json").exists());
+    }
+
+    #[test]
+    fn artifact_retirement_refuses_cross_owner_version_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let artifact = root.join("projects/project-b/local/agent/shared");
+        fs::create_dir_all(artifact.join(".versions")).unwrap();
+        let metadata = |owner: &str| ArtifactMetadata {
+            kind: ArtifactKind::Agent,
+            name: "shared".into(),
+            version: "1".into(),
+            source: "fixture".into(),
+            installed_at: "2026-07-27T00:00:00Z".into(),
+            content_sha256: Some("a".repeat(64)),
+            project_id: Some(owner.into()),
+            project_path: None,
+            local: true,
+            supersedes: None,
+            supersedes_chain: Vec::new(),
+            superseded_by: None,
+            active: true,
+            install_warnings: Vec::new(),
+        };
+        fs::write(
+            artifact.join("metadata.json"),
+            serde_json::to_vec(&metadata("project-b")).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            artifact.join(".versions/v1.metadata.json"),
+            serde_json::to_vec(&metadata("project-a")).unwrap(),
+        )
+        .unwrap();
+        fs::write(artifact.with_extension("json"), b"payload").unwrap();
+
+        assert!(capture_project_catalog_retirement_targets(&root, "project-a", &[]).is_err());
+        assert!(artifact.exists());
+        assert!(artifact.with_extension("json").exists());
+    }
+
+    #[test]
+    fn artifact_retirement_refuses_oversized_payload_before_reading() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let artifact = root.join("projects/project-a/local/agent/large");
+        fs::create_dir_all(&artifact).unwrap();
+        let metadata = ArtifactMetadata {
+            kind: ArtifactKind::Agent,
+            name: "large".into(),
+            version: "1".into(),
+            source: "fixture".into(),
+            installed_at: "2026-07-27T00:00:00Z".into(),
+            content_sha256: Some("a".repeat(64)),
+            project_id: Some("project-a".into()),
+            project_path: None,
+            local: true,
+            supersedes: None,
+            supersedes_chain: Vec::new(),
+            superseded_by: None,
+            active: true,
+            install_warnings: Vec::new(),
+        };
+        fs::write(
+            artifact.join("metadata.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        fs::File::create(artifact.with_extension("json"))
+            .unwrap()
+            .set_len(MAX_RETIREMENT_PAYLOAD_BYTES + 1)
+            .unwrap();
+        let error =
+            capture_project_catalog_retirement_targets(&root, "project-a", &[]).unwrap_err();
+        assert!(error.to_string().contains("per-file byte limit"));
     }
 }
