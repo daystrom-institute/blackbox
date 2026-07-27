@@ -143,18 +143,33 @@ EOF
     else
       echo "S4 PASS: revoked token refused after SIGHUP"
     fi
-    SMOKE="$SMOKE" python3 - <<'EOF'
-import json, glob, os
-for p in glob.glob(os.environ["SMOKE"] + "/rehearsal/state/code-sources/activations/*.json"):
-    r = json.load(open(p))
-    print("S4 state:", r.get("project_id"), "cutback:", json.dumps(r.get("cutback")), "pending:", r.get("cutback_pending"))
+    sleep 5
+    SMOKE="$SMOKE" WINNER="$WINNER_PROJECT" python3 - <<'EOF'
+import json, glob, os, sys
+smoke = os.environ["SMOKE"]; winner = os.environ["WINNER"]
+mi = json.load(open(smoke + "/rehearsal/state/edges/materialized/manifest-index.json"))
+entry = mi.get("workspaces", {}).get(winner, {})
+selector = entry.get("code_source_selector") or ""
+acts = [p for p in glob.glob(smoke + "/rehearsal/state/code-sources/activations/*.json") if winner in os.path.basename(p)]
+cutback = None
+if acts:
+    cutback = json.load(open(acts[0])).get("cutback")
+if not selector.startswith("collected:"):
+    print("S4 PASS: removal completed cutback to local (selector:", selector or "none", ")")
+elif cutback is not None:
+    print("S4 PASS: removal persisted typed pending state:", json.dumps(cutback))
+else:
+    print("S4 FAIL: still collected with no typed cutback state (selector:", selector, ")"); sys.exit(1)
 EOF
     ;;
   s5)
     stop_daemon
     SMOKE="$SMOKE" python3 - <<'EOF'
 import json, glob, os
+import sys
 recs = glob.glob(os.environ["SMOKE"] + "/rehearsal/state/code-sources/activations/*.json")
+if not recs:
+    print("S5 FAIL: no activation record available to drift"); sys.exit(1)
 p = recs[0]; r = json.load(open(p))
 open(p + ".orig", "w").write(json.dumps(r))
 r["document_count"] = r.get("document_count", 0) + 999
