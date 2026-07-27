@@ -1641,13 +1641,14 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>, runtime_handle: tokio::
                         );
                     }
 
-                    let action = evaluate_reduction(
+                    let mut action = evaluate_reduction(
                         desired,
                         effective,
                         persisted.as_ref(),
                         ladder,
                         bridge_open,
                     );
+                    action = gate_transient_deadline(action, persisted.as_ref(), unix_now());
 
                     tracing::debug!(
                         project_id = %project_id,
@@ -1748,6 +1749,28 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>, runtime_handle: tokio::
     // exits. The background task is a daemon-lifetime thread; it is NOT
     // a tokio task and does NOT hold any sync lock across slow work.
     *state.reconciler_shutdown.write() = shutdown.clone();
+}
+
+fn gate_transient_deadline(
+    action: ReducerAction,
+    persisted: Option<&CutbackStateV2>,
+    now: u64,
+) -> ReducerAction {
+    if action == ReducerAction::ReattemptCutback
+        && persisted.is_some_and(|state| {
+            matches!(
+                state,
+                CutbackStateV2::Transient {
+                    deadline_unix_secs,
+                    ..
+                } if *deadline_unix_secs > now
+            )
+        })
+    {
+        ReducerAction::NoOp
+    } else {
+        action
+    }
 }
 
 fn load_reconciler_activation(
@@ -2516,7 +2539,7 @@ enum LadderResult {
 }
 
 /// The action the reducer decides (section 9.3 reduction table output).
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum ReducerAction {
     /// No action needed; state is steady.
     NoOp,
@@ -2962,6 +2985,27 @@ fn validate_relationship_chain(
         // Typed cutback states are validated by ActivationRecordV2::validate
         // (called transitively through validate_against_generation). Terminal
         // and ManualRetryRequired are valid persisted states.
+    }
+    for (project_id, entry) in &manifest.workspaces {
+        if !entry
+            .code_source_selector
+            .as_deref()
+            .is_some_and(|selector| selector.starts_with("collected:"))
+        {
+            continue;
+        }
+        let matching = records
+            .iter()
+            .filter(|activation| {
+                activation.is_current_v2() && activation.project_id() == project_id
+            })
+            .count();
+        if matching != 1 {
+            bail!(
+                "error.code_source_relationship_chain_reverse: collected workspace \
+                 entry for project {project_id} resolves to {matching} activation records"
+            );
+        }
     }
     Ok(())
 }
@@ -8668,14 +8712,17 @@ mod tests {
         // Transient state with a future deadline: not attempted on
         // resume, scheduler waits until the deadline.
         let future_deadline = unix_now() + 3600;
-        let _transient = CutbackStateV2::Transient {
+        let transient = CutbackStateV2::Transient {
             attempt: 2,
             error_class: CutbackErrorClass::IoPressure,
             deadline_unix_secs: future_deadline,
         };
-        // The reducer still returns ReattemptCutback (the cell is the
-        // same), but the scheduler's drain_due filters by deadline.
-        // Verify the scheduler would NOT drain a future deadline.
+        let action = gate_transient_deadline(
+            ReducerAction::ReattemptCutback,
+            Some(&transient),
+            unix_now(),
+        );
+        assert_eq!(action, ReducerAction::NoOp);
         let reconciler = CutbackReconciler::new(Arc::new(TransitionGuardMap::default()));
         reconciler.register_transient(future_deadline, "p_future_deadline_test");
         let due = reconciler.drain_due(unix_now());
@@ -8891,6 +8938,36 @@ mod tests {
         // No activation records in the store: chain must pass.
         let result = validate_relationship_chain(&store, &snapshot, &manifest);
         assert!(result.is_ok(), "fresh store must pass relationship chain");
+    }
+
+    #[test]
+    fn p4f_collected_workspace_without_activation_refuses_chain() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let runtime = CodeSourceRuntime::for_test_catalog(&root);
+        let store = runtime.store();
+        let pid = "p_000000000000000000000000000004f1";
+        let snapshot = p4f_catalog_snapshot(
+            pid,
+            PublishedScope::try_new("p4f-fresh", ".").unwrap(),
+            vec![],
+        );
+        let mut manifest = bbox_edge_sidecar::manifest::ManifestIndex::new();
+        manifest.workspaces.insert(
+            pid.to_string(),
+            bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
+                manifest: format!("workspace/{pid}/manifest.json"),
+                active_snapshot: Some(format!("workspace/{pid}/snapshots/s")),
+                dirty_overlay: None,
+                repo_materialization: None,
+                code_source_selector: Some(format!("collected:{pid}:missing")),
+                code_source_generation: Some("a".repeat(64)),
+                git_overlay: None,
+                git_overlay_managed: false,
+            },
+        );
+        let error = validate_relationship_chain(&store, &snapshot, &manifest).unwrap_err();
+        assert!(error.to_string().contains("relationship_chain_reverse"));
     }
 
     /// Section 10.4: a hand-drifted activation record (scope mismatch
