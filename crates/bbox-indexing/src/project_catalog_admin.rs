@@ -2320,8 +2320,7 @@ pub struct RetirementJournalEvidence {
     pub reference_class_counts: Option<std::collections::BTreeMap<String, u64>>,
 
     /// Stable exact-row commitments for every declared blocking class.
-    pub reference_class_commitments:
-        Option<std::collections::BTreeMap<String, Vec<String>>>,
+    pub reference_class_commitments: Option<std::collections::BTreeMap<String, Vec<String>>>,
 
     /// Hash-linked blob inventory persisted in a bounded sidecar.
     pub blob_inventory: Option<RetirementBlobInventoryRef>,
@@ -2677,7 +2676,9 @@ fn validate_journal_evidence_shape(
         })?;
     for (class, identities) in commitments {
         if class.is_empty()
-            || identities.iter().any(|identity| !validate_sha256_text(identity))
+            || identities
+                .iter()
+                .any(|identity| !validate_sha256_text(identity))
             || identities
                 .iter()
                 .collect::<std::collections::BTreeSet<_>>()
@@ -3531,6 +3532,17 @@ pub fn retire_project_journaled_with(
             .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
     }
 
+    let post_cut_state = store.snapshot()?;
+    if post_cut_state.catalog().projects.contains_key(project_id) {
+        return Err(admin_error(
+            "error.project_catalog_retire_recovery_not_quiescent",
+            format!(
+                "retirement journal reached the post-cut path while project {project_id} is present"
+            ),
+        ));
+    }
+    workers.verify_retirement_quiescent(project_id, &journal.evidence)?;
+
     // Stage: MaterializationSwept (section 11.3).
     // Blob deletion only when shared-history reference accounting
     // reaches zero. When other projects still reference shared blobs,
@@ -3553,6 +3565,7 @@ pub fn retire_project_journaled_with(
 
     // Stage: Complete (step 9). Archive the journal.
     if journal.current_stage != RetirementJournalStage::Complete {
+        workers.verify_retirement_quiescent(project_id, &journal.evidence)?;
         journal.advance(&now());
         save_retirement_journal(bro_home, &journal)
             .map_err(|e| admin_error("error.project_catalog_retire_journal_io", e.to_string()))?;
@@ -3638,6 +3651,82 @@ mod tests {
     const PROJECT: &str = "p_000000000000000000000000000000a1";
     const OTHER: &str = "p_000000000000000000000000000000b1";
     const CHECKOUT: &str = "feed00000000000000000000000000a1";
+
+    struct RejectPostCutOwnerRows {
+        inner: NoopDischargeWorkers,
+        verify_calls: usize,
+    }
+
+    impl RetirementDischargeWorkers for RejectPostCutOwnerRows {
+        fn capture_retirement_evidence(
+            &mut self,
+            project_id: &ProjectId,
+        ) -> AdminResult<RetirementJournalEvidence> {
+            self.inner.capture_retirement_evidence(project_id)
+        }
+
+        fn discharge_collected_generations(
+            &mut self,
+            project_id: &ProjectId,
+            evidence: &RetirementJournalEvidence,
+        ) -> AdminResult<()> {
+            self.inner
+                .discharge_collected_generations(project_id, evidence)
+        }
+
+        fn discharge_publications(&mut self, project_id: &ProjectId) -> AdminResult<()> {
+            self.inner.discharge_publications(project_id)
+        }
+
+        fn discharge_attachments(
+            &mut self,
+            store: &ProjectCatalogStore,
+            project_id: &ProjectId,
+        ) -> AdminResult<()> {
+            self.inner.discharge_attachments(store, project_id)
+        }
+
+        fn sweep_materialization(
+            &mut self,
+            project_id: &ProjectId,
+            evidence: &RetirementJournalEvidence,
+        ) -> AdminResult<()> {
+            self.inner.sweep_materialization(project_id, evidence)
+        }
+
+        fn verify_source_authority_quiesced(
+            &mut self,
+            store: &ProjectCatalogStore,
+            project_id: &ProjectId,
+            evidence: &RetirementJournalEvidence,
+        ) -> AdminResult<()> {
+            self.inner
+                .verify_source_authority_quiesced(store, project_id, evidence)
+        }
+
+        fn verify_retirement_quiescent(
+            &mut self,
+            _project_id: &ProjectId,
+            _evidence: &RetirementJournalEvidence,
+        ) -> AdminResult<()> {
+            self.verify_calls += 1;
+            Err(admin_error(
+                "error.project_catalog_retire_recovery_not_quiescent",
+                "injected owner row",
+            ))
+        }
+
+        fn reprobe_evidence(
+            &mut self,
+            store: &ProjectCatalogStore,
+            project_id: &ProjectId,
+            original_evidence: &RetireEvidence,
+            retirement_evidence: &RetirementJournalEvidence,
+        ) -> AdminResult<RetireEvidence> {
+            self.inner
+                .reprobe_evidence(store, project_id, original_evidence, retirement_evidence)
+        }
+    }
 
     fn project(id: &str, scope: ProjectScope) -> CorpusProject {
         CorpusProject {
@@ -5804,6 +5893,49 @@ mod tests {
         );
         assert!(!retirement_journal_path(tmp.path(), &pid).exists());
         assert!(archived_retirement_journal_path(tmp.path(), &pid).exists());
+    }
+
+    #[test]
+    fn post_cut_resume_reproves_owner_rows_before_sweep_and_archive() {
+        for stage in [
+            RetirementJournalStage::CatalogPairRemoved,
+            RetirementJournalStage::MaterializationSwept,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let projects = tmp.path().join("projects.json");
+            let store = ProjectCatalogStore::initialize_empty(&projects).unwrap();
+            let pid = ProjectId::parse(PROJECT).unwrap();
+            let mut journal = ProjectRetirementJournal::new(pid.clone(), 1, "1");
+            while journal.current_stage != stage {
+                journal.advance("2");
+            }
+            save_retirement_journal(tmp.path(), &journal).unwrap();
+            let mut workers = RejectPostCutOwnerRows {
+                inner: NoopDischargeWorkers,
+                verify_calls: 0,
+            };
+            let error = retire_project_journaled_with(
+                &store,
+                tmp.path(),
+                &pid,
+                &RetireEvidence::default(),
+                true,
+                &mut workers,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.code(),
+                "error.project_catalog_retire_recovery_not_quiescent"
+            );
+            assert_eq!(workers.verify_calls, 1);
+            assert_eq!(
+                load_retirement_journal(tmp.path(), &pid)
+                    .unwrap()
+                    .unwrap()
+                    .current_stage,
+                stage
+            );
+        }
     }
 
     #[test]

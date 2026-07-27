@@ -208,11 +208,17 @@ pub fn capture_project_catalog_owner_snapshot(
     }
     let captures =
         match capture_stable_regular_tree_nofollow(root, "artifact", limits, |relative| {
-            relative.file_name().and_then(|name| name.to_str()) == Some("metadata.json")
+            !relative.components().any(|component| {
+                matches!(
+                    component,
+                    Component::Normal(value)
+                        if value.to_string_lossy().starts_with(".retiring-")
+                )
+            }) && (relative.file_name().and_then(|name| name.to_str()) == Some("metadata.json")
                 || relative
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.ends_with(".metadata.json"))
+                    .is_some_and(|name| name.ends_with(".metadata.json")))
         }) {
             Ok(captures) => captures,
             Err(error) => {
@@ -440,6 +446,9 @@ pub fn discharge_project_catalog_targets(
     root: &Path,
     targets: &[ArtifactRetirementTarget],
 ) -> Result<usize> {
+    if targets.is_empty() {
+        return Ok(0);
+    }
     let anchored = AnchoredArtifactRoot::open(root)?;
     let mut removed = 0usize;
     for target in targets {
@@ -506,10 +515,14 @@ impl AnchoredArtifactRoot {
         let payload_name = payload
             .file_name()
             .ok_or_else(|| anyhow!("artifact payload has no final component"))?;
-        let metadata_tombstone =
-            std::ffi::OsString::from(format!(".retiring-metadata-{}", directory_name.to_string_lossy()));
-        let payload_tombstone =
-            std::ffi::OsString::from(format!(".retiring-payload-{}", payload_name.to_string_lossy()));
+        let metadata_tombstone = std::ffi::OsString::from(format!(
+            ".retiring-metadata-{}",
+            directory_name.to_string_lossy()
+        ));
+        let payload_tombstone = std::ffi::OsString::from(format!(
+            ".retiring-payload-{}",
+            payload_name.to_string_lossy()
+        ));
 
         self.validate_target_state(
             target,
@@ -525,12 +538,14 @@ impl AnchoredArtifactRoot {
                 bail!("artifact payload retirement tombstone already exists");
             }
             rename_entry_at(&parent_fd, payload_name, &payload_tombstone)?;
+            artifact_retirement_fault("payload_hidden")?;
         }
         if entry_kind_at(&parent_fd, directory_name)? == Some(ArtifactEntryKind::Directory) {
             if entry_kind_at(&parent_fd, &metadata_tombstone)?.is_some() {
                 bail!("artifact metadata retirement tombstone already exists");
             }
             rename_entry_at(&parent_fd, directory_name, &metadata_tombstone)?;
+            artifact_retirement_fault("metadata_hidden")?;
         }
         remove_artifact_entry_at(&parent_fd, &metadata_tombstone)?;
         remove_artifact_entry_at(&parent_fd, &payload_tombstone)?;
@@ -562,11 +577,7 @@ impl AnchoredArtifactRoot {
         let tombstone_payload_kind = self.entry_kind(parent.join(payload_tombstone))?;
 
         reject_wrong_artifact_kind("metadata directory", live_directory_kind, true)?;
-        reject_wrong_artifact_kind(
-            "metadata tombstone",
-            tombstone_directory_kind,
-            true,
-        )?;
+        reject_wrong_artifact_kind("metadata tombstone", tombstone_directory_kind, true)?;
         reject_wrong_artifact_kind("payload", live_payload_kind, false)?;
         reject_wrong_artifact_kind("payload tombstone", tombstone_payload_kind, false)?;
         if live_directory_kind.is_some() && tombstone_directory_kind.is_some() {
@@ -639,11 +650,23 @@ impl AnchoredArtifactRoot {
     fn open_directory_chain(&self, components: &[std::ffi::OsString]) -> Result<fs::File> {
         let mut current = self.directory.try_clone()?;
         for component in components {
-            current = open_artifact_at(current.as_raw_fd(), component, true)
-                .with_context(|| format!("artifact path component {component:?} is not confined"))?;
+            current =
+                open_artifact_at(current.as_raw_fd(), component, true).with_context(|| {
+                    format!("artifact path component {component:?} is not confined")
+                })?;
         }
         Ok(current)
     }
+}
+
+fn artifact_retirement_fault(boundary: &str) -> Result<()> {
+    if cfg!(debug_assertions)
+        && std::env::var("BLACKBOX_TEST_ARTIFACT_RETIRE_FAULT")
+            .is_ok_and(|requested| requested == boundary)
+    {
+        bail!("injected artifact retirement fault after {boundary}");
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -752,11 +775,17 @@ fn rename_entry_at(parent: &fs::File, from: &std::ffi::OsStr, to: &std::ffi::OsS
 
     let from = std::ffi::CString::new(from.as_bytes())
         .map_err(|_| anyhow!("artifact path contains NUL"))?;
-    let to = std::ffi::CString::new(to.as_bytes())
-        .map_err(|_| anyhow!("artifact path contains NUL"))?;
+    let to =
+        std::ffi::CString::new(to.as_bytes()).map_err(|_| anyhow!("artifact path contains NUL"))?;
     // SAFETY: parent is live and both names are NUL-terminated.
-    if unsafe { libc::renameat(parent.as_raw_fd(), from.as_ptr(), parent.as_raw_fd(), to.as_ptr()) }
-        != 0
+    if unsafe {
+        libc::renameat(
+            parent.as_raw_fd(),
+            from.as_ptr(),
+            parent.as_raw_fd(),
+            to.as_ptr(),
+        )
+    } != 0
     {
         return Err(std::io::Error::last_os_error().into());
     }
@@ -772,8 +801,8 @@ fn remove_artifact_entry_at(parent: &fs::File, name: &std::ffi::OsStr) -> Result
         Some(kind) => kind,
         None => return Ok(false),
     };
-    let name_c =
-        std::ffi::CString::new(name.as_bytes()).map_err(|_| anyhow!("artifact path contains NUL"))?;
+    let name_c = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| anyhow!("artifact path contains NUL"))?;
     match kind {
         ArtifactEntryKind::Directory => {
             let child = open_artifact_at(parent.as_raw_fd(), name, true)
@@ -782,7 +811,8 @@ fn remove_artifact_entry_at(parent: &fs::File, name: &std::ffi::OsStr) -> Result
                 remove_artifact_entry_at(&child, &child_name)?;
             }
             // SAFETY: parent and name identify the drained directory.
-            if unsafe { libc::unlinkat(parent.as_raw_fd(), name_c.as_ptr(), libc::AT_REMOVEDIR) } != 0
+            if unsafe { libc::unlinkat(parent.as_raw_fd(), name_c.as_ptr(), libc::AT_REMOVEDIR) }
+                != 0
             {
                 return Err(std::io::Error::last_os_error().into());
             }

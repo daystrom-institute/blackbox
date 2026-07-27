@@ -255,10 +255,33 @@ impl AnchoredEdgeRoot {
             }
             Err(error) => return Err(error),
         };
-        match openat_nofollow(parent.as_raw_fd(), name, false) {
-            Ok(_) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error).context("edge retirement path failed nofollow validation"),
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| anyhow::anyhow!("edge path contains NUL"))?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: stat is writable and name is NUL-terminated.
+        let status = unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if status != 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == std::io::ErrorKind::NotFound {
+                Ok(false)
+            } else {
+                Err(error).context("edge retirement path failed nofollow validation")
+            };
+        }
+        // SAFETY: fstatat initialized stat on success.
+        let stat = unsafe { stat.assume_init() };
+        match stat.st_mode & libc::S_IFMT {
+            libc::S_IFREG | libc::S_IFDIR => Ok(true),
+            libc::S_IFLNK => anyhow::bail!("edge retirement path is symlinked"),
+            _ => anyhow::bail!("edge retirement path is not a regular file or directory"),
         }
     }
 
@@ -1110,7 +1133,11 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), root.join("derived")).unwrap();
 
         let error = capture_project_retirement_inventory(&root, "project-a").unwrap_err();
-        assert!(error.to_string().contains("nofollow") || error.to_string().contains("confined"));
+        assert!(
+            error.to_string().contains("nofollow")
+                || error.to_string().contains("confined")
+                || error.to_string().contains("symlinked")
+        );
     }
 
     #[cfg(unix)]
@@ -1159,6 +1186,47 @@ mod tests {
             fs::read(outside.path().join("project-a.jsonl")).unwrap(),
             b"outside"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retirement_capture_refuses_fifo_final_component_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let fifo = root.join("project-a.jsonl");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_c is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        assert!(capture_project_retirement_inventory(&root, "project-a").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retirement_capture_refuses_socket_final_component() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let _listener =
+            std::os::unix::net::UnixListener::bind(root.join("project-a.jsonl")).unwrap();
+        assert!(capture_project_retirement_inventory(&root, "project-a").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retirement_capture_refuses_device_final_component_when_supported() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let device = root.join("project-a.jsonl");
+        let device_c = std::ffi::CString::new(device.as_os_str().as_bytes()).unwrap();
+        // SAFETY: device_c is a valid NUL-terminated path. Unprivileged hosts
+        // may refuse mknod; supported hosts must classify the node without
+        // opening it.
+        if unsafe { libc::mknod(device_c.as_ptr(), libc::S_IFCHR | 0o600, 0) } == 0 {
+            assert!(capture_project_retirement_inventory(&root, "project-a").is_err());
+        }
     }
 
     #[test]

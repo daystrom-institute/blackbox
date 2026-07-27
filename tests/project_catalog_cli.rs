@@ -134,6 +134,22 @@ fn run_with_isolated_index(args: &[&str], index_path: &Path) -> Output {
     command.output().unwrap()
 }
 
+fn run_with_isolated_index_and_env(
+    args: &[&str],
+    index_path: &Path,
+    key: &str,
+    value: &str,
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_blackbox"));
+    command
+        .args(args)
+        .env_remove("BLACKBOX_CONFIG")
+        .env_remove("BLACKBOX_STATE_DIR")
+        .env("TRANSCRIPT_SEARCH_INDEX_PATH", index_path)
+        .env(key, value);
+    command.output().unwrap()
+}
+
 /// An isolated state root holding an initialized empty v2 catalog store plus
 /// the configuration file every offline command resolves its evidence roots
 /// from. Returns the state dir, the projects path, the config path, and the
@@ -1185,6 +1201,95 @@ fn retirement_execute_refuses_when_prepared_plan_hash_drifts() {
 }
 
 #[test]
+fn retirement_journal_resumes_each_artifact_tombstone_boundary() {
+    for boundary in ["payload_hidden", "metadata_hidden"] {
+        let directory = tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (state, projects_path, config_path, index_path) = isolated_state_root(&root);
+        let projects = projects_path.to_str().unwrap();
+        let config = config_path.to_str().unwrap();
+        let project_id =
+            add_published_project(projects, "artifactfault", ".", "2026-07-27T00:00:00Z");
+        let artifact_dir = state
+            .join("artifacts/projects")
+            .join(&project_id)
+            .join("local/agent/retire-me");
+        write(
+            &artifact_dir.join("metadata.json"),
+            &serde_json::to_vec(&serde_json::json!({
+                "kind": "agent",
+                "name": "retire-me",
+                "version": "1",
+                "source": "fixture",
+                "installed_at": "2026-07-27T00:00:00Z",
+                "content_sha256": "a".repeat(64),
+                "project_id": project_id,
+                "project_path": null,
+                "local": true,
+                "supersedes": null,
+                "supersedes_chain": [],
+                "superseded_by": null,
+                "active": true,
+                "install_warnings": []
+            }))
+            .unwrap(),
+        );
+        write(
+            &artifact_dir.with_extension("json"),
+            br#"{"name":"retire-me"}"#,
+        );
+        let plan_hash = retirement_plan_hash(projects, &project_id, config, None, &index_path);
+        let args = [
+            "project-catalog",
+            "retirement-journal",
+            "--projects-path",
+            projects,
+            "--project",
+            &project_id,
+            "--execute",
+            "--plan-hash",
+            &plan_hash,
+            "--config",
+            config,
+        ];
+        let interrupted = run_with_isolated_index_and_env(
+            &args,
+            &index_path,
+            "BLACKBOX_TEST_ARTIFACT_RETIRE_FAULT",
+            boundary,
+        );
+        assert!(
+            !interrupted.status.success(),
+            "{boundary} did not interrupt"
+        );
+        assert!(
+            state
+                .join("bro/retirement-journals")
+                .join(format!("{project_id}.json"))
+                .exists()
+        );
+
+        let resumed = run_with_isolated_index(&args, &index_path);
+        assert!(
+            resumed.status.success(),
+            "{boundary} resume failed: {}",
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+        assert!(!artifact_dir.exists());
+        assert!(!artifact_dir.with_extension("json").exists());
+        assert!(
+            !ProjectCatalogStore::open_existing(&projects_path)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .catalog()
+                .projects
+                .contains_key(&ProjectId::parse(project_id).unwrap())
+        );
+    }
+}
+
+#[test]
 fn retire_refuses_on_a_slack_channel_binding() {
     let directory = tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
@@ -1265,7 +1370,11 @@ fn retire_refuses_on_a_slack_channel_binding() {
         ],
         &index_path,
     );
-    assert!(journaled.status.success());
+    assert!(
+        journaled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&journaled.stderr)
+    );
     let bindings: Value =
         serde_json::from_slice(&fs::read(state.join("bro/slack-channel-bindings.json")).unwrap())
             .unwrap();

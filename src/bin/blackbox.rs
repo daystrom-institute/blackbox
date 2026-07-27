@@ -765,7 +765,7 @@ mod tests {
                 .unwrap();
             assert!(matches!(
                 count_project_rows(&path, &project, &selectors, &PROJECT_ROW_KEYS),
-                ClassProbe::Counted(0)
+                ClassProbe::Committed(rows) if rows.is_empty()
             ));
             let value: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -799,7 +799,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             count_project_rows(&roadmap, &project, &selectors, &PROJECT_ROW_KEYS),
-            ClassProbe::Counted(0)
+            ClassProbe::Committed(rows) if rows.is_empty()
         ));
 
         let slack = root.join("slack-channel-bindings.json");
@@ -820,7 +820,7 @@ mod tests {
         clear_slack_channel_bindings(&slack, &project, &selectors).unwrap();
         assert!(matches!(
             count_project_rows(&slack, &project, &selectors, &SLACK_ROW_KEYS),
-            ClassProbe::Counted(0)
+            ClassProbe::Committed(rows) if rows.is_empty()
         ));
     }
 }
@@ -1542,19 +1542,25 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             *count > expected_reference_counts.get(class).copied().unwrap_or(0)
         });
         let expected_commitments =
-            evidence.reference_class_commitments.as_ref().ok_or_else(|| {
-                project_catalog_admin::admin_error(
-                    "error.project_catalog_retire_evidence_incomplete",
-                    "retirement evidence is missing reference-class commitments",
-                )
-            })?;
+            evidence
+                .reference_class_commitments
+                .as_ref()
+                .ok_or_else(|| {
+                    project_catalog_admin::admin_error(
+                        "error.project_catalog_retire_evidence_incomplete",
+                        "retirement evidence is missing reference-class commitments",
+                    )
+                })?;
         let current_commitments =
-            current.reference_class_commitments.as_ref().ok_or_else(|| {
-                project_catalog_admin::admin_error(
-                    "error.project_catalog_retire_evidence_incomplete",
-                    "current retirement evidence is missing reference-class commitments",
-                )
-            })?;
+            current
+                .reference_class_commitments
+                .as_ref()
+                .ok_or_else(|| {
+                    project_catalog_admin::admin_error(
+                        "error.project_catalog_retire_evidence_incomplete",
+                        "current retirement evidence is missing reference-class commitments",
+                    )
+                })?;
         let reference_commitment_drifted = current_commitments.iter().any(|(class, identities)| {
             let expected = expected_commitments
                 .get(class)
@@ -2326,7 +2332,8 @@ impl RetireProbe {
 }
 
 fn retirement_commitment(value: &impl serde::Serialize) -> String {
-    let bytes = serde_json::to_vec(value).expect("retirement commitment serialization is infallible");
+    let bytes =
+        serde_json::to_vec(value).expect("retirement commitment serialization is infallible");
     bbox_corpus_core::project_catalog_snapshot::sha256_hex(&bytes)
 }
 
@@ -3020,11 +3027,7 @@ fn probe_index_entity_refs(
                 .iter()
                 .filter(|row| selectors.iter().any(|selector| selector == &row.project_id))
                 .map(|row| {
-                    retirement_commitment(&(
-                        &row.project_id,
-                        &row.entity_ref,
-                        row.document_count,
-                    ))
+                    retirement_commitment(&(&row.project_id, &row.entity_ref, row.document_count))
                 })
                 .collect(),
         ),
