@@ -234,6 +234,7 @@ pub struct CatalogCommitObserver {
 struct CatalogObserverQueue {
     event: Option<CatalogCommittedEvent>,
     rescan_required: bool,
+    rescan_generation: u64,
 }
 
 impl CatalogCommitObserver {
@@ -255,6 +256,10 @@ impl CatalogCommitObserver {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        if guard.rescan_required {
+            guard.rescan_generation = guard.rescan_generation.wrapping_add(1);
+            return;
+        }
         const MAX_PENDING_PROJECTS: usize = 4096;
         let pending = guard.event.get_or_insert_with(|| CatalogCommittedEvent {
             epoch: event.epoch,
@@ -267,6 +272,7 @@ impl CatalogCommitObserver {
         if pending.changed_project_ids.len() > MAX_PENDING_PROJECTS {
             guard.event = None;
             guard.rescan_required = true;
+            guard.rescan_generation = guard.rescan_generation.wrapping_add(1);
         }
     }
 
@@ -279,12 +285,25 @@ impl CatalogCommitObserver {
         guard.event.take().into_iter().collect()
     }
 
-    pub fn take_rescan_required(&self) -> bool {
+    pub fn pending_rescan_generation(&self) -> Option<u64> {
+        let guard = match self.queue.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.rescan_required.then_some(guard.rescan_generation)
+    }
+
+    pub fn complete_rescan(&self, generation: u64) -> bool {
         let mut guard = match self.queue.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        std::mem::take(&mut guard.rescan_required)
+        if guard.rescan_required && guard.rescan_generation == generation {
+            guard.rescan_required = false;
+            true
+        } else {
+            false
+        }
     }
 
     pub fn request_rescan(&self) {
@@ -293,6 +312,7 @@ impl CatalogCommitObserver {
             Err(poisoned) => poisoned.into_inner(),
         };
         guard.rescan_required = true;
+        guard.rescan_generation = guard.rescan_generation.wrapping_add(1);
     }
 
     /// Returns true if at least one event is pending.

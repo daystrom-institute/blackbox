@@ -1780,6 +1780,41 @@ fn load_reconciler_activation(
     store.load_activation_mixed(project_id)
 }
 
+const CATALOG_OBSERVER_RESCAN_PAGE_SIZE: usize = 4096;
+
+struct CatalogObserverRescanProgress {
+    generation: u64,
+    epoch: u64,
+    project_ids: Vec<String>,
+    next_index: usize,
+}
+
+impl CatalogObserverRescanProgress {
+    fn next_event(
+        &mut self,
+    ) -> Option<bbox_indexing::project_catalog_store::CatalogCommittedEvent> {
+        if self.next_index >= self.project_ids.len() {
+            return None;
+        }
+        let end = (self.next_index + CATALOG_OBSERVER_RESCAN_PAGE_SIZE).min(self.project_ids.len());
+        let changed_project_ids = self.project_ids[self.next_index..end]
+            .iter()
+            .cloned()
+            .collect();
+        self.next_index = end;
+        Some(
+            bbox_indexing::project_catalog_store::CatalogCommittedEvent {
+                epoch: self.epoch,
+                changed_project_ids,
+            },
+        )
+    }
+
+    fn is_complete(&self) -> bool {
+        self.next_index >= self.project_ids.len()
+    }
+}
+
 /// Spawn the post-commit observer thread (section 9.4).
 ///
 /// Polls the `ProjectCatalogStore` commit observer at a bounded interval.
@@ -1791,6 +1826,7 @@ pub(crate) fn spawn_commit_observer(state: &Arc<SharedState>) {
     let Some(catalog_store) = state.project_authority.catalog_store() else {
         return;
     };
+    let catalog_store = catalog_store.clone();
     let observer = catalog_store.commit_observer();
     let state = state.clone();
     let shutdown = state.reconciler_shutdown.read().clone();
@@ -1798,44 +1834,82 @@ pub(crate) fn spawn_commit_observer(state: &Arc<SharedState>) {
         .name("blackbox-catalog-commit-observer".to_string())
         .spawn(move || {
             let poll_interval = std::time::Duration::from_secs(2);
+            let mut rescan_progress: Option<CatalogObserverRescanProgress> = None;
             while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
                 let mut events = observer.drain_events();
-                if observer.take_rescan_required() {
-                    let mut project_ids = state
-                        .code_sources
-                        .assignments()
-                        .into_iter()
-                        .map(|(_, project_id)| project_id)
-                        .collect::<BTreeSet<_>>();
-                    match state.code_sources.store().activation_records_mixed() {
-                        Ok(records) => {
-                            project_ids.extend(
-                                records
-                                    .into_iter()
-                                    .map(|record| record.project_id().to_string()),
+                if let Some(generation) = observer.pending_rescan_generation() {
+                    if rescan_progress
+                        .as_ref()
+                        .is_none_or(|progress| progress.generation != generation)
+                    {
+                        let mut project_ids = state
+                            .code_sources
+                            .assignments()
+                            .into_iter()
+                            .map(|(_, project_id)| project_id)
+                            .collect::<BTreeSet<_>>();
+                        let snapshot = match catalog_store.snapshot() {
+                            Ok(snapshot) => snapshot,
+                            Err(error) => {
+                                tracing::error!(%error, "catalog observer catalog rescan failed");
+                                for project_id in &project_ids {
+                                    let _ = state.code_sources.store().record_health_failure(
+                                        project_id,
+                                        "catalog_observer_rescan_failed",
+                                        &error.to_string(),
+                                    );
+                                }
+                                observer.request_rescan();
+                                std::thread::sleep(poll_interval);
+                                continue;
+                            }
+                        };
+                        project_ids.extend(
+                            snapshot
+                                .catalog()
+                                .projects
+                                .keys()
+                                .map(|project_id| project_id.as_str().to_string()),
+                        );
+                        let records = match state.code_sources.store().activation_records_mixed() {
+                            Ok(records) => records,
+                            Err(error) => {
+                                tracing::error!(%error, "catalog observer activation rescan failed");
+                                for project_id in &project_ids {
+                                    let _ = state.code_sources.store().record_health_failure(
+                                        project_id,
+                                        "catalog_observer_rescan_failed",
+                                        &error.to_string(),
+                                    );
+                                }
+                                observer.request_rescan();
+                                std::thread::sleep(poll_interval);
+                                continue;
+                            }
+                        };
+                        project_ids.extend(
+                            records
+                                .into_iter()
+                                .map(|record| record.project_id().to_string()),
+                        );
+                        for project_id in &project_ids {
+                            let _ = state.code_sources.store().record_health_failure(
+                                project_id,
+                                "catalog_observer_rescan",
+                                "observer delivery overflow required a complete paged rescan",
                             );
                         }
-                        Err(error) => {
-                            tracing::error!(%error, "catalog observer bounded rescan failed");
-                        }
+                        rescan_progress = Some(CatalogObserverRescanProgress {
+                            generation,
+                            epoch: snapshot.epoch(),
+                            project_ids: project_ids.into_iter().collect(),
+                            next_index: 0,
+                        });
                     }
-                    if project_ids.len() > 4096 {
-                        project_ids = project_ids.into_iter().take(4096).collect();
-                    }
-                    for project_id in &project_ids {
-                        let _ = state.code_sources.store().record_health_failure(
-                            project_id,
-                            "catalog_observer_rescan",
-                            "observer delivery overflow or read failure required a bounded rescan",
-                        );
-                    }
-                    if !project_ids.is_empty() {
-                        events.push(
-                            bbox_indexing::project_catalog_store::CatalogCommittedEvent {
-                                epoch: 0,
-                                changed_project_ids: project_ids,
-                            },
-                        );
+                    if let Some(progress) = rescan_progress.as_mut()
+                        && let Some(event) = progress.next_event()
+                    {
+                        events.push(event);
                     }
                 }
                 for event in events {
@@ -1891,6 +1965,13 @@ pub(crate) fn spawn_commit_observer(state: &Arc<SharedState>) {
                         changed_count = event.changed_project_ids.len(),
                         "commit observer: mapped catalog commit to reconciler events"
                     );
+                }
+                if let Some(progress) = rescan_progress.as_ref()
+                    && progress.is_complete()
+                {
+                    let generation = progress.generation;
+                    observer.complete_rescan(generation);
+                    rescan_progress = None;
                 }
                 std::thread::sleep(poll_interval);
             }
@@ -8522,7 +8603,7 @@ mod tests {
     }
 
     #[test]
-    fn p4e_post_commit_observer_overflow_requests_bounded_rescan() {
+    fn p4e_post_commit_observer_overflow_retains_rescan_until_matching_completion() {
         use bbox_indexing::project_catalog_store::{CatalogCommitObserver, CatalogCommittedEvent};
         let observer = CatalogCommitObserver::new();
         for index in 0..4100 {
@@ -8531,8 +8612,35 @@ mod tests {
                 changed_project_ids: BTreeSet::from([format!("p_{index:032x}")]),
             });
         }
-        assert!(observer.take_rescan_required());
+        let generation = observer.pending_rescan_generation().unwrap();
+        assert_eq!(observer.pending_rescan_generation(), Some(generation));
+        observer.request_rescan();
+        assert!(!observer.complete_rescan(generation));
+        let retry_generation = observer.pending_rescan_generation().unwrap();
+        assert_ne!(retry_generation, generation);
+        assert!(observer.complete_rescan(retry_generation));
+        assert_eq!(observer.pending_rescan_generation(), None);
         assert!(observer.drain_events().len() <= 1);
+    }
+
+    #[test]
+    fn p4e_post_commit_observer_pages_the_full_supported_catalog() {
+        let project_ids = (0..100_000)
+            .map(|index| format!("p_{index:032x}"))
+            .collect::<Vec<_>>();
+        let mut progress = CatalogObserverRescanProgress {
+            generation: 7,
+            epoch: 19,
+            project_ids: project_ids.clone(),
+            next_index: 0,
+        };
+        let mut delivered = Vec::new();
+        while let Some(event) = progress.next_event() {
+            assert!(event.changed_project_ids.len() <= CATALOG_OBSERVER_RESCAN_PAGE_SIZE);
+            delivered.extend(event.changed_project_ids);
+        }
+        assert!(progress.is_complete());
+        assert_eq!(delivered, project_ids);
     }
 
     // P4-E commit (c): bridge-clear and scope-migrate refusal tests.
