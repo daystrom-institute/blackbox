@@ -203,7 +203,7 @@ impl BlackboxServer {
             let (deleted, delete_errors) = if p.dry_run {
                 (None, None)
             } else {
-                let (d, e) = storage_health::apply_gc(&candidates);
+                let (d, e) = storage_health::apply_gc(&edges_dir, &candidates);
                 (Some(d), if e.is_empty() { None } else { Some(e) })
             };
 

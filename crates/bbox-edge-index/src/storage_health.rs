@@ -139,7 +139,7 @@ pub fn scan_storage_health(
 ) -> Result<StorageHealthReport> {
     let mut totals = StorageHealthTotals::default();
     let mut files: Vec<StorageFileInfo> = Vec::new();
-    let project_facts = collect_project_storage_facts(edges_dir);
+    let project_facts = collect_project_storage_facts(edges_dir)?;
 
     scan_legacy_dir(
         edges_dir,
@@ -439,14 +439,16 @@ fn scan_managed_derived_dir(
     totals: &mut StorageHealthTotals,
     files: &mut Vec<StorageFileInfo>,
 ) -> Result<()> {
-    let namespace_entries = match fs::read_dir(managed_dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(()),
-    };
+    let namespace_entries = fs::read_dir(managed_dir)?;
 
-    for namespace_entry in namespace_entries.filter_map(Result::ok) {
+    for namespace_entry in namespace_entries {
+        let namespace_entry = namespace_entry?;
         let namespace_path = namespace_entry.path();
-        if !namespace_path.is_dir() {
+        let namespace_metadata = fs::symlink_metadata(&namespace_path)?;
+        if namespace_metadata.file_type().is_symlink() {
+            anyhow::bail!("managed edge namespace is a symlink");
+        }
+        if !namespace_metadata.is_dir() {
             continue;
         }
         let namespace = namespace_path
@@ -455,19 +457,21 @@ fn scan_managed_derived_dir(
             .unwrap_or("")
             .to_string();
 
-        let sidecar_entries = match fs::read_dir(&namespace_path) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        let sidecar_entries = fs::read_dir(&namespace_path)?;
 
-        for sidecar_entry in sidecar_entries.filter_map(Result::ok) {
+        for sidecar_entry in sidecar_entries {
+            let sidecar_entry = sidecar_entry?;
             let path = sidecar_entry.path();
             let file_name = match path.file_name().and_then(|n| n.to_str()) {
                 Some(n) => n,
                 None => continue,
             };
 
-            if path.is_dir() {
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                anyhow::bail!("managed edge sidecar is a symlink");
+            }
+            if metadata.is_dir() {
                 continue;
             }
 
@@ -576,22 +580,25 @@ fn orphan_reason(kind: FileKind) -> &'static str {
     }
 }
 
-fn collect_project_storage_facts(edges_dir: &Path) -> ProjectStorageFacts {
+fn collect_project_storage_facts(edges_dir: &Path) -> Result<ProjectStorageFacts> {
     let workspace_dir = bbox_edge_sidecar::manifest::materialized_dir(edges_dir).join("workspace");
     let mut facts = ProjectStorageFacts::default();
-    let Ok(entries) = fs::read_dir(workspace_dir) else {
-        return facts;
+    let entries = match fs::read_dir(workspace_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(facts),
+        Err(error) => return Err(error.into()),
     };
-    for entry in entries.filter_map(Result::ok) {
+    for entry in entries {
+        let entry = entry?;
         let manifest_path = entry.path().join("manifest.json");
-        if !manifest_path.is_file() {
-            continue;
+        let metadata = fs::symlink_metadata(&manifest_path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            anyhow::bail!(
+                "workspace manifest is not a regular nofollow file: {}",
+                manifest_path.display()
+            );
         }
-        let Ok(manifest) =
-            bbox_edge_sidecar::manifest::WorkspaceManifest::read_from(&manifest_path)
-        else {
-            continue;
-        };
+        let manifest = bbox_edge_sidecar::manifest::WorkspaceManifest::read_from(&manifest_path)?;
         facts.manifest_projects.insert(manifest.project_id.clone());
         if let Some(repo_id) = manifest.repo_id {
             facts
@@ -606,7 +613,7 @@ fn collect_project_storage_facts(edges_dir: &Path) -> ProjectStorageFacts {
             facts.dangling_projects.insert(manifest.project_id);
         }
     }
-    facts
+    Ok(facts)
 }
 
 fn scan_inactive_snapshots(
@@ -647,6 +654,16 @@ fn scan_inactive_snapshots(
             }
             if !metadata.is_file() || path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
+            }
+            let staging_marker = path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("snapshot member has no parent"))?
+                .join(".staging");
+            match fs::symlink_metadata(&staging_marker) {
+                Ok(marker) if marker.is_file() && !marker.file_type().is_symlink() => continue,
+                Ok(_) => anyhow::bail!("snapshot staging marker is not a regular file"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
             let path_str = path
                 .to_str()
@@ -804,6 +821,12 @@ pub fn find_edges_dir(store_dir: &Path, projects_path: Option<&Path>) -> PathBuf
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcCandidate {
     pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_relative_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planned_device: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planned_inode: Option<u64>,
     pub kind: FileKind,
     pub bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -966,6 +989,9 @@ pub fn plan_gc_with_policy(
                         age_secs, TEMP_GRACE_SECS
                     ),
                     deletable: false,
+                    root_relative_path: None,
+                    planned_device: None,
+                    planned_inode: None,
                 });
                 continue;
             }
@@ -976,6 +1002,9 @@ pub fn plan_gc_with_policy(
                 project_id: f.project_id.clone(),
                 rule: "temp_past_grace".to_string(),
                 deletable: true,
+                root_relative_path: None,
+                planned_device: None,
+                planned_inode: None,
             });
         }
     }
@@ -995,12 +1024,15 @@ pub fn plan_gc_with_policy(
                 project_id: None,
                 rule: "orphan_none_found".to_string(),
                 deletable: false,
+                root_relative_path: None,
+                planned_device: None,
+                planned_inode: None,
             });
         }
     }
 
     if params.prune_inactive_snapshots {
-        let project_facts = collect_project_storage_facts(edges_dir);
+        let project_facts = collect_project_storage_facts(edges_dir)?;
         plan_snapshot_gc(
             &report.files,
             &project_facts,
@@ -1011,6 +1043,32 @@ pub fn plan_gc_with_policy(
 
     plan_observed_gc(&report.observed, &policy.observed, &mut candidates);
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        for candidate in &mut candidates {
+            if candidate.path.is_empty() {
+                continue;
+            }
+            let path = Path::new(&candidate.path);
+            let relative = path
+                .strip_prefix(edges_dir)
+                .context("GC candidate escaped the edge root")?;
+            if relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                anyhow::bail!("GC candidate path is not normalized");
+            }
+            let metadata = fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                anyhow::bail!("GC candidate is not a regular nofollow file");
+            }
+            candidate.root_relative_path = Some(relative.to_string_lossy().into_owned());
+            candidate.planned_device = Some(metadata.dev());
+            candidate.planned_inode = Some(metadata.ino());
+        }
+    }
     candidates.sort_by(|a, b| a.rule.cmp(&b.rule).then(a.path.cmp(&b.path)));
     Ok(candidates)
 }
@@ -1052,6 +1110,9 @@ fn plan_backup_gc(
                     project_id: f.project_id.clone(),
                     rule: format!("backup_retained(#{},source={})", i + 1, source),
                     deletable: false,
+                    root_relative_path: None,
+                    planned_device: None,
+                    planned_inode: None,
                 });
             } else {
                 prunable_backup_refs.push(f);
@@ -1076,6 +1137,9 @@ fn plan_backup_gc(
                         age_note
                     ),
                     deletable: true,
+                    root_relative_path: None,
+                    planned_device: None,
+                    planned_inode: None,
                 });
             }
         }
@@ -1094,6 +1158,9 @@ fn plan_backup_gc(
                     "backup_total_cap_exceeded_by_retained_newest(max_total_bytes={max_total})"
                 ),
                 deletable: false,
+                root_relative_path: None,
+                planned_device: None,
+                planned_inode: None,
             });
         }
     }
@@ -1136,6 +1203,9 @@ fn plan_orphan_gc(
         };
         candidates.push(GcCandidate {
             path: f.path.clone(),
+            root_relative_path: None,
+            planned_device: None,
+            planned_inode: None,
             kind: f.kind,
             bytes: f.bytes,
             project_id: f.project_id.clone(),
@@ -1329,6 +1399,9 @@ fn plan_snapshot_gc(
         };
         candidates.push(GcCandidate {
             path: snapshot.file.path.clone(),
+            root_relative_path: None,
+            planned_device: None,
+            planned_inode: None,
             kind: snapshot.file.kind,
             bytes: snapshot.file.bytes,
             project_id: snapshot.file.project_id.clone(),
@@ -1398,6 +1471,9 @@ fn plan_observed_gc(
                 project_id: Some(usage.project_id.clone()),
                 rule: format!("observed_over_cap_operator_review(max_bytes_per_project={max})"),
                 deletable: false,
+                root_relative_path: None,
+                planned_device: None,
+                planned_inode: None,
             }),
             None if usage.bytes > 0 => candidates.push(GcCandidate {
                 path: usage.path.clone(),
@@ -1406,38 +1482,47 @@ fn plan_observed_gc(
                 project_id: Some(usage.project_id.clone()),
                 rule: "observed_keep_no_cap".to_string(),
                 deletable: false,
+                root_relative_path: None,
+                planned_device: None,
+                planned_inode: None,
             }),
             _ => {}
         }
     }
 }
 
-pub fn apply_gc(candidates: &[GcCandidate]) -> (Vec<String>, Vec<String>) {
+pub fn apply_gc(edges_dir: &Path, candidates: &[GcCandidate]) -> (Vec<String>, Vec<String>) {
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
-    let mut snapshot_dirs: std::collections::BTreeSet<std::path::PathBuf> =
-        std::collections::BTreeSet::new();
     for c in candidates {
         if !c.deletable || c.path.is_empty() {
             continue;
         }
-        match fs::remove_file(&c.path) {
-            Ok(()) => {
-                if c.kind == FileKind::InactiveSnapshot {
-                    if let Some(parent) = Path::new(&c.path).parent() {
-                        snapshot_dirs.insert(parent.to_path_buf());
-                    }
-                }
-                deleted.push(c.path.clone());
+        #[cfg(unix)]
+        let result = match (
+            c.root_relative_path.as_deref(),
+            c.planned_device,
+            c.planned_inode,
+        ) {
+            (Some(relative), Some(device), Some(inode)) => {
+                bbox_edge_sidecar::snapshot::remove_gc_candidate_file(
+                    edges_dir,
+                    Path::new(relative),
+                    (device, inode),
+                    c.kind == FileKind::InactiveSnapshot,
+                )
             }
-            Err(e) => errors.push(format!("{}: {}", c.path, e)),
+            _ => Err(anyhow::anyhow!(
+                "GC candidate is missing its plan-time identity commitment"
+            )),
+        };
+        #[cfg(not(unix))]
+        let result = fs::remove_file(&c.path).map(|_| true).map_err(Into::into);
+        match result {
+            Ok(true) => deleted.push(c.path.clone()),
+            Ok(false) => {}
+            Err(error) => errors.push(format!("{}: {error}", c.path)),
         }
-    }
-    // Drop fully-pruned snapshot directories so dead `head-<sha>-…` dirs
-    // don't accumulate (remove_dir refuses non-empty dirs, so a dir that
-    // still holds retained files survives untouched).
-    for dir in snapshot_dirs {
-        let _ = fs::remove_dir(&dir);
     }
     (deleted, errors)
 }
@@ -1908,7 +1993,7 @@ mod tests {
         )
         .unwrap();
 
-        let (deleted, errors) = apply_gc(&candidates);
+        let (deleted, errors) = apply_gc(&edges_dir, &candidates);
         assert!(errors.is_empty(), "no delete errors expected");
         assert!(
             edges_dir.join("proj1234.jsonl").exists(),
@@ -2107,7 +2192,7 @@ mod tests {
             "recent legacy_unknown orphans must be reported but retained within grace"
         );
 
-        let (deleted, _) = apply_gc(&candidates_report);
+        let (deleted, _) = apply_gc(&edges_dir, &candidates_report);
         assert!(deleted.is_empty(), "Phase 1 must not delete orphans");
         assert!(
             edges_dir.join("orphan99.jsonl").exists(),
@@ -2389,6 +2474,88 @@ mod tests {
             "rule must name the budget: {}",
             older_candidate.rule
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_apply_refuses_parent_symlink_swap_and_preserves_external_file() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let original_parent = edges_dir.join("derived/project");
+        fs::create_dir_all(&original_parent).unwrap();
+        let candidate_path = original_parent.join("candidate.jsonl");
+        fs::write(&candidate_path, b"candidate").unwrap();
+        let metadata = fs::symlink_metadata(&candidate_path).unwrap();
+        let candidate = GcCandidate {
+            path: candidate_path.to_string_lossy().into_owned(),
+            root_relative_path: Some("derived/project/candidate.jsonl".into()),
+            planned_device: Some(metadata.dev()),
+            planned_inode: Some(metadata.ino()),
+            kind: FileKind::Temp,
+            bytes: metadata.len(),
+            project_id: None,
+            rule: "test".into(),
+            deletable: true,
+        };
+        fs::rename(
+            edges_dir.join("derived"),
+            edges_dir.join("derived-original"),
+        )
+        .unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(outside.path().join("project")).unwrap();
+        let victim = outside.path().join("project/candidate.jsonl");
+        fs::write(&victim, b"victim").unwrap();
+        symlink(outside.path(), edges_dir.join("derived")).unwrap();
+
+        let (deleted, errors) = apply_gc(&edges_dir, &[candidate]);
+        assert!(deleted.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert_eq!(fs::read(&victim).unwrap(), b"victim");
+    }
+
+    #[test]
+    fn staged_snapshot_is_not_gc_eligible_before_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let edges = Vec::new();
+        bbox_edge_sidecar::snapshot::write_snapshot_files(
+            &edges_dir,
+            "p1",
+            "snap1",
+            &[("project.jsonl", &edges)],
+        )
+        .unwrap();
+        let params = GcParams {
+            dry_run: false,
+            project_filter: None,
+            prune_backups: false,
+            prune_orphans: false,
+            prune_temps: false,
+            prune_inactive_snapshots: true,
+            max_backup_age_days: None,
+            keep_newest_backup_per_source: 1,
+        };
+        assert!(
+            plan_gc_with_policy(&edges_dir, &HashSet::new(), &params, &GcPolicy::default())
+                .is_err()
+        );
+        let member = bbox_edge_sidecar::snapshot::snapshot_dir(&edges_dir, "p1", "snap1")
+            .join("project.jsonl");
+        assert!(member.is_file());
+        bbox_edge_sidecar::snapshot::activate_collected_snapshot(
+            &edges_dir,
+            "p1",
+            "repo",
+            &"a".repeat(40),
+            "generation",
+            "collected:repo:.:generation",
+            "snap1",
+        )
+        .unwrap();
+        assert!(member.is_file());
     }
 
     #[test]

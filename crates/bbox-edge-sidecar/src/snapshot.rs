@@ -49,27 +49,39 @@ pub fn remove_inactive_materialization_file(
     candidate: &Path,
     expected_identity: (u64, u64),
 ) -> Result<bool> {
+    let relative = candidate
+        .strip_prefix(edges_dir)
+        .context("inactive materialization candidate escaped its root")?;
+    remove_gc_candidate_file(edges_dir, relative, expected_identity, true)
+}
+
+#[cfg(unix)]
+pub fn remove_gc_candidate_file(
+    edges_dir: &Path,
+    root_relative: &Path,
+    expected_identity: (u64, u64),
+    require_inactive: bool,
+) -> Result<bool> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     with_manifest_coordinator(|| {
-        let index = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
-        if index
-            .active_paths_for_loader(edges_dir)?
-            .iter()
-            .any(|active| active.path == candidate)
-        {
-            anyhow::bail!(
-                "refusing to delete materialization that became active: {}",
-                candidate.display()
-            );
+        let candidate = edges_dir.join(root_relative);
+        if require_inactive {
+            let index = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
+            if index
+                .active_paths_for_loader(edges_dir)?
+                .iter()
+                .any(|active| active.path == candidate)
+            {
+                anyhow::bail!(
+                    "refusing to delete materialization that became active: {}",
+                    candidate.display()
+                );
+            }
         }
-        let materialized = crate::manifest::materialized_dir(edges_dir);
-        let relative = candidate
-            .strip_prefix(&materialized)
-            .context("inactive materialization candidate escaped its root")?;
-        let components = relative
+        let components = root_relative
             .components()
             .map(|component| match component {
                 std::path::Component::Normal(value) => Ok(value.to_os_string()),
@@ -82,7 +94,7 @@ pub fn remove_inactive_materialization_file(
         let mut directory = fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&materialized)?;
+            .open(edges_dir)?;
         for parent in parents {
             let parent = std::ffi::CString::new(parent.as_bytes())?;
             let fd = unsafe {
@@ -472,6 +484,7 @@ fn activate_source_snapshot(
         active_dirty_overlay_id: None,
         updated_at: None,
     };
+    clear_snapshot_staging_marker(edges_dir, project_id, snapshot_id)?;
     WorkspaceManifest::write_to(edges_dir, &manifest)?;
 
     let mut index = ManifestIndex::load_or_new(edges_dir)?;
@@ -743,6 +756,11 @@ pub fn activate_pending_local_snapshots(
                 active_dirty_overlay_id: None,
                 updated_at: None,
             };
+            clear_snapshot_staging_marker(
+                edges_dir,
+                &activation.project_id,
+                &activation.snapshot_id,
+            )?;
             WorkspaceManifest::write_to(edges_dir, &manifest)?;
         }
 
@@ -836,27 +854,39 @@ pub fn write_snapshot_files(
 ) -> Result<()> {
     #[cfg(unix)]
     {
-        for (filename, edges) in files {
+        return with_manifest_coordinator(|| {
             validate_snapshot_component(project_id)?;
             validate_snapshot_component(snapshot_id)?;
-            validate_snapshot_component(filename)?;
-            let mut bytes = Vec::new();
-            for edge in *edges {
-                serde_json::to_writer(&mut bytes, edge)?;
-                bytes.push(b'\n');
-            }
             write_materialized_file_atomic(
                 edges_dir,
                 Path::new("workspace")
                     .join(project_id)
                     .join("snapshots")
                     .join(snapshot_id)
-                    .join(filename)
+                    .join(".staging")
                     .as_path(),
-                &bytes,
+                b"pending\n",
             )?;
-        }
-        return Ok(());
+            for (filename, edges) in files {
+                validate_snapshot_component(filename)?;
+                let mut bytes = Vec::new();
+                for edge in *edges {
+                    serde_json::to_writer(&mut bytes, edge)?;
+                    bytes.push(b'\n');
+                }
+                write_materialized_file_atomic(
+                    edges_dir,
+                    Path::new("workspace")
+                        .join(project_id)
+                        .join("snapshots")
+                        .join(snapshot_id)
+                        .join(filename)
+                        .as_path(),
+                    &bytes,
+                )?;
+            }
+            Ok(())
+        });
     }
     #[cfg(not(unix))]
     {
@@ -902,6 +932,29 @@ fn validate_snapshot_component(value: &str) -> Result<()> {
         anyhow::bail!("snapshot writer component is not a single normalized name");
     }
     Ok(())
+}
+
+fn clear_snapshot_staging_marker(
+    edges_dir: &Path,
+    project_id: &str,
+    snapshot_id: &str,
+) -> Result<()> {
+    let marker = snapshot_dir(edges_dir, project_id, snapshot_id).join(".staging");
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            fs::remove_file(&marker)?;
+            fs::File::open(
+                marker
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("snapshot staging marker has no parent"))?,
+            )?
+            .sync_all()?;
+            Ok(())
+        }
+        Ok(_) => anyhow::bail!("snapshot staging marker is not a regular nofollow file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub struct SnapshotEdgeWriter {
@@ -1272,6 +1325,7 @@ fn update_manifest_for_snapshot(
         active_dirty_overlay_id: dirty_overlay_rel.map(|r| r.to_string()),
         updated_at: None,
     };
+    clear_snapshot_staging_marker(edges_dir, project_id, snapshot_id)?;
     WorkspaceManifest::write_to(edges_dir, &manifest)?;
 
     let mut idx = ManifestIndex::load_or_new(edges_dir)?;
