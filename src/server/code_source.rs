@@ -1570,7 +1570,17 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>, runtime_handle: tokio::
                     let ladder = probe_ladder(&state_for_task, &project_id);
 
                     // Evaluate open-bridge predicate (section 9.3).
-                    let activation = store.load_activation_mixed(&project_id).ok().flatten();
+                    let activation = match store.load_activation_mixed(&project_id) {
+                        Ok(activation) => activation,
+                        Err(error) => {
+                            tracing::warn!(
+                                project_id = %project_id,
+                                %error,
+                                "reducer refused to treat an activation load failure as absence"
+                            );
+                            return;
+                        }
+                    };
                     let effective_gen = activation
                         .as_ref()
                         .map(|a| a.generation_id().to_string())
@@ -1591,7 +1601,15 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>, runtime_handle: tokio::
                     // trigger the transact to null it before evaluating the
                     // reduction table.
                     if !bridge_open {
-                        try_automatic_bridge_clear(&state_for_task, &project_id);
+                        if let Err(error) = try_automatic_bridge_clear(&state_for_task, &project_id)
+                        {
+                            tracing::warn!(
+                                project_id = %project_id,
+                                %error,
+                                "automatic bridge-clear evidence failed"
+                            );
+                            return;
+                        }
                     }
 
                     let action = evaluate_reduction(
@@ -3371,15 +3389,15 @@ fn check_bridge_open_for_reducer(
 /// that makes the open-bridge predicate false.
 ///
 /// Returns true if the bridge was cleared (or was already clear).
-fn try_automatic_bridge_clear(state: &Arc<SharedState>, project_id: &str) -> bool {
+fn try_automatic_bridge_clear(state: &Arc<SharedState>, project_id: &str) -> Result<bool> {
     use bbox_corpus_core::project_catalog::ProjectScope;
     use bbox_indexing::project_catalog_admin::{ScopeBridgeClearMode, clear_scope_bridge};
     let Some(catalog_store) = state.project_authority.catalog_store() else {
-        return false;
+        return Ok(false);
     };
-    let Ok(snapshot) = catalog_store.snapshot() else {
-        return false;
-    };
+    let snapshot = catalog_store
+        .snapshot()
+        .context("loading catalog for automatic bridge clear")?;
     let epoch = snapshot.epoch();
     let catalog = snapshot.catalog();
     // Find bridge-bearing records for this project.
@@ -3389,30 +3407,28 @@ fn try_automatic_bridge_clear(state: &Arc<SharedState>, project_id: &str) -> boo
         .filter(|r| r.project_id.as_str() == project_id && r.code_bridge_generation.is_some())
         .collect();
     if bridge_records.is_empty() {
-        return true; // no bridge to clear
+        return Ok(true); // no bridge to clear
     }
     // Check if the effective activation's scope matches the migration
     // record's new_scope. If so, the bridge is stale and can be cleared.
-    let Ok(pid) = bbox_corpus_core::project_catalog::ProjectId::parse(project_id.to_string())
-    else {
-        return false;
-    };
+    let pid = bbox_corpus_core::project_catalog::ProjectId::parse(project_id.to_string())
+        .map_err(|error| anyhow!(error))?;
     let project_scope = catalog.projects.get(&pid).map(|p| &p.scope);
     let Some(ProjectScope::Published(current_scope)) = project_scope else {
-        return false; // project not in published state
+        return Ok(false); // project not in published state
     };
     // The bridge is clearable when the newest bridge record's new_scope
     // matches the current project scope (meaning the new scope is active).
     let newest = bridge_records.iter().max_by_key(|r| r.catalog_epoch);
     let Some(record) = newest else {
-        return false;
+        return Ok(false);
     };
     let bridge_is_stale = match &record.new_scope {
         ProjectScope::Published(new_scope) => new_scope == current_scope,
         ProjectScope::LegacyLocal => false,
     };
     if !bridge_is_stale {
-        return false;
+        return Ok(false);
     }
     // Gather verified evidence from the activation record (F4: automatic
     // path must verify the bridge is actually stale). R3F3: enumerate the
@@ -3420,34 +3436,23 @@ fn try_automatic_bridge_clear(state: &Arc<SharedState>, project_id: &str) -> boo
     // empty set (which would make mode 1 treat any bridge generation as
     // absent without proof). Also pass the effective scope for completeness.
     let store = state.code_sources.store();
-    let activation = store.load_activation_mixed(project_id).ok().flatten();
-    let effective_generation_id = activation.as_ref().map(|a| a.generation_id().to_string());
-    let effective_scope = activation
-        .as_ref()
-        .and_then(|a| a.published_scope().cloned());
-    // Enumerate retained generation ids from the store's scope directories.
-    let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
-    let code_source_dir = edges_dir
-        .parent()
-        .unwrap_or(&state.store_dir)
-        .join("code-sources");
-    let mut retained_generation_ids = std::collections::BTreeSet::new();
-    if let Ok(paths) = bbox_code_source_store::CodeSourceStorePaths::new(&code_source_dir) {
-        let scopes_dir = paths.root().join("scopes");
-        if let Ok(scope_entries) = std::fs::read_dir(&scopes_dir) {
-            for scope_entry in scope_entries.flatten() {
-                let gen_dir = scope_entry.path().join("generations");
-                if let Ok(gen_entries) = std::fs::read_dir(&gen_dir) {
-                    for gen_entry in gen_entries.flatten() {
-                        if let Some(name) = gen_entry.file_name().to_str() {
-                            retained_generation_ids
-                                .insert(name.trim_end_matches(".json").to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let activation = store
+        .load_activation_mixed(project_id)
+        .context("loading activation for automatic bridge clear")?
+        .ok_or_else(|| anyhow!("automatic bridge clear requires an activation record"))?;
+    let effective_generation_id = Some(activation.generation_id().to_string());
+    let effective_scope = Some(
+        activation
+            .published_scope()
+            .cloned()
+            .ok_or_else(|| anyhow!("automatic bridge clear requires a v2 activation scope"))?,
+    );
+    let retained_generation_ids = store
+        .retirement_generation_inventory()
+        .context("enumerating retained generations for automatic bridge clear")?
+        .into_iter()
+        .map(|generation| generation.generation_id)
+        .collect();
     let evidence = bbox_indexing::project_catalog_admin::ScopeBridgeClearEvidence {
         effective_generation_id,
         effective_scope,
@@ -3458,7 +3463,7 @@ fn try_automatic_bridge_clear(state: &Arc<SharedState>, project_id: &str) -> boo
         catalog_store,
         epoch,
         &pid,
-        ScopeBridgeClearMode::DanglingReference,
+        ScopeBridgeClearMode::AutomaticFirstNewScope,
         &evidence,
     ) {
         Ok(_) => {
@@ -3467,7 +3472,7 @@ fn try_automatic_bridge_clear(state: &Arc<SharedState>, project_id: &str) -> boo
                 epoch,
                 "automatic bridge-clear: nulled code_bridge_generation"
             );
-            true
+            Ok(true)
         }
         Err(error) => {
             tracing::warn!(
@@ -3475,7 +3480,7 @@ fn try_automatic_bridge_clear(state: &Arc<SharedState>, project_id: &str) -> boo
                 %error,
                 "automatic bridge-clear transaction failed"
             );
-            false
+            Err(anyhow!(error))
         }
     }
 }
@@ -10312,8 +10317,8 @@ mod tests {
             "automatic bridge-clear must build retained_generation_ids from store enumeration"
         );
         assert!(
-            body.contains("read_dir"),
-            "automatic bridge-clear must read directories to enumerate generations"
+            body.contains("retirement_generation_inventory"),
+            "automatic bridge-clear must use strict store-owned generation enumeration"
         );
         assert!(
             body.contains("effective_scope"),
@@ -10333,5 +10338,10 @@ mod tests {
             !ev_literal.contains("BTreeSet::new()"),
             "evidence struct must not inline an empty retained set"
         );
+        assert!(
+            !body.contains(".ok().flatten()") && !body.contains("if let Ok"),
+            "automatic bridge-clear must propagate activation and enumeration errors"
+        );
+        assert!(body.contains("AutomaticFirstNewScope"));
     }
 }

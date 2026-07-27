@@ -1883,6 +1883,65 @@ pub fn clear_scope_bridge(
             }
             newest.scope_migration_id.clone()
         }
+        ScopeBridgeClearMode::AutomaticFirstNewScope => {
+            let newest = bridge_records.last().ok_or_else(|| {
+                admin_error(
+                    "error.project_catalog_scope_bridge_clear_no_bridge",
+                    "no bridge-bearing record to clear",
+                )
+            })?;
+            let bridge_gen = newest.code_bridge_generation.as_ref().ok_or_else(|| {
+                admin_error(
+                    "error.project_catalog_scope_bridge_clear_no_bridge",
+                    "newest record has no bridge generation",
+                )
+            })?;
+            let current_scope = catalog
+                .projects
+                .get(project_id)
+                .and_then(|project| match &project.scope {
+                    ProjectScope::Published(scope) => Some(scope),
+                    ProjectScope::LegacyLocal => None,
+                })
+                .ok_or_else(|| {
+                    admin_error(
+                        "error.project_catalog_scope_bridge_clear_missing_current_scope",
+                        "automatic bridge clear requires a published current catalog scope",
+                    )
+                })?;
+            let effective_scope = evidence.effective_scope.as_ref().ok_or_else(|| {
+                admin_error(
+                    "error.project_catalog_scope_bridge_clear_missing_evidence",
+                    "automatic bridge clear requires a strictly loaded activation scope",
+                )
+            })?;
+            let effective_generation =
+                evidence.effective_generation_id.as_ref().ok_or_else(|| {
+                    admin_error(
+                        "error.project_catalog_scope_bridge_clear_missing_evidence",
+                        "automatic bridge clear requires a strictly loaded activation generation",
+                    )
+                })?;
+            if effective_scope != current_scope {
+                return Err(admin_error(
+                    "error.project_catalog_scope_bridge_clear_activation_scope_mismatch",
+                    "automatic bridge clear activation scope does not match the current catalog scope",
+                ));
+            }
+            if effective_generation == bridge_gen {
+                return Err(admin_error(
+                    "error.project_catalog_scope_bridge_clear_bridge_still_live",
+                    "automatic bridge clear activation still names the bridge generation",
+                ));
+            }
+            if !evidence.retained_generation_ids.contains(bridge_gen) {
+                return Err(admin_error(
+                    "error.project_catalog_scope_bridge_clear_bridge_not_retained",
+                    "automatic bridge clear expected the GC-pinned bridge generation to remain retained",
+                ));
+            }
+            newest.scope_migration_id.clone()
+        }
         ScopeBridgeClearMode::DoubleMigrationRepair => {
             // Mode 2 precondition (R2F4): implements the exact open-bridge
             // predicate. At least two bridge-bearing records exist. The
@@ -2000,6 +2059,9 @@ pub struct ScopeBridgeClearEvidence {
 pub enum ScopeBridgeClearMode {
     /// Mode 1: the named generation is retired (dangling reference).
     DanglingReference,
+    /// Automatic convergence after the first generation activates in the new
+    /// scope. The old bridge generation remains retained as a GC root.
+    AutomaticFirstNewScope,
     /// Mode 2: double-migration truthfulness repair. Null the newest
     /// bridge-bearing record, restoring the older admitting record.
     DoubleMigrationRepair,
@@ -4569,6 +4631,51 @@ mod tests {
             result.is_ok(),
             "dangling bridge with no activation and absent generation must clear, got: {:?}",
             result.err()
+        );
+    }
+
+    #[test]
+    fn automatic_first_new_scope_clear_expects_retained_bridge() {
+        let (_tmp, store, pid) = f4_store_with_bridge(Some("dangling_gen"));
+        let epoch = store.snapshot().unwrap().epoch();
+        let evidence = ScopeBridgeClearEvidence {
+            effective_generation_id: Some("new_generation".into()),
+            effective_scope: Some(PublishedScope::try_new("f4-scope", ".").unwrap()),
+            retained_generation_ids: std::collections::BTreeSet::from(["dangling_gen".into()]),
+        };
+        clear_scope_bridge(
+            &store,
+            epoch,
+            &pid,
+            ScopeBridgeClearMode::AutomaticFirstNewScope,
+            &evidence,
+        )
+        .unwrap();
+        assert!(
+            store
+                .snapshot()
+                .unwrap()
+                .catalog()
+                .scope_migrations
+                .values()
+                .all(|record| record.code_bridge_generation.is_none())
+        );
+    }
+
+    #[test]
+    fn automatic_first_new_scope_clear_refuses_missing_evidence() {
+        let (_tmp, store, pid) = f4_store_with_bridge(Some("dangling_gen"));
+        let error = clear_scope_bridge(
+            &store,
+            store.snapshot().unwrap().epoch(),
+            &pid,
+            ScopeBridgeClearMode::AutomaticFirstNewScope,
+            &ScopeBridgeClearEvidence::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_scope_bridge_clear_missing_evidence"
         );
     }
 

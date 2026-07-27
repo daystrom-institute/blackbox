@@ -1135,6 +1135,9 @@ fn execute_scope_bridge_clear(
             project_catalog_admin::ScopeBridgeClearMode::DoubleMigrationRepair => {
                 "double_migration_repair"
             }
+            project_catalog_admin::ScopeBridgeClearMode::AutomaticFirstNewScope => {
+                unreachable!("automatic bridge clear is daemon-only")
+            }
         },
         "epoch": commit.epoch,
     }))
