@@ -2,7 +2,7 @@ use super::startup::{configure_dispatch_mcp_env, discover_transcript_roots, reso
 use super::{SIGNAL_LOG_CAP, SharedState, WEBHOOK_LOG_CAP, is_loopback_bind};
 use anyhow::Context;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -488,12 +488,14 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     // BEFORE the schema rebuild, reindex, and CodeReadView construction
     // so that a broken relationship chain fails closed before the daemon
     // builds any read view from corrupt state. Bridge mode is a no-op.
-    super::code_source::pre_bind_catalog_recovery(
+    let pending_first_republish = super::code_source::pre_bind_catalog_recovery(
         &project_authority,
         &code_sources,
         &checkout_access,
         &store_dir,
     )?;
+    idx.refresh_active_code_selectors()
+        .context("refreshing active code selectors after pre-bind catalog recovery")?;
 
     // The grant table is built after the writer actor spawns, so the
     // planner's assignment view is installed here rather than passed to
@@ -553,6 +555,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         &roadmap_store.read(),
         &store_dir,
         &records_provider.records_snapshot(),
+        &pending_first_republish,
     )?;
     let code_read_view = super::CodeReadView {
         active_selectors: idx.active_code_selectors(),
@@ -778,20 +781,24 @@ fn build_startup_edge_index(
     roadmap_store: &Roadmap,
     store_dir: &Path,
     records: &bbox_corpus_core::project_record::ProjectRecordsSnapshot,
+    pending_first_republish: &BTreeSet<String>,
 ) -> anyhow::Result<edge_index::EdgeIndex> {
     if cfg.index.edge_index_boot_rebuild {
-        edge_index::EdgeIndex::rebuild(&edge_index::EdgeStoreRefs {
-            index: idx,
-            knowledge: kb,
-            threads: th,
-            notes: notes_store,
-            session_brofile_rows: task_store.session_brofile_rows(),
-            roadmap: roadmap_store,
-            edges_dir: edge_index::edges_dir_from_bro_store(store_dir),
-            registered_project_ids: Some(records.registered_project_ids()),
-            include_tantivy_projection: false,
-            include_observed: true,
-        })
+        edge_index::EdgeIndex::rebuild_admitting_fully_absent(
+            &edge_index::EdgeStoreRefs {
+                index: idx,
+                knowledge: kb,
+                threads: th,
+                notes: notes_store,
+                session_brofile_rows: task_store.session_brofile_rows(),
+                roadmap: roadmap_store,
+                edges_dir: edge_index::edges_dir_from_bro_store(store_dir),
+                registered_project_ids: Some(records.registered_project_ids()),
+                include_tantivy_projection: false,
+                include_observed: true,
+            },
+            pending_first_republish,
+        )
     } else {
         tracing::info!(
             "startup EdgeIndex rebuild deferred (set BLACKBOX_EDGE_INDEX_BOOT_REBUILD=1 to restore eager rebuild)"

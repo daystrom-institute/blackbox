@@ -3407,30 +3407,55 @@ fn reconstruct_workspace_entries_from_activations(
 fn validate_pre_bind_workspace_materializations(
     manifest: &bbox_edge_sidecar::manifest::ManifestIndex,
     edges_dir: &std::path::Path,
-    reconstructed: &BTreeSet<String>,
+    pending_first_republish: &BTreeSet<String>,
 ) -> Result<()> {
-    let mut strict = manifest.clone();
-    for project_id in reconstructed {
-        let entry = manifest.workspaces.get(project_id).ok_or_else(|| {
-            anyhow!("reconstructed workspace entry disappeared for project {project_id}")
-        })?;
-        if !entry
-            .code_source_selector
-            .as_deref()
-            .is_some_and(|selector| selector.starts_with("collected:"))
-        {
-            bail!("reconstructed workspace entry is not collected for project {project_id}");
-        }
-        if manifest.workspace_materialization_is_fully_absent(edges_dir, project_id)? {
-            tracing::info!(
-                project_id,
-                "pre-bind: admitting absent collected workspace materialization pending first republish"
-            );
-            strict.workspaces.remove(project_id);
-        }
-    }
-    strict.active_paths_for_loader(edges_dir)?;
+    manifest.active_paths_for_loader_admitting_fully_absent(edges_dir, pending_first_republish)?;
     Ok(())
+}
+
+fn derive_pending_first_republish(
+    store: &CodeSourceStore,
+    manifest: &bbox_edge_sidecar::manifest::ManifestIndex,
+    edges_dir: &std::path::Path,
+) -> Result<BTreeSet<String>> {
+    let records = store
+        .activation_records_mixed()
+        .context("loading activation records for pending first republish")?;
+    let mut pending = BTreeSet::new();
+
+    for (project_id, entry) in &manifest.workspaces {
+        if !manifest.workspace_materialization_is_fully_absent(edges_dir, project_id)? {
+            continue;
+        }
+        let mut matching = records
+            .iter()
+            .filter(|record| record.is_current_v2() && record.project_id() == project_id);
+        let Some(activation) = matching.next() else {
+            continue;
+        };
+        if matching.next().is_some() {
+            bail!(
+                "multiple current activation records found for absent workspace materialization project {project_id}"
+            );
+        }
+        let expected_snapshot =
+            bbox_edge_sidecar::snapshot::active_snapshot_rel(project_id, activation.snapshot_id());
+        let selector = activation.selector();
+        if !selector.starts_with("collected:")
+            || entry.code_source_selector.as_deref() != Some(selector)
+            || entry.code_source_generation.as_deref() != Some(activation.generation_id())
+            || entry.active_snapshot.as_deref() != Some(expected_snapshot.as_str())
+        {
+            continue;
+        }
+        tracing::info!(
+            project_id,
+            "pre-bind: admitting absent collected workspace materialization pending first republish"
+        );
+        pending.insert(project_id.clone());
+    }
+
+    Ok(pending)
 }
 
 /// Pre-bind catalog-mode recovery: steps 5-8 of the startup order
@@ -3446,14 +3471,14 @@ pub(crate) fn pre_bind_catalog_recovery(
     code_sources: &CodeSourceRuntime,
     checkout_access: &CheckoutAccessBroker,
     bro_home: &std::path::Path,
-) -> Result<()> {
+) -> Result<BTreeSet<String>> {
     let Some(catalog_store) = project_authority.catalog_store() else {
         // Bridge mode: steps 5-8 do not run (byte-compatible).
-        return Ok(());
+        return Ok(BTreeSet::new());
     };
     let store = code_sources.store();
     if store.record_mode() != RuntimeRecordMode::CatalogV2 {
-        return Ok(());
+        return Ok(BTreeSet::new());
     }
     let store: &CodeSourceStore = &store;
 
@@ -3484,16 +3509,18 @@ pub(crate) fn pre_bind_catalog_recovery(
     // activation record against its generation (selector, generation id,
     // snapshot id, manifest path), so reconstructing the entry from the
     // validated record is safe (R2F2).
-    let reconstructed =
-        reconstruct_workspace_entries_from_activations(store, &edges_dir, &manifest)
-            .context("pre-bind: workspace entry reconstruction")?;
+    reconstruct_workspace_entries_from_activations(store, &edges_dir, &manifest)
+        .context("pre-bind: workspace entry reconstruction")?;
     let reconstructed_manifest =
         bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)
             .context("pre-bind: reloading reconstructed workspace entries")?;
+    let pending_first_republish =
+        derive_pending_first_republish(store, &reconstructed_manifest, &edges_dir)
+            .context("pre-bind: deriving pending first republish materializations")?;
     validate_pre_bind_workspace_materializations(
         &reconstructed_manifest,
         &edges_dir,
-        &reconstructed,
+        &pending_first_republish,
     )
     .context("pre-bind: validating active workspace materializations")?;
 
@@ -3557,7 +3584,7 @@ pub(crate) fn pre_bind_catalog_recovery(
     // case where a live-written record has cutback: None.
     enqueue_desired_effective_mismatches(store, code_sources);
 
-    Ok(())
+    Ok(pending_first_republish)
 }
 
 /// Pre-bind version of resume_persisted_cutback_states (section 9.7).
@@ -9432,12 +9459,29 @@ mod tests {
         assert_eq!(reconstructed, BTreeSet::from([project_id.to_string()]));
         let reconstructed_manifest =
             bbox_edge_sidecar::manifest::ManifestIndex::load(&edges_dir).unwrap();
-        validate_pre_bind_workspace_materializations(
-            &reconstructed_manifest,
-            &edges_dir,
-            &reconstructed,
-        )
-        .unwrap();
+        let pending =
+            derive_pending_first_republish(&store, &reconstructed_manifest, &edges_dir).unwrap();
+        assert_eq!(pending, BTreeSet::from([project_id.to_string()]));
+        validate_pre_bind_workspace_materializations(&reconstructed_manifest, &edges_dir, &pending)
+            .unwrap();
+        reconstructed_manifest
+            .active_paths_for_loader_admitting_fully_absent(&edges_dir, &pending)
+            .unwrap();
+
+        // A crash before the first republish loses no process-local authority:
+        // the next boot derives the same exemption from the collected
+        // activation and the fully absent writer-shaped materialization.
+        let crash_restart_manifest =
+            bbox_edge_sidecar::manifest::ManifestIndex::load(&edges_dir).unwrap();
+        let crash_restart_pending =
+            derive_pending_first_republish(&store, &crash_restart_manifest, &edges_dir).unwrap();
+        assert_eq!(
+            crash_restart_pending,
+            BTreeSet::from([project_id.to_string()])
+        );
+        crash_restart_manifest
+            .active_paths_for_loader_admitting_fully_absent(&edges_dir, &crash_restart_pending)
+            .unwrap();
 
         let snapshot_path = bbox_edge_sidecar::snapshot::snapshot_dir(
             &edges_dir,
@@ -9448,12 +9492,7 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), &snapshot_path).unwrap();
         assert!(
-            validate_pre_bind_workspace_materializations(
-                &reconstructed_manifest,
-                &edges_dir,
-                &reconstructed,
-            )
-            .is_err()
+            derive_pending_first_republish(&store, &reconstructed_manifest, &edges_dir).is_err()
         );
         fs::remove_file(&snapshot_path).unwrap();
 
@@ -9463,10 +9502,7 @@ mod tests {
             .get_mut(project_id)
             .unwrap()
             .active_snapshot = Some("../outside".to_string());
-        assert!(
-            validate_pre_bind_workspace_materializations(&traversal, &edges_dir, &reconstructed,)
-                .is_err()
-        );
+        assert!(derive_pending_first_republish(&store, &traversal, &edges_dir).is_err());
 
         let empty_edges: Vec<bbox_edge_sidecar::edge_sidecar::Edge> = Vec::new();
         bbox_edge_sidecar::snapshot::write_snapshot_files(
@@ -9489,8 +9525,15 @@ mod tests {
 
         let second_boot = bbox_edge_sidecar::manifest::ManifestIndex::load(&edges_dir).unwrap();
         validate_relationship_chain(&store, &catalog, &second_boot).unwrap();
-        validate_pre_bind_workspace_materializations(&second_boot, &edges_dir, &BTreeSet::new())
-            .unwrap();
+        let second_boot_pending =
+            derive_pending_first_republish(&store, &second_boot, &edges_dir).unwrap();
+        assert!(second_boot_pending.is_empty());
+        validate_pre_bind_workspace_materializations(
+            &second_boot,
+            &edges_dir,
+            &second_boot_pending,
+        )
+        .unwrap();
     }
 
     #[test]

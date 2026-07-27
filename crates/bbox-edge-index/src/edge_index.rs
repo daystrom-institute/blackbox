@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -68,14 +68,22 @@ pub struct EdgeStoreRefs<'a> {
 
 impl EdgeIndex {
     pub fn rebuild(stores: &EdgeStoreRefs<'_>) -> Result<Self> {
+        Self::rebuild_admitting_fully_absent(stores, &BTreeSet::new())
+    }
+
+    pub fn rebuild_admitting_fully_absent(
+        stores: &EdgeStoreRefs<'_>,
+        admitted_absent_projects: &BTreeSet<String>,
+    ) -> Result<Self> {
         let started = Instant::now();
         let (mut index, mut seen) = Self::project_store_edges(stores);
 
-        index.load_sidecar_edges(
+        index.load_sidecar_edges_admitting_fully_absent(
             &stores.edges_dir,
             stores.registered_project_ids.as_ref(),
             &mut seen,
             stores.include_observed,
+            admitted_absent_projects,
         )?;
 
         index.log_rebuilt(stores.include_tantivy_projection, started);
@@ -125,9 +133,29 @@ impl EdgeIndex {
         seen: &mut HashSet<EdgeKey>,
         include_observed: bool,
     ) -> Result<()> {
+        self.load_sidecar_edges_admitting_fully_absent(
+            edges_dir,
+            registered_project_ids,
+            seen,
+            include_observed,
+            &BTreeSet::new(),
+        )
+    }
+
+    fn load_sidecar_edges_admitting_fully_absent(
+        &mut self,
+        edges_dir: &Path,
+        registered_project_ids: Option<&HashSet<String>>,
+        seen: &mut HashSet<EdgeKey>,
+        include_observed: bool,
+        admitted_absent_projects: &BTreeSet<String>,
+    ) -> Result<()> {
         match bbox_edge_sidecar::manifest::try_load_manifest_index(edges_dir) {
             Ok(manifest_index) => {
-                let loadable = manifest_index.active_paths_for_loader(edges_dir)?;
+                let loadable = manifest_index.active_paths_for_loader_admitting_fully_absent(
+                    edges_dir,
+                    admitted_absent_projects,
+                )?;
                 let total_materialized_files = count_materialized_jsonl_files(edges_dir);
                 let skipped_inactive = total_materialized_files.saturating_sub(loadable.len());
                 self.load_manifest_active_paths(&loadable, seen)?;

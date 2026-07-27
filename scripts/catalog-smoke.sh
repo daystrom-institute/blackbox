@@ -49,7 +49,7 @@ start_daemon() {
   TRANSCRIPT_SEARCH_CODEX_ROOT=$T/codex \
   HOME=$T/home XDG_CONFIG_HOME=$T/config XDG_CACHE_HOME=$T/cache \
   XDG_DATA_HOME=$T/data XDG_STATE_HOME=$T/xdg-state \
-  BLACKBOX_REINDEX_INTERVAL_SECS=999999 BLACKBOX_EDGE_INDEX_BOOT_REBUILD=false \
+BLACKBOX_REINDEX_INTERVAL_SECS=999999 \
   RUST_LOG=blackbox=info \
   "$BIN/blackboxd" >> "$SMOKE/daemon.log" 2>&1 &
   echo $! > "$SMOKE/daemon.pid"

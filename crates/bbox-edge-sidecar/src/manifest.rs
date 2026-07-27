@@ -426,6 +426,20 @@ impl ManifestIndex {
         Ok(result)
     }
 
+    pub fn active_paths_for_loader_admitting_fully_absent(
+        &self,
+        edges_dir: &Path,
+        admitted_absent_projects: &std::collections::BTreeSet<String>,
+    ) -> Result<Vec<LoadablePath>> {
+        let mut strict = self.clone();
+        for project_id in admitted_absent_projects {
+            if self.workspace_materialization_is_fully_absent(edges_dir, project_id)? {
+                strict.workspaces.remove(project_id);
+            }
+        }
+        strict.active_paths_for_loader(edges_dir)
+    }
+
     /// Returns true only when every filesystem object referenced by one
     /// writer-shaped workspace entry is absent. Any malformed path, symlink,
     /// unsupported type, or partial presence is either an error or `false`.
