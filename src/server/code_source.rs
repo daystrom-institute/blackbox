@@ -2793,13 +2793,61 @@ fn validate_relationship_chain(
                 // crash window in the reduction table: local | local | any
                 // non-None | clear stale state). ADMIT with a tracing::info
                 // so the startup reducer sweep converges it (the stale
-                // collected record is cleared). Every other mismatch shape
-                // still fails closed.
+                // collected record is cleared).
+                //
+                // R3F2: admission requires a FULLY VALID local-writer entry.
+                // The crash window must not admit a drifted or malformed entry
+                // that happens to carry the correct selector. The loader
+                // (manifest.rs:306) joins active_snapshot beneath the
+                // materialized root, so a traversal-bearing or cross-project
+                // snapshot path could load another project's or an escaped
+                // directory's JSONL. Validate:
+                //   1. exact manifest path for this project
+                //   2. generation is "local" (the local-writer shape)
+                //   3. snapshot path is same-project confined (no traversal)
                 let entry_selector = entry.code_source_selector.as_deref();
+                let expected_local_selector = bbox_code_source::local_selector(project_id);
                 let is_cutback_crash_window = entry_selector
-                    == Some(bbox_code_source::local_selector(project_id).as_str())
+                    == Some(expected_local_selector.as_str())
                     && activation.selector().starts_with("collected:");
                 if is_cutback_crash_window {
+                    // Validate manifest path.
+                    let expected_manifest = format!("workspace/{project_id}/manifest.json");
+                    if entry.manifest != expected_manifest {
+                        bail!(
+                            "error.code_source_relationship_chain: \
+                             crash-window entry has wrong manifest path for project {project_id} \
+                             (expected {expected_manifest}, got {})",
+                            entry.manifest
+                        );
+                    }
+                    // Validate generation is the local-writer shape.
+                    if entry.code_source_generation.as_deref() != Some("local") {
+                        bail!(
+                            "error.code_source_relationship_chain: \
+                             crash-window entry has non-local generation for project {project_id}"
+                        );
+                    }
+                    // Validate snapshot path is same-project confined and
+                    // carries no path-traversal components. The writer
+                    // produces "workspace/{project_id}/snapshots/{snapshot_id}".
+                    if let Some(ref snap) = entry.active_snapshot {
+                        let expected_prefix = format!("workspace/{project_id}/snapshots/");
+                        if !snap.starts_with(&expected_prefix)
+                            || snap.contains("..")
+                            || snap.contains('\0')
+                        {
+                            bail!(
+                                "error.code_source_relationship_chain: \
+                                 crash-window entry has unsafe snapshot path for project {project_id}"
+                            );
+                        }
+                    } else {
+                        bail!(
+                            "error.code_source_relationship_chain: \
+                             crash-window entry has no snapshot path for project {project_id}"
+                        );
+                    }
                     tracing::info!(
                         project = %project_id,
                         "relationship chain link 5: cutback crash window admitted \
@@ -2811,23 +2859,15 @@ fn validate_relationship_chain(
                         "error.code_source_relationship_chain: \
                          workspace selector mismatch for project {project_id}"
                     );
-                }
-                if !is_cutback_crash_window {
+                } else {
+                    // Normal (non-crash-window) collected entry: validate
+                    // generation, snapshot, and manifest path exactly.
                     if entry.code_source_generation.as_deref() != Some(generation_id) {
                         bail!(
                             "error.code_source_relationship_chain: \
                              workspace generation mismatch for project {project_id}"
                         );
                     }
-                    // Require EXACT equality with the canonical writer-produced
-                    // snapshot path (R2F3). The production writer
-                    // (activate_source_snapshot in bbox_edge_sidecar::snapshot)
-                    // stores active_snapshot as the ManifestIndex-relative path
-                    // "workspace/{project_id}/snapshots/{snapshot_id}" (built by
-                    // active_snapshot_rel). Comparing only the final path segment
-                    // admitted cross-project drift (a path from a different
-                    // project whose snapshot id happened to match). Derive the
-                    // expected string the same way the writer does.
                     let expected_snapshot = bbox_edge_sidecar::snapshot::active_snapshot_rel(
                         project_id,
                         activation.snapshot_id(),
@@ -2838,11 +2878,6 @@ fn validate_relationship_chain(
                              workspace snapshot mismatch for project {project_id}"
                         );
                     }
-                    // Require EXACT equality with the canonical writer-produced
-                    // manifest path (R2F3). The production writer always writes
-                    // "workspace/{project_id}/manifest.json". Checking only
-                    // non-emptiness admitted wrong-nonempty paths (including
-                    // cross-project paths from a different project's manifest).
                     let expected_manifest = format!("workspace/{project_id}/manifest.json");
                     if entry.manifest != expected_manifest {
                         bail!(
@@ -2959,7 +2994,14 @@ fn reconstruct_workspace_entries_from_activations(
                 code_source_selector: Some(selector.to_string()),
                 code_source_generation: Some(activation.generation_id().to_string()),
                 git_overlay: None,
-                git_overlay_managed: false,
+                // R3F5: the authoritative collected writer
+                // (activate_source_snapshot in edge-sidecar snapshot.rs)
+                // sets git_overlay_managed: true. The reconstruction must
+                // match: false loads every JSONL member including stale
+                // git-current.jsonl (manifest.rs gating), and overlay
+                // selection refuses non-managed entries (snapshot.rs:344),
+                // so the promised Git overlay can never install.
+                git_overlay_managed: true,
             },
         );
         reconstructed += 1;
@@ -10047,26 +10089,188 @@ mod tests {
             body.contains("cutback crash window admitted"),
             "crash window admission must emit a tracing::info"
         );
-    }
-
-    /// Structural assertion: the reducer's NoOp arm checks for stale
-    /// collected activation records when effective is Local (the
-    /// convergence half of the crash-window transition).
-    #[test]
-    fn crash_window_reducer_clears_stale_collected_record() {
-        let src = self_source();
-        let body = extract_fn_body_again(&src, "spawn_reconciler");
-        let noop_pos = body
-            .find("ReducerAction::NoOp =>")
-            .expect("reducer must have a NoOp arm");
-        let noop_body = &body[noop_pos..];
+        // R3F2: crash-window admission must validate the full entry shape.
         assert!(
-            noop_body.contains("starts_with(\"collected:\")"),
-            "reducer NoOp arm must check for stale collected activation records"
+            body.contains("crash-window entry has wrong manifest path"),
+            "crash window must validate manifest path"
         );
         assert!(
-            noop_body.contains("clear_activation"),
-            "reducer NoOp arm must clear stale collected activation records"
+            body.contains("crash-window entry has non-local generation"),
+            "crash window must validate generation shape"
+        );
+        assert!(
+            body.contains("crash-window entry has unsafe snapshot path"),
+            "crash window must validate snapshot path confinement"
+        );
+    }
+
+    // ---- R3F2: adversarial crash-window field tests ----
+
+    fn crash_window_fixture() -> (
+        tempfile::TempDir,
+        Arc<CodeSourceStore>,
+        CatalogSnapshotV2,
+        String,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let runtime = CodeSourceRuntime::for_test_catalog(&root);
+        let store = runtime.store();
+        let scope = PublishedScope::try_new("crash-adv", ".").unwrap();
+        let project_id = "p_0000000000000000000000000000adv".to_string();
+        let generation_id = compute_generation_id(
+            "p4f-producer",
+            &empty_generation_descriptor(scope.clone(), &"a".repeat(40)),
+        );
+        p4f_seed_activation(
+            &store,
+            &root.join("code-sources"),
+            &project_id,
+            &scope,
+            &generation_id,
+            None,
+            false,
+        );
+        let snapshot = p4f_catalog_snapshot(&project_id, scope, vec![]);
+        (directory, store, snapshot, project_id)
+    }
+
+    fn crash_window_entry(
+        project_id: &str,
+        manifest: &str,
+        generation: &str,
+        snapshot: &str,
+    ) -> bbox_edge_sidecar::manifest::ManifestIndex {
+        let mut m = bbox_edge_sidecar::manifest::ManifestIndex::new();
+        m.workspaces.insert(
+            project_id.to_string(),
+            bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
+                manifest: manifest.to_string(),
+                active_snapshot: Some(snapshot.to_string()),
+                dirty_overlay: None,
+                repo_materialization: None,
+                code_source_selector: Some(bbox_code_source::local_selector(project_id)),
+                code_source_generation: Some(generation.to_string()),
+                git_overlay: None,
+                git_overlay_managed: false,
+            },
+        );
+        m
+    }
+
+    #[test]
+    fn crash_window_wrong_manifest_path_fails() {
+        let (dir, store, snapshot, pid) = crash_window_fixture();
+        let manifest = crash_window_entry(
+            &pid,
+            "workspace/other-project/manifest.json", // wrong manifest path
+            "local",
+            &format!("workspace/{pid}/snapshots/local-snap"),
+        );
+        let result = validate_relationship_chain(&store, &snapshot, &manifest);
+        assert!(
+            result.is_err(),
+            "wrong manifest path must fail even in crash window"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("wrong manifest path"), "got: {err}");
+        drop(dir);
+    }
+
+    #[test]
+    fn crash_window_foreign_generation_fails() {
+        let (dir, store, snapshot, pid) = crash_window_fixture();
+        let manifest = crash_window_entry(
+            &pid,
+            &format!("workspace/{pid}/manifest.json"),
+            "foreign-generation-id", // not "local"
+            &format!("workspace/{pid}/snapshots/local-snap"),
+        );
+        let result = validate_relationship_chain(&store, &snapshot, &manifest);
+        assert!(
+            result.is_err(),
+            "foreign generation must fail even in crash window"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("non-local generation"), "got: {err}");
+        drop(dir);
+    }
+
+    #[test]
+    fn crash_window_traversal_snapshot_fails() {
+        let (dir, store, snapshot, pid) = crash_window_fixture();
+        let manifest = crash_window_entry(
+            &pid,
+            &format!("workspace/{pid}/manifest.json"),
+            "local",
+            &format!("workspace/{pid}/snapshots/../../../etc/passwd"), // traversal
+        );
+        let result = validate_relationship_chain(&store, &snapshot, &manifest);
+        assert!(
+            result.is_err(),
+            "traversal snapshot must fail even in crash window"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("unsafe snapshot path"), "got: {err}");
+        drop(dir);
+    }
+
+    #[test]
+    fn crash_window_cross_project_snapshot_fails() {
+        let (dir, store, snapshot, pid) = crash_window_fixture();
+        let manifest = crash_window_entry(
+            &pid,
+            &format!("workspace/{pid}/manifest.json"),
+            "local",
+            "workspace/p_0000000000000000000000000other/snapshots/local-snap", // cross-project
+        );
+        let result = validate_relationship_chain(&store, &snapshot, &manifest);
+        assert!(
+            result.is_err(),
+            "cross-project snapshot must fail even in crash window"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("unsafe snapshot path"), "got: {err}");
+        drop(dir);
+    }
+
+    #[test]
+    fn crash_window_missing_snapshot_fails() {
+        let (dir, store, snapshot, pid) = crash_window_fixture();
+        let mut m = bbox_edge_sidecar::manifest::ManifestIndex::new();
+        m.workspaces.insert(
+            pid.clone(),
+            bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
+                manifest: format!("workspace/{pid}/manifest.json"),
+                active_snapshot: None, // missing
+                dirty_overlay: None,
+                repo_materialization: None,
+                code_source_selector: Some(bbox_code_source::local_selector(&pid)),
+                code_source_generation: Some("local".to_string()),
+                git_overlay: None,
+                git_overlay_managed: false,
+            },
+        );
+        let result = validate_relationship_chain(&store, &snapshot, &m);
+        assert!(
+            result.is_err(),
+            "missing snapshot must fail even in crash window"
+        );
+        drop(dir);
+    }
+
+    // ---- R3F5: reconstruction overlay ownership ----
+
+    #[test]
+    fn r3f5_reconstruction_sets_overlay_managed_true() {
+        let src = self_source();
+        let body = extract_fn_body_again(&src, "reconstruct_workspace_entries_from_activations");
+        // The reconstruction body must set git_overlay_managed: true to
+        // match the authoritative collected writer (activate_source_snapshot
+        // in edge-sidecar snapshot.rs:313).
+        assert!(
+            body.contains("git_overlay_managed: true"),
+            "reconstruction must set git_overlay_managed: true to match the collected writer"
         );
     }
 }
