@@ -2461,51 +2461,111 @@ pub fn load_archived_retirement_journal(
     load_retirement_journal_from_path(&path, project_id)
 }
 
+#[cfg(unix)]
+fn open_retirement_parent(
+    path: &std::path::Path,
+    create: bool,
+) -> Result<Option<std::fs::File>, RetirementJournalError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| RetirementJournalError::other("retirement journal has no parent"))?;
+    if create {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)
+    {
+        Ok(directory) => Ok(Some(directory)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create => Ok(None),
+        Err(error) => Err(RetirementJournalError::other(format!(
+            "retirement journal parent is unavailable: {error}"
+        ))),
+    }
+}
+
+#[cfg(unix)]
+fn open_retirement_leaf(
+    directory: &std::fs::File,
+    name: &str,
+    limit: usize,
+) -> Result<Option<std::fs::File>, RetirementJournalError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let name = std::ffi::CString::new(name)
+        .map_err(|_| RetirementJournalError::other("retirement journal filename contains NUL"))?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return Err(RetirementJournalError::other(
+                "retirement journal leaf is a symlink, not a regular file",
+            ));
+        }
+        return Err(RetirementJournalError::other(format!(
+            "retirement journal leaf is unavailable: {error}"
+        )));
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > limit as u64 {
+        return Err(RetirementJournalError::other(
+            "retirement journal leaf exceeds its byte limit or is not regular",
+        ));
+    }
+    Ok(Some(file))
+}
+
 fn load_retirement_journal_from_path(
     path: &std::path::Path,
     project_id: &ProjectId,
 ) -> Result<Option<ProjectRetirementJournal>, RetirementJournalError> {
-    if !path.is_file() {
-        return Ok(None);
-    }
-    // Nofollow read: open the file without following symlinks (F6).
     #[cfg(unix)]
-    let bytes = {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .map_err(|e| {
-                if e.raw_os_error() == Some(libc::ELOOP) {
-                    RetirementJournalError::other(
-                        "retirement journal is a symlink; refusing to follow",
-                    )
-                } else {
-                    RetirementJournalError::from(e)
-                }
-            })?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.len() as usize > MAX_JOURNAL_BYTES {
-            return Err(RetirementJournalError::other(
-                "retirement journal exceeds its byte limit or is not regular",
-            ));
+    let Some(directory) = open_retirement_parent(path, false)? else {
+        return Ok(None);
+    };
+    #[cfg(unix)]
+    let leaf_name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| RetirementJournalError::other("retirement journal filename is invalid"))?;
+    #[cfg(unix)]
+    let bytes = match open_retirement_leaf(&directory, leaf_name, MAX_JOURNAL_BYTES)? {
+        Some(mut file) => {
+            let metadata = file.metadata()?;
+            let mut buf = Vec::with_capacity(metadata.len() as usize);
+            std::io::Read::read_to_end(
+                &mut std::io::Read::take(&mut file, MAX_JOURNAL_BYTES as u64 + 1),
+                &mut buf,
+            )?;
+            if buf.len() as u64 != metadata.len() {
+                return Err(RetirementJournalError::other(
+                    "retirement journal changed while being read",
+                ));
+            }
+            buf
         }
-        let mut buf = Vec::with_capacity(metadata.len() as usize);
-        std::io::Read::read_to_end(
-            &mut std::io::Read::take(&mut file, MAX_JOURNAL_BYTES as u64 + 1),
-            &mut buf,
-        )?;
-        if buf.len() as u64 != metadata.len() {
-            return Err(RetirementJournalError::other(
-                "retirement journal changed while being read",
-            ));
-        }
-        buf
+        None => return Ok(None),
     };
     #[cfg(not(unix))]
     let bytes = {
-        let mut file = std::fs::OpenOptions::new().read(true).open(&path)?;
+        let mut file = match std::fs::OpenOptions::new().read(true).open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.len() as usize > MAX_JOURNAL_BYTES {
             return Err(RetirementJournalError::other(
@@ -2555,7 +2615,15 @@ fn load_retirement_journal_from_path(
     // before current_stage. This prevents stage forgery where an
     // attacker edits current_stage to skip work.
     validate_journal_stage_history(&journal)?;
-    journal.evidence.owned_blob_hashes = load_retirement_blob_inventory(&path, &journal)?;
+    #[cfg(unix)]
+    {
+        journal.evidence.owned_blob_hashes =
+            load_retirement_blob_inventory_at(&directory, leaf_name, &journal)?;
+    }
+    #[cfg(not(unix))]
+    {
+        journal.evidence.owned_blob_hashes = load_retirement_blob_inventory(path, &journal)?;
+    }
     validate_journal_evidence_shape(&journal)?;
     Ok(Some(journal))
 }
@@ -2749,6 +2817,32 @@ pub fn retirement_evidence_sha256(evidence: &RetirementJournalEvidence) -> Strin
     bbox_corpus_core::project_catalog_snapshot::sha256_hex(&bytes)
 }
 
+#[cfg(unix)]
+fn load_retirement_blob_inventory_at(
+    directory: &std::fs::File,
+    journal_leaf: &str,
+    journal: &ProjectRetirementJournal,
+) -> Result<Vec<String>, RetirementJournalError> {
+    const MAX_BLOB_INVENTORY_BYTES: usize = 64 * 1024 * 1024;
+    let stem = journal_leaf
+        .strip_suffix(".json")
+        .ok_or_else(|| RetirementJournalError::other("retirement journal filename is invalid"))?;
+    let sidecar_leaf = format!("{stem}.blobs.json");
+    let mut file = open_retirement_leaf(directory, &sidecar_leaf, MAX_BLOB_INVENTORY_BYTES)?
+        .ok_or_else(|| RetirementJournalError::other("retirement blob evidence is missing"))?;
+    let metadata = file.metadata()?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let mut bounded = std::io::Read::take(&mut file, MAX_BLOB_INVENTORY_BYTES as u64 + 1);
+    std::io::Read::read_to_end(&mut bounded, &mut bytes)?;
+    if bytes.len() as u64 != metadata.len() {
+        return Err(RetirementJournalError::other(
+            "retirement blob evidence changed while being read",
+        ));
+    }
+    validate_retirement_blob_inventory_bytes(&bytes, journal)
+}
+
+#[cfg(not(unix))]
 fn load_retirement_blob_inventory(
     journal_path: &std::path::Path,
     journal: &ProjectRetirementJournal,
@@ -2793,6 +2887,13 @@ fn load_retirement_blob_inventory(
             "retirement blob evidence exceeds its byte limit",
         ));
     }
+    validate_retirement_blob_inventory_bytes(&bytes, journal)
+}
+
+fn validate_retirement_blob_inventory_bytes(
+    bytes: &[u8],
+    journal: &ProjectRetirementJournal,
+) -> Result<Vec<String>, RetirementJournalError> {
     let expected = journal.evidence.blob_inventory.as_ref().ok_or_else(|| {
         RetirementJournalError::other("retirement journal is missing blob evidence")
     })?;
@@ -2802,7 +2903,7 @@ fn load_retirement_blob_inventory(
             "retirement blob evidence hash does not match the journal",
         ));
     }
-    let sidecar: RetirementBlobInventorySidecar = serde_json::from_slice(&bytes)?;
+    let sidecar: RetirementBlobInventorySidecar = serde_json::from_slice(bytes)?;
     if sidecar.version != 1 || sidecar.project_id != journal.project_id {
         return Err(RetirementJournalError::other(
             "retirement blob evidence identity is invalid",
@@ -2888,6 +2989,83 @@ fn validate_journal_stage_history(
 /// Maximum byte size for a retirement journal (F6: bounded read).
 const MAX_JOURNAL_BYTES: usize = 64 * 1024;
 
+#[cfg(unix)]
+fn atomic_write_retirement_leaf(
+    directory: &std::fs::File,
+    target: &str,
+    bytes: &[u8],
+) -> Result<(), RetirementJournalError> {
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = format!(".retirement.{}.{}.tmp", std::process::id(), sequence);
+    let temp_c = std::ffi::CString::new(temp.as_str())
+        .map_err(|_| RetirementJournalError::other("retirement temp filename contains NUL"))?;
+    let target_c = std::ffi::CString::new(target)
+        .map_err(|_| RetirementJournalError::other("retirement filename contains NUL"))?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let status = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            target_c.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if status == 0 {
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            return Err(RetirementJournalError::other(
+                "retirement journal target is a symlink",
+            ));
+        }
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(RetirementJournalError::other(
+                "retirement journal target is present with an invalid type",
+            ));
+        }
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error.into());
+        }
+    }
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            temp_c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        unsafe { libc::unlinkat(directory.as_raw_fd(), temp_c.as_ptr(), 0) };
+        return Err(error.into());
+    }
+    drop(file);
+    if unsafe {
+        libc::renameat(
+            directory.as_raw_fd(),
+            temp_c.as_ptr(),
+            directory.as_raw_fd(),
+            target_c.as_ptr(),
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        unsafe { libc::unlinkat(directory.as_raw_fd(), temp_c.as_ptr(), 0) };
+        return Err(error.into());
+    }
+    directory.sync_all()?;
+    Ok(())
+}
+
 /// Persist a journal to disk, syncing the file AND directory after the
 /// write (section 11.3: "each advance synced to disk"). F6: uses an
 /// anchored atomic write with fsync on both the temp file and the
@@ -2896,89 +3074,121 @@ pub fn save_retirement_journal(
     bro_home: &std::path::Path,
     journal: &ProjectRetirementJournal,
 ) -> Result<(), RetirementJournalError> {
-    let dir = bro_home.join("retirement-journals");
-    std::fs::create_dir_all(&dir)?;
-    let dir_metadata = std::fs::symlink_metadata(&dir)?;
-    if dir_metadata.file_type().is_symlink() || !dir_metadata.is_dir() {
-        return Err(RetirementJournalError::other(
-            "retirement-journals parent is not a regular directory",
-        ));
-    }
-
-    // R3F4: open the parent directory for the post-rename fsync.
-    // The directory handle ensures we sync the actual directory, not
-    // a redirected path.
     #[cfg(unix)]
-    let dir_handle = {
-        std::fs::File::open(&dir).map_err(|e| {
-            RetirementJournalError::other(&format!(
-                "failed to open retirement-journals directory: {e}"
-            ))
-        })?
-    };
-
-    let path = retirement_journal_path(bro_home, &journal.project_id);
-
-    // F6: refuse if the target path is a symlink (nofollow write).
-    if path.is_symlink() {
-        return Err(RetirementJournalError::other(
-            "retirement journal target is a symlink; refusing to write through it",
-        ));
-    }
-
-    let sidecar = RetirementBlobInventorySidecar {
-        version: 1,
-        project_id: journal.project_id.clone(),
-        blob_hashes: journal.evidence.owned_blob_hashes.clone(),
-    };
-    let sidecar_bytes = serde_json::to_vec(&sidecar)?;
-    let sidecar_path = retirement_blob_inventory_path(&path);
-    bbox_corpus_core::json_store::with_store_lock(&sidecar_path, || {
-        bbox_corpus_core::json_store::atomic_write_bytes_locked(&sidecar_path, &sidecar_bytes)
-    })
-    .map_err(|error| RetirementJournalError::other(error.to_string()))?;
-    let mut persisted = journal.clone();
-    persisted.evidence.blob_inventory = Some(RetirementBlobInventoryRef {
-        version: 1,
-        sha256: bbox_corpus_core::project_catalog_snapshot::sha256_hex(&sidecar_bytes),
-        blob_count: sidecar.blob_hashes.len() as u64,
-    });
-    let bytes = serde_json::to_vec_pretty(&persisted)?;
-
-    // Bounded write: refuse oversized journals.
-    if bytes.len() > MAX_JOURNAL_BYTES {
-        return Err(RetirementJournalError::other(
-            "retirement journal exceeds its byte limit",
-        ));
-    }
-
-    // R3F4: use a UNIQUE temp name so a crash between temp creation and
-    // rename does not permanently wedge the next save (which used a
-    // deterministic <project>.json.tmp and hit EEXIST on retry). The
-    // unique suffix includes the PID and a timestamp to avoid collisions.
-    let tmp = {
-        let unique = format!(
-            "{}-{}-{}.json.tmp",
-            journal.project_id,
-            std::process::id(),
-            unix_now_secs()
-        );
-        dir.join(unique)
-    };
-
-    // R3F4: if a stale temp from a previous crash exists at this exact
-    // unique name (extremely unlikely given PID+timestamp), remove it
-    // before creating. This is safe because the temp name is unique to
-    // this process and invocation.
-    if tmp.exists() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-
     {
+        let path = retirement_journal_path(bro_home, &journal.project_id);
+        let directory = open_retirement_parent(&path, true)?.ok_or_else(|| {
+            RetirementJournalError::other("retirement journal directory disappeared")
+        })?;
+        let sidecar = RetirementBlobInventorySidecar {
+            version: 1,
+            project_id: journal.project_id.clone(),
+            blob_hashes: journal.evidence.owned_blob_hashes.clone(),
+        };
+        let sidecar_bytes = serde_json::to_vec(&sidecar)?;
+        let mut persisted = journal.clone();
+        persisted.evidence.blob_inventory = Some(RetirementBlobInventoryRef {
+            version: 1,
+            sha256: bbox_corpus_core::project_catalog_snapshot::sha256_hex(&sidecar_bytes),
+            blob_count: sidecar.blob_hashes.len() as u64,
+        });
+        let journal_bytes = serde_json::to_vec_pretty(&persisted)?;
+        if journal_bytes.len() > MAX_JOURNAL_BYTES {
+            return Err(RetirementJournalError::other(
+                "retirement journal exceeds its byte limit",
+            ));
+        }
+        let journal_leaf = format!("{}.json", journal.project_id);
+        let sidecar_leaf = format!("{}.blobs.json", journal.project_id);
+        atomic_write_retirement_leaf(&directory, &sidecar_leaf, &sidecar_bytes)?;
+        atomic_write_retirement_leaf(&directory, &journal_leaf, &journal_bytes)?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        let dir = bro_home.join("retirement-journals");
+        std::fs::create_dir_all(&dir)?;
+        let dir_metadata = std::fs::symlink_metadata(&dir)?;
+        if dir_metadata.file_type().is_symlink() || !dir_metadata.is_dir() {
+            return Err(RetirementJournalError::other(
+                "retirement-journals parent is not a regular directory",
+            ));
+        }
+
+        // R3F4: open the parent directory for the post-rename fsync.
+        // The directory handle ensures we sync the actual directory, not
+        // a redirected path.
         #[cfg(unix)]
+        let dir_handle = {
+            std::fs::File::open(&dir).map_err(|e| {
+                RetirementJournalError::other(&format!(
+                    "failed to open retirement-journals directory: {e}"
+                ))
+            })?
+        };
+
+        let path = retirement_journal_path(bro_home, &journal.project_id);
+
+        // F6: refuse if the target path is a symlink (nofollow write).
+        if path.is_symlink() {
+            return Err(RetirementJournalError::other(
+                "retirement journal target is a symlink; refusing to write through it",
+            ));
+        }
+
+        let sidecar = RetirementBlobInventorySidecar {
+            version: 1,
+            project_id: journal.project_id.clone(),
+            blob_hashes: journal.evidence.owned_blob_hashes.clone(),
+        };
+        let sidecar_bytes = serde_json::to_vec(&sidecar)?;
+        let sidecar_path = retirement_blob_inventory_path(&path);
+        bbox_corpus_core::json_store::with_store_lock(&sidecar_path, || {
+            bbox_corpus_core::json_store::atomic_write_bytes_locked(&sidecar_path, &sidecar_bytes)
+        })
+        .map_err(|error| RetirementJournalError::other(error.to_string()))?;
+        let mut persisted = journal.clone();
+        persisted.evidence.blob_inventory = Some(RetirementBlobInventoryRef {
+            version: 1,
+            sha256: bbox_corpus_core::project_catalog_snapshot::sha256_hex(&sidecar_bytes),
+            blob_count: sidecar.blob_hashes.len() as u64,
+        });
+        let bytes = serde_json::to_vec_pretty(&persisted)?;
+
+        // Bounded write: refuse oversized journals.
+        if bytes.len() > MAX_JOURNAL_BYTES {
+            return Err(RetirementJournalError::other(
+                "retirement journal exceeds its byte limit",
+            ));
+        }
+
+        // R3F4: use a UNIQUE temp name so a crash between temp creation and
+        // rename does not permanently wedge the next save (which used a
+        // deterministic <project>.json.tmp and hit EEXIST on retry). The
+        // unique suffix includes the PID and a timestamp to avoid collisions.
+        let tmp = {
+            let unique = format!(
+                "{}-{}-{}.json.tmp",
+                journal.project_id,
+                std::process::id(),
+                unix_now_secs()
+            );
+            dir.join(unique)
+        };
+
+        // R3F4: if a stale temp from a previous crash exists at this exact
+        // unique name (extremely unlikely given PID+timestamp), remove it
+        // before creating. This is safe because the temp name is unique to
+        // this process and invocation.
+        if tmp.exists() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut file = std::fs::OpenOptions::new()
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .custom_flags(libc::O_NOFOLLOW)
@@ -2992,29 +3202,30 @@ pub fn save_retirement_journal(
                         RetirementJournalError::from(e)
                     }
                 })?;
-            std::io::Write::write_all(&mut file, &bytes)?;
-            // Fsync the file before rename so the data is durable.
-            file.sync_all()?;
+                std::io::Write::write_all(&mut file, &bytes)?;
+                // Fsync the file before rename so the data is durable.
+                file.sync_all()?;
+            }
+            #[cfg(not(unix))]
+            {
+                let mut file = std::fs::File::create_new(&tmp)?;
+                std::io::Write::write_all(&mut file, &bytes)?;
+                file.sync_all()?;
+            }
+        }
+        std::fs::rename(&tmp, &path)?;
+        // R3F4: sync the parent directory using the nofollow-opened handle.
+        #[cfg(unix)]
+        {
+            dir_handle.sync_all()?;
         }
         #[cfg(not(unix))]
         {
-            let mut file = std::fs::File::create_new(&tmp)?;
-            std::io::Write::write_all(&mut file, &bytes)?;
-            file.sync_all()?;
+            let dir_handle = std::fs::File::open(&dir)?;
+            dir_handle.sync_all()?;
         }
+        Ok(())
     }
-    std::fs::rename(&tmp, &path)?;
-    // R3F4: sync the parent directory using the nofollow-opened handle.
-    #[cfg(unix)]
-    {
-        dir_handle.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        let dir_handle = std::fs::File::open(&dir)?;
-        dir_handle.sync_all()?;
-    }
-    Ok(())
 }
 
 /// Archive (or remove) a completed journal (section 11.3 step 9).

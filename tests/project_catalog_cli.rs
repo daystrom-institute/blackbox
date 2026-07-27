@@ -1272,7 +1272,13 @@ fn retirement_execute_refuses_activation_content_mutation() {
 
 #[test]
 fn retirement_journal_resumes_each_artifact_tombstone_boundary() {
-    for boundary in ["payload_hidden", "metadata_hidden"] {
+    for boundary in [
+        "payload_hidden",
+        "metadata_hidden",
+        "before_tombstone_validation",
+        "after_tombstone_validation",
+        "before_committed_tree_delete",
+    ] {
         let directory = tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let (state, projects_path, config_path, index_path) = isolated_state_root(&root);

@@ -3071,18 +3071,121 @@ fn validate_relationship_chain(
 fn detect_incomplete_retirement_journal(bro_home: &std::path::Path) -> Result<()> {
     const MAX_RETIREMENT_JOURNALS: usize = 4096;
     let journal_dir = bro_home.join("retirement-journals");
-    match std::fs::symlink_metadata(&journal_dir) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&journal_dir)
+        {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(anyhow!(
+                    "error.code_source_retirement_journal_unavailable: {error}"
+                ));
+            }
+        };
+        #[cfg(test)]
+        if TEST_RETIREMENT_JOURNAL_SWAP_AFTER_OPEN.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            let moved = bro_home.join("retirement-journals-opened");
+            std::fs::rename(&journal_dir, &moved)?;
+            std::fs::create_dir(&journal_dir)?;
+        }
+        let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let stream = unsafe { libc::fdopendir(duplicate) };
+        if stream.is_null() {
+            unsafe { libc::close(duplicate) };
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut journals = Vec::new();
+        let mut total_entries = 0usize;
+        loop {
+            set_readdir_errno(0);
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                let error = readdir_errno();
+                unsafe { libc::closedir(stream) };
+                if error != 0 {
+                    return Err(std::io::Error::from_raw_os_error(error).into());
+                }
+                break;
+            }
+            #[cfg(test)]
+            if TEST_RETIREMENT_JOURNAL_ENUMERATION_ERROR
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                unsafe { libc::closedir(stream) };
+                return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+            }
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            total_entries += 1;
+            if total_entries > MAX_RETIREMENT_JOURNALS {
+                unsafe { libc::closedir(stream) };
+                bail!(
+                    "error.code_source_retirement_journal_unavailable: \
+                     retirement journal scan exceeds its total entry limit"
+                );
+            }
+            let name_os = std::ffi::OsString::from_vec(name.to_vec());
+            let name_path = std::path::Path::new(&name_os);
+            if name_path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            let name_c = std::ffi::CString::new(name)?;
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name_c.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                unsafe { libc::closedir(stream) };
+                return Err(anyhow!(
+                    "error.code_source_retirement_journal_unavailable: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let leaf = unsafe { std::fs::File::from_raw_fd(fd) };
+            if !leaf.metadata()?.is_file() {
+                unsafe { libc::closedir(stream) };
+                bail!(
+                    "error.code_source_retirement_journal_unavailable: \
+                     retirement journal entry is not a regular file"
+                );
+            }
+            journals.push(name_os);
+        }
+        journals.sort();
+        if let Some(first) = journals.first() {
+            let name = std::path::Path::new(first)
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("unknown");
             bail!(
-                "error.code_source_retirement_journal_unavailable: \
-                 retirement journal path is not a strict directory"
+                "error.code_source_retirement_journal_incomplete: \
+                 retirement journal '{name}' is present; \
+                 run `blackbox retirement-journal resume {name}` \
+                 with the daemon stopped to complete it"
             );
         }
-        Ok(_) => {}
+        return Ok(());
     }
+    #[cfg(not(unix))]
     let mut journals = Vec::new();
+    #[cfg(not(unix))]
     for entry in std::fs::read_dir(&journal_dir)
         .with_context(|| format!("reading retirement journal dir {}", journal_dir.display()))?
     {
@@ -3103,7 +3206,9 @@ fn detect_incomplete_retirement_journal(bro_home: &std::path::Path) -> Result<()
             }
         }
     }
+    #[cfg(not(unix))]
     journals.sort_by_key(|e| e.path());
+    #[cfg(not(unix))]
     if let Some(first) = journals.first() {
         let path = first.path();
         let name = path
@@ -3117,12 +3222,36 @@ fn detect_incomplete_retirement_journal(bro_home: &std::path::Path) -> Result<()
              with the daemon stopped to complete it"
         );
     }
+    #[cfg(not(unix))]
     Ok(())
 }
 
 #[cfg(test)]
 static TEST_RETIREMENT_JOURNAL_ENUMERATION_ERROR: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static TEST_RETIREMENT_JOURNAL_SWAP_AFTER_OPEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_readdir_errno(value: libc::c_int) {
+    unsafe { *libc::__errno_location() = value };
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn set_readdir_errno(value: libc::c_int) {
+    unsafe { *libc::__error() = value };
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn readdir_errno() -> libc::c_int {
+    unsafe { *libc::__errno_location() }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn readdir_errno() -> libc::c_int {
+    unsafe { *libc::__error() }
+}
 
 /// Reconstruct WorkspaceIndexEntry rows from validated activation records
 /// for collected projects whose workspace manifest entries are absent
@@ -9408,6 +9537,51 @@ mod tests {
         fs::write(root.join("retirement-journals/a.json"), b"{}").unwrap();
         TEST_RETIREMENT_JOURNAL_ENUMERATION_ERROR.store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(detect_incomplete_retirement_journal(&root).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p4f_retirement_journal_dangling_leaf_refuses() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let journals = root.join("retirement-journals");
+        fs::create_dir_all(&journals).unwrap();
+        std::os::unix::fs::symlink(
+            root.join("missing-journal"),
+            journals.join("project-a.json"),
+        )
+        .unwrap();
+        assert!(detect_incomplete_retirement_journal(&root).is_err());
+    }
+
+    #[test]
+    fn p4f_retirement_journal_total_entry_limit_counts_non_json() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let journals = root.join("retirement-journals");
+        fs::create_dir_all(&journals).unwrap();
+        for index in 0..=4096 {
+            fs::write(journals.join(format!("{index}.tmp")), b"").unwrap();
+        }
+        let error = detect_incomplete_retirement_journal(&root)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("total entry limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p4f_retirement_journal_directory_swap_keeps_opened_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let journals = root.join("retirement-journals");
+        fs::create_dir_all(&journals).unwrap();
+        fs::write(journals.join("project-a.json"), b"{}").unwrap();
+        TEST_RETIREMENT_JOURNAL_SWAP_AFTER_OPEN.store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = detect_incomplete_retirement_journal(&root)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("retirement_journal_incomplete"));
     }
 
     /// Section 10.1 step 5: once-only classification clears the mirror
