@@ -1855,16 +1855,12 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             &selectors,
         )
         .map_err(|error| discharge_error("packet_rows", error))?;
-        let edge_inventory = bbox_edge_sidecar::migration_inventory::EdgeRetirementInventory {
-            version: 1,
-            project_id: project_id.as_str().to_string(),
-            relative_paths: evidence.edge_paths.clone().ok_or_else(|| {
-                project_catalog_admin::admin_error(
-                    "error.project_catalog_retire_edge_evidence",
-                    "retirement evidence is missing its exact edge inventory",
-                )
-            })?,
-        };
+        let edge_inventory = evidence.edge_inventory.clone().ok_or_else(|| {
+            project_catalog_admin::admin_error(
+                "error.project_catalog_retire_edge_evidence",
+                "retirement evidence is missing its exact edge authority inventory",
+            )
+        })?;
         bbox_edge_sidecar::migration_inventory::discharge_project_retirement_inventory(
             &self.config.paths.state_dir.join("edges"),
             &edge_inventory,
@@ -2264,7 +2260,7 @@ fn validate_retirement_targets_absent(
                     && actual.published_scope == expected.published_scope
             })
         });
-    let edge_present =
+    let current_edge_inventory =
         bbox_edge_sidecar::migration_inventory::capture_project_retirement_inventory(
             &config.paths.state_dir.join("edges"),
             evidence
@@ -2278,16 +2274,10 @@ fn validate_retirement_targets_absent(
                 "error.project_catalog_retire_edge_evidence",
                 format!("failed to validate edge retirement evidence: {error}"),
             )
-        })?
-        .relative_paths
-        .iter()
-        .any(|path| {
-            evidence
-                .edge_paths
-                .as_deref()
-                .unwrap_or_default()
-                .contains(path)
-        });
+        })?;
+    let edge_present = !current_edge_inventory.relative_paths.is_empty()
+        || !current_edge_inventory.receipt_bindings.is_empty()
+        || !current_edge_inventory.receipt_closeouts.is_empty();
     if generation_present || desired_present || upload_present || edge_present {
         return Err(project_catalog_admin::admin_error(
             "error.project_catalog_retire_evidence_owner",
@@ -2893,7 +2883,8 @@ fn capture_retirement_evidence(
         owned_generations,
         desired_pointers: Some(desired_pointers),
         owned_uploads: Some(owned_uploads),
-        edge_paths: Some(edge_inventory.relative_paths),
+        edge_paths: Some(edge_inventory.relative_paths.clone()),
+        edge_inventory: Some(edge_inventory),
         artifact_targets: Some(artifact_targets),
         reference_class_counts: Some(reference_class_counts),
         reference_class_commitments: Some(reference_probe.commitments),
@@ -3026,13 +3017,23 @@ fn probe_edge_sidecar(edges_dir: &Path, project_id: &ProjectId) -> ClassProbe {
         edges_dir,
         project_id.as_str(),
     ) {
-        Ok(inventory) => ClassProbe::Committed(
-            inventory
+        Ok(inventory) => {
+            let mut commitments = inventory
                 .relative_paths
                 .iter()
-                .map(retirement_commitment)
-                .collect(),
-        ),
+                .map(|path| retirement_commitment(&format!("path:{path}")))
+                .collect::<Vec<_>>();
+            commitments.extend(inventory.receipt_bindings.iter().map(|(snapshot, digest)| {
+                retirement_commitment(&format!("receipt:{snapshot}:{digest}"))
+            }));
+            commitments.extend(inventory.receipt_closeouts.iter().map(|closeout| {
+                retirement_commitment(&format!(
+                    "closeout:{}:{}:{}",
+                    closeout.commitment, closeout.snapshot, closeout.digest
+                ))
+            }));
+            ClassProbe::Committed(commitments)
+        }
         Err(_) => ClassProbe::Unprobeable,
     }
 }

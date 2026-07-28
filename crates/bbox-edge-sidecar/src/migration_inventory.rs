@@ -24,7 +24,15 @@ const SNAPSHOT_VERSION_V1: u32 = 1;
 const SCHEMA_HASH_DOMAIN: &[u8] = b"blackbox.edge-manifest.schema.v1\0";
 const ROW_HASH_DOMAIN: &[u8] = b"blackbox.edge-manifest.workspace-rows.v1\0";
 const SOURCE_HASH_DOMAIN: &[u8] = b"blackbox.edge-manifest.source.v1\0";
-const RETIREMENT_INVENTORY_VERSION: u32 = 1;
+pub const RETIREMENT_INVENTORY_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeReceiptCloseoutEvidence {
+    pub commitment: String,
+    pub snapshot: String,
+    pub digest: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +40,8 @@ pub struct EdgeRetirementInventory {
     pub version: u32,
     pub project_id: String,
     pub relative_paths: Vec<String>,
+    pub receipt_bindings: std::collections::BTreeMap<String, String>,
+    pub receipt_closeouts: Vec<EdgeReceiptCloseoutEvidence>,
 }
 
 pub fn capture_project_retirement_inventory(
@@ -51,6 +61,8 @@ pub fn capture_project_retirement_inventory(
                 version: RETIREMENT_INVENTORY_VERSION,
                 project_id: project_id.to_string(),
                 relative_paths: Vec::new(),
+                receipt_bindings: std::collections::BTreeMap::new(),
+                receipt_closeouts: Vec::new(),
             });
         }
         Err(error) => return Err(error.into()),
@@ -81,6 +93,8 @@ pub fn capture_project_retirement_inventory(
         }
     }
 
+    let mut receipt_bindings = std::collections::BTreeMap::new();
+    let mut receipt_closeouts = Vec::new();
     if anchored.path_exists(Path::new("materialized/manifest-index.json"))? {
         let index = ManifestIndex::load(edges_dir)?;
         let active = index.workspaces.get(project_id);
@@ -93,12 +107,33 @@ pub fn capture_project_retirement_inventory(
                 insert_existing_retirement_path(&anchored, relative, &mut paths)?;
             }
         }
+        let snapshot_prefix = format!("workspace/{project_id}/snapshots/");
+        receipt_bindings.extend(
+            index
+                .receipt_managed_snapshots
+                .iter()
+                .filter(|(snapshot, _)| snapshot.starts_with(&snapshot_prefix))
+                .map(|(snapshot, digest)| (snapshot.clone(), digest.clone())),
+        );
+        receipt_closeouts.extend(
+            index
+                .receipt_closeouts
+                .iter()
+                .filter(|(_, closeout)| closeout.snapshot.starts_with(&snapshot_prefix))
+                .map(|(commitment, closeout)| EdgeReceiptCloseoutEvidence {
+                    commitment: commitment.clone(),
+                    snapshot: closeout.snapshot.clone(),
+                    digest: closeout.digest.clone(),
+                }),
+        );
     }
 
     Ok(EdgeRetirementInventory {
         version: RETIREMENT_INVENTORY_VERSION,
         project_id: project_id.to_string(),
         relative_paths: paths.into_iter().collect(),
+        receipt_bindings,
+        receipt_closeouts,
     })
 }
 
@@ -121,6 +156,14 @@ pub fn discharge_project_retirement_inventory(
     {
         anyhow::bail!("edge retirement inventory contains an invalid path");
     }
+    let expected_closeouts = inventory
+        .receipt_closeouts
+        .iter()
+        .map(|closeout| (closeout.commitment.as_str(), closeout))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if expected_closeouts.len() != inventory.receipt_closeouts.len() {
+        anyhow::bail!("edge retirement inventory contains duplicate receipt closeouts");
+    }
 
     let current = capture_project_retirement_inventory(edges_dir, &inventory.project_id)?;
     if current
@@ -129,6 +172,18 @@ pub fn discharge_project_retirement_inventory(
         .any(|path| !expected.contains(path))
     {
         anyhow::bail!("edge retirement inventory drifted after Prepared");
+    }
+    if current
+        .receipt_bindings
+        .iter()
+        .any(|(snapshot, digest)| inventory.receipt_bindings.get(snapshot) != Some(digest))
+        || current.receipt_closeouts.iter().any(|closeout| {
+            expected_closeouts
+                .get(closeout.commitment.as_str())
+                .is_none_or(|expected| *expected != closeout)
+        })
+    {
+        anyhow::bail!("edge receipt authority drifted after Prepared");
     }
 
     let index_path = manifest_index_path(edges_dir);
@@ -164,6 +219,38 @@ pub fn discharge_project_retirement_inventory(
             index.updated_at = Some(chrono_now_rfc3339());
             index.write_atomic(edges_dir)?;
             changed = true;
+        }
+        for (snapshot, digest) in &inventory.receipt_bindings {
+            match index.receipt_managed_snapshots.get(snapshot) {
+                Some(current) if current == digest => {
+                    index.receipt_managed_snapshots.remove(snapshot);
+                    changed = true;
+                }
+                Some(_) => anyhow::bail!("edge receipt binding changed during retirement"),
+                None => {}
+            }
+        }
+        for closeout in &inventory.receipt_closeouts {
+            match index.receipt_closeouts.get(&closeout.commitment) {
+                Some(current)
+                    if current.snapshot == closeout.snapshot
+                        && current.digest == closeout.digest =>
+                {
+                    index.receipt_closeouts.remove(&closeout.commitment);
+                    changed = true;
+                }
+                Some(_) => anyhow::bail!("edge receipt closeout changed during retirement"),
+                None => {}
+            }
+        }
+        let reclamations_before = index.snapshot_reclamations.len();
+        index.snapshot_reclamations.retain(|snapshot, _| {
+            !snapshot.starts_with(&format!("workspace/{}/snapshots/", inventory.project_id))
+        });
+        changed |= reclamations_before != index.snapshot_reclamations.len();
+        if changed {
+            index.updated_at = Some(chrono_now_rfc3339());
+            index.write_atomic(edges_dir)?;
         }
     }
     Ok(changed)
@@ -1204,6 +1291,8 @@ mod tests {
             version: RETIREMENT_INVENTORY_VERSION,
             project_id: "project-a".to_string(),
             relative_paths: vec!["materialized/snapshots/project-a".to_string()],
+            receipt_bindings: std::collections::BTreeMap::new(),
+            receipt_closeouts: Vec::new(),
         };
 
         fs::remove_file(root.join("materialized/snapshots/project-a")).unwrap();
@@ -1393,5 +1482,29 @@ mod tests {
                 diagnostic_code: "edge_manifest_source_byte_limit"
             }
         ));
+    }
+
+    #[test]
+    fn retirement_captures_and_discharges_receipt_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let snapshot = "workspace/project-a/snapshots/snapshot-a".to_string();
+        let commitment = format!("project-a:{}:{}", "a".repeat(64), "b".repeat(64));
+        let digest = "c".repeat(64);
+        let mut index = ManifestIndex::new();
+        index.bind_snapshot_receipt(snapshot.clone(), digest.clone());
+        index.record_receipt_closeout(commitment.clone(), snapshot.clone(), digest.clone());
+        index.write_atomic(&root).unwrap();
+
+        let inventory = capture_project_retirement_inventory(&root, "project-a").unwrap();
+        assert_eq!(inventory.receipt_bindings.get(&snapshot), Some(&digest));
+        assert_eq!(inventory.receipt_closeouts.len(), 1);
+        assert_eq!(inventory.receipt_closeouts[0].commitment, commitment);
+
+        assert!(discharge_project_retirement_inventory(&root, &inventory).unwrap());
+        let remaining = capture_project_retirement_inventory(&root, "project-a").unwrap();
+        assert!(remaining.relative_paths.is_empty());
+        assert!(remaining.receipt_bindings.is_empty());
+        assert!(remaining.receipt_closeouts.is_empty());
     }
 }

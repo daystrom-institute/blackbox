@@ -287,8 +287,8 @@ fn commit_snapshot_publications(
     writer: &mut IndexWriter,
     edges_dir: &Path,
     mut publication: super::project_files::PublicationResult,
-) -> Result<super::project_files::PublicationResult> {
-    let attempt = (|| -> Result<()> {
+) -> Result<(super::project_files::PublicationResult, String)> {
+    let attempt = (|| -> Result<String> {
         let prior_payload = index
             .load_metas()
             .context("loading prior index payload before snapshot commit")?
@@ -305,19 +305,22 @@ fn commit_snapshot_publications(
             prepared.set_payload(&payload);
         }
         prepared.commit()?;
-        Ok(())
+        Ok(payload)
     })();
 
-    if let Err(error) = attempt {
-        if let Err(cleanup) = publication.rollback_pending() {
-            return Err(error).context(format!(
-                "snapshot commit failed and rollback also failed: {cleanup:#}"
-            ));
+    let payload = match attempt {
+        Ok(payload) => payload,
+        Err(error) => {
+            if let Err(cleanup) = publication.rollback_pending() {
+                return Err(error).context(format!(
+                    "snapshot commit failed and rollback also failed: {cleanup:#}"
+                ));
+            }
+            return Err(error);
         }
-        return Err(error);
-    }
+    };
     publication.mark_commit_succeeded();
-    Ok(publication)
+    Ok((publication, payload))
 }
 
 /// Derived effective source for one catalog project at planning time
@@ -1533,9 +1536,13 @@ fn run_collected_stage(
     // No checkout lease contributed to this bundle, so there is no
     // publication guard to hold: the broker's guard exists to pin checkout
     // lifecycle across publish, and this transaction touched no checkout.
-    let publication_result =
+    let (publication_result, commit_payload) =
         commit_snapshot_publications(&ctx.index, &mut writer, &edges_dir, publication.publish()?)?;
     publication_result.finalize_publications()?;
+    bbox_edge_sidecar::snapshot::prune_receipt_closeouts_after_commit(
+        &edges_dir,
+        (!commit_payload.is_empty()).then_some(commit_payload.as_str()),
+    )?;
     post_commit(ctx);
     Ok(result)
 }
@@ -1644,9 +1651,13 @@ fn run_local_stage(
     let _publication_guard = ctx
         .checkout_access
         .publication_guard_for([&local_lease, &git_lease])?;
-    let publication_result =
+    let (publication_result, commit_payload) =
         commit_snapshot_publications(&ctx.index, &mut writer, &edges_dir, publication.publish()?)?;
     publication_result.finalize_publications()?;
+    bbox_edge_sidecar::snapshot::prune_receipt_closeouts_after_commit(
+        &edges_dir,
+        (!commit_payload.is_empty()).then_some(commit_payload.as_str()),
+    )?;
     post_commit(ctx);
     Ok(result)
 }
@@ -1692,9 +1703,13 @@ fn run_git_current_overlay(
     drop(git_ctx);
     publication.stage_snapshot_git_current(&edges_dir, &project.project_id, snapshot_id, true);
     let _publication_guard = ctx.checkout_access.publication_guard(lease)?;
-    let publication_result =
+    let (publication_result, commit_payload) =
         commit_snapshot_publications(&ctx.index, &mut writer, &edges_dir, publication.publish()?)?;
     publication_result.finalize_publications()?;
+    bbox_edge_sidecar::snapshot::prune_receipt_closeouts_after_commit(
+        &edges_dir,
+        (!commit_payload.is_empty()).then_some(commit_payload.as_str()),
+    )?;
     post_commit(ctx);
     Ok(())
 }
@@ -1777,7 +1792,7 @@ fn run_consolidated_history(
         }
         return Err(error);
     }
-    let commit_attempt = (|| -> Result<()> {
+    let commit_attempt = (|| -> Result<String> {
         let prior_payload = ctx
             .index
             .load_metas()
@@ -1798,23 +1813,26 @@ fn run_consolidated_history(
             prepared.set_payload(&payload);
         }
         prepared.commit()?;
-        Ok(())
+        Ok(payload)
     })();
-    if let Err(error) = commit_attempt {
-        let mut cleanup_failures = Vec::new();
-        for publication in &mut publications {
-            if let Err(cleanup) = publication.rollback_pending() {
-                cleanup_failures.push(format!("{cleanup:#}"));
+    let commit_payload = match commit_attempt {
+        Ok(payload) => payload,
+        Err(error) => {
+            let mut cleanup_failures = Vec::new();
+            for publication in &mut publications {
+                if let Err(cleanup) = publication.rollback_pending() {
+                    cleanup_failures.push(format!("{cleanup:#}"));
+                }
             }
+            if !cleanup_failures.is_empty() {
+                return Err(error).context(format!(
+                    "snapshot commit failed and rollback left unresolved state: {}",
+                    cleanup_failures.join("; ")
+                ));
+            }
+            return Err(error);
         }
-        if !cleanup_failures.is_empty() {
-            return Err(error).context(format!(
-                "snapshot commit failed and rollback left unresolved state: {}",
-                cleanup_failures.join("; ")
-            ));
-        }
-        return Err(error);
-    }
+    };
     let mut all_handles = Vec::new();
     for publication in &mut publications {
         publication.mark_commit_succeeded();
@@ -1833,6 +1851,10 @@ fn run_consolidated_history(
             return Err(error);
         }
     }
+    bbox_edge_sidecar::snapshot::prune_receipt_closeouts_after_commit(
+        &edges_dir,
+        (!commit_payload.is_empty()).then_some(commit_payload.as_str()),
+    )?;
     post_commit(ctx);
     Ok(written)
 }

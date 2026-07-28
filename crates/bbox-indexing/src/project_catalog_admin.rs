@@ -2214,7 +2214,7 @@ pub struct ProjectRetirementJournal {
 }
 
 impl ProjectRetirementJournal {
-    pub const VERSION: u32 = 5;
+    pub const VERSION: u32 = 6;
 
     pub fn new(project_id: ProjectId, catalog_epoch: u64, now: &str) -> Self {
         let mut journal = Self {
@@ -2231,6 +2231,16 @@ impl ProjectRetirementJournal {
                 desired_pointers: Some(Vec::new()),
                 owned_uploads: Some(Vec::new()),
                 edge_paths: Some(Vec::new()),
+                edge_inventory: Some(
+                    bbox_edge_sidecar::migration_inventory::EdgeRetirementInventory {
+                        version:
+                            bbox_edge_sidecar::migration_inventory::RETIREMENT_INVENTORY_VERSION,
+                        project_id: project_id.as_str().to_string(),
+                        relative_paths: Vec::new(),
+                        receipt_bindings: std::collections::BTreeMap::new(),
+                        receipt_closeouts: Vec::new(),
+                    },
+                ),
                 artifact_targets: Some(Vec::new()),
                 reference_class_counts: Some(std::collections::BTreeMap::new()),
                 reference_class_commitments: Some(std::collections::BTreeMap::new()),
@@ -2310,6 +2320,10 @@ pub struct RetirementJournalEvidence {
     /// Exact project-owned edge lanes and materialized paths captured at
     /// Prepared. Paths are relative to the configured edge root.
     pub edge_paths: Option<Vec<String>>,
+
+    /// Exact edge workspace, receipt binding, and closeout authority captured
+    /// before retirement begins.
+    pub edge_inventory: Option<bbox_edge_sidecar::migration_inventory::EdgeRetirementInventory>,
 
     /// Exact artifact payload plus metadata targets captured at Prepared.
     pub artifact_targets: Option<Vec<bbox_artifacts::artifacts::ArtifactRetirementTarget>>,
@@ -2731,6 +2745,42 @@ fn validate_journal_evidence_shape(
             ));
         }
     }
+    let edge_inventory = journal.evidence.edge_inventory.as_ref().ok_or_else(|| {
+        RetirementJournalError::other("retirement journal is missing its edge authority evidence")
+    })?;
+    if edge_inventory.project_id != journal.project_id.as_str()
+        || edge_inventory.version
+            != bbox_edge_sidecar::migration_inventory::RETIREMENT_INVENTORY_VERSION
+        || edge_inventory.relative_paths.as_slice() != edge_paths.as_slice()
+    {
+        return Err(RetirementJournalError::other(
+            "retirement journal edge authority evidence is not bound to its owner and paths",
+        ));
+    }
+    let snapshot_prefix = format!("workspace/{}/snapshots/", journal.project_id.as_str());
+    if edge_inventory
+        .receipt_bindings
+        .iter()
+        .any(|(snapshot, digest)| {
+            !snapshot.starts_with(&snapshot_prefix) || !validate_sha256_text(digest)
+        })
+        || edge_inventory.receipt_closeouts.iter().any(|closeout| {
+            closeout.commitment.is_empty()
+                || !closeout.snapshot.starts_with(&snapshot_prefix)
+                || !validate_sha256_text(&closeout.digest)
+        })
+        || edge_inventory
+            .receipt_closeouts
+            .iter()
+            .map(|closeout| closeout.commitment.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != edge_inventory.receipt_closeouts.len()
+    {
+        return Err(RetirementJournalError::other(
+            "retirement journal edge receipt authority evidence is invalid",
+        ));
+    }
     let artifact_targets = journal.evidence.artifact_targets.as_ref().ok_or_else(|| {
         RetirementJournalError::other("retirement journal is missing artifact target evidence")
     })?;
@@ -2809,6 +2859,7 @@ pub fn retirement_evidence_sha256(evidence: &RetirementJournalEvidence) -> Strin
         &evidence.desired_pointers,
         &evidence.owned_uploads,
         &evidence.edge_paths,
+        &evidence.edge_inventory,
         &evidence.artifact_targets,
         &evidence.reference_class_counts,
         &evidence.reference_class_commitments,
@@ -3513,6 +3564,15 @@ pub trait RetirementDischargeWorkers {
             desired_pointers: Some(Vec::new()),
             owned_uploads: Some(Vec::new()),
             edge_paths: Some(Vec::new()),
+            edge_inventory: Some(
+                bbox_edge_sidecar::migration_inventory::EdgeRetirementInventory {
+                    version: bbox_edge_sidecar::migration_inventory::RETIREMENT_INVENTORY_VERSION,
+                    project_id: project_id.as_str().to_string(),
+                    relative_paths: Vec::new(),
+                    receipt_bindings: std::collections::BTreeMap::new(),
+                    receipt_closeouts: Vec::new(),
+                },
+            ),
             artifact_targets: Some(Vec::new()),
             reference_class_counts: Some(std::collections::BTreeMap::new()),
             reference_class_commitments: Some(std::collections::BTreeMap::new()),
@@ -3637,6 +3697,15 @@ impl RetirementDischargeWorkers for NoopDischargeWorkers {
             desired_pointers: Some(Vec::new()),
             owned_uploads: Some(Vec::new()),
             edge_paths: Some(Vec::new()),
+            edge_inventory: Some(
+                bbox_edge_sidecar::migration_inventory::EdgeRetirementInventory {
+                    version: bbox_edge_sidecar::migration_inventory::RETIREMENT_INVENTORY_VERSION,
+                    project_id: project_id.as_str().to_string(),
+                    relative_paths: Vec::new(),
+                    receipt_bindings: std::collections::BTreeMap::new(),
+                    receipt_closeouts: Vec::new(),
+                },
+            ),
             artifact_targets: Some(Vec::new()),
             reference_class_counts: Some(std::collections::BTreeMap::new()),
             reference_class_commitments: Some(std::collections::BTreeMap::new()),

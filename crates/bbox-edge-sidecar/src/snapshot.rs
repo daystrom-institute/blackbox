@@ -222,8 +222,19 @@ pub fn remove_inactive_snapshot_tree(
         let snapshot_relative = format!("workspace/{project_id}/snapshots/{snapshot_id}");
 
         let mut manifest = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
-        if manifest.snapshot_is_active(&snapshot_relative)
-            || snapshot_has_pending_journal(edges_dir, project_id, snapshot_id)?
+        let existing_intent = manifest
+            .snapshot_reclamations
+            .get(&snapshot_relative)
+            .cloned();
+        if manifest.snapshot_is_active(&snapshot_relative) {
+            if existing_intent.is_some() {
+                anyhow::bail!("snapshot became active during durable reclamation");
+            }
+            return Ok(false);
+        }
+        if existing_intent.is_none()
+            && (snapshot_has_pending_journal(edges_dir, project_id, snapshot_id)?
+                || snapshot_has_pending_local_activation(edges_dir, project_id, snapshot_id)?)
         {
             return Ok(false);
         }
@@ -244,6 +255,12 @@ pub fn remove_inactive_snapshot_tree(
             if fd < 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() == std::io::ErrorKind::NotFound {
+                    if existing_intent.is_some() {
+                        manifest.snapshot_reclamations.remove(&snapshot_relative);
+                        manifest.prune_snapshot_receipt_state(&snapshot_relative);
+                        manifest.write_atomic(edges_dir)?;
+                        return Ok(true);
+                    }
                     return Ok(false);
                 }
                 return Err(error.into());
@@ -251,44 +268,107 @@ pub fn remove_inactive_snapshot_tree(
             directory = unsafe { fs::File::from_raw_fd(fd) };
         }
         let leaf = std::ffi::CString::new(components[4].as_bytes())?;
-        let stat = match fstatat_nofollow(directory.as_raw_fd(), &leaf) {
-            Ok(stat) => stat,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error.into()),
-        };
-        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
-            || (stat.st_dev as u64, stat.st_ino as u64) != expected_identity
-        {
-            anyhow::bail!("inactive snapshot directory identity changed before deletion");
-        }
-        let snapshot_dir = open_confined_dir_fd(directory.as_raw_fd(), &leaf)?;
-        let staging = std::ffi::CString::new(".staging")?;
-        match fstatat_nofollow(snapshot_dir.as_raw_fd(), &staging) {
-            Ok(_) => anyhow::bail!("refusing to delete a staged snapshot directory"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        let loaded = load_snapshot_receipt_from_dir(&snapshot_dir, project_id, snapshot_id)?;
-        match (
-            manifest.receipt_managed_snapshots.get(&snapshot_relative),
-            loaded,
-        ) {
-            (Some(expected), Some(loaded)) if expected == &loaded.digest => {}
-            (Some(_), _) => {
-                anyhow::bail!("inactive snapshot receipt does not match manifest authority")
+        let intent = if let Some(intent) = existing_intent {
+            intent
+        } else {
+            let stat = match fstatat_nofollow(directory.as_raw_fd(), &leaf) {
+                Ok(stat) => stat,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+            if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+                || (stat.st_dev as u64, stat.st_ino as u64) != expected_identity
+            {
+                anyhow::bail!("inactive snapshot directory identity changed before deletion");
             }
-            (None, Some(_)) if manifest.receipt_protocol_version != 0 => {
-                anyhow::bail!("inactive snapshot receipt is not bound by the manifest")
+            let snapshot_dir = open_confined_dir_fd(directory.as_raw_fd(), &leaf)?;
+            let staging = std::ffi::CString::new(".staging")?;
+            match fstatat_nofollow(snapshot_dir.as_raw_fd(), &staging) {
+                Ok(_) => anyhow::bail!("refusing to delete a staged snapshot directory"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
-            _ => {}
-        }
-        drop(snapshot_dir);
-
-        if manifest.prune_snapshot_receipt_state(&snapshot_relative) {
+            let loaded = load_snapshot_receipt_from_dir(&snapshot_dir, project_id, snapshot_id)?;
+            match (
+                manifest.receipt_managed_snapshots.get(&snapshot_relative),
+                loaded,
+            ) {
+                (Some(expected), Some(loaded)) if expected == &loaded.digest => {}
+                (Some(_), _) => {
+                    anyhow::bail!("inactive snapshot receipt does not match manifest authority")
+                }
+                (None, Some(_)) if manifest.receipt_protocol_version != 0 => {
+                    anyhow::bail!("inactive snapshot receipt is not bound by the manifest")
+                }
+                _ => {}
+            }
+            drop(snapshot_dir);
+            let tombstone = format!(".reclaim-{snapshot_id}");
+            validate_snapshot_component(&tombstone)?;
+            let tombstone_c = std::ffi::CString::new(tombstone.as_bytes())?;
+            match fstatat_nofollow(directory.as_raw_fd(), &tombstone_c) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => anyhow::bail!("inactive snapshot reclamation tombstone already exists"),
+                Err(error) => return Err(error.into()),
+            }
+            let intent = crate::manifest::SnapshotReclamationIntent {
+                receipt_digest: manifest
+                    .receipt_managed_snapshots
+                    .get(&snapshot_relative)
+                    .cloned(),
+                tombstone,
+                device: stat.st_dev as u64,
+                inode: stat.st_ino as u64,
+            };
+            manifest
+                .snapshot_reclamations
+                .insert(snapshot_relative.clone(), intent.clone());
             manifest.write_atomic(edges_dir)?;
+            intent
+        };
+        let tombstone = std::ffi::CString::new(intent.tombstone.as_bytes())?;
+        match fstatat_nofollow(directory.as_raw_fd(), &tombstone) {
+            Ok(stat)
+                if stat.st_mode & libc::S_IFMT == libc::S_IFDIR
+                    && (stat.st_dev as u64, stat.st_ino as u64)
+                        == (intent.device, intent.inode) => {}
+            Ok(_) => anyhow::bail!("inactive snapshot reclamation tombstone identity changed"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let stat = match fstatat_nofollow(directory.as_raw_fd(), &leaf) {
+                    Ok(stat) => stat,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        manifest.snapshot_reclamations.remove(&snapshot_relative);
+                        manifest.prune_snapshot_receipt_state(&snapshot_relative);
+                        manifest.write_atomic(edges_dir)?;
+                        return Ok(true);
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+                    || (stat.st_dev as u64, stat.st_ino as u64) != (intent.device, intent.inode)
+                {
+                    anyhow::bail!("inactive snapshot changed before reclamation publication");
+                }
+                if unsafe {
+                    libc::renameat(
+                        directory.as_raw_fd(),
+                        leaf.as_ptr(),
+                        directory.as_raw_fd(),
+                        tombstone.as_ptr(),
+                    )
+                } != 0
+                {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                directory.sync_all()?;
+            }
+            Err(error) => return Err(error.into()),
         }
-        unlinkat_tree(directory.as_raw_fd(), &leaf)?;
+        unlinkat_tree(directory.as_raw_fd(), &tombstone)?;
         directory.sync_all()?;
+        manifest.snapshot_reclamations.remove(&snapshot_relative);
+        manifest.prune_snapshot_receipt_state(&snapshot_relative);
+        manifest.write_atomic(edges_dir)?;
         Ok(true)
     })
 }
@@ -315,16 +395,60 @@ pub fn remove_inactive_snapshot_tree(
     let snapshot_relative = format!("workspace/{project_id}/snapshots/{snapshot_id}");
     with_manifest_coordinator(|| {
         let mut manifest = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
-        if manifest.snapshot_is_active(&snapshot_relative)
-            || snapshot_has_pending_journal(edges_dir, project_id, snapshot_id)?
+        let existing_intent = manifest
+            .snapshot_reclamations
+            .get(&snapshot_relative)
+            .cloned();
+        if manifest.snapshot_is_active(&snapshot_relative) {
+            if existing_intent.is_some() {
+                anyhow::bail!("snapshot became active during durable reclamation");
+            }
+            return Ok(false);
+        }
+        if existing_intent.is_none()
+            && (snapshot_has_pending_journal(edges_dir, project_id, snapshot_id)?
+                || snapshot_has_pending_local_activation(edges_dir, project_id, snapshot_id)?)
         {
             return Ok(false);
         }
-        validate_nonunix_directory_chain(edges_dir, &path)?;
-        if manifest.prune_snapshot_receipt_state(&snapshot_relative) {
+        let intent = if let Some(intent) = existing_intent {
+            intent
+        } else {
+            validate_nonunix_directory_chain(edges_dir, &path)?;
+            let intent = crate::manifest::SnapshotReclamationIntent {
+                receipt_digest: manifest
+                    .receipt_managed_snapshots
+                    .get(&snapshot_relative)
+                    .cloned(),
+                tombstone: format!(".reclaim-{snapshot_id}"),
+                device: 0,
+                inode: 0,
+            };
+            manifest
+                .snapshot_reclamations
+                .insert(snapshot_relative.clone(), intent.clone());
             manifest.write_atomic(edges_dir)?;
+            intent
+        };
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("inactive snapshot has no parent"))?;
+        let tombstone = parent.join(&intent.tombstone);
+        if !tombstone.exists() {
+            match fs::rename(&path, &tombstone) {
+                Ok(()) => fs::File::open(parent)?.sync_all()?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
-        fs::remove_dir_all(path)?;
+        match fs::remove_dir_all(tombstone) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        manifest.snapshot_reclamations.remove(&snapshot_relative);
+        manifest.prune_snapshot_receipt_state(&snapshot_relative);
+        manifest.write_atomic(edges_dir)?;
         Ok(true)
     })
 }
@@ -838,6 +962,33 @@ fn pending_local_activations_path(edges_dir: &Path) -> PathBuf {
     crate::manifest::materialized_dir(edges_dir).join(PENDING_LOCAL_ACTIVATIONS_FILENAME)
 }
 
+fn pin_pending_local_activation(
+    edges_dir: &Path,
+    activation: &PendingLocalSnapshotActivation,
+) -> Result<()> {
+    let mut activations = load_pending_local_activation_journal(edges_dir)?
+        .map(|journal| journal.activations)
+        .unwrap_or_default();
+    activations.retain(|current| current.project_id != activation.project_id);
+    activations.push(activation.clone());
+    write_pending_local_activation_journal(edges_dir, &activations)?;
+    Ok(())
+}
+
+fn snapshot_has_pending_local_activation(
+    edges_dir: &Path,
+    project_id: &str,
+    snapshot_id: &str,
+) -> Result<bool> {
+    Ok(
+        load_pending_local_activation_journal(edges_dir)?.is_some_and(|journal| {
+            journal.activations.iter().any(|activation| {
+                activation.project_id == project_id && activation.snapshot_id == snapshot_id
+            })
+        }),
+    )
+}
+
 pub fn write_pending_local_activation_journal(
     edges_dir: &Path,
     activations: &[PendingLocalSnapshotActivation],
@@ -1001,6 +1152,16 @@ pub fn stage_local_snapshot_activation(
     symbol_edges: &[Edge],
     git_current_edges: &[Edge],
 ) -> Result<PendingLocalSnapshotActivation> {
+    let activation = PendingLocalSnapshotActivation {
+        project_id: project_id.to_string(),
+        repo_id: repo_id.to_string(),
+        branch: branch.map(str::to_string),
+        head_sha: head_sha.to_string(),
+        dirty,
+        dirty_fingerprint: dirty_fingerprint.map(str::to_string),
+        snapshot_id: snapshot_id.to_string(),
+    };
+    pin_pending_local_activation(edges_dir, &activation)?;
     write_snapshot_files(
         edges_dir,
         project_id,
@@ -1011,15 +1172,7 @@ pub fn stage_local_snapshot_activation(
             ("git-current.jsonl", git_current_edges),
         ],
     )?;
-    Ok(PendingLocalSnapshotActivation {
-        project_id: project_id.to_string(),
-        repo_id: repo_id.to_string(),
-        branch: branch.map(str::to_string),
-        head_sha: head_sha.to_string(),
-        dirty,
-        dirty_fingerprint: dirty_fingerprint.map(str::to_string),
-        snapshot_id: snapshot_id.to_string(),
-    })
+    Ok(activation)
 }
 
 /// Write member files into a snapshot directory. This is used for both
@@ -2888,6 +3041,7 @@ pub fn recover_pending_transactions_prebind(
     edges_dir: &Path,
     commit_payload: Option<&str>,
 ) -> Result<()> {
+    recover_snapshot_reclamations_prebind(edges_dir)?;
     with_manifest_coordinator(|| {
         let index = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
         // R21F2: parse payload as a set of commitments.
@@ -2936,6 +3090,78 @@ pub fn recover_pending_transactions_prebind(
         }
         Ok(())
     })
+}
+
+pub fn prune_receipt_closeouts_after_commit(
+    edges_dir: &Path,
+    commit_payload: Option<&str>,
+) -> Result<()> {
+    let retained = commit_payload
+        .map(|payload| {
+            payload
+                .split(',')
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+    with_manifest_coordinator(|| {
+        let mut index = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
+        if index.prune_receipt_closeouts(&retained) {
+            index.write_atomic(edges_dir)?;
+        }
+        Ok(())
+    })
+}
+
+fn recover_snapshot_reclamations_prebind(edges_dir: &Path) -> Result<()> {
+    let mut index = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
+    let intents = index
+        .snapshot_reclamations
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    for snapshot in intents {
+        if index.snapshot_is_active(&snapshot) {
+            index.snapshot_reclamations.remove(&snapshot);
+            index.write_atomic(edges_dir)?;
+            continue;
+        }
+        let root_relative = Path::new("materialized").join(&snapshot);
+        let path = edges_dir.join(&root_relative);
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) => (metadata.dev() as u64, metadata.ino() as u64),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (0, 0),
+                Err(error) => return Err(error.into()),
+            }
+        };
+        #[cfg(not(unix))]
+        let identity = (0, 0);
+        remove_inactive_snapshot_tree(edges_dir, &root_relative, identity)?;
+        index = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
+    }
+
+    let stale_absent = index
+        .receipt_managed_snapshots
+        .keys()
+        .filter(|snapshot| !index.snapshot_is_active(snapshot))
+        .filter(|snapshot| {
+            !crate::manifest::materialized_dir(edges_dir)
+                .join(snapshot.as_str())
+                .exists()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !stale_absent.is_empty() {
+        for snapshot in stale_absent {
+            index.prune_snapshot_receipt_state(&snapshot);
+        }
+        index.write_atomic(edges_dir)?;
+    }
+    Ok(())
 }
 
 fn verify_receipt_closeout(
@@ -3083,6 +3309,14 @@ pub fn pending_snapshot_paths(edges_dir: &Path) -> Result<std::collections::BTre
                     journal.snapshot_id
                 ));
             }
+        }
+    }
+    if let Some(journal) = load_pending_local_activation_journal(edges_dir)? {
+        for activation in journal.activations {
+            snapshots.insert(format!(
+                "workspace/{}/snapshots/{}",
+                activation.project_id, activation.snapshot_id
+            ));
         }
     }
     Ok(snapshots)
@@ -8567,5 +8801,118 @@ mod tests {
             .active_paths_for_loader(&edges_dir)
             .unwrap_err();
         assert!(format!("{error:#}").contains("hash"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r26_local_snapshot_is_pinned_before_activation() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let activation = stage_local_snapshot_activation(
+            &edges_dir,
+            "p_1",
+            "repo_1",
+            Some("main"),
+            "head-a",
+            false,
+            None,
+            "snapshot-a",
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(activation.snapshot_id(), "snapshot-a");
+        assert!(
+            pending_snapshot_paths(&edges_dir)
+                .unwrap()
+                .contains("workspace/p_1/snapshots/snapshot-a")
+        );
+
+        let snapshot = snapshot_dir(&edges_dir, "p_1", "snapshot-a");
+        let metadata = fs::symlink_metadata(&snapshot).unwrap();
+        assert!(
+            !remove_inactive_snapshot_tree(
+                &edges_dir,
+                Path::new("materialized/workspace/p_1/snapshots/snapshot-a"),
+                (metadata.dev() as u64, metadata.ino() as u64),
+            )
+            .unwrap()
+        );
+        assert!(snapshot.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r26_reclamation_resumes_from_published_tombstone() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        write_snapshot_files(
+            &edges_dir,
+            "p_1",
+            "snapshot-a",
+            &[("project.jsonl", &[]), ("symbols.jsonl", &[])],
+        )
+        .unwrap();
+        let snapshot = snapshot_dir(&edges_dir, "p_1", "snapshot-a");
+        let metadata = fs::symlink_metadata(&snapshot).unwrap();
+        let tombstone = snapshot.parent().unwrap().join(".reclaim-snapshot-a");
+        let mut manifest = ManifestIndex::new();
+        manifest.snapshot_reclamations.insert(
+            "workspace/p_1/snapshots/snapshot-a".to_string(),
+            crate::manifest::SnapshotReclamationIntent {
+                receipt_digest: None,
+                tombstone: ".reclaim-snapshot-a".to_string(),
+                device: metadata.dev() as u64,
+                inode: metadata.ino() as u64,
+            },
+        );
+        manifest.write_atomic(&edges_dir).unwrap();
+        fs::rename(&snapshot, &tombstone).unwrap();
+        fs::remove_file(tombstone.join("project.jsonl")).unwrap();
+        fs::File::open(tombstone.parent().unwrap())
+            .unwrap()
+            .sync_all()
+            .unwrap();
+
+        recover_pending_transactions_prebind(&edges_dir, None).unwrap();
+        assert!(!snapshot.exists());
+        assert!(!tombstone.exists());
+        assert!(
+            ManifestIndex::load(&edges_dir)
+                .unwrap()
+                .snapshot_reclamations
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn r26_post_commit_prunes_superseded_closeouts() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let old = "p_1:old:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let current =
+            "p_1:current:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let mut manifest = ManifestIndex::new();
+        manifest.record_receipt_closeout(
+            old.to_string(),
+            "workspace/p_1/snapshots/snapshot-a".to_string(),
+            "b".repeat(64),
+        );
+        manifest.record_receipt_closeout(
+            current.to_string(),
+            "workspace/p_1/snapshots/snapshot-a".to_string(),
+            "d".repeat(64),
+        );
+        manifest.write_atomic(&edges_dir).unwrap();
+
+        prune_receipt_closeouts_after_commit(&edges_dir, Some(current)).unwrap();
+        let manifest = ManifestIndex::load(&edges_dir).unwrap();
+        assert_eq!(manifest.receipt_closeouts.len(), 1);
+        assert!(manifest.receipt_closeouts.contains_key(current));
     }
 }

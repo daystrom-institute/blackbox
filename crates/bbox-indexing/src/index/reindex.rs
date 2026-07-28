@@ -777,10 +777,10 @@ pub(super) fn execute_reindex_pass(
             prepared.set_payload(&payload);
         }
         prepared.commit()?;
-        Ok(pending_journal)
+        Ok((pending_journal, payload))
     })();
-    let pending_journal = match commit_attempt {
-        Ok(journal) => journal,
+    let (pending_journal, commit_payload) = match commit_attempt {
+        Ok(result) => result,
         Err(error) => {
             if let Err(cleanup) = project_publication_result.rollback_pending() {
                 return Err(error).context(format!(
@@ -805,6 +805,10 @@ pub(super) fn execute_reindex_pass(
             return Err(error);
         }
     }
+    bbox_edge_sidecar::snapshot::prune_receipt_closeouts_after_commit(
+        &edges_dir,
+        (!commit_payload.is_empty()).then_some(commit_payload.as_str()),
+    )?;
     if let Some(journal) = pending_journal {
         bbox_edge_sidecar::snapshot::activate_pending_local_snapshots(
             &edges_dir,

@@ -266,6 +266,14 @@ pub(crate) struct ReceiptCloseout {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct SnapshotReclamationIntent {
+    pub receipt_digest: Option<String>,
+    pub tombstone: String,
+    pub device: u64,
+    pub inode: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ManifestIndex {
     pub version: u32,
     pub workspaces: std::collections::BTreeMap<String, WorkspaceIndexEntry>,
@@ -277,6 +285,8 @@ pub struct ManifestIndex {
     pub(crate) receipt_managed_snapshots: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub(crate) receipt_closeouts: std::collections::BTreeMap<String, ReceiptCloseout>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) snapshot_reclamations: std::collections::BTreeMap<String, SnapshotReclamationIntent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
 }
@@ -290,6 +300,7 @@ impl ManifestIndex {
             receipt_protocol_version: RECEIPT_PROTOCOL_VERSION,
             receipt_managed_snapshots: std::collections::BTreeMap::new(),
             receipt_closeouts: std::collections::BTreeMap::new(),
+            snapshot_reclamations: std::collections::BTreeMap::new(),
             updated_at: None,
         }
     }
