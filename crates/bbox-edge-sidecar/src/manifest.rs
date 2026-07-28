@@ -260,6 +260,12 @@ pub struct WorkspaceIndexEntry {
 pub const GIT_CURRENT_MEMBER: &str = "git-current.jsonl";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct ReceiptCloseout {
+    pub snapshot: String,
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ManifestIndex {
     pub version: u32,
     pub workspaces: std::collections::BTreeMap<String, WorkspaceIndexEntry>,
@@ -269,6 +275,8 @@ pub struct ManifestIndex {
     pub(crate) receipt_protocol_version: u32,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub(crate) receipt_managed_snapshots: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) receipt_closeouts: std::collections::BTreeMap<String, ReceiptCloseout>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
 }
@@ -281,6 +289,7 @@ impl ManifestIndex {
             retirement_tombstones: std::collections::BTreeMap::new(),
             receipt_protocol_version: RECEIPT_PROTOCOL_VERSION,
             receipt_managed_snapshots: std::collections::BTreeMap::new(),
+            receipt_closeouts: std::collections::BTreeMap::new(),
             updated_at: None,
         }
     }
@@ -347,6 +356,53 @@ impl ManifestIndex {
         self.receipt_protocol_version = RECEIPT_PROTOCOL_VERSION;
         self.receipt_managed_snapshots.insert(snapshot, digest);
         self.updated_at = Some(chrono_now_rfc3339());
+    }
+
+    pub(crate) fn record_receipt_closeout(
+        &mut self,
+        commitment: String,
+        snapshot: String,
+        digest: String,
+    ) {
+        self.receipt_closeouts
+            .insert(commitment, ReceiptCloseout { snapshot, digest });
+        self.updated_at = Some(chrono_now_rfc3339());
+    }
+
+    pub(crate) fn prune_receipt_closeouts(
+        &mut self,
+        retained: &std::collections::HashSet<String>,
+    ) -> bool {
+        let before = self.receipt_closeouts.len();
+        self.receipt_closeouts
+            .retain(|commitment, _| retained.contains(commitment));
+        before != self.receipt_closeouts.len()
+    }
+
+    pub(crate) fn prune_snapshot_receipt_state(&mut self, snapshot: &str) -> bool {
+        let mut changed = self.receipt_managed_snapshots.remove(snapshot).is_some();
+        let before = self.receipt_closeouts.len();
+        self.receipt_closeouts
+            .retain(|_, closeout| closeout.snapshot != snapshot);
+        changed |= before != self.receipt_closeouts.len();
+        if changed {
+            self.updated_at = Some(chrono_now_rfc3339());
+        }
+        changed
+    }
+
+    pub(crate) fn snapshot_is_active(&self, snapshot: &str) -> bool {
+        self.workspaces
+            .values()
+            .any(|entry| entry.active_snapshot.as_deref() == Some(snapshot))
+    }
+
+    pub fn has_snapshot_receipt_binding(&self, snapshot: &str) -> bool {
+        self.receipt_managed_snapshots.contains_key(snapshot)
+    }
+
+    pub fn snapshot_receipt_binding_count(&self) -> usize {
+        self.receipt_managed_snapshots.len()
     }
 
     pub fn discharge_project_workspace(edges_dir: &Path, project_id: &str) -> Result<bool> {
@@ -590,6 +646,7 @@ impl ManifestIndex {
                 let snapshot_dir = materialized_dir(edges_dir).join(snapshot);
                 if snapshot_dir.is_dir() {
                     append_jsonl_files(&snapshot_dir, &mut paths);
+                    append_jsonl_files(&snapshot_dir.join(".objects"), &mut paths);
                 }
             }
 

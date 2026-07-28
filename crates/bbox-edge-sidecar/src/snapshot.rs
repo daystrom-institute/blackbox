@@ -187,6 +187,149 @@ pub fn remove_gc_candidate_file(
 }
 
 #[cfg(unix)]
+pub fn remove_inactive_snapshot_tree(
+    edges_dir: &Path,
+    root_relative: &Path,
+    expected_identity: (u64, u64),
+) -> Result<bool> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    with_manifest_coordinator(|| {
+        let components = root_relative
+            .components()
+            .map(|component| match component {
+                std::path::Component::Normal(value) => Ok(value.to_os_string()),
+                _ => anyhow::bail!("inactive snapshot path is not normalized"),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if components.len() != 5
+            || components[0] != "materialized"
+            || components[1] != "workspace"
+            || components[3] != "snapshots"
+        {
+            anyhow::bail!("inactive snapshot path does not have the writer-exact shape");
+        }
+        let project_id = components[2]
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("inactive snapshot project id is not UTF-8"))?;
+        let snapshot_id = components[4]
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("inactive snapshot id is not UTF-8"))?;
+        validate_snapshot_component(project_id)?;
+        validate_snapshot_component(snapshot_id)?;
+        let snapshot_relative = format!("workspace/{project_id}/snapshots/{snapshot_id}");
+
+        let mut manifest = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
+        if manifest.snapshot_is_active(&snapshot_relative)
+            || snapshot_has_pending_journal(edges_dir, project_id, snapshot_id)?
+        {
+            return Ok(false);
+        }
+
+        let mut directory = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(edges_dir)?;
+        for component in &components[..4] {
+            let component = std::ffi::CString::new(component.as_bytes())?;
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    component.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    return Ok(false);
+                }
+                return Err(error.into());
+            }
+            directory = unsafe { fs::File::from_raw_fd(fd) };
+        }
+        let leaf = std::ffi::CString::new(components[4].as_bytes())?;
+        let stat = match fstatat_nofollow(directory.as_raw_fd(), &leaf) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+            || (stat.st_dev as u64, stat.st_ino as u64) != expected_identity
+        {
+            anyhow::bail!("inactive snapshot directory identity changed before deletion");
+        }
+        let snapshot_dir = open_confined_dir_fd(directory.as_raw_fd(), &leaf)?;
+        let staging = std::ffi::CString::new(".staging")?;
+        match fstatat_nofollow(snapshot_dir.as_raw_fd(), &staging) {
+            Ok(_) => anyhow::bail!("refusing to delete a staged snapshot directory"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let loaded = load_snapshot_receipt_from_dir(&snapshot_dir, project_id, snapshot_id)?;
+        match (
+            manifest.receipt_managed_snapshots.get(&snapshot_relative),
+            loaded,
+        ) {
+            (Some(expected), Some(loaded)) if expected == &loaded.digest => {}
+            (Some(_), _) => {
+                anyhow::bail!("inactive snapshot receipt does not match manifest authority")
+            }
+            (None, Some(_)) if manifest.receipt_protocol_version != 0 => {
+                anyhow::bail!("inactive snapshot receipt is not bound by the manifest")
+            }
+            _ => {}
+        }
+        drop(snapshot_dir);
+
+        if manifest.prune_snapshot_receipt_state(&snapshot_relative) {
+            manifest.write_atomic(edges_dir)?;
+        }
+        unlinkat_tree(directory.as_raw_fd(), &leaf)?;
+        directory.sync_all()?;
+        Ok(true)
+    })
+}
+
+#[cfg(not(unix))]
+pub fn remove_inactive_snapshot_tree(
+    edges_dir: &Path,
+    root_relative: &Path,
+    _expected_identity: (u64, u64),
+) -> Result<bool> {
+    let path = edges_dir.join(root_relative);
+    let components = root_relative.components().collect::<Vec<_>>();
+    if components.len() != 5 {
+        anyhow::bail!("inactive snapshot path does not have the writer-exact shape");
+    }
+    let project_id = components[2]
+        .as_os_str()
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("inactive snapshot project id is not UTF-8"))?;
+    let snapshot_id = components[4]
+        .as_os_str()
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("inactive snapshot id is not UTF-8"))?;
+    let snapshot_relative = format!("workspace/{project_id}/snapshots/{snapshot_id}");
+    with_manifest_coordinator(|| {
+        let mut manifest = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
+        if manifest.snapshot_is_active(&snapshot_relative)
+            || snapshot_has_pending_journal(edges_dir, project_id, snapshot_id)?
+        {
+            return Ok(false);
+        }
+        validate_nonunix_directory_chain(edges_dir, &path)?;
+        if manifest.prune_snapshot_receipt_state(&snapshot_relative) {
+            manifest.write_atomic(edges_dir)?;
+        }
+        fs::remove_dir_all(path)?;
+        Ok(true)
+    })
+}
+
+#[cfg(unix)]
 pub(crate) fn write_materialized_file_atomic(
     edges_dir: &Path,
     relative: &Path,
@@ -958,7 +1101,7 @@ pub fn write_snapshot_files(
 /// the live snapshot only after the paired Tantivy commit succeeds.
 ///
 /// Fields:
-///   v: format version (2)
+///   v: format version (3)
 ///   project_id: the project this transaction belongs to (R21F2: bound
 ///     into the journal so it cannot be moved beneath another project)
 ///   txn_token: unique opaque token identifying this transaction
@@ -970,6 +1113,8 @@ struct TxnJournal {
     project_id: String,
     txn_token: String,
     snapshot_id: String,
+    baseline_receipt_digest: Option<String>,
+    final_receipt_digest: String,
     members: Vec<TxnMember>,
 }
 
@@ -985,7 +1130,7 @@ const SNAPSHOT_RECEIPT_VERSION: u32 = 1;
 const SNAPSHOT_MAX_RECEIPT_BYTES: usize = 64 * 1024;
 const SNAPSHOT_MAX_OBJECTS: usize = 4096;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SnapshotMemberReceipt {
     v: u32,
@@ -1039,6 +1184,15 @@ fn txn_commitment(journal: &TxnJournal) -> String {
     hasher.update(journal.snapshot_id.as_bytes());
     hasher.update(b"\0");
     hasher.update(journal.txn_token.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(
+        journal
+            .baseline_receipt_digest
+            .as_deref()
+            .unwrap_or("legacy"),
+    );
+    hasher.update(b"\0");
+    hasher.update(journal.final_receipt_digest.as_bytes());
     hasher.update(b"\0");
     for member in &journal.members {
         hasher.update(member.name.as_bytes());
@@ -1346,23 +1500,33 @@ fn write_snapshot_members_transaction_with_token(
         member_bytes.push((filename.to_string(), bytes));
     }
 
-    let journal = TxnJournal {
-        v: 2,
-        project_id: project_id.to_string(),
-        txn_token: txn_token.to_string(),
-        snapshot_id: snapshot_id.to_string(),
-        members,
-    };
-    let journal_bytes = serde_json::to_vec(&journal)?;
-    if journal_bytes.len() > TXN_MAX_JOURNAL_BYTES {
-        anyhow::bail!(
-            "transaction journal exceeds max size ({} > {})",
-            journal_bytes.len(),
-            TXN_MAX_JOURNAL_BYTES
-        );
-    }
-
     with_manifest_coordinator(|| {
+        let snapshot = format!("workspace/{project_id}/snapshots/{snapshot_id}");
+        let manifest = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
+        let baseline = authorized_baseline_receipt(edges_dir, &snapshot, &manifest)?;
+        let (_, _, final_receipt_digest) = intended_receipt(
+            project_id,
+            snapshot_id,
+            baseline.as_ref().map(|loaded| &loaded.receipt),
+            &members,
+        )?;
+        let journal = TxnJournal {
+            v: 3,
+            project_id: project_id.to_string(),
+            txn_token: txn_token.to_string(),
+            snapshot_id: snapshot_id.to_string(),
+            baseline_receipt_digest: baseline.map(|loaded| loaded.digest),
+            final_receipt_digest,
+            members,
+        };
+        let journal_bytes = serde_json::to_vec(&journal)?;
+        if journal_bytes.len() > TXN_MAX_JOURNAL_BYTES {
+            anyhow::bail!(
+                "transaction journal exceeds max size ({} > {})",
+                journal_bytes.len(),
+                TXN_MAX_JOURNAL_BYTES
+            );
+        }
         let staging_rel = txn_staging_rel(project_id, txn_token);
         let journal_rel = txn_journal_rel(project_id, txn_token);
 
@@ -1393,9 +1557,8 @@ fn write_snapshot_members_transaction_with_token(
             }
             return Err(error);
         }
-        Ok(())
-    })?;
-    Ok(txn_commitment(&journal))
+        Ok(txn_commitment(&journal))
+    })
 }
 
 #[cfg(unix)]
@@ -1459,11 +1622,10 @@ fn cleanup_failed_snapshot_staging(
 /// establishes commitment.
 pub fn validate_journal_inventory(edges_dir: &Path) -> Result<Vec<String>> {
     let mut commitments = Vec::new();
-    let manifest = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
-    for project_id in manifest.workspaces.keys() {
+    for project_id in transaction_project_ids(edges_dir)? {
         let txn_dir_rel = Path::new("materialized")
             .join("workspace")
-            .join(project_id)
+            .join(&project_id)
             .join("txn");
         #[cfg(unix)]
         {
@@ -1877,6 +2039,91 @@ pub(crate) fn snapshot_receipt_digest(edges_dir: &Path, snapshot: &str) -> Resul
     }
 }
 
+fn load_snapshot_receipt_by_relative(
+    edges_dir: &Path,
+    snapshot: &str,
+) -> Result<Option<LoadedSnapshotReceipt>> {
+    let (project_id, snapshot_id) = snapshot_identity_from_relative(snapshot)?;
+    #[cfg(unix)]
+    {
+        let snapshot_dir = match open_dir_under_root(
+            edges_dir,
+            &Path::new("materialized").join(snapshot),
+            false,
+        ) {
+            Ok(directory) => directory,
+            Err(error) if is_not_found(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        load_snapshot_receipt_from_dir(&snapshot_dir, project_id, snapshot_id)
+    }
+    #[cfg(not(unix))]
+    {
+        let path = materialized_dir(edges_dir)
+            .join(snapshot)
+            .join(SNAPSHOT_RECEIPT_FILENAME);
+        match read_nonunix_regular_bounded(&path, SNAPSHOT_MAX_RECEIPT_BYTES as u64) {
+            Ok(bytes) => Ok(Some(LoadedSnapshotReceipt {
+                receipt: decode_snapshot_receipt(&bytes, project_id, snapshot_id)?,
+                digest: hex::encode(Sha256::digest(&bytes)),
+            })),
+            Err(error) if is_not_found(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn authorized_baseline_receipt(
+    edges_dir: &Path,
+    snapshot: &str,
+    manifest: &crate::manifest::ManifestIndex,
+) -> Result<Option<LoadedSnapshotReceipt>> {
+    let expected = manifest.receipt_managed_snapshots.get(snapshot);
+    let loaded = load_snapshot_receipt_by_relative(edges_dir, snapshot)?;
+    match (expected, loaded) {
+        (Some(expected), Some(loaded)) if &loaded.digest == expected => Ok(Some(loaded)),
+        (Some(_), Some(_)) => {
+            anyhow::bail!("transaction baseline receipt digest does not match manifest authority")
+        }
+        (Some(_), None) => {
+            anyhow::bail!("receipt-managed transaction baseline receipt is missing")
+        }
+        (None, Some(_)) if manifest.receipt_protocol_version != 0 => {
+            anyhow::bail!("transaction baseline receipt is not bound by the manifest index")
+        }
+        (None, loaded) => Ok(loaded),
+    }
+}
+
+fn intended_receipt(
+    project_id: &str,
+    snapshot_id: &str,
+    baseline: Option<&SnapshotMemberReceipt>,
+    members: &[TxnMember],
+) -> Result<(SnapshotMemberReceipt, Vec<u8>, String)> {
+    let mut receipt = baseline.cloned().unwrap_or(SnapshotMemberReceipt {
+        v: SNAPSHOT_RECEIPT_VERSION,
+        project_id: project_id.to_string(),
+        snapshot_id: snapshot_id.to_string(),
+        members: BTreeMap::new(),
+    });
+    for member in members {
+        receipt.members.insert(
+            member.name.clone(),
+            SnapshotMemberPointer {
+                sha256: member.sha256.clone(),
+                object: snapshot_object_name(&member.sha256)?,
+            },
+        );
+    }
+    let bytes = serde_json::to_vec(&receipt)?;
+    if bytes.len() > SNAPSHOT_MAX_RECEIPT_BYTES {
+        anyhow::bail!("snapshot member receipt exceeds its byte bound");
+    }
+    let digest = hex::encode(Sha256::digest(&bytes));
+    Ok((receipt, bytes, digest))
+}
+
 #[cfg(unix)]
 fn publish_immutable_snapshot_object(
     staging_dir: &fs::File,
@@ -2275,6 +2522,46 @@ fn finalize_one_transaction(
         .join("snapshots")
         .join(snapshot_id);
     let snap_dir = open_dir_under_root(edges_dir, &snap_dir_rel, true)?;
+    let snapshot_relative = format!("workspace/{project_id}/snapshots/{snapshot_id}");
+    let mut manifest = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
+    let manifest_digest = manifest
+        .receipt_managed_snapshots
+        .get(&snapshot_relative)
+        .cloned();
+    let loaded_receipt = load_snapshot_receipt_from_dir(&snap_dir, project_id, snapshot_id)?;
+    let manifest_matches_journal = manifest_digest == journal.baseline_receipt_digest
+        || manifest_digest.as_deref() == Some(journal.final_receipt_digest.as_str());
+    if !manifest_matches_journal {
+        anyhow::bail!("finalize: manifest receipt authority drifted from the journal baseline");
+    }
+    let mut receipt = match loaded_receipt {
+        Some(loaded) if loaded.digest == journal.final_receipt_digest => loaded.receipt,
+        Some(loaded)
+            if Some(loaded.digest.as_str()) == journal.baseline_receipt_digest.as_deref() =>
+        {
+            let (receipt, _, digest) = intended_receipt(
+                project_id,
+                snapshot_id,
+                Some(&loaded.receipt),
+                &journal.members,
+            )?;
+            if digest != journal.final_receipt_digest {
+                anyhow::bail!("finalize: intended receipt does not match journal result");
+            }
+            receipt
+        }
+        None if journal.baseline_receipt_digest.is_none() => {
+            let (receipt, _, digest) =
+                intended_receipt(project_id, snapshot_id, None, &journal.members)?;
+            if digest != journal.final_receipt_digest {
+                anyhow::bail!("finalize: intended receipt does not match journal result");
+            }
+            receipt
+        }
+        _ => anyhow::bail!(
+            "finalize: receipt is neither the authorized baseline nor the journal result"
+        ),
+    };
 
     let objects_c = std::ffi::CString::new(SNAPSHOT_OBJECTS_DIRNAME)?;
     if unsafe { libc::mkdirat(snap_dir.as_raw_fd(), objects_c.as_ptr(), 0o755) } != 0 {
@@ -2284,14 +2571,6 @@ fn finalize_one_transaction(
         }
     }
     let objects_dir = open_confined_dir_fd(snap_dir.as_raw_fd(), &objects_c)?;
-    let mut receipt = load_snapshot_receipt_from_dir(&snap_dir, project_id, snapshot_id)?
-        .map(|loaded| loaded.receipt)
-        .unwrap_or(SnapshotMemberReceipt {
-            v: SNAPSHOT_RECEIPT_VERSION,
-            project_id: project_id.to_string(),
-            snapshot_id: snapshot_id.to_string(),
-            members: BTreeMap::new(),
-        });
 
     // Publish immutable content-addressed objects. Existing logical members
     // remain untouched until the receipt pointer is durably replaced.
@@ -2325,6 +2604,9 @@ fn finalize_one_transaction(
     if receipt_bytes.len() > SNAPSHOT_MAX_RECEIPT_BYTES {
         anyhow::bail!("snapshot member receipt exceeds its byte bound");
     }
+    if hex::encode(Sha256::digest(&receipt_bytes)) != journal.final_receipt_digest {
+        anyhow::bail!("finalize: receipt bytes do not match the journal result digest");
+    }
     write_materialized_file_atomic(
         edges_dir,
         Path::new("workspace")
@@ -2349,9 +2631,8 @@ fn finalize_one_transaction(
     }
     snap_dir.sync_all()?;
 
-    let snapshot_relative = format!("workspace/{project_id}/snapshots/{snapshot_id}");
-    let mut manifest = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
-    manifest.bind_snapshot_receipt(snapshot_relative, persisted.digest.clone());
+    manifest.bind_snapshot_receipt(snapshot_relative.clone(), persisted.digest.clone());
+    manifest.record_receipt_closeout(recomputed, snapshot_relative, persisted.digest.clone());
     manifest.write_atomic(edges_dir)?;
     gc_superseded_snapshot_objects(
         edges_dir,
@@ -2424,21 +2705,50 @@ fn finalize_one_transaction(
     fs::create_dir_all(&snap_dir)?;
     validate_nonunix_directory_chain(edges_dir, &staging_dir)?;
     validate_nonunix_directory_chain(edges_dir, &snap_dir)?;
+    let snapshot_relative = format!("workspace/{project_id}/snapshots/{snapshot_id}");
+    let mut manifest = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
+    let manifest_digest = manifest
+        .receipt_managed_snapshots
+        .get(&snapshot_relative)
+        .cloned();
+    let loaded_receipt = load_snapshot_receipt_by_relative(edges_dir, &snapshot_relative)?;
+    let manifest_matches_journal = manifest_digest == journal.baseline_receipt_digest
+        || manifest_digest.as_deref() == Some(journal.final_receipt_digest.as_str());
+    if !manifest_matches_journal {
+        anyhow::bail!("finalize: manifest receipt authority drifted from the journal baseline");
+    }
+    let mut receipt = match loaded_receipt {
+        Some(loaded) if loaded.digest == journal.final_receipt_digest => loaded.receipt,
+        Some(loaded)
+            if Some(loaded.digest.as_str()) == journal.baseline_receipt_digest.as_deref() =>
+        {
+            let (receipt, _, digest) = intended_receipt(
+                project_id,
+                snapshot_id,
+                Some(&loaded.receipt),
+                &journal.members,
+            )?;
+            if digest != journal.final_receipt_digest {
+                anyhow::bail!("finalize: intended receipt does not match journal result");
+            }
+            receipt
+        }
+        None if journal.baseline_receipt_digest.is_none() => {
+            let (receipt, _, digest) =
+                intended_receipt(project_id, snapshot_id, None, &journal.members)?;
+            if digest != journal.final_receipt_digest {
+                anyhow::bail!("finalize: intended receipt does not match journal result");
+            }
+            receipt
+        }
+        _ => anyhow::bail!(
+            "finalize: receipt is neither the authorized baseline nor the journal result"
+        ),
+    };
     let objects_dir = snap_dir.join(SNAPSHOT_OBJECTS_DIRNAME);
     fs::create_dir_all(&objects_dir)?;
     validate_nonunix_directory_chain(edges_dir, &objects_dir)?;
     let receipt_path = snap_dir.join(SNAPSHOT_RECEIPT_FILENAME);
-    let mut receipt =
-        match read_nonunix_regular_bounded(&receipt_path, SNAPSHOT_MAX_RECEIPT_BYTES as u64) {
-            Ok(bytes) => decode_snapshot_receipt(&bytes, project_id, snapshot_id)?,
-            Err(error) if is_not_found(&error) => SnapshotMemberReceipt {
-                v: SNAPSHOT_RECEIPT_VERSION,
-                project_id: project_id.to_string(),
-                snapshot_id: snapshot_id.to_string(),
-                members: BTreeMap::new(),
-            },
-            Err(error) => return Err(error),
-        };
 
     for member in &journal.members {
         let src = staging_dir.join(&member.name);
@@ -2514,6 +2824,9 @@ fn finalize_one_transaction(
     if receipt_bytes.len() > SNAPSHOT_MAX_RECEIPT_BYTES {
         anyhow::bail!("snapshot member receipt exceeds its byte bound");
     }
+    if hex::encode(Sha256::digest(&receipt_bytes)) != journal.final_receipt_digest {
+        anyhow::bail!("finalize: receipt bytes do not match the journal result digest");
+    }
     static RECEIPT_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
     let receipt_temp = snap_dir.join(format!(
@@ -2538,9 +2851,8 @@ fn finalize_one_transaction(
     fs::rename(&receipt_temp, &receipt_path)?;
     fs::File::open(&snap_dir)?.sync_all()?;
     let receipt_digest = hex::encode(Sha256::digest(&receipt_bytes));
-    let snapshot_relative = format!("workspace/{project_id}/snapshots/{snapshot_id}");
-    let mut manifest = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
-    manifest.bind_snapshot_receipt(snapshot_relative, receipt_digest);
+    manifest.bind_snapshot_receipt(snapshot_relative.clone(), receipt_digest.clone());
+    manifest.record_receipt_closeout(recomputed, snapshot_relative, receipt_digest);
     manifest.write_atomic(edges_dir)?;
     gc_superseded_snapshot_objects(edges_dir, project_id, snapshot_id, &objects_dir, &receipt)?;
     fs::remove_dir(&staging_dir)
@@ -2587,11 +2899,289 @@ pub fn recover_pending_transactions_prebind(
                     .collect()
             })
             .unwrap_or_default();
-        for project_id in index.workspaces.keys() {
-            recover_pending_transactions_for_project(edges_dir, project_id, &committed)?;
+        for commitment in &committed {
+            let (project_id, txn_token, digest) = parse_payload_entry(commitment)
+                .ok_or_else(|| anyhow::anyhow!("recovery: malformed payload commitment"))?;
+            validate_snapshot_component(project_id)?;
+            validate_snapshot_component(txn_token)?;
+            if snapshot_object_name(digest).is_err() {
+                anyhow::bail!("recovery: payload commitment digest is invalid");
+            }
+        }
+        let mut reconciled = std::collections::HashSet::new();
+        for project_id in transaction_project_ids(edges_dir)? {
+            recover_pending_transactions_for_project(
+                edges_dir,
+                &project_id,
+                &committed,
+                &index,
+                &mut reconciled,
+            )?;
+        }
+        let mut latest_index = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
+        for commitment in &committed {
+            if reconciled.contains(commitment) {
+                continue;
+            }
+            if verify_receipt_closeout(edges_dir, &latest_index, commitment)? {
+                reconciled.insert(commitment.clone());
+            } else {
+                anyhow::bail!(
+                    "recovery: committed payload entry has neither a journal nor exact closeout proof: {commitment}"
+                );
+            }
+        }
+        if latest_index.prune_receipt_closeouts(&committed) {
+            latest_index.write_atomic(edges_dir)?;
         }
         Ok(())
     })
+}
+
+fn verify_receipt_closeout(
+    edges_dir: &Path,
+    index: &crate::manifest::ManifestIndex,
+    commitment: &str,
+) -> Result<bool> {
+    let Some(closeout) = index.receipt_closeouts.get(commitment) else {
+        return Ok(false);
+    };
+    let Some((project_id, _, _)) = parse_payload_entry(commitment) else {
+        return Ok(false);
+    };
+    if !closeout
+        .snapshot
+        .starts_with(&format!("workspace/{project_id}/snapshots/"))
+    {
+        anyhow::bail!("recovery: receipt closeout project binding is invalid");
+    }
+    if index.receipt_managed_snapshots.get(&closeout.snapshot) != Some(&closeout.digest) {
+        return Ok(false);
+    }
+    Ok(
+        snapshot_receipt_digest(edges_dir, &closeout.snapshot)?.as_deref()
+            == Some(closeout.digest.as_str()),
+    )
+}
+
+fn committed_for_project_token<'a>(
+    committed: &'a std::collections::HashSet<String>,
+    project_id: &str,
+    txn_token: &str,
+) -> Result<Option<&'a String>> {
+    let mut matches = committed.iter().filter(|commitment| {
+        parse_payload_entry(commitment)
+            .is_some_and(|(project, token, _)| project == project_id && token == txn_token)
+    });
+    let first = matches.next();
+    if matches.next().is_some() {
+        anyhow::bail!("recovery: payload contains duplicate commitments for one transaction");
+    }
+    Ok(first)
+}
+
+#[cfg(unix)]
+fn snapshot_has_pending_journal(
+    edges_dir: &Path,
+    project_id: &str,
+    snapshot_id: &str,
+) -> Result<bool> {
+    let txn_dir = match open_dir_under_root(
+        edges_dir,
+        &Path::new("materialized")
+            .join("workspace")
+            .join(project_id)
+            .join("txn"),
+        false,
+    ) {
+        Ok(directory) => directory,
+        Err(error) if is_not_found(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    for entry in crate::manifest::read_directory_names(&txn_dir)? {
+        let name = entry
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("snapshot transaction entry is not UTF-8"))?;
+        if !name.ends_with(".journal.json") {
+            continue;
+        }
+        let name_c = std::ffi::CString::new(name.as_bytes())?;
+        let journal = decode_txn_journal(&read_confined_file_bounded(
+            &txn_dir,
+            &name_c,
+            TXN_MAX_JOURNAL_BYTES,
+        )?)?;
+        if journal.project_id == project_id && journal.snapshot_id == snapshot_id {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub fn pending_snapshot_paths(edges_dir: &Path) -> Result<std::collections::BTreeSet<String>> {
+    validate_journal_inventory(edges_dir)?;
+    let mut snapshots = std::collections::BTreeSet::new();
+    for project_id in transaction_project_ids(edges_dir)? {
+        #[cfg(unix)]
+        {
+            let txn_dir = match open_dir_under_root(
+                edges_dir,
+                &Path::new("materialized")
+                    .join("workspace")
+                    .join(&project_id)
+                    .join("txn"),
+                false,
+            ) {
+                Ok(directory) => directory,
+                Err(error) if is_not_found(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            for entry in crate::manifest::read_directory_names(&txn_dir)? {
+                let name = entry
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("snapshot transaction entry is not UTF-8"))?;
+                if !name.ends_with(".journal.json") {
+                    continue;
+                }
+                let name_c = std::ffi::CString::new(name.as_bytes())?;
+                let journal = decode_txn_journal(&read_confined_file_bounded(
+                    &txn_dir,
+                    &name_c,
+                    TXN_MAX_JOURNAL_BYTES,
+                )?)?;
+                snapshots.insert(format!(
+                    "workspace/{project_id}/snapshots/{}",
+                    journal.snapshot_id
+                ));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let txn_dir = materialized_dir(edges_dir)
+                .join("workspace")
+                .join(&project_id)
+                .join("txn");
+            let entries = match fs::read_dir(txn_dir) {
+                Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>()?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            for entry in entries {
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("snapshot transaction entry is not UTF-8"))?;
+                if !name.ends_with(".journal.json") {
+                    continue;
+                }
+                let journal = decode_txn_journal(&read_nonunix_regular_bounded(
+                    &entry.path(),
+                    TXN_MAX_JOURNAL_BYTES as u64,
+                )?)?;
+                snapshots.insert(format!(
+                    "workspace/{project_id}/snapshots/{}",
+                    journal.snapshot_id
+                ));
+            }
+        }
+    }
+    Ok(snapshots)
+}
+
+#[cfg(not(unix))]
+fn snapshot_has_pending_journal(
+    edges_dir: &Path,
+    project_id: &str,
+    snapshot_id: &str,
+) -> Result<bool> {
+    let txn_dir = materialized_dir(edges_dir)
+        .join("workspace")
+        .join(project_id)
+        .join("txn");
+    let entries = match fs::read_dir(txn_dir) {
+        Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("snapshot transaction entry is not UTF-8"))?;
+        if !name.ends_with(".journal.json") {
+            continue;
+        }
+        let journal = decode_txn_journal(&read_nonunix_regular_bounded(
+            &entry.path(),
+            TXN_MAX_JOURNAL_BYTES as u64,
+        )?)?;
+        if journal.project_id == project_id && journal.snapshot_id == snapshot_id {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn transaction_project_ids(edges_dir: &Path) -> Result<Vec<String>> {
+    use std::os::fd::AsRawFd;
+
+    let workspace = match open_dir_under_root(
+        edges_dir,
+        Path::new("materialized").join("workspace").as_path(),
+        false,
+    ) {
+        Ok(directory) => directory,
+        Err(error) if is_not_found(&error) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let entries = crate::manifest::read_directory_names(&workspace)?;
+    if entries.len() > 100_000 {
+        anyhow::bail!("recovery: workspace transaction inventory exceeds its bound");
+    }
+    let mut projects = Vec::new();
+    for entry in entries {
+        let project_id = entry
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("recovery: workspace name is not UTF-8"))?;
+        validate_snapshot_component(project_id)?;
+        let entry_c = std::ffi::CString::new(project_id.as_bytes())?;
+        let stat = fstatat_nofollow(workspace.as_raw_fd(), &entry_c)?;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            anyhow::bail!("recovery: workspace transaction root is not a directory");
+        }
+        projects.push(project_id.to_string());
+    }
+    projects.sort();
+    Ok(projects)
+}
+
+#[cfg(not(unix))]
+fn transaction_project_ids(edges_dir: &Path) -> Result<Vec<String>> {
+    let workspace = materialized_dir(edges_dir).join("workspace");
+    let entries = match fs::read_dir(&workspace) {
+        Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    if entries.len() > 100_000 {
+        anyhow::bail!("recovery: workspace transaction inventory exceeds its bound");
+    }
+    let mut projects = Vec::new();
+    for entry in entries {
+        let project_id = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("recovery: workspace name is not UTF-8"))?;
+        validate_snapshot_component(&project_id)?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            anyhow::bail!("recovery: workspace transaction root is not a safe directory");
+        }
+        projects.push(project_id);
+    }
+    projects.sort();
+    Ok(projects)
 }
 
 #[cfg(unix)]
@@ -2599,6 +3189,8 @@ fn recover_pending_transactions_for_project(
     edges_dir: &Path,
     project_id: &str,
     committed: &std::collections::HashSet<String>,
+    index: &crate::manifest::ManifestIndex,
+    reconciled: &mut std::collections::HashSet<String>,
 ) -> Result<()> {
     use std::os::fd::AsRawFd;
     validate_snapshot_component(project_id)?;
@@ -2699,6 +3291,14 @@ fn recover_pending_transactions_for_project(
             anyhow::bail!("recovery: staging entry {s} is not a directory for {project_id}");
         }
         if !journal_tokens.contains(s) {
+            if let Some(commitment) = committed_for_project_token(committed, project_id, s)? {
+                if !verify_receipt_closeout(edges_dir, index, commitment)? {
+                    anyhow::bail!(
+                        "recovery: refusing to reclaim journal-less staging for committed transaction {project_id}:{s}"
+                    );
+                }
+                reconciled.insert(commitment.clone());
+            }
             orphan_tokens.push(s.to_string());
         }
     }
@@ -2782,6 +3382,7 @@ fn recover_pending_transactions_for_project(
                 // Delete the journal to complete closeout.
                 complete_journal_unlink(&txn_dir, &journal_c)?;
             }
+            reconciled.insert(commitment);
         } else {
             // Token NOT in payload: uncommitted or discard-in-progress.
             if staging_exists {
@@ -2905,6 +3506,8 @@ fn recover_pending_transactions_for_project(
     edges_dir: &Path,
     project_id: &str,
     committed: &std::collections::HashSet<String>,
+    index: &crate::manifest::ManifestIndex,
+    reconciled: &mut std::collections::HashSet<String>,
 ) -> Result<()> {
     validate_snapshot_component(project_id)?;
     check_legacy_staging_markers(edges_dir, project_id)?;
@@ -2976,6 +3579,15 @@ fn recover_pending_transactions_for_project(
             );
         }
         if !journal_tokens.contains(name_str) {
+            if let Some(commitment) = committed_for_project_token(committed, project_id, name_str)?
+            {
+                if !verify_receipt_closeout(edges_dir, index, commitment)? {
+                    anyhow::bail!(
+                        "recovery: refusing to reclaim journal-less staging for committed transaction {project_id}:{name_str}"
+                    );
+                }
+                reconciled.insert(commitment.clone());
+            }
             orphan_paths.push((name_str.to_string(), entry.path()));
         }
     }
@@ -3047,6 +3659,7 @@ fn recover_pending_transactions_for_project(
                 }
                 fs::remove_file(&journal_path)?;
             }
+            reconciled.insert(commitment);
         } else {
             if staging_exists {
                 for member in &journal.members {
@@ -3182,9 +3795,9 @@ fn decode_txn_journal(bytes: &[u8]) -> Result<TxnJournal> {
         );
     }
     let journal: TxnJournal = serde_json::from_slice(bytes)?;
-    if journal.v != 2 {
+    if journal.v != 3 {
         anyhow::bail!(
-            "transaction journal version {} is not supported (expected 2)",
+            "transaction journal version {} is not supported (expected 3)",
             journal.v
         );
     }
@@ -3201,6 +3814,16 @@ fn decode_txn_journal(bytes: &[u8]) -> Result<TxnJournal> {
     validate_snapshot_component(&journal.project_id)?;
     validate_snapshot_component(&journal.txn_token)?;
     validate_snapshot_component(&journal.snapshot_id)?;
+    if journal
+        .baseline_receipt_digest
+        .as_deref()
+        .is_some_and(|digest| snapshot_object_name(digest).is_err())
+    {
+        anyhow::bail!("transaction journal baseline receipt digest is invalid");
+    }
+    if snapshot_object_name(&journal.final_receipt_digest).is_err() {
+        anyhow::bail!("transaction journal final receipt digest is invalid");
+    }
     let mut seen_names = std::collections::HashSet::new();
     for member in &journal.members {
         validate_snapshot_component(&member.name)?;
@@ -6884,10 +7507,12 @@ mod tests {
 
         let fake_hash = hex::encode(Sha256::digest(b"wrong data"));
         let journal = TxnJournal {
-            v: 2,
+            v: 3,
             project_id: "p_1".to_string(),
             txn_token: txn_token.to_string(),
             snapshot_id: snapshot_id.clone(),
+            baseline_receipt_digest: None,
+            final_receipt_digest: "0".repeat(64),
             members: vec![TxnMember {
                 name: member_name.to_string(),
                 sha256: fake_hash,
@@ -7136,10 +7761,12 @@ mod tests {
 
         // Write a journal with a token that does NOT match the filename.
         let journal = TxnJournal {
-            v: 2,
+            v: 3,
             project_id: "p_1".to_string(),
             txn_token: "real-token".to_string(),
             snapshot_id: snapshot_id.clone(),
+            baseline_receipt_digest: None,
+            final_receipt_digest: "0".repeat(64),
             members: vec![],
         };
         let journal_bytes = serde_json::to_vec(&journal).unwrap();
@@ -7347,10 +7974,12 @@ mod tests {
         fs::write(staging_dir.join("git-current.jsonl"), &tampered_bytes).unwrap();
         let tampered_hash = hex::encode(Sha256::digest(&tampered_bytes));
         let tampered_journal = TxnJournal {
-            v: 2,
+            v: 3,
             project_id: "p_1".to_string(),
             txn_token: handle.txn_token.clone(),
             snapshot_id: snapshot_id.clone(),
+            baseline_receipt_digest: None,
+            final_receipt_digest: "0".repeat(64),
             members: vec![TxnMember {
                 name: "git-current.jsonl".to_string(),
                 sha256: tampered_hash,
@@ -7530,6 +8159,174 @@ mod tests {
         assert!(
             format!("{error:#}").contains("missing its member receipt"),
             "unexpected refusal: {error:#}"
+        );
+    }
+
+    fn tamper_unrelated_receipt_member(edges_dir: &Path, snapshot_id: &str, member_name: &str) {
+        let snapshot = snapshot_dir(edges_dir, "p_1", snapshot_id);
+        let replacement = b"{\"source\":\"foreign\",\"kind\":\"mentions\",\"target\":\"row\"}\n";
+        let hash = hex::encode(Sha256::digest(replacement));
+        let object_name = snapshot_object_name(&hash).unwrap();
+        let object_path = snapshot.join(SNAPSHOT_OBJECTS_DIRNAME).join(&object_name);
+        fs::write(object_path, replacement).unwrap();
+        let receipt_path = snapshot.join(SNAPSHOT_RECEIPT_FILENAME);
+        let mut receipt: SnapshotMemberReceipt =
+            serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+        receipt.members.insert(
+            member_name.to_string(),
+            SnapshotMemberPointer {
+                sha256: hash,
+                object: object_name,
+            },
+        );
+        fs::write(receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn r25_finalization_rejects_unrelated_receipt_drift() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let initial = vec![explicit_edge("initial", "mentions", "target")];
+        let first = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[
+                ("git-current.jsonl", &initial),
+                ("symbol-current.jsonl", &initial),
+            ],
+        )
+        .unwrap();
+        finalize_snapshot_publication(&first).unwrap();
+
+        let update = vec![explicit_edge("updated", "mentions", "target")];
+        let second = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &update)],
+        )
+        .unwrap();
+        tamper_unrelated_receipt_member(&edges_dir, &snapshot_id, "symbol-current.jsonl");
+
+        let error = finalize_snapshot_publication(&second).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("neither the authorized baseline"),
+            "unexpected refusal: {error:#}"
+        );
+    }
+
+    #[test]
+    fn r25_recovery_rejects_unrelated_receipt_drift() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let initial = vec![explicit_edge("initial", "mentions", "target")];
+        let first = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[
+                ("git-current.jsonl", &initial),
+                ("symbol-current.jsonl", &initial),
+            ],
+        )
+        .unwrap();
+        finalize_snapshot_publication(&first).unwrap();
+
+        let update = vec![explicit_edge("updated", "mentions", "target")];
+        let second = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &update)],
+        )
+        .unwrap();
+        tamper_unrelated_receipt_member(&edges_dir, &snapshot_id, "symbol-current.jsonl");
+
+        let error =
+            recover_pending_transactions_prebind(&edges_dir, Some(&second.commitment)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("neither the authorized baseline"),
+            "unexpected refusal: {error:#}"
+        );
+    }
+
+    #[test]
+    fn r25_committed_journal_loss_refuses_orphan_reclamation() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let edges = vec![explicit_edge("git", "mentions", "target")];
+        let handle = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &edges)],
+        )
+        .unwrap();
+        let txn_dir = materialized_dir(&edges_dir).join("workspace/p_1/txn");
+        fs::remove_file(txn_dir.join(format!("{}.journal.json", handle.txn_token))).unwrap();
+
+        let error =
+            recover_pending_transactions_prebind(&edges_dir, Some(&handle.commitment)).unwrap_err();
+        assert!(format!("{error:#}").contains("journal-less staging"));
+        assert!(txn_dir.join(&handle.txn_token).is_dir());
+    }
+
+    #[test]
+    fn r25_exact_closeout_allows_committed_orphan_reclamation() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let edges = vec![explicit_edge("git", "mentions", "target")];
+        let handle = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &edges)],
+        )
+        .unwrap();
+        finalize_snapshot_publication(&handle).unwrap();
+        let orphan = materialized_dir(&edges_dir)
+            .join("workspace/p_1/txn")
+            .join(&handle.txn_token);
+        fs::create_dir_all(&orphan).unwrap();
+        fs::write(orphan.join("leftover"), b"staged").unwrap();
+
+        recover_pending_transactions_prebind(&edges_dir, Some(&handle.commitment)).unwrap();
+        assert!(!orphan.exists());
+    }
+
+    #[test]
+    fn r25_recovery_enumerates_projects_absent_from_manifest_workspaces() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let edges = vec![explicit_edge("git", "mentions", "target")];
+        let handle = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &edges)],
+        )
+        .unwrap();
+        let mut manifest = ManifestIndex::load(&edges_dir).unwrap();
+        manifest.workspaces.remove("p_1");
+        manifest.write_atomic(&edges_dir).unwrap();
+
+        recover_pending_transactions_prebind(&edges_dir, Some(&handle.commitment)).unwrap();
+        let txn_dir = materialized_dir(&edges_dir).join("workspace/p_1/txn");
+        assert!(
+            !txn_dir
+                .join(format!("{}.journal.json", handle.txn_token))
+                .exists()
+        );
+        assert!(
+            snapshot_dir(&edges_dir, "p_1", &snapshot_id)
+                .join(SNAPSHOT_RECEIPT_FILENAME)
+                .is_file()
         );
     }
 
