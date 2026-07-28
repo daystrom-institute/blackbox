@@ -889,7 +889,6 @@ fn scan_observed_lane_dir(
     }
 }
 
-
 fn is_backup_file(file_name: &str) -> bool {
     if let Some(idx) = file_name.find(".bak-") {
         let rest = &file_name[idx + 5..];
