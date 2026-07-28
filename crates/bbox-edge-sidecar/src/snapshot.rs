@@ -958,21 +958,44 @@ impl PendingLocalActivationJournal {
     }
 }
 
+#[cfg(not(unix))]
 fn pending_local_activations_path(edges_dir: &Path) -> PathBuf {
     crate::manifest::materialized_dir(edges_dir).join(PENDING_LOCAL_ACTIVATIONS_FILENAME)
 }
 
+/// R27F4: the GC pin journal is authority, so its payload is bounded the same
+/// way every other confined journal in this module is. A pin record is a few
+/// hundred bytes per project; a megabyte is orders of magnitude past any real
+/// fleet and still refuses an unbounded read into memory.
+const PENDING_LOCAL_ACTIVATIONS_MAX_BYTES: usize = 1024 * 1024;
+
+/// R27F1: publish the GC pin under the same manifest coordinator reclamation
+/// holds. `remove_inactive_snapshot_tree` and `remove_gc_candidate_file` read
+/// the pin journal (via `snapshot_has_pending_local_activation`) while holding
+/// the coordinator, so an uncoordinated read-modify-write here let a
+/// reactivation observe "no intent", pin, and begin materializing into a tree
+/// GC had already decided to delete. Serializing the pin's publication makes
+/// the two orderings the only reachable ones: either the pin is durably
+/// visible before GC's check (GC declines), or GC's whole reclamation
+/// completes first and staging then re-materializes from scratch.
+///
+/// The coordinator is a non-reentrant `std::sync::Mutex`, so this must stay
+/// the only lock take on the path: `stage_local_snapshot_activation` calls it
+/// before `write_snapshot_files` (which takes the coordinator itself), and the
+/// helpers it calls below are the unlocked variants.
 fn pin_pending_local_activation(
     edges_dir: &Path,
     activation: &PendingLocalSnapshotActivation,
 ) -> Result<()> {
-    let mut activations = load_pending_local_activation_journal(edges_dir)?
-        .map(|journal| journal.activations)
-        .unwrap_or_default();
-    activations.retain(|current| current.project_id != activation.project_id);
-    activations.push(activation.clone());
-    write_pending_local_activation_journal(edges_dir, &activations)?;
-    Ok(())
+    with_manifest_coordinator(|| {
+        let mut activations = load_pending_local_activation_journal(edges_dir)?
+            .map(|journal| journal.activations)
+            .unwrap_or_default();
+        activations.retain(|current| current.project_id != activation.project_id);
+        activations.push(activation.clone());
+        write_pending_local_activation_journal_locked(edges_dir, &activations)?;
+        Ok(())
+    })
 }
 
 fn snapshot_has_pending_local_activation(
@@ -990,6 +1013,17 @@ fn snapshot_has_pending_local_activation(
 }
 
 pub fn write_pending_local_activation_journal(
+    edges_dir: &Path,
+    activations: &[PendingLocalSnapshotActivation],
+) -> Result<PendingLocalActivationJournal> {
+    with_manifest_coordinator(|| {
+        write_pending_local_activation_journal_locked(edges_dir, activations)
+    })
+}
+
+/// Publish the pin journal. The caller must already hold the manifest
+/// coordinator (`with_manifest_coordinator`); it is non-reentrant.
+fn write_pending_local_activation_journal_locked(
     edges_dir: &Path,
     activations: &[PendingLocalSnapshotActivation],
 ) -> Result<PendingLocalActivationJournal> {
@@ -1014,29 +1048,74 @@ pub fn write_pending_local_activation_journal(
         commit_token: hex::encode(token.finalize()),
         activations: activations.to_vec(),
     };
+    let bytes = serde_json::to_vec_pretty(&journal)?;
+    if bytes.len() > PENDING_LOCAL_ACTIVATIONS_MAX_BYTES {
+        anyhow::bail!("pending local activation journal exceeds its byte limit");
+    }
+    // R27F4: root-anchored, O_NOFOLLOW descriptor traversal with a unique
+    // O_EXCL temporary leaf, renameat, and a directory fsync. This is the
+    // same publication path every other materialized authority file in this
+    // module uses; the previous predictable `.tmp` sibling plus
+    // `File::create` would happily follow a planted symlink and could collide
+    // with a concurrent writer's temporary.
+    #[cfg(unix)]
+    {
+        write_materialized_file_atomic(
+            edges_dir,
+            Path::new(PENDING_LOCAL_ACTIVATIONS_FILENAME),
+            &bytes,
+        )?;
+    }
+    #[cfg(not(unix))]
+    {
+        write_nonunix_pending_local_activation_journal(edges_dir, &bytes)?;
+    }
+    Ok(journal)
+}
+
+#[cfg(not(unix))]
+fn write_nonunix_pending_local_activation_journal(edges_dir: &Path, bytes: &[u8]) -> Result<()> {
     let path = pending_local_activations_path(edges_dir);
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("pending activation journal has no parent"))?;
     fs::create_dir_all(parent)?;
-    let temporary = path.with_extension("json.tmp");
-    let mut file = fs::File::create(&temporary)?;
-    serde_json::to_writer_pretty(&mut file, &journal)?;
-    file.sync_all()?;
+    validate_nonunix_directory_chain(
+        parent
+            .ancestors()
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("pending activation journal has no root"))?,
+        parent,
+    )?;
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        PENDING_LOCAL_ACTIVATIONS_FILENAME,
+        std::process::id(),
+        sequence
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
     drop(file);
-    fs::rename(&temporary, &path)?;
-    fs::File::open(parent)?.sync_all()?;
-    Ok(journal)
+    if let Err(error) = fs::rename(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 pub fn load_pending_local_activation_journal(
     edges_dir: &Path,
 ) -> Result<Option<PendingLocalActivationJournal>> {
-    let path = pending_local_activations_path(edges_dir);
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+    let Some(bytes) = read_pending_local_activation_bytes(edges_dir)? else {
+        return Ok(None);
     };
     let journal: PendingLocalActivationJournal = serde_json::from_slice(&bytes)?;
     if journal.version != 1 || journal.activations.is_empty() {
@@ -1045,15 +1124,87 @@ pub fn load_pending_local_activation_journal(
     Ok(Some(journal))
 }
 
+/// R27F4: read the pin journal through a root-anchored, no-follow descriptor
+/// with an explicit byte bound. A missing `materialized/` directory or a
+/// missing journal leaf is absence; every other inspection failure (symlink,
+/// non-regular node, permission, oversize payload) is a typed refusal rather
+/// than a silent "no pin", because "no pin" authorizes deletion.
+#[cfg(unix)]
+fn read_pending_local_activation_bytes(edges_dir: &Path) -> Result<Option<Vec<u8>>> {
+    use std::os::fd::AsRawFd;
+
+    let directory = match open_dir_under_root(edges_dir, Path::new("materialized"), false) {
+        Ok(directory) => directory,
+        Err(error) if is_not_found(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let leaf = std::ffi::CString::new(PENDING_LOCAL_ACTIVATIONS_FILENAME)?;
+    let stat = match fstatat_nofollow(directory.as_raw_fd(), &leaf) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        anyhow::bail!("pending local activation journal is not a regular file");
+    }
+    Ok(Some(read_confined_file_bounded(
+        &directory,
+        &leaf,
+        PENDING_LOCAL_ACTIVATIONS_MAX_BYTES,
+    )?))
+}
+
+#[cfg(not(unix))]
+fn read_pending_local_activation_bytes(edges_dir: &Path) -> Result<Option<Vec<u8>>> {
+    let path = pending_local_activations_path(edges_dir);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!("pending local activation journal is a symlink")
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            anyhow::bail!("pending local activation journal is not a regular file")
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    Ok(Some(read_nonunix_regular_bounded(
+        &path,
+        PENDING_LOCAL_ACTIVATIONS_MAX_BYTES as u64,
+    )?))
+}
+
 pub fn clear_pending_local_activation_journal(edges_dir: &Path) -> Result<()> {
+    with_manifest_coordinator(|| clear_pending_local_activation_journal_locked(edges_dir))
+}
+
+/// Retract the pin. The caller must already hold the manifest coordinator.
+#[cfg(unix)]
+fn clear_pending_local_activation_journal_locked(edges_dir: &Path) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let directory = match open_dir_under_root(edges_dir, Path::new("materialized"), false) {
+        Ok(directory) => directory,
+        Err(error) if is_not_found(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let leaf = std::ffi::CString::new(PENDING_LOCAL_ACTIVATIONS_FILENAME)?;
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), leaf.as_ptr(), 0) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error.into());
+        }
+        return Ok(());
+    }
+    directory.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn clear_pending_local_activation_journal_locked(edges_dir: &Path) -> Result<()> {
     let path = pending_local_activations_path(edges_dir);
     match fs::remove_file(&path) {
-        Ok(()) => {
-            if let Some(parent) = path.parent() {
-                fs::File::open(parent)?.sync_all()?;
-            }
-            Ok(())
-        }
+        Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
@@ -8842,6 +8993,215 @@ mod tests {
             .unwrap()
         );
         assert!(snapshot.is_dir());
+    }
+
+    /// R27F1: the pin's read-modify-write publishes under the same manifest
+    /// coordinator reclamation's pin check runs under, so the two orderings
+    /// below are the only reachable ones.
+    ///
+    /// Ordering A (check-pin-stage): the pin is already durably published
+    /// when reclamation checks, so reclamation declines and the staged tree
+    /// survives. Covered by `r26_local_snapshot_is_pinned_before_activation`
+    /// and re-asserted at the end of this test.
+    ///
+    /// Ordering B (check-intent-delete): reclamation holds the coordinator
+    /// across its check-then-delete window, so a concurrent pin cannot
+    /// publish inside that window. It lands only after the window closes,
+    /// and staging then materializes into a tree reclamation has finished
+    /// with. Before the fix the pin ran uncoordinated, so it could publish
+    /// between reclamation's check and its delete, and staging's member
+    /// writes raced the deletion of the very tree they targeted.
+    #[cfg(unix)]
+    #[test]
+    fn r27_pin_publication_is_serialized_against_reclamation() {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::mpsc;
+
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        // A pre-existing inactive tree for the same project/snapshot, which
+        // is what reclamation is deciding about inside its window.
+        write_snapshot_files(&edges_dir, "p_1", "snapshot-a", &[("project.jsonl", &[])]).unwrap();
+        let snapshot = snapshot_dir(&edges_dir, "p_1", "snapshot-a");
+        let metadata = fs::symlink_metadata(&snapshot).unwrap();
+        let identity = (metadata.dev() as u64, metadata.ino() as u64);
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (staged_tx, staged_rx) = mpsc::channel::<()>();
+
+        let reclaimer_dir = edges_dir.clone();
+        let reclaimer = std::thread::spawn(move || {
+            with_manifest_coordinator(|| {
+                // The check reclamation makes before it commits to deleting.
+                assert!(!snapshot_has_pending_local_activation(
+                    &reclaimer_dir,
+                    "p_1",
+                    "snapshot-a"
+                )?);
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                // The delete reclamation performs on the strength of that
+                // check. No pin may have become visible in between.
+                assert!(!snapshot_has_pending_local_activation(
+                    &reclaimer_dir,
+                    "p_1",
+                    "snapshot-a"
+                )?);
+                fs::remove_dir_all(snapshot_dir(&reclaimer_dir, "p_1", "snapshot-a"))?;
+                assert!(!snapshot_has_pending_local_activation(
+                    &reclaimer_dir,
+                    "p_1",
+                    "snapshot-a"
+                )?);
+                Ok(())
+            })
+            .unwrap();
+        });
+
+        entered_rx.recv().unwrap();
+        let stager_dir = edges_dir.clone();
+        let stager = std::thread::spawn(move || {
+            stage_local_snapshot_activation(
+                &stager_dir,
+                "p_1",
+                "repo_1",
+                Some("main"),
+                "head-a",
+                false,
+                None,
+                "snapshot-a",
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+            staged_tx.send(()).unwrap();
+        });
+
+        // The pin blocks on the coordinator for as long as the reclamation
+        // window is open. This can only time out; it can never observe a
+        // completed pin, because completing one requires the lock the
+        // reclamation thread is holding.
+        assert!(matches!(
+            staged_rx.recv_timeout(std::time::Duration::from_millis(500)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        release_tx.send(()).unwrap();
+        reclaimer.join().unwrap();
+        stager.join().unwrap();
+
+        // The pin published after the window closed, and staging fully
+        // materialized the tree it pinned.
+        assert!(snapshot_has_pending_local_activation(&edges_dir, "p_1", "snapshot-a").unwrap());
+        let restaged = snapshot_dir(&edges_dir, "p_1", "snapshot-a");
+        assert!(restaged.is_dir());
+        assert!(restaged.join("project.jsonl").is_file());
+        assert!(restaged.join("symbols.jsonl").is_file());
+        assert!(restaged.join("git-current.jsonl").is_file());
+
+        // Ordering A: with the pin visible, reclamation declines outright.
+        let restaged_metadata = fs::symlink_metadata(&restaged).unwrap();
+        assert!(
+            !remove_inactive_snapshot_tree(
+                &edges_dir,
+                Path::new("materialized/workspace/p_1/snapshots/snapshot-a"),
+                (
+                    restaged_metadata.dev() as u64,
+                    restaged_metadata.ino() as u64
+                ),
+            )
+            .unwrap()
+        );
+        assert!(restaged.join("project.jsonl").is_file());
+        // The identity captured before the window is stale by construction;
+        // it is only referenced to keep the pre-window tree observation
+        // meaningful.
+        assert_ne!(
+            identity,
+            (
+                restaged_metadata.dev() as u64,
+                restaged_metadata.ino() as u64
+            )
+        );
+    }
+
+    /// R27F4: the pin journal is authority whose absence authorizes deletion,
+    /// so a leaf that is not an ordinary regular file is a typed refusal, not
+    /// "no pin".
+    #[cfg(unix)]
+    #[test]
+    fn r27_pin_journal_refuses_a_symlinked_leaf() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_journal = outside
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("elsewhere.json");
+        fs::write(
+            &outside_journal,
+            b"{\"version\":1,\"commit_token\":\"x\",\"activations\":[]}",
+        )
+        .unwrap();
+        let materialized = crate::manifest::materialized_dir(&edges_dir);
+        fs::create_dir_all(&materialized).unwrap();
+        std::os::unix::fs::symlink(
+            &outside_journal,
+            materialized.join(PENDING_LOCAL_ACTIVATIONS_FILENAME),
+        )
+        .unwrap();
+
+        let error = load_pending_local_activation_journal(&edges_dir).unwrap_err();
+        assert!(format!("{error:#}").contains("not a regular file"));
+
+        // Publication replaces the symlink itself instead of writing through
+        // it, so the outside target is never touched.
+        write_pending_local_activation_journal(
+            &edges_dir,
+            &[PendingLocalSnapshotActivation {
+                project_id: "p_1".to_string(),
+                repo_id: "repo_1".to_string(),
+                branch: None,
+                head_sha: "head-a".to_string(),
+                dirty: false,
+                dirty_fingerprint: None,
+                snapshot_id: "snapshot-a".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(&outside_journal).unwrap(),
+            b"{\"version\":1,\"commit_token\":\"x\",\"activations\":[]}"
+        );
+        assert!(
+            !fs::symlink_metadata(materialized.join(PENDING_LOCAL_ACTIVATIONS_FILENAME))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(snapshot_has_pending_local_activation(&edges_dir, "p_1", "snapshot-a").unwrap());
+    }
+
+    /// R27F4: the load is bounded, and an oversize payload refuses instead of
+    /// being read into memory.
+    #[cfg(unix)]
+    #[test]
+    fn r27_pin_journal_refuses_an_oversized_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let materialized = crate::manifest::materialized_dir(&edges_dir);
+        fs::create_dir_all(&materialized).unwrap();
+        fs::write(
+            materialized.join(PENDING_LOCAL_ACTIVATIONS_FILENAME),
+            vec![b'x'; PENDING_LOCAL_ACTIVATIONS_MAX_BYTES + 1],
+        )
+        .unwrap();
+
+        let error = load_pending_local_activation_journal(&edges_dir).unwrap_err();
+        assert!(format!("{error:#}").contains("exceeds max size"));
     }
 
     #[cfg(unix)]
