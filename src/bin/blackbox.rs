@@ -2275,9 +2275,14 @@ fn validate_retirement_targets_absent(
                 format!("failed to validate edge retirement evidence: {error}"),
             )
         })?;
+    // R27F5: reclamation records are erased by edge discharge, so the
+    // post-cut reprobe has to see them too. Leaving them out let a retirement
+    // whose interrupted reclamation record survived discharge still report
+    // "target fully discharged".
     let edge_present = !current_edge_inventory.relative_paths.is_empty()
         || !current_edge_inventory.receipt_bindings.is_empty()
-        || !current_edge_inventory.receipt_closeouts.is_empty();
+        || !current_edge_inventory.receipt_closeouts.is_empty()
+        || !current_edge_inventory.snapshot_reclamations.is_empty();
     if generation_present || desired_present || upload_present || edge_present {
         return Err(project_catalog_admin::admin_error(
             "error.project_catalog_retire_evidence_owner",
@@ -3030,6 +3035,19 @@ fn probe_edge_sidecar(edges_dir: &Path, project_id: &ProjectId) -> ClassProbe {
                 retirement_commitment(&format!(
                     "closeout:{}:{}:{}",
                     closeout.commitment, closeout.snapshot, closeout.digest
+                ))
+            }));
+            // R27F5: reclamation records join the class commitment set so the
+            // prepared plan hash is bound to the exact recovery authority the
+            // discharge will delete.
+            commitments.extend(inventory.snapshot_reclamations.iter().map(|reclamation| {
+                retirement_commitment(&format!(
+                    "reclamation:{}:{}:{}:{}:{}",
+                    reclamation.snapshot,
+                    reclamation.receipt_digest.as_deref().unwrap_or(""),
+                    reclamation.tombstone,
+                    reclamation.device,
+                    reclamation.inode
                 ))
             }));
             ClassProbe::Committed(commitments)

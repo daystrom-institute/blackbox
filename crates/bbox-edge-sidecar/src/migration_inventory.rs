@@ -24,7 +24,10 @@ const SNAPSHOT_VERSION_V1: u32 = 1;
 const SCHEMA_HASH_DOMAIN: &[u8] = b"blackbox.edge-manifest.schema.v1\0";
 const ROW_HASH_DOMAIN: &[u8] = b"blackbox.edge-manifest.workspace-rows.v1\0";
 const SOURCE_HASH_DOMAIN: &[u8] = b"blackbox.edge-manifest.source.v1\0";
-pub const RETIREMENT_INVENTORY_VERSION: u32 = 2;
+/// v3 (R27F5) adds `snapshot_reclamations`: the project's in-flight snapshot
+/// reclamation intents. Discharge deletes those records, so retirement has to
+/// carry them as exact evidence like every other authority class it erases.
+pub const RETIREMENT_INVENTORY_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +35,22 @@ pub struct EdgeReceiptCloseoutEvidence {
     pub commitment: String,
     pub snapshot: String,
     pub digest: String,
+}
+
+/// R27F5: exact evidence for one snapshot reclamation intent. A reclamation
+/// record is recovery authority: it names the tombstone an interrupted
+/// deletion left behind plus the device/inode identity the resumed deletion
+/// must match. Retirement discharge removes these records, so a retirement
+/// that never captured them could reach Complete after erasing recovery
+/// authority no operator ever reviewed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeSnapshotReclamationEvidence {
+    pub snapshot: String,
+    pub receipt_digest: Option<String>,
+    pub tombstone: String,
+    pub device: u64,
+    pub inode: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +61,7 @@ pub struct EdgeRetirementInventory {
     pub relative_paths: Vec<String>,
     pub receipt_bindings: std::collections::BTreeMap<String, String>,
     pub receipt_closeouts: Vec<EdgeReceiptCloseoutEvidence>,
+    pub snapshot_reclamations: Vec<EdgeSnapshotReclamationEvidence>,
 }
 
 pub fn capture_project_retirement_inventory(
@@ -63,6 +83,7 @@ pub fn capture_project_retirement_inventory(
                 relative_paths: Vec::new(),
                 receipt_bindings: std::collections::BTreeMap::new(),
                 receipt_closeouts: Vec::new(),
+                snapshot_reclamations: Vec::new(),
             });
         }
         Err(error) => return Err(error.into()),
@@ -95,6 +116,7 @@ pub fn capture_project_retirement_inventory(
 
     let mut receipt_bindings = std::collections::BTreeMap::new();
     let mut receipt_closeouts = Vec::new();
+    let mut snapshot_reclamations = Vec::new();
     if anchored.path_exists(Path::new("materialized/manifest-index.json"))? {
         let index = ManifestIndex::load(edges_dir)?;
         let active = index.workspaces.get(project_id);
@@ -126,6 +148,23 @@ pub fn capture_project_retirement_inventory(
                     digest: closeout.digest.clone(),
                 }),
         );
+        // R27F5: the manifest keys reclamations by the same
+        // `workspace/<project>/snapshots/<id>` relative path the receipt
+        // classes use, and BTreeMap iteration is ordered, so the captured
+        // evidence is deterministic without a post-sort.
+        snapshot_reclamations.extend(
+            index
+                .snapshot_reclamations
+                .iter()
+                .filter(|(snapshot, _)| snapshot.starts_with(&snapshot_prefix))
+                .map(|(snapshot, intent)| EdgeSnapshotReclamationEvidence {
+                    snapshot: snapshot.clone(),
+                    receipt_digest: intent.receipt_digest.clone(),
+                    tombstone: intent.tombstone.clone(),
+                    device: intent.device,
+                    inode: intent.inode,
+                }),
+        );
     }
 
     Ok(EdgeRetirementInventory {
@@ -134,6 +173,7 @@ pub fn capture_project_retirement_inventory(
         relative_paths: paths.into_iter().collect(),
         receipt_bindings,
         receipt_closeouts,
+        snapshot_reclamations,
     })
 }
 
@@ -164,6 +204,17 @@ pub fn discharge_project_retirement_inventory(
     if expected_closeouts.len() != inventory.receipt_closeouts.len() {
         anyhow::bail!("edge retirement inventory contains duplicate receipt closeouts");
     }
+    // R27F5: reclamation records are keyed by snapshot path, so a duplicate
+    // key would let one prepared record authorize deleting a different live
+    // one.
+    let expected_reclamations = inventory
+        .snapshot_reclamations
+        .iter()
+        .map(|reclamation| (reclamation.snapshot.as_str(), reclamation))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if expected_reclamations.len() != inventory.snapshot_reclamations.len() {
+        anyhow::bail!("edge retirement inventory contains duplicate snapshot reclamations");
+    }
 
     let current = capture_project_retirement_inventory(edges_dir, &inventory.project_id)?;
     if current
@@ -184,6 +235,17 @@ pub fn discharge_project_retirement_inventory(
         })
     {
         anyhow::bail!("edge receipt authority drifted after Prepared");
+    }
+    // R27F5: monotonic subset validation, matching the receipt classes above.
+    // A reclamation record present now that was not captured at Prepared, or
+    // one whose tombstone/identity changed, is authority outside the reviewed
+    // plan and must refuse rather than be swept.
+    if current.snapshot_reclamations.iter().any(|reclamation| {
+        expected_reclamations
+            .get(reclamation.snapshot.as_str())
+            .is_none_or(|expected| *expected != reclamation)
+    }) {
+        anyhow::bail!("edge snapshot reclamation authority drifted after Prepared");
     }
 
     let index_path = manifest_index_path(edges_dir);
@@ -243,11 +305,27 @@ pub fn discharge_project_retirement_inventory(
                 None => {}
             }
         }
-        let reclamations_before = index.snapshot_reclamations.len();
-        index.snapshot_reclamations.retain(|snapshot, _| {
-            !snapshot.starts_with(&format!("workspace/{}/snapshots/", inventory.project_id))
-        });
-        changed |= reclamations_before != index.snapshot_reclamations.len();
+        // R27F5: delete only individually matched reclamation records. The
+        // prefix-wide retain this replaces erased every reclamation under the
+        // project, including ones minted after Prepared that no operator had
+        // reviewed.
+        for reclamation in &inventory.snapshot_reclamations {
+            match index.snapshot_reclamations.get(&reclamation.snapshot) {
+                Some(current)
+                    if current.receipt_digest == reclamation.receipt_digest
+                        && current.tombstone == reclamation.tombstone
+                        && current.device == reclamation.device
+                        && current.inode == reclamation.inode =>
+                {
+                    index.snapshot_reclamations.remove(&reclamation.snapshot);
+                    changed = true;
+                }
+                Some(_) => {
+                    anyhow::bail!("edge snapshot reclamation changed during retirement")
+                }
+                None => {}
+            }
+        }
         if changed {
             index.updated_at = Some(chrono_now_rfc3339());
             index.write_atomic(edges_dir)?;
@@ -1088,6 +1166,129 @@ mod tests {
     use super::*;
     use crate::manifest::{ManifestIndex, WorkspaceIndexEntry, WorkspaceManifest};
 
+    fn write_reclamation_manifest(root: &Path, snapshot: &str, tombstone: &str) -> ManifestIndex {
+        let mut index = ManifestIndex::new();
+        index.snapshot_reclamations.insert(
+            snapshot.to_string(),
+            crate::manifest::SnapshotReclamationIntent {
+                receipt_digest: None,
+                tombstone: tombstone.to_string(),
+                device: 7,
+                inode: 11,
+            },
+        );
+        index.write_atomic(root).unwrap();
+        index
+    }
+
+    /// R27F5: reclamation records are recovery authority that discharge
+    /// deletes, so the inventory has to carry them as exact evidence.
+    #[test]
+    fn r27_capture_records_project_snapshot_reclamations() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        write_reclamation_manifest(
+            &root,
+            "workspace/project-a/snapshots/snapshot-a",
+            ".reclaim-snapshot-a",
+        );
+
+        let inventory = capture_project_retirement_inventory(&root, "project-a").unwrap();
+        assert_eq!(inventory.version, RETIREMENT_INVENTORY_VERSION);
+        assert_eq!(
+            inventory.snapshot_reclamations,
+            vec![EdgeSnapshotReclamationEvidence {
+                snapshot: "workspace/project-a/snapshots/snapshot-a".to_string(),
+                receipt_digest: None,
+                tombstone: ".reclaim-snapshot-a".to_string(),
+                device: 7,
+                inode: 11,
+            }]
+        );
+
+        // Another project's reclamation is not this project's authority.
+        let other = capture_project_retirement_inventory(&root, "project-b").unwrap();
+        assert!(other.snapshot_reclamations.is_empty());
+    }
+
+    /// R27F5: discharge deletes only the exact records it captured.
+    #[test]
+    fn r27_discharge_removes_only_captured_reclamations() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        write_reclamation_manifest(
+            &root,
+            "workspace/project-a/snapshots/snapshot-a",
+            ".reclaim-snapshot-a",
+        );
+        let inventory = capture_project_retirement_inventory(&root, "project-a").unwrap();
+        assert_eq!(inventory.snapshot_reclamations.len(), 1);
+
+        discharge_project_retirement_inventory(&root, &inventory).unwrap();
+        assert!(
+            ManifestIndex::load(&root)
+                .unwrap()
+                .snapshot_reclamations
+                .is_empty()
+        );
+    }
+
+    /// R27F5: a reclamation record minted after Prepared is authority nobody
+    /// reviewed. The old prefix-wide sweep erased it silently; monotonic
+    /// subset validation refuses instead.
+    #[test]
+    fn r27_discharge_refuses_a_reclamation_minted_after_prepared() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let inventory = capture_project_retirement_inventory(&root, "project-a").unwrap();
+        assert!(inventory.snapshot_reclamations.is_empty());
+
+        write_reclamation_manifest(
+            &root,
+            "workspace/project-a/snapshots/snapshot-late",
+            ".reclaim-snapshot-late",
+        );
+
+        let error = discharge_project_retirement_inventory(&root, &inventory).unwrap_err();
+        assert!(format!("{error:#}").contains("reclamation authority drifted"));
+        assert!(
+            ManifestIndex::load(&root)
+                .unwrap()
+                .snapshot_reclamations
+                .contains_key("workspace/project-a/snapshots/snapshot-late")
+        );
+    }
+
+    /// R27F5: a captured record whose identity changed under us refuses
+    /// rather than being deleted on stale evidence.
+    #[test]
+    fn r27_discharge_refuses_a_mutated_reclamation_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        write_reclamation_manifest(
+            &root,
+            "workspace/project-a/snapshots/snapshot-a",
+            ".reclaim-snapshot-a",
+        );
+        let inventory = capture_project_retirement_inventory(&root, "project-a").unwrap();
+        write_reclamation_manifest(
+            &root,
+            "workspace/project-a/snapshots/snapshot-a",
+            ".reclaim-snapshot-a-moved",
+        );
+
+        let error = discharge_project_retirement_inventory(&root, &inventory).unwrap_err();
+        assert!(format!("{error:#}").contains("reclamation authority drifted"));
+        assert_eq!(
+            ManifestIndex::load(&root)
+                .unwrap()
+                .snapshot_reclamations
+                .get("workspace/project-a/snapshots/snapshot-a")
+                .map(|intent| intent.tombstone.clone()),
+            Some(".reclaim-snapshot-a-moved".to_string())
+        );
+    }
+
     #[test]
     fn missing_root_is_typed_and_never_created() {
         let directory = tempfile::tempdir().unwrap();
@@ -1293,6 +1494,7 @@ mod tests {
             relative_paths: vec!["materialized/snapshots/project-a".to_string()],
             receipt_bindings: std::collections::BTreeMap::new(),
             receipt_closeouts: Vec::new(),
+            snapshot_reclamations: Vec::new(),
         };
 
         fs::remove_file(root.join("materialized/snapshots/project-a")).unwrap();

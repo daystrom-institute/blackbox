@@ -2214,7 +2214,11 @@ pub struct ProjectRetirementJournal {
 }
 
 impl ProjectRetirementJournal {
-    pub const VERSION: u32 = 6;
+    /// v7 (R27F5): `evidence.edge_inventory` gained exact snapshot
+    /// reclamation records, so a v6 journal's edge authority evidence is
+    /// structurally incomplete for the discharge it authorizes. It is
+    /// refused rather than reinterpreted.
+    pub const VERSION: u32 = 7;
 
     pub fn new(project_id: ProjectId, catalog_epoch: u64, now: &str) -> Self {
         let mut journal = Self {
@@ -2239,6 +2243,7 @@ impl ProjectRetirementJournal {
                         relative_paths: Vec::new(),
                         receipt_bindings: std::collections::BTreeMap::new(),
                         receipt_closeouts: Vec::new(),
+                        snapshot_reclamations: Vec::new(),
                     },
                 ),
                 artifact_targets: Some(Vec::new()),
@@ -2779,6 +2784,33 @@ fn validate_journal_evidence_shape(
     {
         return Err(RetirementJournalError::other(
             "retirement journal edge receipt authority evidence is invalid",
+        ));
+    }
+    // R27F5: reclamation records are recovery authority that discharge
+    // deletes, so they are validated to the same standard as the receipt
+    // classes above: owner-bound snapshot path, well-formed receipt digest
+    // when present, non-empty tombstone, and no duplicate snapshot key.
+    if edge_inventory
+        .snapshot_reclamations
+        .iter()
+        .any(|reclamation| {
+            !reclamation.snapshot.starts_with(&snapshot_prefix)
+                || reclamation.tombstone.is_empty()
+                || reclamation
+                    .receipt_digest
+                    .as_deref()
+                    .is_some_and(|digest| !validate_sha256_text(digest))
+        })
+        || edge_inventory
+            .snapshot_reclamations
+            .iter()
+            .map(|reclamation| reclamation.snapshot.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != edge_inventory.snapshot_reclamations.len()
+    {
+        return Err(RetirementJournalError::other(
+            "retirement journal edge snapshot reclamation evidence is invalid",
         ));
     }
     let artifact_targets = journal.evidence.artifact_targets.as_ref().ok_or_else(|| {
@@ -3571,6 +3603,7 @@ pub trait RetirementDischargeWorkers {
                     relative_paths: Vec::new(),
                     receipt_bindings: std::collections::BTreeMap::new(),
                     receipt_closeouts: Vec::new(),
+                    snapshot_reclamations: Vec::new(),
                 },
             ),
             artifact_targets: Some(Vec::new()),
@@ -3704,6 +3737,7 @@ impl RetirementDischargeWorkers for NoopDischargeWorkers {
                     relative_paths: Vec::new(),
                     receipt_bindings: std::collections::BTreeMap::new(),
                     receipt_closeouts: Vec::new(),
+                    snapshot_reclamations: Vec::new(),
                 },
             ),
             artifact_targets: Some(Vec::new()),
