@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
+use bbox_corpus_core::project_catalog::MAX_PROJECT_CATALOG_ENTRIES;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
@@ -626,6 +627,58 @@ fn collect_project_storage_facts(edges_dir: &Path) -> Result<ProjectStorageFacts
     Ok(facts)
 }
 
+/// R29F2: the inventory walk's ceilings, one per authority subtree.
+///
+/// The walk used to enforce a single flat 250,000-entry ceiling across every
+/// recursively visited entry. The supported per-project layout contributes
+/// about five entries to that count (the `workspace/<project>` directory, its
+/// `manifest.json`, its `snapshots` directory, the active snapshot directory,
+/// and one `pending-local-activation-pins/<project>.json` leaf), so the flat
+/// ceiling refused valid state at roughly 50,000 projects while the pin
+/// representation declares support for `MAX_PROJECT_CATALOG_ENTRIES` of them.
+///
+/// Splitting by authority is what makes each half derivable rather than
+/// invented. Root scope is bounded by the catalog's project count, because
+/// that is exactly what populates it. Each project subtree gets its own
+/// budget, bounded by the writer's declared cap on one materialization
+/// directory, so one project's retained generations can never refuse another
+/// project's inventory.
+#[derive(Clone, Copy)]
+struct MaterializedInventoryBounds {
+    root: usize,
+    project: usize,
+}
+
+impl MaterializedInventoryBounds {
+    /// Root-scope entries a single catalog project contributes: its
+    /// `workspace/<project>` directory entry and its pin leaf.
+    const ROOT_ENTRIES_PER_PROJECT: usize = 2;
+    /// Fixed root-scope entries: the manifest index and its siblings, the
+    /// `workspace` and pin directories themselves, and other root leaves.
+    const ROOT_SLACK: usize = 4_096;
+    /// Per-project subtree entries. The dominant term is the writer's own
+    /// per-materialization file cap, which is what this walk descends when a
+    /// project carries a dirty overlay; the second copy of that cap is slack
+    /// for retained snapshot directory entries and the layout leaves beside
+    /// them, whose interiors are measured under their own bound in
+    /// `validated_snapshot_tree_bytes`.
+    const PROJECT_ENTRIES: usize =
+        2 * bbox_edge_sidecar::manifest::MAX_ACTIVE_MATERIALIZATION_FILES;
+
+    const DECLARED: Self = Self {
+        root: MAX_PROJECT_CATALOG_ENTRIES * Self::ROOT_ENTRIES_PER_PROJECT + Self::ROOT_SLACK,
+        project: Self::PROJECT_ENTRIES,
+    };
+}
+
+/// What one bounded inventory walk actually visited. Returned so a test can
+/// compute a layout's real per-project cost instead of restating a constant.
+#[derive(Debug, Default, Clone, Copy)]
+struct MaterializedInventoryCounts {
+    root_entries: usize,
+    max_project_entries: usize,
+}
+
 fn scan_inactive_snapshots(
     edges_dir: &Path,
     project_filter: Option<&str>,
@@ -633,6 +686,25 @@ fn scan_inactive_snapshots(
     files: &mut Vec<StorageFileInfo>,
     file_identities: &mut HashMap<String, (u64, u64)>,
 ) -> Result<()> {
+    scan_inactive_snapshots_bounded(
+        edges_dir,
+        project_filter,
+        totals,
+        files,
+        file_identities,
+        MaterializedInventoryBounds::DECLARED,
+    )
+    .map(|_| ())
+}
+
+fn scan_inactive_snapshots_bounded(
+    edges_dir: &Path,
+    project_filter: Option<&str>,
+    totals: &mut StorageHealthTotals,
+    files: &mut Vec<StorageFileInfo>,
+    file_identities: &mut HashMap<String, (u64, u64)>,
+    bounds: MaterializedInventoryBounds,
+) -> Result<MaterializedInventoryCounts> {
     let manifest = match bbox_edge_sidecar::manifest::try_load_manifest_index(edges_dir) {
         Ok(manifest) => manifest,
         // A legacy root that never migrated has no manifest and nothing
@@ -658,74 +730,153 @@ fn scan_inactive_snapshots(
     match fs::symlink_metadata(&mat_dir) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
         Ok(_) => anyhow::bail!("materialized edge root is not a safe directory"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(MaterializedInventoryCounts::default());
+        }
         Err(error) => return Err(error.into()),
     }
-    const MAX_MATERIALIZED_ENTRIES: usize = 250_000;
-    let mut entries = 0usize;
+    let workspace_dir = mat_dir.join("workspace");
+    let mut counts = MaterializedInventoryCounts::default();
     let mut pending = vec![mat_dir];
     while let Some(directory) = pending.pop() {
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
-            entries += 1;
-            if entries > MAX_MATERIALIZED_ENTRIES {
-                anyhow::bail!("materialized edge inventory exceeds its entry bound");
+            counts.root_entries += 1;
+            if counts.root_entries > bounds.root {
+                anyhow::bail!("materialized edge inventory exceeds its root entry bound");
             }
-            let path = entry.path();
-            let metadata = fs::symlink_metadata(&path)?;
-            if metadata.file_type().is_symlink() {
-                anyhow::bail!(
-                    "materialized edge inventory contains a symlink: {}",
-                    path.display()
-                );
-            }
-            if metadata.is_dir() {
-                if let Some((project_id, _snapshot_dir)) = inactive_snapshot_dir_key(&path) {
-                    if protected_snapshot_dirs.contains(&path) {
-                        continue;
-                    }
-                    if !project_filter_matches(Some(&project_id), project_filter) {
-                        continue;
-                    }
-                    let bytes = validated_snapshot_tree_bytes(&path)?;
-                    let path_str = path
-                        .to_str()
-                        .context("materialized snapshot path is not UTF-8")?;
-                    totals.accumulate(FileKind::InactiveSnapshot, bytes);
-                    record_file_identity(file_identities, path_str, &metadata);
-                    files.push(StorageFileInfo {
-                        path: path_str.to_string(),
-                        kind: FileKind::InactiveSnapshot,
-                        project_id: Some(project_id),
-                        bytes,
-                        reason: Some(
-                            "inactive snapshot directory not selected by the manifest".into(),
-                        ),
-                    });
-                    continue;
-                }
-                pending.push(path);
+            let Some(descend) = classify_materialized_entry(
+                &entry.path(),
+                &protected_snapshot_dirs,
+                project_filter,
+                totals,
+                files,
+                file_identities,
+            )?
+            else {
+                continue;
+            };
+            // A project subtree is its own authority: it is walked to
+            // completion against its own budget, so its size is bounded by
+            // the writer's per-materialization cap rather than by whatever
+            // every other project already spent.
+            if directory == workspace_dir {
+                let project_entries = scan_project_subtree(
+                    &descend,
+                    &protected_snapshot_dirs,
+                    project_filter,
+                    totals,
+                    files,
+                    file_identities,
+                    bounds.project,
+                )?;
+                counts.max_project_entries = counts.max_project_entries.max(project_entries);
                 continue;
             }
-            if !metadata.is_file() || path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let staging_marker = path
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("snapshot member has no parent"))?
-                .join(".staging");
-            match fs::symlink_metadata(&staging_marker) {
-                Ok(marker) if marker.is_file() && !marker.file_type().is_symlink() => continue,
-                Ok(_) => anyhow::bail!("snapshot staging marker is not a regular file"),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-            // Snapshot directories are recorded as one validated retention
-            // unit above. Files outside that writer-exact shape are not
-            // inactive snapshot candidates.
+            pending.push(descend);
         }
     }
-    Ok(())
+    Ok(counts)
+}
+
+/// Walk one `workspace/<project>` subtree under its own entry budget,
+/// returning the entries it visited.
+fn scan_project_subtree(
+    root: &Path,
+    protected_snapshot_dirs: &HashSet<PathBuf>,
+    project_filter: Option<&str>,
+    totals: &mut StorageHealthTotals,
+    files: &mut Vec<StorageFileInfo>,
+    file_identities: &mut HashMap<String, (u64, u64)>,
+    limit: usize,
+) -> Result<usize> {
+    let mut entries = 0usize;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            entries += 1;
+            if entries > limit {
+                anyhow::bail!(
+                    "materialized edge inventory for {} exceeds its per-project entry bound",
+                    root.display()
+                );
+            }
+            if let Some(descend) = classify_materialized_entry(
+                &entry.path(),
+                protected_snapshot_dirs,
+                project_filter,
+                totals,
+                files,
+                file_identities,
+            )? {
+                pending.push(descend);
+            }
+        }
+    }
+    Ok(entries)
+}
+
+/// Classify one visited entry, recording it when it is an inactive snapshot
+/// retention unit. Returns the directory the caller should descend into, or
+/// `None` when the entry needs no further walking.
+fn classify_materialized_entry(
+    path: &Path,
+    protected_snapshot_dirs: &HashSet<PathBuf>,
+    project_filter: Option<&str>,
+    totals: &mut StorageHealthTotals,
+    files: &mut Vec<StorageFileInfo>,
+    file_identities: &mut HashMap<String, (u64, u64)>,
+) -> Result<Option<PathBuf>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "materialized edge inventory contains a symlink: {}",
+            path.display()
+        );
+    }
+    if metadata.is_dir() {
+        if let Some((project_id, _snapshot_dir)) = inactive_snapshot_dir_key(path) {
+            if protected_snapshot_dirs.contains(path) {
+                return Ok(None);
+            }
+            if !project_filter_matches(Some(&project_id), project_filter) {
+                return Ok(None);
+            }
+            let bytes = validated_snapshot_tree_bytes(path)?;
+            let path_str = path
+                .to_str()
+                .context("materialized snapshot path is not UTF-8")?;
+            totals.accumulate(FileKind::InactiveSnapshot, bytes);
+            record_file_identity(file_identities, path_str, &metadata);
+            files.push(StorageFileInfo {
+                path: path_str.to_string(),
+                kind: FileKind::InactiveSnapshot,
+                project_id: Some(project_id),
+                bytes,
+                reason: Some("inactive snapshot directory not selected by the manifest".into()),
+            });
+            return Ok(None);
+        }
+        return Ok(Some(path.to_path_buf()));
+    }
+    if !metadata.is_file() || path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        return Ok(None);
+    }
+    let staging_marker = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("snapshot member has no parent"))?
+        .join(".staging");
+    match fs::symlink_metadata(&staging_marker) {
+        Ok(marker) if marker.is_file() && !marker.file_type().is_symlink() => return Ok(None),
+        Ok(_) => anyhow::bail!("snapshot staging marker is not a regular file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    // Snapshot directories are recorded as one validated retention unit
+    // above. Files outside that writer-exact shape are not inactive snapshot
+    // candidates.
+    Ok(None)
 }
 
 fn inactive_snapshot_dir_key(path: &Path) -> Option<(String, String)> {
@@ -3301,5 +3452,198 @@ mod tests {
             temps.is_empty(),
             "no leftover unique temp files should remain after successful rename"
         );
+    }
+
+    /// R29F2: the inventory walk must admit the maximum layout the rest of
+    /// the system declares supported, and refuse only genuine excess.
+    ///
+    /// The retired flat ceiling counted every recursively visited entry
+    /// against one 250,000 budget. The supported layout costs about five
+    /// entries per project, so that ceiling refused valid state somewhere
+    /// around 50,000 projects while the pin representation declares support
+    /// for `MAX_PROJECT_CATALOG_ENTRIES` = 100,000 of them.
+    ///
+    /// Materializing 100,000 project trees would prove that at the cost of
+    /// minutes of syscalls, so this measures the layout's real per-project
+    /// cost from small synthesized fixtures (two project counts, so the
+    /// marginal and fixed terms separate) and then does the arithmetic
+    /// against the declared bounds. The refusal half runs the same walk at
+    /// the exact observed counts and one below them.
+    #[test]
+    fn r29_materialized_inventory_admits_the_declared_project_cardinality() {
+        /// What the walk used to enforce across every visited entry.
+        const RETIRED_FLAT_CEILING: usize = 250_000;
+
+        fn build(root: &Path, projects: usize, retained: usize) {
+            let materialized = bbox_edge_sidecar::manifest::materialized_dir(root);
+            let pins = materialized.join("pending-local-activation-pins");
+            fs::create_dir_all(&pins).unwrap();
+            let mut index = bbox_edge_sidecar::manifest::ManifestIndex::new();
+            for project in 0..projects {
+                let project_id = format!("p{project:06}");
+                write_snapshot_jsonl(root, &project_id, "head-active");
+                for generation in 0..retained {
+                    write_snapshot_jsonl(root, &project_id, &format!("head-old-{generation}"));
+                }
+                write_workspace_manifest(root, &project_id, Some("repo1234"), None, "head-active");
+                fs::write(
+                    pins.join(format!("{project_id}.json")),
+                    format!(
+                        "{{\"version\":2,\"commit_token\":\"token-{project_id}\",\
+                         \"activation\":{{\"project_id\":\"{project_id}\",\
+                         \"repo_id\":\"repo1234\",\"branch\":null,\
+                         \"head_sha\":\"head-a\",\"dirty\":false,\
+                         \"dirty_fingerprint\":null,\
+                         \"snapshot_id\":\"head-active\"}}}}"
+                    ),
+                )
+                .unwrap();
+                index.upsert_workspace(
+                    &project_id,
+                    bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
+                        manifest: format!("workspace/{project_id}/manifest.json"),
+                        active_snapshot: Some(format!(
+                            "workspace/{project_id}/snapshots/head-active"
+                        )),
+                        dirty_overlay: None,
+                        repo_materialization: None,
+                        code_source_selector: None,
+                        code_source_generation: None,
+                        git_overlay: None,
+                        git_overlay_managed: false,
+                    },
+                );
+            }
+            index.write_atomic(root).unwrap();
+        }
+
+        fn walk(
+            edges_dir: &Path,
+            bounds: MaterializedInventoryBounds,
+        ) -> Result<MaterializedInventoryCounts> {
+            let mut totals = StorageHealthTotals::default();
+            let mut files = Vec::new();
+            let mut identities = HashMap::new();
+            scan_inactive_snapshots_bounded(
+                edges_dir,
+                None,
+                &mut totals,
+                &mut files,
+                &mut identities,
+                bounds,
+            )
+        }
+
+        let unbounded = MaterializedInventoryBounds {
+            root: usize::MAX,
+            project: usize::MAX,
+        };
+
+        // Two project counts per layout shape, so the marginal per-project
+        // cost separates cleanly from the fixed root cost.
+        for retained in [0usize, 2] {
+            let mut measured = Vec::new();
+            for projects in [2usize, 16] {
+                let directory = tempfile::tempdir().unwrap();
+                let edges_dir = directory.path().canonicalize().unwrap();
+                build(&edges_dir, projects, retained);
+                let counts = walk(&edges_dir, unbounded).unwrap();
+                measured.push((projects, edges_dir, directory, counts));
+            }
+            let (small_projects, _, _, small) = &measured[0];
+            let (large_projects, large_dir, _large_guard, large) = &measured[1];
+
+            let span = large_projects - small_projects;
+            assert_eq!(
+                (large.root_entries - small.root_entries) % span,
+                0,
+                "root cost must be linear in the project count"
+            );
+            let marginal_root = (large.root_entries - small.root_entries) / span;
+            let fixed_root = small.root_entries - marginal_root * small_projects;
+            let per_project = large.max_project_entries;
+            assert_eq!(
+                small.max_project_entries, per_project,
+                "a project subtree's cost must not depend on how many peers it has"
+            );
+
+            // The supported layout, spelled out: one `workspace/<project>`
+            // directory entry and one pin leaf at root scope, and inside the
+            // project subtree its `manifest.json`, its `snapshots`
+            // directory, the active snapshot directory entry, and one
+            // directory entry per retained generation.
+            assert_eq!(
+                marginal_root,
+                MaterializedInventoryBounds::ROOT_ENTRIES_PER_PROJECT,
+                "root cost per project must match its documented allowance"
+            );
+            assert_eq!(
+                per_project,
+                3 + retained,
+                "per-project cost must match the documented writer layout"
+            );
+
+            // The declared root bound admits the catalog's full project
+            // count at this layout's measured cost.
+            assert!(
+                marginal_root <= MaterializedInventoryBounds::ROOT_ENTRIES_PER_PROJECT,
+                "root cost per project ({marginal_root}) outgrew its documented allowance"
+            );
+            assert!(
+                fixed_root <= MaterializedInventoryBounds::ROOT_SLACK,
+                "fixed root cost ({fixed_root}) outgrew its documented slack"
+            );
+            assert!(
+                marginal_root * MAX_PROJECT_CATALOG_ENTRIES + fixed_root
+                    <= MaterializedInventoryBounds::DECLARED.root,
+                "the declared root bound must admit {MAX_PROJECT_CATALOG_ENTRIES} projects"
+            );
+            assert!(
+                per_project <= MaterializedInventoryBounds::DECLARED.project,
+                "the declared per-project bound must admit one project's supported layout"
+            );
+
+            // This is the finding: the same supported layout, at the
+            // declared cardinality, blew the retired flat ceiling.
+            assert!(
+                (marginal_root + per_project) * MAX_PROJECT_CATALOG_ENTRIES > RETIRED_FLAT_CEILING,
+                "the flat ceiling this replaced refused the declared cardinality"
+            );
+
+            // The exact observed layout is accepted, and the first entry
+            // past each bound is refused.
+            walk(
+                large_dir,
+                MaterializedInventoryBounds {
+                    root: large.root_entries,
+                    project: per_project,
+                },
+            )
+            .unwrap();
+            let error = walk(
+                large_dir,
+                MaterializedInventoryBounds {
+                    root: large.root_entries - 1,
+                    project: per_project,
+                },
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("exceeds its root entry bound"),
+                "{error:#}"
+            );
+            let error = walk(
+                large_dir,
+                MaterializedInventoryBounds {
+                    root: large.root_entries,
+                    project: per_project - 1,
+                },
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("exceeds its per-project entry bound"),
+                "{error:#}"
+            );
+        }
     }
 }
