@@ -968,7 +968,19 @@ fn confined_regular_file_under_root(
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(edges_dir)?;
-    Ok(open_confined_regular(&root, relative)?.map(|file| (edges_dir.join(relative), file)))
+    match open_confined_regular(&root, relative) {
+        Ok(file) => Ok(file.map(|file| (edges_dir.join(relative), file))),
+        Err(error)
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|io| io.kind() == io::ErrorKind::NotFound)
+            }) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(unix)]
