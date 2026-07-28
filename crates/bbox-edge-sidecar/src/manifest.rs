@@ -62,6 +62,20 @@ impl OverlayManifest {
         Ok(())
     }
 
+    pub fn serialize(hashes: &HashSet<String>) -> Result<Vec<u8>> {
+        let manifest = OverlayManifest {
+            version: OVERLAY_MANIFEST_VERSION,
+            covered_rel_path_hashes: hashes.iter().cloned().collect(),
+        };
+        let mut bytes = serde_json::to_vec(&manifest)?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    pub fn filename() -> &'static str {
+        OVERLAY_MANIFEST_FILENAME
+    }
+
     pub fn read_from(overlay_dir: &Path) -> Option<Self> {
         let path = overlay_dir.join(OVERLAY_MANIFEST_FILENAME);
         let data = fs::read_to_string(&path).ok()?;

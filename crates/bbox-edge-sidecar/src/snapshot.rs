@@ -963,26 +963,210 @@ fn validate_snapshot_component(value: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+/// Open the root edges_dir and walk every component of `relative` with
+/// `O_DIRECTORY | O_NOFOLLOW`, returning the leaf directory descriptor.
+/// This confines filesystem mutation to descriptor-relative operations:
+/// a symlink substituted into any intermediate component is rejected at
+/// open time instead of being silently followed. `create_missing` creates
+/// intermediate directories with `mkdirat`.
+fn open_dir_under_root(
+    edges_dir: &Path,
+    relative: &Path,
+    create_missing: bool,
+) -> Result<fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let components = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(value) => Ok(value.to_os_string()),
+            _ => anyhow::bail!("materialized path is not normalized"),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let root = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(edges_dir)?;
+    let mut directory = root;
+    for component in components {
+        let component_c = std::ffi::CString::new(component.as_bytes())?;
+        if create_missing {
+            if unsafe { libc::mkdirat(directory.as_raw_fd(), component_c.as_ptr(), 0o755) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(error.into());
+                }
+            }
+        }
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                component_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        directory = unsafe { fs::File::from_raw_fd(fd) };
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn fstatat_nofollow(
+    dir_fd: std::os::fd::RawFd,
+    name: &std::ffi::CStr,
+) -> std::io::Result<libc::stat> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    if unsafe {
+        libc::fstatat(
+            dir_fd,
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { stat.assume_init() })
+}
+
+#[cfg(unix)]
+fn collect_dir_entries(dir: &fs::File) -> Result<Vec<std::ffi::OsString>> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut entries = Vec::new();
+    // fdopendir takes ownership of the fd and closedir closes it. Duplicate
+    // the fd so the borrowed fs::File's Drop still has a valid fd to close.
+    let dup_fd = unsafe { libc::dup(dir.as_raw_fd()) };
+    if dup_fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let dir_stream = unsafe { libc::fdopendir(dup_fd) };
+    if dir_stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe { libc::close(dup_fd) };
+        return Err(error.into());
+    }
+    // rewind to start in case the caller's fd position is mid-directory.
+    unsafe { libc::rewinddir(dir_stream) };
+    loop {
+        let entry_ptr = unsafe { libc::readdir(dir_stream) };
+        if entry_ptr.is_null() {
+            break;
+        }
+        let entry = unsafe { &*entry_ptr };
+        let name_bytes = unsafe {
+            std::slice::from_raw_parts(
+                entry.d_name.as_ptr() as *const u8,
+                libc::strlen(entry.d_name.as_ptr()) as usize,
+            )
+        };
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+        entries.push(std::ffi::OsString::from_vec(name_bytes.to_vec()));
+    }
+    unsafe { libc::closedir(dir_stream) };
+    Ok(entries)
+}
+
+#[cfg(unix)]
+/// Recursively remove a directory tree relative to a parent descriptor using
+/// `unlinkat(AT_REMOVEDIR)` for subdirectories and `unlinkat(0)` for files.
+/// Every component is opened with `O_NOFOLLOW` before mutation, so a symlink
+/// planted inside the tree cannot escape the parent.
+fn unlinkat_tree(parent_fd: std::os::fd::RawFd, name: &std::ffi::CStr) -> Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir_fd = unsafe {
+        libc::openat(
+            parent_fd,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if dir_fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(error.into());
+    }
+    let dir_file = unsafe { fs::File::from_raw_fd(dir_fd) };
+    let entries = collect_dir_entries(&dir_file)?;
+    for entry_name in entries {
+        let entry_c = std::ffi::CString::new(entry_name.as_bytes())?;
+        let stat = fstatat_nofollow(dir_file.as_raw_fd(), &entry_c)?;
+        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            unlinkat_tree(dir_file.as_raw_fd(), &entry_c)?;
+        } else if unsafe { libc::unlinkat(dir_file.as_raw_fd(), entry_c.as_ptr(), 0) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error.into());
+            }
+        }
+    }
+    dir_file.sync_all()?;
+    drop(dir_file);
+    if unsafe { libc::unlinkat(parent_fd, name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
 fn clear_snapshot_staging_marker(
     edges_dir: &Path,
     project_id: &str,
     snapshot_id: &str,
 ) -> Result<()> {
-    let marker = snapshot_dir(edges_dir, project_id, snapshot_id).join(".staging");
-    match fs::symlink_metadata(&marker) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-            fs::remove_file(&marker)?;
-            fs::File::open(
-                marker
-                    .parent()
-                    .ok_or_else(|| anyhow::anyhow!("snapshot staging marker has no parent"))?,
-            )?
-            .sync_all()?;
-            Ok(())
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+
+        validate_snapshot_component(project_id)?;
+        validate_snapshot_component(snapshot_id)?;
+        let relative = Path::new("materialized")
+            .join("workspace")
+            .join(project_id)
+            .join("snapshots")
+            .join(snapshot_id);
+        let directory = open_dir_under_root(edges_dir, &relative, false)?;
+        let marker_c = std::ffi::CString::new(b".staging".as_slice())?;
+        match fstatat_nofollow(directory.as_raw_fd(), &marker_c) {
+            Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFREG => {}
+            Ok(_) => anyhow::bail!("snapshot staging marker is not a regular nofollow file"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
         }
-        Ok(_) => anyhow::bail!("snapshot staging marker is not a regular nofollow file"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+        if unsafe { libc::unlinkat(directory.as_raw_fd(), marker_c.as_ptr(), 0) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error.into());
+            }
+        }
+        directory.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let marker = snapshot_dir(edges_dir, project_id, snapshot_id).join(".staging");
+        match fs::symlink_metadata(&marker) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                fs::remove_file(&marker)?;
+                Ok(())
+            }
+            Ok(_) => anyhow::bail!("snapshot staging marker is not a regular nofollow file"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -1071,6 +1255,15 @@ fn write_edges_file(path: &Path, edges: &[Edge]) -> Result<()> {
     Ok(())
 }
 
+/// Open the parent directory of a project workspace (materialized/workspace/<project_id>)
+/// using descriptor-confined traversal with O_NOFOLLOW on every component.
+#[cfg(unix)]
+fn open_workspace_parent(edges_dir: &Path, project_id: &str) -> Result<fs::File> {
+    validate_snapshot_component(project_id)?;
+    let relative = Path::new("materialized").join("workspace").join(project_id);
+    open_dir_under_root(edges_dir, &relative, true)
+}
+
 pub fn write_dirty_overlay(
     edges_dir: &Path,
     project_id: &str,
@@ -1090,91 +1283,374 @@ pub fn write_dirty_overlay(
         }
     }
 
-    let overlay_dir = dirty_overlay_dir(edges_dir, project_id);
-    let tmp_dir = overlay_dir.with_extension("write-tmp");
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::fd::{AsRawFd, FromRawFd};
 
-    if tmp_dir.is_dir() {
-        let _ = fs::remove_dir_all(&tmp_dir);
+        let parent = open_workspace_parent(edges_dir, project_id)?;
+        let overlay_name = DIRTY_OVERLAY_DIRNAME;
+        let overlay_c = std::ffi::CString::new(overlay_name)?;
+        let tmp_c = std::ffi::CString::new(format!("{overlay_name}.write-tmp"))?;
+
+        // Remove any stale temp via descriptor-relative unlinkat_tree.
+        let _ = unlinkat_tree(parent.as_raw_fd(), &tmp_c);
+
+        let all_empty = files.iter().all(|(_, edges)| edges.is_empty());
+        if all_empty {
+            let _ = unlinkat_tree(parent.as_raw_fd(), &overlay_c);
+            parent.sync_all()?;
+            return Ok(());
+        }
+
+        // Create the temp directory with mkdirat.
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), tmp_c.as_ptr(), 0o755) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let tmp_dir_fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                tmp_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if tmp_dir_fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let tmp_dir = unsafe { fs::File::from_raw_fd(tmp_dir_fd) };
+
+        // Collect covered rel_path_hashes from all overlay edges so the loader
+        // can merge snapshot + overlay at per-file granularity.
+        let mut covered_hashes = std::collections::HashSet::new();
+        for (_filename, edges) in files {
+            for edge in *edges {
+                if let EntityRef::ProjectFile { rel_path_hash, .. }
+                | EntityRef::ProjectFileV2 { rel_path_hash, .. } = &edge.source
+                {
+                    covered_hashes.insert(rel_path_hash.clone());
+                }
+                if let EntityRef::ProjectFile { rel_path_hash, .. }
+                | EntityRef::ProjectFileV2 { rel_path_hash, .. } = &edge.target
+                {
+                    covered_hashes.insert(rel_path_hash.clone());
+                }
+            }
+        }
+
+        for (filename, edges) in files {
+            if edges.is_empty() {
+                continue;
+            }
+            let filename_c = std::ffi::CString::new(*filename)?;
+            let fd = unsafe {
+                libc::openat(
+                    tmp_dir.as_raw_fd(),
+                    filename_c.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let file = unsafe { fs::File::from_raw_fd(fd) };
+            let mut writer = std::io::BufWriter::new(file);
+            for edge in *edges {
+                serde_json::to_writer(&mut writer, edge)?;
+                writer.write_all(b"\n")?;
+            }
+            let file = writer.into_inner().map_err(|err| err.into_error())?;
+            file.sync_all()?;
+        }
+
+        // Write overlay_manifest.json via descriptor-relative openat.
+        let manifest_bytes = OverlayManifest::serialize(&covered_hashes)?;
+        let manifest_name = OverlayManifest::filename();
+        let manifest_c = std::ffi::CString::new(manifest_name.as_bytes())?;
+        let fd = unsafe {
+            libc::openat(
+                tmp_dir.as_raw_fd(),
+                manifest_c.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut manifest_file = unsafe { fs::File::from_raw_fd(fd) };
+        manifest_file.write_all(&manifest_bytes)?;
+        manifest_file.sync_all()?;
+        drop(manifest_file);
+
+        tmp_dir.sync_all()?;
+        drop(tmp_dir);
+
+        // Remove the old overlay (if any) and atomically rename the temp.
+        let _ = unlinkat_tree(parent.as_raw_fd(), &overlay_c);
+        if unsafe {
+            libc::renameat(
+                parent.as_raw_fd(),
+                tmp_c.as_ptr(),
+                parent.as_raw_fd(),
+                overlay_c.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        parent.sync_all()?;
+        Ok(())
     }
+    #[cfg(not(unix))]
+    {
+        let overlay_dir = dirty_overlay_dir(edges_dir, project_id);
+        let tmp_dir = overlay_dir.with_extension("write-tmp");
 
-    let all_empty = files.iter().all(|(_, edges)| edges.is_empty());
-    if all_empty {
+        if tmp_dir.is_dir() {
+            let _ = fs::remove_dir_all(&tmp_dir);
+        }
+
+        let all_empty = files.iter().all(|(_, edges)| edges.is_empty());
+        if all_empty {
+            if overlay_dir.is_dir() {
+                fs::remove_dir_all(&overlay_dir)?;
+            }
+            return Ok(());
+        }
+
+        fs::create_dir_all(&tmp_dir)?;
+
+        // Collect covered rel_path_hashes from all overlay edges so the loader
+        // can merge snapshot + overlay at per-file granularity.
+        let mut covered_hashes = std::collections::HashSet::new();
+        for (_filename, edges) in files {
+            for edge in *edges {
+                if let EntityRef::ProjectFile { rel_path_hash, .. }
+                | EntityRef::ProjectFileV2 { rel_path_hash, .. } = &edge.source
+                {
+                    covered_hashes.insert(rel_path_hash.clone());
+                }
+                if let EntityRef::ProjectFile { rel_path_hash, .. }
+                | EntityRef::ProjectFileV2 { rel_path_hash, .. } = &edge.target
+                {
+                    covered_hashes.insert(rel_path_hash.clone());
+                }
+            }
+        }
+
+        for (filename, edges) in files {
+            if edges.is_empty() {
+                continue;
+            }
+            let path = tmp_dir.join(*filename);
+            let file = fs::File::create(&path)?;
+            let mut writer = std::io::BufWriter::new(file);
+            for edge in *edges {
+                serde_json::to_writer(&mut writer, edge)?;
+                writer.write_all(b"\n")?;
+            }
+            let file = writer.into_inner().map_err(|err| err.into_error())?;
+            file.sync_all()?;
+        }
+
+        OverlayManifest::write_to(&tmp_dir, &covered_hashes)?;
+
         if overlay_dir.is_dir() {
-            fs::remove_dir_all(&overlay_dir)?;
+            let _ = fs::remove_dir_all(&overlay_dir);
         }
-        return Ok(());
+        fs::rename(&tmp_dir, &overlay_dir)?;
+        Ok(())
     }
-
-    fs::create_dir_all(&tmp_dir)?;
-
-    // Collect covered rel_path_hashes from all overlay edges so the loader
-    // can merge snapshot + overlay at per-file granularity.
-    let mut covered_hashes = std::collections::HashSet::new();
-    for (_filename, edges) in files {
-        for edge in *edges {
-            if let EntityRef::ProjectFile { rel_path_hash, .. }
-            | EntityRef::ProjectFileV2 { rel_path_hash, .. } = &edge.source
-            {
-                covered_hashes.insert(rel_path_hash.clone());
-            }
-            if let EntityRef::ProjectFile { rel_path_hash, .. }
-            | EntityRef::ProjectFileV2 { rel_path_hash, .. } = &edge.target
-            {
-                covered_hashes.insert(rel_path_hash.clone());
-            }
-        }
-    }
-
-    for (filename, edges) in files {
-        if edges.is_empty() {
-            continue;
-        }
-        let path = tmp_dir.join(*filename);
-        let file = fs::File::create(&path)?;
-        // Buffered: one syscall per ~8KiB instead of one per serialized
-        // fragment (unbuffered writes dominated snapshot rewrites;
-        // thread-935b467d).
-        let mut writer = std::io::BufWriter::new(file);
-        for edge in *edges {
-            serde_json::to_writer(&mut writer, edge)?;
-            writer.write_all(b"\n")?;
-        }
-        let file = writer.into_inner().map_err(|err| err.into_error())?;
-        file.sync_all()?;
-    }
-
-    // Write overlay_manifest.json so the loader knows which hashes are covered.
-    OverlayManifest::write_to(&tmp_dir, &covered_hashes)?;
-
-    if overlay_dir.is_dir() {
-        let _ = fs::remove_dir_all(&overlay_dir);
-    }
-    fs::rename(&tmp_dir, &overlay_dir)?;
-    Ok(())
 }
 
 pub fn clear_dirty_overlay(edges_dir: &Path, project_id: &str) -> Result<bool> {
-    let overlay_dir = dirty_overlay_dir(edges_dir, project_id);
-    if !overlay_dir.is_dir() {
-        return Ok(false);
-    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd};
 
-    let validation = validate_overlay_provenance(&overlay_dir);
-    if let Err(bad_files) = validation {
-        quarantine_dirty_overlay(edges_dir, project_id, &bad_files)?;
-        tracing::warn!(
-            project_id,
-            ?bad_files,
-            "quarantined dirty overlay containing non-Derived provenance"
-        );
-        return Ok(false);
+        let parent = open_workspace_parent(edges_dir, project_id)?;
+        let overlay_c = std::ffi::CString::new(DIRTY_OVERLAY_DIRNAME)?;
+        let stat = fstatat_nofollow(parent.as_raw_fd(), &overlay_c);
+        match stat {
+            Ok(s) if s.st_mode & libc::S_IFMT == libc::S_IFDIR => {}
+            Ok(_) | Err(_) => return Ok(false),
+        }
+        let overlay_fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                overlay_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if overlay_fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(false);
+            }
+            return Err(error.into());
+        }
+        let overlay_dir = unsafe { fs::File::from_raw_fd(overlay_fd) };
+        let validation = validate_overlay_provenance(&overlay_dir);
+        if let Err(bad_names) = validation {
+            quarantine_dirty_overlay(edges_dir, project_id, &overlay_dir, &bad_names)?;
+            tracing::warn!(
+                project_id,
+                ?bad_names,
+                "quarantined dirty overlay containing non-Derived provenance"
+            );
+            return Ok(false);
+        }
+        drop(overlay_dir);
+        unlinkat_tree(parent.as_raw_fd(), &overlay_c)?;
+        parent.sync_all()?;
+        Ok(true)
     }
+    #[cfg(not(unix))]
+    {
+        let overlay_dir = dirty_overlay_dir(edges_dir, project_id);
+        if !overlay_dir.is_dir() {
+            return Ok(false);
+        }
 
-    fs::remove_dir_all(&overlay_dir)?;
-    Ok(true)
+        let validation = validate_overlay_provenance_path(&overlay_dir);
+        if let Err(bad_files) = validation {
+            quarantine_dirty_overlay_path(&overlay_dir, &bad_files)?;
+            tracing::warn!(
+                project_id,
+                ?bad_files,
+                "quarantined dirty overlay containing non-Derived provenance"
+            );
+            return Ok(false);
+        }
+
+        fs::remove_dir_all(&overlay_dir)?;
+        Ok(true)
+    }
 }
 
-fn validate_overlay_provenance(overlay_dir: &Path) -> std::result::Result<(), Vec<PathBuf>> {
+/// Descriptor-relative provenance validation: reads each .jsonl member
+/// through the overlay directory descriptor and returns the list of
+/// member names containing non-Derived edges.
+#[cfg(unix)]
+fn validate_overlay_provenance(overlay_dir: &fs::File) -> std::result::Result<(), Vec<String>> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut bad = Vec::new();
+    let entries = match collect_dir_entries(overlay_dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(()),
+    };
+    for entry_name in entries {
+        let name_bytes = entry_name.as_bytes();
+        if std::str::from_utf8(name_bytes)
+            .map(|s| !s.ends_with(".jsonl"))
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let entry_c = std::ffi::CString::new(name_bytes).unwrap();
+        let stat = match fstatat_nofollow(overlay_dir.as_raw_fd(), &entry_c) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+            continue;
+        }
+        let fd = unsafe {
+            libc::openat(
+                overlay_dir.as_raw_fd(),
+                entry_c.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            continue;
+        }
+        let file = unsafe { fs::File::from_raw_fd(fd) };
+        let reader = std::io::BufReader::new(file);
+        use std::io::BufRead;
+        let mut found_bad = false;
+        for line in reader.lines().map_while(Result::ok) {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(edge) = serde_json::from_str::<Edge>(trimmed)
+                && edge.provenance != EdgeProvenance::Derived
+            {
+                found_bad = true;
+                break;
+            }
+        }
+        if found_bad {
+            bad.push(entry_name.to_string_lossy().into_owned());
+        }
+    }
+    if bad.is_empty() { Ok(()) } else { Err(bad) }
+}
+
+/// Descriptor-relative quarantine: moves named bad members into the
+/// dirty-quarantine subdirectory of the project workspace using
+/// renameat under the workspace parent descriptor.
+#[cfg(unix)]
+fn quarantine_dirty_overlay(
+    edges_dir: &Path,
+    project_id: &str,
+    overlay_dir: &fs::File,
+    bad_names: &[String],
+) -> Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let parent = open_workspace_parent(edges_dir, project_id)?;
+    let quarantine_name = "dirty-quarantine";
+    let quarantine_c = std::ffi::CString::new(quarantine_name)?;
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), quarantine_c.as_ptr(), 0o755) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error.into());
+        }
+    }
+    let quarantine_fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            quarantine_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if quarantine_fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let quarantine_dir = unsafe { fs::File::from_raw_fd(quarantine_fd) };
+    for name in bad_names {
+        let name_c = std::ffi::CString::new(name.as_bytes())?;
+        if unsafe {
+            libc::renameat(
+                overlay_dir.as_raw_fd(),
+                name_c.as_ptr(),
+                quarantine_dir.as_raw_fd(),
+                name_c.as_ptr(),
+            )
+        } != 0
+        {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error.into());
+            }
+        }
+    }
+    quarantine_dir.sync_all()?;
+    parent.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_overlay_provenance_path(overlay_dir: &Path) -> std::result::Result<(), Vec<PathBuf>> {
     let mut bad = Vec::new();
     if let Ok(entries) = fs::read_dir(overlay_dir) {
         for entry in entries.filter_map(Result::ok) {
@@ -1203,16 +1679,12 @@ fn validate_overlay_provenance(overlay_dir: &Path) -> std::result::Result<(), Ve
     if bad.is_empty() { Ok(()) } else { Err(bad) }
 }
 
-fn quarantine_dirty_overlay(
-    edges_dir: &Path,
-    project_id: &str,
-    bad_files: &[PathBuf],
-) -> Result<()> {
-    let quarantine_dir = materialized_dir(edges_dir)
-        .join("workspace")
-        .join(project_id)
+#[cfg(not(unix))]
+fn quarantine_dirty_overlay_path(overlay_dir: &Path, bad_files: &[PathBuf]) -> Result<()> {
+    let quarantine_dir = overlay_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("overlay directory has no parent"))?
         .join("dirty-quarantine");
-
     fs::create_dir_all(&quarantine_dir)?;
     for src in bad_files {
         let filename = src.file_name().unwrap_or_default();
@@ -2791,6 +3263,128 @@ mod tests {
                 .as_deref()
                 .is_some_and(|s| s.starts_with("collected:")),
             "persisted entry must carry collected selector across restart"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_marker_clear_refuses_symlinked_parent() {
+        // R16F1: a symlink planted into a parent component of the snapshot
+        // directory must prevent staging-marker removal rather than following
+        // the symlink outside the state root.
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().canonicalize().unwrap();
+
+        // Build a legitimate snapshot so the directory chain exists.
+        let snapshot_id = overlay_fixture(&edges_dir, "p_sym", "gen-a");
+        let snap_dir = snapshot_dir(&edges_dir, "p_sym", &snapshot_id);
+        let marker = snap_dir.join(".staging");
+        // Place a staging marker for the test.
+        fs::write(&marker, b"pending\n").unwrap();
+
+        // Replace the project_id component with a symlink to outside.
+        let outside = tempfile::tempdir().unwrap();
+        let project_dir = materialized_dir(&edges_dir).join("workspace").join("p_sym");
+        let real_project = project_dir.canonicalize().unwrap();
+        let link_target = outside.path().join("evil-project");
+        fs::create_dir_all(link_target.join("snapshots").join(&snapshot_id)).unwrap();
+        fs::write(
+            link_target
+                .join("snapshots")
+                .join(&snapshot_id)
+                .join(".staging"),
+            b"x",
+        )
+        .unwrap();
+        fs::remove_dir_all(&real_project).unwrap();
+        std::os::unix::fs::symlink(&link_target, &real_project).unwrap();
+
+        // clear_snapshot_staging_marker must fail (O_NOFOLLOW rejects symlink).
+        let result = clear_snapshot_staging_marker(&edges_dir, "p_sym", &snapshot_id);
+        assert!(
+            result.is_err(),
+            "staging marker clear must reject symlinked parent directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlay_removal_refuses_symlinked_workspace_parent() {
+        // R16F1: clear_dirty_overlay must not follow a symlinked workspace
+        // parent into an outside directory and recursively delete it.
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().canonicalize().unwrap();
+
+        // Build an overlay legitimately first.
+        let edges = vec![derived_edge("k1", "DESCRIBES", "k2")];
+        write_dirty_overlay(&edges_dir, "p_sym2", &[("project.jsonl", &edges)]).unwrap();
+
+        // Replace the project workspace dir with a symlink to outside.
+        let outside = tempfile::tempdir().unwrap();
+        let workspace_dir = materialized_dir(&edges_dir)
+            .join("workspace")
+            .join("p_sym2");
+        let real_workspace = workspace_dir.canonicalize().unwrap();
+        let link_target = outside.path().join("evil-workspace");
+        fs::create_dir_all(&link_target).unwrap();
+        // Copy overlay-shaped content into the link target.
+        fs::create_dir_all(link_target.join("dirty-current")).unwrap();
+        fs::write(
+            link_target.join("dirty-current").join("project.jsonl"),
+            b"outside",
+        )
+        .unwrap();
+        fs::remove_dir_all(&real_workspace).unwrap();
+        std::os::unix::fs::symlink(&link_target, &real_workspace).unwrap();
+
+        // clear_dirty_overlay must fail or return false, not delete outside.
+        let result = clear_dirty_overlay(&edges_dir, "p_sym2");
+        assert!(
+            result.is_err() || result.unwrap() == false,
+            "overlay removal must not follow symlinked parent"
+        );
+
+        // The outside directory must still exist with its content.
+        assert!(
+            link_target
+                .join("dirty-current")
+                .join("project.jsonl")
+                .exists(),
+            "outside content must survive symlink attack"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlay_replacement_does_not_escape_via_symlink() {
+        // R16F1: write_dirty_overlay must not follow a symlinked workspace
+        // parent when creating the replacement overlay.
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().canonicalize().unwrap();
+
+        let edges = vec![derived_edge("k1", "DESCRIBES", "k2")];
+        write_dirty_overlay(&edges_dir, "p_sym3", &[("project.jsonl", &edges)]).unwrap();
+
+        // Replace the project workspace dir with a symlink.
+        let outside = tempfile::tempdir().unwrap();
+        let workspace_dir = materialized_dir(&edges_dir)
+            .join("workspace")
+            .join("p_sym3");
+        let real_workspace = workspace_dir.canonicalize().unwrap();
+        let link_target = outside.path().join("evil-replacement");
+        fs::create_dir_all(&link_target).unwrap();
+        fs::remove_dir_all(&real_workspace).unwrap();
+        std::os::unix::fs::symlink(&link_target, &real_workspace).unwrap();
+
+        let result = write_dirty_overlay(&edges_dir, "p_sym3", &[("project.jsonl", &edges)]);
+        assert!(
+            result.is_err(),
+            "overlay replacement must reject symlinked parent"
+        );
+        // Nothing should have been written into the symlink target.
+        assert!(
+            !link_target.join("dirty-current").exists(),
+            "no overlay must appear in symlink target"
         );
     }
 }
