@@ -1760,19 +1760,33 @@ pub fn clear_dirty_overlay(edges_dir: &Path, project_id: &str) -> Result<bool> {
         }
         let overlay_dir = unsafe { fs::File::from_raw_fd(overlay_fd) };
         let validation = validate_overlay_provenance(&overlay_dir);
-        if let Err(bad_names) = validation {
-            quarantine_dirty_overlay(edges_dir, project_id, &overlay_dir, &bad_names)?;
-            tracing::warn!(
-                project_id,
-                ?bad_names,
-                "quarantined dirty overlay containing non-Derived provenance"
-            );
-            return Ok(false);
+        match validation {
+            Ok(OverlayValidationOutcome::Valid) => {
+                drop(overlay_dir);
+                unlinkat_tree(parent.as_raw_fd(), &overlay_c)?;
+                parent.sync_all()?;
+                Ok(true)
+            }
+            Ok(OverlayValidationOutcome::Quarantine(bad_names)) => {
+                quarantine_dirty_overlay(edges_dir, project_id, &overlay_dir, &bad_names)?;
+                tracing::warn!(
+                    project_id,
+                    ?bad_names,
+                    "quarantined dirty overlay containing non-Derived provenance"
+                );
+                Ok(false)
+            }
+            // R17F3: I/O or decoding error. The overlay is NOT deleted.
+            // The error propagates so the operator sees what went wrong.
+            Err(error) => {
+                tracing::error!(
+                    project_id,
+                    error = %error,
+                    "dirty overlay validation failed; refusing to delete or quarantine"
+                );
+                Err(error)
+            }
         }
-        drop(overlay_dir);
-        unlinkat_tree(parent.as_raw_fd(), &overlay_c)?;
-        parent.sync_all()?;
-        Ok(true)
     }
     #[cfg(not(unix))]
     {
@@ -1782,34 +1796,56 @@ pub fn clear_dirty_overlay(edges_dir: &Path, project_id: &str) -> Result<bool> {
         }
 
         let validation = validate_overlay_provenance_path(&overlay_dir);
-        if let Err(bad_files) = validation {
-            quarantine_dirty_overlay_path(&overlay_dir, &bad_files)?;
-            tracing::warn!(
-                project_id,
-                ?bad_files,
-                "quarantined dirty overlay containing non-Derived provenance"
-            );
-            return Ok(false);
+        match validation {
+            Ok(OverlayValidationOutcome::Valid) => {
+                fs::remove_dir_all(&overlay_dir)?;
+                Ok(true)
+            }
+            Ok(OverlayValidationOutcome::Quarantine(bad_names)) => {
+                let bad_files: Vec<PathBuf> = bad_names.iter().map(PathBuf::from).collect();
+                quarantine_dirty_overlay_path(&overlay_dir, &bad_files)?;
+                tracing::warn!(
+                    project_id,
+                    ?bad_names,
+                    "quarantined dirty overlay containing non-Derived provenance"
+                );
+                Ok(false)
+            }
+            Err(error) => {
+                tracing::error!(
+                    project_id,
+                    error = %error,
+                    "dirty overlay validation failed; refusing to delete or quarantine"
+                );
+                Err(error)
+            }
         }
-
-        fs::remove_dir_all(&overlay_dir)?;
-        Ok(true)
     }
 }
 
+/// R17F3: typed outcome for overlay provenance validation. Every I/O and
+/// decoding error is propagated as Err so the overlay is never destroyed
+/// without proof that it is safe to clear.
+enum OverlayValidationOutcome {
+    /// All members are Derived provenance; safe to delete the overlay.
+    Valid,
+    /// Some members contain non-Derived edges; quarantine them.
+    Quarantine(Vec<String>),
+}
+
 /// Descriptor-relative provenance validation: reads each .jsonl member
-/// through the overlay directory descriptor and returns the list of
-/// member names containing non-Derived edges.
+/// through the overlay directory descriptor and returns a typed outcome.
+/// R17F3: enumeration failures, stat failures, non-regular entries, open
+/// failures, read errors, and malformed JSON ALL propagate as Err.
+/// Deletion is permitted only after complete enumeration and successful
+/// parsing of every committed member.
 #[cfg(unix)]
-fn validate_overlay_provenance(overlay_dir: &fs::File) -> std::result::Result<(), Vec<String>> {
+fn validate_overlay_provenance(overlay_dir: &fs::File) -> Result<OverlayValidationOutcome> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
 
     let mut bad = Vec::new();
-    let entries = match collect_dir_entries(overlay_dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(()),
-    };
+    let entries = collect_dir_entries(overlay_dir)?;
     for entry_name in entries {
         let name_bytes = entry_name.as_bytes();
         if std::str::from_utf8(name_bytes)
@@ -1818,13 +1854,14 @@ fn validate_overlay_provenance(overlay_dir: &fs::File) -> std::result::Result<()
         {
             continue;
         }
-        let entry_c = std::ffi::CString::new(name_bytes).unwrap();
-        let stat = match fstatat_nofollow(overlay_dir.as_raw_fd(), &entry_c) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+        let entry_c = std::ffi::CString::new(name_bytes)
+            .map_err(|_| anyhow::anyhow!("invalid member name in overlay"))?;
+        let stat = fstatat_nofollow(overlay_dir.as_raw_fd(), &entry_c)?;
         if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-            continue;
+            anyhow::bail!(
+                "overlay member {} is not a regular file",
+                entry_c.to_string_lossy()
+            );
         }
         let fd = unsafe {
             libc::openat(
@@ -1834,20 +1871,20 @@ fn validate_overlay_provenance(overlay_dir: &fs::File) -> std::result::Result<()
             )
         };
         if fd < 0 {
-            continue;
+            return Err(std::io::Error::last_os_error().into());
         }
         let file = unsafe { fs::File::from_raw_fd(fd) };
         let reader = std::io::BufReader::new(file);
         use std::io::BufRead;
         let mut found_bad = false;
-        for line in reader.lines().map_while(Result::ok) {
+        for line in reader.lines() {
+            let line = line?;
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            if let Ok(edge) = serde_json::from_str::<Edge>(trimmed)
-                && edge.provenance != EdgeProvenance::Derived
-            {
+            let edge: Edge = serde_json::from_str(trimmed)?;
+            if edge.provenance != EdgeProvenance::Derived {
                 found_bad = true;
                 break;
             }
@@ -1856,7 +1893,11 @@ fn validate_overlay_provenance(overlay_dir: &fs::File) -> std::result::Result<()
             bad.push(entry_name.to_string_lossy().into_owned());
         }
     }
-    if bad.is_empty() { Ok(()) } else { Err(bad) }
+    if bad.is_empty() {
+        Ok(OverlayValidationOutcome::Valid)
+    } else {
+        Ok(OverlayValidationOutcome::Quarantine(bad))
+    }
 }
 
 /// Descriptor-relative quarantine: moves named bad members into the
@@ -1914,33 +1955,47 @@ fn quarantine_dirty_overlay(
 }
 
 #[cfg(not(unix))]
-fn validate_overlay_provenance_path(overlay_dir: &Path) -> std::result::Result<(), Vec<PathBuf>> {
+/// R17F3: path-based fallback with the same fail-closed semantics.
+/// Every I/O and decoding error propagates; deletion only permitted after
+/// complete enumeration and successful parsing of every committed member.
+fn validate_overlay_provenance_path(overlay_dir: &Path) -> Result<OverlayValidationOutcome> {
     let mut bad = Vec::new();
-    if let Ok(entries) = fs::read_dir(overlay_dir) {
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+    let entries = fs::read_dir(overlay_dir)?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
+            anyhow::bail!("overlay member {:?} is not a regular file", path);
+        }
+        let file = fs::File::open(&path)?;
+        let reader = std::io::BufReader::new(file);
+        use std::io::BufRead;
+        let mut found_bad = false;
+        for line in reader.lines() {
+            let line = line?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
                 continue;
             }
-            if let Ok(file) = fs::File::open(&path) {
-                let reader = std::io::BufReader::new(file);
-                use std::io::BufRead;
-                for line in reader.lines().map_while(Result::ok) {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    if let Ok(edge) = serde_json::from_str::<Edge>(trimmed) {
-                        if edge.provenance != EdgeProvenance::Derived {
-                            bad.push(path.clone());
-                            break;
-                        }
-                    }
-                }
+            let edge: Edge = serde_json::from_str(trimmed)?;
+            if edge.provenance != EdgeProvenance::Derived {
+                found_bad = true;
+                break;
             }
         }
+        if found_bad {
+            bad.push(path.to_string_lossy().into_owned());
+        }
     }
-    if bad.is_empty() { Ok(()) } else { Err(bad) }
+    if bad.is_empty() {
+        Ok(OverlayValidationOutcome::Valid)
+    } else {
+        Ok(OverlayValidationOutcome::Quarantine(bad))
+    }
 }
 
 #[cfg(not(unix))]
@@ -2673,6 +2728,86 @@ mod tests {
             .join("dirty-quarantine")
             .join("project.jsonl");
         assert!(quarantine.exists(), "quarantined file must exist");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_dirty_overlay_fails_on_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        let overlay = dirty_overlay_dir(edges_dir, "p1");
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(overlay.join("project.jsonl"), b"not valid json {{{").unwrap();
+
+        let result = clear_dirty_overlay(edges_dir, "p1");
+        assert!(
+            result.is_err(),
+            "malformed JSON must propagate an error, not delete the overlay"
+        );
+        assert!(overlay.exists(), "overlay must survive validation failure");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_dirty_overlay_fails_on_non_regular_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        let overlay = dirty_overlay_dir(edges_dir, "p1");
+        fs::create_dir_all(&overlay).unwrap();
+        fs::create_dir_all(overlay.join("subdir.jsonl")).unwrap();
+
+        let result = clear_dirty_overlay(edges_dir, "p1");
+        assert!(
+            result.is_err(),
+            "non-regular member must propagate an error"
+        );
+        assert!(overlay.exists(), "overlay must survive validation failure");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_dirty_overlay_fails_on_truncated_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        let overlay = dirty_overlay_dir(edges_dir, "p1");
+        fs::create_dir_all(&overlay).unwrap();
+
+        // Write a valid derived edge followed by a line that cannot be
+        // deserialised (truncated record). Validation must fail rather
+        // than silently skipping the bad line.
+        let good = serde_json::to_string(&derived_edge("k1", "DESCRIBES", "k2")).unwrap();
+        let truncated = "{\"truncated";
+        let content = format!("{good}\n{truncated}\n");
+        fs::write(overlay.join("project.jsonl"), content).unwrap();
+
+        let result = clear_dirty_overlay(edges_dir, "p1");
+        assert!(result.is_err(), "decode error mid-stream must propagate");
+        assert!(overlay.exists(), "overlay must survive decode failure");
+    }
+
+    #[test]
+    fn clear_dirty_overlay_succeeds_on_multiple_valid_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        let edges_a = vec![derived_edge("k1", "DESCRIBES", "k2")];
+        let edges_b = vec![derived_edge("k3", "DESCRIBES", "k4")];
+        write_dirty_overlay(
+            edges_dir,
+            "p1",
+            &[("project.jsonl", &edges_a), ("extra.jsonl", &edges_b)],
+        )
+        .unwrap();
+
+        let cleared = clear_dirty_overlay(edges_dir, "p1").unwrap();
+        assert!(cleared, "all-Derived overlay must be cleared");
+        assert!(
+            !dirty_overlay_dir(edges_dir, "p1").exists(),
+            "overlay dir must be gone"
+        );
     }
 
     #[test]
