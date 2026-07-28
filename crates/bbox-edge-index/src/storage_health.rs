@@ -633,7 +633,17 @@ fn scan_inactive_snapshots(
     files: &mut Vec<StorageFileInfo>,
     file_identities: &mut HashMap<String, (u64, u64)>,
 ) -> Result<()> {
-    let active_prefixes = collect_protected_jsonl_prefixes(edges_dir);
+    let manifest = bbox_edge_sidecar::manifest::try_load_manifest_index(edges_dir)?;
+    let mut protected_snapshot_dirs = manifest
+        .workspaces
+        .values()
+        .filter_map(|entry| entry.active_snapshot.as_deref())
+        .map(|relative| bbox_edge_sidecar::manifest::materialized_dir(edges_dir).join(relative))
+        .collect::<HashSet<_>>();
+    for pending in bbox_edge_sidecar::snapshot::pending_snapshot_paths(edges_dir)? {
+        protected_snapshot_dirs
+            .insert(bbox_edge_sidecar::manifest::materialized_dir(edges_dir).join(pending));
+    }
     let mat_dir = bbox_edge_sidecar::manifest::materialized_dir(edges_dir);
     match fs::symlink_metadata(&mat_dir) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
@@ -660,6 +670,30 @@ fn scan_inactive_snapshots(
                 );
             }
             if metadata.is_dir() {
+                if let Some((project_id, _snapshot_dir)) = inactive_snapshot_dir_key(&path) {
+                    if protected_snapshot_dirs.contains(&path) {
+                        continue;
+                    }
+                    if !project_filter_matches(Some(&project_id), project_filter) {
+                        continue;
+                    }
+                    let bytes = validated_snapshot_tree_bytes(&path)?;
+                    let path_str = path
+                        .to_str()
+                        .context("materialized snapshot path is not UTF-8")?;
+                    totals.accumulate(FileKind::InactiveSnapshot, bytes);
+                    record_file_identity(file_identities, path_str, &metadata);
+                    files.push(StorageFileInfo {
+                        path: path_str.to_string(),
+                        kind: FileKind::InactiveSnapshot,
+                        project_id: Some(project_id),
+                        bytes,
+                        reason: Some(
+                            "inactive snapshot directory not selected by the manifest".into(),
+                        ),
+                    });
+                    continue;
+                }
                 pending.push(path);
                 continue;
             }
@@ -676,28 +710,53 @@ fn scan_inactive_snapshots(
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
-            let path_str = path
-                .to_str()
-                .context("materialized edge path is not UTF-8")?;
-            if active_prefixes.iter().any(|p| path_str == p) {
-                continue;
-            }
-            let project_id = extract_project_from_workspace_path(&path);
-            if !project_filter_matches(project_id.as_deref(), project_filter) {
-                continue;
-            }
-            totals.accumulate(FileKind::InactiveSnapshot, metadata.len());
-            record_file_identity(file_identities, path_str, &metadata);
-            files.push(StorageFileInfo {
-                path: path_str.to_string(),
-                kind: FileKind::InactiveSnapshot,
-                project_id,
-                bytes: metadata.len(),
-                reason: Some("inactive snapshot not in active manifest paths".into()),
-            });
+            // Snapshot directories are recorded as one validated retention
+            // unit above. Files outside that writer-exact shape are not
+            // inactive snapshot candidates.
         }
     }
     Ok(())
+}
+
+fn inactive_snapshot_dir_key(path: &Path) -> Option<(String, String)> {
+    let snapshot_id = path.file_name()?.to_str()?;
+    let snapshots = path.parent()?;
+    if snapshots.file_name()?.to_str()? != "snapshots" {
+        return None;
+    }
+    let project = snapshots.parent()?.file_name()?.to_str()?;
+    if snapshots.parent()?.parent()?.file_name()?.to_str()? != "workspace" {
+        return None;
+    }
+    Some((project.to_string(), path.to_string_lossy().into_owned()))
+}
+
+fn validated_snapshot_tree_bytes(root: &Path) -> Result<u64> {
+    const MAX_SNAPSHOT_TREE_ENTRIES: usize = 250_000;
+    let mut pending = vec![root.to_path_buf()];
+    let mut entries = 0_usize;
+    let mut bytes = 0_u64;
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            entries += 1;
+            if entries > MAX_SNAPSHOT_TREE_ENTRIES {
+                anyhow::bail!("snapshot retention tree exceeds its entry bound");
+            }
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.file_type().is_symlink() {
+                anyhow::bail!("snapshot retention tree contains a symlink");
+            }
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                bytes = bytes.saturating_add(metadata.len());
+            } else {
+                anyhow::bail!("snapshot retention tree contains a special node");
+            }
+        }
+    }
+    Ok(bytes)
 }
 
 #[cfg(unix)]
@@ -1106,15 +1165,15 @@ pub fn plan_gc_with_policy(
                 anyhow::bail!("GC candidate path is not normalized");
             }
             let metadata = fs::symlink_metadata(path)?;
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                anyhow::bail!("GC candidate is not a regular nofollow file");
+            if metadata.file_type().is_symlink()
+                || (candidate.kind == FileKind::InactiveSnapshot && !metadata.is_dir())
+                || (candidate.kind != FileKind::InactiveSnapshot && !metadata.is_file())
+            {
+                anyhow::bail!("GC candidate has an invalid nofollow type");
             }
             if candidate.kind == FileKind::InactiveSnapshot {
                 validate_inactive_snapshot_identity(&report, candidate, &metadata)?;
-                let staging = path
-                    .parent()
-                    .ok_or_else(|| anyhow::anyhow!("snapshot candidate has no parent"))?
-                    .join(".staging");
+                let staging = path.join(".staging");
                 match fs::symlink_metadata(&staging) {
                     Ok(marker) if marker.is_file() && !marker.file_type().is_symlink() => {
                         anyhow::bail!("inactive snapshot became staged before identity commitment");
@@ -1528,6 +1587,9 @@ fn retained_snapshot_dirs<'a>(
 
 fn inactive_snapshot_key(path: &str) -> Option<(String, String)> {
     let path = Path::new(path);
+    if let Some((project_id, snapshot_dir)) = inactive_snapshot_dir_key(path) {
+        return Some((project_id, snapshot_dir));
+    }
     let mut components = path.components().rev();
     let _filename = components.next()?;
     let snapshot_id = components.next()?;
@@ -1611,20 +1673,41 @@ pub fn apply_gc(edges_dir: &Path, candidates: &[GcCandidate]) -> (Vec<String>, V
                         continue;
                     }
                 }
-                bbox_edge_sidecar::snapshot::remove_gc_candidate_file(
-                    edges_dir,
-                    Path::new(relative),
-                    (device, inode),
-                    Some(planned_mtime),
-                    c.kind == FileKind::InactiveSnapshot,
-                )
+                if c.kind == FileKind::InactiveSnapshot {
+                    bbox_edge_sidecar::snapshot::remove_inactive_snapshot_tree(
+                        edges_dir,
+                        Path::new(relative),
+                        (device, inode),
+                    )
+                } else {
+                    bbox_edge_sidecar::snapshot::remove_gc_candidate_file(
+                        edges_dir,
+                        Path::new(relative),
+                        (device, inode),
+                        Some(planned_mtime),
+                        false,
+                    )
+                }
             }
             _ => Err(anyhow::anyhow!(
                 "GC candidate is missing its plan-time identity commitment"
             )),
         };
         #[cfg(not(unix))]
-        let result = fs::remove_file(&c.path).map(|_| true).map_err(Into::into);
+        let result = if c.kind == FileKind::InactiveSnapshot {
+            let relative = Path::new(&c.path)
+                .strip_prefix(edges_dir)
+                .map_err(anyhow::Error::from);
+            relative.and_then(|relative| {
+                bbox_edge_sidecar::snapshot::remove_inactive_snapshot_tree(
+                    edges_dir,
+                    relative,
+                    (0, 0),
+                )
+            })
+        } else {
+            fs::remove_file(&c.path).map(|_| true).map_err(Into::into)
+        };
         match result {
             Ok(true) => deleted.push(c.path.clone()),
             Ok(false) => {}
@@ -2696,6 +2779,164 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn receipt_snapshot_retention_prunes_tree_and_manifest_binding() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let empty = Vec::new();
+        bbox_edge_sidecar::snapshot::write_snapshot_files(
+            &edges_dir,
+            "p1",
+            "snap-old",
+            &[("project.jsonl", &empty)],
+        )
+        .unwrap();
+        bbox_edge_sidecar::snapshot::activate_collected_snapshot(
+            &edges_dir,
+            "p1",
+            "repo",
+            &"a".repeat(40),
+            "generation-old",
+            "collected:repo:.:generation-old",
+            "snap-old",
+        )
+        .unwrap();
+        let edges: Vec<bbox_edge_sidecar::edge_sidecar::Edge> = Vec::new();
+        let handle = bbox_edge_sidecar::snapshot::write_snapshot_members_transaction(
+            &edges_dir,
+            "p1",
+            "snap-old",
+            &[("git-current.jsonl", &edges)],
+        )
+        .unwrap();
+        bbox_edge_sidecar::snapshot::finalize_snapshot_publication(&handle).unwrap();
+
+        bbox_edge_sidecar::snapshot::write_snapshot_files(
+            &edges_dir,
+            "p1",
+            "snap-active",
+            &[("project.jsonl", &empty)],
+        )
+        .unwrap();
+        bbox_edge_sidecar::snapshot::activate_collected_snapshot(
+            &edges_dir,
+            "p1",
+            "repo",
+            &"b".repeat(40),
+            "generation-active",
+            "collected:repo:.:generation-active",
+            "snap-active",
+        )
+        .unwrap();
+
+        let params = GcParams {
+            dry_run: false,
+            project_filter: None,
+            prune_backups: false,
+            prune_orphans: false,
+            prune_temps: false,
+            prune_inactive_snapshots: true,
+            max_backup_age_days: None,
+            keep_newest_backup_per_source: 1,
+        };
+        let policy = GcPolicy {
+            materialized_snapshots: SnapshotRetentionPolicy {
+                keep_active: true,
+                keep_recent_per_workspace: 0,
+                keep_recent_per_repo: 0,
+                branch_switch_grace_minutes: 0,
+                max_age_days: Some(0),
+                max_count_per_workspace: Some(0),
+                max_total_bytes_per_workspace: Some(0),
+            },
+            ..GcPolicy::default()
+        };
+        let candidates =
+            plan_gc_with_policy(&edges_dir, &HashSet::new(), &params, &policy).unwrap();
+        let old_dir = bbox_edge_sidecar::snapshot::snapshot_dir(&edges_dir, "p1", "snap-old");
+        let active_dir = bbox_edge_sidecar::snapshot::snapshot_dir(&edges_dir, "p1", "snap-active");
+        assert!(candidates.iter().any(|candidate| {
+            candidate.deletable && candidate.path == old_dir.to_string_lossy()
+        }));
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.path == active_dir.to_string_lossy())
+        );
+
+        let (deleted, errors) = apply_gc(&edges_dir, &candidates);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            deleted
+                .iter()
+                .any(|path| path == old_dir.to_string_lossy().as_ref())
+        );
+        assert!(!old_dir.exists());
+        assert!(active_dir.exists());
+        let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load(&edges_dir).unwrap();
+        assert!(!manifest.has_snapshot_receipt_binding("workspace/p1/snapshots/snap-old"));
+        assert!(manifest.snapshot_receipt_binding_count() <= 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_snapshot_reactivation_between_plan_and_apply_is_preserved() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let empty = Vec::new();
+        for snapshot in ["snap-old", "snap-active"] {
+            bbox_edge_sidecar::snapshot::write_snapshot_files(
+                &edges_dir,
+                "p1",
+                snapshot,
+                &[("project.jsonl", &empty)],
+            )
+            .unwrap();
+        }
+        bbox_edge_sidecar::snapshot::activate_collected_snapshot(
+            &edges_dir,
+            "p1",
+            "repo",
+            &"b".repeat(40),
+            "generation-active",
+            "collected:repo:.:generation-active",
+            "snap-active",
+        )
+        .unwrap();
+        let old_dir = bbox_edge_sidecar::snapshot::snapshot_dir(&edges_dir, "p1", "snap-old");
+        let metadata = fs::symlink_metadata(&old_dir).unwrap();
+        let candidate = GcCandidate {
+            path: old_dir.to_string_lossy().into_owned(),
+            root_relative_path: Some("materialized/workspace/p1/snapshots/snap-old".into()),
+            planned_device: Some(metadata.dev()),
+            planned_inode: Some(metadata.ino()),
+            planned_mtime_secs: Some(metadata.mtime() as u64),
+            kind: FileKind::InactiveSnapshot,
+            bytes: validated_snapshot_tree_bytes(&old_dir).unwrap(),
+            project_id: Some("p1".into()),
+            rule: "test".into(),
+            deletable: true,
+        };
+
+        bbox_edge_sidecar::snapshot::activate_collected_snapshot(
+            &edges_dir,
+            "p1",
+            "repo",
+            &"a".repeat(40),
+            "generation-old",
+            "collected:repo:.:generation-old",
+            "snap-old",
+        )
+        .unwrap();
+        let (deleted, errors) = apply_gc(&edges_dir, &[candidate]);
+        assert!(deleted.is_empty());
+        assert!(errors.is_empty());
+        assert!(old_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn inactive_snapshot_replacement_after_classification_is_refused() {
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
@@ -2714,7 +2955,7 @@ mod tests {
         let file = report
             .files
             .iter()
-            .find(|file| file.path == member.to_string_lossy())
+            .find(|file| file.path == snapshot_dir.to_string_lossy())
             .unwrap();
         let candidate = GcCandidate {
             path: file.path.clone(),
@@ -2730,10 +2971,11 @@ mod tests {
             deletable: true,
         };
 
-        fs::rename(&member, snapshot_dir.join("replaced.jsonl")).unwrap();
-        fs::write(&member, b"replacement").unwrap();
-        fs::write(snapshot_dir.join(".staging"), b"pending\n").unwrap();
-        let metadata = fs::symlink_metadata(&member).unwrap();
+        let displaced = snapshot_dir.with_extension("displaced");
+        fs::rename(&snapshot_dir, &displaced).unwrap();
+        fs::create_dir_all(&snapshot_dir).unwrap();
+        fs::write(snapshot_dir.join("project.jsonl"), b"replacement").unwrap();
+        let metadata = fs::symlink_metadata(&snapshot_dir).unwrap();
 
         let error =
             validate_inactive_snapshot_identity(&report, &candidate, &metadata).unwrap_err();
@@ -2747,19 +2989,20 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
-        let snapshot_dir = edges_dir.join("workspace/p1/snapshots/snap1");
+        let snapshot_dir = bbox_edge_sidecar::manifest::materialized_dir(&edges_dir)
+            .join("workspace/p1/snapshots/snap1");
         fs::create_dir_all(&snapshot_dir).unwrap();
         let member = snapshot_dir.join("project.jsonl");
         fs::write(&member, b"candidate").unwrap();
-        let metadata = fs::symlink_metadata(&member).unwrap();
+        let metadata = fs::symlink_metadata(&snapshot_dir).unwrap();
         let candidate = GcCandidate {
-            path: member.to_string_lossy().into_owned(),
-            root_relative_path: Some("workspace/p1/snapshots/snap1/project.jsonl".into()),
+            path: snapshot_dir.to_string_lossy().into_owned(),
+            root_relative_path: Some("materialized/workspace/p1/snapshots/snap1".into()),
             planned_device: Some(metadata.dev()),
             planned_inode: Some(metadata.ino()),
             planned_mtime_secs: Some(metadata.mtime() as u64),
             kind: FileKind::InactiveSnapshot,
-            bytes: metadata.len(),
+            bytes: fs::metadata(&member).unwrap().len(),
             project_id: Some("p1".into()),
             rule: "test".into(),
             deletable: true,
