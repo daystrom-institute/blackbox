@@ -788,14 +788,19 @@ fn snapshot_tree_age_secs(root: &Path) -> Result<u64> {
             if metadata.is_dir() {
                 pending.push(entry.path());
             } else if metadata.is_file() {
-                let age = file_age_secs(&entry.path())?;
+                let age = file_age_secs(&entry.path())
+                    .ok_or_else(|| anyhow::anyhow!("snapshot retention member age unavailable"))?;
                 newest_age = Some(newest_age.map_or(age, |current: u64| current.min(age)));
             } else {
                 anyhow::bail!("snapshot retention tree contains a special node");
             }
         }
     }
-    Ok(newest_age.unwrap_or(file_age_secs(root)?))
+    match newest_age {
+        Some(age) => Ok(age),
+        None => file_age_secs(root)
+            .ok_or_else(|| anyhow::anyhow!("snapshot retention root age unavailable")),
+    }
 }
 
 #[cfg(unix)]

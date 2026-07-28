@@ -6998,7 +6998,18 @@ mod tests {
         )
         .unwrap();
 
-        // Payload proves a different, already-closed transaction.
+        // A well-formed commitment from a different, already-finalized
+        // transaction: its closeout proof resolves, while p_1's staged
+        // transaction is absent from the payload and must be discarded.
+        let foreign_snapshot = overlay_fixture(&edges_dir, "p_2", "gen-b");
+        let foreign = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_2",
+            &foreign_snapshot,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+        finalize_snapshot_publication(&foreign).unwrap();
         recover_pending_transactions_prebind(&edges_dir, Some(&foreign.commitment)).unwrap();
 
         let live_after = fs::read(&live_member).unwrap_or_default();
