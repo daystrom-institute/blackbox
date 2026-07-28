@@ -6882,11 +6882,22 @@ mod tests {
         )
         .unwrap();
 
-        let inventory_error = validate_journal_inventory(&edges_dir).unwrap_err();
-        assert!(format!("{inventory_error:#}").contains("unexpected entry .hidden"));
-        let recovery_error =
-            recover_pending_transactions_prebind(&edges_dir, Some(&handle.commitment)).unwrap_err();
-        assert!(format!("{recovery_error:#}").contains("unexpected entry .hidden"));
+        // The refusal may name either offending entry depending on directory
+        // enumeration order: the dot-prefixed unknown or the now journal-less
+        // staging directory. Both are fail-closed refusals for this txn dir.
+        let inventory_error = format!("{:#}", validate_journal_inventory(&edges_dir).unwrap_err());
+        assert!(
+            inventory_error.contains(".hidden") || inventory_error.contains(&handle.txn_token),
+            "unexpected inventory refusal: {inventory_error}"
+        );
+        let recovery_error = format!(
+            "{:#}",
+            recover_pending_transactions_prebind(&edges_dir, Some(&handle.commitment)).unwrap_err()
+        );
+        assert!(
+            recovery_error.contains(".hidden") || recovery_error.contains(&handle.txn_token),
+            "unexpected recovery refusal: {recovery_error}"
+        );
         assert!(txn_dir.join(".hidden").is_file());
         assert!(txn_dir.join(&handle.txn_token).is_dir());
     }
