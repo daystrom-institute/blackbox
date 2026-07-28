@@ -1674,7 +1674,6 @@ fn recover_pending_transactions_for_project(
     committed: &std::collections::HashSet<String>,
 ) -> Result<()> {
     use std::os::fd::AsRawFd;
-    use std::os::fd::FromRawFd;
     validate_snapshot_component(project_id)?;
 
     // R19F4(c): legacy marker check.
@@ -1904,6 +1903,7 @@ fn verify_live_member(
     snapshot_id: &str,
     member: &TxnMember,
 ) -> Result<()> {
+    use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;
     let snap_dir_rel = Path::new("materialized")
         .join("workspace")
