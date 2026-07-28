@@ -7711,6 +7711,12 @@ mod tests {
         let object = snapshot_dir(&edges_dir, "p_1", &snapshot_id)
             .join(SNAPSHOT_OBJECTS_DIRNAME)
             .join(&receipt.members["git-current.jsonl"].object);
+        // Objects are published read-only; a same-user attacker can restore
+        // write permission, so the swap scenario stays valid.
+        let mut permissions = fs::metadata(&object).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        fs::set_permissions(&object, permissions).unwrap();
         fs::write(object, b"swapped\n").unwrap();
 
         let error = ManifestIndex::load(&edges_dir)
