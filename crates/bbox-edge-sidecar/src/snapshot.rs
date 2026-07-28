@@ -983,6 +983,7 @@ const SNAPSHOT_RECEIPT_FILENAME: &str = ".member-receipts.json";
 const SNAPSHOT_OBJECTS_DIRNAME: &str = ".objects";
 const SNAPSHOT_RECEIPT_VERSION: u32 = 1;
 const SNAPSHOT_MAX_RECEIPT_BYTES: usize = 64 * 1024;
+const SNAPSHOT_MAX_OBJECTS: usize = 4096;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -998,6 +999,11 @@ struct SnapshotMemberReceipt {
 struct SnapshotMemberPointer {
     sha256: String,
     object: String,
+}
+
+struct LoadedSnapshotReceipt {
+    receipt: SnapshotMemberReceipt,
+    digest: String,
 }
 
 /// Test-visible mirror of TxnJournal for deserializing journals in tests.
@@ -1204,6 +1210,89 @@ fn is_reclaimable_orphan_txn_token(value: &str) -> bool {
     generated || legacy
 }
 
+#[cfg(test)]
+thread_local! {
+    static STAGING_FAILURE_POINT: std::cell::RefCell<Option<&'static str>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_staging_failure_point(point: &'static str) {
+    STAGING_FAILURE_POINT.with(|current| {
+        current.replace(Some(point));
+    });
+}
+
+#[cfg(test)]
+fn inject_staging_failure(point: &'static str) -> Result<()> {
+    let should_fail = STAGING_FAILURE_POINT.with(|current| {
+        if current.borrow().as_ref() == Some(&point) {
+            current.replace(None);
+            true
+        } else {
+            false
+        }
+    });
+    if should_fail {
+        anyhow::bail!("injected snapshot staging failure at {point}");
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn inject_staging_failure(_point: &'static str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static OBJECT_COPY_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_object_copy_hook(hook: impl FnOnce() + 'static) {
+    OBJECT_COPY_HOOK.with(|current| {
+        current.replace(Some(Box::new(hook)));
+    });
+}
+
+#[cfg(test)]
+fn run_object_copy_hook() {
+    OBJECT_COPY_HOOK.with(|current| {
+        if let Some(hook) = current.take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_object_copy_hook() {}
+
+#[cfg(test)]
+thread_local! {
+    static OBJECT_GC_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_next_object_gc() {
+    OBJECT_GC_FAILURE.with(|failure| failure.set(true));
+}
+
+#[cfg(test)]
+fn inject_object_gc_failure() -> Result<()> {
+    let should_fail = OBJECT_GC_FAILURE.with(|failure| failure.replace(false));
+    if should_fail {
+        anyhow::bail!("injected snapshot object GC failure");
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn inject_object_gc_failure() -> Result<()> {
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_snapshot_members_transaction_with_token(
     edges_dir: &Path,
@@ -1277,17 +1366,84 @@ fn write_snapshot_members_transaction_with_token(
         let staging_rel = txn_staging_rel(project_id, txn_token);
         let journal_rel = txn_journal_rel(project_id, txn_token);
 
-        // Stage member files into the txn directory.
-        for (filename, bytes) in &member_bytes {
-            write_materialized_file_atomic(edges_dir, staging_rel.join(filename).as_path(), bytes)?;
+        let attempt = (|| -> Result<()> {
+            // Stage member files into the txn directory.
+            for (index, (filename, bytes)) in member_bytes.iter().enumerate() {
+                write_materialized_file_atomic(
+                    edges_dir,
+                    staging_rel.join(filename).as_path(),
+                    bytes,
+                )?;
+                if index == 0 {
+                    inject_staging_failure("after-first-member")?;
+                }
+            }
+
+            // Write the journal last: its presence means staging is complete.
+            inject_staging_failure("before-journal")?;
+            write_materialized_file_atomic(edges_dir, journal_rel.as_path(), &journal_bytes)?;
+            Ok(())
+        })();
+        if let Err(error) = attempt {
+            if let Err(cleanup) = cleanup_failed_snapshot_staging(edges_dir, project_id, txn_token)
+            {
+                return Err(error).context(format!(
+                    "snapshot staging failed and cleanup left unresolved state: {cleanup:#}"
+                ));
+            }
+            return Err(error);
         }
-
-        // Write the journal last: its presence means staging is complete.
-        write_materialized_file_atomic(edges_dir, journal_rel.as_path(), &journal_bytes)?;
-
         Ok(())
     })?;
     Ok(txn_commitment(&journal))
+}
+
+#[cfg(unix)]
+fn cleanup_failed_snapshot_staging(
+    edges_dir: &Path,
+    project_id: &str,
+    txn_token: &str,
+) -> Result<()> {
+    let txn_dir_rel = Path::new("materialized")
+        .join("workspace")
+        .join(project_id)
+        .join("txn");
+    let txn_dir = match open_dir_under_root(edges_dir, &txn_dir_rel, false) {
+        Ok(directory) => directory,
+        Err(error) if is_not_found(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let journal_c = std::ffi::CString::new(format!("{txn_token}.journal.json").as_bytes())?;
+    discard_transaction(&txn_dir, txn_token, &journal_c)
+}
+
+#[cfg(not(unix))]
+fn cleanup_failed_snapshot_staging(
+    edges_dir: &Path,
+    project_id: &str,
+    txn_token: &str,
+) -> Result<()> {
+    let txn_dir = materialized_dir(edges_dir)
+        .join("workspace")
+        .join(project_id)
+        .join("txn");
+    let staging = txn_dir.join(txn_token);
+    match fs::symlink_metadata(&staging) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            fs::remove_dir_all(&staging)?;
+        }
+        Ok(_) => anyhow::bail!("snapshot staging cleanup found an unsafe staging path"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let journal = txn_dir.join(format!("{txn_token}.journal.json"));
+    match fs::remove_file(&journal) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    fs::File::open(txn_dir)?.sync_all()?;
+    Ok(())
 }
 
 /// R22F1+F2: Validate the journal inventory on disk and return the
@@ -1514,14 +1670,13 @@ fn load_snapshot_receipt_from_dir(
     snapshot_dir: &fs::File,
     project_id: &str,
     snapshot_id: &str,
-) -> Result<Option<SnapshotMemberReceipt>> {
+) -> Result<Option<LoadedSnapshotReceipt>> {
     let name = std::ffi::CString::new(SNAPSHOT_RECEIPT_FILENAME)?;
     match read_confined_file_bounded(snapshot_dir, &name, SNAPSHOT_MAX_RECEIPT_BYTES) {
-        Ok(bytes) => Ok(Some(decode_snapshot_receipt(
-            &bytes,
-            project_id,
-            snapshot_id,
-        )?)),
+        Ok(bytes) => Ok(Some(LoadedSnapshotReceipt {
+            receipt: decode_snapshot_receipt(&bytes, project_id, snapshot_id)?,
+            digest: hex::encode(Sha256::digest(&bytes)),
+        })),
         Err(error) if is_not_found(&error) => Ok(None),
         Err(error) => Err(error),
     }
@@ -1532,16 +1687,37 @@ pub(crate) fn committed_snapshot_members(
     edges_dir: &Path,
     snapshot: &str,
 ) -> Result<Vec<(String, PathBuf, fs::File)>> {
+    committed_snapshot_members_bound(edges_dir, snapshot, None, false)
+}
+
+#[cfg(unix)]
+pub(crate) fn committed_snapshot_members_bound(
+    edges_dir: &Path,
+    snapshot: &str,
+    expected_receipt_digest: Option<&str>,
+    receipt_protocol_active: bool,
+) -> Result<Vec<(String, PathBuf, fs::File)>> {
     use std::io::Seek;
     use std::os::fd::{AsRawFd, FromRawFd};
 
     let (project_id, snapshot_id) = snapshot_identity_from_relative(snapshot)?;
     let snapshot_rel = Path::new("materialized").join(snapshot);
     let snapshot_dir = open_dir_under_root(edges_dir, &snapshot_rel, false)?;
-    let Some(receipt) = load_snapshot_receipt_from_dir(&snapshot_dir, project_id, snapshot_id)?
-    else {
+    let loaded = load_snapshot_receipt_from_dir(&snapshot_dir, project_id, snapshot_id)?;
+    let Some(loaded) = loaded else {
+        if expected_receipt_digest.is_some() {
+            anyhow::bail!("receipt-managed snapshot is missing its member receipt");
+        }
         return Ok(Vec::new());
     };
+    if let Some(expected) = expected_receipt_digest {
+        if loaded.digest != expected {
+            anyhow::bail!("receipt-managed snapshot member receipt digest mismatch");
+        }
+    } else if receipt_protocol_active {
+        anyhow::bail!("snapshot member receipt is not bound by the manifest index");
+    }
+    let receipt = loaded.receipt;
     let objects_name = std::ffi::CString::new(SNAPSHOT_OBJECTS_DIRNAME)?;
     let objects_dir = open_confined_dir_fd(snapshot_dir.as_raw_fd(), &objects_name)?;
     let mut result = Vec::with_capacity(receipt.members.len());
@@ -1583,7 +1759,17 @@ pub(crate) fn committed_snapshot_members(
     edges_dir: &Path,
     snapshot: &str,
 ) -> Result<Vec<(String, PathBuf, fs::File)>> {
-    use std::io::Read;
+    committed_snapshot_members_bound(edges_dir, snapshot, None, false)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn committed_snapshot_members_bound(
+    edges_dir: &Path,
+    snapshot: &str,
+    expected_receipt_digest: Option<&str>,
+    receipt_protocol_active: bool,
+) -> Result<Vec<(String, PathBuf, fs::File)>> {
+    use std::io::{Read, Seek};
 
     let (project_id, snapshot_id) = snapshot_identity_from_relative(snapshot)?;
     let snapshot_dir = materialized_dir(edges_dir).join(snapshot);
@@ -1591,7 +1777,12 @@ pub(crate) fn committed_snapshot_members(
     let metadata = match fs::symlink_metadata(&receipt_path) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
         Ok(_) => anyhow::bail!("snapshot member receipt is not a safe regular file"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if expected_receipt_digest.is_some() {
+                anyhow::bail!("receipt-managed snapshot is missing its member receipt");
+            }
+            return Ok(Vec::new());
+        }
         Err(error) => return Err(error.into()),
     };
     if metadata.len() > SNAPSHOT_MAX_RECEIPT_BYTES as u64 {
@@ -1606,6 +1797,14 @@ pub(crate) fn committed_snapshot_members(
     if bytes.len() > SNAPSHOT_MAX_RECEIPT_BYTES {
         anyhow::bail!("snapshot member receipt grew beyond its byte bound");
     }
+    let receipt_digest = hex::encode(Sha256::digest(&bytes));
+    if let Some(expected) = expected_receipt_digest {
+        if receipt_digest != expected {
+            anyhow::bail!("receipt-managed snapshot member receipt digest mismatch");
+        }
+    } else if receipt_protocol_active {
+        anyhow::bail!("snapshot member receipt is not bound by the manifest index");
+    }
     let receipt = decode_snapshot_receipt(&bytes, project_id, snapshot_id)?;
     let objects_dir = snapshot_dir.join(SNAPSHOT_OBJECTS_DIRNAME);
     let objects_metadata = fs::symlink_metadata(&objects_dir)?;
@@ -1615,14 +1814,321 @@ pub(crate) fn committed_snapshot_members(
     let mut result = Vec::with_capacity(receipt.members.len());
     for (logical_name, pointer) in receipt.members {
         let object_path = objects_dir.join(&pointer.object);
-        let bytes = read_nonunix_regular_bounded(&object_path, TXN_MAX_MEMBER_BYTES)?;
-        if hex::encode(Sha256::digest(&bytes)) != pointer.sha256 {
+        let mut file = open_nonunix_regular_nofollow(&object_path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > TXN_MAX_MEMBER_BYTES {
+            anyhow::bail!("snapshot object is not a bounded regular file");
+        }
+        let mut hasher = Sha256::new();
+        let mut limited = file.by_ref().take(TXN_MAX_MEMBER_BYTES + 1);
+        let mut total = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = limited.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            total += read as u64;
+            hasher.update(&buffer[..read]);
+        }
+        if total > TXN_MAX_MEMBER_BYTES || hex::encode(hasher.finalize()) != pointer.sha256 {
             anyhow::bail!("snapshot object hash does not match its receipt");
         }
-        let file = fs::File::open(&object_path)?;
+        if file.metadata()?.len() != metadata.len() {
+            anyhow::bail!("snapshot object changed while being verified");
+        }
+        file.rewind()?;
         result.push((logical_name.clone(), snapshot_dir.join(logical_name), file));
     }
     Ok(result)
+}
+
+pub(crate) fn snapshot_receipt_digest(edges_dir: &Path, snapshot: &str) -> Result<Option<String>> {
+    let (project_id, snapshot_id) = snapshot_identity_from_relative(snapshot)?;
+    #[cfg(unix)]
+    {
+        let snapshot_dir = match open_dir_under_root(
+            edges_dir,
+            &Path::new("materialized").join(snapshot),
+            false,
+        ) {
+            Ok(directory) => directory,
+            Err(error) if is_not_found(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        return Ok(
+            load_snapshot_receipt_from_dir(&snapshot_dir, project_id, snapshot_id)?
+                .map(|loaded| loaded.digest),
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let path = materialized_dir(edges_dir)
+            .join(snapshot)
+            .join(SNAPSHOT_RECEIPT_FILENAME);
+        match read_nonunix_regular_bounded(&path, SNAPSHOT_MAX_RECEIPT_BYTES as u64) {
+            Ok(bytes) => {
+                decode_snapshot_receipt(&bytes, project_id, snapshot_id)?;
+                Ok(Some(hex::encode(Sha256::digest(&bytes))))
+            }
+            Err(error) if is_not_found(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn publish_immutable_snapshot_object(
+    staging_dir: &fs::File,
+    objects_dir: &fs::File,
+    member: &TxnMember,
+) -> Result<String> {
+    use std::io::{Read, Seek, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::MetadataExt;
+
+    let object_name = snapshot_object_name(&member.sha256)?;
+    let object_c = std::ffi::CString::new(object_name.as_bytes())?;
+    match fstatat_nofollow(objects_dir.as_raw_fd(), &object_c) {
+        Ok(_) => {
+            let fd = unsafe {
+                libc::openat(
+                    objects_dir.as_raw_fd(),
+                    object_c.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let file = unsafe { fs::File::from_raw_fd(fd) };
+            verify_member_identity_bound_raw(&file, member)?;
+            return Ok(object_name);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let member_c = std::ffi::CString::new(member.name.as_bytes())?;
+    let source_fd = unsafe {
+        libc::openat(
+            staging_dir.as_raw_fd(),
+            member_c.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if source_fd < 0 {
+        anyhow::bail!(
+            "finalize: committed object and staged member are both missing for {}",
+            member.name
+        );
+    }
+    let mut source = unsafe { fs::File::from_raw_fd(source_fd) };
+    let source_stat = verify_member_identity_bound_raw_ret_stat(&source, member)?;
+    source.rewind()?;
+    run_object_copy_hook();
+
+    let destination_fd = unsafe {
+        libc::openat(
+            objects_dir.as_raw_fd(),
+            object_c.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o444,
+        )
+    };
+    if destination_fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            return publish_immutable_snapshot_object(staging_dir, objects_dir, member);
+        }
+        return Err(error.into());
+    }
+    let mut destination = unsafe { fs::File::from_raw_fd(destination_fd) };
+    let result = (|| -> Result<()> {
+        let mut hasher = Sha256::new();
+        let mut limited = source.by_ref().take(TXN_MAX_MEMBER_BYTES + 1);
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut total = 0_u64;
+        loop {
+            let read = limited.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            total += read as u64;
+            if total > TXN_MAX_MEMBER_BYTES {
+                anyhow::bail!("finalize: staged member exceeded its byte bound");
+            }
+            hasher.update(&buffer[..read]);
+            destination.write_all(&buffer[..read])?;
+        }
+        if hex::encode(hasher.finalize()) != member.sha256 {
+            anyhow::bail!("finalize: staged member changed while being copied");
+        }
+        let source_after = source.metadata()?;
+        if source_after.dev() != source_stat.st_dev
+            || source_after.ino() != source_stat.st_ino
+            || source_after.len() != source_stat.st_size as u64
+        {
+            anyhow::bail!("finalize: staged member identity changed while being copied");
+        }
+        destination.sync_all()?;
+        destination.rewind()?;
+        verify_member_identity_bound_raw(&destination, member)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        drop(destination);
+        let _ = unsafe { libc::unlinkat(objects_dir.as_raw_fd(), object_c.as_ptr(), 0) };
+        objects_dir.sync_all()?;
+        return Err(error);
+    }
+    drop(destination);
+    objects_dir.sync_all()?;
+    Ok(object_name)
+}
+
+#[cfg(unix)]
+fn gc_superseded_snapshot_objects(
+    edges_dir: &Path,
+    project_id: &str,
+    snapshot_id: &str,
+    objects_dir: &fs::File,
+    receipt: &SnapshotMemberReceipt,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    validate_journal_inventory(edges_dir)?;
+    let mut roots = receipt
+        .members
+        .values()
+        .map(|pointer| pointer.object.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let txn_dir = open_dir_under_root(
+        edges_dir,
+        &Path::new("materialized")
+            .join("workspace")
+            .join(project_id)
+            .join("txn"),
+        false,
+    )?;
+    for entry in crate::manifest::read_directory_names(&txn_dir)? {
+        let Some(name) = entry.to_str() else {
+            anyhow::bail!("snapshot transaction entry name is not UTF-8");
+        };
+        if !name.ends_with(".journal.json") {
+            continue;
+        }
+        let name_c = std::ffi::CString::new(name.as_bytes())?;
+        let journal = decode_txn_journal(&read_confined_file_bounded(
+            &txn_dir,
+            &name_c,
+            TXN_MAX_JOURNAL_BYTES,
+        )?)?;
+        if journal.project_id == project_id && journal.snapshot_id == snapshot_id {
+            for member in journal.members {
+                roots.insert(snapshot_object_name(&member.sha256)?);
+            }
+        }
+    }
+    let entries = crate::manifest::read_directory_names(objects_dir)?;
+    if entries.len() > SNAPSHOT_MAX_OBJECTS {
+        anyhow::bail!("snapshot object inventory exceeds its entry bound");
+    }
+    let mut removed = false;
+    for entry in entries {
+        let name = entry
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("snapshot object name is not UTF-8"))?;
+        let hash = name
+            .strip_suffix(".jsonl")
+            .ok_or_else(|| anyhow::anyhow!("snapshot object has an invalid name"))?;
+        if snapshot_object_name(hash)? != name {
+            anyhow::bail!("snapshot object has an invalid content-addressed name");
+        }
+        let name_c = std::ffi::CString::new(name.as_bytes())?;
+        let stat = fstatat_nofollow(objects_dir.as_raw_fd(), &name_c)?;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+            anyhow::bail!("snapshot object is not a regular file");
+        }
+        if roots.contains(name) {
+            continue;
+        }
+        if unsafe { libc::unlinkat(objects_dir.as_raw_fd(), name_c.as_ptr(), 0) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error.into());
+            }
+        }
+        removed = true;
+        inject_object_gc_failure()?;
+    }
+    if removed {
+        objects_dir.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn gc_superseded_snapshot_objects(
+    edges_dir: &Path,
+    project_id: &str,
+    snapshot_id: &str,
+    objects_dir: &Path,
+    receipt: &SnapshotMemberReceipt,
+) -> Result<()> {
+    validate_journal_inventory(edges_dir)?;
+    let mut roots = receipt
+        .members
+        .values()
+        .map(|pointer| pointer.object.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let txn_dir = materialized_dir(edges_dir)
+        .join("workspace")
+        .join(project_id)
+        .join("txn");
+    for entry in fs::read_dir(&txn_dir)?.collect::<std::io::Result<Vec<_>>>()? {
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("snapshot transaction entry name is not UTF-8"))?;
+        if !name.ends_with(".journal.json") {
+            continue;
+        }
+        let journal = decode_txn_journal(&read_nonunix_regular_bounded(
+            &entry.path(),
+            TXN_MAX_JOURNAL_BYTES as u64,
+        )?)?;
+        if journal.project_id == project_id && journal.snapshot_id == snapshot_id {
+            for member in journal.members {
+                roots.insert(snapshot_object_name(&member.sha256)?);
+            }
+        }
+    }
+    let entries = fs::read_dir(objects_dir)?.collect::<std::io::Result<Vec<_>>>()?;
+    if entries.len() > SNAPSHOT_MAX_OBJECTS {
+        anyhow::bail!("snapshot object inventory exceeds its entry bound");
+    }
+    for entry in entries {
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("snapshot object name is not UTF-8"))?;
+        let hash = name
+            .strip_suffix(".jsonl")
+            .ok_or_else(|| anyhow::anyhow!("snapshot object has an invalid name"))?;
+        if snapshot_object_name(hash)? != name {
+            anyhow::bail!("snapshot object has an invalid content-addressed name");
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            anyhow::bail!("snapshot object is not a safe regular file");
+        }
+        if !roots.contains(name.as_str()) {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    fs::File::open(objects_dir)?.sync_all()?;
+    Ok(())
 }
 
 /// R20F2+F3+F4: Finalize the EXACT transaction identified by the handle,
@@ -1780,6 +2286,7 @@ fn finalize_one_transaction(
     }
     let objects_dir = open_confined_dir_fd(snap_dir.as_raw_fd(), &objects_c)?;
     let mut receipt = load_snapshot_receipt_from_dir(&snap_dir, project_id, snapshot_id)?
+        .map(|loaded| loaded.receipt)
         .unwrap_or(SnapshotMemberReceipt {
             v: SNAPSHOT_RECEIPT_VERSION,
             project_id: project_id.to_string(),
@@ -1791,84 +2298,7 @@ fn finalize_one_transaction(
     // remain untouched until the receipt pointer is durably replaced.
     for member in &journal.members {
         let member_c = std::ffi::CString::new(member.name.as_bytes())?;
-        let object_name = snapshot_object_name(&member.sha256)?;
-        let object_c = std::ffi::CString::new(object_name.as_bytes())?;
-        let object_stat = fstatat_nofollow(objects_dir.as_raw_fd(), &object_c);
-        if object_stat.is_ok() {
-            let object_fd = unsafe {
-                libc::openat(
-                    objects_dir.as_raw_fd(),
-                    object_c.as_ptr(),
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if object_fd < 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            let object_file = unsafe { fs::File::from_raw_fd(object_fd) };
-            verify_member_identity_bound_raw(&object_file, member)?;
-        } else if object_stat
-            .as_ref()
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-        {
-            let member_fd = unsafe {
-                libc::openat(
-                    staging_fd.as_raw_fd(),
-                    member_c.as_ptr(),
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if member_fd < 0 {
-                anyhow::bail!(
-                    "finalize: committed object and staged member are both missing for {}",
-                    member.name
-                );
-            }
-            let member_file = unsafe { fs::File::from_raw_fd(member_fd) };
-            let verified_stat = verify_member_identity_bound_raw_ret_stat(&member_file, member)?;
-            let recheck = fstatat_nofollow(staging_fd.as_raw_fd(), &member_c)?;
-            if recheck.st_dev != verified_stat.st_dev
-                || recheck.st_ino != verified_stat.st_ino
-                || recheck.st_mode & libc::S_IFMT != libc::S_IFREG
-            {
-                anyhow::bail!(
-                    "finalize: member {} identity changed before immutable publication",
-                    member.name
-                );
-            }
-            let link_result = unsafe {
-                libc::linkat(
-                    staging_fd.as_raw_fd(),
-                    member_c.as_ptr(),
-                    objects_dir.as_raw_fd(),
-                    object_c.as_ptr(),
-                    0,
-                )
-            };
-            if link_result != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() != std::io::ErrorKind::AlreadyExists {
-                    anyhow::bail!(
-                        "finalize: publishing immutable object for {} failed: {error}",
-                        member.name
-                    );
-                }
-            }
-            let object_fd = unsafe {
-                libc::openat(
-                    objects_dir.as_raw_fd(),
-                    object_c.as_ptr(),
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if object_fd < 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            let object_file = unsafe { fs::File::from_raw_fd(object_fd) };
-            verify_member_identity_bound_raw(&object_file, member)?;
-        } else {
-            return Err(object_stat.unwrap_err().into());
-        }
+        let object_name = publish_immutable_snapshot_object(&staging_fd, &objects_dir, member)?;
 
         match unsafe { libc::unlinkat(staging_fd.as_raw_fd(), member_c.as_ptr(), 0) } {
             0 => {}
@@ -1910,6 +2340,7 @@ fn finalize_one_transaction(
         .ok_or_else(|| anyhow::anyhow!("snapshot member receipt disappeared after publication"))?;
     for member in &journal.members {
         let pointer = persisted
+            .receipt
             .members
             .get(&member.name)
             .ok_or_else(|| anyhow::anyhow!("published receipt omitted {}", member.name))?;
@@ -1918,6 +2349,18 @@ fn finalize_one_transaction(
         }
     }
     snap_dir.sync_all()?;
+
+    let snapshot_relative = format!("workspace/{project_id}/snapshots/{snapshot_id}");
+    let mut manifest = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
+    manifest.bind_snapshot_receipt(snapshot_relative, persisted.digest.clone());
+    manifest.write_atomic(edges_dir)?;
+    gc_superseded_snapshot_objects(
+        edges_dir,
+        project_id,
+        snapshot_id,
+        &objects_dir,
+        &persisted.receipt,
+    )?;
 
     // Delete the empty staging directory before the journal. If interrupted,
     // recovery uses the still-durable receipt and payload commitment to
@@ -2013,13 +2456,42 @@ fn finalize_one_transaction(
                 if hex::encode(Sha256::digest(&bytes)) != member.sha256 {
                     anyhow::bail!("finalize: member {} hash mismatch", member.name);
                 }
-                match fs::hard_link(&src, &object) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                let mut destination = match fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&object)
+                {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let published =
+                            read_nonunix_regular_bounded(&object, TXN_MAX_MEMBER_BYTES)?;
+                        if hex::encode(Sha256::digest(&published)) != member.sha256 {
+                            anyhow::bail!("finalize: existing immutable object hash mismatch");
+                        }
+                        fs::remove_file(&src)?;
+                        receipt.members.insert(
+                            member.name.clone(),
+                            SnapshotMemberPointer {
+                                sha256: member.sha256.clone(),
+                                object: object_name,
+                            },
+                        );
+                        continue;
+                    }
                     Err(error) => return Err(error.into()),
+                };
+                if let Err(error) = destination
+                    .write_all(&bytes)
+                    .and_then(|_| destination.sync_all())
+                {
+                    drop(destination);
+                    let _ = fs::remove_file(&object);
+                    return Err(error.into());
                 }
+                drop(destination);
                 let published = read_nonunix_regular_bounded(&object, TXN_MAX_MEMBER_BYTES)?;
                 if hex::encode(Sha256::digest(&published)) != member.sha256 {
+                    let _ = fs::remove_file(&object);
                     anyhow::bail!("finalize: immutable object hash mismatch after publication");
                 }
             }
@@ -2043,11 +2515,35 @@ fn finalize_one_transaction(
     if receipt_bytes.len() > SNAPSHOT_MAX_RECEIPT_BYTES {
         anyhow::bail!("snapshot member receipt exceeds its byte bound");
     }
-    let receipt_temp = snap_dir.join(format!(".member-receipts.{}.tmp", std::process::id()));
-    fs::write(&receipt_temp, &receipt_bytes)?;
-    fs::File::open(&receipt_temp)?.sync_all()?;
+    static RECEIPT_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let receipt_temp = snap_dir.join(format!(
+        ".member-receipts.{}.{}.tmp",
+        std::process::id(),
+        RECEIPT_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut receipt_temp_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&receipt_temp)?;
+    receipt_temp_file.write_all(&receipt_bytes)?;
+    receipt_temp_file.sync_all()?;
+    let receipt_temp_metadata = receipt_temp_file.metadata()?;
+    if !receipt_temp_metadata.is_file() || receipt_temp_metadata.len() != receipt_bytes.len() as u64
+    {
+        drop(receipt_temp_file);
+        let _ = fs::remove_file(&receipt_temp);
+        anyhow::bail!("finalize: receipt temporary failed identity validation");
+    }
+    drop(receipt_temp_file);
     fs::rename(&receipt_temp, &receipt_path)?;
     fs::File::open(&snap_dir)?.sync_all()?;
+    let receipt_digest = hex::encode(Sha256::digest(&receipt_bytes));
+    let snapshot_relative = format!("workspace/{project_id}/snapshots/{snapshot_id}");
+    let mut manifest = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
+    manifest.bind_snapshot_receipt(snapshot_relative, receipt_digest);
+    manifest.write_atomic(edges_dir)?;
+    gc_superseded_snapshot_objects(edges_dir, project_id, snapshot_id, &objects_dir, &receipt)?;
     fs::remove_dir(&staging_dir)
         .map_err(|error| anyhow::anyhow!("finalize: failed to remove staging dir: {error}"))?;
     match fs::remove_file(&journal_path) {
@@ -2959,6 +3455,30 @@ fn validate_nonunix_directory_chain(root: &Path, directory: &Path) -> Result<()>
 }
 
 #[cfg(not(unix))]
+fn open_nonunix_regular_nofollow(path: &Path) -> Result<fs::File> {
+    let before = fs::symlink_metadata(path)?;
+    if !before.is_file() || before.file_type().is_symlink() {
+        anyhow::bail!("file target is not a safe regular file");
+    }
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?
+    };
+    #[cfg(not(windows))]
+    let file = fs::OpenOptions::new().read(true).open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.len() != before.len() {
+        anyhow::bail!("file target changed while opening");
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
 fn read_nonunix_regular_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
     use std::io::Read;
 
@@ -2977,7 +3497,7 @@ fn read_nonunix_regular_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>> 
     if before.len() > max_bytes {
         anyhow::bail!("bounded read target exceeds its byte limit");
     }
-    let mut file = fs::File::open(path)?;
+    let mut file = open_nonunix_regular_nofollow(path)?;
     let opened = file.metadata()?;
     if !opened.is_file() || opened.len() != before.len() {
         anyhow::bail!("bounded read target changed while opening");
@@ -6457,6 +6977,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn r24_prejournal_staging_failures_cleanup_without_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let edges = vec![explicit_edge("git", "mentions", "target")];
+
+        for (sequence, point) in ["after-first-member", "before-journal"]
+            .into_iter()
+            .enumerate()
+        {
+            let token = format!("txn-24-{sequence}");
+            set_staging_failure_point(point);
+            let error = write_snapshot_members_transaction_with_token(
+                &edges_dir,
+                "p_1",
+                &snapshot_id,
+                &[
+                    ("git-current.jsonl", &edges),
+                    ("symbol-current.jsonl", &edges),
+                ],
+                &token,
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("injected snapshot staging failure"));
+
+            let txn_dir = materialized_dir(&edges_dir).join("workspace/p_1/txn");
+            assert!(!txn_dir.join(&token).exists());
+            assert!(!txn_dir.join(format!("{token}.journal.json")).exists());
+
+            write_snapshot_members_transaction_with_token(
+                &edges_dir,
+                "p_1",
+                &snapshot_id,
+                &[("git-current.jsonl", &edges)],
+                &token,
+            )
+            .unwrap();
+            cleanup_failed_snapshot_staging(&edges_dir, "p_1", &token).unwrap();
+        }
+    }
+
     // R20F1: GC must not deadlock when recovery has already run.
     #[test]
     fn r20_gc_does_not_deadlock_after_recovery() {
@@ -6941,6 +7503,192 @@ mod tests {
             .unwrap()
             .active_paths_for_loader(&edges_dir)
             .unwrap();
+    }
+
+    #[test]
+    fn r24_receipt_managed_snapshot_refuses_missing_receipt_after_closeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
+        let handle = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+        finalize_snapshot_publication(&handle).unwrap();
+
+        fs::remove_file(
+            snapshot_dir(&edges_dir, "p_1", &snapshot_id).join(SNAPSHOT_RECEIPT_FILENAME),
+        )
+        .unwrap();
+        let error = ManifestIndex::load(&edges_dir)
+            .unwrap()
+            .active_paths_for_loader(&edges_dir)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("missing its member receipt"),
+            "unexpected refusal: {error:#}"
+        );
+    }
+
+    #[test]
+    fn r24_receipt_replacement_reclaims_superseded_objects() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+
+        for target in ["target-a", "target-b", "target-c"] {
+            let edges = vec![explicit_edge("git", "mentions", target)];
+            let handle = write_snapshot_members_transaction(
+                &edges_dir,
+                "p_1",
+                &snapshot_id,
+                &[("git-current.jsonl", &edges)],
+            )
+            .unwrap();
+            finalize_snapshot_publication(&handle).unwrap();
+        }
+
+        let objects = snapshot_dir(&edges_dir, "p_1", &snapshot_id).join(SNAPSHOT_OBJECTS_DIRNAME);
+        let entries = fs::read_dir(objects)
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the current receipt object should remain"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r24_object_gc_failure_resumes_from_the_durable_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let first_edges = vec![explicit_edge("git", "mentions", "target-a")];
+        let first = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &first_edges)],
+        )
+        .unwrap();
+        finalize_snapshot_publication(&first).unwrap();
+
+        let second_edges = vec![explicit_edge("git", "mentions", "target-b")];
+        let second = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &second_edges)],
+        )
+        .unwrap();
+        fail_next_object_gc();
+        let error = finalize_snapshot_publication(&second).unwrap_err();
+        assert!(format!("{error:#}").contains("injected snapshot object GC failure"));
+
+        recover_pending_transactions_prebind(&edges_dir, Some(&second.commitment)).unwrap();
+        let txn_dir = materialized_dir(&edges_dir).join("workspace/p_1/txn");
+        assert!(
+            !txn_dir
+                .join(format!("{}.journal.json", second.txn_token))
+                .exists()
+        );
+        ManifestIndex::load(&edges_dir)
+            .unwrap()
+            .active_paths_for_loader(&edges_dir)
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r24_object_copy_is_bound_to_the_verified_staged_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let edges = vec![explicit_edge("git", "mentions", "target")];
+        let handle = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &edges)],
+        )
+        .unwrap();
+        let staged = materialized_dir(&edges_dir)
+            .join("workspace/p_1/txn")
+            .join(&handle.txn_token)
+            .join("git-current.jsonl");
+        let staged_for_hook = staged.clone();
+        set_object_copy_hook(move || {
+            let displaced = staged_for_hook.with_extension("displaced");
+            fs::rename(&staged_for_hook, &displaced).unwrap();
+            fs::remove_file(displaced).unwrap();
+            fs::write(&staged_for_hook, b"replacement pathname bytes").unwrap();
+        });
+
+        finalize_snapshot_publication(&handle).unwrap();
+        let resolved = committed_snapshot_members(
+            &edges_dir,
+            &format!("workspace/p_1/snapshots/{snapshot_id}"),
+        )
+        .unwrap();
+        let (_, _, mut file) = resolved
+            .into_iter()
+            .find(|(name, _, _)| name == "git-current.jsonl")
+            .unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes).unwrap();
+        assert!(!bytes.starts_with(b"replacement"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r24_object_copy_rejects_writable_descriptor_mutation() {
+        use std::io::{Seek, Write};
+
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let edges = vec![explicit_edge("git", "mentions", "target")];
+        let handle = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &edges)],
+        )
+        .unwrap();
+        let staged = materialized_dir(&edges_dir)
+            .join("workspace/p_1/txn")
+            .join(&handle.txn_token)
+            .join("git-current.jsonl");
+        let mut writable = fs::OpenOptions::new().write(true).open(&staged).unwrap();
+        set_object_copy_hook(move || {
+            writable.rewind().unwrap();
+            writable.write_all(b"mutated").unwrap();
+            writable.set_len(7).unwrap();
+            writable.sync_all().unwrap();
+        });
+
+        let error = finalize_snapshot_publication(&handle).unwrap_err();
+        assert!(format!("{error:#}").contains("changed while being copied"));
+        let journal: TxnJournal = serde_json::from_slice(
+            &fs::read(
+                materialized_dir(&edges_dir)
+                    .join("workspace/p_1/txn")
+                    .join(format!("{}.journal.json", handle.txn_token)),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let object = snapshot_dir(&edges_dir, "p_1", &snapshot_id)
+            .join(SNAPSHOT_OBJECTS_DIRNAME)
+            .join(snapshot_object_name(&journal.members[0].sha256).unwrap());
+        assert!(!object.exists(), "failed copy must remove its object");
     }
 
     #[test]

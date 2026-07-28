@@ -27,6 +27,7 @@ use bbox_corpus_core::git_overlay::GitOverlaySelector;
 use serde::{Deserialize, Serialize};
 
 pub(crate) const MANIFEST_VERSION: u32 = 1;
+const RECEIPT_PROTOCOL_VERSION: u32 = 1;
 const MANIFEST_INDEX_FILENAME: &str = "manifest-index.json";
 const OVERLAY_MANIFEST_FILENAME: &str = "overlay_manifest.json";
 const OVERLAY_MANIFEST_VERSION: u32 = 1;
@@ -264,6 +265,10 @@ pub struct ManifestIndex {
     pub workspaces: std::collections::BTreeMap<String, WorkspaceIndexEntry>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub retirement_tombstones: std::collections::BTreeMap<String, WorkspaceIndexEntry>,
+    #[serde(default)]
+    pub(crate) receipt_protocol_version: u32,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) receipt_managed_snapshots: std::collections::BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
 }
@@ -274,18 +279,40 @@ impl ManifestIndex {
             version: MANIFEST_VERSION,
             workspaces: std::collections::BTreeMap::new(),
             retirement_tombstones: std::collections::BTreeMap::new(),
+            receipt_protocol_version: RECEIPT_PROTOCOL_VERSION,
+            receipt_managed_snapshots: std::collections::BTreeMap::new(),
             updated_at: None,
         }
     }
 
     pub fn load(edges_dir: &Path) -> Result<Self> {
         let data = read_manifest_index_confined(edges_dir)?;
-        let idx: Self = serde_json::from_slice(&data)?;
+        let mut idx: Self = serde_json::from_slice(&data)?;
         if idx.version != MANIFEST_VERSION {
             anyhow::bail!(
                 "manifest-index version {} != expected {}",
                 idx.version,
                 MANIFEST_VERSION
+            );
+        }
+        if idx.receipt_protocol_version == 0 {
+            for entry in idx.workspaces.values() {
+                let Some(snapshot) = entry.active_snapshot.as_deref() else {
+                    continue;
+                };
+                if let Some(digest) = crate::snapshot::snapshot_receipt_digest(edges_dir, snapshot)?
+                {
+                    idx.receipt_managed_snapshots
+                        .insert(snapshot.to_string(), digest);
+                }
+            }
+            idx.receipt_protocol_version = RECEIPT_PROTOCOL_VERSION;
+            idx.write_atomic(edges_dir)?;
+        } else if idx.receipt_protocol_version != RECEIPT_PROTOCOL_VERSION {
+            anyhow::bail!(
+                "manifest receipt protocol version {} != expected {}",
+                idx.receipt_protocol_version,
+                RECEIPT_PROTOCOL_VERSION
             );
         }
         Ok(idx)
@@ -314,6 +341,12 @@ impl ManifestIndex {
     pub fn upsert_workspace(&mut self, project_id: &str, entry: WorkspaceIndexEntry) {
         self.updated_at = Some(chrono_now_rfc3339());
         self.workspaces.insert(project_id.to_string(), entry);
+    }
+
+    pub(crate) fn bind_snapshot_receipt(&mut self, snapshot: String, digest: String) {
+        self.receipt_protocol_version = RECEIPT_PROTOCOL_VERSION;
+        self.receipt_managed_snapshots.insert(snapshot, digest);
+        self.updated_at = Some(chrono_now_rfc3339());
     }
 
     pub fn discharge_project_workspace(edges_dir: &Path, project_id: &str) -> Result<bool> {
@@ -423,9 +456,13 @@ impl ManifestIndex {
                         let suppressed: HashSet<String> =
                             om.covered_rel_path_hashes.into_iter().collect();
                         if !suppressed.is_empty() {
-                            for (path, file) in
-                                confined_snapshot_members(edges_dir, snapshot, entry)?
-                            {
+                            for (path, file) in confined_snapshot_members(
+                                edges_dir,
+                                snapshot,
+                                entry,
+                                self.receipt_managed_snapshots.get(snapshot),
+                                self.receipt_protocol_version != 0,
+                            )? {
                                 result.push(LoadablePath {
                                     path,
                                     file,
@@ -440,7 +477,13 @@ impl ManifestIndex {
                 // Legacy overlay (no overlay_manifest): snapshot is completely
                 // replaced, nothing else to add for this project.
             } else if let Some(ref snapshot) = entry.active_snapshot {
-                for (path, file) in confined_snapshot_members(edges_dir, snapshot, entry)? {
+                for (path, file) in confined_snapshot_members(
+                    edges_dir,
+                    snapshot,
+                    entry,
+                    self.receipt_managed_snapshots.get(snapshot),
+                    self.receipt_protocol_version != 0,
+                )? {
                     result.push(LoadablePath {
                         path,
                         file,
@@ -1036,6 +1079,8 @@ fn confined_snapshot_members(
     edges_dir: &Path,
     snapshot: &str,
     entry: &WorkspaceIndexEntry,
+    expected_receipt_digest: Option<&String>,
+    receipt_protocol_active: bool,
 ) -> Result<Vec<(PathBuf, fs::File)>> {
     let overlay_admits_git_current = !entry.git_overlay_managed
         || entry.git_overlay.as_ref().is_some_and(|overlay| {
@@ -1044,7 +1089,12 @@ fn confined_snapshot_members(
                 .as_deref()
                 .is_some_and(|generation| overlay.matches_code_generation(generation))
         });
-    let committed = crate::snapshot::committed_snapshot_members(edges_dir, snapshot)?;
+    let committed = crate::snapshot::committed_snapshot_members_bound(
+        edges_dir,
+        snapshot,
+        expected_receipt_digest.map(String::as_str),
+        receipt_protocol_active,
+    )?;
     let committed_names: HashSet<&str> = committed
         .iter()
         .map(|(logical_name, _, _)| logical_name.as_str())
@@ -1150,6 +1200,8 @@ fn confined_snapshot_members(
     edges_dir: &Path,
     snapshot: &str,
     entry: &WorkspaceIndexEntry,
+    expected_receipt_digest: Option<&String>,
+    receipt_protocol_active: bool,
 ) -> Result<Vec<(PathBuf, fs::File)>> {
     let overlay_admits_git_current = !entry.git_overlay_managed
         || entry.git_overlay.as_ref().is_some_and(|overlay| {
@@ -1158,7 +1210,12 @@ fn confined_snapshot_members(
                 .as_deref()
                 .is_some_and(|generation| overlay.matches_code_generation(generation))
         });
-    let committed = crate::snapshot::committed_snapshot_members(edges_dir, snapshot)?;
+    let committed = crate::snapshot::committed_snapshot_members_bound(
+        edges_dir,
+        snapshot,
+        expected_receipt_digest.map(String::as_str),
+        receipt_protocol_active,
+    )?;
     let committed_names: HashSet<&str> = committed
         .iter()
         .map(|(logical_name, _, _)| logical_name.as_str())
