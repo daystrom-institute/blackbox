@@ -760,18 +760,30 @@ pub(super) fn execute_reindex_pass(
         }
         Some(journal)
     };
-    // R20F1: bind transaction tokens in the prepared-commit payload so
-    // recovery can prove the index commit covered these transactions.
-    let txn_payload = pending_handles
+    // R21F1+F2: bind all transaction commitments in the prepared-commit
+    // payload, plus carry forward outstanding commitments from journals still
+    // on disk. Recovery recomputes and compares exact commitments.
+    let mut commitments: Vec<String> = pending_handles
         .iter()
-        .map(|h| h.txn_token.as_str())
-        .collect::<Vec<_>>()
-        .join(",");
+        .map(|h| h.commitment().to_string())
+        .collect();
+    commitments.extend(
+        bbox_edge_sidecar::snapshot::enumerate_outstanding_commitments(&edges_dir)
+            .into_iter()
+            .filter(|c| !commitments.contains(c)),
+    );
+    let txn_payload = commitments.join(",");
     let mut prepared = writer.prepare_commit()?;
     if !txn_payload.is_empty() {
         prepared.set_payload(&txn_payload);
     }
-    prepared.commit()?;
+    // R21F7: on commit failure, discard all staging to prevent leaks.
+    if let Err(commit_error) = prepared.commit() {
+        for handle in &pending_handles {
+            let _ = bbox_edge_sidecar::snapshot::discard_snapshot_transaction(handle);
+        }
+        return Err(commit_error);
+    }
     // R20F4: fail closed if any finalization fails.
     for handle in &pending_handles {
         if let Err(error) = bbox_edge_sidecar::snapshot::finalize_snapshot_publication(handle) {

@@ -361,6 +361,16 @@ impl PublicationResult {
             .map(|h| h.txn_token.clone())
             .collect()
     }
+
+    /// R21F2: collect all cryptographic commitments from pending finalizations
+    /// for the Tantivy commit payload. Each commitment is
+    /// {project_id}:{txn_token}:{sha256(canonical_journal_bytes)}.
+    pub fn pending_commitments(&self) -> Vec<String> {
+        self.pending_snapshot_finalizations
+            .iter()
+            .map(|h| h.commitment().to_string())
+            .collect()
+    }
 }
 
 #[derive(Debug)]

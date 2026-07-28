@@ -482,23 +482,27 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         checkout_access.clone(),
     )?);
 
-    // R20F1: unconditional pre-bind transaction recovery. Runs before
+    // R21F1: unconditional pre-bind transaction recovery. Runs before
     // selector refresh, read-view construction, and edge-index loading.
-    // The Tantivy commit payload carries the comma-joined txn tokens that
-    // were committed atomically with the index commit. Recovery uses it
-    // to distinguish committed-but-unfinalized transactions (resume
-    // finalization) from uncommitted ones (discard staging). R20F5:
-    // crash-idempotent finalization handles mid-rename restarts.
+    // The Tantivy commit payload carries the cryptographic commitments
+    // for all transactions that were committed atomically with the index
+    // commit. Recovery uses these to distinguish committed-but-unfinalized
+    // transactions (resume finalization) from uncommitted ones (discard
+    // staging). R20F5: crash-idempotent finalization handles mid-rename
+    // restarts.
+    // R21F1: load_metas errors ABORT recovery with a typed error, never
+    // silently become None (which would treat all pending journals as
+    // uncommitted and discard committed transactions).
     let edges_dir = crate::edge_index::edges_dir_from_bro_store(&store_dir);
-    let commit_payload = idx
+    let commit_payload: String = idx
         .index_handle()
         .load_metas()
-        .ok()
-        .and_then(|metas| metas.payload);
-    let commit_payload_ref = commit_payload.as_deref();
+        .context("recovery: load_metas failed, cannot determine committed transactions")?
+        .payload
+        .unwrap_or_default();
     bbox_edge_sidecar::snapshot::recover_pending_transactions_prebind(
         &edges_dir,
-        commit_payload_ref,
+        Some(&commit_payload),
     )
     .context("pre-bind transaction recovery failed")?;
 

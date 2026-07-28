@@ -78,13 +78,11 @@ impl EdgeIndex {
         let started = Instant::now();
         let (mut index, mut seen) = Self::project_store_edges(stores);
 
-        // R20F1: pre-bind recovery. When called from the edge-index rebuild
-        // path there is no Tantivy commit payload available (this rebuild
-        // does not own the index), so commit_payload is None: every pending
-        // journal is treated as uncommitted and discarded. The payload-aware
-        // recovery with a real payload runs in the server open path.
-        bbox_edge_sidecar::snapshot::recover_pending_transactions_prebind(&stores.edges_dir, None)?;
-
+        // R21F3: recovery is exclusively the unconditional pre-bind call in
+        // server open (open.rs). This edge-index rebuild path does not own
+        // the index commit and must NOT run recovery, which could race new
+        // transactions. Recovery here was also unsafe because commit_payload
+        // is None, treating every pending journal as uncommitted.
         index.load_sidecar_edges_admitting_fully_absent(
             &stores.edges_dir,
             stores.registered_project_ids.as_ref(),

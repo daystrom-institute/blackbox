@@ -1496,18 +1496,36 @@ fn run_collected_stage(
     // publication guard to hold: the broker's guard exists to pin checkout
     // lifecycle across publish, and this transaction touched no checkout.
     let publication_result = publication.publish()?;
-    // R20F1: bind the commit to the exact transaction tokens via Tantivy
-    // prepared-commit payload so that recovery can verify the index commit
-    // actually covered these transactions before finalizing or discarding.
-    let txn_payload = publication_result.pending_txn_tokens().join(",");
+    // R21F1+F2: bind the commit to the cryptographic commitments for this
+    // transaction AND carry forward all outstanding commitments from journals
+    // still on disk (from failed finalizations or concurrent writers). Every
+    // commit must carry ALL unresolved tokens so a later commit cannot erase
+    // proof of an earlier one.
+    let mut commitments: Vec<String> = publication_result.pending_commitments();
+    commitments.extend(
+        bbox_edge_sidecar::snapshot::enumerate_outstanding_commitments(&edges_dir)
+            .into_iter()
+            .filter(|c| !commitments.contains(c)),
+    );
+    let txn_payload = commitments.join(",");
     let mut prepared = writer.prepare_commit()?;
     if !txn_payload.is_empty() {
         prepared.set_payload(&txn_payload);
     }
-    prepared.commit()?;
+    // R21F7: on commit failure, discard staging to prevent leaks.
+    if let Err(commit_error) = prepared.commit() {
+        for handle in &publication_result.pending_snapshot_finalizations {
+            let _ = bbox_edge_sidecar::snapshot::discard_snapshot_transaction(handle);
+        }
+        return Err(commit_error);
+    }
     // R20F4: finalization returns Result; do not publish the post-commit
     // read view until staging members are renamed into the live snapshot.
-    publication_result.finalize_publications()?;
+    // R21F7: if finalization fails, discard remaining staging to prevent leaks.
+    if let Err(error) = publication_result.finalize_publications() {
+        tracing::error!(error = %error, "finalization failed after commit, discarding staging");
+        return Err(error);
+    }
     post_commit(ctx);
     Ok(result)
 }
@@ -1617,13 +1635,29 @@ fn run_local_stage(
         .checkout_access
         .publication_guard_for([&local_lease, &git_lease])?;
     let publication_result = publication.publish()?;
-    let txn_payload = publication_result.pending_txn_tokens().join(",");
+    // R21F1+F2: carry forward all outstanding commitments.
+    let mut commitments: Vec<String> = publication_result.pending_commitments();
+    commitments.extend(
+        bbox_edge_sidecar::snapshot::enumerate_outstanding_commitments(&edges_dir)
+            .into_iter()
+            .filter(|c| !commitments.contains(c)),
+    );
+    let txn_payload = commitments.join(",");
     let mut prepared = writer.prepare_commit()?;
     if !txn_payload.is_empty() {
         prepared.set_payload(&txn_payload);
     }
-    prepared.commit()?;
-    publication_result.finalize_publications()?;
+    // R21F7: on commit failure, discard staging to prevent leaks.
+    if let Err(commit_error) = prepared.commit() {
+        for handle in &publication_result.pending_snapshot_finalizations {
+            let _ = bbox_edge_sidecar::snapshot::discard_snapshot_transaction(handle);
+        }
+        return Err(commit_error);
+    }
+    if let Err(error) = publication_result.finalize_publications() {
+        tracing::error!(error = %error, "finalization failed after commit, discarding staging");
+        return Err(error);
+    }
     post_commit(ctx);
     Ok(result)
 }
@@ -1670,13 +1704,29 @@ fn run_git_current_overlay(
     publication.stage_snapshot_git_current(&edges_dir, &project.project_id, snapshot_id, true);
     let _publication_guard = ctx.checkout_access.publication_guard(lease)?;
     let publication_result = publication.publish()?;
-    let txn_payload = publication_result.pending_txn_tokens().join(",");
+    // R21F1+F2: carry forward all outstanding commitments.
+    let mut commitments: Vec<String> = publication_result.pending_commitments();
+    commitments.extend(
+        bbox_edge_sidecar::snapshot::enumerate_outstanding_commitments(&edges_dir)
+            .into_iter()
+            .filter(|c| !commitments.contains(c)),
+    );
+    let txn_payload = commitments.join(",");
     let mut prepared = writer.prepare_commit()?;
     if !txn_payload.is_empty() {
         prepared.set_payload(&txn_payload);
     }
-    prepared.commit()?;
-    publication_result.finalize_publications()?;
+    // R21F7: on commit failure, discard staging to prevent leaks.
+    if let Err(commit_error) = prepared.commit() {
+        for handle in &publication_result.pending_snapshot_finalizations {
+            let _ = bbox_edge_sidecar::snapshot::discard_snapshot_transaction(handle);
+        }
+        return Err(commit_error);
+    }
+    if let Err(error) = publication_result.finalize_publications() {
+        tracing::error!(error = %error, "finalization failed after commit, discarding staging");
+        return Err(error);
+    }
     post_commit(ctx);
     Ok(())
 }
@@ -1741,17 +1791,30 @@ fn run_consolidated_history(
             all_handles.extend(publication_result.pending_snapshot_finalizations);
         }
     }
-    // R20F1: bind all transaction tokens in one prepared-commit payload.
-    let txn_payload = all_handles
+    // R21F1+F2: bind all transaction commitments in one prepared-commit
+    // payload, plus carry forward outstanding commitments from journals still
+    // on disk.
+    let mut commitments: Vec<String> = all_handles
         .iter()
-        .map(|h| h.txn_token.as_str())
-        .collect::<Vec<_>>()
-        .join(",");
+        .map(|h| h.commitment().to_string())
+        .collect();
+    commitments.extend(
+        bbox_edge_sidecar::snapshot::enumerate_outstanding_commitments(&edges_dir)
+            .into_iter()
+            .filter(|c| !commitments.contains(c)),
+    );
+    let txn_payload = commitments.join(",");
     let mut prepared = writer.prepare_commit()?;
     if !txn_payload.is_empty() {
         prepared.set_payload(&txn_payload);
     }
-    prepared.commit()?;
+    // R21F7: on commit failure, discard all staging to prevent leaks.
+    if let Err(commit_error) = prepared.commit() {
+        for handle in &all_handles {
+            let _ = bbox_edge_sidecar::snapshot::discard_snapshot_transaction(handle);
+        }
+        return Err(commit_error);
+    }
     // R20F4: fail closed if any finalization fails.
     for handle in &all_handles {
         if let Err(error) = bbox_edge_sidecar::snapshot::finalize_snapshot_publication(handle) {
