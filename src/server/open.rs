@@ -482,14 +482,15 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         checkout_access.clone(),
     )?);
 
-    // R18F1: unconditional pre-bind staging marker recovery. Runs before
-    // selector refresh, read-view construction, and edge-index loading,
-    // independent of whether eager rebuild is enabled. A crash-left marker
-    // means the paired Tantivy commit was not confirmed; recovery rolls back
-    // the affected snapshot so the next reindex rebuilds from source.
+    // R19F1: unconditional pre-bind transaction recovery. Runs before
+    // selector refresh, read-view construction, and edge-index loading.
+    // Pending transaction journals are ambiguous (the paired Tantivy
+    // commit status is unprovable without a commit token): recovery
+    // discards their staging directories and journals, leaving the live
+    // snapshot untouched in its pre-transaction state.
     let edges_dir = crate::edge_index::edges_dir_from_bro_store(&store_dir);
-    bbox_edge_sidecar::snapshot::recover_staging_markers_prebind(&edges_dir)
-        .context("pre-bind staging marker recovery failed")?;
+    bbox_edge_sidecar::snapshot::recover_pending_transactions_prebind(&edges_dir)
+        .context("pre-bind transaction recovery failed")?;
 
     // Pre-bind catalog-mode recovery (P4-F section 10.1 steps 5-8):
     // once-only classification, relationship chain validation,

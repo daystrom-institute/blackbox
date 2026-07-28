@@ -387,16 +387,14 @@ impl ManifestIndex {
             if let Some(snapshot) = entry.active_snapshot.as_deref()
                 && confined_regular_file(edges_dir, &format!("{snapshot}/.staging"))?.is_some()
             {
-                // R17F1+R17F2: recovery must run in a dedicated pre-bind
-                // transaction (recover_staging_markers_prebind), NOT inside
-                // active_paths_for_loader. The loader is called under the
-                // manifest coordinator lock by GC, so reacquiring the lock
-                // here would deadlock. A staging marker reaching this point
-                // means pre-bind recovery was not run or failed: bail so the
-                // operator sees the error instead of silently binding an
-                // unverified publication.
+                // R19: live snapshots no longer carry .staging markers.
+                // A marker here is from a prior build format. Recovery
+                // (recover_pending_transactions_prebind) runs before bind
+                // and fails closed on legacy markers. Reaching this point
+                // means recovery was not run or failed.
                 anyhow::bail!(
-                    "active snapshot has a lingering staging marker for workspace                      {project_id}: {snapshot} (run recover_staging_markers_prebind first)"
+                    "active snapshot has a legacy staging marker for workspace \
+                     {project_id}: {snapshot} (run recover_pending_transactions_prebind first)"
                 );
             }
             let has_overlay = match entry.dirty_overlay.as_deref() {
@@ -864,7 +862,7 @@ fn open_confined_regular(base: &fs::File, relative: &str) -> Result<Option<fs::F
 }
 
 #[cfg(unix)]
-fn read_directory_names(directory: &fs::File) -> Result<Vec<std::ffi::OsString>> {
+pub(crate) fn read_directory_names(directory: &fs::File) -> Result<Vec<std::ffi::OsString>> {
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStringExt;
 

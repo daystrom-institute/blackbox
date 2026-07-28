@@ -880,6 +880,17 @@ pub fn stage_local_snapshot_activation(
     })
 }
 
+/// Write member files into a snapshot directory. This is used for both
+/// initial snapshot creation (via stage_local_snapshot_activation) and by
+/// the transactional update path. On unix the writes are descriptor-
+/// confined and atomic (temp file + rename + fsync). On non-unix the
+/// snapshot directory is created if missing and members are written
+/// directly.
+///
+/// R19: write_snapshot_files no longer writes a .staging marker into the
+/// live snapshot directory. Transactional member updates that need crash
+/// protection stage outside the live snapshot via
+/// write_snapshot_members_transaction.
 pub fn write_snapshot_files(
     edges_dir: &Path,
     project_id: &str,
@@ -895,13 +906,6 @@ pub fn write_snapshot_files(
                 .join(project_id)
                 .join("snapshots")
                 .join(snapshot_id);
-            // R18F4: compute member hashes and write them into the staging
-            // marker as a versioned bounded commitment. Recovery uses the
-            // commitment to verify the sidecar publication is complete.
-            // The marker's presence means the Tantivy commit is NOT yet
-            // confirmed.
-            let mut members: Vec<StagingMember> = Vec::new();
-            let mut member_bytes: Vec<(String, Vec<u8>)> = Vec::new();
             for (filename, edges) in files {
                 validate_snapshot_component(filename)?;
                 let mut bytes = Vec::new();
@@ -909,24 +913,10 @@ pub fn write_snapshot_files(
                     serde_json::to_writer(&mut bytes, edge)?;
                     bytes.push(b'\n');
                 }
-                let hash = hex::encode(Sha256::digest(&bytes));
-                members.push(StagingMember {
-                    name: filename.to_string(),
-                    sha256: hash,
-                });
-                member_bytes.push((filename.to_string(), bytes));
-            }
-            let commitment = serde_json::to_vec(&StagingCommitment { v: 2, members })?;
-            write_materialized_file_atomic(
-                edges_dir,
-                snap_relative.join(".staging").as_path(),
-                &commitment,
-            )?;
-            for (filename, bytes) in &member_bytes {
                 write_materialized_file_atomic(
                     edges_dir,
-                    snap_relative.join(filename).as_path(),
-                    bytes,
+                    snap_relative.join(*filename).as_path(),
+                    &bytes,
                 )?;
             }
             Ok(())
@@ -963,166 +953,397 @@ pub fn write_snapshot_files(
     }
 }
 
+/// R19 transaction journal. A versioned bounded record written outside the
+/// live snapshot directory. The LIVE snapshot is never touched during
+/// staging; members are staged in a sibling txn directory and renamed into
+/// the live snapshot only after the paired Tantivy commit succeeds.
+///
+/// Fields:
+///   v: format version (1)
+///   txn_token: unique opaque token identifying this transaction
+///   snapshot_id: target snapshot the members belong to
+///   members: validated member names + SHA-256 hashes of staged bytes
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TxnJournal {
+    v: u32,
+    txn_token: String,
+    snapshot_id: String,
+    members: Vec<TxnMember>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct TxnMember {
+    name: String,
+    sha256: String,
+}
+
+/// Test-visible mirror of TxnJournal for deserializing journals in tests.
+#[cfg(test)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct TxnJournalForTest {
+    pub txn_token: String,
+    pub snapshot_id: String,
+}
+
+/// Maximum number of members in a transaction journal.
+const TXN_MAX_MEMBERS: usize = 64;
+/// Maximum total size of the journal file (64 KB).
+const TXN_MAX_JOURNAL_BYTES: usize = 64 * 1024;
+/// Maximum size of any single staged member file (256 MB).
+const TXN_MAX_MEMBER_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Relative path of the transaction staging directory for a project + token.
+fn txn_staging_rel(project_id: &str, txn_token: &str) -> PathBuf {
+    Path::new("workspace")
+        .join(project_id)
+        .join("txn")
+        .join(txn_token)
+}
+
+/// Relative path of the journal file for a project + token.
+fn txn_journal_rel(project_id: &str, txn_token: &str) -> PathBuf {
+    Path::new("workspace")
+        .join(project_id)
+        .join("txn")
+        .join(format!("{txn_token}.journal.json"))
+}
+
+/// R19F1+F3+F4: Stage member files OUTSIDE the live snapshot directory.
+/// Writes each member into materialized/workspace/<project>/txn/<token>/
+/// and a durable versioned bounded journal at
+/// materialized/workspace/<project>/txn/<token>.journal.json.
+/// The LIVE snapshot directory is never touched. The caller MUST call
+/// finalize_snapshot_publication AFTER writer.commit() to rename the
+/// staged members into the live snapshot.
 pub fn write_snapshot_members_transaction(
     edges_dir: &Path,
     project_id: &str,
     snapshot_id: &str,
     files: &[(&str, &[Edge])],
 ) -> Result<()> {
-    // R16F3: write the .staging marker and member files but do NOT clear
-    // the marker here. The marker belongs to the outer sidecar-plus-index
-    // publication: the caller must call finalize_snapshot_publication AFTER
-    // the Tantivy writer.commit() to clear it. A crash before finalize
-    // leaves the marker for pre-bind recovery to finish or roll back.
-    write_snapshot_files(edges_dir, project_id, snapshot_id, files)
+    let txn_token = generate_txn_token();
+    write_snapshot_members_transaction_with_token(
+        edges_dir,
+        project_id,
+        snapshot_id,
+        files,
+        &txn_token,
+    )
 }
 
-/// Clear the staging marker for a snapshot after the outer index transaction
-/// (writer.commit()) has completed. This is the R16F3 finalize step: the
-/// marker is only cleared once both the sidecar members and the index
-/// transaction are durable.
+/// Generate a unique transaction token: process id + monotonic counter +
+/// timestamp. This is opaque to recovery; it only needs uniqueness.
+fn generate_txn_token() -> String {
+    static TXN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TXN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("txn-{seq}-{ts}")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_snapshot_members_transaction_with_token(
+    edges_dir: &Path,
+    project_id: &str,
+    snapshot_id: &str,
+    files: &[(&str, &[Edge])],
+    txn_token: &str,
+) -> Result<()> {
+    validate_snapshot_component(project_id)?;
+    validate_snapshot_component(snapshot_id)?;
+    validate_snapshot_component(txn_token)?;
+    if files.is_empty() {
+        anyhow::bail!("transaction must stage at least one member");
+    }
+    if files.len() > TXN_MAX_MEMBERS {
+        anyhow::bail!(
+            "transaction has {} members (max {})",
+            files.len(),
+            TXN_MAX_MEMBERS
+        );
+    }
+
+    let mut members: Vec<TxnMember> = Vec::new();
+    let mut member_bytes: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut seen_names = std::collections::HashSet::new();
+    for (filename, edges) in files {
+        validate_snapshot_component(filename)?;
+        if !seen_names.insert(*filename) {
+            anyhow::bail!("duplicate member name in transaction: {filename}");
+        }
+        let mut bytes = Vec::new();
+        for edge in *edges {
+            serde_json::to_writer(&mut bytes, edge)?;
+            bytes.push(b'\n');
+        }
+        let hash = hex::encode(Sha256::digest(&bytes));
+        members.push(TxnMember {
+            name: filename.to_string(),
+            sha256: hash,
+        });
+        member_bytes.push((filename.to_string(), bytes));
+    }
+
+    let journal = TxnJournal {
+        v: 1,
+        txn_token: txn_token.to_string(),
+        snapshot_id: snapshot_id.to_string(),
+        members,
+    };
+    let journal_bytes = serde_json::to_vec(&journal)?;
+    if journal_bytes.len() > TXN_MAX_JOURNAL_BYTES {
+        anyhow::bail!(
+            "transaction journal exceeds max size ({} > {})",
+            journal_bytes.len(),
+            TXN_MAX_JOURNAL_BYTES
+        );
+    }
+
+    with_manifest_coordinator(|| {
+        let staging_rel = txn_staging_rel(project_id, txn_token);
+        let journal_rel = txn_journal_rel(project_id, txn_token);
+
+        // Stage member files into the txn directory.
+        for (filename, bytes) in &member_bytes {
+            write_materialized_file_atomic(edges_dir, staging_rel.join(filename).as_path(), bytes)?;
+        }
+
+        // Write the journal last: its presence means staging is complete.
+        write_materialized_file_atomic(edges_dir, journal_rel.as_path(), &journal_bytes)?;
+
+        Ok(())
+    })
+}
+
+/// R19F1+F3: Finalize a transaction after the paired Tantivy commit
+/// succeeded. Renameat each staged member into the live snapshot directory
+/// (descriptor-confined, per-member atomic), fsync the snapshot directory,
+/// then delete the journal and the empty txn staging directory.
+/// Each stage is idempotent: a crash mid-finalize leaves a valid journal
+/// that recovery will resume.
 pub fn finalize_snapshot_publication(
     edges_dir: &Path,
     project_id: &str,
     snapshot_id: &str,
 ) -> Result<()> {
-    with_manifest_coordinator(|| clear_snapshot_staging_marker(edges_dir, project_id, snapshot_id))
+    with_manifest_coordinator(|| finalize_pending_transactions(edges_dir, project_id, snapshot_id))
 }
 
-/// Pre-bind recovery for a staging marker left by a crash between sidecar
-/// publication and index commit. If the marker exists but the snapshot
-/// directory has all its member files intact, the publication is complete
-/// on the sidecar side and the marker can be safely cleared (the index
-/// will reload from the sidecar on the next rebuild). If the snapshot
-/// directory is missing entirely, the publication never landed and the
-/// stale marker is a no-op.
-///
-/// Returns true if a marker was found and recovered (cleared), false if no
-/// marker was present.
-/// R18F4: versioned bounded staging marker commitment. The marker is a
-/// pre-commit indicator: its presence means the sidecar members have been
-/// written but the paired Tantivy index commit has NOT been confirmed.
-/// Recovery must either roll back (delete the snapshot directory) or fail
-/// closed; it must never silently clear the marker and accept unverified
-/// active bytes.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct StagingCommitment {
-    v: u32,
-    members: Vec<StagingMember>,
-}
+/// R19: finalize all pending journals for a project + snapshot. Each
+/// journal with a matching snapshot_id is finalized (members renamed into
+/// the live snapshot, journal + txn dir deleted). Journals with a
+/// different snapshot_id are left for a different snapshot's finalize or
+/// for recovery.
+#[cfg(unix)]
+fn finalize_pending_transactions(
+    edges_dir: &Path,
+    project_id: &str,
+    snapshot_id: &str,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
 
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-struct StagingMember {
-    name: String,
-    sha256: String,
-}
+    validate_snapshot_component(project_id)?;
+    validate_snapshot_component(snapshot_id)?;
 
-/// Maximum number of members in a staging commitment.
-const STAGING_MAX_MEMBERS: usize = 64;
-/// Maximum total size of the staging marker file (64 KB).
-const STAGING_MAX_MARKER_BYTES: usize = 64 * 1024;
-/// Maximum size of any single member file during recovery hash (256 MB).
-const STAGING_MAX_MEMBER_BYTES: u64 = 256 * 1024 * 1024;
-
-/// R18F4: bounded decoder for the staging marker. Validates version,
-/// member count, member names (single normalized component), uniqueness,
-/// and SHA-256 format before returning. Returns a typed error on any
-/// violation; the caller must fail closed.
-fn decode_staging_commitment(bytes: &[u8]) -> Result<StagingCommitment> {
-    if bytes.len() > STAGING_MAX_MARKER_BYTES {
-        anyhow::bail!(
-            "staging marker exceeds max size ({} > {})",
-            bytes.len(),
-            STAGING_MAX_MARKER_BYTES
-        );
-    }
-    let commitment: StagingCommitment = serde_json::from_slice(bytes)?;
-    if commitment.v != 2 {
-        anyhow::bail!(
-            "staging marker version {} is not supported (expected 2)",
-            commitment.v
-        );
-    }
-    if commitment.members.is_empty() {
-        anyhow::bail!("staging commitment has no members");
-    }
-    if commitment.members.len() > STAGING_MAX_MEMBERS {
-        anyhow::bail!(
-            "staging commitment has {} members (max {})",
-            commitment.members.len(),
-            STAGING_MAX_MEMBERS
-        );
-    }
-    let mut seen_names = std::collections::HashSet::new();
-    for member in &commitment.members {
-        validate_snapshot_component(&member.name)?;
-        if !seen_names.insert(&member.name) {
-            anyhow::bail!(
-                "staging commitment has duplicate member name: {}",
-                member.name
-            );
+    let txn_dir_rel = Path::new("materialized")
+        .join("workspace")
+        .join(project_id)
+        .join("txn");
+    let txn_dir = match open_dir_under_root(edges_dir, &txn_dir_rel, false) {
+        Ok(dir) => dir,
+        Err(error)
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            }) =>
+        {
+            return Ok(());
         }
-        if member.sha256.len() != 64 || !member.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
-            anyhow::bail!(
-                "staging commitment member {} has invalid sha256 format",
-                member.name
-            );
+        Err(error) => return Err(error),
+    };
+
+    let entries = crate::manifest::read_directory_names(&txn_dir)?;
+    let journal_names: Vec<_> = entries
+        .iter()
+        .filter_map(|name| {
+            let s = name.to_str()?;
+            if s.ends_with(".journal.json") {
+                Some(s.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let snap_dir_rel = Path::new("materialized")
+        .join("workspace")
+        .join(project_id)
+        .join("snapshots")
+        .join(snapshot_id);
+    let snap_dir = open_dir_under_root(edges_dir, &snap_dir_rel, true)?;
+
+    for journal_name in &journal_names {
+        let journal_c = std::ffi::CString::new(journal_name.as_bytes())?;
+        let journal_bytes =
+            read_confined_file_bounded(&txn_dir, &journal_c, TXN_MAX_JOURNAL_BYTES)?;
+        let journal: TxnJournal = match serde_json::from_slice(&journal_bytes) {
+            Ok(j) => j,
+            Err(_) => continue, // invalid journal: leave for recovery
+        };
+        if journal.snapshot_id != snapshot_id {
+            continue;
         }
+
+        let staging_c = std::ffi::CString::new(journal.txn_token.as_bytes())?;
+        let staging_dir = match open_confined_dir_fd(txn_dir.as_raw_fd(), &staging_c) {
+            Ok(fd) => fd,
+            Err(_) => continue, // staging dir missing: leave for recovery
+        };
+
+        // Rename each staged member into the live snapshot.
+        for member in &journal.members {
+            let member_c = std::ffi::CString::new(member.name.as_bytes())?;
+            let rename_result = unsafe {
+                libc::renameat(
+                    staging_dir.as_raw_fd(),
+                    member_c.as_ptr(),
+                    snap_dir.as_raw_fd(),
+                    member_c.as_ptr(),
+                )
+            };
+            if rename_result != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    // Member rename failed non-trivially: leave journal for recovery.
+                    tracing::warn!(
+                        project_id,
+                        snapshot_id,
+                        member = member.name.as_str(),
+                        error = %error,
+                        "finalize: renameat failed, leaving journal for recovery"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        snap_dir.sync_all()?;
+
+        // Delete the journal and the (now empty) staging directory.
+        let _ = unsafe { libc::unlinkat(txn_dir.as_raw_fd(), journal_c.as_ptr(), 0) };
+        let _ =
+            unsafe { libc::unlinkat(txn_dir.as_raw_fd(), staging_c.as_ptr(), libc::AT_REMOVEDIR) };
+        txn_dir.sync_all()?;
     }
-    Ok(commitment)
+
+    Ok(())
 }
 
-/// R18F1+R18F2+R18F3: unconditional pre-bind recovery for staging markers.
-/// A staging marker's presence means the sidecar publication completed but
-/// the paired Tantivy index commit was NOT confirmed (crash between
-/// publication.publish() and finalize_snapshot_publication()). Recovery
-/// runs once at boot, BEFORE the edge index loads active paths and BEFORE
-/// the read view is constructed. It must NOT call active_paths_for_loader
-/// (that runs under the coordinator lock by GC and would deadlock).
+#[cfg(not(unix))]
+fn finalize_pending_transactions(
+    edges_dir: &Path,
+    project_id: &str,
+    snapshot_id: &str,
+) -> Result<()> {
+    validate_snapshot_component(project_id)?;
+    validate_snapshot_component(snapshot_id)?;
+
+    let txn_dir = materialized_dir(edges_dir)
+        .join("workspace")
+        .join(project_id)
+        .join("txn");
+    if !txn_dir.is_dir() {
+        return Ok(());
+    }
+
+    let snap_dir = snapshot_dir(edges_dir, project_id, snapshot_id);
+    fs::create_dir_all(&snap_dir)?;
+
+    for entry in fs::read_dir(&txn_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = match name.to_str() {
+            Some(s) if s.ends_with(".journal.json") => s.to_string(),
+            _ => continue,
+        };
+        let journal_path = txn_dir.join(&name_str);
+        let journal_bytes = fs::read(&journal_path)?;
+        if journal_bytes.len() > TXN_MAX_JOURNAL_BYTES {
+            continue;
+        }
+        let journal: TxnJournal = match serde_json::from_slice(&journal_bytes) {
+            Ok(j) => j,
+            Err(_) => continue,
+        };
+        if journal.snapshot_id != snapshot_id {
+            continue;
+        }
+        let staging_dir = txn_dir.join(&journal.txn_token);
+        if !staging_dir.is_dir() {
+            continue;
+        }
+
+        for member in &journal.members {
+            let src = staging_dir.join(&member.name);
+            let dst = snap_dir.join(&member.name);
+            if src.exists() {
+                fs::rename(&src, &dst)?;
+            }
+        }
+        fs::File::open(&snap_dir)?.sync_all()?;
+
+        let _ = fs::remove_file(&journal_path);
+        let _ = fs::remove_dir_all(&staging_dir);
+    }
+
+    Ok(())
+}
+
+/// R19F1+F2+F4: Pre-bind recovery for pending transaction journals.
+/// Unconditional in open_shared_state, before selector refresh and
+/// read-view construction. Scans materialized/workspace/<project>/txn/
+/// for *.journal.json files. For each journal:
+///   (a) Journal invalid or staged members fail validation: fail closed
+///       with a typed operator-visible error, preserve everything.
+///   (b) Staged members validate: the transaction is AMBIGUOUS (we cannot
+///       prove whether the paired Tantivy commit succeeded without a
+///       commit token). DISCARD the staging directory and journal; the
+///       live snapshot was never touched, so no rollback is needed and
+///       the relationship chain sees the pre-transaction state.
+///   (c) Legacy .staging marker inside a live snapshot directory (from
+///       prior builds): fail closed with a typed error.
 ///
-/// For each workspace snapshot with a lingering .staging marker:
-///   1. Decode the marker through the bounded versioned decoder (R18F4).
-///   2. Verify every committed member via descriptor-confined open and
-///      streaming SHA-256 hash. All members must validate; no member is
-///      skipped (R18F3).
-///   3. On complete validation: the sidecar data is verified, but the
-///      Tantivy commit status is uncertain. Recovery rolls back: deletes
-///      the snapshot directory and clears the manifest's active_snapshot
-///      pointer. The next reindex pass rebuilds from source (R18F2).
-///   4. On ANY validation failure (parse, hash mismatch, missing member,
-///      non-regular file, invalid name): fail closed with a typed error.
-///      The marker is preserved; the operator must intervene (R18F3).
-pub fn recover_staging_markers_prebind(edges_dir: &Path) -> Result<()> {
+/// Each operation is idempotent: a crash inside recovery itself resumes
+/// cleanly on restart because the journal and staging dir survive until
+/// recovery explicitly deletes them.
+pub fn recover_pending_transactions_prebind(edges_dir: &Path) -> Result<()> {
     with_manifest_coordinator(|| {
         let index = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
-        for (project_id, entry) in &index.workspaces {
-            let Some(snapshot_rel) = entry.active_snapshot.as_deref() else {
-                continue;
-            };
-            let parts: Vec<&str> = std::path::Path::new(snapshot_rel)
-                .components()
-                .filter_map(|c| c.as_os_str().to_str())
-                .collect();
-            if parts.len() < 4 || parts[0] != "workspace" || parts[2] != "snapshots" {
-                continue;
-            }
-            let snapshot_id = parts[3];
-            recover_one_staging_marker(edges_dir, project_id, snapshot_id)?;
+        for project_id in index.workspaces.keys() {
+            recover_pending_transactions_for_project(edges_dir, project_id)?;
         }
         Ok(())
     })
 }
 
 #[cfg(unix)]
-fn recover_one_staging_marker(edges_dir: &Path, project_id: &str, snapshot_id: &str) -> Result<()> {
-    use std::os::fd::{AsRawFd, FromRawFd};
+fn recover_pending_transactions_for_project(edges_dir: &Path, project_id: &str) -> Result<()> {
+    use std::os::fd::AsRawFd;
 
-    let relative = Path::new("materialized")
+    validate_snapshot_component(project_id)?;
+
+    // R19F4(c): check for legacy .staging markers inside live snapshot
+    // directories. These come from prior builds and must fail closed.
+    check_legacy_staging_markers(edges_dir, project_id)?;
+
+    let txn_dir_rel = Path::new("materialized")
         .join("workspace")
         .join(project_id)
-        .join("snapshots")
-        .join(snapshot_id);
-    let directory = match open_dir_under_root(edges_dir, &relative, false) {
+        .join("txn");
+    let txn_dir = match open_dir_under_root(edges_dir, &txn_dir_rel, false) {
         Ok(dir) => dir,
         Err(error)
             if error.chain().any(|cause| {
@@ -1134,204 +1355,452 @@ fn recover_one_staging_marker(edges_dir: &Path, project_id: &str, snapshot_id: &
             return Ok(());
         }
         Err(error) => {
-            anyhow::bail!(
-                "recovery: failed to open snapshot dir for {project_id}/{snapshot_id}: {error}"
-            )
+            anyhow::bail!("recovery: failed to open txn dir for {project_id}: {error}")
         }
     };
-    let marker_c = std::ffi::CString::new(b".staging".as_slice())?;
-    let marker_stat = match fstatat_nofollow(directory.as_raw_fd(), &marker_c) {
-        Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFREG => stat,
-        Ok(_) => return Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            anyhow::bail!(
-                "recovery: failed to stat staging marker for {project_id}/{snapshot_id}: {error}"
-            )
-        }
-    };
-    let marker_size = marker_stat.st_size as usize;
-    if marker_size > STAGING_MAX_MARKER_BYTES {
-        anyhow::bail!("recovery: staging marker for {project_id}/{snapshot_id} exceeds max size");
-    }
-    let marker_fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            marker_c.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if marker_fd < 0 {
-        anyhow::bail!("recovery: failed to open staging marker for {project_id}/{snapshot_id}");
-    }
-    let marker_file = unsafe { fs::File::from_raw_fd(marker_fd) };
-    let mut marker_bytes = Vec::with_capacity(marker_size);
-    use std::io::Read;
-    marker_file
-        .take((STAGING_MAX_MARKER_BYTES as u64) + 1)
-        .read_to_end(&mut marker_bytes)?;
 
-    // R18F4: bounded versioned decoder. Invalid markers fail closed.
-    let commitment = decode_staging_commitment(&marker_bytes)?;
-
-    // R18F3: verify EVERY committed member. No member is skipped.
-    for member in &commitment.members {
-        let member_c = std::ffi::CString::new(member.name.as_bytes())?;
-        let member_stat = fstatat_nofollow(directory.as_raw_fd(), &member_c)?;
-        if member_stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-            anyhow::bail!(
-                "recovery: member {} for {project_id}/{snapshot_id} is not a regular file",
-                member.name
-            );
-        }
-        if member_stat.st_size as u64 > STAGING_MAX_MEMBER_BYTES {
-            anyhow::bail!("recovery: member {} exceeds max size", member.name);
-        }
-        let mfd = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                member_c.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if mfd < 0 {
-            anyhow::bail!(
-                "recovery: failed to open member {} for {project_id}/{snapshot_id}",
-                member.name
-            );
-        }
-        let mfile = unsafe { fs::File::from_raw_fd(mfd) };
-        let mut hasher = Sha256::new();
-        let mut reader = std::io::BufReader::new(mfile);
-        let mut buf = [0u8; 65536];
-        loop {
-            use std::io::Read;
-            let n = reader.read(&mut buf)?;
-            if n == 0 {
-                break;
+    let entries = crate::manifest::read_directory_names(&txn_dir)?;
+    let journal_names: Vec<_> = entries
+        .iter()
+        .filter_map(|name| {
+            let s = name.to_str()?;
+            if s.ends_with(".journal.json") {
+                Some(s.to_string())
+            } else {
+                None
             }
-            hasher.update(&buf[..n]);
+        })
+        .collect();
+
+    for journal_name in &journal_names {
+        let journal_c = std::ffi::CString::new(journal_name.as_bytes())?;
+
+        // R19F4: bounded read of journal.
+        let journal_bytes =
+            read_confined_file_bounded(&txn_dir, &journal_c, TXN_MAX_JOURNAL_BYTES)?;
+
+        // R19F4: versioned bounded decode with full validation.
+        let journal = decode_txn_journal(&journal_bytes)?;
+
+        // R19F5: open the staging directory by descriptor and verify every
+        // member with identity-bound fd hashing.
+        let staging_c = std::ffi::CString::new(journal.txn_token.as_bytes())?;
+        let staging_fd = open_confined_dir_fd(txn_dir.as_raw_fd(), &staging_c)?;
+
+        for member in &journal.members {
+            verify_member_identity_bound(&staging_fd, member)?;
         }
-        let actual_hash = hex::encode(hasher.finalize());
-        if actual_hash != member.sha256 {
-            anyhow::bail!(
-                "recovery: member {} hash mismatch for {project_id}/{snapshot_id}                  (expected {}, got {})",
-                member.name,
-                member.sha256,
-                actual_hash
-            );
-        }
+
+        // R19F2(b): staged members validate. The transaction is ambiguous
+        // (no commit token binding). DISCARD the staging dir and journal.
+        // The live snapshot was never touched: no rollback, no manifest
+        // mutation, the relationship chain sees the pre-transaction state.
+        tracing::info!(
+            project_id,
+            txn_token = journal.txn_token.as_str(),
+            snapshot_id = journal.snapshot_id.as_str(),
+            "recovery: ambiguous pending transaction, discarding staging (live snapshot untouched)"
+        );
+        discard_transaction(&txn_dir, &journal.txn_token, &journal_c)?;
     }
 
-    // R18F2: all members validated. The sidecar publication completed but
-    // the Tantivy commit is unconfirmed. Roll back: delete the snapshot
-    // directory and clear the manifest active_snapshot pointer. The next
-    // reindex pass rebuilds from source.
-    tracing::warn!(
-        project_id,
-        snapshot_id,
-        "recovery: uncommitted staging marker found, rolling back snapshot"
-    );
-    rollback_snapshot_directory(edges_dir, project_id, snapshot_id)?;
-    Ok(())
-}
-
-/// R18F2: roll back an uncommitted snapshot. Deletes the snapshot directory
-/// and clears the manifest active_snapshot pointer so the next reindex
-/// rebuilds from source.
-fn rollback_snapshot_directory(
-    edges_dir: &Path,
-    project_id: &str,
-    snapshot_id: &str,
-) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        let parent = open_dir_under_root(
-            edges_dir,
-            &Path::new("materialized")
-                .join("workspace")
-                .join(project_id)
-                .join("snapshots"),
-            false,
-        )?;
-        let snap_c = std::ffi::CString::new(snapshot_id.as_bytes())?;
-        unlinkat_tree(parent.as_raw_fd(), &snap_c)?;
-        parent.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        let snap_dir = snapshot_dir(edges_dir, project_id, snapshot_id);
-        if snap_dir.exists() {
-            fs::remove_dir_all(&snap_dir)?;
-        }
-    }
-    clear_manifest_active_snapshot(edges_dir, project_id)?;
-    Ok(())
-}
-
-/// Clear the active_snapshot pointer for a workspace in the manifest index.
-fn clear_manifest_active_snapshot(edges_dir: &Path, project_id: &str) -> Result<()> {
-    let mut index = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
-    if let Some(entry) = index.workspaces.get_mut(project_id) {
-        entry.active_snapshot = None;
-    }
-    index.write_atomic(edges_dir)?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn recover_one_staging_marker(edges_dir: &Path, project_id: &str, snapshot_id: &str) -> Result<()> {
-    let marker = snapshot_dir(edges_dir, project_id, snapshot_id).join(".staging");
-    match fs::symlink_metadata(&marker) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-            let mut marker_file = fs::File::open(&marker)?;
-            let mut marker_bytes = Vec::new();
-            marker_file
-                .take((STAGING_MAX_MARKER_BYTES as u64) + 1)
-                .read_to_end(&mut marker_bytes)?;
+fn recover_pending_transactions_for_project(edges_dir: &Path, project_id: &str) -> Result<()> {
+    validate_snapshot_component(project_id)?;
 
-            // R18F4: bounded versioned decoder.
-            let commitment = decode_staging_commitment(&marker_bytes)?;
+    // R19F4(c): legacy marker check.
+    check_legacy_staging_markers(edges_dir, project_id)?;
 
-            // R18F3: verify every committed member.
-            for member in &commitment.members {
-                let member_path =
-                    snapshot_dir(edges_dir, project_id, snapshot_id).join(&member.name);
-                let metadata = fs::metadata(&member_path)?;
-                if !metadata.is_file() {
-                    anyhow::bail!("recovery: member {} is not a regular file", member.name);
-                }
-                let mut file = fs::File::open(&member_path)?;
-                let mut hasher = Sha256::new();
-                let mut buf = [0u8; 65536];
-                loop {
-                    use std::io::Read;
-                    let n = file.read(&mut buf)?;
-                    if n == 0 {
-                        break;
-                    }
-                    hasher.update(&buf[..n]);
-                }
-                let actual_hash = hex::encode(hasher.finalize());
-                if actual_hash != member.sha256 {
-                    anyhow::bail!("recovery: member {} hash mismatch", member.name);
-                }
-            }
-
-            // R18F2: roll back the uncommitted snapshot.
-            tracing::warn!(
-                project_id,
-                snapshot_id,
-                "recovery: uncommitted staging marker found, rolling back snapshot"
-            );
-            rollback_snapshot_directory(edges_dir, project_id, snapshot_id)?;
-            Ok(())
-        }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+    let txn_dir = materialized_dir(edges_dir)
+        .join("workspace")
+        .join(project_id)
+        .join("txn");
+    if !txn_dir.is_dir() {
+        return Ok(());
     }
+
+    let mut journals_to_discard = Vec::new();
+    for entry in fs::read_dir(&txn_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = match name.to_str() {
+            Some(s) if s.ends_with(".journal.json") => s.to_string(),
+            _ => continue,
+        };
+        let journal_path = txn_dir.join(&name_str);
+        let metadata = fs::symlink_metadata(&journal_path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            anyhow::bail!("recovery: journal {name_str} for {project_id} is not a regular file");
+        }
+        if metadata.len() > TXN_MAX_JOURNAL_BYTES as u64 {
+            anyhow::bail!("recovery: journal {name_str} for {project_id} exceeds max size");
+        }
+        let journal_bytes = fs::read(&journal_path)?;
+        let journal = decode_txn_journal(&journal_bytes)?;
+
+        // R19F5: verify members with nofollow + size enforcement.
+        let staging_dir = txn_dir.join(&journal.txn_token);
+        for member in &journal.members {
+            let member_path = staging_dir.join(&member.name);
+            let m = fs::symlink_metadata(&member_path)?;
+            if !m.is_file() || m.file_type().is_symlink() {
+                anyhow::bail!(
+                    "recovery: member {} for {project_id} is not a regular file",
+                    member.name
+                );
+            }
+            if m.len() > TXN_MAX_MEMBER_BYTES {
+                anyhow::bail!(
+                    "recovery: member {} for {project_id} exceeds max size",
+                    member.name
+                );
+            }
+            let mut file = fs::File::open(&member_path)?;
+            let mut hasher = Sha256::new();
+            let mut reader = std::io::BufReader::new(file.try_clone()?);
+            let mut limited = (&mut reader).take(TXN_MAX_MEMBER_BYTES + 1);
+            use std::io::Read;
+            let mut buf = [0u8; 65536];
+            loop {
+                let n = limited.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            let actual_hash = hex::encode(hasher.finalize());
+            if actual_hash != member.sha256 {
+                anyhow::bail!(
+                    "recovery: member {} hash mismatch for {project_id}",
+                    member.name
+                );
+            }
+            // R19F5: reject growth during hashing.
+            let final_meta = file.metadata()?;
+            if final_meta.len() != m.len() {
+                anyhow::bail!(
+                    "recovery: member {} for {project_id} changed size during hashing",
+                    member.name
+                );
+            }
+        }
+
+        journals_to_discard.push((name_str, journal.txn_token.clone()));
+    }
+
+    for (journal_name, txn_token) in &journals_to_discard {
+        tracing::info!(
+            project_id,
+            txn_token = txn_token.as_str(),
+            "recovery: ambiguous pending transaction, discarding staging (live snapshot untouched)"
+        );
+        let journal_path = txn_dir.join(journal_name);
+        let staging_dir = txn_dir.join(txn_token);
+        let _ = fs::remove_dir_all(&staging_dir);
+        fs::remove_file(&journal_path)?;
+    }
+
+    Ok(())
+}
+
+/// R19F4(c): check for legacy .staging markers inside live snapshot
+/// directories (from prior builds). Fail closed with a typed error.
+#[cfg(unix)]
+fn check_legacy_staging_markers(edges_dir: &Path, project_id: &str) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let index = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
+    let Some(entry) = index.workspaces.get(project_id) else {
+        return Ok(());
+    };
+    let Some(snapshot_rel) = entry.active_snapshot.as_deref() else {
+        return Ok(());
+    };
+    let snap_dir = open_dir_under_root(
+        edges_dir,
+        &Path::new("materialized").join(snapshot_rel),
+        false,
+    );
+    let Ok(snap_dir) = snap_dir else {
+        return Ok(());
+    };
+    let marker_c = std::ffi::CString::new(b".staging".as_slice())?;
+    match fstatat_nofollow(snap_dir.as_raw_fd(), &marker_c) {
+        Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFREG => {
+            anyhow::bail!(
+                "recovery: legacy .staging marker found in live snapshot for {project_id} \
+                 (snapshot={snapshot_rel}). This format is no longer supported; \
+                 remove the marker and reindex the project."
+            );
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_legacy_staging_markers(edges_dir: &Path, project_id: &str) -> Result<()> {
+    let index = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
+    let Some(entry) = index.workspaces.get(project_id) else {
+        return Ok(());
+    };
+    if let Some(snapshot_rel) = entry.active_snapshot.as_deref() {
+        let marker = materialized_dir(edges_dir)
+            .join(snapshot_rel)
+            .join(".staging");
+        if marker.exists() {
+            anyhow::bail!(
+                "recovery: legacy .staging marker found in live snapshot for {project_id} \
+                 (snapshot={snapshot_rel}). This format is no longer supported; \
+                 remove the marker and reindex the project."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// R19F4: versioned bounded decoder for the transaction journal. Validates
+/// version, member count, single-component unique names, fixed-format
+/// SHA-256, and txn_token/snapshot_id components. Returns a typed error
+/// on any violation; the caller must fail closed.
+fn decode_txn_journal(bytes: &[u8]) -> Result<TxnJournal> {
+    if bytes.len() > TXN_MAX_JOURNAL_BYTES {
+        anyhow::bail!(
+            "transaction journal exceeds max size ({} > {})",
+            bytes.len(),
+            TXN_MAX_JOURNAL_BYTES
+        );
+    }
+    let journal: TxnJournal = serde_json::from_slice(bytes)?;
+    if journal.v != 1 {
+        anyhow::bail!(
+            "transaction journal version {} is not supported (expected 1)",
+            journal.v
+        );
+    }
+    if journal.members.is_empty() {
+        anyhow::bail!("transaction journal has no members");
+    }
+    if journal.members.len() > TXN_MAX_MEMBERS {
+        anyhow::bail!(
+            "transaction journal has {} members (max {})",
+            journal.members.len(),
+            TXN_MAX_MEMBERS
+        );
+    }
+    validate_snapshot_component(&journal.txn_token)?;
+    validate_snapshot_component(&journal.snapshot_id)?;
+    let mut seen_names = std::collections::HashSet::new();
+    for member in &journal.members {
+        validate_snapshot_component(&member.name)?;
+        if !seen_names.insert(&member.name) {
+            anyhow::bail!(
+                "transaction journal has duplicate member name: {}",
+                member.name
+            );
+        }
+        if member.sha256.len() != 64 || !member.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+            anyhow::bail!(
+                "transaction journal member {} has invalid sha256 format",
+                member.name
+            );
+        }
+    }
+    Ok(journal)
+}
+
+/// R19F5: Verify a staged member with identity-bound fd hashing on unix.
+/// Binds the opened descriptor's dev/ino/type/size, streams via
+/// take(MAX+1) with overflow refusal, and rejects growth during hashing.
+#[cfg(unix)]
+fn verify_member_identity_bound(staging_fd: &fs::File, member: &TxnMember) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let member_c = std::ffi::CString::new(member.name.as_bytes())?;
+    let mfd = unsafe {
+        libc::openat(
+            staging_fd.as_raw_fd(),
+            member_c.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if mfd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            anyhow::bail!("recovery: staged member {} is missing", member.name);
+        }
+        anyhow::bail!(
+            "recovery: failed to open staged member {}: {error}",
+            member.name
+        );
+    }
+    let mfile = unsafe { fs::File::from_raw_fd(mfd) };
+
+    // R19F5: bind identity from the opened descriptor.
+    let meta = mfile.metadata()?;
+    if !meta.is_file() {
+        anyhow::bail!(
+            "recovery: staged member {} is not a regular file",
+            member.name
+        );
+    }
+    let bound_dev = meta.dev();
+    let bound_ino = meta.ino();
+    let bound_size = meta.len();
+    if bound_size > TXN_MAX_MEMBER_BYTES {
+        anyhow::bail!(
+            "recovery: staged member {} exceeds max size ({} > {})",
+            member.name,
+            bound_size,
+            TXN_MAX_MEMBER_BYTES
+        );
+    }
+
+    // R19F5: stream via take(MAX+1) with overflow refusal.
+    let mut hasher = Sha256::new();
+    let reader = std::io::BufReader::new(&mfile);
+    let mut limited = reader.take(TXN_MAX_MEMBER_BYTES + 1);
+    use std::io::Read;
+    let mut buf = [0u8; 65536];
+    let mut total_read: u64 = 0;
+    loop {
+        let n = limited.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total_read += n as u64;
+        hasher.update(&buf[..n]);
+    }
+    if total_read > TXN_MAX_MEMBER_BYTES {
+        anyhow::bail!(
+            "recovery: staged member {} exceeded max size during read",
+            member.name
+        );
+    }
+
+    // R19F5: reject growth during hashing (fd identity check).
+    let post_meta = mfile.metadata()?;
+    if post_meta.dev() != bound_dev || post_meta.ino() != bound_ino || post_meta.len() != bound_size
+    {
+        anyhow::bail!(
+            "recovery: staged member {} changed identity/size during hashing",
+            member.name
+        );
+    }
+
+    let actual_hash = hex::encode(hasher.finalize());
+    if actual_hash != member.sha256 {
+        anyhow::bail!(
+            "recovery: staged member {} hash mismatch (expected {}, got {})",
+            member.name,
+            member.sha256,
+            actual_hash
+        );
+    }
+
+    Ok(())
+}
+
+/// R19F2(b): Discard a transaction's staging directory and journal.
+/// Idempotent: if either is already gone, no error.
+#[cfg(unix)]
+fn discard_transaction(
+    txn_dir: &fs::File,
+    txn_token: &str,
+    journal_c: &std::ffi::CStr,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let staging_c = std::ffi::CString::new(txn_token.as_bytes())?;
+
+    // Delete the staging directory tree first.
+    match fstatat_nofollow(txn_dir.as_raw_fd(), &staging_c) {
+        Ok(_) => {
+            unlinkat_tree(txn_dir.as_raw_fd(), &staging_c)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    // Delete the journal.
+    let _ = unsafe { libc::unlinkat(txn_dir.as_raw_fd(), journal_c.as_ptr(), 0) };
+
+    txn_dir.sync_all()?;
+    Ok(())
+}
+
+/// R19F5 helper: read a file confined to a directory fd with a size bound.
+#[cfg(unix)]
+fn read_confined_file_bounded(
+    dir_fd: &fs::File,
+    name: &std::ffi::CStr,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+
+    // fstatat first to get size and verify it is a regular file.
+    let stat = fstatat_nofollow(dir_fd.as_raw_fd(), name)?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        anyhow::bail!("confined file is not a regular file");
+    }
+    if stat.st_size as usize > max_bytes {
+        anyhow::bail!(
+            "confined file exceeds max size ({} > {})",
+            stat.st_size,
+            max_bytes
+        );
+    }
+
+    let fd = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            anyhow::bail!("confined file is missing");
+        }
+        return Err(error.into());
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    let mut bytes = Vec::with_capacity(stat.st_size as usize);
+    let mut reader = std::io::BufReader::new(file).take((max_bytes as u64) + 1);
+    use std::io::Read;
+    reader.read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        anyhow::bail!("confined file exceeded max size during read");
+    }
+    Ok(bytes)
+}
+
+/// R19F5 helper: open a directory fd confined under a parent fd.
+#[cfg(unix)]
+fn open_confined_dir_fd(parent_fd: std::os::fd::RawFd, name: &std::ffi::CStr) -> Result<fs::File> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe {
+        libc::openat(
+            parent_fd,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            anyhow::bail!("recovery: staging directory is missing");
+        }
+        anyhow::bail!("recovery: failed to open staging directory: {error}");
+    }
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
 }
 
 fn validate_snapshot_component(value: &str) -> Result<()> {
@@ -2477,7 +2946,7 @@ mod tests {
     }
 
     #[test]
-    fn standalone_snapshot_member_transaction_clears_staging_marker() {
+    fn standalone_snapshot_member_transaction_stages_and_finalizes() {
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
         let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
@@ -2491,22 +2960,70 @@ mod tests {
         )
         .unwrap();
 
-        // R16F3: write_snapshot_members_transaction no longer clears the
-        // staging marker. The marker survives until
-        // finalize_snapshot_publication is called after the index commit.
-        assert!(
-            snapshot_dir(&edges_dir, "p_1", &snapshot_id)
-                .join(".staging")
-                .exists()
+        // R19: the live snapshot is NOT touched during staging. The member
+        // is in the txn staging area. The live git-current.jsonl keeps its
+        // old content (from overlay_fixture, which writes empty edges).
+        let live_member = snapshot_dir(&edges_dir, "p_1", &snapshot_id).join("git-current.jsonl");
+        let live_before = fs::read(&live_member).unwrap_or_default();
+
+        // A journal exists in the txn directory.
+        let txn_dir = materialized_dir(&edges_dir)
+            .join("workspace")
+            .join("p_1")
+            .join("txn");
+        assert!(txn_dir.is_dir(), "txn directory must exist");
+        let journals: Vec<_> = fs::read_dir(&txn_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.ends_with(".journal.json"))
+            })
+            .collect();
+        assert_eq!(journals.len(), 1, "exactly one journal must exist");
+
+        // The live member was not modified during staging.
+        let live_during = fs::read(&live_member).unwrap_or_default();
+        assert_eq!(
+            live_before, live_during,
+            "live snapshot must not be modified during staging"
         );
 
         finalize_snapshot_publication(&edges_dir, "p_1", &snapshot_id).unwrap();
 
+        // R19: finalize renames the staged member into the live snapshot.
         assert!(
-            !snapshot_dir(&edges_dir, "p_1", &snapshot_id)
-                .join(".staging")
-                .exists()
+            snapshot_dir(&edges_dir, "p_1", &snapshot_id)
+                .join("git-current.jsonl")
+                .exists(),
+            "live snapshot must contain the member after finalize"
         );
+
+        // The content changed (staged member replaced the old empty one).
+        let live_after =
+            fs::read(&snapshot_dir(&edges_dir, "p_1", &snapshot_id).join("git-current.jsonl"))
+                .unwrap_or_default();
+        assert_ne!(
+            live_before, live_after,
+            "finalize must replace the member content"
+        );
+
+        // The journal and staging dir are cleaned up.
+        let journals_after: Vec<_> = fs::read_dir(&txn_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.ends_with(".journal.json"))
+            })
+            .collect();
+        assert!(
+            journals_after.is_empty(),
+            "journal must be deleted after finalize"
+        );
+
         ManifestIndex::load(&edges_dir)
             .unwrap()
             .active_paths_for_loader(&edges_dir)
@@ -2514,36 +3031,24 @@ mod tests {
     }
 
     #[test]
-    fn active_snapshot_with_staging_marker_fails_closed_on_legacy_format() {
+    fn legacy_in_snapshot_staging_marker_fails_closed() {
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
         let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
-        // R18F3+R18F4: a legacy marker that is not a valid v2 staging
-        // commitment must cause recovery to fail closed (preserve marker,
-        // return error). It must NOT be silently cleared.
+        // R19F4(c): a legacy .staging marker inside a live snapshot
+        // directory (from prior builds) must cause recovery to fail closed.
         fs::write(
             snapshot_dir(&edges_dir, "p_1", &snapshot_id).join(".staging"),
             b"pending\n",
         )
         .unwrap();
 
-        let error = recover_staging_markers_prebind(&edges_dir)
+        let error = recover_pending_transactions_prebind(&edges_dir)
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("decode")
-                || error.contains("parse")
-                || error.contains("invalid")
-                || error.contains("expected"),
+            error.contains("legacy"),
             "recovery must fail on legacy marker: {error}"
-        );
-
-        // R18F3: the marker is preserved (fail closed).
-        assert!(
-            snapshot_dir(&edges_dir, "p_1", &snapshot_id)
-                .join(".staging")
-                .exists(),
-            "recovery must preserve the marker on failure"
         );
     }
 
@@ -3936,60 +4441,119 @@ mod tests {
         );
     }
 
-    // R18F2: crash before Tantivy commit leaves a pre-commit staging marker.
-    // Recovery rolls back (deletes the snapshot directory and clears the
-    // manifest active_snapshot pointer) so the next reindex rebuilds from
-    // source. The marker must NOT be silently cleared while accepting
-    // unverified sidecar bytes.
+    // R19F1: crash between sidecar-stage and Tantivy commit. Recovery
+    // discards the staging directory and journal. The live snapshot was
+    // never touched: no rollback, no manifest mutation.
     #[test]
-    fn r18f2_crash_before_commit_rolls_back_snapshot() {
+    fn r19f2_crash_before_commit_discards_staging() {
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
         let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
         let git_edges = vec![explicit_edge("git", "mentions", "target")];
 
+        // Record the live snapshot state before staging.
+        let live_member = snapshot_dir(&edges_dir, "p_1", &snapshot_id).join("git-current.jsonl");
+        let live_before = fs::read(&live_member).unwrap_or_default();
+
         write_snapshot_members_transaction(
             &edges_dir,
             "p_1",
             &snapshot_id,
-            &[(crate::manifest::GIT_CURRENT_MEMBER, &git_edges)],
+            &[("git-current.jsonl", &git_edges)],
         )
         .unwrap();
 
-        assert!(
-            snapshot_dir(&edges_dir, "p_1", &snapshot_id)
-                .join(".staging")
-                .exists(),
-            "staging marker must survive when finalize is not called"
+        // R19F1: the live snapshot is NOT modified during staging.
+        let live_during = fs::read(&live_member).unwrap_or_default();
+        assert_eq!(
+            live_before, live_during,
+            "live snapshot must not be modified during staging"
         );
 
-        recover_staging_markers_prebind(&edges_dir).unwrap();
+        // A journal exists.
+        let txn_dir = materialized_dir(&edges_dir)
+            .join("workspace")
+            .join("p_1")
+            .join("txn");
+        assert!(txn_dir.is_dir());
 
-        // R18F2: the snapshot directory is rolled back (deleted).
-        assert!(
-            !snapshot_dir(&edges_dir, "p_1", &snapshot_id).exists(),
-            "snapshot directory must be deleted by rollback"
-        );
+        recover_pending_transactions_prebind(&edges_dir).unwrap();
 
-        // The manifest active_snapshot pointer is cleared.
+        // R19F1: the journal and staging dir are discarded.
+        let journals: Vec<_> = fs::read_dir(&txn_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.ends_with(".journal.json"))
+            })
+            .collect();
+        assert!(journals.is_empty(), "journal must be discarded by recovery");
+
+        // R19F1: the live snapshot is untouched. No manifest mutation.
         let index = ManifestIndex::load(&edges_dir).unwrap();
         let entry = index.workspaces.get("p_1").unwrap();
         assert!(
-            entry.active_snapshot.is_none(),
-            "manifest active_snapshot must be cleared after rollback"
+            entry.active_snapshot.is_some(),
+            "manifest active_snapshot must be preserved (not cleared)"
         );
 
-        // active_paths_for_loader must succeed: no staging marker, no dead
-        // snapshot pointer. Recovery cleared active_snapshot so the loader
-        // sees a clean workspace state.
+        // active_paths_for_loader succeeds.
         ManifestIndex::load(&edges_dir)
             .unwrap()
             .active_paths_for_loader(&edges_dir)
             .unwrap();
     }
-    // recovery finds nothing and is a no-op.
+
+    // R19F2: crash between Tantivy commit and finalize. Recovery treats
+    // the journal as ambiguous and discards. The live snapshot was never
+    // touched, so the pre-transaction state is preserved. The next reindex
+    // converges.
     #[test]
-    fn r18f2_crash_after_commit_marker_already_cleared() {
+    fn r19f2_crash_after_commit_discards_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
+
+        // Simulate: stage members (write_snapshot_members_transaction),
+        // then simulate a Tantivy commit that we cannot prove, then crash
+        // before finalize. Recovery finds the journal and discards.
+        write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+
+        // Crash: recovery runs without finalize having been called.
+        recover_pending_transactions_prebind(&edges_dir).unwrap();
+
+        // The live snapshot's git-current.jsonl still has the old content
+        // (staging was discarded, live snapshot untouched).
+        let live_after =
+            fs::read(&snapshot_dir(&edges_dir, "p_1", &snapshot_id).join("git-current.jsonl"))
+                .unwrap_or_default();
+        let live_before = b"".to_vec(); // overlay_fixture writes empty git-current
+        assert_eq!(
+            live_before, live_after,
+            "live snapshot must be untouched after ambiguous recovery"
+        );
+
+        // The manifest still points to the snapshot (relationship chain
+        // sees pre-transaction state).
+        ManifestIndex::load(&edges_dir)
+            .unwrap()
+            .active_paths_for_loader(&edges_dir)
+            .unwrap();
+    }
+
+    // R19F4: discard-resume idempotency. Recovery run twice is a no-op
+    // the second time (journal already deleted).
+    #[test]
+    fn r19f4_recovery_is_idempotent() {
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
         let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
@@ -3999,29 +4563,130 @@ mod tests {
             &edges_dir,
             "p_1",
             &snapshot_id,
-            &[(crate::manifest::GIT_CURRENT_MEMBER, &git_edges)],
+            &[("git-current.jsonl", &git_edges)],
         )
         .unwrap();
+
+        // First recovery discards.
+        recover_pending_transactions_prebind(&edges_dir).unwrap();
+
+        // Second recovery is a clean no-op.
+        recover_pending_transactions_prebind(&edges_dir).unwrap();
+
+        ManifestIndex::load(&edges_dir)
+            .unwrap()
+            .active_paths_for_loader(&edges_dir)
+            .unwrap();
+    }
+
+    // R19F4: finish-resume idempotency. A crash inside finalize (members
+    // renamed but journal not yet deleted) resumes cleanly: finalize is
+    // called again and completes.
+    #[test]
+    fn r19f4_finalize_resumes_after_partial_crash() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
+
+        write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+
+        // Simulate partial finalize: rename the member manually but leave
+        // the journal in place.
+        let txn_dir = materialized_dir(&edges_dir)
+            .join("workspace")
+            .join("p_1")
+            .join("txn");
+        let journal_entry: std::path::PathBuf = fs::read_dir(&txn_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.ends_with(".journal.json"))
+            })
+            .next()
+            .unwrap()
+            .path();
+        let journal_bytes = fs::read(&journal_entry).unwrap();
+        let journal: crate::snapshot::TxnJournalForTest =
+            serde_json::from_slice(&journal_bytes).unwrap();
+        let staging_dir = txn_dir.join(&journal.txn_token);
+        let member_src = staging_dir.join("git-current.jsonl");
+        let member_dst = snapshot_dir(&edges_dir, "p_1", &snapshot_id).join("git-current.jsonl");
+        fs::rename(&member_src, &member_dst).unwrap();
+
+        // The member is in the live snapshot but the journal still exists.
+        assert!(member_dst.exists());
+
+        // Finalize again: it should be idempotent (member already there,
+        // journal gets cleaned up).
         finalize_snapshot_publication(&edges_dir, "p_1", &snapshot_id).unwrap();
 
-        recover_staging_markers_prebind(&edges_dir).unwrap();
-
-        // Snapshot and members survive because the marker was cleared.
-        assert!(
-            snapshot_dir(&edges_dir, "p_1", &snapshot_id).exists(),
-            "committed snapshot must survive"
-        );
-
-        ManifestIndex::load(&edges_dir)
+        // Journal is cleaned up.
+        let journals: Vec<_> = fs::read_dir(&txn_dir)
             .unwrap()
-            .active_paths_for_loader(&edges_dir)
-            .unwrap();
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.ends_with(".journal.json"))
+            })
+            .collect();
+        assert!(journals.is_empty(), "journal must be cleaned up");
     }
 
-    // R18F3: corrupt member hash must fail closed. The marker is preserved
-    // and the snapshot directory is NOT deleted. No silent clear.
+    // R19F3: finalize renames members into the live snapshot without
+    // disturbing pre-existing members.
     #[test]
-    fn r18f3_corrupt_member_hash_fails_closed() {
+    fn r19f3_finalize_preserves_existing_snapshot_members() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+
+        // The snapshot already has project.jsonl from overlay_fixture.
+        assert!(
+            snapshot_dir(&edges_dir, "p_1", &snapshot_id)
+                .join("project.jsonl")
+                .exists()
+        );
+
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
+        write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+
+        finalize_snapshot_publication(&edges_dir, "p_1", &snapshot_id).unwrap();
+
+        // Both members exist: the pre-existing one and the newly staged one.
+        assert!(
+            snapshot_dir(&edges_dir, "p_1", &snapshot_id)
+                .join("project.jsonl")
+                .exists(),
+            "pre-existing project.jsonl must survive"
+        );
+        assert!(
+            snapshot_dir(&edges_dir, "p_1", &snapshot_id)
+                .join("git-current.jsonl")
+                .exists(),
+            "newly staged git-current.jsonl must be in live snapshot"
+        );
+    }
+
+    // R19F5: corrupt member hash must fail closed. The journal and staging
+    // dir are preserved; recovery returns an error.
+    #[test]
+    fn r19f5_corrupt_member_hash_fails_closed() {
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
         let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
@@ -4031,40 +4696,55 @@ mod tests {
             &edges_dir,
             "p_1",
             &snapshot_id,
-            &[(crate::manifest::GIT_CURRENT_MEMBER, &git_edges)],
+            &[("git-current.jsonl", &git_edges)],
         )
         .unwrap();
 
-        // Corrupt the member file after publication.
-        fs::write(
-            snapshot_dir(&edges_dir, "p_1", &snapshot_id).join(crate::manifest::GIT_CURRENT_MEMBER),
-            b"corrupted",
-        )
-        .unwrap();
+        // Corrupt the staged member file.
+        let txn_dir = materialized_dir(&edges_dir)
+            .join("workspace")
+            .join("p_1")
+            .join("txn");
+        for entry in fs::read_dir(&txn_dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry
+                .file_name()
+                .to_str()
+                .unwrap()
+                .ends_with(".journal.json")
+            {
+                continue;
+            }
+            // This is the staging directory.
+            let staging_dir = entry.path();
+            let member = staging_dir.join("git-current.jsonl");
+            if member.exists() {
+                fs::write(&member, b"corrupted\n").unwrap();
+            }
+        }
 
-        let result = recover_staging_markers_prebind(&edges_dir);
+        let result = recover_pending_transactions_prebind(&edges_dir);
         assert!(
             result.is_err(),
-            "corrupt member hash must fail closed, not clear the marker"
+            "recovery must fail on corrupted member hash"
         );
 
-        // Marker must survive (not cleared).
-        assert!(
-            snapshot_dir(&edges_dir, "p_1", &snapshot_id)
-                .join(".staging")
-                .exists(),
-            "marker must be preserved on validation failure"
-        );
-        // Snapshot directory must survive (not deleted).
-        assert!(
-            snapshot_dir(&edges_dir, "p_1", &snapshot_id).exists(),
-            "snapshot directory must survive validation failure"
-        );
+        // The journal is preserved (fail closed).
+        let journals: Vec<_> = fs::read_dir(&txn_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.ends_with(".journal.json"))
+            })
+            .collect();
+        assert_eq!(journals.len(), 1, "journal must be preserved on failure");
     }
 
-    // R18F3: missing member must fail closed.
+    // R19F5: missing staged member must fail closed.
     #[test]
-    fn r18f3_missing_member_fails_closed() {
+    fn r19f5_missing_member_fails_closed() {
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
         let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
@@ -4074,28 +4754,39 @@ mod tests {
             &edges_dir,
             "p_1",
             &snapshot_id,
-            &[(crate::manifest::GIT_CURRENT_MEMBER, &git_edges)],
+            &[("git-current.jsonl", &git_edges)],
         )
         .unwrap();
 
-        fs::remove_file(
-            snapshot_dir(&edges_dir, "p_1", &snapshot_id).join(crate::manifest::GIT_CURRENT_MEMBER),
-        )
-        .unwrap();
+        // Delete the staged member file.
+        let txn_dir = materialized_dir(&edges_dir)
+            .join("workspace")
+            .join("p_1")
+            .join("txn");
+        for entry in fs::read_dir(&txn_dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry
+                .file_name()
+                .to_str()
+                .unwrap()
+                .ends_with(".journal.json")
+            {
+                continue;
+            }
+            let staging_dir = entry.path();
+            let member = staging_dir.join("git-current.jsonl");
+            if member.exists() {
+                fs::remove_file(&member).unwrap();
+            }
+        }
 
-        let result = recover_staging_markers_prebind(&edges_dir);
-        assert!(result.is_err(), "missing member must fail closed");
-        assert!(
-            snapshot_dir(&edges_dir, "p_1", &snapshot_id)
-                .join(".staging")
-                .exists(),
-            "marker must be preserved"
-        );
+        let result = recover_pending_transactions_prebind(&edges_dir);
+        assert!(result.is_err(), "recovery must fail on missing member");
     }
 
-    // R18F3: non-regular member (directory) must fail closed.
+    // R19F4: invalid journal version must fail closed.
     #[test]
-    fn r18f3_nonregular_member_fails_closed() {
+    fn r19f4_invalid_journal_version_fails_closed() {
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
         let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
@@ -4105,171 +4796,234 @@ mod tests {
             &edges_dir,
             "p_1",
             &snapshot_id,
-            &[(crate::manifest::GIT_CURRENT_MEMBER, &git_edges)],
+            &[("git-current.jsonl", &git_edges)],
         )
         .unwrap();
 
-        let member_path =
-            snapshot_dir(&edges_dir, "p_1", &snapshot_id).join(crate::manifest::GIT_CURRENT_MEMBER);
-        fs::remove_file(&member_path).unwrap();
-        fs::create_dir_all(&member_path).unwrap();
+        // Overwrite the journal with an invalid version.
+        let txn_dir = materialized_dir(&edges_dir)
+            .join("workspace")
+            .join("p_1")
+            .join("txn");
+        for entry in fs::read_dir(&txn_dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry
+                .file_name()
+                .to_str()
+                .unwrap()
+                .ends_with(".journal.json")
+            {
+                let bad = serde_json::json!({
+                    "v": 99,
+                    "txn_token": "tok",
+                    "snapshot_id": &snapshot_id,
+                    "members": [{"name": "git-current.jsonl", "sha256": "a".repeat(64)}]
+                });
+                fs::write(entry.path(), serde_json::to_vec(&bad).unwrap()).unwrap();
+            }
+        }
 
-        let result = recover_staging_markers_prebind(&edges_dir);
-        assert!(result.is_err(), "non-regular member must fail closed");
-        assert!(
-            snapshot_dir(&edges_dir, "p_1", &snapshot_id)
-                .join(".staging")
-                .exists(),
-            "marker must be preserved"
-        );
-    }
-
-    // R18F4: invalid marker version must fail closed.
-    #[test]
-    fn r18f4_invalid_marker_version_fails_closed() {
-        let directory = tempfile::tempdir().unwrap();
-        let edges_dir = directory.path().canonicalize().unwrap();
-        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
-
-        let bad_marker = serde_json::json!({"v": 1, "members": []});
-        write_materialized_file_atomic(
-            &edges_dir,
-            Path::new("workspace")
-                .join("p_1")
-                .join("snapshots")
-                .join(&snapshot_id)
-                .join(".staging")
-                .as_path(),
-            &serde_json::to_vec(&bad_marker).unwrap(),
-        )
-        .unwrap();
-
-        let result = recover_staging_markers_prebind(&edges_dir);
-        assert!(result.is_err(), "invalid version must fail closed");
-    }
-
-    // R18F4: marker with path-traversal member name must fail closed.
-    #[test]
-    fn r18f4_path_traversal_member_name_fails_closed() {
-        let directory = tempfile::tempdir().unwrap();
-        let edges_dir = directory.path().canonicalize().unwrap();
-        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
-
-        let bad_marker = serde_json::json!({
-            "v": 2,
-            "members": [{"name": "../escape.jsonl", "sha256": "a".repeat(64)}]
-        });
-        write_materialized_file_atomic(
-            &edges_dir,
-            Path::new("workspace")
-                .join("p_1")
-                .join("snapshots")
-                .join(&snapshot_id)
-                .join(".staging")
-                .as_path(),
-            &serde_json::to_vec(&bad_marker).unwrap(),
-        )
-        .unwrap();
-
-        let result = recover_staging_markers_prebind(&edges_dir);
+        let result = recover_pending_transactions_prebind(&edges_dir);
         assert!(
             result.is_err(),
-            "path-traversal member name must fail closed"
+            "recovery must fail on invalid journal version"
         );
     }
 
-    // R18F4: marker with invalid sha256 format must fail closed.
+    // R19F4: path-traversal member name in journal must fail closed.
     #[test]
-    fn r18f4_invalid_sha256_format_fails_closed() {
+    fn r19f4_path_traversal_member_name_fails_closed() {
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
         let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
 
-        let bad_marker = serde_json::json!({
-            "v": 2,
-            "members": [{"name": "git-current.jsonl", "sha256": "nothex"}]
-        });
-        write_materialized_file_atomic(
+        write_snapshot_members_transaction(
             &edges_dir,
-            Path::new("workspace")
-                .join("p_1")
-                .join("snapshots")
-                .join(&snapshot_id)
-                .join(".staging")
-                .as_path(),
-            &serde_json::to_vec(&bad_marker).unwrap(),
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
         )
         .unwrap();
 
-        let result = recover_staging_markers_prebind(&edges_dir);
-        assert!(result.is_err(), "invalid sha256 format must fail closed");
+        // Overwrite the journal with a path-traversal member name.
+        let txn_dir = materialized_dir(&edges_dir)
+            .join("workspace")
+            .join("p_1")
+            .join("txn");
+        for entry in fs::read_dir(&txn_dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry
+                .file_name()
+                .to_str()
+                .unwrap()
+                .ends_with(".journal.json")
+            {
+                let bad = serde_json::json!({
+                    "v": 1,
+                    "txn_token": "tok",
+                    "snapshot_id": &snapshot_id,
+                    "members": [{"name": "../../../etc/passwd", "sha256": "a".repeat(64)}]
+                });
+                fs::write(entry.path(), serde_json::to_vec(&bad).unwrap()).unwrap();
+            }
+        }
+
+        let result = recover_pending_transactions_prebind(&edges_dir);
+        assert!(
+            result.is_err(),
+            "recovery must fail on path-traversal member name"
+        );
     }
 
-    // R18F4: marker with duplicate member names must fail closed.
+    // R19F4: invalid sha256 format in journal must fail closed.
     #[test]
-    fn r18f4_duplicate_member_names_fails_closed() {
+    fn r19f4_invalid_sha256_format_fails_closed() {
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
         let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
 
-        let bad_marker = serde_json::json!({
-            "v": 2,
-            "members": [
-                {"name": "git-current.jsonl", "sha256": "a".repeat(64)},
-                {"name": "git-current.jsonl", "sha256": "b".repeat(64)}
-            ]
-        });
-        write_materialized_file_atomic(
+        write_snapshot_members_transaction(
             &edges_dir,
-            Path::new("workspace")
-                .join("p_1")
-                .join("snapshots")
-                .join(&snapshot_id)
-                .join(".staging")
-                .as_path(),
-            &serde_json::to_vec(&bad_marker).unwrap(),
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
         )
         .unwrap();
 
-        let result = recover_staging_markers_prebind(&edges_dir);
-        assert!(result.is_err(), "duplicate member names must fail closed");
+        // Overwrite the journal with invalid sha256.
+        let txn_dir = materialized_dir(&edges_dir)
+            .join("workspace")
+            .join("p_1")
+            .join("txn");
+        for entry in fs::read_dir(&txn_dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry
+                .file_name()
+                .to_str()
+                .unwrap()
+                .ends_with(".journal.json")
+            {
+                let bad = serde_json::json!({
+                    "v": 1,
+                    "txn_token": "tok",
+                    "snapshot_id": &snapshot_id,
+                    "members": [{"name": "git-current.jsonl", "sha256": "tooshort"}]
+                });
+                fs::write(entry.path(), serde_json::to_vec(&bad).unwrap()).unwrap();
+            }
+        }
+
+        let result = recover_pending_transactions_prebind(&edges_dir);
+        assert!(
+            result.is_err(),
+            "recovery must fail on invalid sha256 format"
+        );
     }
 
-    // R18F4: marker with too many members must fail closed.
+    // R19F4: duplicate member names in journal must fail closed.
     #[test]
-    fn r18f4_too_many_members_fails_closed() {
+    fn r19f4_duplicate_member_names_fails_closed() {
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
         let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
 
+        write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+
+        // Overwrite the journal with duplicate member names.
+        let txn_dir = materialized_dir(&edges_dir)
+            .join("workspace")
+            .join("p_1")
+            .join("txn");
+        for entry in fs::read_dir(&txn_dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry
+                .file_name()
+                .to_str()
+                .unwrap()
+                .ends_with(".journal.json")
+            {
+                let bad = serde_json::json!({
+                    "v": 1,
+                    "txn_token": "tok",
+                    "snapshot_id": &snapshot_id,
+                    "members": [
+                        {"name": "git-current.jsonl", "sha256": "a".repeat(64)},
+                        {"name": "git-current.jsonl", "sha256": "b".repeat(64)}
+                    ]
+                });
+                fs::write(entry.path(), serde_json::to_vec(&bad).unwrap()).unwrap();
+            }
+        }
+
+        let result = recover_pending_transactions_prebind(&edges_dir);
+        assert!(
+            result.is_err(),
+            "recovery must fail on duplicate member names"
+        );
+    }
+
+    // R19F4: too many members in journal must fail closed.
+    #[test]
+    fn r19f4_too_many_members_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
+
+        write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+
+        // Overwrite the journal with too many members.
+        let txn_dir = materialized_dir(&edges_dir)
+            .join("workspace")
+            .join("p_1")
+            .join("txn");
         let mut members = Vec::new();
         for i in 0..70 {
             members.push(serde_json::json!({
                 "name": format!("m{i}.jsonl"),
-                "sha256": "a".repeat(64)
+                "sha256": "a".repeat(64),
             }));
         }
-        let bad_marker = serde_json::json!({"v": 2, "members": members});
-        write_materialized_file_atomic(
-            &edges_dir,
-            Path::new("workspace")
-                .join("p_1")
-                .join("snapshots")
-                .join(&snapshot_id)
-                .join(".staging")
-                .as_path(),
-            &serde_json::to_vec(&bad_marker).unwrap(),
-        )
-        .unwrap();
+        for entry in fs::read_dir(&txn_dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry
+                .file_name()
+                .to_str()
+                .unwrap()
+                .ends_with(".journal.json")
+            {
+                let bad = serde_json::json!({
+                    "v": 1,
+                    "txn_token": "tok",
+                    "snapshot_id": &snapshot_id,
+                    "members": members,
+                });
+                fs::write(entry.path(), serde_json::to_vec(&bad).unwrap()).unwrap();
+            }
+        }
 
-        let result = recover_staging_markers_prebind(&edges_dir);
-        assert!(result.is_err(), "too many members must fail closed");
+        let result = recover_pending_transactions_prebind(&edges_dir);
+        assert!(result.is_err(), "recovery must fail on too many members");
     }
 
-    // R18F1+R18F2: loader bails on staging marker if pre-bind recovery was
-    // not run. Recovery is a separate transaction.
+    // R19F1: GC must not deadlock when recovery has already run.
     #[test]
-    fn r18f1_loader_bails_on_staging_marker_without_prebind_recovery() {
+    fn r19f1_gc_does_not_deadlock_after_recovery() {
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
         let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
@@ -4283,33 +5037,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = ManifestIndex::load(&edges_dir)
-            .unwrap()
-            .active_paths_for_loader(&edges_dir)
-            .unwrap_err();
-        assert!(
-            format!("{error:#}").contains("staging marker"),
-            "loader must bail on staging marker without pre-bind recovery: {error:#}"
-        );
-    }
-
-    // R18F2: GC must not deadlock when recovery has already run.
-    #[test]
-    fn r18f2_gc_does_not_deadlock_after_recovery() {
-        let directory = tempfile::tempdir().unwrap();
-        let edges_dir = directory.path().canonicalize().unwrap();
-        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
-        let git_edges = vec![explicit_edge("git", "mentions", "target")];
-
-        write_snapshot_members_transaction(
-            &edges_dir,
-            "p_1",
-            &snapshot_id,
-            &[(crate::manifest::GIT_CURRENT_MEMBER, &git_edges)],
-        )
-        .unwrap();
-
-        recover_staging_markers_prebind(&edges_dir).unwrap();
+        recover_pending_transactions_prebind(&edges_dir).unwrap();
 
         let inactive_path = std::path::PathBuf::from("materialized")
             .join("workspace")
