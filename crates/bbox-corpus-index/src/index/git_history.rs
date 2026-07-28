@@ -644,9 +644,10 @@ mod tests {
             .is_empty(),
             "Git sidecars must remain unchanged until final publication"
         );
-        publication.publish().unwrap();
+        let publication_result = publication.publish().unwrap();
         assert!(git_meta_dir.join("proj1234.json").exists());
         writer.commit().unwrap();
+        publication_result.finalize_publications();
 
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();

@@ -1495,8 +1495,9 @@ fn run_collected_stage(
     // No checkout lease contributed to this bundle, so there is no
     // publication guard to hold: the broker's guard exists to pin checkout
     // lifecycle across publish, and this transaction touched no checkout.
-    publication.publish()?;
+    let publication_result = publication.publish()?;
     writer.commit()?;
+    publication_result.finalize_publications();
     post_commit(ctx);
     Ok(result)
 }
@@ -1605,8 +1606,9 @@ fn run_local_stage(
     let _publication_guard = ctx
         .checkout_access
         .publication_guard_for([&local_lease, &git_lease])?;
-    publication.publish()?;
+    let publication_result = publication.publish()?;
     writer.commit()?;
+    publication_result.finalize_publications();
     post_commit(ctx);
     Ok(result)
 }
@@ -1652,8 +1654,9 @@ fn run_git_current_overlay(
     drop(git_ctx);
     publication.stage_snapshot_git_current(&edges_dir, &project.project_id, snapshot_id, true);
     let _publication_guard = ctx.checkout_access.publication_guard(lease)?;
-    publication.publish()?;
+    let publication_result = publication.publish()?;
     writer.commit()?;
+    publication_result.finalize_publications();
     post_commit(ctx);
     Ok(())
 }
@@ -1703,6 +1706,7 @@ fn run_consolidated_history(
         );
         written += 1;
     }
+    let mut all_finalizations: Vec<(std::path::PathBuf, String, String)> = Vec::new();
     for (project_id, edges) in edges_by_project {
         // Replace, not merge: a consolidated walk that produced no edge for a
         // project is asserting that project currently has none, and merging
@@ -1713,10 +1717,25 @@ fn run_consolidated_history(
         if let Some(snapshot_id) = snapshot_by_project.get(project_id) {
             let mut publication = super::project_files::ProjectIndexPublicationBundle::default();
             publication.stage_snapshot_git_current(&edges_dir, project_id, snapshot_id, true);
-            publication.publish()?;
+            let publication_result = publication.publish()?;
+            all_finalizations.extend(publication_result.pending_snapshot_finalizations);
         }
     }
     writer.commit()?;
+    for (edges_dir, project_id, snapshot_id) in &all_finalizations {
+        if let Err(error) = bbox_edge_sidecar::snapshot::finalize_snapshot_publication(
+            edges_dir,
+            project_id,
+            snapshot_id,
+        ) {
+            tracing::warn!(
+                project_id = %project_id,
+                snapshot_id = %snapshot_id,
+                error = %error,
+                "failed to finalize snapshot publication marker after consolidated index commit"
+            );
+        }
+    }
     post_commit(ctx);
     Ok(written)
 }

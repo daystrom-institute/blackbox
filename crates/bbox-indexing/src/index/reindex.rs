@@ -737,7 +737,9 @@ pub(super) fn execute_reindex_pass(
     };
     publisher_ref_publication.publish()?;
     let tool_edge_publication = tool_edges.take_publish_bundle();
-    project_stats.pending_local_snapshots = project_stats.publication.publish()?;
+    let project_publication_result = project_stats.publication.publish()?;
+    project_stats.pending_local_snapshots = project_publication_result.pending_local_snapshots;
+    let pending_snapshot_finalizations = project_publication_result.pending_snapshot_finalizations;
     tool_edge_publication.publish()?;
     let pending_journal = if project_stats.pending_local_snapshots.is_empty() {
         None
@@ -759,6 +761,20 @@ pub(super) fn execute_reindex_pass(
         Some(journal)
     };
     writer.commit()?;
+    for (edges_dir, project_id, snapshot_id) in &pending_snapshot_finalizations {
+        if let Err(error) = bbox_edge_sidecar::snapshot::finalize_snapshot_publication(
+            edges_dir,
+            project_id,
+            snapshot_id,
+        ) {
+            tracing::warn!(
+                project_id = %project_id,
+                snapshot_id = %snapshot_id,
+                error = %error,
+                "failed to finalize snapshot publication marker after reindex commit"
+            );
+        }
+    }
     if let Some(journal) = pending_journal {
         bbox_edge_sidecar::snapshot::activate_pending_local_snapshots(
             &edges_dir,

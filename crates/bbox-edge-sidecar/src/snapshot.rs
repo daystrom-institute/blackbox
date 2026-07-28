@@ -944,8 +944,83 @@ pub fn write_snapshot_members_transaction(
     snapshot_id: &str,
     files: &[(&str, &[Edge])],
 ) -> Result<()> {
-    write_snapshot_files(edges_dir, project_id, snapshot_id, files)?;
+    // R16F3: write the .staging marker and member files but do NOT clear
+    // the marker here. The marker belongs to the outer sidecar-plus-index
+    // publication: the caller must call finalize_snapshot_publication AFTER
+    // the Tantivy writer.commit() to clear it. A crash before finalize
+    // leaves the marker for pre-bind recovery to finish or roll back.
+    write_snapshot_files(edges_dir, project_id, snapshot_id, files)
+}
+
+/// Clear the staging marker for a snapshot after the outer index transaction
+/// (writer.commit()) has completed. This is the R16F3 finalize step: the
+/// marker is only cleared once both the sidecar members and the index
+/// transaction are durable.
+pub fn finalize_snapshot_publication(
+    edges_dir: &Path,
+    project_id: &str,
+    snapshot_id: &str,
+) -> Result<()> {
     with_manifest_coordinator(|| clear_snapshot_staging_marker(edges_dir, project_id, snapshot_id))
+}
+
+/// Pre-bind recovery for a staging marker left by a crash between sidecar
+/// publication and index commit. If the marker exists but the snapshot
+/// directory has all its member files intact, the publication is complete
+/// on the sidecar side and the marker can be safely cleared (the index
+/// will reload from the sidecar on the next rebuild). If the snapshot
+/// directory is missing entirely, the publication never landed and the
+/// stale marker is a no-op.
+///
+/// Returns true if a marker was found and recovered (cleared), false if no
+/// marker was present.
+pub fn recover_staging_marker(
+    edges_dir: &Path,
+    project_id: &str,
+    snapshot_id: &str,
+) -> Result<bool> {
+    with_manifest_coordinator(|| {
+        let relative = Path::new("materialized")
+            .join("workspace")
+            .join(project_id)
+            .join("snapshots")
+            .join(snapshot_id);
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            let directory = match open_dir_under_root(edges_dir, &relative, false) {
+                Ok(dir) => dir,
+                Err(_) => return Ok(false),
+            };
+            let marker_c = std::ffi::CString::new(b".staging".as_slice())?;
+            match fstatat_nofollow(directory.as_raw_fd(), &marker_c) {
+                Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFREG => {
+                    if unsafe { libc::unlinkat(directory.as_raw_fd(), marker_c.as_ptr(), 0) } != 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() != std::io::ErrorKind::NotFound {
+                            return Err(error.into());
+                        }
+                    }
+                    directory.sync_all()?;
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = relative;
+            let marker = snapshot_dir(edges_dir, project_id, snapshot_id).join(".staging");
+            match fs::symlink_metadata(&marker) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    fs::remove_file(&marker)?;
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        }
+    })
 }
 
 fn validate_snapshot_component(value: &str) -> Result<()> {
@@ -2050,6 +2125,17 @@ mod tests {
         )
         .unwrap();
 
+        // R16F3: write_snapshot_members_transaction no longer clears the
+        // staging marker. The marker survives until
+        // finalize_snapshot_publication is called after the index commit.
+        assert!(
+            snapshot_dir(&edges_dir, "p_1", &snapshot_id)
+                .join(".staging")
+                .exists()
+        );
+
+        finalize_snapshot_publication(&edges_dir, "p_1", &snapshot_id).unwrap();
+
         assert!(
             !snapshot_dir(&edges_dir, "p_1", &snapshot_id)
                 .join(".staging")
@@ -2062,7 +2148,7 @@ mod tests {
     }
 
     #[test]
-    fn active_snapshot_with_staging_marker_is_refused() {
+    fn active_snapshot_with_staging_marker_is_recovered_on_boot() {
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
         let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
@@ -2072,11 +2158,20 @@ mod tests {
         )
         .unwrap();
 
-        let error = ManifestIndex::load(&edges_dir)
+        // R16F3: a lingering .staging marker is no longer fatal. The boot
+        // loader recovers by clearing it since the snapshot directory and
+        // its members are intact.
+        ManifestIndex::load(&edges_dir)
             .unwrap()
             .active_paths_for_loader(&edges_dir)
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("incomplete publication"));
+            .unwrap();
+
+        assert!(
+            !snapshot_dir(&edges_dir, "p_1", &snapshot_id)
+                .join(".staging")
+                .exists(),
+            "recovery must clear the stale staging marker"
+        );
     }
 
     #[test]
@@ -3385,6 +3480,140 @@ mod tests {
         assert!(
             !link_target.join("dirty-current").exists(),
             "no overlay must appear in symlink target"
+        );
+    }
+
+    // R16F3: fault test for crash BEFORE index commit (marker still present).
+    // write_snapshot_members_transaction writes members + .staging marker but
+    // does NOT clear the marker. A crash before finalize_snapshot_publication
+    // leaves the marker for boot recovery.
+    #[test]
+    fn r16f3_crash_before_index_commit_marker_surives_for_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
+
+        // Simulate the publish step: write members + staging marker.
+        write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+
+        // CRASH: finalize_snapshot_publication is never called.
+        // The marker must survive for recovery.
+        assert!(
+            snapshot_dir(&edges_dir, "p_1", &snapshot_id)
+                .join(".staging")
+                .exists(),
+            "staging marker must survive when finalize is not called"
+        );
+
+        // Boot recovery: active_paths_for_loader clears the stale marker.
+        ManifestIndex::load(&edges_dir)
+            .unwrap()
+            .active_paths_for_loader(&edges_dir)
+            .unwrap();
+
+        assert!(
+            !snapshot_dir(&edges_dir, "p_1", &snapshot_id)
+                .join(".staging")
+                .exists(),
+            "boot recovery must clear stale staging marker"
+        );
+
+        // The member file must still be intact after recovery.
+        assert!(
+            snapshot_dir(&edges_dir, "p_1", &snapshot_id)
+                .join("git-current.jsonl")
+                .exists(),
+            "member files must survive recovery"
+        );
+    }
+
+    // R16F3: fault test for crash AFTER index commit. finalize_snapshot_publication
+    // runs after the index commit, so the marker is cleared and a subsequent boot
+    // finds no marker at all.
+    #[test]
+    fn r16f3_crash_after_index_commit_marker_already_cleared() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
+
+        // Full publish + finalize cycle.
+        write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+
+        // Simulate post-commit finalize: marker is cleared.
+        finalize_snapshot_publication(&edges_dir, "p_1", &snapshot_id).unwrap();
+
+        assert!(
+            !snapshot_dir(&edges_dir, "p_1", &snapshot_id)
+                .join(".staging")
+                .exists(),
+            "finalize must clear staging marker"
+        );
+
+        // Subsequent boot: no marker, clean load.
+        ManifestIndex::load(&edges_dir)
+            .unwrap()
+            .active_paths_for_loader(&edges_dir)
+            .unwrap();
+    }
+
+    // R16F3: recover_staging_marker returns false when no marker exists.
+    #[test]
+    fn r16f3_recover_returns_false_without_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+
+        let recovered = recover_staging_marker(&edges_dir, "p_1", &snapshot_id).unwrap();
+        assert!(
+            !recovered,
+            "recover_staging_marker must return false when no marker exists"
+        );
+    }
+
+    // R16F3: recover_staging_marker returns true and clears when marker exists.
+    #[test]
+    fn r16f3_recover_clears_existing_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+
+        fs::write(
+            snapshot_dir(&edges_dir, "p_1", &snapshot_id).join(".staging"),
+            b"pending\n",
+        )
+        .unwrap();
+
+        let recovered = recover_staging_marker(&edges_dir, "p_1", &snapshot_id).unwrap();
+        assert!(
+            recovered,
+            "recover_staging_marker must return true when marker is cleared"
+        );
+        assert!(
+            !snapshot_dir(&edges_dir, "p_1", &snapshot_id)
+                .join(".staging")
+                .exists(),
+            "marker must be gone after recovery"
+        );
+
+        // Second call finds nothing.
+        let recovered_again = recover_staging_marker(&edges_dir, "p_1", &snapshot_id).unwrap();
+        assert!(
+            !recovered_again,
+            "recover_staging_marker must return false on second call"
         );
     }
 }

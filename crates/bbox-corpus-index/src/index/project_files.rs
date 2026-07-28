@@ -190,10 +190,9 @@ impl ProjectIndexPublicationBundle {
     /// Publish every filesystem-derived effect staged by the corpus pass.
     /// The caller must hold the checkout publication guard for all leases that
     /// contributed to this bundle for the entire call and the Tantivy commit.
-    pub fn publish(
-        &mut self,
-    ) -> Result<Vec<bbox_edge_sidecar::snapshot::PendingLocalSnapshotActivation>> {
+    pub fn publish(&mut self) -> Result<PublicationResult> {
         let mut pending_local_snapshots = Vec::new();
+        let mut pending_snapshot_finalizations: Vec<(PathBuf, String, String)> = Vec::new();
         for action in self.actions.drain(..) {
             match action {
                 ProjectIndexPublication::SnapshotRename {
@@ -270,6 +269,7 @@ impl ProjectIndexPublicationBundle {
                         &snapshot_id,
                         &[("git-current.jsonl", git_edges.as_slice())],
                     )?;
+                    pending_snapshot_finalizations.push((edges_dir, project_id, snapshot_id));
                 }
                 ProjectIndexPublication::LocalSnapshot(publication) => {
                     let project_edges =
@@ -301,7 +301,10 @@ impl ProjectIndexPublicationBundle {
                 }
             }
         }
-        Ok(pending_local_snapshots)
+        Ok(PublicationResult {
+            pending_local_snapshots,
+            pending_snapshot_finalizations,
+        })
     }
 }
 
@@ -310,6 +313,37 @@ impl Drop for ProjectIndexPublicationBundle {
         for action in &self.actions {
             if let ProjectIndexPublication::SnapshotRename { staged, .. } = action {
                 let _ = fs::remove_file(staged);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PublicationResult {
+    pub pending_local_snapshots: Vec<bbox_edge_sidecar::snapshot::PendingLocalSnapshotActivation>,
+    /// Snapshots that had their member files written during publish() but
+    /// whose staging markers were intentionally left in place. The caller
+    /// must call finalize_snapshot_publication for each entry AFTER
+    /// writer.commit() succeeds, closing the R16F3 crash window between
+    /// sidecar publication and index commit.
+    pub pending_snapshot_finalizations: Vec<(PathBuf, String, String)>,
+}
+
+impl PublicationResult {
+    /// Clear all pending staging markers. Called after writer.commit().
+    pub fn finalize_publications(self) {
+        for (edges_dir, project_id, snapshot_id) in &self.pending_snapshot_finalizations {
+            if let Err(error) = bbox_edge_sidecar::snapshot::finalize_snapshot_publication(
+                edges_dir,
+                project_id,
+                snapshot_id,
+            ) {
+                tracing::warn!(
+                    project_id = %project_id,
+                    snapshot_id = %snapshot_id,
+                    error = %error,
+                    "failed to finalize snapshot publication marker after index commit"
+                );
             }
         }
     }
