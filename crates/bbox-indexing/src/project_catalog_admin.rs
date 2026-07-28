@@ -5756,7 +5756,8 @@ mod tests {
         bridge_gen: Option<&str>,
     ) -> (tempfile::TempDir, ProjectCatalogStore, ProjectId) {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ProjectCatalogStore::initialize_empty(tmp.path().join("catalog")).unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let store = ProjectCatalogStore::initialize_empty(root.join("catalog")).unwrap();
         let pid = ProjectId::parse(PROJECT).unwrap();
 
         // Add the project to the catalog with a matching attachment.
@@ -6304,26 +6305,27 @@ mod tests {
     #[test]
     fn complete_active_journal_is_verified_and_archived_on_resume() {
         let tmp = tempfile::tempdir().unwrap();
-        let projects = tmp.path().join("projects.json");
+        let root = tmp.path().canonicalize().unwrap();
+        let projects = root.join("projects.json");
         let store = ProjectCatalogStore::initialize_empty(&projects).unwrap();
         let pid = ProjectId::parse(PROJECT).unwrap();
         let mut journal = ProjectRetirementJournal::new(pid.clone(), 1, "1");
         while journal.current_stage != RetirementJournalStage::Complete {
             journal.advance("2");
         }
-        save_retirement_journal(tmp.path(), &journal).unwrap();
+        save_retirement_journal(root.as_path(), &journal).unwrap();
 
         let mut workers = NoopDischargeWorkers;
         let evidence = RetireEvidence::default();
         let (_, resumed) =
-            retire_project_journaled_with(&store, tmp.path(), &pid, &evidence, true, &mut workers)
+            retire_project_journaled_with(&store, root.as_path(), &pid, &evidence, true, &mut workers)
                 .unwrap();
         assert_eq!(
             resumed.unwrap().current_stage,
             RetirementJournalStage::Complete
         );
-        assert!(!retirement_journal_path(tmp.path(), &pid).exists());
-        assert!(archived_retirement_journal_path(tmp.path(), &pid).exists());
+        assert!(!retirement_journal_path(root.as_path(), &pid).exists());
+        assert!(archived_retirement_journal_path(root.as_path(), &pid).exists());
     }
 
     #[test]
@@ -6333,21 +6335,22 @@ mod tests {
             RetirementJournalStage::MaterializationSwept,
         ] {
             let tmp = tempfile::tempdir().unwrap();
-            let projects = tmp.path().join("projects.json");
+            let root = tmp.path().canonicalize().unwrap();
+            let projects = root.join("projects.json");
             let store = ProjectCatalogStore::initialize_empty(&projects).unwrap();
             let pid = ProjectId::parse(PROJECT).unwrap();
             let mut journal = ProjectRetirementJournal::new(pid.clone(), 1, "1");
             while journal.current_stage != stage {
                 journal.advance("2");
             }
-            save_retirement_journal(tmp.path(), &journal).unwrap();
+            save_retirement_journal(root.as_path(), &journal).unwrap();
             let mut workers = RejectPostCutOwnerRows {
                 inner: NoopDischargeWorkers,
                 verify_calls: 0,
             };
             let error = retire_project_journaled_with(
                 &store,
-                tmp.path(),
+                root.as_path(),
                 &pid,
                 &RetireEvidence::default(),
                 true,
@@ -6360,7 +6363,7 @@ mod tests {
             );
             assert_eq!(workers.verify_calls, 1);
             assert_eq!(
-                load_retirement_journal(tmp.path(), &pid)
+                load_retirement_journal(root.as_path(), &pid)
                     .unwrap()
                     .unwrap()
                     .current_stage,
@@ -6373,17 +6376,18 @@ mod tests {
     fn archive_marker_recovers_each_two_file_rename_boundary_twice() {
         for journal_moved in [false, true] {
             let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
             let pid = ProjectId::parse(PROJECT).unwrap();
             let mut journal = ProjectRetirementJournal::new(pid.clone(), 1, "1");
             while journal.current_stage != RetirementJournalStage::Complete {
                 journal.advance("2");
             }
-            save_retirement_journal(tmp.path(), &journal).unwrap();
-            let active = retirement_journal_path(tmp.path(), &pid);
-            let archived = archived_retirement_journal_path(tmp.path(), &pid);
+            save_retirement_journal(root.as_path(), &journal).unwrap();
+            let active = retirement_journal_path(root.as_path(), &pid);
+            let archived = archived_retirement_journal_path(root.as_path(), &pid);
             let active_sidecar = retirement_blob_inventory_path(&active);
             let archived_sidecar = retirement_blob_inventory_path(&archived);
-            let marker = retirement_archive_marker_path(tmp.path(), &pid);
+            let marker = retirement_archive_marker_path(root.as_path(), &pid);
             std::fs::create_dir_all(archived.parent().unwrap()).unwrap();
             std::fs::write(&marker, pid.as_str()).unwrap();
             if journal_moved {
@@ -6392,8 +6396,8 @@ mod tests {
                 std::fs::rename(&active_sidecar, &archived_sidecar).unwrap();
             }
 
-            archive_retirement_journal(tmp.path(), &pid).unwrap();
-            archive_retirement_journal(tmp.path(), &pid).unwrap();
+            archive_retirement_journal(root.as_path(), &pid).unwrap();
+            archive_retirement_journal(root.as_path(), &pid).unwrap();
             assert!(!active.exists());
             assert!(!active_sidecar.exists());
             assert!(!marker.exists());
