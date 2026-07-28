@@ -1070,6 +1070,181 @@ fn pending_local_activation_pin_leaf(project_id: &str) -> Result<String> {
     Ok(format!("{project_id}.json"))
 }
 
+/// What one name in the pin directory is.
+///
+/// R29F1: the directory holds two populations, and only one of them is
+/// budgeted. A legitimate pin leaf is `<project id>.json`, and the supported
+/// count of those is exactly `MAX_PENDING_LOCAL_ACTIVATION_PINS`. The atomic
+/// publication path also mints `.<leaf>.<pid>.<sequence>.tmp` siblings, which
+/// a crash between create and `renameat` leaves behind. Those temporaries are
+/// residue, not pins, so they must never consume a pin's budget.
+#[derive(Debug)]
+enum PendingLocalActivationPinEntry<'a> {
+    Pin(&'a str),
+    WriterTemporary { pid: u32 },
+}
+
+/// Whether the caller may reclaim residue minted by THIS process.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PinTemporaryReclaim {
+    /// The caller holds the manifest coordinator, which is the only lock a
+    /// pin write takes, so no publication in this process can be in flight:
+    /// every temporary present is crash residue and is reclaimed.
+    CoordinatorHeld,
+    /// An unlocked read path. A temporary carrying this process's pid may
+    /// belong to a publication running right now, so it is left alone and the
+    /// next coordinator-held write or clear reclaims it. Foreign residue is
+    /// reclaimed here, because the process that minted it is by definition
+    /// not this one.
+    Concurrent,
+}
+
+/// The `pid` embedded in an atomic-writer temporary leaf, or `None` when the
+/// name is not one. Both publication paths mint
+/// `.<project id>.json.<pid>.<sequence>.tmp`.
+fn pending_local_activation_pin_temporary_pid(dotless: &str) -> Option<u32> {
+    let body = dotless.strip_suffix(".tmp")?;
+    let (head, sequence) = body.rsplit_once('.')?;
+    sequence.parse::<u64>().ok()?;
+    let (leaf, pid) = head.rsplit_once('.')?;
+    let pid = pid.parse::<u32>().ok()?;
+    leaf.strip_suffix(".json")?;
+    Some(pid)
+}
+
+fn classify_pending_local_activation_pin_entry(
+    name: &str,
+) -> Result<PendingLocalActivationPinEntry<'_>> {
+    if let Some(dotless) = name.strip_prefix('.') {
+        let Some(pid) = pending_local_activation_pin_temporary_pid(dotless) else {
+            anyhow::bail!("local activation pin directory holds an unrecognized entry");
+        };
+        return Ok(PendingLocalActivationPinEntry::WriterTemporary { pid });
+    }
+    let Some(project_id) = name.strip_suffix(".json") else {
+        anyhow::bail!("local activation pin directory holds an unrecognized entry");
+    };
+    Ok(PendingLocalActivationPinEntry::Pin(project_id))
+}
+
+/// Reclaim is best effort by construction: a temporary that cannot be
+/// unlinked (a read-only mount, a lost race with another reclaimer) still
+/// does not count against the pin budget, so the enumeration it would
+/// otherwise have broken still succeeds.
+fn should_reclaim_pin_temporary(reclaim: PinTemporaryReclaim, pid: u32) -> bool {
+    reclaim == PinTemporaryReclaim::CoordinatorHeld || pid != std::process::id()
+}
+
+/// R29F1: enumerate the pin directory under the PIN bound rather than the raw
+/// directory-entry bound.
+///
+/// The collecting `read_directory_names` refuses past
+/// `MAX_ACTIVE_MATERIALIZATION_FILES` RAW entries, and both pin readers used
+/// to filter the writer's temporaries only afterwards. At the declared limit
+/// of 100,000 pins, one crash-left temporary made 100,001 raw entries and
+/// every pin read failed before it could recognize the temporary as residue,
+/// and `clear` skipped temporaries instead of reclaiming them, so nothing in
+/// the system ever removed it. This enumerator classifies first: residue is
+/// reclaimed and never budgeted, and only legitimate pins are counted against
+/// `limit`.
+///
+/// Returns project ids sorted, so no caller depends on enumeration order.
+#[cfg(unix)]
+fn enumerate_pending_local_activation_pin_dir(
+    directory: &fs::File,
+    reclaim: PinTemporaryReclaim,
+    limit: usize,
+) -> Result<Vec<String>> {
+    use std::os::fd::AsRawFd;
+
+    let mut projects = Vec::new();
+    let mut temporaries = 0usize;
+    crate::manifest::for_each_directory_name(directory, |name| {
+        let name = name
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("local activation pin name is not UTF-8"))?;
+        match classify_pending_local_activation_pin_entry(name)? {
+            PendingLocalActivationPinEntry::WriterTemporary { pid } => {
+                // Residue is bounded too, by the same cardinality: one
+                // in-flight publication per project is the writer's worst
+                // case, so more than that is not a directory this reader
+                // should keep walking.
+                temporaries += 1;
+                if temporaries > limit {
+                    anyhow::bail!(
+                        "local activation pin directory holds more writer temporaries than \
+                         the project catalog entry bound"
+                    );
+                }
+                if should_reclaim_pin_temporary(reclaim, pid) {
+                    let leaf = std::ffi::CString::new(name.as_bytes())?;
+                    unsafe { libc::unlinkat(directory.as_raw_fd(), leaf.as_ptr(), 0) };
+                }
+            }
+            PendingLocalActivationPinEntry::Pin(project_id) => {
+                projects.push(project_id.to_string());
+                if projects.len() > limit {
+                    anyhow::bail!(
+                        "local activation pin set exceeds the project catalog entry bound"
+                    );
+                }
+            }
+        }
+        Ok(())
+    })?;
+    projects.sort();
+    Ok(projects)
+}
+
+/// The non-unix mirror. R29F1 also drops this path's eager
+/// `read_dir(..).collect()`: the iterator is consumed one entry at a time so
+/// the walk never materializes the whole directory before its bound applies.
+#[cfg(not(unix))]
+fn enumerate_pending_local_activation_pin_dir(
+    directory: &Path,
+    reclaim: PinTemporaryReclaim,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut projects = Vec::new();
+    let mut temporaries = 0usize;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("local activation pin name is not UTF-8"))?;
+        match classify_pending_local_activation_pin_entry(&name)? {
+            PendingLocalActivationPinEntry::WriterTemporary { pid } => {
+                temporaries += 1;
+                if temporaries > limit {
+                    anyhow::bail!(
+                        "local activation pin directory holds more writer temporaries than \
+                         the project catalog entry bound"
+                    );
+                }
+                if should_reclaim_pin_temporary(reclaim, pid) {
+                    let _ = fs::remove_file(directory.join(&name));
+                }
+            }
+            PendingLocalActivationPinEntry::Pin(project_id) => {
+                projects.push(project_id.to_string());
+                if projects.len() > limit {
+                    anyhow::bail!(
+                        "local activation pin set exceeds the project catalog entry bound"
+                    );
+                }
+            }
+        }
+    }
+    projects.sort();
+    Ok(projects)
+}
+
 /// R28F2: enforce the record bound DURING serialization rather than after it.
 /// The v1 path allocated the complete document and only then compared its
 /// length against the limit, so the refusal it advertised never prevented the
@@ -1461,22 +1636,16 @@ fn read_pending_local_activation_pins_dir(
         Err(error) if is_not_found(&error) => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    let mut names = crate::manifest::read_directory_names(&directory)?;
-    names.sort();
+    // R29F1: the writer's crash-left temporaries are reclaimed here and never
+    // counted, so the declared pin cardinality is what this bound admits.
+    let projects = enumerate_pending_local_activation_pin_dir(
+        &directory,
+        PinTemporaryReclaim::Concurrent,
+        MAX_PENDING_LOCAL_ACTIVATION_PINS,
+    )?;
     let mut pins = Vec::new();
-    for name in names {
-        let name = name
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("local activation pin name is not UTF-8"))?
-            .to_string();
-        // Dot-prefixed entries are the atomic writer's own temporaries; a
-        // pin leaf can never start with a dot.
-        if name.starts_with('.') {
-            continue;
-        }
-        let Some(project_id) = name.strip_suffix(".json") else {
-            anyhow::bail!("local activation pin directory holds an unrecognized entry");
-        };
+    for project_id in &projects {
+        let name = pending_local_activation_pin_leaf(project_id)?;
         let leaf = std::ffi::CString::new(name.as_bytes())?;
         // `read_confined_file_bounded` stats the leaf itself and refuses any
         // non-regular node, so a separate stat here would only duplicate a
@@ -1500,29 +1669,14 @@ fn read_pending_local_activation_pins_dir(
     edges_dir: &Path,
 ) -> Result<Vec<PendingLocalActivationPin>> {
     let directory = pending_local_activation_pins_path(edges_dir);
-    let entries = match fs::read_dir(&directory) {
-        Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>()?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.into()),
-    };
-    let mut names = entries
-        .iter()
-        .map(|entry| {
-            entry
-                .file_name()
-                .into_string()
-                .map_err(|_| anyhow::anyhow!("local activation pin name is not UTF-8"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    names.sort();
+    let projects = enumerate_pending_local_activation_pin_dir(
+        &directory,
+        PinTemporaryReclaim::Concurrent,
+        MAX_PENDING_LOCAL_ACTIVATION_PINS,
+    )?;
     let mut pins = Vec::new();
-    for name in names {
-        if name.starts_with('.') {
-            continue;
-        }
-        let Some(project_id) = name.strip_suffix(".json") else {
-            anyhow::bail!("local activation pin directory holds an unrecognized entry");
-        };
+    for project_id in &projects {
+        let name = pending_local_activation_pin_leaf(project_id)?;
         let Some(bytes) = read_nonunix_pending_local_activation_pin(edges_dir, &name)? else {
             continue;
         };
@@ -1642,6 +1796,11 @@ fn write_nonunix_pending_local_activation_pin(
     Ok(())
 }
 
+/// The projects that currently hold a pin. R29F1: every caller of this holds
+/// the manifest coordinator, so a writer temporary present here is crash
+/// residue and is reclaimed rather than skipped. `clear` is built on this, so
+/// clearing the pin set now actually empties the directory instead of leaving
+/// residue that later reads must pay for.
 #[cfg(unix)]
 fn pending_local_activation_pin_projects(edges_dir: &Path) -> Result<Vec<String>> {
     let directory = match open_dir_under_root(
@@ -1655,47 +1814,20 @@ fn pending_local_activation_pin_projects(edges_dir: &Path) -> Result<Vec<String>
         Err(error) if is_not_found(&error) => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    let mut projects = Vec::new();
-    for name in crate::manifest::read_directory_names(&directory)? {
-        let name = name
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("local activation pin name is not UTF-8"))?;
-        if name.starts_with('.') {
-            continue;
-        }
-        let Some(project_id) = name.strip_suffix(".json") else {
-            anyhow::bail!("local activation pin directory holds an unrecognized entry");
-        };
-        projects.push(project_id.to_string());
-    }
-    projects.sort();
-    Ok(projects)
+    enumerate_pending_local_activation_pin_dir(
+        &directory,
+        PinTemporaryReclaim::CoordinatorHeld,
+        MAX_PENDING_LOCAL_ACTIVATION_PINS,
+    )
 }
 
 #[cfg(not(unix))]
 fn pending_local_activation_pin_projects(edges_dir: &Path) -> Result<Vec<String>> {
-    let directory = pending_local_activation_pins_path(edges_dir);
-    let entries = match fs::read_dir(&directory) {
-        Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>()?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.into()),
-    };
-    let mut projects = Vec::new();
-    for entry in entries {
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| anyhow::anyhow!("local activation pin name is not UTF-8"))?;
-        if name.starts_with('.') {
-            continue;
-        }
-        let Some(project_id) = name.strip_suffix(".json") else {
-            anyhow::bail!("local activation pin directory holds an unrecognized entry");
-        };
-        projects.push(project_id.to_string());
-    }
-    projects.sort();
-    Ok(projects)
+    enumerate_pending_local_activation_pin_dir(
+        &pending_local_activation_pins_path(edges_dir),
+        PinTemporaryReclaim::CoordinatorHeld,
+        MAX_PENDING_LOCAL_ACTIVATION_PINS,
+    )
 }
 
 #[cfg(unix)]
@@ -10234,6 +10366,182 @@ mod tests {
             published + 1,
             "the refusal must land before any pin is written"
         );
+    }
+
+    /// R29F1: a crash between the atomic writer's create and its `renameat`
+    /// leaves a temporary sibling in the pin directory, and at the declared
+    /// pin cardinality that residue used to make the directory unreadable:
+    /// the raw directory bound refused 100,001 entries before either reader
+    /// could recognize the 100,001st as the writer's own temporary, and
+    /// `clear` skipped temporaries instead of reclaiming them, so nothing
+    /// ever removed it.
+    ///
+    /// Same split as the capacity test above, and for the same reason:
+    /// materializing 100,000 real leaves proves nothing the scaled bound does
+    /// not. The scaled half exercises classification, reclamation, and the
+    /// refusal at an explicit small limit; the computed half asserts the
+    /// production limits the scaled proof transfers to, including that the
+    /// raw bound leaves the writer's temporaries no headroom at all.
+    #[cfg(unix)]
+    #[test]
+    fn r29_pin_enumeration_reclaims_writer_temporaries_before_its_bound() {
+        const SCALED_LIMIT: usize = 8;
+
+        assert_eq!(
+            MAX_PENDING_LOCAL_ACTIVATION_PINS,
+            bbox_corpus_core::project_catalog::MAX_PROJECT_CATALOG_ENTRIES,
+            "the supported pin count is exactly the catalog's declared bound"
+        );
+        assert_eq!(
+            crate::manifest::MAX_ACTIVE_MATERIALIZATION_FILES,
+            MAX_PENDING_LOCAL_ACTIVATION_PINS,
+            "the raw directory bound leaves the writer's own temporaries no headroom, \
+             so classification has to happen before any bound is enforced"
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let pins_dir = crate::manifest::materialized_dir(&edges_dir)
+            .join(PENDING_LOCAL_ACTIVATION_PINS_DIRNAME);
+        fs::create_dir_all(&pins_dir).unwrap();
+
+        let publish = |project_id: &str| {
+            let pin =
+                new_pending_local_activation_pin(&pin_test_activation(project_id, "snapshot-a"));
+            fs::write(
+                pins_dir.join(format!("{project_id}.json")),
+                encode_pending_local_activation_pin(&pin).unwrap(),
+            )
+            .unwrap();
+        };
+
+        // Exactly the limit in legitimate pins.
+        let expected = (0..SCALED_LIMIT)
+            .map(|index| format!("p{index:03}"))
+            .collect::<Vec<_>>();
+        for project_id in &expected {
+            publish(project_id);
+        }
+
+        // Residue in both flavours: one left by a process that is gone, and
+        // one carrying this process's pid, which an unlocked reader cannot
+        // distinguish from a publication in flight.
+        let foreign = pins_dir.join(format!(
+            ".p{:03}.json.{}.0.tmp",
+            SCALED_LIMIT,
+            std::process::id().wrapping_add(1)
+        ));
+        let ours = pins_dir.join(format!(
+            ".p{:03}.json.{}.1.tmp",
+            SCALED_LIMIT + 1,
+            std::process::id()
+        ));
+        fs::write(&foreign, b"{}").unwrap();
+        fs::write(&ours, b"{}").unwrap();
+
+        let pin_dir_fd = || {
+            open_dir_under_root(
+                &edges_dir,
+                Path::new("materialized")
+                    .join(PENDING_LOCAL_ACTIVATION_PINS_DIRNAME)
+                    .as_path(),
+                false,
+            )
+            .unwrap()
+        };
+
+        let projects = enumerate_pending_local_activation_pin_dir(
+            &pin_dir_fd(),
+            PinTemporaryReclaim::Concurrent,
+            SCALED_LIMIT,
+        )
+        .unwrap();
+        assert_eq!(
+            projects, expected,
+            "residue must not consume a legitimate pin's budget, and the set is sorted"
+        );
+        assert!(
+            !foreign.exists(),
+            "residue from a process that is gone is reclaimed"
+        );
+        assert!(
+            ours.exists(),
+            "an unlocked reader must not unlink a temporary this process may be writing"
+        );
+
+        // The whole public read path agrees, at exactly the limit.
+        let loaded = load_pending_local_activation_pins(&edges_dir).unwrap();
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|pin| pin.activation.project_id.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+
+        // A coordinator-held enumeration owns the directory outright, so it
+        // reclaims what the unlocked read had to leave alone.
+        let projects = enumerate_pending_local_activation_pin_dir(
+            &pin_dir_fd(),
+            PinTemporaryReclaim::CoordinatorHeld,
+            SCALED_LIMIT,
+        )
+        .unwrap();
+        assert_eq!(projects, expected);
+        assert!(!ours.exists(), "coordinator-held reclamation is complete");
+
+        // The bound still applies to pins: the first genuinely excess one is
+        // refused, temporaries or not.
+        publish(&format!("p{SCALED_LIMIT:03}"));
+        fs::write(&ours, b"{}").unwrap();
+        let error = enumerate_pending_local_activation_pin_dir(
+            &pin_dir_fd(),
+            PinTemporaryReclaim::Concurrent,
+            SCALED_LIMIT,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("exceeds the project catalog entry bound"),
+            "the pin bound is what refuses, not the raw entry count: {error:#}"
+        );
+
+        // Clearing reclaims residue rather than skipping it, so the directory
+        // a later read inherits is genuinely empty.
+        clear_pending_local_activation_pins(&edges_dir).unwrap();
+        assert_eq!(
+            fs::read_dir(&pins_dir).unwrap().count(),
+            0,
+            "clear leaves no residue behind"
+        );
+        assert!(
+            load_pending_local_activation_pins(&edges_dir)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// R29F1: an entry that is neither a pin leaf nor the writer's own
+    /// temporary shape is a typed refusal. The pin directory is authority; a
+    /// blanket "skip anything dot-prefixed" would let unexplained state sit
+    /// in it indefinitely.
+    #[cfg(unix)]
+    #[test]
+    fn r29_pin_enumeration_refuses_an_unrecognized_entry() {
+        for name in [".stray", ".p1.json.tmp", ".p1.json.notapid.0.tmp", "p1.txt"] {
+            let error = classify_pending_local_activation_pin_entry(name).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("unrecognized entry"),
+                "{name} must refuse: {error:#}"
+            );
+        }
+        assert!(matches!(
+            classify_pending_local_activation_pin_entry(".p1.json.4321.7.tmp").unwrap(),
+            PendingLocalActivationPinEntry::WriterTemporary { pid: 4321 }
+        ));
+        assert!(matches!(
+            classify_pending_local_activation_pin_entry("p1.json").unwrap(),
+            PendingLocalActivationPinEntry::Pin("p1")
+        ));
     }
 
     /// R28F2: the retired v1 document migrates to per-project pins on the

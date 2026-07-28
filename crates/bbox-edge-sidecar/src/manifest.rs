@@ -837,7 +837,11 @@ fn write_manifest_index_confined(edges_dir: &Path, index: &ManifestIndex) -> Res
     Ok(())
 }
 
-const MAX_ACTIVE_MATERIALIZATION_FILES: usize = 100_000;
+/// The writer's declared cap on the files one workspace materialization
+/// directory may hold. Public because inventory walks outside this crate size
+/// their own per-project bounds against the same writer contract instead of
+/// inventing a flat ceiling of their own (R29F2).
+pub const MAX_ACTIVE_MATERIALIZATION_FILES: usize = 100_000;
 const MAX_OVERLAY_MANIFEST_BYTES: usize = 1024 * 1024;
 
 fn validate_workspace_entry_shape(project_id: &str, entry: &WorkspaceIndexEntry) -> Result<()> {
@@ -973,10 +977,25 @@ fn open_confined_regular(base: &fs::File, relative: &str) -> Result<Option<fs::F
     Ok(Some(file))
 }
 
+/// R29F1: stream a directory's names to `visit` without collecting them.
+///
+/// `read_directory_names` below is the collecting form, and its bound counts
+/// RAW entries. A caller whose own bound applies to a CLASSIFIED subset of
+/// the directory (legitimate leaves, ignoring the atomic writer's own
+/// temporaries) cannot express that through the collecting form: the raw
+/// bound refuses before classification ever runs. Streaming lets such a
+/// caller classify, reclaim, and count on its own terms while still never
+/// holding more than one entry name at a time.
+///
+/// `visit` returning an error stops enumeration and propagates, with the
+/// directory stream closed first.
 #[cfg(unix)]
-pub(crate) fn read_directory_names(directory: &fs::File) -> Result<Vec<std::ffi::OsString>> {
+pub(crate) fn for_each_directory_name<F>(directory: &fs::File, mut visit: F) -> Result<()>
+where
+    F: FnMut(&std::ffi::OsStr) -> Result<()>,
+{
     use std::os::fd::AsRawFd;
-    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::ffi::OsStrExt;
 
     let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
     if duplicate < 0 {
@@ -987,7 +1006,6 @@ pub(crate) fn read_directory_names(directory: &fs::File) -> Result<Vec<std::ffi:
         unsafe { libc::close(duplicate) };
         return Err(std::io::Error::last_os_error().into());
     }
-    let mut names = Vec::new();
     loop {
         set_readdir_errno(0);
         let entry = unsafe { libc::readdir(stream) };
@@ -997,17 +1015,29 @@ pub(crate) fn read_directory_names(directory: &fs::File) -> Result<Vec<std::ffi:
             if error != 0 {
                 return Err(std::io::Error::from_raw_os_error(error).into());
             }
-            break;
+            return Ok(());
         }
         let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-        if name != b"." && name != b".." {
-            names.push(std::ffi::OsString::from_vec(name.to_vec()));
-            if names.len() > MAX_ACTIVE_MATERIALIZATION_FILES {
-                unsafe { libc::closedir(stream) };
-                anyhow::bail!("workspace materialization exceeds its file limit");
-            }
+        if name == b"." || name == b".." {
+            continue;
+        }
+        if let Err(error) = visit(std::ffi::OsStr::from_bytes(name)) {
+            unsafe { libc::closedir(stream) };
+            return Err(error);
         }
     }
+}
+
+#[cfg(unix)]
+pub(crate) fn read_directory_names(directory: &fs::File) -> Result<Vec<std::ffi::OsString>> {
+    let mut names = Vec::new();
+    for_each_directory_name(directory, |name| {
+        names.push(name.to_os_string());
+        if names.len() > MAX_ACTIVE_MATERIALIZATION_FILES {
+            anyhow::bail!("workspace materialization exceeds its file limit");
+        }
+        Ok(())
+    })?;
     Ok(names)
 }
 
