@@ -187,7 +187,7 @@ impl ArtifactWatchAccess for DaemonArtifactWatchAccess {
         &self,
         carrier: &ArtifactWatchCarrier,
         prepare: &mut dyn FnMut(&dyn ArtifactWatchRead) -> Result<()>,
-        publish: &mut dyn FnMut() -> Result<()>,
+        publish: &mut dyn FnMut(&dyn ArtifactWatchRead) -> Result<()>,
     ) -> Result<()> {
         let scope_lease = self
             .broker
@@ -228,7 +228,7 @@ impl ArtifactWatchAccess for DaemonArtifactWatchAccess {
             .broker
             .publication_guard(&lease)
             .map_err(anyhow::Error::new)?;
-        publish()
+        publish(&LeaseArtifactWatchRead { lease: &lease })
     }
 }
 
@@ -246,5 +246,9 @@ impl ArtifactWatchRead for LeaseArtifactWatchRead<'_> {
             .read_relative_file(relative)
             .map(|(_, bytes)| bytes)
             .map_err(anyhow::Error::new)
+    }
+
+    fn check_relative_absence(&self, relative: &Path) -> Result<bool> {
+        Ok(!self.lease.relative_regular_file_exists(relative)?)
     }
 }

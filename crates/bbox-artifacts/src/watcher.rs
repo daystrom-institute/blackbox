@@ -90,6 +90,12 @@ pub trait ArtifactWatchRead {
     fn project_root(&self) -> &Path;
 
     fn read_relative_file(&self, relative: &Path) -> anyhow::Result<Vec<u8>>;
+
+    /// R17F4: descriptor-relative absence inspection. Returns true when
+    /// the relative path does not exist (or is inaccessible) under the
+    /// confined checkout descriptor. Implementations must reject symlinks
+    /// in every path component, same as read_relative_file.
+    fn check_relative_absence(&self, relative: &Path) -> anyhow::Result<bool>;
 }
 
 pub trait ArtifactWatchAccess: Send + Sync {
@@ -97,7 +103,7 @@ pub trait ArtifactWatchAccess: Send + Sync {
         &self,
         carrier: &ArtifactWatchCarrier,
         prepare: &mut dyn FnMut(&dyn ArtifactWatchRead) -> anyhow::Result<()>,
-        publish: &mut dyn FnMut() -> anyhow::Result<()>,
+        publish: &mut dyn FnMut(&dyn ArtifactWatchRead) -> anyhow::Result<()>,
     ) -> anyhow::Result<()>;
 }
 
@@ -258,7 +264,7 @@ impl BbxWatcher {
             discovered_root = Some(bbox_root);
             Ok(())
         };
-        let mut publish = || Ok(());
+        let mut publish = |_read: &dyn ArtifactWatchRead| Ok(());
         let discovery_result = self
             .access
             .with_discovery(&carrier, &mut operation, &mut publish);
@@ -345,6 +351,7 @@ enum PreparedArtifactAction {
         local: bool,
         kind: crate::artifacts::ArtifactKind,
         source: PathBuf,
+        relative_source: PathBuf,
         expected_name: String,
         expected_version: String,
         expected_content_sha256: Option<String>,
@@ -352,7 +359,7 @@ enum PreparedArtifactAction {
 }
 
 impl PreparedArtifactAction {
-    fn publish(self, catalog: &ArtifactCatalog) {
+    fn publish(self, catalog: &ArtifactCatalog, publish_read: &dyn ArtifactWatchRead) {
         match self {
             Self::Install {
                 project_id,
@@ -390,33 +397,58 @@ impl PreparedArtifactAction {
                 local,
                 kind,
                 source,
+                relative_source,
                 expected_name,
                 expected_version,
                 expected_content_sha256,
-            } => match catalog.mark_removed_by_source_if_identity(
-                ArtifactScope::Project {
-                    project_id: &project_id,
-                    local,
-                },
-                kind,
-                &source,
-                &expected_name,
-                &expected_version,
-                expected_content_sha256.as_deref(),
-            ) {
-                Ok(Some(meta)) => tracing::info!(
-                    "watcher: marked removed {}/{} (project {})",
-                    kind.as_str(),
-                    meta.name,
-                    project_id,
-                ),
-                Ok(None) => {}
-                Err(error) => tracing::warn!(
-                    artifact_kind = %kind.as_str(),
-                    error = %error,
-                    "watcher: prepared artifact removal failed"
-                ),
-            },
+            } => {
+                // R17F4: re-verify source absence under the publication
+                // lease before mutating the catalog.
+                match publish_read.check_relative_absence(&relative_source) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::info!(
+                            artifact_kind = %kind.as_str(),
+                            source = %source.display(),
+                            "watcher: removal skipped, source reappeared before publication"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            artifact_kind = %kind.as_str(),
+                            source = %source.display(),
+                            error = %error,
+                            "watcher: removal skipped, could not re-verify absence"
+                        );
+                        return;
+                    }
+                }
+                match catalog.mark_removed_by_source_if_identity(
+                    ArtifactScope::Project {
+                        project_id: &project_id,
+                        local,
+                    },
+                    kind,
+                    &source,
+                    &expected_name,
+                    &expected_version,
+                    expected_content_sha256.as_deref(),
+                ) {
+                    Ok(Some(meta)) => tracing::info!(
+                        "watcher: marked removed {}/{} (project {})",
+                        kind.as_str(),
+                        meta.name,
+                        project_id,
+                    ),
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(
+                        artifact_kind = %kind.as_str(),
+                        error = %error,
+                        "watcher: prepared artifact removal failed"
+                    ),
+                }
+            }
         }
     }
 }
@@ -466,7 +498,7 @@ fn prepare_artifact_event(
             if let Some(action) = prepare_create(path, project_id, bbox_root, read) {
                 actions.push(action);
             }
-        } else if let Some(action) = prepare_remove(path, project_id, bbox_root, catalog) {
+        } else if let Some(action) = prepare_remove(path, project_id, bbox_root, read, catalog) {
             actions.push(action);
         }
     }
@@ -516,9 +548,9 @@ fn handle_event_batch(
                     event_touches_repo_store(event, std::slice::from_ref(&bbox_root));
                 Ok(())
             };
-            let mut publish = || {
+            let mut publish = |read: &dyn ArtifactWatchRead| {
                 for action in prepared_actions.borrow_mut().drain(..) {
-                    action.publish(catalog);
+                    action.publish(catalog, read);
                 }
                 Ok(())
             };
@@ -589,6 +621,7 @@ fn prepare_remove(
     path: &Path,
     project_id: &str,
     bbox_root: &Path,
+    read: &dyn ArtifactWatchRead,
     catalog: &ArtifactCatalog,
 ) -> Option<PreparedArtifactAction> {
     let Ok(relative) = path.strip_prefix(bbox_root) else {
@@ -625,24 +658,38 @@ fn prepare_remove(
             return None;
         }
     };
-    // R16F4: prove source absence. A remove event that fires while the
-    // source file still exists is a spurious event (e.g. a modify that
-    // the watcher misreported, or a rapid create-after-remove). Binding
-    // the removal to a non-absent source would deactivate an artifact
-    // whose file is still present.
-    if path.exists() || std::fs::symlink_metadata(path).is_ok() {
-        tracing::debug!(
-            artifact_kind = %kind.as_str(),
-            source = %source.display(),
-            "watcher: remove event ignored because source still exists"
-        );
-        return None;
+    // R17F4: prove source absence through the descriptor-relative reader
+    // (confined checkout descriptor), not via raw path-based exists().
+    // source is already relative to the project root (includes .bbox/
+    // prefix from logical_artifact_source). This is the first absence
+    // check under the discovery lease.
+    let relative_source = source.clone();
+    match read.check_relative_absence(&relative_source) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::debug!(
+                artifact_kind = %kind.as_str(),
+                source = %source.display(),
+                "watcher: remove event ignored because source still exists"
+            );
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!(
+                artifact_kind = %kind.as_str(),
+                source = %source.display(),
+                error = %error,
+                "watcher: could not verify source absence under descriptor"
+            );
+            return None;
+        }
     }
     Some(PreparedArtifactAction::Remove {
         project_id: project_id.to_owned(),
         local,
         kind,
         source,
+        relative_source,
         expected_name: metadata.name,
         expected_version: metadata.version,
         expected_content_sha256: metadata.content_sha256,
@@ -738,6 +785,42 @@ mod tests {
             &self.root
         }
 
+        fn check_relative_absence(&self, relative: &Path) -> anyhow::Result<bool> {
+            self.access
+                .relative_read_calls
+                .fetch_add(1, Ordering::SeqCst);
+            if self.access.deny_relative_reads.load(Ordering::SeqCst) {
+                anyhow::bail!("confined artifact read denied");
+            }
+            let mut current = self.root.clone();
+            let components = relative.components().collect::<Vec<_>>();
+            if components.is_empty() {
+                anyhow::bail!("empty relative artifact path");
+            }
+            for (index, component) in components.iter().enumerate() {
+                let std::path::Component::Normal(name) = component else {
+                    anyhow::bail!("unsafe relative artifact path");
+                };
+                current.push(name);
+                let metadata = match std::fs::symlink_metadata(&current) {
+                    Ok(m) => m,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+                    Err(e) => return Err(e.into()),
+                };
+                if metadata.file_type().is_symlink() {
+                    anyhow::bail!("symlinked artifact path refused");
+                }
+                let is_last = index + 1 == components.len();
+                if is_last {
+                    return Ok(false);
+                }
+                if !metadata.is_dir() {
+                    anyhow::bail!("artifact path component has the wrong type");
+                }
+            }
+            Ok(false)
+        }
+
         fn read_relative_file(&self, relative: &Path) -> anyhow::Result<Vec<u8>> {
             self.access
                 .relative_read_calls
@@ -779,7 +862,7 @@ mod tests {
             &self,
             carrier: &ArtifactWatchCarrier,
             prepare: &mut dyn FnMut(&dyn ArtifactWatchRead) -> anyhow::Result<()>,
-            publish: &mut dyn FnMut() -> anyhow::Result<()>,
+            publish: &mut dyn FnMut(&dyn ArtifactWatchRead) -> anyhow::Result<()>,
         ) -> anyhow::Result<()> {
             if self.denied.load(Ordering::SeqCst) {
                 anyhow::bail!("artifact watch discovery denied");
@@ -800,7 +883,7 @@ mod tests {
             if self.fail_after_operation.load(Ordering::SeqCst) {
                 anyhow::bail!("artifact watch discovery changed after operation");
             }
-            publish()
+            publish(&read)
         }
     }
 
@@ -970,6 +1053,11 @@ mod tests {
         let workflow_dir = bbox_dir.join("workflows");
         std::fs::create_dir_all(&workflow_dir).unwrap();
         let catalog = ArtifactCatalog::open(directory.path().join("catalog")).unwrap();
+        let access = TestWatchAccess::default();
+        let test_read = TestWatchRead {
+            access: &access,
+            root: project_dir.clone(),
+        };
         let source = PathBuf::from(".bbox/workflows/reinstall.json");
         catalog
             .install_value_scoped(
@@ -989,6 +1077,7 @@ mod tests {
             &workflow_dir.join("reinstall.json"),
             "p1",
             &bbox_dir,
+            &test_read,
             &catalog,
         )
         .unwrap();
@@ -1007,7 +1096,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        action.publish(&catalog);
+        action.publish(&catalog, &test_read);
 
         let active = catalog
             .active_artifact_by_source(
@@ -1036,6 +1125,11 @@ mod tests {
         let workflow_dir = bbox_dir.join("workflows");
         std::fs::create_dir_all(&workflow_dir).unwrap();
         let catalog = ArtifactCatalog::open(directory.path().join("catalog")).unwrap();
+        let access = TestWatchAccess::default();
+        let test_read = TestWatchRead {
+            access: &access,
+            root: project_dir.clone(),
+        };
         let source = PathBuf::from(".bbox/workflows/reinstall.json");
         catalog
             .install_value_scoped(
@@ -1055,6 +1149,7 @@ mod tests {
             &workflow_dir.join("reinstall.json"),
             "p1",
             &bbox_dir,
+            &test_read,
             &catalog,
         )
         .unwrap();
@@ -1074,7 +1169,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        action.publish(&catalog);
+        action.publish(&catalog, &test_read);
 
         let active = catalog
             .active_artifact_by_source(
@@ -1104,6 +1199,11 @@ mod tests {
         let workflow_dir = bbox_dir.join("workflows");
         std::fs::create_dir_all(&workflow_dir).unwrap();
         let catalog = ArtifactCatalog::open(directory.path().join("catalog")).unwrap();
+        let access = TestWatchAccess::default();
+        let test_read = TestWatchRead {
+            access: &access,
+            root: project_dir.clone(),
+        };
         let source = PathBuf::from(".bbox/workflows/persist.json");
         catalog
             .install_value_scoped(
@@ -1131,11 +1231,135 @@ mod tests {
             &workflow_dir.join("persist.json"),
             "p1",
             &bbox_dir,
+            &test_read,
             &catalog,
         );
         assert!(
             action.is_none(),
             "remove event for existing source must produce no action"
+        );
+    }
+
+    // R17F4: descriptor-relative absence re-verified under the publication
+    // lease. If the source file reappears between prepare and publish, the
+    // removal must be skipped.
+    #[test]
+    fn r17f4_remove_skipped_when_source_reappears_before_publish() {
+        let directory = tempdir().unwrap();
+        let project_dir = directory.path().canonicalize().unwrap().join("project");
+        let bbox_dir = project_dir.join(".bbox");
+        let workflow_dir = bbox_dir.join("workflows");
+        std::fs::create_dir_all(&workflow_dir).unwrap();
+        let catalog = ArtifactCatalog::open(directory.path().join("catalog")).unwrap();
+        let access = TestWatchAccess::default();
+        let test_read = TestWatchRead {
+            access: &access,
+            root: project_dir.clone(),
+        };
+        let source = PathBuf::from(".bbox/workflows/reinstall.json");
+        let original = serde_json::json!({"name": "reinstall", "version": "1", "steps": []});
+        catalog
+            .install_value_scoped(
+                ArtifactScope::Project {
+                    project_id: "p1",
+                    local: false,
+                },
+                crate::artifacts::ArtifactKind::Workflow,
+                source.to_string_lossy().into_owned(),
+                &original,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Source is absent at prepare time.
+        let action = prepare_remove(
+            &workflow_dir.join("reinstall.json"),
+            "p1",
+            &bbox_dir,
+            &test_read,
+            &catalog,
+        )
+        .unwrap();
+
+        // Recreate the file with identical content before publish.
+        std::fs::write(
+            workflow_dir.join("reinstall.json"),
+            serde_json::to_vec(&original).unwrap(),
+        )
+        .unwrap();
+
+        // Publish must re-check absence and skip the removal.
+        action.publish(&catalog, &test_read);
+
+        let active = catalog
+            .active_artifact_by_source(
+                ArtifactScope::Project {
+                    project_id: "p1",
+                    local: false,
+                },
+                crate::artifacts::ArtifactKind::Workflow,
+                &source,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.name, "reinstall", "artifact must remain active");
+    }
+
+    // R17F4: the absence check must be descriptor-relative. A swapped
+    // parent component (replacing a directory) must not trick the check.
+    #[test]
+    fn r17f4_remove_detects_swapped_parent_component() {
+        let directory = tempdir().unwrap();
+        let project_dir = directory.path().canonicalize().unwrap().join("project");
+        let bbox_dir = project_dir.join(".bbox");
+        let workflow_dir = bbox_dir.join("workflows");
+        std::fs::create_dir_all(&workflow_dir).unwrap();
+        let catalog = ArtifactCatalog::open(directory.path().join("catalog")).unwrap();
+        let access = TestWatchAccess::default();
+        let test_read = TestWatchRead {
+            access: &access,
+            root: project_dir.clone(),
+        };
+        let source = PathBuf::from(".bbox/workflows/swap.json");
+        catalog
+            .install_value_scoped(
+                ArtifactScope::Project {
+                    project_id: "p1",
+                    local: false,
+                },
+                crate::artifacts::ArtifactKind::Workflow,
+                source.to_string_lossy().into_owned(),
+                &serde_json::json!({"name": "swap", "version": "1", "steps": []}),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Replace the workflows directory with a symlink to a temp dir
+        // that contains swap.json. A path-based check would follow the
+        // symlink and see the file as absent. The descriptor-relative
+        // check must detect the symlink and refuse.
+        let other_dir = directory.path().join("other");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        std::fs::remove_dir_all(&workflow_dir).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&other_dir, &workflow_dir).unwrap();
+
+        let action = prepare_remove(
+            &workflow_dir.join("swap.json"),
+            "p1",
+            &bbox_dir,
+            &test_read,
+            &catalog,
+        );
+        // The descriptor-relative reader rejects the symlink in the path
+        // component, so prepare_remove returns None (no action).
+        assert!(
+            action.is_none(),
+            "symlinked parent component must not bypass absence check"
         );
     }
 
@@ -1222,7 +1446,7 @@ mod tests {
         let access = TestWatchAccess::default();
         access.insert(carrier.clone(), project.clone());
         let mut discovered = None;
-        let mut publish = || Ok(());
+        let mut publish = |_read: &dyn ArtifactWatchRead| Ok(());
         access
             .with_discovery(
                 &carrier,
