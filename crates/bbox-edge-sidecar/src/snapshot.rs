@@ -3265,6 +3265,83 @@ pub fn prune_receipt_closeouts_after_commit(
     })
 }
 
+/// R27F6: decide whether a materialized snapshot tree is present, using
+/// descriptor-confined inspection. Returns `Ok(false)` only for an exact
+/// ENOENT on the leaf or one of its anchored parents. A symlink anywhere on
+/// the chain, a non-directory leaf, a permission failure, or any other error
+/// is a typed refusal so the caller never treats an inspection failure as
+/// proof of absence.
+#[cfg(unix)]
+fn snapshot_tree_is_present(edges_dir: &Path, snapshot: &str) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let relative = Path::new("materialized").join(snapshot);
+    let components = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(value) => Ok(value.to_os_string()),
+            _ => anyhow::bail!("receipt binding snapshot path is not normalized"),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let Some((leaf, parents)) = components.split_last() else {
+        anyhow::bail!("receipt binding snapshot path has no leaf");
+    };
+    let directory = match open_dir_under_root(
+        edges_dir,
+        parents.iter().collect::<PathBuf>().as_path(),
+        false,
+    ) {
+        Ok(directory) => directory,
+        Err(error) if is_not_found(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let leaf_c = std::ffi::CString::new(leaf.as_bytes())?;
+    let stat = match fstatat_nofollow(directory.as_raw_fd(), &leaf_c) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    match stat.st_mode & libc::S_IFMT {
+        libc::S_IFDIR => Ok(true),
+        libc::S_IFLNK => {
+            anyhow::bail!("receipt binding snapshot path is a symlink")
+        }
+        _ => anyhow::bail!("receipt binding snapshot path is not a directory"),
+    }
+}
+
+#[cfg(not(unix))]
+fn snapshot_tree_is_present(edges_dir: &Path, snapshot: &str) -> Result<bool> {
+    let relative = Path::new("materialized").join(snapshot);
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        anyhow::bail!("receipt binding snapshot path is not normalized");
+    }
+    let path = edges_dir.join(&relative);
+    let Some(parent) = path.parent() else {
+        anyhow::bail!("receipt binding snapshot path has no parent");
+    };
+    match validate_nonunix_directory_chain(edges_dir, parent) {
+        Ok(()) => {}
+        Err(error) if is_not_found(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!("receipt binding snapshot path is a symlink")
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            anyhow::bail!("receipt binding snapshot path is not a directory")
+        }
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn recover_snapshot_reclamations_prebind(edges_dir: &Path) -> Result<()> {
     let mut index = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
     let intents = index
@@ -3295,17 +3372,23 @@ fn recover_snapshot_reclamations_prebind(edges_dir: &Path) -> Result<()> {
         index = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
     }
 
-    let stale_absent = index
-        .receipt_managed_snapshots
-        .keys()
-        .filter(|snapshot| !index.snapshot_is_active(snapshot))
-        .filter(|snapshot| {
-            !crate::manifest::materialized_dir(edges_dir)
-                .join(snapshot.as_str())
-                .exists()
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    // R27F6: pruning a receipt binding discards recovery authority, so
+    // absence has to be proven, not inferred. `Path::exists()` collapses a
+    // permission or traversal failure into `false` and follows symlinks on
+    // every component, which means a denied read on `materialized/` used to
+    // read as "the snapshot is gone, drop its binding". Inspect through
+    // anchored no-follow descriptors instead and prune only on an exact
+    // ENOENT; every other inspection outcome refuses without mutating
+    // authority.
+    let mut stale_absent = Vec::new();
+    for snapshot in index.receipt_managed_snapshots.keys() {
+        if index.snapshot_is_active(snapshot) {
+            continue;
+        }
+        if !snapshot_tree_is_present(edges_dir, snapshot)? {
+            stale_absent.push(snapshot.clone());
+        }
+    }
     if !stale_absent.is_empty() {
         for snapshot in stale_absent {
             index.prune_snapshot_receipt_state(&snapshot);
@@ -9202,6 +9285,61 @@ mod tests {
 
         let error = load_pending_local_activation_journal(&edges_dir).unwrap_err();
         assert!(format!("{error:#}").contains("exceeds max size"));
+    }
+
+    /// R27F6: pruning a receipt binding discards recovery authority, so an
+    /// inspection failure must refuse rather than read as absence.
+    #[cfg(unix)]
+    #[test]
+    fn r27_prebind_refuses_to_prune_a_binding_it_cannot_inspect() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let snapshots = crate::manifest::materialized_dir(&edges_dir)
+            .join("workspace")
+            .join("p_1")
+            .join("snapshots");
+        fs::create_dir_all(&snapshots).unwrap();
+        std::os::unix::fs::symlink(outside.path(), snapshots.join("snapshot-a")).unwrap();
+
+        let mut manifest = ManifestIndex::new();
+        manifest.receipt_managed_snapshots.insert(
+            "workspace/p_1/snapshots/snapshot-a".to_string(),
+            "0".repeat(64),
+        );
+        manifest.write_atomic(&edges_dir).unwrap();
+
+        let error = recover_pending_transactions_prebind(&edges_dir, None).unwrap_err();
+        assert!(format!("{error:#}").contains("symlink"));
+        assert!(
+            ManifestIndex::load(&edges_dir)
+                .unwrap()
+                .receipt_managed_snapshots
+                .contains_key("workspace/p_1/snapshots/snapshot-a")
+        );
+    }
+
+    /// R27F6: an exact ENOENT is still proof of absence, so genuinely stale
+    /// bindings are still pruned.
+    #[cfg(unix)]
+    #[test]
+    fn r27_prebind_prunes_a_binding_whose_tree_is_exactly_absent() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let mut manifest = ManifestIndex::new();
+        manifest.receipt_managed_snapshots.insert(
+            "workspace/p_1/snapshots/snapshot-a".to_string(),
+            "0".repeat(64),
+        );
+        manifest.write_atomic(&edges_dir).unwrap();
+
+        recover_pending_transactions_prebind(&edges_dir, None).unwrap();
+        assert!(
+            ManifestIndex::load(&edges_dir)
+                .unwrap()
+                .receipt_managed_snapshots
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]
