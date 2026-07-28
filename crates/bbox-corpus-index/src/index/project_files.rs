@@ -192,7 +192,9 @@ impl ProjectIndexPublicationBundle {
     /// contributed to this bundle for the entire call and the Tantivy commit.
     pub fn publish(&mut self) -> Result<PublicationResult> {
         let mut pending_local_snapshots = Vec::new();
-        let mut pending_snapshot_finalizations: Vec<(PathBuf, String, String)> = Vec::new();
+        let mut pending_snapshot_finalizations: Vec<
+            bbox_edge_sidecar::snapshot::SnapshotTxnHandle,
+        > = Vec::new();
         for action in self.actions.drain(..) {
             match action {
                 ProjectIndexPublication::SnapshotRename {
@@ -263,13 +265,14 @@ impl ProjectIndexPublicationBundle {
                     } else {
                         Vec::new()
                     };
-                    bbox_edge_sidecar::snapshot::write_snapshot_members_transaction(
-                        &edges_dir,
-                        &project_id,
-                        &snapshot_id,
-                        &[("git-current.jsonl", git_edges.as_slice())],
-                    )?;
-                    pending_snapshot_finalizations.push((edges_dir, project_id, snapshot_id));
+                    let txn_handle =
+                        bbox_edge_sidecar::snapshot::write_snapshot_members_transaction(
+                            &edges_dir,
+                            &project_id,
+                            &snapshot_id,
+                            &[("git-current.jsonl", git_edges.as_slice())],
+                        )?;
+                    pending_snapshot_finalizations.push(txn_handle);
                 }
                 ProjectIndexPublication::LocalSnapshot(publication) => {
                     let project_edges =
@@ -321,31 +324,42 @@ impl Drop for ProjectIndexPublicationBundle {
 #[derive(Debug)]
 pub struct PublicationResult {
     pub pending_local_snapshots: Vec<bbox_edge_sidecar::snapshot::PendingLocalSnapshotActivation>,
-    /// Snapshots that had their member files written during publish() but
-    /// whose staging markers were intentionally left in place. The caller
-    /// must call finalize_snapshot_publication for each entry AFTER
-    /// writer.commit() succeeds, closing the R16F3 crash window between
-    /// sidecar publication and index commit.
-    pub pending_snapshot_finalizations: Vec<(PathBuf, String, String)>,
+    /// Transaction handles for snapshots that had their member files staged
+    /// during publish(). The caller MUST carry each handle's txn_token in
+    /// the Tantivy commit payload (prepare_commit + set_payload) and call
+    /// finalize_snapshot_publication for each handle AFTER writer.commit()
+    /// succeeds. R20F2: finalization processes ONLY the exact handle.
+    pub pending_snapshot_finalizations: Vec<bbox_edge_sidecar::snapshot::SnapshotTxnHandle>,
 }
 
 impl PublicationResult {
-    /// Clear all pending staging markers. Called after writer.commit().
-    pub fn finalize_publications(self) {
-        for (edges_dir, project_id, snapshot_id) in &self.pending_snapshot_finalizations {
-            if let Err(error) = bbox_edge_sidecar::snapshot::finalize_snapshot_publication(
-                edges_dir,
-                project_id,
-                snapshot_id,
-            ) {
-                tracing::warn!(
-                    project_id = %project_id,
-                    snapshot_id = %snapshot_id,
+    /// Finalize all pending transactions. R20F4: returns Result; the caller
+    /// must NOT publish the post-commit read view until this succeeds.
+    pub fn finalize_publications(self) -> Result<()> {
+        for handle in &self.pending_snapshot_finalizations {
+            if let Err(error) = bbox_edge_sidecar::snapshot::finalize_snapshot_publication(handle) {
+                tracing::error!(
+                    project_id = %handle.project_id,
+                    snapshot_id = %handle.snapshot_id,
+                    txn_token = %handle.txn_token,
                     error = %error,
-                    "failed to finalize snapshot publication marker after index commit"
+                    "failed to finalize snapshot publication after index commit"
                 );
+                return Err(error);
             }
         }
+        Ok(())
+    }
+}
+
+impl PublicationResult {
+    /// Collect all txn_tokens from pending finalizations for the Tantivy
+    /// commit payload.
+    pub fn pending_txn_tokens(&self) -> Vec<String> {
+        self.pending_snapshot_finalizations
+            .iter()
+            .map(|h| h.txn_token.clone())
+            .collect()
     }
 }
 

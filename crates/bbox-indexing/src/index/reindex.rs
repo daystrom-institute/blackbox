@@ -739,7 +739,7 @@ pub(super) fn execute_reindex_pass(
     let tool_edge_publication = tool_edges.take_publish_bundle();
     let project_publication_result = project_stats.publication.publish()?;
     project_stats.pending_local_snapshots = project_publication_result.pending_local_snapshots;
-    let pending_snapshot_finalizations = project_publication_result.pending_snapshot_finalizations;
+    let pending_handles = project_publication_result.pending_snapshot_finalizations;
     tool_edge_publication.publish()?;
     let pending_journal = if project_stats.pending_local_snapshots.is_empty() {
         None
@@ -760,19 +760,29 @@ pub(super) fn execute_reindex_pass(
         }
         Some(journal)
     };
-    writer.commit()?;
-    for (edges_dir, project_id, snapshot_id) in &pending_snapshot_finalizations {
-        if let Err(error) = bbox_edge_sidecar::snapshot::finalize_snapshot_publication(
-            edges_dir,
-            project_id,
-            snapshot_id,
-        ) {
-            tracing::warn!(
-                project_id = %project_id,
-                snapshot_id = %snapshot_id,
+    // R20F1: bind transaction tokens in the prepared-commit payload so
+    // recovery can prove the index commit covered these transactions.
+    let txn_payload = pending_handles
+        .iter()
+        .map(|h| h.txn_token.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut prepared = writer.prepare_commit()?;
+    if !txn_payload.is_empty() {
+        prepared.set_payload(&txn_payload);
+    }
+    prepared.commit()?;
+    // R20F4: fail closed if any finalization fails.
+    for handle in &pending_handles {
+        if let Err(error) = bbox_edge_sidecar::snapshot::finalize_snapshot_publication(handle) {
+            tracing::error!(
+                project_id = %handle.project_id,
+                snapshot_id = %handle.snapshot_id,
+                txn_token = %handle.txn_token,
                 error = %error,
-                "failed to finalize snapshot publication marker after reindex commit"
+                "failed to finalize snapshot publication after reindex commit"
             );
+            return Err(error);
         }
     }
     if let Some(journal) = pending_journal {

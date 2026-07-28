@@ -482,15 +482,25 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         checkout_access.clone(),
     )?);
 
-    // R19F1: unconditional pre-bind transaction recovery. Runs before
+    // R20F1: unconditional pre-bind transaction recovery. Runs before
     // selector refresh, read-view construction, and edge-index loading.
-    // Pending transaction journals are ambiguous (the paired Tantivy
-    // commit status is unprovable without a commit token): recovery
-    // discards their staging directories and journals, leaving the live
-    // snapshot untouched in its pre-transaction state.
+    // The Tantivy commit payload carries the comma-joined txn tokens that
+    // were committed atomically with the index commit. Recovery uses it
+    // to distinguish committed-but-unfinalized transactions (resume
+    // finalization) from uncommitted ones (discard staging). R20F5:
+    // crash-idempotent finalization handles mid-rename restarts.
     let edges_dir = crate::edge_index::edges_dir_from_bro_store(&store_dir);
-    bbox_edge_sidecar::snapshot::recover_pending_transactions_prebind(&edges_dir)
-        .context("pre-bind transaction recovery failed")?;
+    let commit_payload = idx
+        .index_handle()
+        .load_metas()
+        .ok()
+        .and_then(|metas| metas.payload);
+    let commit_payload_ref = commit_payload.as_deref();
+    bbox_edge_sidecar::snapshot::recover_pending_transactions_prebind(
+        &edges_dir,
+        commit_payload_ref,
+    )
+    .context("pre-bind transaction recovery failed")?;
 
     // Pre-bind catalog-mode recovery (P4-F section 10.1 steps 5-8):
     // once-only classification, relationship chain validation,

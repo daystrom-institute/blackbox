@@ -78,12 +78,12 @@ impl EdgeIndex {
         let started = Instant::now();
         let (mut index, mut seen) = Self::project_store_edges(stores);
 
-        // R19: run pending transaction recovery BEFORE loading active
-        // paths. This is a dedicated pre-bind transaction that discards
-        // ambiguous pending journals (live snapshot untouched). It must
-        // not run inside active_paths_for_loader (which is called under
-        // the manifest coordinator lock by GC).
-        bbox_edge_sidecar::snapshot::recover_pending_transactions_prebind(&stores.edges_dir)?;
+        // R20F1: pre-bind recovery. When called from the edge-index rebuild
+        // path there is no Tantivy commit payload available (this rebuild
+        // does not own the index), so commit_payload is None: every pending
+        // journal is treated as uncommitted and discarded. The payload-aware
+        // recovery with a real payload runs in the server open path.
+        bbox_edge_sidecar::snapshot::recover_pending_transactions_prebind(&stores.edges_dir, None)?;
 
         index.load_sidecar_edges_admitting_fully_absent(
             &stores.edges_dir,

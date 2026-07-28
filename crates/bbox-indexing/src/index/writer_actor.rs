@@ -1496,8 +1496,18 @@ fn run_collected_stage(
     // publication guard to hold: the broker's guard exists to pin checkout
     // lifecycle across publish, and this transaction touched no checkout.
     let publication_result = publication.publish()?;
-    writer.commit()?;
-    publication_result.finalize_publications();
+    // R20F1: bind the commit to the exact transaction tokens via Tantivy
+    // prepared-commit payload so that recovery can verify the index commit
+    // actually covered these transactions before finalizing or discarding.
+    let txn_payload = publication_result.pending_txn_tokens().join(",");
+    let mut prepared = writer.prepare_commit()?;
+    if !txn_payload.is_empty() {
+        prepared.set_payload(&txn_payload);
+    }
+    prepared.commit()?;
+    // R20F4: finalization returns Result; do not publish the post-commit
+    // read view until staging members are renamed into the live snapshot.
+    publication_result.finalize_publications()?;
     post_commit(ctx);
     Ok(result)
 }
@@ -1607,8 +1617,13 @@ fn run_local_stage(
         .checkout_access
         .publication_guard_for([&local_lease, &git_lease])?;
     let publication_result = publication.publish()?;
-    writer.commit()?;
-    publication_result.finalize_publications();
+    let txn_payload = publication_result.pending_txn_tokens().join(",");
+    let mut prepared = writer.prepare_commit()?;
+    if !txn_payload.is_empty() {
+        prepared.set_payload(&txn_payload);
+    }
+    prepared.commit()?;
+    publication_result.finalize_publications()?;
     post_commit(ctx);
     Ok(result)
 }
@@ -1655,8 +1670,13 @@ fn run_git_current_overlay(
     publication.stage_snapshot_git_current(&edges_dir, &project.project_id, snapshot_id, true);
     let _publication_guard = ctx.checkout_access.publication_guard(lease)?;
     let publication_result = publication.publish()?;
-    writer.commit()?;
-    publication_result.finalize_publications();
+    let txn_payload = publication_result.pending_txn_tokens().join(",");
+    let mut prepared = writer.prepare_commit()?;
+    if !txn_payload.is_empty() {
+        prepared.set_payload(&txn_payload);
+    }
+    prepared.commit()?;
+    publication_result.finalize_publications()?;
     post_commit(ctx);
     Ok(())
 }
@@ -1706,7 +1726,7 @@ fn run_consolidated_history(
         );
         written += 1;
     }
-    let mut all_finalizations: Vec<(std::path::PathBuf, String, String)> = Vec::new();
+    let mut all_handles: Vec<bbox_edge_sidecar::snapshot::SnapshotTxnHandle> = Vec::new();
     for (project_id, edges) in edges_by_project {
         // Replace, not merge: a consolidated walk that produced no edge for a
         // project is asserting that project currently has none, and merging
@@ -1718,22 +1738,31 @@ fn run_consolidated_history(
             let mut publication = super::project_files::ProjectIndexPublicationBundle::default();
             publication.stage_snapshot_git_current(&edges_dir, project_id, snapshot_id, true);
             let publication_result = publication.publish()?;
-            all_finalizations.extend(publication_result.pending_snapshot_finalizations);
+            all_handles.extend(publication_result.pending_snapshot_finalizations);
         }
     }
-    writer.commit()?;
-    for (edges_dir, project_id, snapshot_id) in &all_finalizations {
-        if let Err(error) = bbox_edge_sidecar::snapshot::finalize_snapshot_publication(
-            edges_dir,
-            project_id,
-            snapshot_id,
-        ) {
-            tracing::warn!(
-                project_id = %project_id,
-                snapshot_id = %snapshot_id,
+    // R20F1: bind all transaction tokens in one prepared-commit payload.
+    let txn_payload = all_handles
+        .iter()
+        .map(|h| h.txn_token.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut prepared = writer.prepare_commit()?;
+    if !txn_payload.is_empty() {
+        prepared.set_payload(&txn_payload);
+    }
+    prepared.commit()?;
+    // R20F4: fail closed if any finalization fails.
+    for handle in &all_handles {
+        if let Err(error) = bbox_edge_sidecar::snapshot::finalize_snapshot_publication(handle) {
+            tracing::error!(
+                project_id = %handle.project_id,
+                snapshot_id = %handle.snapshot_id,
+                txn_token = %handle.txn_token,
                 error = %error,
-                "failed to finalize snapshot publication marker after consolidated index commit"
+                "failed to finalize snapshot publication after consolidated index commit"
             );
+            return Err(error);
         }
     }
     post_commit(ctx);
