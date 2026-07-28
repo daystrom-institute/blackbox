@@ -6855,6 +6855,15 @@ mod tests {
         let live_member = snapshot_dir(&edges_dir, "p_1", &snapshot_id).join("git-current.jsonl");
         let live_before = fs::read(&live_member).unwrap_or_default();
 
+        let foreign = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("symbol-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+        finalize_snapshot_publication(&foreign).unwrap();
+
         let _txn_handle = write_snapshot_members_transaction(
             &edges_dir,
             "p_1",
@@ -6989,8 +6998,8 @@ mod tests {
         )
         .unwrap();
 
-        // Payload has a different token than what was staged.
-        recover_pending_transactions_prebind(&edges_dir, Some("different_token")).unwrap();
+        // Payload proves a different, already-closed transaction.
+        recover_pending_transactions_prebind(&edges_dir, Some(&foreign.commitment)).unwrap();
 
         let live_after = fs::read(&live_member).unwrap_or_default();
         assert_eq!(
@@ -7014,6 +7023,32 @@ mod tests {
         assert!(
             journals.is_empty(),
             "journal must be discarded when payload does not match"
+        );
+    }
+
+    #[test]
+    fn r25_malformed_payload_entry_refuses_before_recovery_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
+        let handle = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+
+        let error =
+            recover_pending_transactions_prebind(&edges_dir, Some("different_token")).unwrap_err();
+        assert!(format!("{error:#}").contains("malformed payload commitment"));
+        let txn_dir = materialized_dir(&edges_dir).join("workspace/p_1/txn");
+        assert!(txn_dir.join(&handle.txn_token).is_dir());
+        assert!(
+            txn_dir
+                .join(format!("{}.journal.json", handle.txn_token))
+                .is_file()
         );
     }
 

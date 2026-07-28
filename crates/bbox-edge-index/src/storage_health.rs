@@ -769,6 +769,35 @@ fn validated_snapshot_tree_bytes(root: &Path) -> Result<u64> {
     Ok(bytes)
 }
 
+fn snapshot_tree_age_secs(root: &Path) -> Result<u64> {
+    const MAX_SNAPSHOT_TREE_ENTRIES: usize = 250_000;
+    let mut pending = vec![root.to_path_buf()];
+    let mut entries = 0_usize;
+    let mut newest_age = None;
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            entries += 1;
+            if entries > MAX_SNAPSHOT_TREE_ENTRIES {
+                anyhow::bail!("snapshot retention tree exceeds its entry bound");
+            }
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.file_type().is_symlink() {
+                anyhow::bail!("snapshot retention tree contains a symlink");
+            }
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                let age = file_age_secs(&entry.path())?;
+                newest_age = Some(newest_age.map_or(age, |current: u64| current.min(age)));
+            } else {
+                anyhow::bail!("snapshot retention tree contains a special node");
+            }
+        }
+    }
+    Ok(newest_age.unwrap_or(file_age_secs(root)?))
+}
+
 #[cfg(unix)]
 fn record_file_identity(
     identities: &mut HashMap<String, (u64, u64)>,
@@ -1406,7 +1435,7 @@ fn plan_snapshot_gc(
             snapshot_dir,
             project_id,
             repo_id,
-            age_secs: file_age_secs(Path::new(&file.path)).unwrap_or(0),
+            age_secs: snapshot_tree_age_secs(Path::new(&file.path)).unwrap_or(0),
         });
     }
 
