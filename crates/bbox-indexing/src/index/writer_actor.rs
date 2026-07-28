@@ -1496,18 +1496,16 @@ fn run_collected_stage(
     // publication guard to hold: the broker's guard exists to pin checkout
     // lifecycle across publish, and this transaction touched no checkout.
     let publication_result = publication.publish()?;
-    // R21F1+F2: bind the commit to the cryptographic commitments for this
-    // transaction AND carry forward all outstanding commitments from journals
-    // still on disk (from failed finalizations or concurrent writers). Every
-    // commit must carry ALL unresolved tokens so a later commit cannot erase
-    // proof of an earlier one.
-    let mut commitments: Vec<String> = publication_result.pending_commitments();
-    let outstanding: Vec<String> =
-        bbox_edge_sidecar::snapshot::enumerate_outstanding_commitments(&edges_dir)
-            .into_iter()
-            .filter(|c| !commitments.contains(c))
-            .collect();
-    commitments.extend(outstanding);
+    // R22F1+F2: carry-forward = (prior Tantivy payload intersected with
+    // validated journal inventory) UNION current handles. Journal presence
+    // alone never establishes commitment. Inventory errors abort the commit.
+    let prior_payload = ctx.index.load_metas().ok().and_then(|m| m.payload);
+    let current: Vec<String> = publication_result.pending_commitments();
+    let commitments = bbox_edge_sidecar::snapshot::carry_forward_commitments(
+        &edges_dir,
+        prior_payload.as_deref(),
+        &current,
+    )?;
     let txn_payload = commitments.join(",");
     let mut prepared = writer.prepare_commit()?;
     if !txn_payload.is_empty() {
@@ -1636,14 +1634,14 @@ fn run_local_stage(
         .checkout_access
         .publication_guard_for([&local_lease, &git_lease])?;
     let publication_result = publication.publish()?;
-    // R21F1+F2: carry forward all outstanding commitments.
-    let mut commitments: Vec<String> = publication_result.pending_commitments();
-    let outstanding: Vec<String> =
-        bbox_edge_sidecar::snapshot::enumerate_outstanding_commitments(&edges_dir)
-            .into_iter()
-            .filter(|c| !commitments.contains(c))
-            .collect();
-    commitments.extend(outstanding);
+    // R22F1+F2: carry-forward from prior payload intersected with inventory.
+    let prior_payload = ctx.index.load_metas().ok().and_then(|m| m.payload);
+    let current: Vec<String> = publication_result.pending_commitments();
+    let commitments = bbox_edge_sidecar::snapshot::carry_forward_commitments(
+        &edges_dir,
+        prior_payload.as_deref(),
+        &current,
+    )?;
     let txn_payload = commitments.join(",");
     let mut prepared = writer.prepare_commit()?;
     if !txn_payload.is_empty() {
@@ -1706,14 +1704,14 @@ fn run_git_current_overlay(
     publication.stage_snapshot_git_current(&edges_dir, &project.project_id, snapshot_id, true);
     let _publication_guard = ctx.checkout_access.publication_guard(lease)?;
     let publication_result = publication.publish()?;
-    // R21F1+F2: carry forward all outstanding commitments.
-    let mut commitments: Vec<String> = publication_result.pending_commitments();
-    let outstanding: Vec<String> =
-        bbox_edge_sidecar::snapshot::enumerate_outstanding_commitments(&edges_dir)
-            .into_iter()
-            .filter(|c| !commitments.contains(c))
-            .collect();
-    commitments.extend(outstanding);
+    // R22F1+F2: carry-forward from prior payload intersected with inventory.
+    let prior_payload = ctx.index.load_metas().ok().and_then(|m| m.payload);
+    let current: Vec<String> = publication_result.pending_commitments();
+    let commitments = bbox_edge_sidecar::snapshot::carry_forward_commitments(
+        &edges_dir,
+        prior_payload.as_deref(),
+        &current,
+    )?;
     let txn_payload = commitments.join(",");
     let mut prepared = writer.prepare_commit()?;
     if !txn_payload.is_empty() {
@@ -1794,19 +1792,18 @@ fn run_consolidated_history(
             all_handles.extend(publication_result.pending_snapshot_finalizations);
         }
     }
-    // R21F1+F2: bind all transaction commitments in one prepared-commit
-    // payload, plus carry forward outstanding commitments from journals still
-    // on disk.
-    let mut commitments: Vec<String> = all_handles
+    // R22F1+F2: carry-forward = (prior Tantivy payload intersected with
+    // validated journal inventory) UNION current handles.
+    let prior_payload = ctx.index.load_metas().ok().and_then(|m| m.payload);
+    let current: Vec<String> = all_handles
         .iter()
         .map(|h| h.commitment().to_string())
         .collect();
-    let outstanding: Vec<String> =
-        bbox_edge_sidecar::snapshot::enumerate_outstanding_commitments(&edges_dir)
-            .into_iter()
-            .filter(|c| !commitments.contains(c))
-            .collect();
-    commitments.extend(outstanding);
+    let commitments = bbox_edge_sidecar::snapshot::carry_forward_commitments(
+        &edges_dir,
+        prior_payload.as_deref(),
+        &current,
+    )?;
     let txn_payload = commitments.join(",");
     let mut prepared = writer.prepare_commit()?;
     if !txn_payload.is_empty() {

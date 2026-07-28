@@ -760,19 +760,18 @@ pub(super) fn execute_reindex_pass(
         }
         Some(journal)
     };
-    // R21F1+F2: bind all transaction commitments in the prepared-commit
-    // payload, plus carry forward outstanding commitments from journals still
-    // on disk. Recovery recomputes and compares exact commitments.
-    let mut commitments: Vec<String> = pending_handles
+    // R22F1+F2: carry-forward = (prior Tantivy payload intersected with
+    // validated journal inventory) UNION current handles.
+    let prior_payload = index.load_metas().ok().and_then(|m| m.payload);
+    let current: Vec<String> = pending_handles
         .iter()
         .map(|h| h.commitment().to_string())
         .collect();
-    let outstanding: Vec<String> =
-        bbox_edge_sidecar::snapshot::enumerate_outstanding_commitments(&edges_dir)
-            .into_iter()
-            .filter(|c| !commitments.contains(c))
-            .collect();
-    commitments.extend(outstanding);
+    let commitments = bbox_edge_sidecar::snapshot::carry_forward_commitments(
+        &edges_dir,
+        prior_payload.as_deref(),
+        &current,
+    )?;
     let txn_payload = commitments.join(",");
     let mut prepared = writer.prepare_commit()?;
     if !txn_payload.is_empty() {

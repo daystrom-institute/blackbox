@@ -1211,21 +1211,20 @@ fn write_snapshot_members_transaction_with_token(
     Ok(txn_commitment(&journal))
 }
 
-/// R21F1: Enumerate all outstanding transaction commitments on disk.
-/// Used by the writer actor to carry forward unresolved tokens in every
-/// commit payload, so a later ordinary commit does not erase the proof
-/// of an earlier committed-but-unfinalized transaction.
+/// R22F1+F2: Validate the journal inventory on disk and return the
+/// commitments for every successfully decoded journal. Unlike the previous
+/// enumerate_outstanding_commitments, this returns Result: every unexpected
+/// I/O, filename, type, decode, or ownership error ABORTS the caller rather
+/// than silently skipping the journal (which would erase proof of a
+/// committed transaction from the replacement payload).
 ///
-/// Returns a list of commitments (format: {project}:{token}:{digest})
-/// for every journal found under any workspace's txn directory. The
-/// caller unions these with its own pending tokens before setting the
-/// payload.
-pub fn enumerate_outstanding_commitments(edges_dir: &Path) -> Vec<String> {
+/// The returned commitments are candidates for carry-forward. The caller
+/// intersects them with the PRIOR Tantivy payload to select only journals
+/// that were already proven committed. Journal presence alone never
+/// establishes commitment.
+pub fn validate_journal_inventory(edges_dir: &Path) -> Result<Vec<String>> {
     let mut commitments = Vec::new();
-    let manifest = match crate::manifest::ManifestIndex::load_or_new(edges_dir) {
-        Ok(m) => m,
-        Err(_) => return commitments,
-    };
+    let manifest = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
     for project_id in manifest.workspaces.keys() {
         let txn_dir_rel = Path::new("materialized")
             .join("workspace")
@@ -1233,30 +1232,50 @@ pub fn enumerate_outstanding_commitments(edges_dir: &Path) -> Vec<String> {
             .join("txn");
         #[cfg(unix)]
         {
-            if let Ok(txn_dir) = open_dir_under_root(edges_dir, &txn_dir_rel, false) {
-                if let Ok(entries) = crate::manifest::read_directory_names(&txn_dir) {
-                    for name in &entries {
-                        if let Some(s) = name.to_str() {
-                            if s.ends_with(".journal.json") {
-                                let journal_c = match std::ffi::CString::new(s.as_bytes()) {
-                                    Ok(c) => c,
-                                    Err(_) => continue,
-                                };
-                                if let Ok(jb) = read_confined_file_bounded(
-                                    &txn_dir,
-                                    &journal_c,
-                                    TXN_MAX_JOURNAL_BYTES,
-                                ) {
-                                    if let Ok(journal) = decode_txn_journal(&jb) {
-                                        if journal.project_id == *project_id {
-                                            commitments.push(txn_commitment(&journal));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+            let txn_dir = match open_dir_under_root(edges_dir, &txn_dir_rel, false) {
+                Ok(dir) => dir,
+                Err(error)
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                    }) =>
+                {
+                    continue;
                 }
+                Err(error) => {
+                    anyhow::bail!("inventory: failed to open txn dir for {project_id}: {error}");
+                }
+            };
+            let entries = crate::manifest::read_directory_names(&txn_dir)?;
+            for name in &entries {
+                let s = name.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("inventory: non-UTF-8 filename in txn dir for {project_id}")
+                })?;
+                if !s.ends_with(".journal.json") {
+                    continue;
+                }
+                let journal_c = std::ffi::CString::new(s.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("inventory: invalid filename: {e}"))?;
+                let journal_bytes =
+                    read_confined_file_bounded(&txn_dir, &journal_c, TXN_MAX_JOURNAL_BYTES)?;
+                let journal = decode_txn_journal(&journal_bytes)?;
+                let file_token = s.strip_suffix(".journal.json").unwrap();
+                if file_token != journal.txn_token {
+                    anyhow::bail!(
+                        "inventory: journal filename token {file_token} does not match \
+                         decoded token {} for {project_id}",
+                        journal.txn_token
+                    );
+                }
+                if journal.project_id != *project_id {
+                    anyhow::bail!(
+                        "inventory: journal project_id {} does not match \
+                         directory project_id {project_id}",
+                        journal.project_id
+                    );
+                }
+                commitments.push(txn_commitment(&journal));
             }
         }
         #[cfg(not(unix))]
@@ -1265,25 +1284,77 @@ pub fn enumerate_outstanding_commitments(edges_dir: &Path) -> Vec<String> {
                 .join("workspace")
                 .join(project_id)
                 .join("txn");
-            if txn_dir.is_dir() {
-                if let Ok(rd) = fs::read_dir(&txn_dir) {
-                    for entry in rd.flatten() {
-                        let name = entry.file_name();
-                        if name.to_str().is_some_and(|s| s.ends_with(".journal.json")) {
-                            if let Ok(jb) = fs::read(entry.path()) {
-                                if let Ok(journal) = decode_txn_journal(&jb) {
-                                    if journal.project_id == *project_id {
-                                        commitments.push(txn_commitment(&journal));
-                                    }
-                                }
-                            }
-                        }
-                    }
+            if !txn_dir.is_dir() {
+                continue;
+            }
+            for entry in fs::read_dir(&txn_dir)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let s = name.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("inventory: non-UTF-8 filename in txn dir for {project_id}")
+                })?;
+                if !s.ends_with(".journal.json") {
+                    continue;
                 }
+                let journal_path = entry.path();
+                let metadata = fs::symlink_metadata(&journal_path)?;
+                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    anyhow::bail!("inventory: journal {s} for {project_id} is not a regular file");
+                }
+                if metadata.len() > TXN_MAX_JOURNAL_BYTES as u64 {
+                    anyhow::bail!("inventory: journal {s} exceeds max size");
+                }
+                let journal_bytes = fs::read(&journal_path)?;
+                let journal = decode_txn_journal(&journal_bytes)?;
+                let file_token = s.strip_suffix(".journal.json").unwrap();
+                if file_token != journal.txn_token {
+                    anyhow::bail!(
+                        "inventory: journal filename token {file_token} does not match \
+                         decoded token {} for {project_id}",
+                        journal.txn_token
+                    );
+                }
+                if journal.project_id != *project_id {
+                    anyhow::bail!("inventory: journal project_id mismatch for {project_id}");
+                }
+                commitments.push(txn_commitment(&journal));
             }
         }
     }
-    commitments
+    Ok(commitments)
+}
+
+/// R22F1: Compute the carry-forward commitments for a new commit payload.
+/// The carry-forward is the set of commitments proven by the PREVIOUS
+/// Tantivy payload, intersected with the validated journal inventory on
+/// disk. Journal presence alone never establishes commitment; only
+/// intersection with the prior payload does. Any inventory I/O or decode
+/// error aborts the commit.
+///
+/// `prior_payload` is the payload string from the last successful Tantivy
+/// commit (comma-joined commitments), or None if there is no prior commit.
+/// `current_commitments` are the new transaction handles being committed
+/// in this operation.
+pub fn carry_forward_commitments(
+    edges_dir: &Path,
+    prior_payload: Option<&str>,
+    current_commitments: &[String],
+) -> Result<Vec<String>> {
+    let inventory = validate_journal_inventory(edges_dir)?;
+    let prior_set: std::collections::HashSet<&str> = prior_payload
+        .map(|p| p.split(',').filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    // R22F1: carry-forward = prior_payload INTERSECT inventory,
+    // unioned with the current commit's handles. Journal presence alone
+    // never establishes commitment; only intersection with the prior
+    // payload does.
+    let mut result: Vec<String> = current_commitments.to_vec();
+    for commitment in &inventory {
+        if prior_set.contains(commitment.as_str()) && !result.contains(commitment) {
+            result.push(commitment.clone());
+        }
+    }
+    Ok(result)
 }
 
 /// R20F2+F3+F4: Finalize the EXACT transaction identified by the handle,
@@ -1291,6 +1362,12 @@ pub fn enumerate_outstanding_commitments(edges_dir: &Path) -> Vec<String> {
 /// verifies each member's identity/type/size/hash, then renames each staged
 /// member into the live snapshot directory (descriptor-confined, per-member
 /// atomic), fsyncs, then deletes the journal and staging dir.
+///
+/// R22F3: the handle's commitment is validated against the journal on disk
+/// before ANY mutation. The journal's project_id is checked, and the
+/// commitment is recomputed from the decoded journal bytes and compared to
+/// the handle's commitment. A mismatch means the journal was replaced after
+/// the commit and finalization must refuse.
 ///
 /// R20F5: crash-idempotent. A member already renamed (absent from staging
 /// but present in the live snapshot with the matching hash) is treated as
@@ -1305,6 +1382,7 @@ pub fn finalize_snapshot_publication(handle: &SnapshotTxnHandle) -> Result<()> {
             &handle.project_id,
             &handle.snapshot_id,
             &handle.txn_token,
+            Some(&handle.commitment),
         )
     })
 }
@@ -1360,6 +1438,7 @@ fn finalize_one_transaction(
     project_id: &str,
     snapshot_id: &str,
     txn_token: &str,
+    expected_commitment: Option<&str>,
 ) -> Result<()> {
     use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;
@@ -1392,6 +1471,26 @@ fn finalize_one_transaction(
             journal.snapshot_id,
             snapshot_id
         );
+    }
+
+    // R22F3: validate project identity and recompute the commitment from
+    // the decoded journal. A post-commit replacement of the journal (same
+    // token and snapshot but different members/project) must be refused.
+    if journal.project_id != project_id {
+        anyhow::bail!(
+            "finalize: journal project_id {} does not match handle project_id {project_id}",
+            journal.project_id
+        );
+    }
+    let recomputed = txn_commitment(&journal);
+    if let Some(expected) = expected_commitment {
+        if recomputed != expected {
+            anyhow::bail!(
+                "finalize: commitment mismatch for token {txn_token} \
+                 (journal recomputed {recomputed}, handle expected {expected}); \
+                 journal may have been replaced after commit"
+            );
+        }
     }
 
     let staging_c = std::ffi::CString::new(txn_token.as_bytes())?;
@@ -1535,6 +1634,28 @@ fn finalize_one_transaction(
                 member.name
             );
         }
+
+        // R22F4: reopen and hash-verify the destination after every
+        // successful rename. A same-user process that swapped the staging
+        // pathname between fstatat and renameat gets its substituted inode
+        // moved into live; this verification catches it before sync and
+        // journal deletion. Fail closed: do NOT delete the journal.
+        let verify_fd = unsafe {
+            libc::openat(
+                snap_dir.as_raw_fd(),
+                member_c.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if verify_fd < 0 {
+            anyhow::bail!(
+                "finalize: cannot reopen renamed member {} for post-rename verification: {}",
+                member.name,
+                std::io::Error::last_os_error()
+            );
+        }
+        let verify_file = unsafe { fs::File::from_raw_fd(verify_fd) };
+        verify_member_identity_bound_raw(&verify_file, member)?;
     }
 
     snap_dir.sync_all()?;
@@ -1560,6 +1681,7 @@ fn finalize_one_transaction(
     project_id: &str,
     snapshot_id: &str,
     txn_token: &str,
+    expected_commitment: Option<&str>,
 ) -> Result<()> {
     validate_snapshot_component(project_id)?;
     validate_snapshot_component(snapshot_id)?;
@@ -1580,6 +1702,22 @@ fn finalize_one_transaction(
     let journal = decode_txn_journal(&journal_bytes)?;
     if journal.txn_token != txn_token || journal.snapshot_id != snapshot_id {
         anyhow::bail!("finalize: journal token/snapshot mismatch");
+    }
+    // R22F3: validate project identity and recompute commitment.
+    if journal.project_id != project_id {
+        anyhow::bail!(
+            "finalize: journal project_id {} does not match handle project_id {project_id}",
+            journal.project_id
+        );
+    }
+    let recomputed = txn_commitment(&journal);
+    if let Some(expected) = expected_commitment {
+        if recomputed != expected {
+            anyhow::bail!(
+                "finalize: commitment mismatch for token {txn_token}; \
+                 journal may have been replaced after commit"
+            );
+        }
     }
 
     let staging_dir = txn_dir.join(txn_token);
@@ -1609,6 +1747,15 @@ fn finalize_one_transaction(
                 anyhow::bail!("finalize: member {} hash mismatch", member.name);
             }
             fs::rename(&src, &dst)?;
+            // R22F4: verify destination after rename.
+            let dst_bytes = fs::read(&dst)?;
+            let dst_hash = hex::encode(Sha256::digest(&dst_bytes));
+            if dst_hash != member.sha256 {
+                anyhow::bail!(
+                    "finalize: post-rename hash mismatch for member {}",
+                    member.name
+                );
+            }
         } else {
             anyhow::bail!("finalize: member {} missing from staging", member.name);
         }
@@ -1713,7 +1860,10 @@ fn recover_pending_transactions_for_project(
     let mut journal_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for name in &entries {
-        let s = name.to_str().unwrap_or("");
+        // R22F5: reject non-UTF-8 filenames during mutation-free inventory.
+        let s = name.to_str().ok_or_else(|| {
+            anyhow::anyhow!("recovery: non-UTF-8 filename in txn dir for {project_id}")
+        })?;
         if !s.ends_with(".journal.json") {
             continue;
         }
@@ -1750,8 +1900,11 @@ fn recover_pending_transactions_for_project(
 
     // R21F4: Phase 2 - reclaim genuine orphan staging dirs. An orphan is
     // a directory entry that is not a journal and not a known journal token.
+    // R22F5: propagate all unexpected errors; reject unexpected entry types.
     for name in &entries {
-        let s = name.to_str().unwrap_or("");
+        let s = name.to_str().ok_or_else(|| {
+            anyhow::anyhow!("recovery: non-UTF-8 filename in txn dir for {project_id}")
+        })?;
         if s.ends_with(".journal.json") || s.starts_with('.') {
             continue;
         }
@@ -1769,7 +1922,15 @@ fn recover_pending_transactions_for_project(
                 unlinkat_tree(txn_dir.as_raw_fd(), &orphan_c)?;
                 txn_dir.sync_all()?;
             }
-            _ => {}
+            Ok(_) => {
+                // R22F5: unexpected entry type (not a directory, not a
+                // journal). Fail closed rather than silently ignoring.
+                anyhow::bail!(
+                    "recovery: unexpected non-directory entry {s} in txn dir for {project_id}"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
     }
 
@@ -1779,9 +1940,14 @@ fn recover_pending_transactions_for_project(
         let commitment = txn_commitment(journal);
         let journal_c = std::ffi::CString::new(dj.filename.as_bytes())?;
 
-        // Check if staging directory exists.
+        // R22F5: Check if staging directory exists. Only exact NotFound
+        // means absent; propagate all other errors.
         let staging_c = std::ffi::CString::new(journal.txn_token.as_bytes())?;
-        let staging_exists = fstatat_nofollow(txn_dir.as_raw_fd(), &staging_c).is_ok();
+        let staging_exists = match fstatat_nofollow(txn_dir.as_raw_fd(), &staging_c) {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.into()),
+        };
 
         if committed.contains(&commitment) {
             // R21F6: token IS in the payload proof set.
@@ -1813,11 +1979,13 @@ fn recover_pending_transactions_for_project(
                     txn_token = journal.txn_token.as_str(),
                     "recovery: commit proven, resuming finalization"
                 );
+                let expected = txn_commitment(journal);
                 finalize_one_transaction(
                     edges_dir,
                     project_id,
                     &journal.snapshot_id,
                     &journal.txn_token,
+                    Some(&expected),
                 )?;
             } else {
                 // R21F6: staging dir is absent but token is in payload.
@@ -1967,13 +2135,14 @@ fn recover_pending_transactions_for_project(
     for entry in fs::read_dir(&txn_dir)? {
         let entry = entry?;
         let name = entry.file_name();
-        let name_str = match name.to_str() {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
+        // R22F5: reject non-UTF-8 filenames during mutation-free inventory.
+        let name_str = name.to_str().ok_or_else(|| {
+            anyhow::anyhow!("recovery: non-UTF-8 filename in txn dir for {project_id}")
+        })?;
         if !name_str.ends_with(".journal.json") {
             continue;
         }
+        let name_str = name_str.to_string();
         let journal_path = txn_dir.join(&name_str);
         let metadata = fs::symlink_metadata(&journal_path)?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -2002,26 +2171,32 @@ fn recover_pending_transactions_for_project(
     }
 
     // R21F4: Phase 2 - reclaim orphans.
+    // R22F5: propagate all unexpected errors; reject unexpected entry types.
     for entry in fs::read_dir(&txn_dir)? {
         let entry = entry?;
         let name = entry.file_name();
-        let name_str = match name.to_str() {
-            Some(s) => s,
-            None => continue,
-        };
+        let name_str = name.to_str().ok_or_else(|| {
+            anyhow::anyhow!("recovery: non-UTF-8 filename in txn dir for {project_id}")
+        })?;
         if name_str.ends_with(".journal.json")
             || name_str.starts_with('.')
             || journal_tokens.contains(name_str)
         {
             continue;
         }
-        if entry.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
             tracing::warn!(
                 project_id,
                 orphan = name_str,
                 "recovery: reclaiming orphan staging dir"
             );
             fs::remove_dir_all(entry.path())?;
+        } else {
+            // R22F5: unexpected entry type. Fail closed.
+            anyhow::bail!(
+                "recovery: unexpected non-directory entry {name_str} in txn dir for {project_id}"
+            );
         }
     }
 
@@ -2032,7 +2207,12 @@ fn recover_pending_transactions_for_project(
         let journal_path = txn_dir.join(&dj.filename);
         let staging_dir = txn_dir.join(&journal.txn_token);
         let snap_dir = snapshot_dir(edges_dir, project_id, &journal.snapshot_id);
-        let staging_exists = staging_dir.is_dir();
+        // R22F5: only exact NotFound means absent; propagate other errors.
+        let staging_exists = match fs::metadata(&staging_dir) {
+            Ok(m) => m.is_dir(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.into()),
+        };
 
         if committed.contains(&commitment) {
             if staging_exists {
@@ -2051,11 +2231,13 @@ fn recover_pending_transactions_for_project(
                     txn_token = journal.txn_token.as_str(),
                     "recovery: commit proven, resuming finalization"
                 );
+                let expected = txn_commitment(journal);
                 finalize_one_transaction(
                     edges_dir,
                     project_id,
                     &journal.snapshot_id,
                     &journal.txn_token,
+                    Some(&expected),
                 )?;
             } else {
                 // R21F6: complete finalize closeout.
@@ -6112,11 +6294,11 @@ mod tests {
         );
     }
 
-    // R21F1: enumerate_outstanding_commitments must find all journals on
-    // disk. This is the carry-forward mechanism that prevents later commits
-    // from erasing proof of earlier transactions.
+    // R22F2: validate_journal_inventory must find all journals on disk and
+    // return their commitments. This is the inventory half of the carry-forward
+    // mechanism. Inventory errors must abort, not silently skip.
     #[test]
-    fn r21_enumerate_outstanding_commitments_finds_journals() {
+    fn r22_validate_journal_inventory_finds_journals() {
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
         let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
@@ -6130,10 +6312,122 @@ mod tests {
         )
         .unwrap();
 
-        let commitments = enumerate_outstanding_commitments(&edges_dir);
+        let commitments = validate_journal_inventory(&edges_dir).unwrap();
         assert!(
             commitments.contains(&handle.commitment),
-            "enumerate must find the journal's commitment"
+            "inventory must find the journal's commitment"
+        );
+    }
+
+    // R22F1: carry_forward_commitments must NOT carry a journal whose
+    // commitment was not in the prior payload. A stale journal from a
+    // failed prepare or discard must not be promoted into a later commit.
+    #[test]
+    fn r22_carry_forward_excludes_unproven_journals() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
+
+        // Stage a journal but do NOT commit it (no prior payload includes it).
+        let stale_handle = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+
+        // Carry-forward with empty prior payload and no current handles.
+        let result = carry_forward_commitments(&edges_dir, None, &[]).unwrap();
+        assert!(
+            !result.contains(&stale_handle.commitment),
+            "uncommitted journal must NOT be carried forward"
+        );
+    }
+
+    // R22F1: carry_forward_commitments must include a journal whose
+    // commitment IS in the prior payload (proven committed).
+    #[test]
+    fn r22_carry_forward_includes_proven_journals() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
+
+        let handle = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+
+        // Prior payload includes this commitment.
+        let prior = handle.commitment.clone();
+        let result = carry_forward_commitments(&edges_dir, Some(&prior), &[]).unwrap();
+        assert!(
+            result.contains(&handle.commitment),
+            "committed journal must be carried forward"
+        );
+    }
+
+    // R22F3: finalization must refuse a journal whose commitment does not
+    // match the handle. A post-commit replacement of journal+members with
+    // the same token and snapshot must be rejected.
+    #[cfg(unix)]
+    #[test]
+    fn r22_finalize_rejects_replaced_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
+
+        let handle = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+
+        // Tamper: replace the journal with different members (same token
+        // and snapshot, different hash -> different commitment).
+        let txn_dir = materialized_dir(&edges_dir)
+            .join("workspace")
+            .join("p_1")
+            .join("txn");
+        let staging_dir = txn_dir.join(&handle.txn_token);
+        let tampered_edges = vec![explicit_edge("git", "different", "target")];
+        let mut tampered_bytes = Vec::new();
+        for edge in &tampered_edges {
+            serde_json::to_writer(&mut tampered_bytes, edge).unwrap();
+            tampered_bytes.push(b'\n');
+        }
+        fs::write(staging_dir.join("git-current.jsonl"), &tampered_bytes).unwrap();
+        let tampered_hash = hex::encode(Sha256::digest(&tampered_bytes));
+        let tampered_journal = TxnJournal {
+            v: 2,
+            project_id: "p_1".to_string(),
+            txn_token: handle.txn_token.clone(),
+            snapshot_id: snapshot_id.clone(),
+            members: vec![TxnMember {
+                name: "git-current.jsonl".to_string(),
+                sha256: tampered_hash,
+            }],
+        };
+        let tampered_journal_bytes = serde_json::to_vec(&tampered_journal).unwrap();
+        fs::write(
+            txn_dir.join(format!("{}.journal.json", handle.txn_token)),
+            &tampered_journal_bytes,
+        )
+        .unwrap();
+
+        // Finalization must refuse: commitment mismatch.
+        let result = finalize_snapshot_publication(&handle);
+        assert!(
+            result.is_err(),
+            "finalize must refuse replaced journal (commitment mismatch)"
         );
     }
 }
