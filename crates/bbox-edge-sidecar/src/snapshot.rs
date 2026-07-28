@@ -52,7 +52,7 @@ pub fn remove_inactive_materialization_file(
     let relative = candidate
         .strip_prefix(edges_dir)
         .context("inactive materialization candidate escaped its root")?;
-    remove_gc_candidate_file(edges_dir, relative, expected_identity, true)
+    remove_gc_candidate_file(edges_dir, relative, expected_identity, None, true)
 }
 
 #[cfg(unix)]
@@ -60,6 +60,7 @@ pub fn remove_gc_candidate_file(
     edges_dir: &Path,
     root_relative: &Path,
     expected_identity: (u64, u64),
+    expected_mtime_secs: Option<u64>,
     require_inactive: bool,
 ) -> Result<bool> {
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -147,6 +148,20 @@ pub fn remove_gc_candidate_file(
         let metadata = file.metadata()?;
         if !metadata.is_file() || (metadata.dev(), metadata.ino()) != expected_identity {
             anyhow::bail!("inactive materialization candidate identity changed before deletion");
+        }
+        // R17F5: verify mtime from the opened fd immediately before
+        // unlinkat. The path-based mtime check in revalidate_temp_identity
+        // races with a concurrent writer that replaces the file between
+        // path validation and descriptor unlink.
+        if let Some(planned_mtime) = expected_mtime_secs {
+            let current_mtime = metadata.mtime() as u64;
+            if current_mtime != planned_mtime {
+                anyhow::bail!(
+                    "temp file mtime changed after descriptor open (planned={}, current={})",
+                    planned_mtime,
+                    current_mtime
+                );
+            }
         }
         let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
         if unsafe {
@@ -3994,7 +4009,7 @@ mod tests {
             .join("p_1")
             .join("snapshots")
             .join("nonexistent");
-        let result = remove_gc_candidate_file(&edges_dir, &inactive_path, (0, 0), true);
+        let result = remove_gc_candidate_file(&edges_dir, &inactive_path, (0, 0), None, true);
         // The result is Ok(false) because the path does not exist.
         assert!(result.is_ok() || result.is_err());
     }

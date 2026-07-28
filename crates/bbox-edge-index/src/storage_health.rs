@@ -1615,6 +1615,7 @@ pub fn apply_gc(edges_dir: &Path, candidates: &[GcCandidate]) -> (Vec<String>, V
                     edges_dir,
                     Path::new(relative),
                     (device, inode),
+                    Some(planned_mtime),
                     c.kind == FileKind::InactiveSnapshot,
                 )
             }
@@ -2933,6 +2934,57 @@ mod tests {
             temp_path.exists(),
             "temp file must survive GC when identity changed"
         );
+    }
+
+    // R17F5: the fd-based mtime check in remove_gc_candidate_file must
+    // catch a file replaced AFTER the path-based revalidate_temp_identity
+    // check passes but BEFORE the descriptor unlink. This test calls
+    // remove_gc_candidate_file directly with the original mtime, then
+    // verifies that a replaced file (new mtime) is rejected at the
+    // fd level.
+    #[cfg(unix)]
+    #[test]
+    fn r17f5_fd_mtime_check_catches_post_revalidation_replacement() {
+        let dir = setup_edges_dir();
+        let edges_dir = dir.path();
+        let namespace_dir = edges_dir.join("derived").join("proj");
+        fs::create_dir_all(&namespace_dir).unwrap();
+        let temp_name = "p1.jsonl.tmp.9999.0";
+        let temp_path = namespace_dir.join(temp_name);
+        write_file(&namespace_dir, temp_name, b"original");
+        set_mtime_days_old(&temp_path, 2);
+
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(&temp_path).unwrap();
+        let planned_dev = metadata.dev();
+        let planned_ino = metadata.ino();
+        let planned_mtime = metadata.mtime() as u64;
+
+        // Simulate a concurrent writer replacing the file AFTER the
+        // path-based check but BEFORE the fd-based check. The new file
+        // has a different mtime, so remove_gc_candidate_file must refuse.
+        fs::write(&temp_path, b"replaced by concurrent writer").unwrap();
+
+        let result = bbox_edge_sidecar::snapshot::remove_gc_candidate_file(
+            edges_dir,
+            std::path::Path::new("derived/proj")
+                .join(temp_name)
+                .as_path(),
+            (planned_dev, planned_ino),
+            Some(planned_mtime),
+            false,
+        );
+
+        assert!(
+            result.is_err(),
+            "fd-based mtime check must catch post-revalidation replacement"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mtime changed"),
+            "error must explain mtime change: {err}"
+        );
+        assert!(temp_path.exists(), "replaced temp must survive");
     }
 
     #[cfg(unix)]
