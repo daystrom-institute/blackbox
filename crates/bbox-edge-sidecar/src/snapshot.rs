@@ -1242,9 +1242,11 @@ pub fn enumerate_outstanding_commitments(edges_dir: &Path) -> Vec<String> {
                                     Ok(c) => c,
                                     Err(_) => continue,
                                 };
-                                if let Ok(jb) =
-                                    read_confined_file_bounded(&txn_dir, &journal_c, TXN_MAX_JOURNAL_BYTES)
-                                {
+                                if let Ok(jb) = read_confined_file_bounded(
+                                    &txn_dir,
+                                    &journal_c,
+                                    TXN_MAX_JOURNAL_BYTES,
+                                ) {
                                     if let Ok(journal) = decode_txn_journal(&jb) {
                                         if journal.project_id == *project_id {
                                             commitments.push(txn_commitment(&journal));
@@ -1540,9 +1542,8 @@ fn finalize_one_transaction(
     // R21F6: delete journal and staging dir, propagating unexpected errors.
     complete_journal_unlink(&txn_dir, &journal_c)?;
     // Delete staging dir.
-    let staging_unlink = unsafe {
-        libc::unlinkat(txn_dir.as_raw_fd(), staging_c.as_ptr(), libc::AT_REMOVEDIR)
-    };
+    let staging_unlink =
+        unsafe { libc::unlinkat(txn_dir.as_raw_fd(), staging_c.as_ptr(), libc::AT_REMOVEDIR) };
     if staging_unlink != 0 {
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::NotFound {
@@ -1615,9 +1616,8 @@ fn finalize_one_transaction(
     fs::File::open(&snap_dir)?.sync_all()?;
     // R21F6: propagate errors from staging dir removal.
     if staging_dir.is_dir() {
-        fs::remove_dir_all(&staging_dir).map_err(|e| anyhow::anyhow!(
-            "finalize: failed to remove staging dir: {e}"
-        ))?;
+        fs::remove_dir_all(&staging_dir)
+            .map_err(|e| anyhow::anyhow!("finalize: failed to remove staging dir: {e}"))?;
     }
     // R21F6: propagate errors from journal removal (NotFound is ok).
     match fs::remove_file(&journal_path) {
@@ -1687,9 +1687,11 @@ fn recover_pending_transactions_for_project(
     let txn_dir = match open_dir_under_root(edges_dir, &txn_dir_rel, false) {
         Ok(dir) => dir,
         Err(error)
-            if error
-                .chain()
-                .any(|cause| cause.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)) =>
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            }) =>
         {
             return Ok(());
         }
@@ -1796,7 +1798,12 @@ fn recover_pending_transactions_for_project(
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                             // R21F6: already renamed into live. Verify live copy.
-                            verify_live_member(edges_dir, project_id, &journal.snapshot_id, member)?;
+                            verify_live_member(
+                                edges_dir,
+                                project_id,
+                                &journal.snapshot_id,
+                                member,
+                            )?;
                         }
                         Err(e) => return Err(e.into()),
                     }
@@ -1840,7 +1847,12 @@ fn recover_pending_transactions_for_project(
                             verify_member_identity_bound(&staging_fd, member)?;
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            verify_live_member(edges_dir, project_id, &journal.snapshot_id, member)?;
+                            verify_live_member(
+                                edges_dir,
+                                project_id,
+                                &journal.snapshot_id,
+                                member,
+                            )?;
                         }
                         Err(e) => return Err(e.into()),
                     }
@@ -1927,8 +1939,6 @@ fn verify_live_member(
     verify_member_identity_bound_raw(&live_file, member)
 }
 
-
-
 #[cfg(not(unix))]
 fn recover_pending_transactions_for_project(
     edges_dir: &Path,
@@ -1967,9 +1977,7 @@ fn recover_pending_transactions_for_project(
         let journal_path = txn_dir.join(&name_str);
         let metadata = fs::symlink_metadata(&journal_path)?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
-            anyhow::bail!(
-                "recovery: journal {name_str} for {project_id} is not a regular file"
-            );
+            anyhow::bail!("recovery: journal {name_str} for {project_id} is not a regular file");
         }
         if metadata.len() > TXN_MAX_JOURNAL_BYTES as u64 {
             anyhow::bail!("recovery: journal {name_str} exceeds max size");
@@ -1984,9 +1992,7 @@ fn recover_pending_transactions_for_project(
             );
         }
         if journal.project_id != project_id {
-            anyhow::bail!(
-                "recovery: journal project_id mismatch for {project_id}"
-            );
+            anyhow::bail!("recovery: journal project_id mismatch for {project_id}");
         }
         journal_tokens.insert(journal.txn_token.clone());
         decoded.push(DecodedJournal {
@@ -2114,8 +2120,6 @@ fn verify_member_nofollow(path: &Path, member: &TxnMember) -> Result<()> {
     }
     Ok(())
 }
-
-
 
 /// R19F4(c): check for legacy .staging markers inside live snapshot
 /// directories (from prior builds). Fail closed with a typed error.
@@ -5801,8 +5805,11 @@ mod tests {
             }],
         };
         let journal_bytes = serde_json::to_vec(&journal).unwrap();
-        fs::write(txn_dir.join(format!("{txn_token}.journal.json")), &journal_bytes)
-            .unwrap();
+        fs::write(
+            txn_dir.join(format!("{txn_token}.journal.json")),
+            &journal_bytes,
+        )
+        .unwrap();
 
         let result = recover_pending_transactions_prebind(&edges_dir, None);
         assert!(
@@ -5933,7 +5940,9 @@ mod tests {
             .join("p_1")
             .join("txn");
         assert!(
-            !txn_dir.join(format!("{}.journal.json", txn_handle.txn_token)).exists(),
+            !txn_dir
+                .join(format!("{}.journal.json", txn_handle.txn_token))
+                .exists(),
             "uncommitted journal must be discarded"
         );
     }
@@ -5963,7 +5972,9 @@ mod tests {
             .join("p_1")
             .join("txn");
         assert!(
-            !txn_dir.join(format!("{}.journal.json", txn_handle.txn_token)).exists(),
+            !txn_dir
+                .join(format!("{}.journal.json", txn_handle.txn_token))
+                .exists(),
             "committed journal must be finalized and journal removed"
         );
         let live_member = materialized_dir(&edges_dir)
@@ -6002,17 +6013,10 @@ mod tests {
         };
         let journal_bytes = serde_json::to_vec(&journal).unwrap();
         // Filename says "wrong-token" but decoded token is "real-token".
-        fs::write(
-            txn_dir.join("wrong-token.journal.json"),
-            &journal_bytes,
-        )
-        .unwrap();
+        fs::write(txn_dir.join("wrong-token.journal.json"), &journal_bytes).unwrap();
 
         let result = recover_pending_transactions_prebind(&edges_dir, None);
-        assert!(
-            result.is_err(),
-            "filename/token mismatch must fail closed"
-        );
+        assert!(result.is_err(), "filename/token mismatch must fail closed");
         // The mismatched journal must NOT be deleted (fail closed).
         assert!(
             txn_dir.join("wrong-token.journal.json").exists(),
