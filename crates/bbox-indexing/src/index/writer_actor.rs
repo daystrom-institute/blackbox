@@ -320,28 +320,6 @@ fn commit_snapshot_publications(
     Ok(publication)
 }
 
-fn rollback_snapshot_handles(
-    handles: &[bbox_edge_sidecar::snapshot::SnapshotTxnHandle],
-) -> Result<()> {
-    let mut failures = Vec::new();
-    for handle in handles {
-        if let Err(error) = bbox_edge_sidecar::snapshot::discard_snapshot_transaction(handle) {
-            failures.push(format!(
-                "{}:{}: {error:#}",
-                handle.project_id, handle.txn_token
-            ));
-        }
-    }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "snapshot transaction rollback left unresolved staging: {}",
-            failures.join("; ")
-        )
-    }
-}
-
 /// Derived effective source for one catalog project at planning time
 /// (Phase 3 plan section 4.7). There is no persisted effective-source store:
 /// this is computed per pass from the pinned catalog snapshot, the edge
@@ -1766,20 +1744,38 @@ fn run_consolidated_history(
         );
         written += 1;
     }
-    let mut all_handles: Vec<bbox_edge_sidecar::snapshot::SnapshotTxnHandle> = Vec::new();
-    for (project_id, edges) in edges_by_project {
-        // Replace, not merge: a consolidated walk that produced no edge for a
-        // project is asserting that project currently has none, and merging
-        // would keep a retired snapshot's edges alive forever.
-        bbox_edge_sidecar::edge_sidecar::replace_materialized_edges(
-            &edges_dir, "git", project_id, edges,
-        )?;
-        if let Some(snapshot_id) = snapshot_by_project.get(project_id) {
-            let mut publication = super::project_files::ProjectIndexPublicationBundle::default();
-            publication.stage_snapshot_git_current(&edges_dir, project_id, snapshot_id, true);
-            let mut publication_result = publication.publish()?;
-            all_handles.extend(publication_result.take_pending_snapshot_finalizations());
+    let mut publications: Vec<super::project_files::PublicationResult> = Vec::new();
+    let staging_attempt = (|| -> Result<()> {
+        for (project_id, edges) in edges_by_project {
+            // Replace, not merge: a consolidated walk that produced no edge for a
+            // project is asserting that project currently has none, and merging
+            // would keep a retired snapshot's edges alive forever.
+            bbox_edge_sidecar::edge_sidecar::replace_materialized_edges(
+                &edges_dir, "git", project_id, edges,
+            )?;
+            if let Some(snapshot_id) = snapshot_by_project.get(project_id) {
+                let mut publication =
+                    super::project_files::ProjectIndexPublicationBundle::default();
+                publication.stage_snapshot_git_current(&edges_dir, project_id, snapshot_id, true);
+                publications.push(publication.publish()?);
+            }
         }
+        Ok(())
+    })();
+    if let Err(error) = staging_attempt {
+        let mut cleanup_failures = Vec::new();
+        for publication in &mut publications {
+            if let Err(cleanup) = publication.rollback_pending() {
+                cleanup_failures.push(format!("{cleanup:#}"));
+            }
+        }
+        if !cleanup_failures.is_empty() {
+            return Err(error).context(format!(
+                "consolidated snapshot staging failed and rollback left unresolved state: {}",
+                cleanup_failures.join("; ")
+            ));
+        }
+        return Err(error);
     }
     let commit_attempt = (|| -> Result<()> {
         let prior_payload = ctx
@@ -1787,9 +1783,9 @@ fn run_consolidated_history(
             .load_metas()
             .context("loading prior index payload before snapshot commit")?
             .payload;
-        let current: Vec<String> = all_handles
+        let current: Vec<String> = publications
             .iter()
-            .map(|handle| handle.commitment().to_string())
+            .flat_map(|publication| publication.pending_commitments())
             .collect();
         let commitments = bbox_edge_sidecar::snapshot::carry_forward_commitments(
             &edges_dir,
@@ -1805,12 +1801,24 @@ fn run_consolidated_history(
         Ok(())
     })();
     if let Err(error) = commit_attempt {
-        if let Err(cleanup) = rollback_snapshot_handles(&all_handles) {
+        let mut cleanup_failures = Vec::new();
+        for publication in &mut publications {
+            if let Err(cleanup) = publication.rollback_pending() {
+                cleanup_failures.push(format!("{cleanup:#}"));
+            }
+        }
+        if !cleanup_failures.is_empty() {
             return Err(error).context(format!(
-                "snapshot commit failed and rollback also failed: {cleanup:#}"
+                "snapshot commit failed and rollback left unresolved state: {}",
+                cleanup_failures.join("; ")
             ));
         }
         return Err(error);
+    }
+    let mut all_handles = Vec::new();
+    for publication in &mut publications {
+        publication.mark_commit_succeeded();
+        all_handles.extend(publication.take_pending_snapshot_finalizations());
     }
     // R20F4: fail closed if any finalization fails.
     for handle in &all_handles {

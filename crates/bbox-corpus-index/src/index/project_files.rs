@@ -191,10 +191,11 @@ impl ProjectIndexPublicationBundle {
     /// The caller must hold the checkout publication guard for all leases that
     /// contributed to this bundle for the entire call and the Tantivy commit.
     pub fn publish(&mut self) -> Result<PublicationResult> {
-        let mut pending_local_snapshots = Vec::new();
-        let mut pending_snapshot_finalizations: Vec<
-            bbox_edge_sidecar::snapshot::SnapshotTxnHandle,
-        > = Vec::new();
+        let mut result = PublicationResult {
+            pending_local_snapshots: Vec::new(),
+            pending_snapshot_finalizations: Vec::new(),
+            commit_succeeded: false,
+        };
         for action in self.actions.drain(..) {
             match action {
                 ProjectIndexPublication::SnapshotRename {
@@ -272,7 +273,7 @@ impl ProjectIndexPublicationBundle {
                             &snapshot_id,
                             &[("git-current.jsonl", git_edges.as_slice())],
                         )?;
-                    pending_snapshot_finalizations.push(txn_handle);
+                    result.pending_snapshot_finalizations.push(txn_handle);
                 }
                 ProjectIndexPublication::LocalSnapshot(publication) => {
                     let project_edges =
@@ -286,7 +287,7 @@ impl ProjectIndexPublicationBundle {
                         "git",
                         &publication.project_id,
                     )?;
-                    pending_local_snapshots.push(
+                    result.pending_local_snapshots.push(
                         bbox_edge_sidecar::snapshot::stage_local_snapshot_activation(
                             &publication.edges_dir,
                             &publication.project_id,
@@ -304,11 +305,7 @@ impl ProjectIndexPublicationBundle {
                 }
             }
         }
-        Ok(PublicationResult {
-            pending_local_snapshots,
-            pending_snapshot_finalizations,
-            commit_succeeded: false,
-        })
+        Ok(result)
     }
 }
 
@@ -2872,6 +2869,30 @@ mod tests {
     use crate::index::build_schema;
     use bbox_chunker::SourceFormatChunker;
     use tantivy::schema::Field;
+
+    #[test]
+    fn publication_bundle_rolls_back_earlier_snapshot_when_later_action_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let mut bundle = ProjectIndexPublicationBundle::default();
+        bundle.stage_snapshot_git_current(&edges_dir, "p1", "snapshot-a", false);
+        bundle.stage_snapshot_git_current(&edges_dir, "../invalid", "snapshot-b", false);
+
+        assert!(bundle.publish().is_err());
+        let txn_dir =
+            bbox_edge_sidecar::manifest::materialized_dir(&edges_dir).join("workspace/p1/txn");
+        if txn_dir.exists() {
+            assert_eq!(
+                fs::read_dir(txn_dir)
+                    .unwrap()
+                    .collect::<std::io::Result<Vec<_>>>()
+                    .unwrap()
+                    .len(),
+                0,
+                "the first staged transaction must remain under rollback ownership"
+            );
+        }
+    }
 
     #[test]
     fn document_containers_get_the_larger_byte_budget() {

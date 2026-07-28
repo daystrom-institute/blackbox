@@ -740,36 +740,32 @@ pub(super) fn execute_reindex_pass(
     let mut project_publication_result = project_stats.publication.publish()?;
     project_stats.pending_local_snapshots =
         project_publication_result.take_pending_local_snapshots();
-    let pending_handles = project_publication_result.take_pending_snapshot_finalizations();
-    tool_edge_publication.publish()?;
-    let pending_journal = if project_stats.pending_local_snapshots.is_empty() {
-        None
-    } else {
-        let journal = bbox_edge_sidecar::snapshot::write_pending_local_activation_journal(
-            &edges_dir,
-            &project_stats.pending_local_snapshots,
-        )?;
-        for activation in journal.activations() {
-            let marker = project_files::local_activation_marker(activation.project_id());
-            writer.delete_term(Term::from_field_text(fields.entity_id, &marker));
-            let mut document = TantivyDocument::new();
-            document.add_text(fields.doc_type, "code_source_activation");
-            document.add_text(fields.entity_id, &marker);
-            document.add_text(fields.project_id, activation.project_id());
-            document.add_text(fields.code_source_generation, journal.commit_token());
-            writer.add_document(document)?;
-        }
-        Some(journal)
-    };
-    let commit_attempt = (|| -> Result<()> {
+    let commit_attempt = (|| -> Result<_> {
+        tool_edge_publication.publish()?;
+        let pending_journal = if project_stats.pending_local_snapshots.is_empty() {
+            None
+        } else {
+            let journal = bbox_edge_sidecar::snapshot::write_pending_local_activation_journal(
+                &edges_dir,
+                &project_stats.pending_local_snapshots,
+            )?;
+            for activation in journal.activations() {
+                let marker = project_files::local_activation_marker(activation.project_id());
+                writer.delete_term(Term::from_field_text(fields.entity_id, &marker));
+                let mut document = TantivyDocument::new();
+                document.add_text(fields.doc_type, "code_source_activation");
+                document.add_text(fields.entity_id, &marker);
+                document.add_text(fields.project_id, activation.project_id());
+                document.add_text(fields.code_source_generation, journal.commit_token());
+                writer.add_document(document)?;
+            }
+            Some(journal)
+        };
         let prior_payload = index
             .load_metas()
             .context("loading prior index payload before snapshot commit")?
             .payload;
-        let current: Vec<String> = pending_handles
-            .iter()
-            .map(|handle| handle.commitment().to_string())
-            .collect();
+        let current = project_publication_result.pending_commitments();
         let commitments = bbox_edge_sidecar::snapshot::carry_forward_commitments(
             &edges_dir,
             prior_payload.as_deref(),
@@ -781,27 +777,21 @@ pub(super) fn execute_reindex_pass(
             prepared.set_payload(&payload);
         }
         prepared.commit()?;
-        Ok(())
+        Ok(pending_journal)
     })();
-    if let Err(error) = commit_attempt {
-        let mut cleanup_failures = Vec::new();
-        for handle in &pending_handles {
-            if let Err(cleanup) = bbox_edge_sidecar::snapshot::discard_snapshot_transaction(handle)
-            {
-                cleanup_failures.push(format!(
-                    "{}:{}: {cleanup:#}",
-                    handle.project_id, handle.txn_token
+    let pending_journal = match commit_attempt {
+        Ok(journal) => journal,
+        Err(error) => {
+            if let Err(cleanup) = project_publication_result.rollback_pending() {
+                return Err(error).context(format!(
+                    "snapshot commit failed and rollback left unresolved staging: {cleanup:#}"
                 ));
             }
+            return Err(error);
         }
-        if !cleanup_failures.is_empty() {
-            return Err(error).context(format!(
-                "snapshot commit failed and rollback left unresolved staging: {}",
-                cleanup_failures.join("; ")
-            ));
-        }
-        return Err(error);
-    }
+    };
+    project_publication_result.mark_commit_succeeded();
+    let pending_handles = project_publication_result.take_pending_snapshot_finalizations();
     // R20F4: fail closed if any finalization fails.
     for handle in &pending_handles {
         if let Err(error) = bbox_edge_sidecar::snapshot::finalize_snapshot_publication(handle) {
