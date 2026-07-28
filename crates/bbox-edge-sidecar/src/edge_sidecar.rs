@@ -331,6 +331,16 @@ pub fn append_project_edges(
     Ok(())
 }
 
+// Unique per-process sequence counter for writer temp files. Using
+// create_new (O_EXCL) with pid+seq guarantees a fresh inode every time,
+// so GC cannot unlink a temp the writer is actively using via a
+// deterministic name (R16F2).
+static WRITER_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn writer_temp_sequence() -> u64 {
+    WRITER_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 // edge sidecar writes run on the reindex/writer-actor thread.
 #[allow(clippy::disallowed_methods)]
 pub fn replace_project_edges(
@@ -351,11 +361,14 @@ pub fn replace_project_edges(
         return Ok(());
     }
 
-    let tmp_path = path.with_extension("jsonl.tmp");
+    let tmp_path = dir.join(format!(
+        "{project_id}.jsonl.tmp.{pid}.{seq}",
+        pid = std::process::id(),
+        seq = writer_temp_sequence()
+    ));
     let file = OpenOptions::new()
-        .create(true)
+        .create_new(true)
         .write(true)
-        .truncate(true)
         .open(&tmp_path)?;
     // Buffered: one syscall per ~8KiB instead of one per serialized fragment
     // (the unbuffered loop dominated reindex project phases; thread-935b467d).
@@ -375,7 +388,10 @@ pub fn replace_project_edges(
     let file = writer.into_inner().map_err(|err| err.into_error())?;
     file.sync_all()?;
     drop(file);
-    fs::rename(tmp_path, path)?;
+    if let Err(err) = fs::rename(&tmp_path, &path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
     Ok(())
 }
 

@@ -813,7 +813,13 @@ fn is_backup_file(file_name: &str) -> bool {
 }
 
 fn is_temp_file(file_name: &str) -> bool {
-    file_name.contains(".compact-") || file_name.ends_with(".tmp")
+    file_name.contains(".compact-")
+        || file_name.ends_with(".tmp")
+        || file_name.find(".tmp.").is_some_and(|pos| {
+            file_name[pos + 5..]
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == '.')
+        })
 }
 
 fn extract_project_id_from_backup(file_name: &str) -> Option<String> {
@@ -858,6 +864,8 @@ pub struct GcCandidate {
     pub planned_device: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub planned_inode: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planned_mtime_secs: Option<u64>,
     pub kind: FileKind,
     pub bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1023,6 +1031,8 @@ pub fn plan_gc_with_policy(
                     root_relative_path: None,
                     planned_device: None,
                     planned_inode: None,
+
+                    planned_mtime_secs: None,
                 });
                 continue;
             }
@@ -1036,6 +1046,8 @@ pub fn plan_gc_with_policy(
                 root_relative_path: None,
                 planned_device: None,
                 planned_inode: None,
+
+                planned_mtime_secs: None,
             });
         }
     }
@@ -1058,6 +1070,8 @@ pub fn plan_gc_with_policy(
                 root_relative_path: None,
                 planned_device: None,
                 planned_inode: None,
+
+                planned_mtime_secs: None,
             });
         }
     }
@@ -1113,6 +1127,7 @@ pub fn plan_gc_with_policy(
             candidate.root_relative_path = Some(relative.to_string_lossy().into_owned());
             candidate.planned_device = Some(metadata.dev());
             candidate.planned_inode = Some(metadata.ino());
+            candidate.planned_mtime_secs = Some(metadata.mtime() as u64);
         }
     }
     candidates.sort_by(|a, b| a.rule.cmp(&b.rule).then(a.path.cmp(&b.path)));
@@ -1179,6 +1194,8 @@ fn plan_backup_gc(
                     root_relative_path: None,
                     planned_device: None,
                     planned_inode: None,
+
+                    planned_mtime_secs: None,
                 });
             } else {
                 prunable_backup_refs.push(f);
@@ -1206,6 +1223,8 @@ fn plan_backup_gc(
                     root_relative_path: None,
                     planned_device: None,
                     planned_inode: None,
+
+                    planned_mtime_secs: None,
                 });
             }
         }
@@ -1227,6 +1246,8 @@ fn plan_backup_gc(
                 root_relative_path: None,
                 planned_device: None,
                 planned_inode: None,
+
+                planned_mtime_secs: None,
             });
         }
     }
@@ -1272,6 +1293,8 @@ fn plan_orphan_gc(
             root_relative_path: None,
             planned_device: None,
             planned_inode: None,
+
+            planned_mtime_secs: None,
             kind: f.kind,
             bytes: f.bytes,
             project_id: f.project_id.clone(),
@@ -1468,6 +1491,8 @@ fn plan_snapshot_gc(
             root_relative_path: None,
             planned_device: None,
             planned_inode: None,
+
+            planned_mtime_secs: None,
             kind: snapshot.file.kind,
             bytes: snapshot.file.bytes,
             project_id: snapshot.file.project_id.clone(),
@@ -1540,6 +1565,8 @@ fn plan_observed_gc(
                 root_relative_path: None,
                 planned_device: None,
                 planned_inode: None,
+
+                planned_mtime_secs: None,
             }),
             None if usage.bytes > 0 => candidates.push(GcCandidate {
                 path: usage.path.clone(),
@@ -1551,6 +1578,8 @@ fn plan_observed_gc(
                 root_relative_path: None,
                 planned_device: None,
                 planned_inode: None,
+
+                planned_mtime_secs: None,
             }),
             _ => {}
         }
@@ -1569,8 +1598,19 @@ pub fn apply_gc(edges_dir: &Path, candidates: &[GcCandidate]) -> (Vec<String>, V
             c.root_relative_path.as_deref(),
             c.planned_device,
             c.planned_inode,
+            c.planned_mtime_secs,
         ) {
-            (Some(relative), Some(device), Some(inode)) => {
+            (Some(relative), Some(device), Some(inode), Some(planned_mtime)) => {
+                // R16F2: revalidate age and mtime identity immediately before
+                // unlink. A concurrent writer that reused the file between
+                // the scan-time age check and apply must not have its temp
+                // collected: if the mtime changed, the file was replaced.
+                if c.kind == FileKind::Temp {
+                    if let Err(reason) = revalidate_temp_identity(&c.path, planned_mtime) {
+                        errors.push(reason);
+                        continue;
+                    }
+                }
                 bbox_edge_sidecar::snapshot::remove_gc_candidate_file(
                     edges_dir,
                     Path::new(relative),
@@ -1622,6 +1662,34 @@ fn file_age_secs(path: &Path) -> Option<u64> {
 
 fn recency_age_secs(path: &Path) -> u64 {
     file_age_secs(path).unwrap_or(0)
+}
+
+/// R16F2: revalidate a temp file's identity immediately before unlink.
+/// Returns Err(reason_string) if the file was replaced (mtime changed) or
+/// disappeared between the scan-time age check and apply. The caller skips
+/// deletion on Err and records the reason.
+#[cfg(unix)]
+fn revalidate_temp_identity(path: &str, planned_mtime_secs: u64) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!("{path}: temp vanished before revalidation"));
+        }
+        Err(error) => {
+            return Err(format!("{path}: revalidation stat failed: {error}"));
+        }
+    };
+    if !metadata.is_file() {
+        return Err(format!("{path}: temp is no longer a regular file"));
+    }
+    let current_mtime = metadata.mtime() as u64;
+    if current_mtime != planned_mtime_secs {
+        return Err(format!(
+            "{path}: temp mtime changed since scan (planned={planned_mtime_secs}, current={current_mtime})"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2559,6 +2627,7 @@ mod tests {
             root_relative_path: Some("derived/project/candidate.jsonl".into()),
             planned_device: Some(metadata.dev()),
             planned_inode: Some(metadata.ino()),
+            planned_mtime_secs: Some(metadata.mtime() as u64),
             kind: FileKind::Temp,
             bytes: metadata.len(),
             project_id: None,
@@ -2651,6 +2720,8 @@ mod tests {
             root_relative_path: None,
             planned_device: None,
             planned_inode: None,
+
+            planned_mtime_secs: None,
             kind: file.kind,
             bytes: file.bytes,
             project_id: file.project_id.clone(),
@@ -2685,6 +2756,7 @@ mod tests {
             root_relative_path: Some("workspace/p1/snapshots/snap1/project.jsonl".into()),
             planned_device: Some(metadata.dev()),
             planned_inode: Some(metadata.ino()),
+            planned_mtime_secs: Some(metadata.mtime() as u64),
             kind: FileKind::InactiveSnapshot,
             bytes: metadata.len(),
             project_id: Some("p1".into()),
@@ -2806,5 +2878,106 @@ mod tests {
                 && c.rule.contains("backup_total_cap_exceeded")
                 && !c.deletable
         }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_skips_temp_replaced_between_scan_and_apply() {
+        // R16F2: a temp file whose mtime changed between the plan-time scan
+        // and apply (a concurrent writer reused it) must NOT be collected.
+        let dir = setup_edges_dir();
+        let edges_dir = dir.path();
+        let namespace_dir = edges_dir.join("derived").join("proj");
+        fs::create_dir_all(&namespace_dir).unwrap();
+        let temp_path = namespace_dir.join("p1.jsonl.tmp.1234.0");
+        write_file(&namespace_dir, "p1.jsonl.tmp.1234.0", b"original");
+        set_mtime_days_old(&temp_path, 2);
+
+        let report = scan_storage_health(edges_dir, &HashSet::new(), None, true).unwrap();
+        let temp_file = report
+            .files
+            .iter()
+            .find(|f| f.kind == FileKind::Temp)
+            .expect("temp file must be scanned");
+
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(&temp_path).unwrap();
+
+        let candidate = GcCandidate {
+            path: temp_path.to_string_lossy().into_owned(),
+            root_relative_path: Some("derived/proj/p1.jsonl.tmp.1234.0".into()),
+            planned_device: Some(metadata.dev()),
+            planned_inode: Some(metadata.ino()),
+            planned_mtime_secs: Some(metadata.mtime() as u64),
+            kind: FileKind::Temp,
+            bytes: temp_file.bytes,
+            project_id: None,
+            rule: "temp_past_grace".to_string(),
+            deletable: true,
+        };
+
+        // Simulate concurrent writer: replace the temp content, which changes mtime.
+        fs::write(&temp_path, b"replaced by concurrent writer").unwrap();
+
+        let (deleted, errors) = apply_gc(edges_dir, &[candidate]);
+        assert!(deleted.is_empty(), "replaced temp must not be deleted");
+        assert_eq!(errors.len(), 1, "revalidation must produce an error");
+        assert!(
+            errors[0].contains("mtime changed"),
+            "error must explain mtime change: {}",
+            errors[0]
+        );
+
+        // The file must survive.
+        assert!(
+            temp_path.exists(),
+            "temp file must survive GC when identity changed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_temp_is_unique_per_call() {
+        // R16F2: replace_project_edges must create unique temp files
+        // (O_EXCL) so GC cannot unlink a temp the writer is actively using.
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+        let edge = bbox_chunker::Edge {
+            source: bbox_corpus_core::entity_ref::EntityRef::Knowledge { id: "s1".into() },
+            kind: "DESCRIBES".into(),
+            target: bbox_corpus_core::entity_ref::EntityRef::Knowledge { id: "t1".into() },
+            provenance: bbox_chunker::EdgeProvenance::Derived,
+            confidence: bbox_chunker::EdgeConfidence::Exact,
+        };
+
+        // Write twice; both should succeed and the final file should have content.
+        bbox_edge_sidecar::edge_sidecar::replace_project_edges(
+            edges_dir,
+            "proj",
+            "p1",
+            std::slice::from_ref(&edge),
+        )
+        .unwrap();
+        bbox_edge_sidecar::edge_sidecar::replace_project_edges(
+            edges_dir,
+            "proj",
+            "p1",
+            std::slice::from_ref(&edge),
+        )
+        .unwrap();
+
+        let final_path = edges_dir.join("derived").join("proj").join("p1.jsonl");
+        assert!(final_path.exists(), "final file must exist");
+
+        // No leftover temps from either write.
+        let temps: Vec<_> = fs::read_dir(edges_dir.join("derived").join("proj"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            temps.is_empty(),
+            "no leftover unique temp files should remain after successful rename"
+        );
     }
 }
