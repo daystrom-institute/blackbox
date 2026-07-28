@@ -889,22 +889,6 @@ fn scan_observed_lane_dir(
     }
 }
 
-fn extract_project_from_workspace_path(path: &Path) -> Option<String> {
-    let mut components = path.components().rev();
-    let _filename = components.next()?;
-    let _snapshot_id = components.next()?;
-    let snapshots = components.next()?;
-    if snapshots.as_os_str() != "snapshots" {
-        return None;
-    }
-    let project = components.next()?;
-    let workspace = components.next()?;
-    if workspace.as_os_str() == "workspace" {
-        Some(project.as_os_str().to_str()?.to_string())
-    } else {
-        None
-    }
-}
 
 fn is_backup_file(file_name: &str) -> bool {
     if let Some(idx) = file_name.find(".bak-") {
