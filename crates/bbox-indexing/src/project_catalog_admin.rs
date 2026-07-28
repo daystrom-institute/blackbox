@@ -6317,9 +6317,15 @@ mod tests {
 
         let mut workers = NoopDischargeWorkers;
         let evidence = RetireEvidence::default();
-        let (_, resumed) =
-            retire_project_journaled_with(&store, root.as_path(), &pid, &evidence, true, &mut workers)
-                .unwrap();
+        let (_, resumed) = retire_project_journaled_with(
+            &store,
+            root.as_path(),
+            &pid,
+            &evidence,
+            true,
+            &mut workers,
+        )
+        .unwrap();
         assert_eq!(
             resumed.unwrap().current_stage,
             RetirementJournalStage::Complete
