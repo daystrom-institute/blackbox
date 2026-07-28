@@ -83,6 +83,7 @@ cmd="${1:-}"
 run_row() {
 case "$1" in
   produce)
+    mkdir -p "$SMOKE"
     (cd "$REPO_ROOT" && BBOX_SMOKE_FIXTURE_ROOT="$SMOKE" \
       cargo nextest run -p bbox-indexing --run-ignored all \
       -E 'test(produce_migrated_smoke_fixture_from_env_root)') || return 1
