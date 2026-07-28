@@ -190,8 +190,24 @@ pub fn remove_gc_candidate_file(
     })
 }
 
-#[cfg(unix)]
 pub fn remove_inactive_snapshot_tree(
+    edges_dir: &Path,
+    root_relative: &Path,
+    expected_identity: (u64, u64),
+) -> Result<bool> {
+    with_manifest_coordinator(|| {
+        remove_inactive_snapshot_tree_locked(edges_dir, root_relative, expected_identity)
+    })
+}
+
+/// Reclaim one inactive snapshot tree. The caller must already hold the
+/// manifest coordinator; it is non-reentrant.
+///
+/// R28F1: publishing a local activation pin resolves a standing reclamation
+/// intent for the same snapshot through this entry point, so the destructive
+/// half has to be reachable while the coordinator is already held.
+#[cfg(unix)]
+fn remove_inactive_snapshot_tree_locked(
     edges_dir: &Path,
     root_relative: &Path,
     expected_identity: (u64, u64),
@@ -200,7 +216,7 @@ pub fn remove_inactive_snapshot_tree(
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
 
-    with_manifest_coordinator(|| {
+    {
         let components = root_relative
             .components()
             .map(|component| match component {
@@ -236,10 +252,15 @@ pub fn remove_inactive_snapshot_tree(
             }
             return Ok(false);
         }
-        if existing_intent.is_none()
-            && (snapshot_has_pending_journal(edges_dir, project_id, snapshot_id)?
-                || snapshot_has_pending_local_activation(edges_dir, project_id, snapshot_id)?)
-        {
+        // R28F1: BOTH pending-work classes are consulted on every pass, not
+        // only when no intent exists yet. An intent persisted before a
+        // nonfatal GC failure used to authorize the rest of the reclamation
+        // unconditionally on the retry, so a snapshot staged in between (its
+        // members written into the very directory inode the intent names)
+        // was renamed away and unlinked.
+        let pending_work = snapshot_has_pending_journal(edges_dir, project_id, snapshot_id)?
+            || snapshot_has_pending_local_activation(edges_dir, project_id, snapshot_id)?;
+        if existing_intent.is_none() && pending_work {
             return Ok(false);
         }
 
@@ -338,6 +359,15 @@ pub fn remove_inactive_snapshot_tree(
                         == (intent.device, intent.inode) => {}
             Ok(_) => anyhow::bail!("inactive snapshot reclamation tombstone identity changed"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // R28F1: the rename below is the point of no return for the
+                // tree still standing at the leaf. Nothing destructive may
+                // run past a pending transaction journal or a pending local
+                // activation pin naming this snapshot, whatever the intent
+                // says. (Once the tombstone exists the leaf is a different
+                // directory, so that branch continues safely.)
+                if pending_work {
+                    return Ok(false);
+                }
                 let stat = match fstatat_nofollow(directory.as_raw_fd(), &leaf) {
                     Ok(stat) => stat,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -374,11 +404,11 @@ pub fn remove_inactive_snapshot_tree(
         manifest.prune_snapshot_receipt_state(&snapshot_relative);
         manifest.write_atomic(edges_dir)?;
         Ok(true)
-    })
+    }
 }
 
 #[cfg(not(unix))]
-pub fn remove_inactive_snapshot_tree(
+fn remove_inactive_snapshot_tree_locked(
     edges_dir: &Path,
     root_relative: &Path,
     _expected_identity: (u64, u64),
@@ -397,7 +427,7 @@ pub fn remove_inactive_snapshot_tree(
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("inactive snapshot id is not UTF-8"))?;
     let snapshot_relative = format!("workspace/{project_id}/snapshots/{snapshot_id}");
-    with_manifest_coordinator(|| {
+    {
         let mut manifest = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
         let existing_intent = manifest
             .snapshot_reclamations
@@ -409,10 +439,12 @@ pub fn remove_inactive_snapshot_tree(
             }
             return Ok(false);
         }
-        if existing_intent.is_none()
-            && (snapshot_has_pending_journal(edges_dir, project_id, snapshot_id)?
-                || snapshot_has_pending_local_activation(edges_dir, project_id, snapshot_id)?)
-        {
+        // R28F1: see the unix path. Both pending-work classes are consulted
+        // on every pass, and the recheck below gates the rename that dooms
+        // the tree still standing at the leaf.
+        let pending_work = snapshot_has_pending_journal(edges_dir, project_id, snapshot_id)?
+            || snapshot_has_pending_local_activation(edges_dir, project_id, snapshot_id)?;
+        if existing_intent.is_none() && pending_work {
             return Ok(false);
         }
         let intent = if let Some(intent) = existing_intent {
@@ -439,6 +471,9 @@ pub fn remove_inactive_snapshot_tree(
             .ok_or_else(|| anyhow::anyhow!("inactive snapshot has no parent"))?;
         let tombstone = parent.join(&intent.tombstone);
         if !tombstone.exists() {
+            if pending_work {
+                return Ok(false);
+            }
             match fs::rename(&path, &tombstone) {
                 Ok(()) => fs::File::open(parent)?.sync_all()?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -454,7 +489,7 @@ pub fn remove_inactive_snapshot_tree(
         manifest.prune_snapshot_receipt_state(&snapshot_relative);
         manifest.write_atomic(edges_dir)?;
         Ok(true)
-    })
+    }
 }
 
 #[cfg(unix)]
@@ -1132,6 +1167,8 @@ fn new_pending_local_activation_pin(
     }
 }
 
+/// R28F1: publish the GC pin for one staged snapshot.
+///
 /// R27F1: publication runs under the same manifest coordinator reclamation
 /// holds. `remove_inactive_snapshot_tree` and `remove_gc_candidate_file` read
 /// the pin state while holding the coordinator, so an uncoordinated
@@ -1142,6 +1179,14 @@ fn new_pending_local_activation_pin(
 /// declines), or GC's whole reclamation completes first and staging then
 /// re-materializes from scratch.
 ///
+/// R28F1: a persisted reclamation intent survives a nonfatal GC failure, and
+/// the existing-intent branch of reclamation used to skip both pending-work
+/// checks. Publishing a pin for a snapshot that already carries an intent
+/// therefore has to resolve that intent FIRST: the resolution either finishes
+/// the reclamation (the tree goes away and staging re-materializes it from
+/// scratch) or refuses, and no pin is published on top of an unresolved
+/// deletion decision.
+///
 /// The coordinator is a non-reentrant `std::sync::Mutex`, so this must stay
 /// the only lock take on the path: `stage_local_snapshot_activation` calls it
 /// before `write_snapshot_files` (which takes the coordinator itself), and the
@@ -1151,10 +1196,55 @@ fn pin_pending_local_activation(
     activation: &PendingLocalSnapshotActivation,
 ) -> Result<()> {
     with_manifest_coordinator(|| {
+        resolve_reclamation_intent_before_pin_locked(
+            edges_dir,
+            &activation.project_id,
+            &activation.snapshot_id,
+        )?;
         migrate_legacy_pending_local_activations_locked(edges_dir)?;
         let pin = new_pending_local_activation_pin(activation);
         write_pending_local_activation_pin_locked(edges_dir, &pin)
     })
+}
+
+/// R28F1 (a): a snapshot that carries a durable reclamation intent is
+/// mid-deletion. Staging into it would materialize members inside a tree GC
+/// is entitled to rename away and unlink, and the intent's mere presence used
+/// to make GC skip its pending-pin checks entirely. Drive the reclamation to
+/// completion under the coordinator both sides already share, then refuse if
+/// the intent is still standing afterwards.
+///
+/// The caller must already hold the manifest coordinator.
+fn resolve_reclamation_intent_before_pin_locked(
+    edges_dir: &Path,
+    project_id: &str,
+    snapshot_id: &str,
+) -> Result<()> {
+    validate_snapshot_component(project_id)?;
+    validate_snapshot_component(snapshot_id)?;
+    let snapshot_relative = active_snapshot_rel(project_id, snapshot_id);
+    let manifest = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
+    let Some(intent) = manifest
+        .snapshot_reclamations
+        .get(&snapshot_relative)
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let root_relative = Path::new("materialized").join(&snapshot_relative);
+    // The existing-intent branch validates against the intent's own recorded
+    // identity, so that is the identity to hand it.
+    remove_inactive_snapshot_tree_locked(edges_dir, &root_relative, (intent.device, intent.inode))?;
+    if crate::manifest::ManifestIndex::load_or_new(edges_dir)?
+        .snapshot_reclamations
+        .contains_key(&snapshot_relative)
+    {
+        anyhow::bail!(
+            "refusing to pin a local activation while the reclamation intent for \
+             {snapshot_relative} is unresolved"
+        );
+    }
+    Ok(())
 }
 
 fn snapshot_has_pending_local_activation(
@@ -1775,6 +1865,17 @@ pub fn activate_pending_local_snapshots(
         }
 
         let mut index = ManifestIndex::load_or_new(edges_dir)?;
+        // R28F1: a reclamation intent that declined its own destructive
+        // continuation because this snapshot was pinned is settled the moment
+        // the snapshot becomes active. Retiring it here keeps the
+        // active-plus-intent state (which every reclamation entry point
+        // refuses) from having to wait for the next pre-bind recovery.
+        for activation in activations {
+            index.snapshot_reclamations.remove(&active_snapshot_rel(
+                &activation.project_id,
+                &activation.snapshot_id,
+            ));
+        }
         for activation in activations {
             // Preserve an existing collected: entry: a project whose
             // effective source is collected must not be overwritten by a
@@ -9861,6 +9962,137 @@ mod tests {
             &[],
         )
         .unwrap();
+    }
+
+    /// R28F1: a reclamation intent that outlives a nonfatal GC failure must
+    /// not authorize deleting a snapshot staged afterwards.
+    ///
+    /// The failure is injected for real rather than simulated: the intent is
+    /// persisted before the tombstone rename, so denying writes on the
+    /// snapshots directory fails the reclamation at exactly the point where
+    /// the intent is already durable. The same snapshot is then restaged, and
+    /// both a live GC retry and a full pre-bind recovery must leave the newly
+    /// staged members standing.
+    #[cfg(unix)]
+    #[test]
+    fn r28_reclamation_intent_surviving_a_failure_cannot_delete_a_restaged_snapshot() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let relative = Path::new("materialized/workspace/p_1/snapshots/snapshot-a");
+        let snapshot_key = "workspace/p_1/snapshots/snapshot-a";
+        write_snapshot_files(&edges_dir, "p_1", "snapshot-a", &[("project.jsonl", &[])]).unwrap();
+        let snapshot = snapshot_dir(&edges_dir, "p_1", "snapshot-a");
+        let stale = fs::symlink_metadata(&snapshot).unwrap();
+        let stale_identity = (stale.dev() as u64, stale.ino() as u64);
+        let snapshots_parent = snapshot.parent().unwrap().to_path_buf();
+
+        fs::set_permissions(&snapshots_parent, fs::Permissions::from_mode(0o500)).unwrap();
+        let failure = remove_inactive_snapshot_tree(&edges_dir, relative, stale_identity);
+        fs::set_permissions(&snapshots_parent, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(failure.is_err(), "the injected fault must fail the pass");
+        assert!(
+            ManifestIndex::load(&edges_dir)
+                .unwrap()
+                .snapshot_reclamations
+                .contains_key(snapshot_key),
+            "the fault must land after the intent is durable"
+        );
+        assert!(snapshot.is_dir());
+
+        // A later reindex stages the SAME snapshot. Publishing its pin
+        // resolves the standing intent first, so the stale tree is reclaimed
+        // and the new members land in a fresh directory.
+        pin_test_stage(&edges_dir, "p_1", "snapshot-a");
+        assert!(
+            ManifestIndex::load(&edges_dir)
+                .unwrap()
+                .snapshot_reclamations
+                .is_empty()
+        );
+        let restaged = fs::symlink_metadata(&snapshot).unwrap();
+        assert_ne!(
+            (restaged.dev() as u64, restaged.ino() as u64),
+            stale_identity
+        );
+        assert!(snapshot.join("project.jsonl").is_file());
+        assert!(snapshot.join("symbols.jsonl").is_file());
+        assert!(snapshot.join("git-current.jsonl").is_file());
+
+        // A live GC retry now sees the pin and declines.
+        assert!(
+            !remove_inactive_snapshot_tree(
+                &edges_dir,
+                relative,
+                (restaged.dev() as u64, restaged.ino() as u64),
+            )
+            .unwrap()
+        );
+        assert!(snapshot.join("project.jsonl").is_file());
+
+        // And so does a restart, whose pre-bind reclamation recovery runs
+        // before pending-transaction recovery.
+        recover_pending_transactions_prebind(&edges_dir, None).unwrap();
+        assert!(snapshot.join("project.jsonl").is_file());
+        assert!(snapshot_has_pending_local_activation(&edges_dir, "p_1", "snapshot-a").unwrap());
+    }
+
+    /// R28F1: the durable overlap a crash can leave behind (an intent for a
+    /// snapshot that is now pinned and staged) must survive pre-bind
+    /// recovery intact, and activating the pin retires the intent.
+    #[cfg(unix)]
+    #[test]
+    fn r28_prebind_recovery_declines_a_reclamation_for_a_pinned_snapshot() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_key = "workspace/p_1/snapshots/snapshot-a";
+        pin_test_stage(&edges_dir, "p_1", "snapshot-a");
+        let snapshot = snapshot_dir(&edges_dir, "p_1", "snapshot-a");
+        let staged = fs::symlink_metadata(&snapshot).unwrap();
+
+        let mut manifest = ManifestIndex::load_or_new(&edges_dir).unwrap();
+        manifest.snapshot_reclamations.insert(
+            snapshot_key.to_string(),
+            crate::manifest::SnapshotReclamationIntent {
+                receipt_digest: None,
+                tombstone: ".reclaim-snapshot-a".to_string(),
+                device: staged.dev() as u64,
+                inode: staged.ino() as u64,
+            },
+        );
+        manifest.write_atomic(&edges_dir).unwrap();
+
+        recover_pending_transactions_prebind(&edges_dir, None).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&snapshot).unwrap().ino(),
+            staged.ino(),
+            "recovery must not have renamed the staged tree away"
+        );
+        assert!(snapshot.join("project.jsonl").is_file());
+        assert!(snapshot_has_pending_local_activation(&edges_dir, "p_1", "snapshot-a").unwrap());
+        assert!(
+            ManifestIndex::load(&edges_dir)
+                .unwrap()
+                .snapshot_reclamations
+                .contains_key(snapshot_key),
+            "declining leaves the undecided intent standing rather than destroying evidence"
+        );
+
+        let activations = load_pending_local_activation_pins(&edges_dir)
+            .unwrap()
+            .iter()
+            .map(|pin| pin.activation().clone())
+            .collect::<Vec<_>>();
+        activate_pending_local_snapshots(&edges_dir, &activations).unwrap();
+        assert!(
+            ManifestIndex::load(&edges_dir)
+                .unwrap()
+                .snapshot_reclamations
+                .is_empty()
+        );
     }
 
     /// R28F2: publishing a pin writes exactly one file. The v1 whole-document
