@@ -767,11 +767,12 @@ pub(super) fn execute_reindex_pass(
         .iter()
         .map(|h| h.commitment().to_string())
         .collect();
-    commitments.extend(
+    let outstanding: Vec<String> =
         bbox_edge_sidecar::snapshot::enumerate_outstanding_commitments(&edges_dir)
             .into_iter()
-            .filter(|c| !commitments.contains(c)),
-    );
+            .filter(|c| !commitments.contains(c))
+            .collect();
+    commitments.extend(outstanding);
     let txn_payload = commitments.join(",");
     let mut prepared = writer.prepare_commit()?;
     if !txn_payload.is_empty() {
@@ -782,7 +783,7 @@ pub(super) fn execute_reindex_pass(
         for handle in &pending_handles {
             let _ = bbox_edge_sidecar::snapshot::discard_snapshot_transaction(handle);
         }
-        return Err(commit_error);
+        return Err(commit_error.into());
     }
     // R20F4: fail closed if any finalization fails.
     for handle in &pending_handles {

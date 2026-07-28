@@ -647,7 +647,7 @@ mod tests {
         let publication_result = publication.publish().unwrap();
         assert!(git_meta_dir.join("proj1234.json").exists());
         writer.commit().unwrap();
-        publication_result.finalize_publications();
+        publication_result.finalize_publications().unwrap();
 
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();

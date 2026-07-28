@@ -1502,11 +1502,12 @@ fn run_collected_stage(
     // commit must carry ALL unresolved tokens so a later commit cannot erase
     // proof of an earlier one.
     let mut commitments: Vec<String> = publication_result.pending_commitments();
-    commitments.extend(
+    let outstanding: Vec<String> =
         bbox_edge_sidecar::snapshot::enumerate_outstanding_commitments(&edges_dir)
             .into_iter()
-            .filter(|c| !commitments.contains(c)),
-    );
+            .filter(|c| !commitments.contains(c))
+            .collect();
+    commitments.extend(outstanding);
     let txn_payload = commitments.join(",");
     let mut prepared = writer.prepare_commit()?;
     if !txn_payload.is_empty() {
@@ -1517,7 +1518,7 @@ fn run_collected_stage(
         for handle in &publication_result.pending_snapshot_finalizations {
             let _ = bbox_edge_sidecar::snapshot::discard_snapshot_transaction(handle);
         }
-        return Err(commit_error);
+        return Err(commit_error.into());
     }
     // R20F4: finalization returns Result; do not publish the post-commit
     // read view until staging members are renamed into the live snapshot.
@@ -1637,11 +1638,12 @@ fn run_local_stage(
     let publication_result = publication.publish()?;
     // R21F1+F2: carry forward all outstanding commitments.
     let mut commitments: Vec<String> = publication_result.pending_commitments();
-    commitments.extend(
+    let outstanding: Vec<String> =
         bbox_edge_sidecar::snapshot::enumerate_outstanding_commitments(&edges_dir)
             .into_iter()
-            .filter(|c| !commitments.contains(c)),
-    );
+            .filter(|c| !commitments.contains(c))
+            .collect();
+    commitments.extend(outstanding);
     let txn_payload = commitments.join(",");
     let mut prepared = writer.prepare_commit()?;
     if !txn_payload.is_empty() {
@@ -1652,7 +1654,7 @@ fn run_local_stage(
         for handle in &publication_result.pending_snapshot_finalizations {
             let _ = bbox_edge_sidecar::snapshot::discard_snapshot_transaction(handle);
         }
-        return Err(commit_error);
+        return Err(commit_error.into());
     }
     if let Err(error) = publication_result.finalize_publications() {
         tracing::error!(error = %error, "finalization failed after commit, discarding staging");
@@ -1706,11 +1708,12 @@ fn run_git_current_overlay(
     let publication_result = publication.publish()?;
     // R21F1+F2: carry forward all outstanding commitments.
     let mut commitments: Vec<String> = publication_result.pending_commitments();
-    commitments.extend(
+    let outstanding: Vec<String> =
         bbox_edge_sidecar::snapshot::enumerate_outstanding_commitments(&edges_dir)
             .into_iter()
-            .filter(|c| !commitments.contains(c)),
-    );
+            .filter(|c| !commitments.contains(c))
+            .collect();
+    commitments.extend(outstanding);
     let txn_payload = commitments.join(",");
     let mut prepared = writer.prepare_commit()?;
     if !txn_payload.is_empty() {
@@ -1721,7 +1724,7 @@ fn run_git_current_overlay(
         for handle in &publication_result.pending_snapshot_finalizations {
             let _ = bbox_edge_sidecar::snapshot::discard_snapshot_transaction(handle);
         }
-        return Err(commit_error);
+        return Err(commit_error.into());
     }
     if let Err(error) = publication_result.finalize_publications() {
         tracing::error!(error = %error, "finalization failed after commit, discarding staging");
@@ -1798,11 +1801,12 @@ fn run_consolidated_history(
         .iter()
         .map(|h| h.commitment().to_string())
         .collect();
-    commitments.extend(
+    let outstanding: Vec<String> =
         bbox_edge_sidecar::snapshot::enumerate_outstanding_commitments(&edges_dir)
             .into_iter()
-            .filter(|c| !commitments.contains(c)),
-    );
+            .filter(|c| !commitments.contains(c))
+            .collect();
+    commitments.extend(outstanding);
     let txn_payload = commitments.join(",");
     let mut prepared = writer.prepare_commit()?;
     if !txn_payload.is_empty() {
@@ -1813,7 +1817,7 @@ fn run_consolidated_history(
         for handle in &all_handles {
             let _ = bbox_edge_sidecar::snapshot::discard_snapshot_transaction(handle);
         }
-        return Err(commit_error);
+        return Err(commit_error.into());
     }
     // R20F4: fail closed if any finalization fails.
     for handle in &all_handles {
