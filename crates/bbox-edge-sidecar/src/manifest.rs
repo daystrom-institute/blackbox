@@ -339,6 +339,7 @@ impl ManifestIndex {
                 let snapshot_dir = materialized_dir(edges_dir).join(snapshot);
                 if snapshot_dir.is_dir() {
                     append_jsonl_files(&snapshot_dir, &mut paths);
+                    append_jsonl_files(&snapshot_dir.join(".objects"), &mut paths);
                 }
             }
 
@@ -1043,12 +1044,30 @@ fn confined_snapshot_members(
                 .as_deref()
                 .is_some_and(|generation| overlay.matches_code_generation(generation))
         });
+    let committed = crate::snapshot::committed_snapshot_members(edges_dir, snapshot)?;
+    let committed_names: HashSet<&str> = committed
+        .iter()
+        .map(|(logical_name, _, _)| logical_name.as_str())
+        .collect();
     let mut files = confined_jsonl_files(edges_dir, snapshot)?;
+    files.retain(|(path, _)| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_none_or(|name| !committed_names.contains(name))
+    });
     if !overlay_admits_git_current {
         files.retain(|(path, _)| {
             path.file_name().and_then(|name| name.to_str()) != Some(GIT_CURRENT_MEMBER)
         });
     }
+    files.extend(
+        committed
+            .into_iter()
+            .filter(|(logical_name, _, _)| {
+                overlay_admits_git_current || logical_name != GIT_CURRENT_MEMBER
+            })
+            .map(|(_, path, file)| (path, file)),
+    );
     if files.is_empty() {
         anyhow::bail!("active snapshot has no loadable JSONL members");
     }
@@ -1139,12 +1158,30 @@ fn confined_snapshot_members(
                 .as_deref()
                 .is_some_and(|generation| overlay.matches_code_generation(generation))
         });
+    let committed = crate::snapshot::committed_snapshot_members(edges_dir, snapshot)?;
+    let committed_names: HashSet<&str> = committed
+        .iter()
+        .map(|(logical_name, _, _)| logical_name.as_str())
+        .collect();
     let mut files = confined_jsonl_files(edges_dir, snapshot)?;
+    files.retain(|(path, _)| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_none_or(|name| !committed_names.contains(name))
+    });
     if !overlay_admits_git_current {
         files.retain(|(path, _)| {
             path.file_name().and_then(|name| name.to_str()) != Some(GIT_CURRENT_MEMBER)
         });
     }
+    files.extend(
+        committed
+            .into_iter()
+            .filter(|(logical_name, _, _)| {
+                overlay_admits_git_current || logical_name != GIT_CURRENT_MEMBER
+            })
+            .map(|(_, path, file)| (path, file)),
+    );
     if files.is_empty() {
         anyhow::bail!("active snapshot has no loadable JSONL members");
     }

@@ -307,6 +307,7 @@ impl ProjectIndexPublicationBundle {
         Ok(PublicationResult {
             pending_local_snapshots,
             pending_snapshot_finalizations,
+            commit_succeeded: false,
         })
     }
 }
@@ -330,12 +331,54 @@ pub struct PublicationResult {
     /// finalize_snapshot_publication for each handle AFTER writer.commit()
     /// succeeds. R20F2: finalization processes ONLY the exact handle.
     pub pending_snapshot_finalizations: Vec<bbox_edge_sidecar::snapshot::SnapshotTxnHandle>,
+    commit_succeeded: bool,
 }
 
 impl PublicationResult {
+    pub fn rollback_pending(&mut self) -> Result<()> {
+        let mut failures = Vec::new();
+        self.pending_snapshot_finalizations.retain(|handle| {
+            match bbox_edge_sidecar::snapshot::discard_snapshot_transaction(handle) {
+                Ok(()) => false,
+                Err(error) => {
+                    failures.push(format!(
+                        "{}:{}: {error:#}",
+                        handle.project_id, handle.txn_token
+                    ));
+                    true
+                }
+            }
+        });
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "snapshot transaction rollback left unresolved staging: {}",
+                failures.join("; ")
+            )
+        }
+    }
+
+    pub fn mark_commit_succeeded(&mut self) {
+        self.commit_succeeded = true;
+    }
+
+    pub fn take_pending_snapshot_finalizations(
+        &mut self,
+    ) -> Vec<bbox_edge_sidecar::snapshot::SnapshotTxnHandle> {
+        std::mem::take(&mut self.pending_snapshot_finalizations)
+    }
+
+    pub fn take_pending_local_snapshots(
+        &mut self,
+    ) -> Vec<bbox_edge_sidecar::snapshot::PendingLocalSnapshotActivation> {
+        std::mem::take(&mut self.pending_local_snapshots)
+    }
+
     /// Finalize all pending transactions. R20F4: returns Result; the caller
     /// must NOT publish the post-commit read view until this succeeds.
-    pub fn finalize_publications(self) -> Result<()> {
+    pub fn finalize_publications(mut self) -> Result<()> {
+        self.commit_succeeded = true;
         for handle in &self.pending_snapshot_finalizations {
             if let Err(error) = bbox_edge_sidecar::snapshot::finalize_snapshot_publication(handle) {
                 tracing::error!(
@@ -349,6 +392,20 @@ impl PublicationResult {
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for PublicationResult {
+    fn drop(&mut self) {
+        if self.commit_succeeded || self.pending_snapshot_finalizations.is_empty() {
+            return;
+        }
+        if let Err(error) = self.rollback_pending() {
+            tracing::error!(
+                error = %error,
+                "snapshot publication dropped with unresolved staged transactions"
+            );
+        }
     }
 }
 

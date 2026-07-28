@@ -282,6 +282,66 @@ struct ActorCtx {
     assignments: Arc<parking_lot::RwLock<Option<Arc<dyn ProducerAssignmentSource>>>>,
 }
 
+fn commit_snapshot_publications(
+    index: &Index,
+    writer: &mut IndexWriter,
+    edges_dir: &Path,
+    mut publication: super::project_files::PublicationResult,
+) -> Result<super::project_files::PublicationResult> {
+    let attempt = (|| -> Result<()> {
+        let prior_payload = index
+            .load_metas()
+            .context("loading prior index payload before snapshot commit")?
+            .payload;
+        let current = publication.pending_commitments();
+        let commitments = bbox_edge_sidecar::snapshot::carry_forward_commitments(
+            edges_dir,
+            prior_payload.as_deref(),
+            &current,
+        )?;
+        let mut prepared = writer.prepare_commit()?;
+        let payload = commitments.join(",");
+        if !payload.is_empty() {
+            prepared.set_payload(&payload);
+        }
+        prepared.commit()?;
+        Ok(())
+    })();
+
+    if let Err(error) = attempt {
+        if let Err(cleanup) = publication.rollback_pending() {
+            return Err(error).context(format!(
+                "snapshot commit failed and rollback also failed: {cleanup:#}"
+            ));
+        }
+        return Err(error);
+    }
+    publication.mark_commit_succeeded();
+    Ok(publication)
+}
+
+fn rollback_snapshot_handles(
+    handles: &[bbox_edge_sidecar::snapshot::SnapshotTxnHandle],
+) -> Result<()> {
+    let mut failures = Vec::new();
+    for handle in handles {
+        if let Err(error) = bbox_edge_sidecar::snapshot::discard_snapshot_transaction(handle) {
+            failures.push(format!(
+                "{}:{}: {error:#}",
+                handle.project_id, handle.txn_token
+            ));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "snapshot transaction rollback left unresolved staging: {}",
+            failures.join("; ")
+        )
+    }
+}
+
 /// Derived effective source for one catalog project at planning time
 /// (Phase 3 plan section 4.7). There is no persisted effective-source store:
 /// this is computed per pass from the pinned catalog snapshot, the edge
@@ -1495,36 +1555,9 @@ fn run_collected_stage(
     // No checkout lease contributed to this bundle, so there is no
     // publication guard to hold: the broker's guard exists to pin checkout
     // lifecycle across publish, and this transaction touched no checkout.
-    let publication_result = publication.publish()?;
-    // R22F1+F2: carry-forward = (prior Tantivy payload intersected with
-    // validated journal inventory) UNION current handles. Journal presence
-    // alone never establishes commitment. Inventory errors abort the commit.
-    let prior_payload = ctx.index.load_metas().ok().and_then(|m| m.payload);
-    let current: Vec<String> = publication_result.pending_commitments();
-    let commitments = bbox_edge_sidecar::snapshot::carry_forward_commitments(
-        &edges_dir,
-        prior_payload.as_deref(),
-        &current,
-    )?;
-    let txn_payload = commitments.join(",");
-    let mut prepared = writer.prepare_commit()?;
-    if !txn_payload.is_empty() {
-        prepared.set_payload(&txn_payload);
-    }
-    // R21F7: on commit failure, discard staging to prevent leaks.
-    if let Err(commit_error) = prepared.commit() {
-        for handle in &publication_result.pending_snapshot_finalizations {
-            let _ = bbox_edge_sidecar::snapshot::discard_snapshot_transaction(handle);
-        }
-        return Err(commit_error.into());
-    }
-    // R20F4: finalization returns Result; do not publish the post-commit
-    // read view until staging members are renamed into the live snapshot.
-    // R21F7: if finalization fails, discard remaining staging to prevent leaks.
-    if let Err(error) = publication_result.finalize_publications() {
-        tracing::error!(error = %error, "finalization failed after commit, discarding staging");
-        return Err(error);
-    }
+    let publication_result =
+        commit_snapshot_publications(&ctx.index, &mut writer, &edges_dir, publication.publish()?)?;
+    publication_result.finalize_publications()?;
     post_commit(ctx);
     Ok(result)
 }
@@ -1633,31 +1666,9 @@ fn run_local_stage(
     let _publication_guard = ctx
         .checkout_access
         .publication_guard_for([&local_lease, &git_lease])?;
-    let publication_result = publication.publish()?;
-    // R22F1+F2: carry-forward from prior payload intersected with inventory.
-    let prior_payload = ctx.index.load_metas().ok().and_then(|m| m.payload);
-    let current: Vec<String> = publication_result.pending_commitments();
-    let commitments = bbox_edge_sidecar::snapshot::carry_forward_commitments(
-        &edges_dir,
-        prior_payload.as_deref(),
-        &current,
-    )?;
-    let txn_payload = commitments.join(",");
-    let mut prepared = writer.prepare_commit()?;
-    if !txn_payload.is_empty() {
-        prepared.set_payload(&txn_payload);
-    }
-    // R21F7: on commit failure, discard staging to prevent leaks.
-    if let Err(commit_error) = prepared.commit() {
-        for handle in &publication_result.pending_snapshot_finalizations {
-            let _ = bbox_edge_sidecar::snapshot::discard_snapshot_transaction(handle);
-        }
-        return Err(commit_error.into());
-    }
-    if let Err(error) = publication_result.finalize_publications() {
-        tracing::error!(error = %error, "finalization failed after commit, discarding staging");
-        return Err(error);
-    }
+    let publication_result =
+        commit_snapshot_publications(&ctx.index, &mut writer, &edges_dir, publication.publish()?)?;
+    publication_result.finalize_publications()?;
     post_commit(ctx);
     Ok(result)
 }
@@ -1703,31 +1714,9 @@ fn run_git_current_overlay(
     drop(git_ctx);
     publication.stage_snapshot_git_current(&edges_dir, &project.project_id, snapshot_id, true);
     let _publication_guard = ctx.checkout_access.publication_guard(lease)?;
-    let publication_result = publication.publish()?;
-    // R22F1+F2: carry-forward from prior payload intersected with inventory.
-    let prior_payload = ctx.index.load_metas().ok().and_then(|m| m.payload);
-    let current: Vec<String> = publication_result.pending_commitments();
-    let commitments = bbox_edge_sidecar::snapshot::carry_forward_commitments(
-        &edges_dir,
-        prior_payload.as_deref(),
-        &current,
-    )?;
-    let txn_payload = commitments.join(",");
-    let mut prepared = writer.prepare_commit()?;
-    if !txn_payload.is_empty() {
-        prepared.set_payload(&txn_payload);
-    }
-    // R21F7: on commit failure, discard staging to prevent leaks.
-    if let Err(commit_error) = prepared.commit() {
-        for handle in &publication_result.pending_snapshot_finalizations {
-            let _ = bbox_edge_sidecar::snapshot::discard_snapshot_transaction(handle);
-        }
-        return Err(commit_error.into());
-    }
-    if let Err(error) = publication_result.finalize_publications() {
-        tracing::error!(error = %error, "finalization failed after commit, discarding staging");
-        return Err(error);
-    }
+    let publication_result =
+        commit_snapshot_publications(&ctx.index, &mut writer, &edges_dir, publication.publish()?)?;
+    publication_result.finalize_publications()?;
     post_commit(ctx);
     Ok(())
 }
@@ -1788,33 +1777,40 @@ fn run_consolidated_history(
         if let Some(snapshot_id) = snapshot_by_project.get(project_id) {
             let mut publication = super::project_files::ProjectIndexPublicationBundle::default();
             publication.stage_snapshot_git_current(&edges_dir, project_id, snapshot_id, true);
-            let publication_result = publication.publish()?;
-            all_handles.extend(publication_result.pending_snapshot_finalizations);
+            let mut publication_result = publication.publish()?;
+            all_handles.extend(publication_result.take_pending_snapshot_finalizations());
         }
     }
-    // R22F1+F2: carry-forward = (prior Tantivy payload intersected with
-    // validated journal inventory) UNION current handles.
-    let prior_payload = ctx.index.load_metas().ok().and_then(|m| m.payload);
-    let current: Vec<String> = all_handles
-        .iter()
-        .map(|h| h.commitment().to_string())
-        .collect();
-    let commitments = bbox_edge_sidecar::snapshot::carry_forward_commitments(
-        &edges_dir,
-        prior_payload.as_deref(),
-        &current,
-    )?;
-    let txn_payload = commitments.join(",");
-    let mut prepared = writer.prepare_commit()?;
-    if !txn_payload.is_empty() {
-        prepared.set_payload(&txn_payload);
-    }
-    // R21F7: on commit failure, discard all staging to prevent leaks.
-    if let Err(commit_error) = prepared.commit() {
-        for handle in &all_handles {
-            let _ = bbox_edge_sidecar::snapshot::discard_snapshot_transaction(handle);
+    let commit_attempt = (|| -> Result<()> {
+        let prior_payload = ctx
+            .index
+            .load_metas()
+            .context("loading prior index payload before snapshot commit")?
+            .payload;
+        let current: Vec<String> = all_handles
+            .iter()
+            .map(|handle| handle.commitment().to_string())
+            .collect();
+        let commitments = bbox_edge_sidecar::snapshot::carry_forward_commitments(
+            &edges_dir,
+            prior_payload.as_deref(),
+            &current,
+        )?;
+        let mut prepared = writer.prepare_commit()?;
+        let payload = commitments.join(",");
+        if !payload.is_empty() {
+            prepared.set_payload(&payload);
         }
-        return Err(commit_error.into());
+        prepared.commit()?;
+        Ok(())
+    })();
+    if let Err(error) = commit_attempt {
+        if let Err(cleanup) = rollback_snapshot_handles(&all_handles) {
+            return Err(error).context(format!(
+                "snapshot commit failed and rollback also failed: {cleanup:#}"
+            ));
+        }
+        return Err(error);
     }
     // R20F4: fail closed if any finalization fails.
     for handle in &all_handles {
@@ -2236,6 +2232,181 @@ mod tests {
             dir.join("roadmap.json"),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn snapshot_commit_aborts_and_rolls_back_when_prior_payload_is_unreadable() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let transcript = test_index(&root);
+        let index = transcript.index_handle();
+        let mut writer = index.writer(15_000_000).unwrap();
+        let edges_dir = root.join("edges");
+        std::fs::create_dir_all(&edges_dir).unwrap();
+        let snapshot_id = "snapshot-a";
+        bbox_edge_sidecar::snapshot::write_snapshot_files(
+            &edges_dir,
+            "p1",
+            snapshot_id,
+            &[("project.jsonl", &[])],
+        )
+        .unwrap();
+        bbox_edge_sidecar::snapshot::activate_collected_snapshot(
+            &edges_dir,
+            "p1",
+            "repo",
+            &"a".repeat(40),
+            "generation-a",
+            "collected:p1:.:generation-a",
+            snapshot_id,
+        )
+        .unwrap();
+        let mut bundle = super::super::project_files::ProjectIndexPublicationBundle::default();
+        bundle.stage_snapshot_git_current(&edges_dir, "p1", snapshot_id, false);
+        let publication = bundle.publish().unwrap();
+        std::fs::write(root.join("idx/meta.json"), b"{broken").unwrap();
+
+        let error =
+            commit_snapshot_publications(&index, &mut writer, &edges_dir, publication).unwrap_err();
+        assert!(format!("{error:#}").contains("loading prior index payload"));
+        let txn_dir =
+            bbox_edge_sidecar::manifest::materialized_dir(&edges_dir).join("workspace/p1/txn");
+        if txn_dir.is_dir() {
+            assert_eq!(std::fs::read_dir(txn_dir).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn snapshot_commit_rejects_missing_current_journal_and_rolls_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let transcript = test_index(&root);
+        let index = transcript.index_handle();
+        let mut writer = index.writer(15_000_000).unwrap();
+        let edges_dir = root.join("edges");
+        std::fs::create_dir_all(&edges_dir).unwrap();
+        bbox_edge_sidecar::snapshot::write_snapshot_files(
+            &edges_dir,
+            "p1",
+            "snapshot-a",
+            &[("project.jsonl", &[])],
+        )
+        .unwrap();
+        bbox_edge_sidecar::snapshot::activate_collected_snapshot(
+            &edges_dir,
+            "p1",
+            "repo",
+            &"a".repeat(40),
+            "generation-a",
+            "collected:p1:.:generation-a",
+            "snapshot-a",
+        )
+        .unwrap();
+        let mut bundle = super::super::project_files::ProjectIndexPublicationBundle::default();
+        bundle.stage_snapshot_git_current(&edges_dir, "p1", "snapshot-a", false);
+        let publication = bundle.publish().unwrap();
+        let token = publication.pending_snapshot_finalizations[0]
+            .txn_token
+            .clone();
+        let txn_dir =
+            bbox_edge_sidecar::manifest::materialized_dir(&edges_dir).join("workspace/p1/txn");
+        std::fs::remove_file(txn_dir.join(format!("{token}.journal.json"))).unwrap();
+
+        let error =
+            commit_snapshot_publications(&index, &mut writer, &edges_dir, publication).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unexpected entry")
+                || format!("{error:#}").contains("no exact validated journal")
+        );
+        assert_eq!(std::fs::read_dir(txn_dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn snapshot_commit_rejects_replaced_current_journal_and_rolls_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let transcript = test_index(&root);
+        let index = transcript.index_handle();
+        let mut writer = index.writer(15_000_000).unwrap();
+        let edges_dir = root.join("edges");
+        std::fs::create_dir_all(&edges_dir).unwrap();
+        bbox_edge_sidecar::snapshot::write_snapshot_files(
+            &edges_dir,
+            "p1",
+            "snapshot-a",
+            &[("project.jsonl", &[])],
+        )
+        .unwrap();
+        bbox_edge_sidecar::snapshot::activate_collected_snapshot(
+            &edges_dir,
+            "p1",
+            "repo",
+            &"a".repeat(40),
+            "generation-a",
+            "collected:p1:.:generation-a",
+            "snapshot-a",
+        )
+        .unwrap();
+        let mut bundle = super::super::project_files::ProjectIndexPublicationBundle::default();
+        bundle.stage_snapshot_git_current(&edges_dir, "p1", "snapshot-a", false);
+        let publication = bundle.publish().unwrap();
+        let handle = &publication.pending_snapshot_finalizations[0];
+        let txn_dir =
+            bbox_edge_sidecar::manifest::materialized_dir(&edges_dir).join("workspace/p1/txn");
+        let journal_path = txn_dir.join(format!("{}.journal.json", handle.txn_token));
+        let mut journal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+        journal["members"][0]["sha256"] = serde_json::Value::String("a".repeat(64));
+        std::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+        let error =
+            commit_snapshot_publications(&index, &mut writer, &edges_dir, publication).unwrap_err();
+        assert!(format!("{error:#}").contains("no exact validated journal"));
+        assert_eq!(std::fs::read_dir(txn_dir).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_commit_reports_failed_precommit_cleanup_as_unresolved() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let transcript = test_index(&root);
+        let index = transcript.index_handle();
+        let mut writer = index.writer(15_000_000).unwrap();
+        let edges_dir = root.join("edges");
+        std::fs::create_dir_all(&edges_dir).unwrap();
+        bbox_edge_sidecar::snapshot::write_snapshot_files(
+            &edges_dir,
+            "p1",
+            "snapshot-a",
+            &[("project.jsonl", &[])],
+        )
+        .unwrap();
+        bbox_edge_sidecar::snapshot::activate_collected_snapshot(
+            &edges_dir,
+            "p1",
+            "repo",
+            &"a".repeat(40),
+            "generation-a",
+            "collected:p1:.:generation-a",
+            "snapshot-a",
+        )
+        .unwrap();
+        let mut bundle = super::super::project_files::ProjectIndexPublicationBundle::default();
+        bundle.stage_snapshot_git_current(&edges_dir, "p1", "snapshot-a", false);
+        let publication = bundle.publish().unwrap();
+        let token = publication.pending_snapshot_finalizations[0]
+            .txn_token
+            .clone();
+        let txn_dir =
+            bbox_edge_sidecar::manifest::materialized_dir(&edges_dir).join("workspace/p1/txn");
+        std::fs::remove_dir_all(txn_dir.join(&token)).unwrap();
+        std::fs::write(txn_dir.join(&token), b"not-a-directory").unwrap();
+
+        let error =
+            commit_snapshot_publications(&index, &mut writer, &edges_dir, publication).unwrap_err();
+        assert!(format!("{error:#}").contains("rollback also failed"));
+        assert!(txn_dir.join(&token).is_file());
     }
 
     #[test]

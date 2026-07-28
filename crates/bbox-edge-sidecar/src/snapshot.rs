@@ -1,4 +1,3 @@
-#[cfg(test)]
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
@@ -980,6 +979,27 @@ struct TxnMember {
     sha256: String,
 }
 
+const SNAPSHOT_RECEIPT_FILENAME: &str = ".member-receipts.json";
+const SNAPSHOT_OBJECTS_DIRNAME: &str = ".objects";
+const SNAPSHOT_RECEIPT_VERSION: u32 = 1;
+const SNAPSHOT_MAX_RECEIPT_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotMemberReceipt {
+    v: u32,
+    project_id: String,
+    snapshot_id: String,
+    members: BTreeMap<String, SnapshotMemberPointer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotMemberPointer {
+    sha256: String,
+    object: String,
+}
+
 /// Test-visible mirror of TxnJournal for deserializing journals in tests.
 #[cfg(test)]
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1022,6 +1042,44 @@ fn txn_commitment(journal: &TxnJournal) -> String {
     }
     let digest = hex::encode(hasher.finalize());
     format!("{}:{}:{}", journal.project_id, journal.txn_token, digest)
+}
+
+fn snapshot_object_name(sha256: &str) -> Result<String> {
+    if sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        anyhow::bail!("snapshot member commitment is not a lowercase SHA-256");
+    }
+    Ok(format!("{sha256}.jsonl"))
+}
+
+fn decode_snapshot_receipt(
+    bytes: &[u8],
+    project_id: &str,
+    snapshot_id: &str,
+) -> Result<SnapshotMemberReceipt> {
+    if bytes.len() > SNAPSHOT_MAX_RECEIPT_BYTES {
+        anyhow::bail!("snapshot member receipt exceeds its byte bound");
+    }
+    let receipt: SnapshotMemberReceipt = serde_json::from_slice(bytes)?;
+    if receipt.v != SNAPSHOT_RECEIPT_VERSION {
+        anyhow::bail!("unsupported snapshot member receipt version {}", receipt.v);
+    }
+    if receipt.project_id != project_id || receipt.snapshot_id != snapshot_id {
+        anyhow::bail!("snapshot member receipt ownership does not match its directory");
+    }
+    if receipt.members.len() > TXN_MAX_MEMBERS {
+        anyhow::bail!("snapshot member receipt exceeds its member bound");
+    }
+    for (name, pointer) in &receipt.members {
+        validate_snapshot_component(name)?;
+        if pointer.object != snapshot_object_name(&pointer.sha256)? {
+            anyhow::bail!("snapshot member receipt object name does not match its hash");
+        }
+    }
+    Ok(receipt)
 }
 
 /// R21F2: Parse a payload entry into (project_id, txn_token, commitment_digest).
@@ -1232,6 +1290,8 @@ pub fn validate_journal_inventory(edges_dir: &Path) -> Result<Vec<String>> {
             .join("txn");
         #[cfg(unix)]
         {
+            use std::os::fd::AsRawFd;
+
             let txn_dir = match open_dir_under_root(edges_dir, &txn_dir_rel, false) {
                 Ok(dir) => dir,
                 Err(error)
@@ -1248,6 +1308,7 @@ pub fn validate_journal_inventory(edges_dir: &Path) -> Result<Vec<String>> {
                 }
             };
             let entries = crate::manifest::read_directory_names(&txn_dir)?;
+            let mut journal_tokens = std::collections::HashSet::new();
             for name in &entries {
                 let s = name.to_str().ok_or_else(|| {
                     anyhow::anyhow!("inventory: non-UTF-8 filename in txn dir for {project_id}")
@@ -1275,7 +1336,26 @@ pub fn validate_journal_inventory(edges_dir: &Path) -> Result<Vec<String>> {
                         journal.project_id
                     );
                 }
+                journal_tokens.insert(journal.txn_token.clone());
                 commitments.push(txn_commitment(&journal));
+            }
+            for name in &entries {
+                let s = name.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("inventory: non-UTF-8 filename in txn dir for {project_id}")
+                })?;
+                if s.ends_with(".journal.json") {
+                    continue;
+                }
+                if !journal_tokens.contains(s) {
+                    anyhow::bail!("inventory: unexpected entry {s} in txn dir for {project_id}");
+                }
+                let entry_c = std::ffi::CString::new(s.as_bytes())?;
+                let stat = fstatat_nofollow(txn_dir.as_raw_fd(), &entry_c)?;
+                if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                    anyhow::bail!(
+                        "inventory: staging entry {s} for {project_id} is not a directory"
+                    );
+                }
             }
         }
         #[cfg(not(unix))]
@@ -1287,8 +1367,9 @@ pub fn validate_journal_inventory(edges_dir: &Path) -> Result<Vec<String>> {
             if !txn_dir.is_dir() {
                 continue;
             }
-            for entry in fs::read_dir(&txn_dir)? {
-                let entry = entry?;
+            let entries = fs::read_dir(&txn_dir)?.collect::<std::io::Result<Vec<_>>>()?;
+            let mut journal_tokens = std::collections::HashSet::new();
+            for entry in &entries {
                 let name = entry.file_name();
                 let s = name.to_str().ok_or_else(|| {
                     anyhow::anyhow!("inventory: non-UTF-8 filename in txn dir for {project_id}")
@@ -1297,14 +1378,8 @@ pub fn validate_journal_inventory(edges_dir: &Path) -> Result<Vec<String>> {
                     continue;
                 }
                 let journal_path = entry.path();
-                let metadata = fs::symlink_metadata(&journal_path)?;
-                if !metadata.is_file() || metadata.file_type().is_symlink() {
-                    anyhow::bail!("inventory: journal {s} for {project_id} is not a regular file");
-                }
-                if metadata.len() > TXN_MAX_JOURNAL_BYTES as u64 {
-                    anyhow::bail!("inventory: journal {s} exceeds max size");
-                }
-                let journal_bytes = fs::read(&journal_path)?;
+                let journal_bytes =
+                    read_nonunix_regular_bounded(&journal_path, TXN_MAX_JOURNAL_BYTES as u64)?;
                 let journal = decode_txn_journal(&journal_bytes)?;
                 let file_token = s.strip_suffix(".journal.json").unwrap();
                 if file_token != journal.txn_token {
@@ -1317,7 +1392,26 @@ pub fn validate_journal_inventory(edges_dir: &Path) -> Result<Vec<String>> {
                 if journal.project_id != *project_id {
                     anyhow::bail!("inventory: journal project_id mismatch for {project_id}");
                 }
+                journal_tokens.insert(journal.txn_token.clone());
                 commitments.push(txn_commitment(&journal));
+            }
+            for entry in &entries {
+                let name = entry.file_name();
+                let s = name.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("inventory: non-UTF-8 filename in txn dir for {project_id}")
+                })?;
+                if s.ends_with(".journal.json") {
+                    continue;
+                }
+                if !journal_tokens.contains(s) {
+                    anyhow::bail!("inventory: unexpected entry {s} in txn dir for {project_id}");
+                }
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    anyhow::bail!(
+                        "inventory: staging entry {s} for {project_id} is not a safe directory"
+                    );
+                }
             }
         }
     }
@@ -1341,6 +1435,15 @@ pub fn carry_forward_commitments(
     current_commitments: &[String],
 ) -> Result<Vec<String>> {
     let inventory = validate_journal_inventory(edges_dir)?;
+    let inventory_set: std::collections::HashSet<&str> =
+        inventory.iter().map(String::as_str).collect();
+    for commitment in current_commitments {
+        if !inventory_set.contains(commitment.as_str()) {
+            anyhow::bail!(
+                "current snapshot commitment has no exact validated journal inventory entry: {commitment}"
+            );
+        }
+    }
     let prior_set: std::collections::HashSet<&str> = prior_payload
         .map(|p| p.split(',').filter(|s| !s.is_empty()).collect())
         .unwrap_or_default();
@@ -1353,6 +1456,148 @@ pub fn carry_forward_commitments(
         if prior_set.contains(commitment.as_str()) && !result.contains(commitment) {
             result.push(commitment.clone());
         }
+    }
+    Ok(result)
+}
+
+fn snapshot_identity_from_relative(snapshot: &str) -> Result<(&str, &str)> {
+    let components = Path::new(snapshot)
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(value) => value
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("snapshot path is not UTF-8")),
+            _ => anyhow::bail!("snapshot path is not normalized"),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    match components.as_slice() {
+        ["workspace", project_id, "snapshots", snapshot_id] => {
+            validate_snapshot_component(project_id)?;
+            validate_snapshot_component(snapshot_id)?;
+            Ok((project_id, snapshot_id))
+        }
+        _ => anyhow::bail!("snapshot path does not have the writer-exact shape"),
+    }
+}
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+#[cfg(unix)]
+fn load_snapshot_receipt_from_dir(
+    snapshot_dir: &fs::File,
+    project_id: &str,
+    snapshot_id: &str,
+) -> Result<Option<SnapshotMemberReceipt>> {
+    let name = std::ffi::CString::new(SNAPSHOT_RECEIPT_FILENAME)?;
+    match read_confined_file_bounded(snapshot_dir, &name, SNAPSHOT_MAX_RECEIPT_BYTES) {
+        Ok(bytes) => Ok(Some(decode_snapshot_receipt(
+            &bytes,
+            project_id,
+            snapshot_id,
+        )?)),
+        Err(error) if is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn committed_snapshot_members(
+    edges_dir: &Path,
+    snapshot: &str,
+) -> Result<Vec<(String, PathBuf, fs::File)>> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let (project_id, snapshot_id) = snapshot_identity_from_relative(snapshot)?;
+    let snapshot_rel = Path::new("materialized").join(snapshot);
+    let snapshot_dir = open_dir_under_root(edges_dir, &snapshot_rel, false)?;
+    let Some(receipt) = load_snapshot_receipt_from_dir(&snapshot_dir, project_id, snapshot_id)?
+    else {
+        return Ok(Vec::new());
+    };
+    let objects_name = std::ffi::CString::new(SNAPSHOT_OBJECTS_DIRNAME)?;
+    let objects_dir = open_confined_dir_fd(snapshot_dir.as_raw_fd(), &objects_name)?;
+    let mut result = Vec::with_capacity(receipt.members.len());
+    for (logical_name, pointer) in receipt.members {
+        let object_name = std::ffi::CString::new(pointer.object.as_bytes())?;
+        let fd = unsafe {
+            libc::openat(
+                objects_dir.as_raw_fd(),
+                object_name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("opening committed snapshot object {}", pointer.object));
+        }
+        let file = unsafe { fs::File::from_raw_fd(fd) };
+        verify_member_identity_bound_raw(
+            &file,
+            &TxnMember {
+                name: logical_name.clone(),
+                sha256: pointer.sha256,
+            },
+        )?;
+        result.push((
+            logical_name.clone(),
+            materialized_dir(edges_dir)
+                .join(snapshot)
+                .join(logical_name),
+            file,
+        ));
+    }
+    Ok(result)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn committed_snapshot_members(
+    edges_dir: &Path,
+    snapshot: &str,
+) -> Result<Vec<(String, PathBuf, fs::File)>> {
+    use std::io::Read;
+
+    let (project_id, snapshot_id) = snapshot_identity_from_relative(snapshot)?;
+    let snapshot_dir = materialized_dir(edges_dir).join(snapshot);
+    let receipt_path = snapshot_dir.join(SNAPSHOT_RECEIPT_FILENAME);
+    let metadata = match fs::symlink_metadata(&receipt_path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
+        Ok(_) => anyhow::bail!("snapshot member receipt is not a safe regular file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.len() > SNAPSHOT_MAX_RECEIPT_BYTES as u64 {
+        anyhow::bail!("snapshot member receipt exceeds its byte bound");
+    }
+    let mut receipt_file = fs::File::open(&receipt_path)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    receipt_file
+        .by_ref()
+        .take(SNAPSHOT_MAX_RECEIPT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > SNAPSHOT_MAX_RECEIPT_BYTES {
+        anyhow::bail!("snapshot member receipt grew beyond its byte bound");
+    }
+    let receipt = decode_snapshot_receipt(&bytes, project_id, snapshot_id)?;
+    let objects_dir = snapshot_dir.join(SNAPSHOT_OBJECTS_DIRNAME);
+    let objects_metadata = fs::symlink_metadata(&objects_dir)?;
+    if !objects_metadata.is_dir() || objects_metadata.file_type().is_symlink() {
+        anyhow::bail!("snapshot object directory is not a safe directory");
+    }
+    let mut result = Vec::with_capacity(receipt.members.len());
+    for (logical_name, pointer) in receipt.members {
+        let object_path = objects_dir.join(&pointer.object);
+        let bytes = read_nonunix_regular_bounded(&object_path, TXN_MAX_MEMBER_BYTES)?;
+        if hex::encode(Sha256::digest(&bytes)) != pointer.sha256 {
+            anyhow::bail!("snapshot object hash does not match its receipt");
+        }
+        let file = fs::File::open(&object_path)?;
+        result.push((logical_name.clone(), snapshot_dir.join(logical_name), file));
     }
     Ok(result)
 }
@@ -1503,166 +1748,157 @@ fn finalize_one_transaction(
         .join(snapshot_id);
     let snap_dir = open_dir_under_root(edges_dir, &snap_dir_rel, true)?;
 
-    // R20F3+F5: verify each member and rename into live snapshot.
+    let objects_c = std::ffi::CString::new(SNAPSHOT_OBJECTS_DIRNAME)?;
+    if unsafe { libc::mkdirat(snap_dir.as_raw_fd(), objects_c.as_ptr(), 0o755) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error.into());
+        }
+    }
+    let objects_dir = open_confined_dir_fd(snap_dir.as_raw_fd(), &objects_c)?;
+    let mut receipt = load_snapshot_receipt_from_dir(&snap_dir, project_id, snapshot_id)?
+        .unwrap_or(SnapshotMemberReceipt {
+            v: SNAPSHOT_RECEIPT_VERSION,
+            project_id: project_id.to_string(),
+            snapshot_id: snapshot_id.to_string(),
+            members: BTreeMap::new(),
+        });
+
+    // Publish immutable content-addressed objects. Existing logical members
+    // remain untouched until the receipt pointer is durably replaced.
     for member in &journal.members {
         let member_c = std::ffi::CString::new(member.name.as_bytes())?;
-
-        // Check if already renamed (crash-idempotent).
-        let in_staging = fstatat_nofollow(staging_fd.as_raw_fd(), &member_c);
-        let in_live = fstatat_nofollow(snap_dir.as_raw_fd(), &member_c);
-
-        match (&in_staging, &in_live) {
-            (Err(staging_err), Ok(_)) if staging_err.kind() == std::io::ErrorKind::NotFound => {
-                // R20F5: member absent from staging but present in live.
-                // Verify the live copy matches the journal hash to prove
-                // it was renamed by this transaction.
-                let live_fd = unsafe {
-                    libc::openat(
-                        snap_dir.as_raw_fd(),
-                        member_c.as_ptr(),
-                        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    )
-                };
-                if live_fd < 0 {
-                    anyhow::bail!(
-                        "finalize: cannot open live member {} to verify resumed rename",
-                        member.name
-                    );
-                }
-                let live_file = unsafe { fs::File::from_raw_fd(live_fd) };
-                let staged_member = TxnMember {
-                    name: member.name.clone(),
-                    sha256: member.sha256.clone(),
-                };
-                // verify against live copy: if hash matches, already renamed.
-                match verify_member_identity_bound_raw(&live_file, &staged_member) {
-                    Ok(()) => continue, // already renamed, skip
-                    Err(_) => {
-                        anyhow::bail!(
-                            "finalize: member {} missing from staging and live copy hash mismatch",
-                            member.name
-                        );
-                    }
-                }
+        let object_name = snapshot_object_name(&member.sha256)?;
+        let object_c = std::ffi::CString::new(object_name.as_bytes())?;
+        let object_stat = fstatat_nofollow(objects_dir.as_raw_fd(), &object_c);
+        if object_stat.is_ok() {
+            let object_fd = unsafe {
+                libc::openat(
+                    objects_dir.as_raw_fd(),
+                    object_c.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if object_fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
             }
-            _ => {}
-        }
-
-        // Member is in staging: verify identity/hash before rename.
-        // R21F5: open the member file by fd and re-fstat immediately before
-        // renameat to detect staged-leaf swap between verify and rename.
-        let member_fd = unsafe {
-            libc::openat(
-                staging_fd.as_raw_fd(),
-                member_c.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if member_fd < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::NotFound {
-                // R21F5: member vanished between checks and rename. Verify
-                // live destination matches committed identity and hash.
-                let live_fd = unsafe {
-                    libc::openat(
-                        snap_dir.as_raw_fd(),
-                        member_c.as_ptr(),
-                        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    )
-                };
-                if live_fd < 0 {
-                    anyhow::bail!(
-                        "finalize: member {} vanished from staging and not in live",
-                        member.name
-                    );
-                }
-                let live_file = unsafe { fs::File::from_raw_fd(live_fd) };
-                verify_member_identity_bound_raw(&live_file, member)?;
-                continue;
-            }
-            anyhow::bail!("finalize: cannot open staging member {}: {e}", member.name);
-        }
-        let member_file = unsafe { fs::File::from_raw_fd(member_fd) };
-        // R21F5: verify identity through the opened fd.
-        let verified_stat = verify_member_identity_bound_raw_ret_stat(&member_file, member)?;
-
-        // R21F5: re-fstat through the held parent dirfd to detect swap.
-        let recheck = fstatat_nofollow(staging_fd.as_raw_fd(), &member_c)?;
-        if recheck.st_dev != verified_stat.st_dev
-            || recheck.st_ino != verified_stat.st_ino
-            || recheck.st_mode & libc::S_IFMT != libc::S_IFREG
+            let object_file = unsafe { fs::File::from_raw_fd(object_fd) };
+            verify_member_identity_bound_raw(&object_file, member)?;
+        } else if object_stat
+            .as_ref()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
         {
-            anyhow::bail!(
-                "finalize: member {} identity changed between verify and rename (staged-leaf swap)",
-                member.name
-            );
-        }
-
-        // Rename into live snapshot (atomic, descriptor-confined).
-        let rename_result = unsafe {
-            libc::renameat(
-                staging_fd.as_raw_fd(),
-                member_c.as_ptr(),
-                snap_dir.as_raw_fd(),
-                member_c.as_ptr(),
-            )
-        };
-        if rename_result != 0 {
-            let error = std::io::Error::last_os_error();
-            // R21F5: ENOENT counts as progress ONLY when live destination
-            // is reopened and matches committed identity and hash.
-            if error.kind() == std::io::ErrorKind::NotFound {
-                let live_fd = unsafe {
-                    libc::openat(
-                        snap_dir.as_raw_fd(),
-                        member_c.as_ptr(),
-                        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    )
-                };
-                if live_fd < 0 {
+            let member_fd = unsafe {
+                libc::openat(
+                    staging_fd.as_raw_fd(),
+                    member_c.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if member_fd < 0 {
+                anyhow::bail!(
+                    "finalize: committed object and staged member are both missing for {}",
+                    member.name
+                );
+            }
+            let member_file = unsafe { fs::File::from_raw_fd(member_fd) };
+            let verified_stat = verify_member_identity_bound_raw_ret_stat(&member_file, member)?;
+            let recheck = fstatat_nofollow(staging_fd.as_raw_fd(), &member_c)?;
+            if recheck.st_dev != verified_stat.st_dev
+                || recheck.st_ino != verified_stat.st_ino
+                || recheck.st_mode & libc::S_IFMT != libc::S_IFREG
+            {
+                anyhow::bail!(
+                    "finalize: member {} identity changed before immutable publication",
+                    member.name
+                );
+            }
+            let link_result = unsafe {
+                libc::linkat(
+                    staging_fd.as_raw_fd(),
+                    member_c.as_ptr(),
+                    objects_dir.as_raw_fd(),
+                    object_c.as_ptr(),
+                    0,
+                )
+            };
+            if link_result != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
                     anyhow::bail!(
-                        "finalize: renameat ENOENT for member {} and live copy missing",
+                        "finalize: publishing immutable object for {} failed: {error}",
                         member.name
                     );
                 }
-                let live_file = unsafe { fs::File::from_raw_fd(live_fd) };
-                verify_member_identity_bound_raw(&live_file, member)?;
-                continue;
             }
-            anyhow::bail!(
-                "finalize: renameat failed for member {}: {error}",
-                member.name
-            );
+            let object_fd = unsafe {
+                libc::openat(
+                    objects_dir.as_raw_fd(),
+                    object_c.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if object_fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let object_file = unsafe { fs::File::from_raw_fd(object_fd) };
+            verify_member_identity_bound_raw(&object_file, member)?;
+        } else {
+            return Err(object_stat.unwrap_err().into());
         }
 
-        // R22F4: reopen and hash-verify the destination after every
-        // successful rename. A same-user process that swapped the staging
-        // pathname between fstatat and renameat gets its substituted inode
-        // moved into live; this verification catches it before sync and
-        // journal deletion. Fail closed: do NOT delete the journal.
-        let verify_fd = unsafe {
-            libc::openat(
-                snap_dir.as_raw_fd(),
-                member_c.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if verify_fd < 0 {
-            anyhow::bail!(
-                "finalize: cannot reopen renamed member {} for post-rename verification: {}",
-                member.name,
-                std::io::Error::last_os_error()
-            );
+        match unsafe { libc::unlinkat(staging_fd.as_raw_fd(), member_c.as_ptr(), 0) } {
+            0 => {}
+            _ => {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    anyhow::bail!(
+                        "finalize: removing staged member {} failed: {error}",
+                        member.name
+                    );
+                }
+            }
         }
-        let verify_file = unsafe { fs::File::from_raw_fd(verify_fd) };
-        verify_member_identity_bound_raw(&verify_file, member)?;
+        receipt.members.insert(
+            member.name.clone(),
+            SnapshotMemberPointer {
+                sha256: member.sha256.clone(),
+                object: object_name,
+            },
+        );
     }
+    objects_dir.sync_all()?;
 
+    let receipt_bytes = serde_json::to_vec(&receipt)?;
+    if receipt_bytes.len() > SNAPSHOT_MAX_RECEIPT_BYTES {
+        anyhow::bail!("snapshot member receipt exceeds its byte bound");
+    }
+    write_materialized_file_atomic(
+        edges_dir,
+        Path::new("workspace")
+            .join(project_id)
+            .join("snapshots")
+            .join(snapshot_id)
+            .join(SNAPSHOT_RECEIPT_FILENAME)
+            .as_path(),
+        &receipt_bytes,
+    )?;
+    let persisted = load_snapshot_receipt_from_dir(&snap_dir, project_id, snapshot_id)?
+        .ok_or_else(|| anyhow::anyhow!("snapshot member receipt disappeared after publication"))?;
+    for member in &journal.members {
+        let pointer = persisted
+            .members
+            .get(&member.name)
+            .ok_or_else(|| anyhow::anyhow!("published receipt omitted {}", member.name))?;
+        if pointer.sha256 != member.sha256 {
+            anyhow::bail!("published receipt hash mismatch for {}", member.name);
+        }
+    }
     snap_dir.sync_all()?;
 
-    // R21F6: delete journal and staging dir, propagating unexpected errors.
-    complete_journal_unlink(&txn_dir, &journal_c)?;
-    // Delete staging dir.
+    // Delete the empty staging directory before the journal. If interrupted,
+    // recovery uses the still-durable receipt and payload commitment to
+    // complete closeout without touching the live logical member.
     let staging_unlink =
         unsafe { libc::unlinkat(txn_dir.as_raw_fd(), staging_c.as_ptr(), libc::AT_REMOVEDIR) };
     if staging_unlink != 0 {
@@ -1672,6 +1908,7 @@ fn finalize_one_transaction(
         }
     }
     txn_dir.sync_all()?;
+    complete_journal_unlink(&txn_dir, &journal_c)?;
     Ok(())
 }
 
@@ -1683,6 +1920,8 @@ fn finalize_one_transaction(
     txn_token: &str,
     expected_commitment: Option<&str>,
 ) -> Result<()> {
+    use std::io::{Read, Seek};
+
     validate_snapshot_component(project_id)?;
     validate_snapshot_component(snapshot_id)?;
     validate_snapshot_component(txn_token)?;
@@ -1691,14 +1930,9 @@ fn finalize_one_transaction(
         .join("workspace")
         .join(project_id)
         .join("txn");
-    if !txn_dir.is_dir() {
-        anyhow::bail!("finalize: txn directory is missing for {project_id}/{txn_token}");
-    }
+    validate_nonunix_directory_chain(edges_dir, &txn_dir)?;
     let journal_path = txn_dir.join(format!("{txn_token}.journal.json"));
-    let journal_bytes = fs::read(&journal_path)?;
-    if journal_bytes.len() > TXN_MAX_JOURNAL_BYTES {
-        anyhow::bail!("finalize: journal exceeds max size");
-    }
+    let journal_bytes = read_nonunix_regular_bounded(&journal_path, TXN_MAX_JOURNAL_BYTES as u64)?;
     let journal = decode_txn_journal(&journal_bytes)?;
     if journal.txn_token != txn_token || journal.snapshot_id != snapshot_id {
         anyhow::bail!("finalize: journal token/snapshot mismatch");
@@ -1723,55 +1957,83 @@ fn finalize_one_transaction(
     let staging_dir = txn_dir.join(txn_token);
     let snap_dir = snapshot_dir(edges_dir, project_id, snapshot_id);
     fs::create_dir_all(&snap_dir)?;
+    validate_nonunix_directory_chain(edges_dir, &staging_dir)?;
+    validate_nonunix_directory_chain(edges_dir, &snap_dir)?;
+    let objects_dir = snap_dir.join(SNAPSHOT_OBJECTS_DIRNAME);
+    fs::create_dir_all(&objects_dir)?;
+    validate_nonunix_directory_chain(edges_dir, &objects_dir)?;
+    let receipt_path = snap_dir.join(SNAPSHOT_RECEIPT_FILENAME);
+    let mut receipt =
+        match read_nonunix_regular_bounded(&receipt_path, SNAPSHOT_MAX_RECEIPT_BYTES as u64) {
+            Ok(bytes) => decode_snapshot_receipt(&bytes, project_id, snapshot_id)?,
+            Err(error) if is_not_found(&error) => SnapshotMemberReceipt {
+                v: SNAPSHOT_RECEIPT_VERSION,
+                project_id: project_id.to_string(),
+                snapshot_id: snapshot_id.to_string(),
+                members: BTreeMap::new(),
+            },
+            Err(error) => return Err(error),
+        };
 
     for member in &journal.members {
         let src = staging_dir.join(&member.name);
-        let dst = snap_dir.join(&member.name);
-        if !src.exists() && dst.exists() {
-            // R20F5: already renamed, verify hash.
-            let dst_bytes = fs::read(&dst)?;
-            let hash = hex::encode(Sha256::digest(&dst_bytes));
-            if hash == member.sha256 {
-                continue;
+        let object_name = snapshot_object_name(&member.sha256)?;
+        let object = objects_dir.join(&object_name);
+        match read_nonunix_regular_bounded(&object, TXN_MAX_MEMBER_BYTES) {
+            Ok(bytes) => {
+                if hex::encode(Sha256::digest(&bytes)) != member.sha256 {
+                    anyhow::bail!("finalize: immutable object hash mismatch");
+                }
             }
-            anyhow::bail!(
-                "finalize: member {} missing from staging and live hash mismatch",
-                member.name
-            );
+            Err(error) if is_not_found(&error) => {
+                let bytes = read_nonunix_regular_bounded(&src, TXN_MAX_MEMBER_BYTES)?;
+                if hex::encode(Sha256::digest(&bytes)) != member.sha256 {
+                    anyhow::bail!("finalize: member {} hash mismatch", member.name);
+                }
+                match fs::hard_link(&src, &object) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+                let published = read_nonunix_regular_bounded(&object, TXN_MAX_MEMBER_BYTES)?;
+                if hex::encode(Sha256::digest(&published)) != member.sha256 {
+                    anyhow::bail!("finalize: immutable object hash mismatch after publication");
+                }
+            }
+            Err(error) => return Err(error),
         }
-        if src.exists() {
-            // Verify hash before rename.
-            let src_bytes = fs::read(&src)?;
-            let hash = hex::encode(Sha256::digest(&src_bytes));
-            if hash != member.sha256 {
-                anyhow::bail!("finalize: member {} hash mismatch", member.name);
-            }
-            fs::rename(&src, &dst)?;
-            // R22F4: verify destination after rename.
-            let dst_bytes = fs::read(&dst)?;
-            let dst_hash = hex::encode(Sha256::digest(&dst_bytes));
-            if dst_hash != member.sha256 {
-                anyhow::bail!(
-                    "finalize: post-rename hash mismatch for member {}",
-                    member.name
-                );
-            }
-        } else {
-            anyhow::bail!("finalize: member {} missing from staging", member.name);
+        match fs::remove_file(&src) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
+        receipt.members.insert(
+            member.name.clone(),
+            SnapshotMemberPointer {
+                sha256: member.sha256.clone(),
+                object: object_name,
+            },
+        );
     }
+    fs::File::open(&objects_dir)?.sync_all()?;
+    let receipt_bytes = serde_json::to_vec(&receipt)?;
+    if receipt_bytes.len() > SNAPSHOT_MAX_RECEIPT_BYTES {
+        anyhow::bail!("snapshot member receipt exceeds its byte bound");
+    }
+    let receipt_temp = snap_dir.join(format!(".member-receipts.{}.tmp", std::process::id()));
+    fs::write(&receipt_temp, &receipt_bytes)?;
+    fs::File::open(&receipt_temp)?.sync_all()?;
+    fs::rename(&receipt_temp, &receipt_path)?;
     fs::File::open(&snap_dir)?.sync_all()?;
-    // R21F6: propagate errors from staging dir removal.
-    if staging_dir.is_dir() {
-        fs::remove_dir_all(&staging_dir)
-            .map_err(|e| anyhow::anyhow!("finalize: failed to remove staging dir: {e}"))?;
-    }
-    // R21F6: propagate errors from journal removal (NotFound is ok).
+    fs::remove_dir(&staging_dir)
+        .map_err(|error| anyhow::anyhow!("finalize: failed to remove staging dir: {error}"))?;
     match fs::remove_file(&journal_path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(anyhow::anyhow!("finalize: failed to remove journal: {e}")),
     }
+    let mut receipt_file = fs::File::open(&receipt_path)?;
+    receipt_file.rewind()?;
     Ok(())
 }
 
@@ -1898,42 +2160,24 @@ fn recover_pending_transactions_for_project(
         });
     }
 
-    // R21F4: Phase 2 - reclaim genuine orphan staging dirs. An orphan is
-    // a directory entry that is not a journal and not a known journal token.
-    // R22F5: propagate all unexpected errors; reject unexpected entry types.
+    // Classify every entry before mutation. Only validated journal leaves and
+    // their exact staging directories are permitted.
     for name in &entries {
         let s = name.to_str().ok_or_else(|| {
             anyhow::anyhow!("recovery: non-UTF-8 filename in txn dir for {project_id}")
         })?;
-        if s.ends_with(".journal.json") || s.starts_with('.') {
+        if s.ends_with(".journal.json") {
             continue;
         }
-        if journal_tokens.contains(s) {
-            continue;
+        if !journal_tokens.contains(s) {
+            anyhow::bail!("recovery: unexpected entry {s} in txn dir for {project_id}");
         }
-        let orphan_c = std::ffi::CString::new(s.as_bytes())?;
-        match fstatat_nofollow(txn_dir.as_raw_fd(), &orphan_c) {
-            Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFDIR => {
-                tracing::warn!(
-                    project_id,
-                    orphan = s,
-                    "recovery: reclaiming orphan staging directory (no journal)"
-                );
-                unlinkat_tree(txn_dir.as_raw_fd(), &orphan_c)?;
-                txn_dir.sync_all()?;
-            }
-            Ok(_) => {
-                // R22F5: unexpected entry type (not a directory, not a
-                // journal). Fail closed rather than silently ignoring.
-                anyhow::bail!(
-                    "recovery: unexpected non-directory entry {s} in txn dir for {project_id}"
-                );
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
+        let staging_c = std::ffi::CString::new(s.as_bytes())?;
+        let stat = fstatat_nofollow(txn_dir.as_raw_fd(), &staging_c)?;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            anyhow::bail!("recovery: staging entry {s} is not a directory for {project_id}");
         }
     }
-
     // R21F4+F2+F6: Phase 3 - process each decoded journal.
     for dj in &decoded_journals {
         let journal = &dj.journal;
@@ -1962,8 +2206,7 @@ fn recover_pending_transactions_for_project(
                             verify_member_identity_bound(&staging_fd, member)?;
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            // R21F6: already renamed into live. Verify live copy.
-                            verify_live_member(
+                            verify_published_snapshot_object(
                                 edges_dir,
                                 project_id,
                                 &journal.snapshot_id,
@@ -2014,12 +2257,10 @@ fn recover_pending_transactions_for_project(
                             verify_member_identity_bound(&staging_fd, member)?;
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            verify_live_member(
-                                edges_dir,
-                                project_id,
-                                &journal.snapshot_id,
-                                member,
-                            )?;
+                            anyhow::bail!(
+                                "recovery: uncommitted staged member {} is missing",
+                                member.name
+                            );
                         }
                         Err(e) => return Err(e.into()),
                     }
@@ -2063,7 +2304,44 @@ fn complete_journal_unlink(txn_dir: &fs::File, journal_c: &std::ffi::CStr) -> Re
     Ok(())
 }
 
-/// R21F5: Verify a member in the live snapshot directory.
+#[cfg(unix)]
+fn verify_published_snapshot_object(
+    edges_dir: &Path,
+    project_id: &str,
+    snapshot_id: &str,
+    member: &TxnMember,
+) -> Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let snapshot_dir = open_dir_under_root(
+        edges_dir,
+        &Path::new("materialized")
+            .join("workspace")
+            .join(project_id)
+            .join("snapshots")
+            .join(snapshot_id),
+        false,
+    )?;
+    let objects_name = std::ffi::CString::new(SNAPSHOT_OBJECTS_DIRNAME)?;
+    let objects_dir = open_confined_dir_fd(snapshot_dir.as_raw_fd(), &objects_name)?;
+    let object_name = std::ffi::CString::new(snapshot_object_name(&member.sha256)?)?;
+    let fd = unsafe {
+        libc::openat(
+            objects_dir.as_raw_fd(),
+            object_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("opening published immutable object for {}", member.name));
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    verify_member_identity_bound_raw(&file, member)
+}
+
+/// Verify that the durable receipt resolves the logical member to an
+/// immutable object with the committed hash.
 #[cfg(unix)]
 fn verify_live_member(
     edges_dir: &Path,
@@ -2071,40 +2349,18 @@ fn verify_live_member(
     snapshot_id: &str,
     member: &TxnMember,
 ) -> Result<()> {
-    use std::os::fd::AsRawFd;
-    use std::os::fd::FromRawFd;
-    let snap_dir_rel = Path::new("materialized")
-        .join("workspace")
-        .join(project_id)
-        .join("snapshots")
-        .join(snapshot_id);
-    let snap_dir = open_dir_under_root(edges_dir, &snap_dir_rel, false)?;
-    let member_c = std::ffi::CString::new(member.name.as_bytes())?;
-    match fstatat_nofollow(snap_dir.as_raw_fd(), &member_c) {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            anyhow::bail!(
-                "recovery: member {} missing from staging and live for {project_id}",
+    let snapshot = format!("workspace/{project_id}/snapshots/{snapshot_id}");
+    let resolved = committed_snapshot_members(edges_dir, &snapshot)?;
+    let (_, _, file) = resolved
+        .into_iter()
+        .find(|(logical_name, _, _)| logical_name == &member.name)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "recovery: receipt does not resolve committed member {} for {project_id}",
                 member.name
-            );
-        }
-        Err(e) => return Err(e.into()),
-    }
-    let fd = unsafe {
-        libc::openat(
-            snap_dir.as_raw_fd(),
-            member_c.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        anyhow::bail!(
-            "recovery: cannot open live member {} for {project_id}",
-            member.name
-        );
-    }
-    let live_file = unsafe { fs::File::from_raw_fd(fd) };
-    verify_member_identity_bound_raw(&live_file, member)
+            )
+        })?;
+    verify_member_identity_bound_raw(&file, member)
 }
 
 #[cfg(not(unix))]
@@ -2132,8 +2388,8 @@ fn recover_pending_transactions_for_project(
     let mut decoded: Vec<DecodedJournal> = Vec::new();
     let mut journal_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for entry in fs::read_dir(&txn_dir)? {
-        let entry = entry?;
+    let entries = fs::read_dir(&txn_dir)?.collect::<std::io::Result<Vec<_>>>()?;
+    for entry in &entries {
         let name = entry.file_name();
         // R22F5: reject non-UTF-8 filenames during mutation-free inventory.
         let name_str = name.to_str().ok_or_else(|| {
@@ -2144,14 +2400,8 @@ fn recover_pending_transactions_for_project(
         }
         let name_str = name_str.to_string();
         let journal_path = txn_dir.join(&name_str);
-        let metadata = fs::symlink_metadata(&journal_path)?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            anyhow::bail!("recovery: journal {name_str} for {project_id} is not a regular file");
-        }
-        if metadata.len() > TXN_MAX_JOURNAL_BYTES as u64 {
-            anyhow::bail!("recovery: journal {name_str} exceeds max size");
-        }
-        let journal_bytes = fs::read(&journal_path)?;
+        let journal_bytes =
+            read_nonunix_regular_bounded(&journal_path, TXN_MAX_JOURNAL_BYTES as u64)?;
         let journal = decode_txn_journal(&journal_bytes)?;
         let file_token = name_str.strip_suffix(".journal.json").unwrap();
         if file_token != journal.txn_token {
@@ -2170,32 +2420,21 @@ fn recover_pending_transactions_for_project(
         });
     }
 
-    // R21F4: Phase 2 - reclaim orphans.
-    // R22F5: propagate all unexpected errors; reject unexpected entry types.
-    for entry in fs::read_dir(&txn_dir)? {
-        let entry = entry?;
+    for entry in &entries {
         let name = entry.file_name();
         let name_str = name.to_str().ok_or_else(|| {
             anyhow::anyhow!("recovery: non-UTF-8 filename in txn dir for {project_id}")
         })?;
-        if name_str.ends_with(".journal.json")
-            || name_str.starts_with('.')
-            || journal_tokens.contains(name_str)
-        {
+        if name_str.ends_with(".journal.json") {
             continue;
         }
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            tracing::warn!(
-                project_id,
-                orphan = name_str,
-                "recovery: reclaiming orphan staging dir"
-            );
-            fs::remove_dir_all(entry.path())?;
-        } else {
-            // R22F5: unexpected entry type. Fail closed.
+        if !journal_tokens.contains(name_str) {
+            anyhow::bail!("recovery: unexpected entry {name_str} in txn dir for {project_id}");
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
             anyhow::bail!(
-                "recovery: unexpected non-directory entry {name_str} in txn dir for {project_id}"
+                "recovery: staging entry {name_str} is not a safe directory for {project_id}"
             );
         }
     }
@@ -2206,10 +2445,9 @@ fn recover_pending_transactions_for_project(
         let commitment = txn_commitment(journal);
         let journal_path = txn_dir.join(&dj.filename);
         let staging_dir = txn_dir.join(&journal.txn_token);
-        let snap_dir = snapshot_dir(edges_dir, project_id, &journal.snapshot_id);
-        // R22F5: only exact NotFound means absent; propagate other errors.
-        let staging_exists = match fs::metadata(&staging_dir) {
-            Ok(m) => m.is_dir(),
+        let staging_exists = match fs::symlink_metadata(&staging_dir) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => true,
+            Ok(_) => anyhow::bail!("recovery: staging path is not a safe directory"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => return Err(e.into()),
         };
@@ -2222,8 +2460,12 @@ fn recover_pending_transactions_for_project(
                     if sm.exists() {
                         verify_member_nofollow(&sm, member)?;
                     } else {
-                        let live = snap_dir.join(&member.name);
-                        verify_member_nofollow(&live, member)?;
+                        verify_committed_member_nonunix(
+                            edges_dir,
+                            project_id,
+                            &journal.snapshot_id,
+                            member,
+                        )?;
                     }
                 }
                 tracing::info!(
@@ -2247,8 +2489,12 @@ fn recover_pending_transactions_for_project(
                     "recovery: completing finalize closeout (staging already deleted)"
                 );
                 for member in &journal.members {
-                    let live = snap_dir.join(&member.name);
-                    verify_member_nofollow(&live, member)?;
+                    verify_committed_member_nonunix(
+                        edges_dir,
+                        project_id,
+                        &journal.snapshot_id,
+                        member,
+                    )?;
                 }
                 fs::remove_file(&journal_path)?;
             }
@@ -2259,8 +2505,10 @@ fn recover_pending_transactions_for_project(
                     if sm.exists() {
                         verify_member_nofollow(&sm, member)?;
                     } else {
-                        let live = snap_dir.join(&member.name);
-                        verify_member_nofollow(&live, member)?;
+                        anyhow::bail!(
+                            "recovery: uncommitted staged member {} is missing",
+                            member.name
+                        );
                     }
                 }
                 tracing::info!(
@@ -2288,17 +2536,29 @@ fn recover_pending_transactions_for_project(
 /// R21F5 (non-unix): verify a member file with nofollow and hash check.
 #[cfg(not(unix))]
 fn verify_member_nofollow(path: &Path, member: &TxnMember) -> Result<()> {
-    let m = fs::symlink_metadata(path)?;
-    if !m.is_file() || m.file_type().is_symlink() {
-        anyhow::bail!("recovery: member {} not regular", member.name);
-    }
-    if m.len() > TXN_MAX_MEMBER_BYTES {
-        anyhow::bail!("recovery: member {} too large", member.name);
-    }
-    let bytes = fs::read(path)?;
+    let bytes = read_nonunix_regular_bounded(path, TXN_MAX_MEMBER_BYTES)?;
     let hash = hex::encode(Sha256::digest(&bytes));
     if hash != member.sha256 {
         anyhow::bail!("recovery: member {} hash mismatch", member.name);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_committed_member_nonunix(
+    edges_dir: &Path,
+    project_id: &str,
+    snapshot_id: &str,
+    member: &TxnMember,
+) -> Result<()> {
+    let snapshot = format!("workspace/{project_id}/snapshots/{snapshot_id}");
+    let (_, _, file) = committed_snapshot_members(edges_dir, &snapshot)?
+        .into_iter()
+        .find(|(logical_name, _, _)| logical_name == &member.name)
+        .ok_or_else(|| anyhow::anyhow!("recovery: committed receipt omitted {}", member.name))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > TXN_MAX_MEMBER_BYTES {
+        anyhow::bail!("recovery: committed member is not a bounded regular file");
     }
     Ok(())
 }
@@ -2616,6 +2876,68 @@ fn discard_transaction(
     complete_journal_unlink(txn_dir, journal_c)?;
 
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_nonunix_directory_chain(root: &Path, directory: &Path) -> Result<()> {
+    let relative = directory
+        .strip_prefix(root)
+        .context("non-Unix confined path escaped its root")?;
+    let mut current = root.to_path_buf();
+    let root_metadata = fs::symlink_metadata(&current)?;
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        anyhow::bail!("non-Unix confined root is not a safe directory");
+    }
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            anyhow::bail!("non-Unix confined path is not normalized");
+        };
+        current.push(component);
+        let metadata = fs::symlink_metadata(&current)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "non-Unix confined path component is not a safe directory: {}",
+                current.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn read_nonunix_regular_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("bounded read path has no parent"))?;
+    let root = path
+        .ancestors()
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("bounded read path has no root"))?;
+    validate_nonunix_directory_chain(root, parent)?;
+    let before = fs::symlink_metadata(path)?;
+    if !before.is_file() || before.file_type().is_symlink() {
+        anyhow::bail!("bounded read target is not a safe regular file");
+    }
+    if before.len() > max_bytes {
+        anyhow::bail!("bounded read target exceeds its byte limit");
+    }
+    let mut file = fs::File::open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.len() != before.len() {
+        anyhow::bail!("bounded read target changed while opening");
+    }
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    file.by_ref().take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        anyhow::bail!("bounded read target grew beyond its byte limit");
+    }
+    let after = file.metadata()?;
+    if !after.is_file() || after.len() != opened.len() {
+        anyhow::bail!("bounded read target changed while reading");
+    }
+    Ok(bytes)
 }
 
 /// R19F5 helper: read a file confined to a directory fd with a size bound.
@@ -3875,20 +4197,20 @@ mod tests {
         );
 
         finalize_snapshot_publication(&txn_handle).unwrap();
-        assert!(
-            snapshot_dir(&edges_dir, "p_1", &snapshot_id)
-                .join("git-current.jsonl")
-                .exists(),
-            "live snapshot must contain the member after finalize"
-        );
-
-        // The content changed (staged member replaced the old empty one).
-        let live_after =
-            fs::read(&snapshot_dir(&edges_dir, "p_1", &snapshot_id).join("git-current.jsonl"))
-                .unwrap_or_default();
-        assert_ne!(
+        let live_after = fs::read(&live_member).unwrap_or_default();
+        assert_eq!(
             live_before, live_after,
-            "finalize must replace the member content"
+            "finalize must preserve the last-good logical member"
+        );
+        let resolved = committed_snapshot_members(
+            &edges_dir,
+            &format!("workspace/p_1/snapshots/{snapshot_id}"),
+        )
+        .unwrap();
+        assert!(
+            resolved
+                .iter()
+                .any(|(name, _, _)| name == "git-current.jsonl")
         );
 
         // The journal and staging dir are cleaned up.
@@ -5414,11 +5736,21 @@ mod tests {
         let payload = txn_handle.commitment.clone();
         recover_pending_transactions_prebind(&edges_dir, Some(&payload)).unwrap();
 
-        // The staged member is now in the live snapshot.
+        // The last-good logical member remains untouched and the receipt now
+        // resolves the committed immutable object.
         let live_after = fs::read(&live_member).unwrap_or_default();
-        assert_ne!(
+        assert_eq!(
             live_before, live_after,
-            "finalize must have renamed the staged member into the live snapshot"
+            "recovery must not overwrite the last-good logical member"
+        );
+        assert!(
+            committed_snapshot_members(
+                &edges_dir,
+                &format!("workspace/p_1/snapshots/{snapshot_id}")
+            )
+            .unwrap()
+            .iter()
+            .any(|(name, _, _)| name == "git-current.jsonl")
         );
 
         // Journal and staging dir cleaned up.
@@ -5507,8 +5839,8 @@ mod tests {
         )
         .unwrap();
 
-        // Simulate partial finalize: rename the member manually but leave
-        // the journal in place.
+        // Simulate partial finalize: publish the immutable object but leave
+        // the receipt and journal for recovery.
         let txn_dir = materialized_dir(&edges_dir)
             .join("workspace")
             .join("p_1")
@@ -5525,14 +5857,16 @@ mod tests {
             .unwrap()
             .path();
         let journal_bytes = fs::read(&journal_entry).unwrap();
-        let journal: crate::snapshot::TxnJournalForTest =
-            serde_json::from_slice(&journal_bytes).unwrap();
+        let journal: TxnJournal = serde_json::from_slice(&journal_bytes).unwrap();
         let staging_dir = txn_dir.join(&journal.txn_token);
         let member_src = staging_dir.join("git-current.jsonl");
-        let member_dst = snapshot_dir(&edges_dir, "p_1", &snapshot_id).join("git-current.jsonl");
-        fs::rename(&member_src, &member_dst).unwrap();
-
-        assert!(member_dst.exists());
+        let objects_dir =
+            snapshot_dir(&edges_dir, "p_1", &snapshot_id).join(SNAPSHOT_OBJECTS_DIRNAME);
+        fs::create_dir_all(&objects_dir).unwrap();
+        let object = objects_dir.join(snapshot_object_name(&journal.members[0].sha256).unwrap());
+        fs::hard_link(&member_src, &object).unwrap();
+        fs::remove_file(&member_src).unwrap();
+        assert!(object.exists());
 
         // Recovery with matching commitment payload resumes: sees member
         // already renamed, cleans up journal.
@@ -6225,25 +6559,16 @@ mod tests {
         )
         .unwrap();
 
-        // Manually move the member to live snapshot (simulate rename done).
         let txn_dir = materialized_dir(&edges_dir)
             .join("workspace")
             .join("p_1")
             .join("txn");
-        let staging_dir = txn_dir.join(&txn_handle.txn_token);
-        let snap_dir = materialized_dir(&edges_dir)
-            .join("workspace")
-            .join("p_1")
-            .join("snapshots")
-            .join(&snapshot_id);
-        fs::create_dir_all(&snap_dir).unwrap();
-        fs::rename(
-            staging_dir.join("git-current.jsonl"),
-            snap_dir.join("git-current.jsonl"),
-        )
-        .unwrap();
-        // Remove staging dir (simulate post-rename cleanup).
-        fs::remove_dir_all(&staging_dir).unwrap();
+        let journal_path = txn_dir.join(format!("{}.journal.json", txn_handle.txn_token));
+        let journal_bytes = fs::read(&journal_path).unwrap();
+        finalize_snapshot_publication(&txn_handle).unwrap();
+        // Simulate a crash after receipt publication and staging cleanup but
+        // before durable journal closeout.
+        fs::write(&journal_path, journal_bytes).unwrap();
 
         // Recovery with the correct commitment should complete closeout.
         let payload = txn_handle.commitment.clone();
@@ -6429,5 +6754,157 @@ mod tests {
             result.is_err(),
             "finalize must refuse replaced journal (commitment mismatch)"
         );
+    }
+
+    #[test]
+    fn r23_current_commitment_requires_its_exact_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
+        let handle = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+        let journal = materialized_dir(&edges_dir)
+            .join("workspace/p_1/txn")
+            .join(format!("{}.journal.json", handle.txn_token));
+        fs::remove_file(journal).unwrap();
+
+        let error =
+            carry_forward_commitments(&edges_dir, None, &[handle.commitment.clone()]).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unexpected entry")
+                || format!("{error:#}").contains("no exact validated journal")
+        );
+    }
+
+    #[test]
+    fn r23_replaced_current_journal_aborts_before_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
+        let handle = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+        let journal_path = materialized_dir(&edges_dir)
+            .join("workspace/p_1/txn")
+            .join(format!("{}.journal.json", handle.txn_token));
+        let mut journal: TxnJournal =
+            serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+        journal.members[0].sha256 = "a".repeat(64);
+        fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+        let error =
+            carry_forward_commitments(&edges_dir, None, &[handle.commitment.clone()]).unwrap_err();
+        assert!(format!("{error:#}").contains("no exact validated journal"));
+    }
+
+    #[test]
+    fn r23_dot_prefixed_journal_rename_fails_inventory_and_recovery_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
+        let handle = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+        let txn_dir = materialized_dir(&edges_dir).join("workspace/p_1/txn");
+        fs::rename(
+            txn_dir.join(format!("{}.journal.json", handle.txn_token)),
+            txn_dir.join(".hidden"),
+        )
+        .unwrap();
+
+        let inventory_error = validate_journal_inventory(&edges_dir).unwrap_err();
+        assert!(format!("{inventory_error:#}").contains("unexpected entry .hidden"));
+        let recovery_error =
+            recover_pending_transactions_prebind(&edges_dir, Some(&handle.commitment)).unwrap_err();
+        assert!(format!("{recovery_error:#}").contains("unexpected entry .hidden"));
+        assert!(txn_dir.join(".hidden").is_file());
+        assert!(txn_dir.join(&handle.txn_token).is_dir());
+    }
+
+    #[test]
+    fn r23_finalization_publishes_receipt_resolved_immutable_member() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
+        let handle = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+        let logical = snapshot_dir(&edges_dir, "p_1", &snapshot_id).join("git-current.jsonl");
+        let original_logical = fs::read(&logical).unwrap();
+
+        finalize_snapshot_publication(&handle).unwrap();
+
+        assert_eq!(
+            fs::read(&logical).unwrap(),
+            original_logical,
+            "content-addressed finalization must not overwrite the last-good logical member"
+        );
+        let resolved = committed_snapshot_members(
+            &edges_dir,
+            &format!("workspace/p_1/snapshots/{snapshot_id}"),
+        )
+        .unwrap();
+        let (_, _, mut file) = resolved
+            .into_iter()
+            .find(|(name, _, _)| name == "git-current.jsonl")
+            .unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes).unwrap();
+        assert!(!bytes.is_empty());
+        ManifestIndex::load(&edges_dir)
+            .unwrap()
+            .active_paths_for_loader(&edges_dir)
+            .unwrap();
+    }
+
+    #[test]
+    fn r23_loader_detects_committed_object_swap_after_finalization() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
+        let handle = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+        finalize_snapshot_publication(&handle).unwrap();
+        let receipt_path =
+            snapshot_dir(&edges_dir, "p_1", &snapshot_id).join(SNAPSHOT_RECEIPT_FILENAME);
+        let receipt: SnapshotMemberReceipt =
+            serde_json::from_slice(&fs::read(receipt_path).unwrap()).unwrap();
+        let object = snapshot_dir(&edges_dir, "p_1", &snapshot_id)
+            .join(SNAPSHOT_OBJECTS_DIRNAME)
+            .join(&receipt.members["git-current.jsonl"].object);
+        fs::write(object, b"swapped\n").unwrap();
+
+        let error = ManifestIndex::load(&edges_dir)
+            .unwrap()
+            .active_paths_for_loader(&edges_dir)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("hash"));
     }
 }

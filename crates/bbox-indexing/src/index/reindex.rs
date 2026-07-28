@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::TermQuery;
 use tantivy::schema::{IndexRecordOption, Term};
@@ -737,9 +737,10 @@ pub(super) fn execute_reindex_pass(
     };
     publisher_ref_publication.publish()?;
     let tool_edge_publication = tool_edges.take_publish_bundle();
-    let project_publication_result = project_stats.publication.publish()?;
-    project_stats.pending_local_snapshots = project_publication_result.pending_local_snapshots;
-    let pending_handles = project_publication_result.pending_snapshot_finalizations;
+    let mut project_publication_result = project_stats.publication.publish()?;
+    project_stats.pending_local_snapshots =
+        project_publication_result.take_pending_local_snapshots();
+    let pending_handles = project_publication_result.take_pending_snapshot_finalizations();
     tool_edge_publication.publish()?;
     let pending_journal = if project_stats.pending_local_snapshots.is_empty() {
         None
@@ -760,29 +761,46 @@ pub(super) fn execute_reindex_pass(
         }
         Some(journal)
     };
-    // R22F1+F2: carry-forward = (prior Tantivy payload intersected with
-    // validated journal inventory) UNION current handles.
-    let prior_payload = index.load_metas().ok().and_then(|m| m.payload);
-    let current: Vec<String> = pending_handles
-        .iter()
-        .map(|h| h.commitment().to_string())
-        .collect();
-    let commitments = bbox_edge_sidecar::snapshot::carry_forward_commitments(
-        &edges_dir,
-        prior_payload.as_deref(),
-        &current,
-    )?;
-    let txn_payload = commitments.join(",");
-    let mut prepared = writer.prepare_commit()?;
-    if !txn_payload.is_empty() {
-        prepared.set_payload(&txn_payload);
-    }
-    // R21F7: on commit failure, discard all staging to prevent leaks.
-    if let Err(commit_error) = prepared.commit() {
-        for handle in &pending_handles {
-            let _ = bbox_edge_sidecar::snapshot::discard_snapshot_transaction(handle);
+    let commit_attempt = (|| -> Result<()> {
+        let prior_payload = index
+            .load_metas()
+            .context("loading prior index payload before snapshot commit")?
+            .payload;
+        let current: Vec<String> = pending_handles
+            .iter()
+            .map(|handle| handle.commitment().to_string())
+            .collect();
+        let commitments = bbox_edge_sidecar::snapshot::carry_forward_commitments(
+            &edges_dir,
+            prior_payload.as_deref(),
+            &current,
+        )?;
+        let mut prepared = writer.prepare_commit()?;
+        let payload = commitments.join(",");
+        if !payload.is_empty() {
+            prepared.set_payload(&payload);
         }
-        return Err(commit_error.into());
+        prepared.commit()?;
+        Ok(())
+    })();
+    if let Err(error) = commit_attempt {
+        let mut cleanup_failures = Vec::new();
+        for handle in &pending_handles {
+            if let Err(cleanup) = bbox_edge_sidecar::snapshot::discard_snapshot_transaction(handle)
+            {
+                cleanup_failures.push(format!(
+                    "{}:{}: {cleanup:#}",
+                    handle.project_id, handle.txn_token
+                ));
+            }
+        }
+        if !cleanup_failures.is_empty() {
+            return Err(error).context(format!(
+                "snapshot commit failed and rollback left unresolved staging: {}",
+                cleanup_failures.join("; ")
+            ));
+        }
+        return Err(error);
     }
     // R20F4: fail closed if any finalization fails.
     for handle in &pending_handles {
