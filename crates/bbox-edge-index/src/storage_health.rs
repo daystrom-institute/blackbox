@@ -633,8 +633,17 @@ fn scan_inactive_snapshots(
     files: &mut Vec<StorageFileInfo>,
     file_identities: &mut HashMap<String, (u64, u64)>,
 ) -> Result<()> {
-    let manifest = bbox_edge_sidecar::manifest::try_load_manifest_index(edges_dir)
-        .map_err(|reason| anyhow::anyhow!("manifest index unavailable for gc: {reason:?}"))?;
+    let manifest = match bbox_edge_sidecar::manifest::try_load_manifest_index(edges_dir) {
+        Ok(manifest) => manifest,
+        // A legacy root that never migrated has no manifest and nothing
+        // receipt-managed to protect; corrupt or stale state refuses.
+        Err(bbox_edge_sidecar::manifest::ManifestFallbackReason::MissingNotMigrated) => {
+            bbox_edge_sidecar::manifest::ManifestIndex::new()
+        }
+        Err(reason) => {
+            anyhow::bail!("manifest index unavailable for gc: {reason:?}");
+        }
+    };
     let mut protected_snapshot_dirs = manifest
         .workspaces
         .values()
