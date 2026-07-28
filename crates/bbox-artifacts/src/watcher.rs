@@ -347,6 +347,7 @@ enum PreparedArtifactAction {
         source: PathBuf,
         expected_name: String,
         expected_version: String,
+        expected_content_sha256: Option<String>,
     },
 }
 
@@ -391,6 +392,7 @@ impl PreparedArtifactAction {
                 source,
                 expected_name,
                 expected_version,
+                expected_content_sha256,
             } => match catalog.mark_removed_by_source_if_identity(
                 ArtifactScope::Project {
                     project_id: &project_id,
@@ -400,6 +402,7 @@ impl PreparedArtifactAction {
                 &source,
                 &expected_name,
                 &expected_version,
+                expected_content_sha256.as_deref(),
             ) {
                 Ok(Some(meta)) => tracing::info!(
                     "watcher: marked removed {}/{} (project {})",
@@ -622,6 +625,19 @@ fn prepare_remove(
             return None;
         }
     };
+    // R16F4: prove source absence. A remove event that fires while the
+    // source file still exists is a spurious event (e.g. a modify that
+    // the watcher misreported, or a rapid create-after-remove). Binding
+    // the removal to a non-absent source would deactivate an artifact
+    // whose file is still present.
+    if path.exists() || std::fs::symlink_metadata(path).is_ok() {
+        tracing::debug!(
+            artifact_kind = %kind.as_str(),
+            source = %source.display(),
+            "watcher: remove event ignored because source still exists"
+        );
+        return None;
+    }
     Some(PreparedArtifactAction::Remove {
         project_id: project_id.to_owned(),
         local,
@@ -629,6 +645,7 @@ fn prepare_remove(
         source,
         expected_name: metadata.name,
         expected_version: metadata.version,
+        expected_content_sha256: metadata.content_sha256,
     })
 }
 
@@ -1005,6 +1022,121 @@ mod tests {
             .unwrap();
         assert!(active.active);
         assert_eq!(active.version, "2");
+    }
+
+    // R16F4: delayed remove after reinstall with same name+version but
+    // different content must NOT deactivate the reinstalled artifact.
+    // The content hash identity check prevents a stale removal prepared
+    // against the original content from deactivating the reinstall.
+    #[test]
+    fn r16f4_delayed_remove_after_reinstall_same_version_different_content() {
+        let directory = tempdir().unwrap();
+        let project_dir = directory.path().canonicalize().unwrap().join("project");
+        let bbox_dir = project_dir.join(".bbox");
+        let workflow_dir = bbox_dir.join("workflows");
+        std::fs::create_dir_all(&workflow_dir).unwrap();
+        let catalog = ArtifactCatalog::open(directory.path().join("catalog")).unwrap();
+        let source = PathBuf::from(".bbox/workflows/reinstall.json");
+        catalog
+            .install_value_scoped(
+                ArtifactScope::Project {
+                    project_id: "p1",
+                    local: false,
+                },
+                crate::artifacts::ArtifactKind::Workflow,
+                source.to_string_lossy().into_owned(),
+                &serde_json::json!({"name": "reinstall", "version": "1", "steps": [{"action": "original"}]}),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let action = prepare_remove(
+            &workflow_dir.join("reinstall.json"),
+            "p1",
+            &bbox_dir,
+            &catalog,
+        )
+        .unwrap();
+
+        // Reinstall with SAME name+version but DIFFERENT content.
+        catalog
+            .install_value_scoped(
+                ArtifactScope::Project {
+                    project_id: "p1",
+                    local: false,
+                },
+                crate::artifacts::ArtifactKind::Workflow,
+                source.to_string_lossy().into_owned(),
+                &serde_json::json!({"name": "reinstall", "version": "1", "steps": [{"action": "replaced"}]}),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        action.publish(&catalog);
+
+        let active = catalog
+            .active_artifact_by_source(
+                ArtifactScope::Project {
+                    project_id: "p1",
+                    local: false,
+                },
+                crate::artifacts::ArtifactKind::Workflow,
+                &source,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            active.active,
+            "same-version reinstall with different content must NOT be deactivated by stale removal"
+        );
+    }
+
+    // R16F4: remove event for a source that still exists is ignored.
+    // A remove event that fires while the file is still present is
+    // spurious and must not deactivate the artifact.
+    #[test]
+    fn r16f4_remove_event_ignored_when_source_still_exists() {
+        let directory = tempdir().unwrap();
+        let project_dir = directory.path().canonicalize().unwrap().join("project");
+        let bbox_dir = project_dir.join(".bbox");
+        let workflow_dir = bbox_dir.join("workflows");
+        std::fs::create_dir_all(&workflow_dir).unwrap();
+        let catalog = ArtifactCatalog::open(directory.path().join("catalog")).unwrap();
+        let source = PathBuf::from(".bbox/workflows/persist.json");
+        catalog
+            .install_value_scoped(
+                ArtifactScope::Project {
+                    project_id: "p1",
+                    local: false,
+                },
+                crate::artifacts::ArtifactKind::Workflow,
+                source.to_string_lossy().into_owned(),
+                &serde_json::json!({"name": "persist", "version": "1", "steps": []}),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Write the actual source file so it exists when prepare_remove runs.
+        std::fs::write(
+            workflow_dir.join("persist.json"),
+            serde_json::to_vec(&serde_json::json!({"name": "persist", "version": "1"})).unwrap(),
+        )
+        .unwrap();
+
+        let action = prepare_remove(
+            &workflow_dir.join("persist.json"),
+            "p1",
+            &bbox_dir,
+            &catalog,
+        );
+        assert!(
+            action.is_none(),
+            "remove event for existing source must produce no action"
+        );
     }
 
     #[test]

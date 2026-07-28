@@ -2290,13 +2290,21 @@ impl ArtifactCatalog {
         source_path: &Path,
         expected_name: &str,
         expected_version: &str,
+        expected_content_sha256: Option<&str>,
     ) -> anyhow::Result<Option<ArtifactMetadata>> {
         with_artifact_mutation_lock(&self.root, || {
             let Some(meta) = self.active_artifact_by_source_locked(&scope, kind, source_path)?
             else {
                 return Ok(None);
             };
-            if meta.name != expected_name || meta.version != expected_version {
+            // R16F4: bind complete metadata identity. Name and version
+            // alone are not sufficient: a reinstall with the same name
+            // and version but different content must NOT be deactivated
+            // by a stale removal prepared against the old content.
+            if meta.name != expected_name
+                || meta.version != expected_version
+                || meta.content_sha256 != expected_content_sha256.map(str::to_string)
+            {
                 return Ok(None);
             }
             self.mark_removed_metadata_locked(scope, meta)
