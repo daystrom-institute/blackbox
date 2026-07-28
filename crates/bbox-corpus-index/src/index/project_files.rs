@@ -459,18 +459,14 @@ pub fn recover_pending_local_snapshot_activations(
     fields: FieldHandles,
     edges_dir: &Path,
 ) -> Result<()> {
-    let Some(journal) =
-        bbox_edge_sidecar::snapshot::load_pending_local_activation_journal(edges_dir)?
-    else {
+    let pins = bbox_edge_sidecar::snapshot::load_pending_local_activation_pins(edges_dir)?;
+    if pins.is_empty() {
         return Ok(());
-    };
+    }
     let mut committed = 0_usize;
-    for activation in journal.activations() {
+    for pin in &pins {
         let query = TermQuery::new(
-            Term::from_field_text(
-                fields.entity_id,
-                &local_activation_marker(activation.project_id()),
-            ),
+            Term::from_field_text(fields.entity_id, &local_activation_marker(pin.project_id())),
             IndexRecordOption::Basic,
         );
         let count = searcher.search(&query, &Count)?;
@@ -491,21 +487,22 @@ pub fn recover_pending_local_snapshot_activations(
                         _ => None,
                     })
             })
-            .is_some_and(|token| token == journal.commit_token());
+            .is_some_and(|token| token == pin.commit_token());
         if matches_commit {
             committed += 1;
         }
     }
 
-    if committed == journal.activations().len() {
-        bbox_edge_sidecar::snapshot::activate_pending_local_snapshots(
-            edges_dir,
-            journal.activations(),
-        )?;
+    if committed == pins.len() {
+        let activations = pins
+            .iter()
+            .map(|pin| pin.activation().clone())
+            .collect::<Vec<_>>();
+        bbox_edge_sidecar::snapshot::activate_pending_local_snapshots(edges_dir, &activations)?;
     } else if committed != 0 {
         anyhow::bail!("local activation commit markers are only partially visible");
     }
-    bbox_edge_sidecar::snapshot::clear_pending_local_activation_journal(edges_dir)
+    bbox_edge_sidecar::snapshot::clear_pending_local_activation_pins(edges_dir)
 }
 
 #[derive(Debug, Default)]

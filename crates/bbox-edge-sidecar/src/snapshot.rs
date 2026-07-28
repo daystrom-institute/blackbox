@@ -28,6 +28,10 @@ const INDEXER_VERSION: &str = "project-index-v2-path-free";
 const CHUNKER_VERSION: &str = "chunker-v1";
 const DIRTY_OVERLAY_DIRNAME: &str = "dirty-current";
 const PENDING_LOCAL_ACTIVATIONS_FILENAME: &str = "pending-local-activations.json";
+/// R28F2: the v2 GC pin representation is one confined file per project under
+/// this directory, replacing the single `PENDING_LOCAL_ACTIVATIONS_FILENAME`
+/// document that could not represent the declared catalog cardinality.
+const PENDING_LOCAL_ACTIVATION_PINS_DIRNAME: &str = "pending-local-activation-pins";
 static MANIFEST_COORDINATOR: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn lock_manifest_coordinator() -> Result<MutexGuard<'static, ()>> {
@@ -941,43 +945,202 @@ impl PendingLocalSnapshotActivation {
     }
 }
 
+/// R28F2 v2 pin record: one confined file per project, published under
+/// `materialized/pending-local-activation-pins/<project_id>.json`.
+///
+/// The retired v1 representation was a single document holding every
+/// project's activation, so publishing one pin read the complete activation
+/// set, appended one entry, and rewrote the whole document under the manifest
+/// coordinator. That is quadratic serialized I/O in the number of attached
+/// local projects, and its 1 MiB payload bound refuses publication long
+/// before the catalog's declared `MAX_PROJECT_CATALOG_ENTRIES`. A per-project
+/// file makes publication a single leaf write, bounds each record on its own,
+/// shortens the coordinator hold to that one write, and turns GC's pin check
+/// into a direct key lookup instead of a full-set scan.
+///
+/// Each pin carries its own commit token. The token's job is to prove that
+/// the Tantivy commit which promised THIS project's activation actually
+/// landed, and that question is per project; a shared token would reintroduce
+/// a cross-file agreement invariant the split exists to remove.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PendingLocalActivationJournal {
+pub struct PendingLocalActivationPin {
+    version: u32,
+    commit_token: String,
+    activation: PendingLocalSnapshotActivation,
+}
+
+impl PendingLocalActivationPin {
+    pub fn commit_token(&self) -> &str {
+        &self.commit_token
+    }
+
+    pub fn activation(&self) -> &PendingLocalSnapshotActivation {
+        &self.activation
+    }
+
+    pub fn project_id(&self) -> &str {
+        &self.activation.project_id
+    }
+
+    pub fn snapshot_id(&self) -> &str {
+        &self.activation.snapshot_id
+    }
+}
+
+/// The retired v1 single-file journal. Read-only: it exists so an
+/// interrupted upgrade can still be interpreted, and nothing writes this
+/// shape any more.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyPendingLocalActivationJournal {
     version: u32,
     commit_token: String,
     activations: Vec<PendingLocalSnapshotActivation>,
 }
 
-impl PendingLocalActivationJournal {
-    pub fn commit_token(&self) -> &str {
-        &self.commit_token
-    }
-
-    pub fn activations(&self) -> &[PendingLocalSnapshotActivation] {
-        &self.activations
-    }
-}
-
 #[cfg(not(unix))]
-fn pending_local_activations_path(edges_dir: &Path) -> PathBuf {
+fn legacy_pending_local_activations_path(edges_dir: &Path) -> PathBuf {
     crate::manifest::materialized_dir(edges_dir).join(PENDING_LOCAL_ACTIVATIONS_FILENAME)
 }
 
+#[cfg(not(unix))]
+fn pending_local_activation_pins_path(edges_dir: &Path) -> PathBuf {
+    crate::manifest::materialized_dir(edges_dir).join(PENDING_LOCAL_ACTIVATION_PINS_DIRNAME)
+}
+
 /// R27F4: the GC pin journal is authority, so its payload is bounded the same
-/// way every other confined journal in this module is. A pin record is a few
-/// hundred bytes per project; a megabyte is orders of magnitude past any real
-/// fleet and still refuses an unbounded read into memory.
+/// way every other confined journal in this module is. This bound now applies
+/// only to the retired v1 document on the migration read path.
 const PENDING_LOCAL_ACTIVATIONS_MAX_BYTES: usize = 1024 * 1024;
 
-/// R27F1: publish the GC pin under the same manifest coordinator reclamation
+/// R28F2: a v2 pin holds exactly one project's activation record, so its
+/// bound is per record rather than per fleet. 64 KiB is orders of magnitude
+/// past the few hundred bytes a real record occupies and still refuses an
+/// unbounded read into memory.
+const PENDING_LOCAL_ACTIVATION_PIN_MAX_BYTES: usize = 64 * 1024;
+
+const PENDING_LOCAL_ACTIVATION_PIN_VERSION: u32 = 2;
+
+/// R28F2: the pin set is keyed by project, so its cardinality is exactly the
+/// catalog's declared project bound. Deriving it from the catalog constant
+/// keeps the two from drifting into another "valid catalog, refused
+/// publication" gap.
+const MAX_PENDING_LOCAL_ACTIVATION_PINS: usize =
+    bbox_corpus_core::project_catalog::MAX_PROJECT_CATALOG_ENTRIES;
+
+fn pending_local_activation_pin_leaf(project_id: &str) -> Result<String> {
+    validate_snapshot_component(project_id)?;
+    if project_id.starts_with('.') {
+        anyhow::bail!("local activation pin project id may not start with a dot");
+    }
+    Ok(format!("{project_id}.json"))
+}
+
+/// R28F2: enforce the record bound DURING serialization rather than after it.
+/// The v1 path allocated the complete document and only then compared its
+/// length against the limit, so the refusal it advertised never prevented the
+/// allocation it was there to prevent.
+struct BoundedJsonWriter {
+    buffer: Vec<u8>,
+    limit: usize,
+    overflowed: bool,
+}
+
+impl Write for BoundedJsonWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buffer.len().saturating_add(data.len()) > self.limit {
+            self.overflowed = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bounded json payload exceeds its byte limit",
+            ));
+        }
+        self.buffer.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encode_pending_local_activation_pin(pin: &PendingLocalActivationPin) -> Result<Vec<u8>> {
+    let mut writer = BoundedJsonWriter {
+        buffer: Vec::new(),
+        limit: PENDING_LOCAL_ACTIVATION_PIN_MAX_BYTES,
+        overflowed: false,
+    };
+    if let Err(error) = serde_json::to_writer(&mut writer, pin) {
+        if writer.overflowed {
+            anyhow::bail!("local activation pin exceeds its byte limit");
+        }
+        return Err(error.into());
+    }
+    Ok(writer.buffer)
+}
+
+fn decode_pending_local_activation_pin(
+    project_id: &str,
+    bytes: &[u8],
+) -> Result<PendingLocalActivationPin> {
+    let pin: PendingLocalActivationPin = serde_json::from_slice(bytes)?;
+    if pin.version != PENDING_LOCAL_ACTIVATION_PIN_VERSION {
+        anyhow::bail!("local activation pin version is not supported");
+    }
+    if pin.commit_token.is_empty() {
+        anyhow::bail!("local activation pin has no commit token");
+    }
+    if pin.activation.project_id != project_id {
+        anyhow::bail!("local activation pin project binding does not match its file name");
+    }
+    validate_snapshot_component(&pin.activation.project_id)?;
+    validate_snapshot_component(&pin.activation.snapshot_id)?;
+    Ok(pin)
+}
+
+fn mint_local_activation_commit_token(activation: &PendingLocalSnapshotActivation) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TOKEN_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let mut token = Sha256::new();
+    token.update(b"bbox-local-activation-commit-v2");
+    token.update(std::process::id().to_be_bytes());
+    token.update(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_be_bytes(),
+    );
+    token.update(
+        TOKEN_SEQUENCE
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .to_be_bytes(),
+    );
+    token.update(activation.project_id.as_bytes());
+    token.update(activation.snapshot_id.as_bytes());
+    hex::encode(token.finalize())
+}
+
+fn new_pending_local_activation_pin(
+    activation: &PendingLocalSnapshotActivation,
+) -> PendingLocalActivationPin {
+    PendingLocalActivationPin {
+        version: PENDING_LOCAL_ACTIVATION_PIN_VERSION,
+        commit_token: mint_local_activation_commit_token(activation),
+        activation: activation.clone(),
+    }
+}
+
+/// R27F1: publication runs under the same manifest coordinator reclamation
 /// holds. `remove_inactive_snapshot_tree` and `remove_gc_candidate_file` read
-/// the pin journal (via `snapshot_has_pending_local_activation`) while holding
-/// the coordinator, so an uncoordinated read-modify-write here let a
-/// reactivation observe "no intent", pin, and begin materializing into a tree
-/// GC had already decided to delete. Serializing the pin's publication makes
-/// the two orderings the only reachable ones: either the pin is durably
-/// visible before GC's check (GC declines), or GC's whole reclamation
-/// completes first and staging then re-materializes from scratch.
+/// the pin state while holding the coordinator, so an uncoordinated
+/// read-modify-write here let a reactivation observe "no intent", pin, and
+/// begin materializing into a tree GC had already decided to delete.
+/// Serializing the pin's publication makes the two orderings the only
+/// reachable ones: either the pin is durably visible before GC's check (GC
+/// declines), or GC's whole reclamation completes first and staging then
+/// re-materializes from scratch.
 ///
 /// The coordinator is a non-reentrant `std::sync::Mutex`, so this must stay
 /// the only lock take on the path: `stage_local_snapshot_activation` calls it
@@ -988,13 +1151,9 @@ fn pin_pending_local_activation(
     activation: &PendingLocalSnapshotActivation,
 ) -> Result<()> {
     with_manifest_coordinator(|| {
-        let mut activations = load_pending_local_activation_journal(edges_dir)?
-            .map(|journal| journal.activations)
-            .unwrap_or_default();
-        activations.retain(|current| current.project_id != activation.project_id);
-        activations.push(activation.clone());
-        write_pending_local_activation_journal_locked(edges_dir, &activations)?;
-        Ok(())
+        migrate_legacy_pending_local_activations_locked(edges_dir)?;
+        let pin = new_pending_local_activation_pin(activation);
+        write_pending_local_activation_pin_locked(edges_dir, &pin)
     })
 }
 
@@ -1003,95 +1162,377 @@ fn snapshot_has_pending_local_activation(
     project_id: &str,
     snapshot_id: &str,
 ) -> Result<bool> {
-    Ok(
-        load_pending_local_activation_journal(edges_dir)?.is_some_and(|journal| {
-            journal.activations.iter().any(|activation| {
-                activation.project_id == project_id && activation.snapshot_id == snapshot_id
-            })
-        }),
-    )
+    Ok(load_pending_local_activation_pin(edges_dir, project_id)?
+        .is_some_and(|pin| pin.activation.snapshot_id == snapshot_id))
 }
 
-pub fn write_pending_local_activation_journal(
+/// Replace the complete pin set with `activations`, minting a fresh commit
+/// token per pin. Pins for projects the caller did not name are retracted, so
+/// this keeps the v1 whole-document rewrite's set semantics while paying one
+/// leaf write per named project instead of one document rewrite per pin.
+pub fn write_pending_local_activation_pins(
     edges_dir: &Path,
     activations: &[PendingLocalSnapshotActivation],
-) -> Result<PendingLocalActivationJournal> {
-    with_manifest_coordinator(|| {
-        write_pending_local_activation_journal_locked(edges_dir, activations)
-    })
+) -> Result<Vec<PendingLocalActivationPin>> {
+    with_manifest_coordinator(|| write_pending_local_activation_pins_locked(edges_dir, activations))
 }
 
-/// Publish the pin journal. The caller must already hold the manifest
-/// coordinator (`with_manifest_coordinator`); it is non-reentrant.
-fn write_pending_local_activation_journal_locked(
+/// The caller must already hold the manifest coordinator; it is non-reentrant.
+fn write_pending_local_activation_pins_locked(
     edges_dir: &Path,
     activations: &[PendingLocalSnapshotActivation],
-) -> Result<PendingLocalActivationJournal> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let mut token = Sha256::new();
-    token.update(b"bbox-local-activation-commit-v1");
-    token.update(std::process::id().to_be_bytes());
-    token.update(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            .to_be_bytes(),
-    );
+) -> Result<Vec<PendingLocalActivationPin>> {
+    if activations.len() > MAX_PENDING_LOCAL_ACTIVATION_PINS {
+        anyhow::bail!("local activation set exceeds the project catalog entry bound");
+    }
+    migrate_legacy_pending_local_activations_locked(edges_dir)?;
+    let mut named = std::collections::BTreeSet::new();
+    let mut pins = Vec::with_capacity(activations.len());
     for activation in activations {
-        token.update(activation.project_id.as_bytes());
-        token.update(activation.snapshot_id.as_bytes());
+        if !named.insert(activation.project_id.clone()) {
+            anyhow::bail!("local activation set names one project twice");
+        }
+        let pin = new_pending_local_activation_pin(activation);
+        write_pending_local_activation_pin_locked(edges_dir, &pin)?;
+        pins.push(pin);
     }
-    let journal = PendingLocalActivationJournal {
-        version: 1,
-        commit_token: hex::encode(token.finalize()),
-        activations: activations.to_vec(),
+    for existing in pending_local_activation_pin_projects(edges_dir)? {
+        if !named.contains(&existing) {
+            remove_pending_local_activation_pin_locked(edges_dir, &existing)?;
+        }
+    }
+    pins.sort_by(|left, right| left.activation.project_id.cmp(&right.activation.project_id));
+    Ok(pins)
+}
+
+/// The effective pin set, sorted by project id so callers never depend on
+/// directory enumeration order.
+///
+/// Versioned representation rule (R28F2). The v2 per-project directory and
+/// the retired v1 document may both be present only while a migration is
+/// incomplete, and the rule is a union: every v2 pin, plus every v1
+/// activation whose project has no v2 pin. A v1 activation whose project DOES
+/// have a v2 pin must agree with it on the snapshot, or the load refuses
+/// rather than guessing. Because migration writes v2 pins before unlinking
+/// the v1 leaf, every intermediate state of that migration reads back as
+/// exactly the pre-migration set.
+pub fn load_pending_local_activation_pins(
+    edges_dir: &Path,
+) -> Result<Vec<PendingLocalActivationPin>> {
+    let mut pins = read_pending_local_activation_pins_dir(edges_dir)?;
+    if let Some(journal) = load_legacy_pending_local_activation_journal(edges_dir)? {
+        let commit_token = journal.commit_token;
+        for activation in journal.activations {
+            match pins
+                .iter()
+                .find(|pin| pin.activation.project_id == activation.project_id)
+            {
+                Some(pin) if pin.activation.snapshot_id == activation.snapshot_id => continue,
+                Some(_) => anyhow::bail!(
+                    "local activation pin and the legacy journal disagree for {}",
+                    activation.project_id
+                ),
+                None => pins.push(PendingLocalActivationPin {
+                    version: PENDING_LOCAL_ACTIVATION_PIN_VERSION,
+                    commit_token: commit_token.clone(),
+                    activation,
+                }),
+            }
+        }
+    }
+    if pins.len() > MAX_PENDING_LOCAL_ACTIVATION_PINS {
+        anyhow::bail!("local activation pin set exceeds the project catalog entry bound");
+    }
+    pins.sort_by(|left, right| left.activation.project_id.cmp(&right.activation.project_id));
+    Ok(pins)
+}
+
+/// The pin for one project, or `None`. This is the hot path GC takes: the v2
+/// representation answers it with a single confined leaf read instead of
+/// decoding the complete activation set.
+fn load_pending_local_activation_pin(
+    edges_dir: &Path,
+    project_id: &str,
+) -> Result<Option<PendingLocalActivationPin>> {
+    if let Some(pin) = read_pending_local_activation_pin_file(edges_dir, project_id)? {
+        return Ok(Some(pin));
+    }
+    let Some(journal) = load_legacy_pending_local_activation_journal(edges_dir)? else {
+        return Ok(None);
     };
-    let bytes = serde_json::to_vec_pretty(&journal)?;
-    if bytes.len() > PENDING_LOCAL_ACTIVATIONS_MAX_BYTES {
-        anyhow::bail!("pending local activation journal exceeds its byte limit");
+    let commit_token = journal.commit_token;
+    Ok(journal
+        .activations
+        .into_iter()
+        .find(|activation| activation.project_id == project_id)
+        .map(|activation| PendingLocalActivationPin {
+            version: PENDING_LOCAL_ACTIVATION_PIN_VERSION,
+            commit_token,
+            activation,
+        }))
+}
+
+pub fn clear_pending_local_activation_pins(edges_dir: &Path) -> Result<()> {
+    with_manifest_coordinator(|| clear_pending_local_activation_pins_locked(edges_dir))
+}
+
+/// Retract every pin and the retired v1 leaf. The caller must already hold
+/// the manifest coordinator.
+fn clear_pending_local_activation_pins_locked(edges_dir: &Path) -> Result<()> {
+    for project_id in pending_local_activation_pin_projects(edges_dir)? {
+        remove_pending_local_activation_pin_locked(edges_dir, &project_id)?;
     }
+    unlink_legacy_pending_local_activation_journal(edges_dir)
+}
+
+/// R28F2 migration: rewrite the retired v1 document as v2 per-project pins,
+/// then unlink it. Every write path runs this first, so the v1 leaf cannot
+/// outlive the first publication after the upgrade. The union load rule above
+/// makes the intermediate states of this loop indistinguishable from the
+/// pre-migration set, so a crash part-way through loses nothing and the next
+/// write resumes it.
+///
+/// The caller must already hold the manifest coordinator.
+fn migrate_legacy_pending_local_activations_locked(edges_dir: &Path) -> Result<()> {
+    let Some(journal) = load_legacy_pending_local_activation_journal(edges_dir)? else {
+        return Ok(());
+    };
+    if journal.activations.len() > MAX_PENDING_LOCAL_ACTIVATION_PINS {
+        anyhow::bail!("legacy local activation journal exceeds the project catalog entry bound");
+    }
+    let commit_token = journal.commit_token;
+    for activation in journal.activations {
+        if let Some(existing) =
+            read_pending_local_activation_pin_file(edges_dir, &activation.project_id)?
+        {
+            if existing.activation.snapshot_id != activation.snapshot_id {
+                anyhow::bail!(
+                    "local activation pin and the legacy journal disagree for {}",
+                    activation.project_id
+                );
+            }
+            continue;
+        }
+        let pin = PendingLocalActivationPin {
+            version: PENDING_LOCAL_ACTIVATION_PIN_VERSION,
+            commit_token: commit_token.clone(),
+            activation,
+        };
+        write_pending_local_activation_pin_locked(edges_dir, &pin)?;
+    }
+    unlink_legacy_pending_local_activation_journal(edges_dir)
+}
+
+fn write_pending_local_activation_pin_locked(
+    edges_dir: &Path,
+    pin: &PendingLocalActivationPin,
+) -> Result<()> {
+    let leaf = pending_local_activation_pin_leaf(&pin.activation.project_id)?;
+    let bytes = encode_pending_local_activation_pin(pin)?;
     // R27F4: root-anchored, O_NOFOLLOW descriptor traversal with a unique
     // O_EXCL temporary leaf, renameat, and a directory fsync. This is the
     // same publication path every other materialized authority file in this
-    // module uses; the previous predictable `.tmp` sibling plus
-    // `File::create` would happily follow a planted symlink and could collide
-    // with a concurrent writer's temporary.
+    // module uses; a predictable `.tmp` sibling plus `File::create` would
+    // happily follow a planted symlink and could collide with a concurrent
+    // writer's temporary.
     #[cfg(unix)]
     {
         write_materialized_file_atomic(
             edges_dir,
-            Path::new(PENDING_LOCAL_ACTIVATIONS_FILENAME),
+            Path::new(PENDING_LOCAL_ACTIVATION_PINS_DIRNAME)
+                .join(&leaf)
+                .as_path(),
             &bytes,
-        )?;
+        )
     }
     #[cfg(not(unix))]
     {
-        write_nonunix_pending_local_activation_journal(edges_dir, &bytes)?;
+        write_nonunix_pending_local_activation_pin(edges_dir, &leaf, &bytes)
     }
-    Ok(journal)
+}
+
+/// R28F2: the pin directory is authority whose absence authorizes deletion,
+/// so inspection failures refuse rather than reading as "no pin". A missing
+/// directory is absence; a symlinked or non-regular leaf, an oversize
+/// payload, an unsupported version, or a record whose project binding does
+/// not match its file name is a typed refusal.
+#[cfg(unix)]
+fn read_pending_local_activation_pins_dir(
+    edges_dir: &Path,
+) -> Result<Vec<PendingLocalActivationPin>> {
+    let directory = match open_dir_under_root(
+        edges_dir,
+        Path::new("materialized")
+            .join(PENDING_LOCAL_ACTIVATION_PINS_DIRNAME)
+            .as_path(),
+        false,
+    ) {
+        Ok(directory) => directory,
+        Err(error) if is_not_found(&error) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut names = crate::manifest::read_directory_names(&directory)?;
+    names.sort();
+    let mut pins = Vec::new();
+    for name in names {
+        let name = name
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("local activation pin name is not UTF-8"))?
+            .to_string();
+        // Dot-prefixed entries are the atomic writer's own temporaries; a
+        // pin leaf can never start with a dot.
+        if name.starts_with('.') {
+            continue;
+        }
+        let Some(project_id) = name.strip_suffix(".json") else {
+            anyhow::bail!("local activation pin directory holds an unrecognized entry");
+        };
+        let leaf = std::ffi::CString::new(name.as_bytes())?;
+        // `read_confined_file_bounded` stats the leaf itself and refuses any
+        // non-regular node, so a separate stat here would only duplicate a
+        // syscall per pin across the whole set.
+        let bytes = match read_confined_file_bounded(
+            &directory,
+            &leaf,
+            PENDING_LOCAL_ACTIVATION_PIN_MAX_BYTES,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) if is_not_found(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        pins.push(decode_pending_local_activation_pin(project_id, &bytes)?);
+    }
+    Ok(pins)
 }
 
 #[cfg(not(unix))]
-fn write_nonunix_pending_local_activation_journal(edges_dir: &Path, bytes: &[u8]) -> Result<()> {
-    let path = pending_local_activations_path(edges_dir);
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("pending activation journal has no parent"))?;
-    fs::create_dir_all(parent)?;
+fn read_pending_local_activation_pins_dir(
+    edges_dir: &Path,
+) -> Result<Vec<PendingLocalActivationPin>> {
+    let directory = pending_local_activation_pins_path(edges_dir);
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut names = entries
+        .iter()
+        .map(|entry| {
+            entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("local activation pin name is not UTF-8"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    names.sort();
+    let mut pins = Vec::new();
+    for name in names {
+        if name.starts_with('.') {
+            continue;
+        }
+        let Some(project_id) = name.strip_suffix(".json") else {
+            anyhow::bail!("local activation pin directory holds an unrecognized entry");
+        };
+        let Some(bytes) = read_nonunix_pending_local_activation_pin(edges_dir, &name)? else {
+            continue;
+        };
+        pins.push(decode_pending_local_activation_pin(project_id, &bytes)?);
+    }
+    Ok(pins)
+}
+
+#[cfg(unix)]
+fn read_pending_local_activation_pin_file(
+    edges_dir: &Path,
+    project_id: &str,
+) -> Result<Option<PendingLocalActivationPin>> {
+    use std::os::fd::AsRawFd;
+
+    let leaf_name = pending_local_activation_pin_leaf(project_id)?;
+    let directory = match open_dir_under_root(
+        edges_dir,
+        Path::new("materialized")
+            .join(PENDING_LOCAL_ACTIVATION_PINS_DIRNAME)
+            .as_path(),
+        false,
+    ) {
+        Ok(directory) => directory,
+        Err(error) if is_not_found(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let leaf = std::ffi::CString::new(leaf_name.as_bytes())?;
+    let stat = match fstatat_nofollow(directory.as_raw_fd(), &leaf) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        anyhow::bail!("local activation pin is not a regular file");
+    }
+    let bytes =
+        read_confined_file_bounded(&directory, &leaf, PENDING_LOCAL_ACTIVATION_PIN_MAX_BYTES)?;
+    Ok(Some(decode_pending_local_activation_pin(
+        project_id, &bytes,
+    )?))
+}
+
+#[cfg(not(unix))]
+fn read_pending_local_activation_pin_file(
+    edges_dir: &Path,
+    project_id: &str,
+) -> Result<Option<PendingLocalActivationPin>> {
+    let leaf_name = pending_local_activation_pin_leaf(project_id)?;
+    let Some(bytes) = read_nonunix_pending_local_activation_pin(edges_dir, &leaf_name)? else {
+        return Ok(None);
+    };
+    Ok(Some(decode_pending_local_activation_pin(
+        project_id, &bytes,
+    )?))
+}
+
+#[cfg(not(unix))]
+fn read_nonunix_pending_local_activation_pin(
+    edges_dir: &Path,
+    leaf_name: &str,
+) -> Result<Option<Vec<u8>>> {
+    let path = pending_local_activation_pins_path(edges_dir).join(leaf_name);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!("local activation pin is a symlink")
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            anyhow::bail!("local activation pin is not a regular file")
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    Ok(Some(read_nonunix_regular_bounded(
+        &path,
+        PENDING_LOCAL_ACTIVATION_PIN_MAX_BYTES as u64,
+    )?))
+}
+
+#[cfg(not(unix))]
+fn write_nonunix_pending_local_activation_pin(
+    edges_dir: &Path,
+    leaf_name: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    let directory = pending_local_activation_pins_path(edges_dir);
+    fs::create_dir_all(&directory)?;
     validate_nonunix_directory_chain(
-        parent
+        directory
             .ancestors()
             .last()
-            .ok_or_else(|| anyhow::anyhow!("pending activation journal has no root"))?,
-        parent,
+            .ok_or_else(|| anyhow::anyhow!("local activation pin directory has no root"))?,
+        &directory,
     )?;
     static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let sequence = TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let temporary = parent.join(format!(
+    let temporary = directory.join(format!(
         ".{}.{}.{}.tmp",
-        PENDING_LOCAL_ACTIVATIONS_FILENAME,
+        leaf_name,
         std::process::id(),
         sequence
     ));
@@ -1104,33 +1545,129 @@ fn write_nonunix_pending_local_activation_journal(edges_dir: &Path, bytes: &[u8]
         return Err(error.into());
     }
     drop(file);
-    if let Err(error) = fs::rename(&temporary, &path) {
+    if let Err(error) = fs::rename(&temporary, directory.join(leaf_name)) {
         let _ = fs::remove_file(&temporary);
         return Err(error.into());
     }
     Ok(())
 }
 
-pub fn load_pending_local_activation_journal(
+#[cfg(unix)]
+fn pending_local_activation_pin_projects(edges_dir: &Path) -> Result<Vec<String>> {
+    let directory = match open_dir_under_root(
+        edges_dir,
+        Path::new("materialized")
+            .join(PENDING_LOCAL_ACTIVATION_PINS_DIRNAME)
+            .as_path(),
+        false,
+    ) {
+        Ok(directory) => directory,
+        Err(error) if is_not_found(&error) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut projects = Vec::new();
+    for name in crate::manifest::read_directory_names(&directory)? {
+        let name = name
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("local activation pin name is not UTF-8"))?;
+        if name.starts_with('.') {
+            continue;
+        }
+        let Some(project_id) = name.strip_suffix(".json") else {
+            anyhow::bail!("local activation pin directory holds an unrecognized entry");
+        };
+        projects.push(project_id.to_string());
+    }
+    projects.sort();
+    Ok(projects)
+}
+
+#[cfg(not(unix))]
+fn pending_local_activation_pin_projects(edges_dir: &Path) -> Result<Vec<String>> {
+    let directory = pending_local_activation_pins_path(edges_dir);
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut projects = Vec::new();
+    for entry in entries {
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("local activation pin name is not UTF-8"))?;
+        if name.starts_with('.') {
+            continue;
+        }
+        let Some(project_id) = name.strip_suffix(".json") else {
+            anyhow::bail!("local activation pin directory holds an unrecognized entry");
+        };
+        projects.push(project_id.to_string());
+    }
+    projects.sort();
+    Ok(projects)
+}
+
+#[cfg(unix)]
+fn remove_pending_local_activation_pin_locked(edges_dir: &Path, project_id: &str) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let leaf_name = pending_local_activation_pin_leaf(project_id)?;
+    let directory = match open_dir_under_root(
+        edges_dir,
+        Path::new("materialized")
+            .join(PENDING_LOCAL_ACTIVATION_PINS_DIRNAME)
+            .as_path(),
+        false,
+    ) {
+        Ok(directory) => directory,
+        Err(error) if is_not_found(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let leaf = std::ffi::CString::new(leaf_name.as_bytes())?;
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), leaf.as_ptr(), 0) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error.into());
+        }
+        return Ok(());
+    }
+    directory.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn remove_pending_local_activation_pin_locked(edges_dir: &Path, project_id: &str) -> Result<()> {
+    let leaf_name = pending_local_activation_pin_leaf(project_id)?;
+    let path = pending_local_activation_pins_path(edges_dir).join(leaf_name);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn load_legacy_pending_local_activation_journal(
     edges_dir: &Path,
-) -> Result<Option<PendingLocalActivationJournal>> {
-    let Some(bytes) = read_pending_local_activation_bytes(edges_dir)? else {
+) -> Result<Option<LegacyPendingLocalActivationJournal>> {
+    let Some(bytes) = read_legacy_pending_local_activation_bytes(edges_dir)? else {
         return Ok(None);
     };
-    let journal: PendingLocalActivationJournal = serde_json::from_slice(&bytes)?;
+    let journal: LegacyPendingLocalActivationJournal = serde_json::from_slice(&bytes)?;
     if journal.version != 1 || journal.activations.is_empty() {
         anyhow::bail!("pending local activation journal is invalid");
     }
     Ok(Some(journal))
 }
 
-/// R27F4: read the pin journal through a root-anchored, no-follow descriptor
-/// with an explicit byte bound. A missing `materialized/` directory or a
-/// missing journal leaf is absence; every other inspection failure (symlink,
-/// non-regular node, permission, oversize payload) is a typed refusal rather
-/// than a silent "no pin", because "no pin" authorizes deletion.
+/// R27F4: read the retired v1 leaf through a root-anchored, no-follow
+/// descriptor with an explicit byte bound. A missing `materialized/`
+/// directory or a missing leaf is absence; every other inspection failure
+/// (symlink, non-regular node, permission, oversize payload) is a typed
+/// refusal rather than a silent "no pin", because "no pin" authorizes
+/// deletion.
 #[cfg(unix)]
-fn read_pending_local_activation_bytes(edges_dir: &Path) -> Result<Option<Vec<u8>>> {
+fn read_legacy_pending_local_activation_bytes(edges_dir: &Path) -> Result<Option<Vec<u8>>> {
     use std::os::fd::AsRawFd;
 
     let directory = match open_dir_under_root(edges_dir, Path::new("materialized"), false) {
@@ -1155,8 +1692,8 @@ fn read_pending_local_activation_bytes(edges_dir: &Path) -> Result<Option<Vec<u8
 }
 
 #[cfg(not(unix))]
-fn read_pending_local_activation_bytes(edges_dir: &Path) -> Result<Option<Vec<u8>>> {
-    let path = pending_local_activations_path(edges_dir);
+fn read_legacy_pending_local_activation_bytes(edges_dir: &Path) -> Result<Option<Vec<u8>>> {
+    let path = legacy_pending_local_activations_path(edges_dir);
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             anyhow::bail!("pending local activation journal is a symlink")
@@ -1174,13 +1711,8 @@ fn read_pending_local_activation_bytes(edges_dir: &Path) -> Result<Option<Vec<u8
     )?))
 }
 
-pub fn clear_pending_local_activation_journal(edges_dir: &Path) -> Result<()> {
-    with_manifest_coordinator(|| clear_pending_local_activation_journal_locked(edges_dir))
-}
-
-/// Retract the pin. The caller must already hold the manifest coordinator.
 #[cfg(unix)]
-fn clear_pending_local_activation_journal_locked(edges_dir: &Path) -> Result<()> {
+fn unlink_legacy_pending_local_activation_journal(edges_dir: &Path) -> Result<()> {
     use std::os::fd::AsRawFd;
 
     let directory = match open_dir_under_root(edges_dir, Path::new("materialized"), false) {
@@ -1201,8 +1733,8 @@ fn clear_pending_local_activation_journal_locked(edges_dir: &Path) -> Result<()>
 }
 
 #[cfg(not(unix))]
-fn clear_pending_local_activation_journal_locked(edges_dir: &Path) -> Result<()> {
-    let path = pending_local_activations_path(edges_dir);
+fn unlink_legacy_pending_local_activation_journal(edges_dir: &Path) -> Result<()> {
+    let path = legacy_pending_local_activations_path(edges_dir);
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -3545,13 +4077,11 @@ pub fn pending_snapshot_paths(edges_dir: &Path) -> Result<std::collections::BTre
             }
         }
     }
-    if let Some(journal) = load_pending_local_activation_journal(edges_dir)? {
-        for activation in journal.activations {
-            snapshots.insert(format!(
-                "workspace/{}/snapshots/{}",
-                activation.project_id, activation.snapshot_id
-            ));
-        }
+    for pin in load_pending_local_activation_pins(edges_dir)? {
+        snapshots.insert(format!(
+            "workspace/{}/snapshots/{}",
+            pin.activation.project_id, pin.activation.snapshot_id
+        ));
     }
     Ok(snapshots)
 }
@@ -7058,15 +7588,18 @@ mod tests {
         )
         .unwrap();
 
-        let journal = write_pending_local_activation_journal(edges_dir, &[first, second]).unwrap();
-        assert_eq!(journal.activations().len(), 2);
-        assert!(
-            load_pending_local_activation_journal(edges_dir)
-                .unwrap()
-                .is_some()
+        let pins = write_pending_local_activation_pins(edges_dir, &[first, second]).unwrap();
+        assert_eq!(pins.len(), 2);
+        assert_eq!(
+            load_pending_local_activation_pins(edges_dir).unwrap().len(),
+            2
         );
 
-        activate_pending_local_snapshots(edges_dir, journal.activations()).unwrap();
+        let activations = pins
+            .iter()
+            .map(|pin| pin.activation().clone())
+            .collect::<Vec<_>>();
+        activate_pending_local_snapshots(edges_dir, &activations).unwrap();
         let manifest = ManifestIndex::load(edges_dir).unwrap();
         assert_eq!(manifest.workspaces.len(), 2);
         assert_eq!(
@@ -7081,11 +7614,11 @@ mod tests {
             Some(expected_second.as_str())
         );
 
-        clear_pending_local_activation_journal(edges_dir).unwrap();
+        clear_pending_local_activation_pins(edges_dir).unwrap();
         assert!(
-            load_pending_local_activation_journal(edges_dir)
+            load_pending_local_activation_pins(edges_dir)
                 .unwrap()
-                .is_none()
+                .is_empty()
         );
     }
 
@@ -9210,57 +9743,50 @@ mod tests {
         );
     }
 
-    /// R27F4: the pin journal is authority whose absence authorizes deletion,
-    /// so a leaf that is not an ordinary regular file is a typed refusal, not
-    /// "no pin".
+    fn pin_test_activation(project_id: &str, snapshot_id: &str) -> PendingLocalSnapshotActivation {
+        PendingLocalSnapshotActivation {
+            project_id: project_id.to_string(),
+            repo_id: "repo_1".to_string(),
+            branch: None,
+            head_sha: "head-a".to_string(),
+            dirty: false,
+            dirty_fingerprint: None,
+            snapshot_id: snapshot_id.to_string(),
+        }
+    }
+
+    /// R27F4: a pin is authority whose absence authorizes deletion, so a leaf
+    /// that is not an ordinary regular file is a typed refusal, not "no pin".
     #[cfg(unix)]
     #[test]
-    fn r27_pin_journal_refuses_a_symlinked_leaf() {
+    fn r27_pin_refuses_a_symlinked_leaf() {
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let outside_journal = outside
+        let outside_pin = outside
             .path()
             .canonicalize()
             .unwrap()
             .join("elsewhere.json");
-        fs::write(
-            &outside_journal,
-            b"{\"version\":1,\"commit_token\":\"x\",\"activations\":[]}",
-        )
-        .unwrap();
-        let materialized = crate::manifest::materialized_dir(&edges_dir);
-        fs::create_dir_all(&materialized).unwrap();
-        std::os::unix::fs::symlink(
-            &outside_journal,
-            materialized.join(PENDING_LOCAL_ACTIVATIONS_FILENAME),
-        )
-        .unwrap();
+        fs::write(&outside_pin, b"{}").unwrap();
+        let pins = crate::manifest::materialized_dir(&edges_dir)
+            .join(PENDING_LOCAL_ACTIVATION_PINS_DIRNAME);
+        fs::create_dir_all(&pins).unwrap();
+        std::os::unix::fs::symlink(&outside_pin, pins.join("p_1.json")).unwrap();
 
-        let error = load_pending_local_activation_journal(&edges_dir).unwrap_err();
+        let error = load_pending_local_activation_pins(&edges_dir).unwrap_err();
         assert!(format!("{error:#}").contains("not a regular file"));
 
         // Publication replaces the symlink itself instead of writing through
         // it, so the outside target is never touched.
-        write_pending_local_activation_journal(
+        write_pending_local_activation_pins(
             &edges_dir,
-            &[PendingLocalSnapshotActivation {
-                project_id: "p_1".to_string(),
-                repo_id: "repo_1".to_string(),
-                branch: None,
-                head_sha: "head-a".to_string(),
-                dirty: false,
-                dirty_fingerprint: None,
-                snapshot_id: "snapshot-a".to_string(),
-            }],
+            &[pin_test_activation("p_1", "snapshot-a")],
         )
         .unwrap();
-        assert_eq!(
-            fs::read(&outside_journal).unwrap(),
-            b"{\"version\":1,\"commit_token\":\"x\",\"activations\":[]}"
-        );
+        assert_eq!(fs::read(&outside_pin).unwrap(), b"{}");
         assert!(
-            !fs::symlink_metadata(materialized.join(PENDING_LOCAL_ACTIVATIONS_FILENAME))
+            !fs::symlink_metadata(pins.join("p_1.json"))
                 .unwrap()
                 .file_type()
                 .is_symlink()
@@ -9269,10 +9795,31 @@ mod tests {
     }
 
     /// R27F4: the load is bounded, and an oversize payload refuses instead of
-    /// being read into memory.
+    /// being read into memory. R28F2 moves the bound from the whole-fleet
+    /// document to the per-project record.
     #[cfg(unix)]
     #[test]
-    fn r27_pin_journal_refuses_an_oversized_payload() {
+    fn r27_pin_refuses_an_oversized_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let pins = crate::manifest::materialized_dir(&edges_dir)
+            .join(PENDING_LOCAL_ACTIVATION_PINS_DIRNAME);
+        fs::create_dir_all(&pins).unwrap();
+        fs::write(
+            pins.join("p_1.json"),
+            vec![b'x'; PENDING_LOCAL_ACTIVATION_PIN_MAX_BYTES + 1],
+        )
+        .unwrap();
+
+        let error = load_pending_local_activation_pins(&edges_dir).unwrap_err();
+        assert!(format!("{error:#}").contains("exceeds max size"));
+    }
+
+    /// R27F4 still applies to the retired v1 leaf, which the migration read
+    /// path continues to consult.
+    #[cfg(unix)]
+    #[test]
+    fn r27_legacy_pin_journal_refuses_an_oversized_payload() {
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
         let materialized = crate::manifest::materialized_dir(&edges_dir);
@@ -9283,8 +9830,246 @@ mod tests {
         )
         .unwrap();
 
-        let error = load_pending_local_activation_journal(&edges_dir).unwrap_err();
+        let error = load_pending_local_activation_pins(&edges_dir).unwrap_err();
         assert!(format!("{error:#}").contains("exceeds max size"));
+    }
+
+    /// R28F2: the record bound is enforced during serialization, so an
+    /// oversize record never gets fully allocated before being refused.
+    #[test]
+    fn r28_pin_serialization_refuses_before_allocating_past_the_bound() {
+        let mut activation = pin_test_activation("p_1", "snapshot-a");
+        activation.head_sha = "a".repeat(PENDING_LOCAL_ACTIVATION_PIN_MAX_BYTES + 1);
+        let pin = new_pending_local_activation_pin(&activation);
+        let error = encode_pending_local_activation_pin(&pin).unwrap_err();
+        assert!(format!("{error:#}").contains("exceeds its byte limit"));
+    }
+
+    #[cfg(unix)]
+    fn pin_test_stage(edges_dir: &Path, project_id: &str, snapshot_id: &str) {
+        stage_local_snapshot_activation(
+            edges_dir,
+            project_id,
+            "repo_1",
+            Some("main"),
+            "head-a",
+            false,
+            None,
+            snapshot_id,
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+    }
+
+    /// R28F2: publishing a pin writes exactly one file. The v1 whole-document
+    /// rewrite made each publication O(existing pins); the assertion is
+    /// structural (an untouched pin keeps its inode, and the atomic writer
+    /// mints a new inode on every rewrite) rather than wall-clock based.
+    #[cfg(unix)]
+    #[test]
+    fn r28_pin_publication_does_not_rewrite_other_projects() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let pins_dir = crate::manifest::materialized_dir(&edges_dir)
+            .join(PENDING_LOCAL_ACTIVATION_PINS_DIRNAME);
+        for index in 0..8 {
+            pin_test_stage(
+                &edges_dir,
+                &format!("p_{index}"),
+                &format!("snapshot-{index}"),
+            );
+        }
+        let observed = pins_dir.join("p_0.json");
+        let before = fs::symlink_metadata(&observed).unwrap().ino();
+        for index in 8..24 {
+            pin_test_stage(
+                &edges_dir,
+                &format!("p_{index}"),
+                &format!("snapshot-{index}"),
+            );
+        }
+        assert_eq!(
+            fs::symlink_metadata(&observed).unwrap().ino(),
+            before,
+            "publishing a pin must not rewrite another project's pin"
+        );
+        assert_eq!(
+            load_pending_local_activation_pins(&edges_dir)
+                .unwrap()
+                .len(),
+            24
+        );
+    }
+
+    /// R28F2: the pin representation admits the catalog's declared
+    /// cardinality.
+    ///
+    /// Two halves, because materializing a real 100,000-file directory costs
+    /// minutes of syscalls on a loaded machine and proves nothing the split
+    /// does not:
+    ///
+    ///   * on disk, publish and then load a set whose serialized bytes are
+    ///     past the point where the retired single document would already
+    ///     have refused, alongside the computed count at which that document
+    ///     refused ordinary records: an order of magnitude below the declared
+    ///     limit, which is exactly the "valid catalog, refused publication"
+    ///     gap; and
+    ///   * at the declared limit itself, assert the widest record the limit
+    ///     can produce still fits its own bound, and that the only set-level
+    ///     bound admits exactly `MAX_PROJECT_CATALOG_ENTRIES` and refuses one
+    ///     more before writing anything.
+    #[cfg(unix)]
+    #[test]
+    fn r28_pin_set_admits_the_declared_catalog_cardinality() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let pins_dir = crate::manifest::materialized_dir(&edges_dir)
+            .join(PENDING_LOCAL_ACTIVATION_PINS_DIRNAME);
+        fs::create_dir_all(&pins_dir).unwrap();
+
+        // How far the retired document's byte bound actually reached with
+        // ordinary records: a few thousand projects, a small fraction of the
+        // declared limit. That is the refusal this finding is about.
+        let ordinary = encode_pending_local_activation_pin(&new_pending_local_activation_pin(
+            &pin_test_activation("p000000", "snapshot-a"),
+        ))
+        .unwrap()
+        .len();
+        let legacy_ceiling = PENDING_LOCAL_ACTIVATIONS_MAX_BYTES / ordinary;
+        assert!(
+            legacy_ceiling * 10 < MAX_PENDING_LOCAL_ACTIVATION_PINS,
+            "the retired document refused an order of magnitude below the declared limit"
+        );
+
+        // The refusal was a bound on SERIALIZED BYTES, so the on-disk fixture
+        // varies bytes rather than file count: it publishes past that bound
+        // without paying for thousands of syscalls in a parallel test run.
+        let mut serialized = 0usize;
+        let mut published = 0usize;
+        while serialized <= PENDING_LOCAL_ACTIVATIONS_MAX_BYTES {
+            let project_id = format!("p{published:06}");
+            let mut activation = pin_test_activation(&project_id, "snapshot-a");
+            activation.dirty_fingerprint = Some("f".repeat(4 * 1024));
+            let pin = new_pending_local_activation_pin(&activation);
+            let bytes = encode_pending_local_activation_pin(&pin).unwrap();
+            serialized += bytes.len();
+            fs::write(pins_dir.join(format!("{project_id}.json")), bytes).unwrap();
+            published += 1;
+        }
+        assert!(serialized > PENDING_LOCAL_ACTIVATIONS_MAX_BYTES);
+        assert!(published < MAX_PENDING_LOCAL_ACTIVATION_PINS);
+        pin_test_stage(&edges_dir, "p_last", "snapshot-last");
+        assert!(
+            snapshot_has_pending_local_activation(&edges_dir, "p_last", "snapshot-last").unwrap()
+        );
+        assert_eq!(
+            load_pending_local_activation_pins(&edges_dir)
+                .unwrap()
+                .len(),
+            published + 1
+        );
+
+        assert_eq!(
+            MAX_PENDING_LOCAL_ACTIVATION_PINS,
+            bbox_corpus_core::project_catalog::MAX_PROJECT_CATALOG_ENTRIES
+        );
+        let widest = encode_pending_local_activation_pin(&new_pending_local_activation_pin(
+            &pin_test_activation(
+                &format!("p{:06}", MAX_PENDING_LOCAL_ACTIVATION_PINS - 1),
+                "snapshot-a",
+            ),
+        ))
+        .unwrap()
+        .len();
+        assert!(widest <= PENDING_LOCAL_ACTIVATION_PIN_MAX_BYTES);
+
+        let overflow = (0..=MAX_PENDING_LOCAL_ACTIVATION_PINS)
+            .map(|index| pin_test_activation(&format!("p{index:06}"), "snapshot-a"))
+            .collect::<Vec<_>>();
+        let error = write_pending_local_activation_pins(&edges_dir, &overflow).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("exceeds the project catalog entry bound"),
+            "the only set-level bound is the catalog entry count: {error:#}"
+        );
+        assert_eq!(
+            load_pending_local_activation_pins(&edges_dir)
+                .unwrap()
+                .len(),
+            published + 1,
+            "the refusal must land before any pin is written"
+        );
+    }
+
+    /// R28F2: the retired v1 document migrates to per-project pins on the
+    /// first write, and reads before that migration see exactly the same set.
+    #[cfg(unix)]
+    #[test]
+    fn r28_legacy_pin_journal_migrates_to_per_project_pins() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let materialized = crate::manifest::materialized_dir(&edges_dir);
+        fs::create_dir_all(&materialized).unwrap();
+        let legacy = LegacyPendingLocalActivationJournal {
+            version: 1,
+            commit_token: "legacy-token".to_string(),
+            activations: vec![
+                pin_test_activation("p_1", "snapshot-a"),
+                pin_test_activation("p_2", "snapshot-b"),
+            ],
+        };
+        let legacy_leaf = materialized.join(PENDING_LOCAL_ACTIVATIONS_FILENAME);
+        fs::write(&legacy_leaf, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        // Read side: the v1 document is authority until a write migrates it.
+        let pins = load_pending_local_activation_pins(&edges_dir).unwrap();
+        assert_eq!(pins.len(), 2);
+        assert!(pins.iter().all(|pin| pin.commit_token() == "legacy-token"));
+        assert!(snapshot_has_pending_local_activation(&edges_dir, "p_2", "snapshot-b").unwrap());
+
+        // Write side: staging a third project migrates the document first.
+        pin_test_stage(&edges_dir, "p_3", "snapshot-c");
+        assert!(!legacy_leaf.exists());
+        let pins = load_pending_local_activation_pins(&edges_dir).unwrap();
+        assert_eq!(
+            pins.iter()
+                .map(|pin| pin.project_id().to_string())
+                .collect::<Vec<_>>(),
+            vec!["p_1", "p_2", "p_3"]
+        );
+        assert_eq!(
+            pins.iter()
+                .find(|pin| pin.project_id() == "p_1")
+                .unwrap()
+                .commit_token(),
+            "legacy-token"
+        );
+    }
+
+    /// R28F2: the versioned rule fails closed when the two representations
+    /// disagree rather than silently preferring one.
+    #[cfg(unix)]
+    #[test]
+    fn r28_disagreeing_representations_refuse_instead_of_guessing() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        pin_test_stage(&edges_dir, "p_1", "snapshot-a");
+        let legacy = LegacyPendingLocalActivationJournal {
+            version: 1,
+            commit_token: "legacy-token".to_string(),
+            activations: vec![pin_test_activation("p_1", "snapshot-z")],
+        };
+        fs::write(
+            crate::manifest::materialized_dir(&edges_dir).join(PENDING_LOCAL_ACTIVATIONS_FILENAME),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let error = load_pending_local_activation_pins(&edges_dir).unwrap_err();
+        assert!(format!("{error:#}").contains("disagree"));
     }
 
     /// R27F6: pruning a receipt binding discards recovery authority, so an

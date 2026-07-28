@@ -742,24 +742,27 @@ pub(super) fn execute_reindex_pass(
         project_publication_result.take_pending_local_snapshots();
     let commit_attempt = (|| -> Result<_> {
         tool_edge_publication.publish()?;
-        let pending_journal = if project_stats.pending_local_snapshots.is_empty() {
-            None
+        let pending_pins = if project_stats.pending_local_snapshots.is_empty() {
+            Vec::new()
         } else {
-            let journal = bbox_edge_sidecar::snapshot::write_pending_local_activation_journal(
+            // R28F2: pins are per project and each carries its own commit
+            // token, so the marker a project's recovery compares against is
+            // stamped from that project's own pin.
+            let pins = bbox_edge_sidecar::snapshot::write_pending_local_activation_pins(
                 &edges_dir,
                 &project_stats.pending_local_snapshots,
             )?;
-            for activation in journal.activations() {
-                let marker = project_files::local_activation_marker(activation.project_id());
+            for pin in &pins {
+                let marker = project_files::local_activation_marker(pin.project_id());
                 writer.delete_term(Term::from_field_text(fields.entity_id, &marker));
                 let mut document = TantivyDocument::new();
                 document.add_text(fields.doc_type, "code_source_activation");
                 document.add_text(fields.entity_id, &marker);
-                document.add_text(fields.project_id, activation.project_id());
-                document.add_text(fields.code_source_generation, journal.commit_token());
+                document.add_text(fields.project_id, pin.project_id());
+                document.add_text(fields.code_source_generation, pin.commit_token());
                 writer.add_document(document)?;
             }
-            Some(journal)
+            pins
         };
         let prior_payload = index
             .load_metas()
@@ -777,9 +780,9 @@ pub(super) fn execute_reindex_pass(
             prepared.set_payload(&payload);
         }
         prepared.commit()?;
-        Ok((pending_journal, payload))
+        Ok((pending_pins, payload))
     })();
-    let (pending_journal, commit_payload) = match commit_attempt {
+    let (pending_pins, commit_payload) = match commit_attempt {
         Ok(result) => result,
         Err(error) => {
             if let Err(cleanup) = project_publication_result.rollback_pending() {
@@ -809,12 +812,13 @@ pub(super) fn execute_reindex_pass(
         &edges_dir,
         (!commit_payload.is_empty()).then_some(commit_payload.as_str()),
     )?;
-    if let Some(journal) = pending_journal {
-        bbox_edge_sidecar::snapshot::activate_pending_local_snapshots(
-            &edges_dir,
-            journal.activations(),
-        )?;
-        bbox_edge_sidecar::snapshot::clear_pending_local_activation_journal(&edges_dir)?;
+    if !pending_pins.is_empty() {
+        let activations = pending_pins
+            .iter()
+            .map(|pin| pin.activation().clone())
+            .collect::<Vec<_>>();
+        bbox_edge_sidecar::snapshot::activate_pending_local_snapshots(&edges_dir, &activations)?;
+        bbox_edge_sidecar::snapshot::clear_pending_local_activation_pins(&edges_dir)?;
     }
     save_meta(&config.meta_path, &meta)?;
     // The manifest is promoted to COMMITTED only now: the population it
