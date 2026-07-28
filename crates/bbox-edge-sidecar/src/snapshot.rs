@@ -1183,6 +1183,27 @@ fn generate_txn_token() -> String {
     format!("txn-{seq}-{ts}")
 }
 
+fn is_reclaimable_orphan_txn_token(value: &str) -> bool {
+    if validate_snapshot_component(value).is_err() {
+        return false;
+    }
+
+    let generated = value
+        .strip_prefix("txn-")
+        .and_then(|suffix| suffix.split_once('-'))
+        .is_some_and(|(sequence, timestamp)| {
+            !sequence.is_empty()
+                && sequence.bytes().all(|byte| byte.is_ascii_digit())
+                && !timestamp.is_empty()
+                && timestamp.bytes().all(|byte| byte.is_ascii_digit())
+        });
+    let legacy = value.strip_prefix("orphan_token_").is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    });
+
+    generated || legacy
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_snapshot_members_transaction_with_token(
     edges_dir: &Path,
@@ -1511,6 +1532,7 @@ pub(crate) fn committed_snapshot_members(
     edges_dir: &Path,
     snapshot: &str,
 ) -> Result<Vec<(String, PathBuf, fs::File)>> {
+    use std::io::Seek;
     use std::os::fd::{AsRawFd, FromRawFd};
 
     let (project_id, snapshot_id) = snapshot_identity_from_relative(snapshot)?;
@@ -1536,7 +1558,7 @@ pub(crate) fn committed_snapshot_members(
             return Err(std::io::Error::last_os_error())
                 .with_context(|| format!("opening committed snapshot object {}", pointer.object));
         }
-        let file = unsafe { fs::File::from_raw_fd(fd) };
+        let mut file = unsafe { fs::File::from_raw_fd(fd) };
         verify_member_identity_bound_raw(
             &file,
             &TxnMember {
@@ -1544,6 +1566,7 @@ pub(crate) fn committed_snapshot_members(
                 sha256: pointer.sha256,
             },
         )?;
+        file.rewind()?;
         result.push((
             logical_name.clone(),
             materialized_dir(edges_dir)
@@ -2160,8 +2183,11 @@ fn recover_pending_transactions_for_project(
         });
     }
 
-    // Classify every entry before mutation. Only validated journal leaves and
-    // their exact staging directories are permitted.
+    // Classify every entry before mutation. A well-formed transaction staging
+    // directory without a journal is the defined crash-before-journal orphan.
+    // It is reclaimed only after the complete directory inventory proves that
+    // no unknown entry is present.
+    let mut orphan_tokens = Vec::new();
     for name in &entries {
         let s = name.to_str().ok_or_else(|| {
             anyhow::anyhow!("recovery: non-UTF-8 filename in txn dir for {project_id}")
@@ -2169,7 +2195,7 @@ fn recover_pending_transactions_for_project(
         if s.ends_with(".journal.json") {
             continue;
         }
-        if !journal_tokens.contains(s) {
+        if !journal_tokens.contains(s) && !is_reclaimable_orphan_txn_token(s) {
             anyhow::bail!("recovery: unexpected entry {s} in txn dir for {project_id}");
         }
         let staging_c = std::ffi::CString::new(s.as_bytes())?;
@@ -2177,6 +2203,22 @@ fn recover_pending_transactions_for_project(
         if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
             anyhow::bail!("recovery: staging entry {s} is not a directory for {project_id}");
         }
+        if !journal_tokens.contains(s) {
+            orphan_tokens.push(s.to_string());
+        }
+    }
+    let had_orphans = !orphan_tokens.is_empty();
+    for orphan_token in orphan_tokens {
+        let orphan_c = std::ffi::CString::new(orphan_token.as_bytes())?;
+        unlinkat_tree(txn_dir.as_raw_fd(), &orphan_c)?;
+        tracing::info!(
+            project_id,
+            txn_token = orphan_token,
+            "recovery: reclaimed crash-before-journal staging directory"
+        );
+    }
+    if had_orphans {
+        txn_dir.sync_all()?;
     }
     // R21F4+F2+F6: Phase 3 - process each decoded journal.
     for dj in &decoded_journals {
@@ -2420,6 +2462,7 @@ fn recover_pending_transactions_for_project(
         });
     }
 
+    let mut orphan_paths = Vec::new();
     for entry in &entries {
         let name = entry.file_name();
         let name_str = name.to_str().ok_or_else(|| {
@@ -2428,7 +2471,7 @@ fn recover_pending_transactions_for_project(
         if name_str.ends_with(".journal.json") {
             continue;
         }
-        if !journal_tokens.contains(name_str) {
+        if !journal_tokens.contains(name_str) && !is_reclaimable_orphan_txn_token(name_str) {
             anyhow::bail!("recovery: unexpected entry {name_str} in txn dir for {project_id}");
         }
         let metadata = fs::symlink_metadata(entry.path())?;
@@ -2437,6 +2480,17 @@ fn recover_pending_transactions_for_project(
                 "recovery: staging entry {name_str} is not a safe directory for {project_id}"
             );
         }
+        if !journal_tokens.contains(name_str) {
+            orphan_paths.push((name_str.to_string(), entry.path()));
+        }
+    }
+    for (orphan_token, orphan_path) in orphan_paths {
+        fs::remove_dir_all(&orphan_path)?;
+        tracing::info!(
+            project_id,
+            txn_token = orphan_token,
+            "recovery: reclaimed crash-before-journal staging directory"
+        );
     }
 
     // R21F4+F2+F6: Phase 3 - process each decoded journal.
