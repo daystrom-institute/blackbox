@@ -633,7 +633,8 @@ fn scan_inactive_snapshots(
     files: &mut Vec<StorageFileInfo>,
     file_identities: &mut HashMap<String, (u64, u64)>,
 ) -> Result<()> {
-    let manifest = bbox_edge_sidecar::manifest::try_load_manifest_index(edges_dir)?;
+    let manifest = bbox_edge_sidecar::manifest::try_load_manifest_index(edges_dir)
+        .map_err(|reason| anyhow::anyhow!("manifest index unavailable for gc: {reason:?}"))?;
     let mut protected_snapshot_dirs = manifest
         .workspaces
         .values()
@@ -719,7 +720,7 @@ fn scan_inactive_snapshots(
 }
 
 fn inactive_snapshot_dir_key(path: &Path) -> Option<(String, String)> {
-    let snapshot_id = path.file_name()?.to_str()?;
+    let _snapshot_id = path.file_name()?.to_str()?;
     let snapshots = path.parent()?;
     if snapshots.file_name()?.to_str()? != "snapshots" {
         return None;

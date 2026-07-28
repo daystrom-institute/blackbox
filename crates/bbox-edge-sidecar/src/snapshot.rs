@@ -194,7 +194,7 @@ pub fn remove_inactive_snapshot_tree(
 ) -> Result<bool> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
 
     with_manifest_coordinator(|| {
         let components = root_relative
