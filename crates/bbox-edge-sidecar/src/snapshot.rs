@@ -1946,7 +1946,7 @@ fn publish_immutable_snapshot_object(
     let mut destination = unsafe { fs::File::from_raw_fd(destination_fd) };
     let result = (|| -> Result<()> {
         let mut hasher = Sha256::new();
-        let mut limited = source.by_ref().take(TXN_MAX_MEMBER_BYTES + 1);
+        let mut limited = std::io::Read::by_ref(&mut source).take(TXN_MAX_MEMBER_BYTES + 1);
         let mut buffer = [0_u8; 64 * 1024];
         let mut total = 0_u64;
         loop {
@@ -1965,8 +1965,8 @@ fn publish_immutable_snapshot_object(
             anyhow::bail!("finalize: staged member changed while being copied");
         }
         let source_after = source.metadata()?;
-        if source_after.dev() != source_stat.st_dev
-            || source_after.ino() != source_stat.st_ino
+        if source_after.dev() != source_stat.st_dev as u64
+            || source_after.ino() != source_stat.st_ino as u64
             || source_after.len() != source_stat.st_size as u64
         {
             anyhow::bail!("finalize: staged member identity changed while being copied");
@@ -2215,7 +2215,6 @@ fn finalize_one_transaction(
     expected_commitment: Option<&str>,
 ) -> Result<()> {
     use std::os::fd::AsRawFd;
-    use std::os::fd::FromRawFd;
 
     validate_snapshot_component(project_id)?;
     validate_snapshot_component(snapshot_id)?;
