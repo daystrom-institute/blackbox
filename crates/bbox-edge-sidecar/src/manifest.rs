@@ -387,38 +387,17 @@ impl ManifestIndex {
             if let Some(snapshot) = entry.active_snapshot.as_deref()
                 && confined_regular_file(edges_dir, &format!("{snapshot}/.staging"))?.is_some()
             {
-                // R16F3: a lingering .staging marker means a crash occurred
-                // between sidecar publication and the finalize step that
-                // clears the marker after the index commit. The snapshot
-                // directory exists and is complete, so recovery clears the
-                // stale marker. The edge index will reload from the sidecar
-                // on the next rebuild.
-                let snapshot_dir = std::path::Path::new(snapshot);
-                let parts: Vec<&str> = snapshot_dir
-                    .components()
-                    .filter_map(|c| c.as_os_str().to_str())
-                    .collect();
-                if parts.len() >= 4 && parts[0] == "workspace" {
-                    let recover_project_id = parts[1];
-                    let recover_snapshot_id = parts[3];
-                    if let Err(error) = crate::snapshot::recover_staging_marker(
-                        edges_dir,
-                        recover_project_id,
-                        recover_snapshot_id,
-                    ) {
-                        tracing::warn!(
-                            project_id = %project_id,
-                            snapshot_id = %snapshot,
-                            error = %error,
-                            "failed to recover stale staging marker; will skip this workspace"
-                        );
-                        continue;
-                    }
-                } else {
-                    anyhow::bail!(
-                        "active snapshot has unexpected path structure for workspace {project_id}: {snapshot}"
-                    );
-                }
+                // R17F1+R17F2: recovery must run in a dedicated pre-bind
+                // transaction (recover_staging_markers_prebind), NOT inside
+                // active_paths_for_loader. The loader is called under the
+                // manifest coordinator lock by GC, so reacquiring the lock
+                // here would deadlock. A staging marker reaching this point
+                // means pre-bind recovery was not run or failed: bail so the
+                // operator sees the error instead of silently binding an
+                // unverified publication.
+                anyhow::bail!(
+                    "active snapshot has a lingering staging marker for workspace                      {project_id}: {snapshot} (run recover_staging_markers_prebind first)"
+                );
             }
             let has_overlay = match entry.dirty_overlay.as_deref() {
                 Some(relative) if confined_directory_exists(edges_dir, relative)? => true,

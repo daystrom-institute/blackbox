@@ -78,6 +78,13 @@ impl EdgeIndex {
         let started = Instant::now();
         let (mut index, mut seen) = Self::project_store_edges(stores);
 
+        // R17F1+R17F2: run staging marker recovery BEFORE loading active
+        // paths. This is a dedicated pre-bind transaction that verifies
+        // member hashes and clears or rolls back incomplete publications.
+        // It must not run inside active_paths_for_loader (which is called
+        // under the manifest coordinator lock by GC).
+        bbox_edge_sidecar::snapshot::recover_staging_markers_prebind(&stores.edges_dir)?;
+
         index.load_sidecar_edges_admitting_fully_absent(
             &stores.edges_dir,
             stores.registered_project_ids.as_ref(),

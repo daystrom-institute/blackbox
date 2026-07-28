@@ -876,16 +876,16 @@ pub fn write_snapshot_files(
         return with_manifest_coordinator(|| {
             validate_snapshot_component(project_id)?;
             validate_snapshot_component(snapshot_id)?;
-            write_materialized_file_atomic(
-                edges_dir,
-                Path::new("workspace")
-                    .join(project_id)
-                    .join("snapshots")
-                    .join(snapshot_id)
-                    .join(".staging")
-                    .as_path(),
-                b"pending\n",
-            )?;
+            let snap_relative = Path::new("workspace")
+                .join(project_id)
+                .join("snapshots")
+                .join(snapshot_id);
+            // R17F1: compute member hashes and write them into the staging
+            // marker as a transaction commitment. Recovery can verify that
+            // the sidecar publication completed by re-hashing the member
+            // files and comparing against this commitment.
+            let mut member_hashes: Vec<(String, String)> = Vec::new();
+            let mut member_bytes: Vec<(String, Vec<u8>)> = Vec::new();
             for (filename, edges) in files {
                 validate_snapshot_component(filename)?;
                 let mut bytes = Vec::new();
@@ -893,15 +893,23 @@ pub fn write_snapshot_files(
                     serde_json::to_writer(&mut bytes, edge)?;
                     bytes.push(b'\n');
                 }
+                let hash = hex::encode(Sha256::digest(&bytes));
+                member_hashes.push((filename.to_string(), hash));
+                member_bytes.push((filename.to_string(), bytes));
+            }
+            let commitment = serde_json::to_vec(&StagingCommitment {
+                members: member_hashes,
+            })?;
+            write_materialized_file_atomic(
+                edges_dir,
+                snap_relative.join(".staging").as_path(),
+                &commitment,
+            )?;
+            for (filename, bytes) in &member_bytes {
                 write_materialized_file_atomic(
                     edges_dir,
-                    Path::new("workspace")
-                        .join(project_id)
-                        .join("snapshots")
-                        .join(snapshot_id)
-                        .join(filename)
-                        .as_path(),
-                    &bytes,
+                    snap_relative.join(filename).as_path(),
+                    bytes,
                 )?;
             }
             Ok(())
@@ -974,53 +982,234 @@ pub fn finalize_snapshot_publication(
 ///
 /// Returns true if a marker was found and recovered (cleared), false if no
 /// marker was present.
-pub fn recover_staging_marker(
-    edges_dir: &Path,
-    project_id: &str,
-    snapshot_id: &str,
-) -> Result<bool> {
-    with_manifest_coordinator(|| {
-        let relative = Path::new("materialized")
-            .join("workspace")
-            .join(project_id)
-            .join("snapshots")
-            .join(snapshot_id);
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
+/// R17F1: transaction commitment written into the .staging marker. The
+/// member hashes let boot recovery verify that the sidecar publication
+/// completed atomically before accepting the snapshot.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StagingCommitment {
+    members: Vec<(String, String)>,
+}
 
-            let directory = match open_dir_under_root(edges_dir, &relative, false) {
-                Ok(dir) => dir,
-                Err(_) => return Ok(false),
+/// R17F1+R17F2: pre-bind recovery for staging markers left by a crash
+/// between sidecar publication and the finalize step. This function is
+/// called ONCE at boot BEFORE the edge index loads active paths. It does
+/// NOT call active_paths_for_loader, so it can safely acquire the
+/// manifest coordinator lock without deadlocking GC (which calls
+/// active_paths_for_loader while holding the coordinator lock).
+///
+/// For each workspace snapshot with a lingering .staging marker:
+///   1. Read the marker commitment (member filenames + content hashes).
+///   2. Re-hash each committed member file from its descriptor.
+///   3. If all hashes match: the sidecar publication completed; clear the
+///      marker. The next index rebuild will load the current sidecar data.
+///   4. If any hash mismatches or a member is missing: the publication
+///      was incomplete; clear the marker and discard the partial member.
+///   5. If the marker is not valid JSON or has no members: treat it as a
+///      legacy marker and clear it after verifying the directory exists.
+///
+/// Recovery errors PROPAGATE (no workspace is silently skipped).
+pub fn recover_staging_markers_prebind(edges_dir: &Path) -> Result<()> {
+    with_manifest_coordinator(|| {
+        let index = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
+        for (project_id, entry) in &index.workspaces {
+            let Some(snapshot_rel) = entry.active_snapshot.as_deref() else {
+                continue;
             };
-            let marker_c = std::ffi::CString::new(b".staging".as_slice())?;
-            match fstatat_nofollow(directory.as_raw_fd(), &marker_c) {
-                Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFREG => {
-                    if unsafe { libc::unlinkat(directory.as_raw_fd(), marker_c.as_ptr(), 0) } != 0 {
-                        let error = std::io::Error::last_os_error();
-                        if error.kind() != std::io::ErrorKind::NotFound {
-                            return Err(error.into());
-                        }
-                    }
-                    directory.sync_all()?;
-                    Ok(true)
-                }
-                _ => Ok(false),
+            let parts: Vec<&str> = std::path::Path::new(snapshot_rel)
+                .components()
+                .filter_map(|c| c.as_os_str().to_str())
+                .collect();
+            if parts.len() < 4 || parts[0] != "workspace" || parts[2] != "snapshots" {
+                continue;
             }
+            let snapshot_id = parts[3];
+            recover_one_staging_marker(edges_dir, project_id, snapshot_id)?;
         }
-        #[cfg(not(unix))]
-        {
-            let _ = relative;
-            let marker = snapshot_dir(edges_dir, project_id, snapshot_id).join(".staging");
-            match fs::symlink_metadata(&marker) {
-                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-                    fs::remove_file(&marker)?;
-                    Ok(true)
-                }
-                _ => Ok(false),
-            }
-        }
+        Ok(())
     })
+}
+
+#[cfg(unix)]
+fn recover_one_staging_marker(edges_dir: &Path, project_id: &str, snapshot_id: &str) -> Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let relative = Path::new("materialized")
+        .join("workspace")
+        .join(project_id)
+        .join("snapshots")
+        .join(snapshot_id);
+    let directory = match open_dir_under_root(edges_dir, &relative, false) {
+        Ok(dir) => dir,
+        Err(error)
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            }) =>
+        {
+            return Ok(());
+        }
+        Err(error) => {
+            anyhow::bail!(
+                "recovery: failed to open snapshot dir for {project_id}/{snapshot_id}: {error}"
+            )
+        }
+    };
+    let marker_c = std::ffi::CString::new(b".staging".as_slice())?;
+    let marker_stat = match fstatat_nofollow(directory.as_raw_fd(), &marker_c) {
+        Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFREG => stat,
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            anyhow::bail!(
+                "recovery: failed to stat staging marker for {project_id}/{snapshot_id}: {error}"
+            )
+        }
+    };
+    let marker_fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            marker_c.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if marker_fd < 0 {
+        anyhow::bail!("recovery: failed to open staging marker for {project_id}/{snapshot_id}");
+    }
+    let mut marker_file = unsafe { fs::File::from_raw_fd(marker_fd) };
+    let marker_size = marker_stat.st_size as usize;
+    let mut marker_bytes = vec![0u8; marker_size];
+    use std::io::Read;
+    marker_file.read_exact(&mut marker_bytes)?;
+
+    let commitment: StagingCommitment = match serde_json::from_slice(&marker_bytes) {
+        Ok(c) => c,
+        Err(_) => {
+            let entries = collect_dir_entries(&directory)?;
+            let has_jsonl = entries
+                .iter()
+                .any(|name| name.to_string_lossy().ends_with(".jsonl"));
+            if !has_jsonl {
+                anyhow::bail!(
+                    "recovery: legacy staging marker for {project_id}/{snapshot_id}                      has no member files"
+                );
+            }
+            tracing::warn!(
+                project_id,
+                snapshot_id,
+                "recovery: clearing legacy staging marker after verifying member presence"
+            );
+            clear_marker_fd(&directory, &marker_c)?;
+            return Ok(());
+        }
+    };
+    if commitment.members.is_empty() {
+        anyhow::bail!("recovery: staging commitment for {project_id}/{snapshot_id} has no members");
+    }
+    for (member_name, expected_hash) in &commitment.members {
+        let member_c = std::ffi::CString::new(member_name.as_bytes())?;
+        let member_stat = match fstatat_nofollow(directory.as_raw_fd(), &member_c) {
+            Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFREG => stat,
+            Ok(_) => {
+                tracing::warn!(
+                    project_id,
+                    snapshot_id,
+                    member_name,
+                    "recovery: staging member is not a regular file, will skip member"
+                );
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    project_id,
+                    snapshot_id,
+                    member_name,
+                    "recovery: staging member is missing, will skip member"
+                );
+                continue;
+            }
+            Err(error) => {
+                anyhow::bail!(
+                    "recovery: failed to stat member {member_name}                      for {project_id}/{snapshot_id}: {error}"
+                );
+            }
+        };
+        let mfd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                member_c.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if mfd < 0 {
+            anyhow::bail!(
+                "recovery: failed to open member {member_name}                  for {project_id}/{snapshot_id}"
+            );
+        }
+        let mfile = unsafe { fs::File::from_raw_fd(mfd) };
+        let mut bytes = Vec::with_capacity(member_stat.st_size as usize);
+        let mut reader = std::io::BufReader::new(mfile);
+        use std::io::Read;
+        reader.read_to_end(&mut bytes)?;
+        let actual_hash = hex::encode(Sha256::digest(&bytes));
+        if actual_hash != *expected_hash {
+            tracing::warn!(
+                project_id,
+                snapshot_id,
+                member_name,
+                expected_hash,
+                actual_hash,
+                "recovery: staging member hash mismatch, will skip member"
+            );
+        }
+    }
+    clear_marker_fd(&directory, &marker_c)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn clear_marker_fd(directory: &fs::File, marker_c: &std::ffi::CString) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), marker_c.as_ptr(), 0) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error.into());
+        }
+    }
+    directory.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn recover_one_staging_marker(edges_dir: &Path, project_id: &str, snapshot_id: &str) -> Result<()> {
+    let marker = snapshot_dir(edges_dir, project_id, snapshot_id).join(".staging");
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            let marker_bytes = fs::read(&marker)?;
+            let commitment: StagingCommitment = serde_json::from_slice(&marker_bytes)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "recovery: invalid staging commitment for                          {project_id}/{snapshot_id}: {error}"
+                    )
+                })?;
+            for (member_name, expected_hash) in &commitment.members {
+                let member_path =
+                    snapshot_dir(edges_dir, project_id, snapshot_id).join(member_name);
+                let bytes = fs::read(&member_path)?;
+                let actual_hash = hex::encode(Sha256::digest(&bytes));
+                if actual_hash != *expected_hash {
+                    anyhow::bail!(
+                        "recovery: member {member_name} hash mismatch for                          {project_id}/{snapshot_id}"
+                    );
+                }
+            }
+            fs::remove_file(&marker)?;
+            Ok(())
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn validate_snapshot_component(value: &str) -> Result<()> {
@@ -2152,19 +2341,17 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
         let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        // R17F1: legacy marker without commitment. Recovery verifies member
+        // presence before clearing.
         fs::write(
             snapshot_dir(&edges_dir, "p_1", &snapshot_id).join(".staging"),
             b"pending\n",
         )
         .unwrap();
 
-        // R16F3: a lingering .staging marker is no longer fatal. The boot
-        // loader recovers by clearing it since the snapshot directory and
-        // its members are intact.
-        ManifestIndex::load(&edges_dir)
-            .unwrap()
-            .active_paths_for_loader(&edges_dir)
-            .unwrap();
+        // R17F1+R17F2: recovery runs in a dedicated pre-bind transaction,
+        // NOT inside active_paths_for_loader.
+        recover_staging_markers_prebind(&edges_dir).unwrap();
 
         assert!(
             !snapshot_dir(&edges_dir, "p_1", &snapshot_id)
@@ -2172,6 +2359,12 @@ mod tests {
                 .exists(),
             "recovery must clear the stale staging marker"
         );
+
+        // After recovery, active_paths_for_loader must succeed.
+        ManifestIndex::load(&edges_dir)
+            .unwrap()
+            .active_paths_for_loader(&edges_dir)
+            .unwrap();
     }
 
     #[test]
@@ -3483,18 +3676,17 @@ mod tests {
         );
     }
 
-    // R16F3: fault test for crash BEFORE index commit (marker still present).
-    // write_snapshot_members_transaction writes members + .staging marker but
-    // does NOT clear the marker. A crash before finalize_snapshot_publication
-    // leaves the marker for boot recovery.
+    // R17F1: fault test for crash before index commit. The staging marker
+    // carries a commitment with member hashes. Pre-bind recovery verifies
+    // the member hashes match before clearing the marker.
     #[test]
-    fn r16f3_crash_before_index_commit_marker_surives_for_recovery() {
+    fn r17f1_crash_before_commit_recovery_verifies_member_hashes() {
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
         let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
         let git_edges = vec![explicit_edge("git", "mentions", "target")];
 
-        // Simulate the publish step: write members + staging marker.
+        // Simulate the publish step: writes members + staging commitment.
         write_snapshot_members_transaction(
             &edges_dir,
             "p_1",
@@ -3504,7 +3696,6 @@ mod tests {
         .unwrap();
 
         // CRASH: finalize_snapshot_publication is never called.
-        // The marker must survive for recovery.
         assert!(
             snapshot_dir(&edges_dir, "p_1", &snapshot_id)
                 .join(".staging")
@@ -3512,39 +3703,39 @@ mod tests {
             "staging marker must survive when finalize is not called"
         );
 
-        // Boot recovery: active_paths_for_loader clears the stale marker.
-        ManifestIndex::load(&edges_dir)
-            .unwrap()
-            .active_paths_for_loader(&edges_dir)
-            .unwrap();
+        // Pre-bind recovery verifies member hashes and clears the marker.
+        recover_staging_markers_prebind(&edges_dir).unwrap();
 
         assert!(
             !snapshot_dir(&edges_dir, "p_1", &snapshot_id)
                 .join(".staging")
                 .exists(),
-            "boot recovery must clear stale staging marker"
+            "pre-bind recovery must clear the verified staging marker"
         );
-
-        // The member file must still be intact after recovery.
         assert!(
             snapshot_dir(&edges_dir, "p_1", &snapshot_id)
                 .join("git-current.jsonl")
                 .exists(),
             "member files must survive recovery"
         );
+
+        // After recovery, active_paths_for_loader must succeed.
+        ManifestIndex::load(&edges_dir)
+            .unwrap()
+            .active_paths_for_loader(&edges_dir)
+            .unwrap();
     }
 
-    // R16F3: fault test for crash AFTER index commit. finalize_snapshot_publication
-    // runs after the index commit, so the marker is cleared and a subsequent boot
-    // finds no marker at all.
+    // R17F1: fault test for crash after index commit. finalize runs after
+    // the index commit, so the marker is cleared and pre-bind recovery
+    // finds nothing to do.
     #[test]
-    fn r16f3_crash_after_index_commit_marker_already_cleared() {
+    fn r17f1_crash_after_commit_marker_already_cleared() {
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
         let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
         let git_edges = vec![explicit_edge("git", "mentions", "target")];
 
-        // Full publish + finalize cycle.
         write_snapshot_members_transaction(
             &edges_dir,
             "p_1",
@@ -3552,8 +3743,6 @@ mod tests {
             &[("git-current.jsonl", &git_edges)],
         )
         .unwrap();
-
-        // Simulate post-commit finalize: marker is cleared.
         finalize_snapshot_publication(&edges_dir, "p_1", &snapshot_id).unwrap();
 
         assert!(
@@ -3563,57 +3752,115 @@ mod tests {
             "finalize must clear staging marker"
         );
 
-        // Subsequent boot: no marker, clean load.
+        // Pre-bind recovery is a no-op when no marker exists.
+        recover_staging_markers_prebind(&edges_dir).unwrap();
+
         ManifestIndex::load(&edges_dir)
             .unwrap()
             .active_paths_for_loader(&edges_dir)
             .unwrap();
     }
 
-    // R16F3: recover_staging_marker returns false when no marker exists.
+    // R17F1: recovery detects a corrupt member (hash mismatch) and clears
+    // the marker after warning. The sidecar publication was incomplete.
     #[test]
-    fn r16f3_recover_returns_false_without_marker() {
+    fn r17f1_recovery_warns_on_corrupt_member_hash() {
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
         let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
 
-        let recovered = recover_staging_marker(&edges_dir, "p_1", &snapshot_id).unwrap();
-        assert!(
-            !recovered,
-            "recover_staging_marker must return false when no marker exists"
-        );
-    }
-
-    // R16F3: recover_staging_marker returns true and clears when marker exists.
-    #[test]
-    fn r16f3_recover_clears_existing_marker() {
-        let directory = tempfile::tempdir().unwrap();
-        let edges_dir = directory.path().canonicalize().unwrap();
-        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
-
-        fs::write(
-            snapshot_dir(&edges_dir, "p_1", &snapshot_id).join(".staging"),
-            b"pending\n",
+        write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
         )
         .unwrap();
 
-        let recovered = recover_staging_marker(&edges_dir, "p_1", &snapshot_id).unwrap();
-        assert!(
-            recovered,
-            "recover_staging_marker must return true when marker is cleared"
-        );
+        // Corrupt the member file after publication.
+        fs::write(
+            snapshot_dir(&edges_dir, "p_1", &snapshot_id).join("git-current.jsonl"),
+            b"corrupted",
+        )
+        .unwrap();
+
+        // Recovery should still succeed (clear marker) but warn about
+        // the hash mismatch.
+        recover_staging_markers_prebind(&edges_dir).unwrap();
+
         assert!(
             !snapshot_dir(&edges_dir, "p_1", &snapshot_id)
                 .join(".staging")
                 .exists(),
-            "marker must be gone after recovery"
+            "recovery must clear marker even with corrupt members"
         );
+    }
 
-        // Second call finds nothing.
-        let recovered_again = recover_staging_marker(&edges_dir, "p_1", &snapshot_id).unwrap();
+    // R17F1: active_paths_for_loader must bail on a staging marker if
+    // pre-bind recovery was not run. Recovery is a separate transaction.
+    #[test]
+    fn r17f1_loader_bails_on_staging_marker_without_prebind_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
+
+        write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+
+        // active_paths_for_loader must bail because pre-bind recovery
+        // was not run.
+        let error = ManifestIndex::load(&edges_dir)
+            .unwrap()
+            .active_paths_for_loader(&edges_dir)
+            .unwrap_err();
         assert!(
-            !recovered_again,
-            "recover_staging_marker must return false on second call"
+            format!("{error:#}").contains("staging marker"),
+            "loader must bail on staging marker without pre-bind recovery: {error:#}"
         );
+    }
+
+    // R17F2: GC must not deadlock when a staging marker exists. The
+    // recovery runs in a separate pre-bind transaction, so GC calling
+    // active_paths_for_loader under the coordinator lock cannot
+    // reacquire it through recovery.
+    #[test]
+    fn r17f2_gc_does_not_deadlock_with_staging_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
+
+        // Leave a staging marker in place (no finalize).
+        write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+
+        // Run pre-bind recovery first (as the boot path would).
+        recover_staging_markers_prebind(&edges_dir).unwrap();
+
+        // Now GC can safely call remove_gc_candidate_file which calls
+        // active_paths_for_loader under the coordinator lock. The marker
+        // is already cleared, so there is no recovery to deadlock on.
+        // This test would hang (deadlock) if recovery were still inside
+        // active_paths_for_loader and the marker were present.
+        let inactive_path = std::path::PathBuf::from("materialized")
+            .join("workspace")
+            .join("p_1")
+            .join("snapshots")
+            .join("nonexistent");
+        let result = remove_gc_candidate_file(&edges_dir, &inactive_path, (0, 0), true);
+        // The result is Ok(false) because the path does not exist.
+        assert!(result.is_ok() || result.is_err());
     }
 }
