@@ -643,10 +643,23 @@ fn collect_project_storage_facts(edges_dir: &Path) -> Result<ProjectStorageFacts
 /// budget, bounded by the writer's declared cap on one materialization
 /// directory, so one project's retained generations can never refuse another
 /// project's inventory.
+///
+/// R30F2: "a project subtree" was still one budget for what the writer bounds
+/// SEPARATELY. A project carries several independently bounded materialization
+/// directories (`dirty-current`, `snapshots`, `txn`), each of which may hold
+/// `MAX_ACTIVE_MATERIALIZATION_FILES` entries on its own authority, plus the
+/// mandatory layout entries beside them. One budget of two caps could not hold
+/// even two full directories, let alone the fixed layout charged against the
+/// same total: a project with a full dirty overlay AND a full snapshots
+/// directory overflowed before `manifest.json` was counted. So the split goes
+/// one level further: the project directory's own entries are budgeted as the
+/// fixed layout they are, and every authority subtree below it is walked to
+/// completion against the writer's cap for one materialization directory.
 #[derive(Clone, Copy)]
 struct MaterializedInventoryBounds {
     root: usize,
-    project: usize,
+    project_layout: usize,
+    project_subtree: usize,
 }
 
 impl MaterializedInventoryBounds {
@@ -656,18 +669,30 @@ impl MaterializedInventoryBounds {
     /// Fixed root-scope entries: the manifest index and its siblings, the
     /// `workspace` and pin directories themselves, and other root leaves.
     const ROOT_SLACK: usize = 4_096;
-    /// Per-project subtree entries. The dominant term is the writer's own
-    /// per-materialization file cap, which is what this walk descends when a
-    /// project carries a dirty overlay; the second copy of that cap is slack
-    /// for retained snapshot directory entries and the layout leaves beside
-    /// them, whose interiors are measured under their own bound in
-    /// `validated_snapshot_tree_bytes`.
-    const PROJECT_ENTRIES: usize =
-        2 * bbox_edge_sidecar::manifest::MAX_ACTIVE_MATERIALIZATION_FILES;
+    /// The entries the supported layout places directly under
+    /// `workspace/<project>`: its `manifest.json`, its `snapshots` directory,
+    /// its `dirty-current` overlay directory, and its `txn` directory. This is
+    /// the mandatory cost R30F2 gives its own allowance instead of charging it
+    /// against a subtree's population.
+    const PROJECT_LAYOUT_ENTRIES: usize = 4;
+    /// Slack for layout leaves added beside those four. Small on purpose: this
+    /// scope holds the project's fixed shape, and everything that grows with
+    /// use lives one level down under `PROJECT_SUBTREE_ENTRIES`.
+    const PROJECT_LAYOUT_SLACK: usize = 1_024;
+    /// One authority subtree below `workspace/<project>` is one independently
+    /// bounded materialization directory, so its budget is the writer's own
+    /// declared cap on one of those, whole rather than shared. A subtree is
+    /// walked to completion against this, which covers the nested staging
+    /// directories under `txn`; the interiors of retained snapshot directories
+    /// are measured under their own bound in `validated_snapshot_tree_bytes`
+    /// and are never descended here.
+    const PROJECT_SUBTREE_ENTRIES: usize =
+        bbox_edge_sidecar::manifest::MAX_ACTIVE_MATERIALIZATION_FILES;
 
     const DECLARED: Self = Self {
         root: MAX_PROJECT_CATALOG_ENTRIES * Self::ROOT_ENTRIES_PER_PROJECT + Self::ROOT_SLACK,
-        project: Self::PROJECT_ENTRIES,
+        project_layout: Self::PROJECT_LAYOUT_ENTRIES + Self::PROJECT_LAYOUT_SLACK,
+        project_subtree: Self::PROJECT_SUBTREE_ENTRIES,
     };
 }
 
@@ -676,7 +701,8 @@ impl MaterializedInventoryBounds {
 #[derive(Debug, Default, Clone, Copy)]
 struct MaterializedInventoryCounts {
     root_entries: usize,
-    max_project_entries: usize,
+    max_project_layout_entries: usize,
+    max_project_subtree_entries: usize,
 }
 
 fn scan_inactive_snapshots(
@@ -757,20 +783,25 @@ fn scan_inactive_snapshots_bounded(
                 continue;
             };
             // A project subtree is its own authority: it is walked to
-            // completion against its own budget, so its size is bounded by
+            // completion against its own budgets, so its size is bounded by
             // the writer's per-materialization cap rather than by whatever
             // every other project already spent.
             if directory == workspace_dir {
-                let project_entries = scan_project_subtree(
+                let project = scan_project_subtree(
                     &descend,
                     &protected_snapshot_dirs,
                     project_filter,
                     totals,
                     files,
                     file_identities,
-                    bounds.project,
+                    bounds,
                 )?;
-                counts.max_project_entries = counts.max_project_entries.max(project_entries);
+                counts.max_project_layout_entries = counts
+                    .max_project_layout_entries
+                    .max(project.layout_entries);
+                counts.max_project_subtree_entries = counts
+                    .max_project_subtree_entries
+                    .max(project.max_subtree_entries);
                 continue;
             }
             pending.push(descend);
@@ -779,9 +810,69 @@ fn scan_inactive_snapshots_bounded(
     Ok(counts)
 }
 
-/// Walk one `workspace/<project>` subtree under its own entry budget,
-/// returning the entries it visited.
+/// What one `workspace/<project>` walk visited, split the way it is budgeted.
+#[derive(Debug, Default, Clone, Copy)]
+struct MaterializedProjectCounts {
+    /// Entries directly under `workspace/<project>`.
+    layout_entries: usize,
+    /// The largest single authority subtree below it.
+    max_subtree_entries: usize,
+}
+
+/// Walk one `workspace/<project>` subtree.
+///
+/// R30F2: the project directory's own entries are its fixed layout and are
+/// budgeted as such, and every authority subtree below it (`dirty-current`,
+/// `snapshots`, `txn`) is walked to completion against a budget of its own.
+/// A full dirty overlay can no longer refuse the snapshots directory beside
+/// it, and neither can crowd out `manifest.json`.
 fn scan_project_subtree(
+    root: &Path,
+    protected_snapshot_dirs: &HashSet<PathBuf>,
+    project_filter: Option<&str>,
+    totals: &mut StorageHealthTotals,
+    files: &mut Vec<StorageFileInfo>,
+    file_identities: &mut HashMap<String, (u64, u64)>,
+    bounds: MaterializedInventoryBounds,
+) -> Result<MaterializedProjectCounts> {
+    let mut counts = MaterializedProjectCounts::default();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        counts.layout_entries += 1;
+        if counts.layout_entries > bounds.project_layout {
+            anyhow::bail!(
+                "materialized edge inventory for {} exceeds its project layout entry bound",
+                root.display()
+            );
+        }
+        let Some(descend) = classify_materialized_entry(
+            &entry.path(),
+            protected_snapshot_dirs,
+            project_filter,
+            totals,
+            files,
+            file_identities,
+        )?
+        else {
+            continue;
+        };
+        let subtree_entries = scan_project_authority_subtree(
+            &descend,
+            protected_snapshot_dirs,
+            project_filter,
+            totals,
+            files,
+            file_identities,
+            bounds.project_subtree,
+        )?;
+        counts.max_subtree_entries = counts.max_subtree_entries.max(subtree_entries);
+    }
+    Ok(counts)
+}
+
+/// Walk one independently bounded materialization directory below
+/// `workspace/<project>` to completion against its own entry budget.
+fn scan_project_authority_subtree(
     root: &Path,
     protected_snapshot_dirs: &HashSet<PathBuf>,
     project_filter: Option<&str>,
@@ -798,7 +889,7 @@ fn scan_project_subtree(
             entries += 1;
             if entries > limit {
                 anyhow::bail!(
-                    "materialized edge inventory for {} exceeds its per-project entry bound",
+                    "materialized edge inventory for {} exceeds its authority subtree entry bound",
                     root.display()
                 );
             }
@@ -3536,7 +3627,8 @@ mod tests {
 
         let unbounded = MaterializedInventoryBounds {
             root: usize::MAX,
-            project: usize::MAX,
+            project_layout: usize::MAX,
+            project_subtree: usize::MAX,
         };
 
         // Two project counts per layout shape, so the marginal per-project
@@ -3561,26 +3653,35 @@ mod tests {
             );
             let marginal_root = (large.root_entries - small.root_entries) / span;
             let fixed_root = small.root_entries - marginal_root * small_projects;
-            let per_project = large.max_project_entries;
+            let project_layout = large.max_project_layout_entries;
+            let project_subtree = large.max_project_subtree_entries;
             assert_eq!(
-                small.max_project_entries, per_project,
+                (
+                    small.max_project_layout_entries,
+                    small.max_project_subtree_entries
+                ),
+                (project_layout, project_subtree),
                 "a project subtree's cost must not depend on how many peers it has"
             );
 
             // The supported layout, spelled out: one `workspace/<project>`
-            // directory entry and one pin leaf at root scope, and inside the
-            // project subtree its `manifest.json`, its `snapshots`
-            // directory, the active snapshot directory entry, and one
-            // directory entry per retained generation.
+            // directory entry and one pin leaf at root scope; inside the
+            // project directory its `manifest.json` and its `snapshots`
+            // directory; and inside that subtree the active snapshot
+            // directory entry plus one entry per retained generation.
             assert_eq!(
                 marginal_root,
                 MaterializedInventoryBounds::ROOT_ENTRIES_PER_PROJECT,
                 "root cost per project must match its documented allowance"
             );
             assert_eq!(
-                per_project,
-                3 + retained,
-                "per-project cost must match the documented writer layout"
+                project_layout, 2,
+                "project layout cost must match the documented writer layout"
+            );
+            assert_eq!(
+                project_subtree,
+                1 + retained,
+                "authority subtree cost must match the documented writer layout"
             );
 
             // The declared root bound admits the catalog's full project
@@ -3599,32 +3700,32 @@ mod tests {
                 "the declared root bound must admit {MAX_PROJECT_CATALOG_ENTRIES} projects"
             );
             assert!(
-                per_project <= MaterializedInventoryBounds::DECLARED.project,
-                "the declared per-project bound must admit one project's supported layout"
+                project_layout <= MaterializedInventoryBounds::DECLARED.project_layout
+                    && project_subtree <= MaterializedInventoryBounds::DECLARED.project_subtree,
+                "the declared per-project bounds must admit one project's supported layout"
             );
 
             // This is the finding: the same supported layout, at the
             // declared cardinality, blew the retired flat ceiling.
             assert!(
-                (marginal_root + per_project) * MAX_PROJECT_CATALOG_ENTRIES > RETIRED_FLAT_CEILING,
+                (marginal_root + project_layout + project_subtree) * MAX_PROJECT_CATALOG_ENTRIES
+                    > RETIRED_FLAT_CEILING,
                 "the flat ceiling this replaced refused the declared cardinality"
             );
 
             // The exact observed layout is accepted, and the first entry
             // past each bound is refused.
-            walk(
-                large_dir,
-                MaterializedInventoryBounds {
-                    root: large.root_entries,
-                    project: per_project,
-                },
-            )
-            .unwrap();
+            let exact = MaterializedInventoryBounds {
+                root: large.root_entries,
+                project_layout,
+                project_subtree,
+            };
+            walk(large_dir, exact).unwrap();
             let error = walk(
                 large_dir,
                 MaterializedInventoryBounds {
                     root: large.root_entries - 1,
-                    project: per_project,
+                    ..exact
                 },
             )
             .unwrap_err();
@@ -3635,15 +3736,206 @@ mod tests {
             let error = walk(
                 large_dir,
                 MaterializedInventoryBounds {
-                    root: large.root_entries,
-                    project: per_project - 1,
+                    project_layout: project_layout - 1,
+                    ..exact
                 },
             )
             .unwrap_err();
             assert!(
-                format!("{error:#}").contains("exceeds its per-project entry bound"),
+                format!("{error:#}").contains("exceeds its project layout entry bound"),
+                "{error:#}"
+            );
+            let error = walk(
+                large_dir,
+                MaterializedInventoryBounds {
+                    project_subtree: project_subtree - 1,
+                    ..exact
+                },
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("exceeds its authority subtree entry bound"),
                 "{error:#}"
             );
         }
+    }
+
+    /// R30F2: a project's independently bounded directories must not share
+    /// one budget, and its mandatory layout entries must not be charged
+    /// against that budget either.
+    ///
+    /// The per-project ceiling was exactly two copies of the writer's
+    /// per-materialization file cap. But a project may carry a full
+    /// `dirty-current` overlay (one cap on its own authority) AND a full
+    /// `snapshots` directory (another cap on its own authority), and the walk
+    /// also charges `manifest.json`, the `txn` directory, and the directory
+    /// entries for the overlay and snapshots themselves against the same
+    /// total. That layout is supported everywhere else in the system and
+    /// overflowed here before a single mandatory entry was counted.
+    ///
+    /// The shape arithmetic runs at the real constants; materializing 200,000
+    /// entries to prove it would cost minutes of syscalls and prove nothing
+    /// extra. Acceptance and refusal run at scaled ones, on a project built to
+    /// the same shape: full overlay, full snapshots, every mandatory entry.
+    #[test]
+    fn r30_project_inventory_admits_full_authority_subtrees_beside_its_layout() {
+        /// What the per-project walk used to enforce across every entry in
+        /// the subtree.
+        const RETIRED_PROJECT_CEILING: usize =
+            2 * bbox_edge_sidecar::manifest::MAX_ACTIVE_MATERIALIZATION_FILES;
+        /// The scaled stand-in for the writer's per-materialization cap.
+        const SCALED_SUBTREE: usize = 24;
+
+        // The shape, at the real constants: two full authority subtrees plus
+        // the mandatory layout beside them do not fit under the retired
+        // ceiling, and each of them fits its own declared budget exactly.
+        let writer_cap = bbox_edge_sidecar::manifest::MAX_ACTIVE_MATERIALIZATION_FILES;
+        assert!(
+            2 * writer_cap + MaterializedInventoryBounds::PROJECT_LAYOUT_ENTRIES
+                > RETIRED_PROJECT_CEILING,
+            "a full overlay beside full snapshots plus the mandatory layout overflowed the \
+             ceiling this replaces"
+        );
+        assert_eq!(
+            MaterializedInventoryBounds::DECLARED.project_subtree,
+            writer_cap,
+            "an authority subtree is budgeted by the writer's own cap for one \
+             materialization directory"
+        );
+        assert!(
+            MaterializedInventoryBounds::DECLARED.project_layout
+                >= MaterializedInventoryBounds::PROJECT_LAYOUT_ENTRIES,
+            "the layout allowance must admit manifest.json, snapshots, dirty-current, and txn"
+        );
+
+        // The same shape at scaled limits, on disk.
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let project_dir = bbox_edge_sidecar::manifest::materialized_dir(&edges_dir)
+            .join("workspace")
+            .join("p_full");
+
+        // A full snapshots directory: every generation inactive, so every one
+        // of them is a retention unit this walk records.
+        for generation in 0..SCALED_SUBTREE {
+            write_snapshot_jsonl(&edges_dir, "p_full", &format!("head-old-{generation:04}"));
+        }
+        // A full dirty overlay beside it.
+        let overlay = project_dir.join("dirty-current");
+        fs::create_dir_all(&overlay).unwrap();
+        for member in 0..SCALED_SUBTREE {
+            fs::write(overlay.join(format!("part-{member:04}.jsonl")), b"{}\n").unwrap();
+        }
+        // And the mandatory layout entries: manifest.json and the txn
+        // directory, plus the two directory entries above.
+        write_workspace_manifest(
+            &edges_dir,
+            "p_full",
+            Some("repo1234"),
+            None,
+            "head-old-0000",
+        );
+        // The txn directory is a third authority subtree, and it nests: an
+        // open transaction's staging directory is walked inside txn's own
+        // budget, beside its journal.
+        let edges: Vec<bbox_edge_sidecar::edge_sidecar::Edge> = Vec::new();
+        bbox_edge_sidecar::snapshot::write_snapshot_members_transaction(
+            &edges_dir,
+            "p_full",
+            "head-old-0000",
+            &[("git-current.jsonl", &edges)],
+        )
+        .unwrap();
+
+        fn walk(
+            edges_dir: &Path,
+            bounds: MaterializedInventoryBounds,
+        ) -> Result<MaterializedInventoryCounts> {
+            let mut totals = StorageHealthTotals::default();
+            let mut files = Vec::new();
+            let mut identities = HashMap::new();
+            scan_inactive_snapshots_bounded(
+                edges_dir,
+                None,
+                &mut totals,
+                &mut files,
+                &mut identities,
+                bounds,
+            )
+        }
+
+        let measured = walk(
+            &edges_dir,
+            MaterializedInventoryBounds {
+                root: usize::MAX,
+                project_layout: usize::MAX,
+                project_subtree: usize::MAX,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            measured.max_project_layout_entries,
+            MaterializedInventoryBounds::PROJECT_LAYOUT_ENTRIES,
+            "the built project carries exactly the mandatory layout"
+        );
+        assert_eq!(
+            measured.max_project_subtree_entries, SCALED_SUBTREE,
+            "the largest authority subtree is one full materialization directory"
+        );
+
+        // Acceptance at the exact limits: two subtrees of SCALED_SUBTREE
+        // entries each, plus the four layout entries, under budgets that
+        // would refuse if either were charged against the other.
+        let exact = MaterializedInventoryBounds {
+            root: measured.root_entries,
+            project_layout: MaterializedInventoryBounds::PROJECT_LAYOUT_ENTRIES,
+            project_subtree: SCALED_SUBTREE,
+        };
+        walk(&edges_dir, exact).unwrap();
+
+        // Refusal at the first excess, per bound.
+        let error = walk(
+            &edges_dir,
+            MaterializedInventoryBounds {
+                project_subtree: SCALED_SUBTREE - 1,
+                ..exact
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("exceeds its authority subtree entry bound"),
+            "{error:#}"
+        );
+        let error = walk(
+            &edges_dir,
+            MaterializedInventoryBounds {
+                project_layout: MaterializedInventoryBounds::PROJECT_LAYOUT_ENTRIES - 1,
+                ..exact
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("exceeds its project layout entry bound"),
+            "{error:#}"
+        );
+
+        // The retired shape, spelled out: one budget covering both subtrees
+        // and the layout refuses this project, and the split budgets accept
+        // it. Scaled `2 * cap` stands in for the retired ceiling.
+        let error = walk(
+            &edges_dir,
+            MaterializedInventoryBounds {
+                project_layout: 2 * SCALED_SUBTREE,
+                project_subtree: 2 * SCALED_SUBTREE
+                    - MaterializedInventoryBounds::PROJECT_LAYOUT_ENTRIES
+                    - SCALED_SUBTREE,
+                ..exact
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("exceeds its authority subtree entry bound"),
+            "one shared budget cannot hold both full subtrees and the layout: {error:#}"
+        );
     }
 }
