@@ -861,6 +861,7 @@ dependencies = [
  "anyhow",
  "bbox-corpus-core",
  "dirs",
+ "fs2",
  "tempfile",
  "tokio",
  "tracing",

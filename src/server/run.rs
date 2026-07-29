@@ -8,6 +8,25 @@ use crate::util;
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
+/// Where the one-time legacy migration puts each store: this daemon's
+/// RESOLVED paths.
+///
+/// R33F2: the migration used to recompute its destinations from env vars and
+/// `$HOME` defaults, which never consult the config file. A daemon isolated
+/// through `[paths].state_dir` alone therefore renamed shared legacy state
+/// into the production default paths — roots it had not claimed and does not
+/// serve — racing whichever daemon owns them.
+fn legacy_destinations(cfg: &crate::config::Config) -> util::LegacyMigrationDestinations {
+    util::LegacyMigrationDestinations {
+        knowledge_path: cfg.paths.knowledge_path.clone(),
+        threads_path: cfg.paths.threads_path.clone(),
+        notes_path: cfg.paths.notes_path.clone(),
+        index_path: cfg.paths.index_path.clone(),
+        global_common_md: cfg.paths.global_common_md.clone(),
+        bro_home: cfg.paths.bro_home.clone(),
+    }
+}
+
 /// Claim every root this daemon will write to, then run the one-time legacy
 /// migrations.
 ///
@@ -18,12 +37,19 @@ use tokio_util::sync::CancellationToken;
 /// existed, so two upgrade startups could race the same one-time move. A
 /// process that loses the claim now returns from here having renamed,
 /// copied, and opened nothing.
+///
+/// R33F2 closes the other half: the destinations come from `cfg`, so every
+/// one of them sits inside a root the claim above covers, and the migration
+/// takes its own non-blocking claim on the legacy SOURCE (which hangs off
+/// `$HOME` and belongs to no daemon) so two daemons with distinct roots still
+/// cannot race the one-time move.
 fn claim_roots_then_migrate(
     home: &Path,
+    cfg: &crate::config::Config,
     roots: &[InstanceRoot],
 ) -> anyhow::Result<(InstanceLockSet, Vec<String>)> {
     let locks = acquire_instance_locks(roots)?;
-    let migrated = util::migrate_legacy_defaults(home)?;
+    let migrated = util::migrate_legacy_defaults(home, &legacy_destinations(cfg))?;
     Ok((locks, migrated))
 }
 
@@ -34,7 +60,7 @@ pub async fn run() -> anyhow::Result<()> {
     // guarantee that.
     let loaded = crate::config::load()?;
     let roots = super::instance_lock::instance_lock_roots(&loaded);
-    let (instance_locks, migrated) = claim_roots_then_migrate(&home, &roots)?;
+    let (instance_locks, migrated) = claim_roots_then_migrate(&home, &loaded, &roots)?;
     init_logging(&home, migrated);
 
     let opened = open_shared_state(&home, loaded, &instance_locks)?;
@@ -109,18 +135,22 @@ mod tests {
         let state = root.join("state");
 
         let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_CONFIG", root.join("absent-config.toml"));
         env.set("BLACKBOX_STATE_DIR", &state);
-        // Keep every home-derived migration destination inside the fixture.
+        // Keep every resolved migration destination inside the fixture: the
+        // index and the vector root both default outside the state directory.
         env.set("TRANSCRIPT_SEARCH_INDEX_PATH", root.join("index"));
+        env.set("BLACKBOX_VECTORS_PATH", root.join("vectors"));
+        env.set("BLACKBOX_GLOBAL_COMMON_MD", root.join("BLACKBOX.md"));
         for var in [
             "BLACKBOX_KNOWLEDGE_PATH",
             "BLACKBOX_THREADS_PATH",
             "BLACKBOX_NOTES_PATH",
-            "BLACKBOX_GLOBAL_COMMON_MD",
             "BRO_HOME",
         ] {
             env.remove(var);
         }
+        let cfg = crate::config::load().expect("load the daemon config");
 
         // The legacy tree an upgrading daemon finds.
         let legacy = home.join(".claude-shared");
@@ -133,8 +163,8 @@ mod tests {
         let roots = vec![InstanceRoot::state_root(state.clone())];
         let live = acquire_instance_locks(&roots).expect("the healthy daemon claims its roots");
 
-        let error =
-            claim_roots_then_migrate(&home, &roots).expect_err("the duplicate startup must refuse");
+        let error = claim_roots_then_migrate(&home, &cfg, &roots)
+            .expect_err("the duplicate startup must refuse");
         assert!(
             error.to_string().contains("already holds"),
             "the refusal must name the contention: {error:#}"
@@ -171,13 +201,117 @@ mod tests {
         // The winner exits; the next startup performs the migration exactly
         // once, which is what the refusal above deferred rather than lost.
         drop(live);
-        let (_locks, migrated) =
-            claim_roots_then_migrate(&home, &roots).expect("a released root is claimable again");
+        let (_locks, migrated) = claim_roots_then_migrate(&home, &cfg, &roots)
+            .expect("a released root is claimable again");
         assert!(
             migrated.iter().any(|line| line.starts_with("knowledge:")),
             "the migration runs under the claim: {migrated:?}"
         );
         assert!(state.join("blackbox-knowledge.json").exists());
         assert!(state.join("bro").join("tasks.json").exists());
+    }
+
+    /// The R33F2 regression, driven through the surface the finding names:
+    /// two daemons isolated ONLY by `[paths].state_dir` in their own config
+    /// files, sharing one `$HOME` and therefore one legacy source tree.
+    ///
+    /// The destinations must follow the loaded configuration, so the winner's
+    /// stores receive the legacy state and the second daemon's stores stay
+    /// empty. Recomputing destinations from env vars and `$HOME` sent both at
+    /// the same production-default paths, which neither had claimed.
+    #[test]
+    fn config_file_isolated_daemons_migrate_into_their_own_resolved_roots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonicalize the fixture");
+        let home = root.join("home");
+
+        // The legacy tree both daemons can see.
+        let legacy = home.join(".claude-shared");
+        std::fs::create_dir_all(&legacy).expect("create the legacy tree");
+        std::fs::write(legacy.join("blackbox-knowledge.json"), b"[]").expect("legacy knowledge");
+        std::fs::create_dir_all(home.join(".bro")).expect("create the legacy bro home");
+        std::fs::write(home.join(".bro").join("tasks.json"), b"[]").expect("legacy bro state");
+
+        let load_for = |env: &mut crate::util::TestEnvGuard, name: &str| {
+            let state = root.join(name);
+            let config_path = root.join(format!("{name}.toml"));
+            std::fs::write(
+                &config_path,
+                format!("[paths]\nstate_dir = {state:?}\n").as_bytes(),
+            )
+            .expect("write the daemon config file");
+            // state_dir is deliberately config-file-only. The index, vector,
+            // and global-memory roots default outside the state directory, so
+            // pin them inside the fixture rather than at the host's real ones.
+            env.set("BLACKBOX_CONFIG", &config_path);
+            env.set(
+                "TRANSCRIPT_SEARCH_INDEX_PATH",
+                root.join(name).join("index"),
+            );
+            env.set("BLACKBOX_VECTORS_PATH", root.join(name).join("vectors"));
+            env.set(
+                "BLACKBOX_GLOBAL_COMMON_MD",
+                root.join(name).join("BLACKBOX.md"),
+            );
+            for var in [
+                "BLACKBOX_STATE_DIR",
+                "BLACKBOX_KNOWLEDGE_PATH",
+                "BLACKBOX_THREADS_PATH",
+                "BLACKBOX_NOTES_PATH",
+                "BRO_HOME",
+            ] {
+                env.remove(var);
+            }
+            (
+                state,
+                crate::config::load().expect("load the daemon config"),
+            )
+        };
+
+        let mut env = crate::util::TestEnvGuard::new();
+        let (first_state, first) = load_for(&mut env, "daemon-a");
+        let (second_state, second) = load_for(&mut env, "daemon-b");
+        assert_ne!(
+            first.paths.knowledge_path, second.paths.knowledge_path,
+            "the two config files isolate the knowledge store"
+        );
+
+        // The second daemon is mid-migration, holding the legacy source.
+        let held = crate::util::try_lock_legacy_migration(&home)
+            .expect("open the legacy source lock")
+            .expect("the peer claims the legacy source");
+        let skipped = claim_roots_then_migrate(
+            &home,
+            &first,
+            &[InstanceRoot::state_root(first_state.clone())],
+        )
+        .expect("a contended legacy source is not a startup failure");
+        assert!(
+            skipped.1.is_empty(),
+            "the daemon that lost the source claim migrates nothing: {:?}",
+            skipped.1
+        );
+        assert!(!first.paths.knowledge_path.exists());
+        drop(skipped);
+        drop(held);
+
+        // It releases; this daemon migrates into ITS resolved roots, once.
+        let (_locks, migrated) = claim_roots_then_migrate(
+            &home,
+            &first,
+            &[InstanceRoot::state_root(first_state.clone())],
+        )
+        .expect("a released legacy source is claimable");
+        assert!(
+            migrated.iter().any(|line| line.starts_with("knowledge:")),
+            "the migration ran: {migrated:?}"
+        );
+        assert!(first.paths.knowledge_path.exists());
+        assert!(first.paths.bro_home.join("tasks.json").exists());
+        assert!(
+            !second_state.exists(),
+            "the other daemon's resolved roots were never written"
+        );
+        assert!(!legacy.join("blackbox-knowledge.json").exists());
     }
 }
