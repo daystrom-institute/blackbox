@@ -1,4 +1,5 @@
 use super::background::start_background_tasks;
+use super::instance_lock::acquire_instance_locks;
 use super::mcp::build_http_app;
 use super::open::open_shared_state;
 use super::shutdown::serve_until_shutdown;
@@ -11,11 +12,18 @@ pub async fn run() -> anyhow::Result<()> {
     let migrated = util::migrate_legacy_defaults(&home)?;
     init_logging(&home, migrated);
 
-    let opened = open_shared_state(&home)?;
-    // R31F1: the state root's single-writer claim outlives every store opened
-    // under it. Binding it here keeps it held until `run` returns; process
-    // exit by any other route releases it with the file description.
-    let _instance_lock = opened.instance_lock;
+    // Load once: the claim below and the store opens further down must agree
+    // on which roots this daemon owns, and a reload between them could not
+    // guarantee that.
+    let loaded = crate::config::load()?;
+    let instance_locks =
+        acquire_instance_locks(&super::instance_lock::instance_lock_roots(&loaded))?;
+
+    let opened = open_shared_state(&home, loaded, &instance_locks)?;
+    // R31F1: the single-writer claim outlives every store opened under it.
+    // Binding it here keeps it held until `run` returns; process exit by any
+    // other route releases it with the file descriptions.
+    let _instance_locks = instance_locks;
     let cfg = opened.cfg;
     let shared = opened.shared;
     let store_dir = opened.store_dir;

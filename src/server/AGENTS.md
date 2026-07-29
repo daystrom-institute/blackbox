@@ -18,14 +18,25 @@
   can run, or the in-memory set purges the repo's files; alias
   materialization follows registry open and must tolerate per-repo failure
   (skip + warn — boot cannot fail closed the way registration does).
-- The FIRST thing `open_shared_state` does after loading config is claim the
-  root-scoped instance lock (`instance_lock.rs`, `<state_dir>/instance.lock`),
-  and `run` holds the guard for the process lifetime. Nothing that reads or
-  repairs shared state may move above it. The listener bind is NOT exclusivity
-  for this purpose: it happens after the corpus index opens, after
-  local-activation recovery, and after the coordinator-held pin clear, which
-  unlinks writer temporaries a live peer daemon may still be publishing
-  through. The offline `blackbox` CLI deliberately does not take this lock; it
-  cannot reach those paths and relies on the per-store locks instead.
+- `open_shared_state` takes the config `run` loaded plus the held
+  `InstanceLockSet` rather than reloading, so the claim and the store opens
+  cannot disagree about which roots this daemon owns. Nothing that reads or
+  repairs shared state may move above the claim; `run` holds the set for the
+  process lifetime.
+- The claim covers EVERY mutable root the config resolves, not just
+  `state_dir` (`instance_lock.rs::instance_lock_roots`): the transcript index
+  defaults to the XDG data dir, and `BRO_HOME`, the packet/artifact dirs, and
+  each JSON store carry independent overrides, so two daemons with distinct
+  state roots otherwise share a Tantivy index. Roots are canonicalized,
+  deduplicated, and reduced by containment; refusal names the contended root
+  and lists every claimed root. The state root keeps its lock inside itself
+  (`<state_dir>/instance.lock`); every other root uses a sibling
+  (`<root>.instance.lock`) because store directories reject foreign entries.
+  The listener bind is NOT exclusivity for this purpose: it happens after the
+  corpus index opens, after local-activation recovery, and after the
+  coordinator-held pin clear, which unlinks writer temporaries a live peer
+  daemon may still be publishing through. The offline `blackbox` CLI
+  deliberately does not take these locks; it cannot reach those paths and
+  relies on the per-store locks instead.
 - `run_blocking`'s per-call log line (`tool`, `elapsed_ms`, `bytes`) is the
   only built-in tool telemetry; keep it intact when wrapping handlers.

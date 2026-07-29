@@ -29,3 +29,8 @@ rust_analyzer_init_timeout_secs = 60
 [paths]
 # Use absolute path or ~/... (tilde will be expanded relative to $HOME)
 state_dir = "~/.local/state/blackbox-dev"
+# state_dir is not the whole story: the daemon claims an instance lock on every
+# mutable root it resolves, and the transcript index derives from the XDG data
+# dir rather than from state_dir. It has no config field, so the dev service
+# sets TRANSCRIPT_SEARCH_INDEX_PATH (see deploy/blackbox-dev.service). Without
+# it the dev instance shares the production index and refuses to start.

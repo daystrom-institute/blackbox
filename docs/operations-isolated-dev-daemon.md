@@ -62,14 +62,31 @@ The script sets `BLACKBOX_STATE_DIR`, isolated HOME/XDG directories, and the
 corpus paths below. The remaining store paths inherit the default resolution
 under the state root.
 
-One state root serves exactly one daemon. Before any store opens, `blackboxd`
-claims an advisory instance lock at `<state_dir>/instance.lock` and holds it
-for the process lifetime; a second daemon on the same root refuses to start
-with `error.daemon_instance_locked` rather than proceeding into shared-state
-recovery it is not entitled to run. This is precisely why the throwaway
-daemon must set `BLACKBOX_STATE_DIR` — with a distinct root it gets a distinct
-lock and coexists with the production daemon. The lock is released by process
-exit through any route, including a kill, so no stale-lock cleanup is needed.
+Every mutable root serves exactly one daemon. Before it migrates legacy
+state, opens a log file, or opens any store, `blackboxd` claims an advisory
+instance lock on each root its config resolves and holds them for the process
+lifetime. A second daemon reaching any of those roots refuses to start with
+`error.daemon_instance_locked`, naming the contended root, rather than
+proceeding into shared-state recovery it is not entitled to run. The locks are
+released by process exit through any route, including a kill, so no stale-lock
+cleanup is needed.
+
+The claim is per root, not per state root, because the roots move
+independently. `BLACKBOX_STATE_DIR` alone is NOT isolation: the transcript
+index defaults to the XDG data directory, so two daemons with distinct state
+roots share one Tantivy index (one writer lock, two reindex passes purging
+each other's documents) unless `TRANSCRIPT_SEARCH_INDEX_PATH` moves too. Give
+the throwaway daemon a distinct value for every override in the table above
+plus `TRANSCRIPT_SEARCH_INDEX_PATH`, or an isolated `HOME`/XDG environment
+that moves their defaults as a set — which is what the launcher below does.
+The lock file lives at `<state_dir>/instance.lock` for the state root and at
+`<root>.instance.lock` beside every other claimed root.
+
+Two paths are deliberately NOT claimed, because they follow the platform home
+/ state directory rather than config and macOS moves them only with `$HOME`:
+the rolling log directory and the vector store. A second daemon shares both
+unless it isolates `HOME` (and `XDG_STATE_HOME` on Linux), so the throwaway
+launcher below does exactly that.
 
 ### Skipping heavy startup work
 

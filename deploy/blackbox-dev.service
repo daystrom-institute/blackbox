@@ -8,6 +8,13 @@ ExecStart=%h/.local/bin/blackboxd-dev
 Restart=on-failure
 RestartSec=3
 Environment=BLACKBOX_CONFIG=%h/.config/blackbox-dev/config.toml
+# The transcript index is NOT below state_dir by default (it derives from the
+# XDG data dir), so without this the dev instance would share the production
+# Tantivy index and refuse to start against the running prod daemon.
+Environment=TRANSCRIPT_SEARCH_INDEX_PATH=%h/.local/share/blackbox-dev/index
+# Same reason for the vector store and the rolling log directory, which follow
+# the platform state dir rather than state_dir.
+Environment=XDG_STATE_HOME=%h/.local/state/blackbox-dev/xdg-state
 Environment=RUST_LOG=blackbox=info
 WorkingDirectory=%h
 StandardOutput=journal
