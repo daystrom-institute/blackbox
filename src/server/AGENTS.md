@@ -18,11 +18,12 @@
   can run, or the in-memory set purges the repo's files; alias
   materialization follows registry open and must tolerate per-repo failure
   (skip + warn — boot cannot fail closed the way registration does).
-- `open_shared_state` takes the config `run` loaded plus the held
-  `InstanceLockSet` rather than reloading, so the claim and the store opens
-  cannot disagree about which roots this daemon owns. Nothing that reads or
-  repairs shared state may move above the claim; `run` holds the set for the
-  process lifetime.
+- `run` owns the startup order: load config ONCE, claim the instance-lock set,
+  migrate legacy defaults, initialize file logging, then `open_shared_state`.
+  Nothing that reads, repairs, moves, or creates durable state may move above
+  the claim, and `open_shared_state` takes the loaded config plus the held
+  `InstanceLockSet` rather than reloading (a reload could resolve roots the
+  claim does not cover). `run` holds the set for the process lifetime.
 - The claim covers EVERY mutable root the config resolves, not just
   `state_dir` (`instance_lock.rs::instance_lock_roots`): the transcript index
   defaults to the XDG data dir, and `BRO_HOME`, the packet/artifact dirs, and
