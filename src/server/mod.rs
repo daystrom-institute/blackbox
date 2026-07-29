@@ -5,6 +5,7 @@ pub(crate) mod code_source;
 pub mod dispatch;
 mod gap_view;
 pub mod handler;
+pub mod instance_lock;
 mod knowledge_lifecycle;
 mod knowledge_merge_gate;
 mod knowledge_view;

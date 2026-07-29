@@ -62,6 +62,15 @@ The script sets `BLACKBOX_STATE_DIR`, isolated HOME/XDG directories, and the
 corpus paths below. The remaining store paths inherit the default resolution
 under the state root.
 
+One state root serves exactly one daemon. Before any store opens, `blackboxd`
+claims an advisory instance lock at `<state_dir>/instance.lock` and holds it
+for the process lifetime; a second daemon on the same root refuses to start
+with `error.daemon_instance_locked` rather than proceeding into shared-state
+recovery it is not entitled to run. This is precisely why the throwaway
+daemon must set `BLACKBOX_STATE_DIR` — with a distinct root it gets a distinct
+lock and coexists with the production daemon. The lock is released by process
+exit through any route, including a kill, so no stale-lock cleanup is needed.
+
 ### Skipping heavy startup work
 
 | Env var | Default | Dev value | Effect |

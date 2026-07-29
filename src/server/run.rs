@@ -12,6 +12,10 @@ pub async fn run() -> anyhow::Result<()> {
     init_logging(&home, migrated);
 
     let opened = open_shared_state(&home)?;
+    // R31F1: the state root's single-writer claim outlives every store opened
+    // under it. Binding it here keeps it held until `run` returns; process
+    // exit by any other route releases it with the file description.
+    let _instance_lock = opened.instance_lock;
     let cfg = opened.cfg;
     let shared = opened.shared;
     let store_dir = opened.store_dir;

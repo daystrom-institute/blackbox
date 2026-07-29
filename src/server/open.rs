@@ -30,6 +30,10 @@ pub(super) struct OpenedServer {
     pub(super) store_dir: PathBuf,
     pub(super) bind_host: String,
     pub(super) bind_is_loopback: bool,
+    /// R31F1: the state root's single-writer claim. Held for the process
+    /// lifetime by the caller, so a duplicate daemon refuses at the lock
+    /// rather than at the listener, which is far too late.
+    pub(super) instance_lock: super::instance_lock::InstanceLockGuard,
 }
 
 fn sync_project_aliases_at_startup(
@@ -148,6 +152,15 @@ fn backfill_project_languages(
 
 pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     let cfg = config::load()?;
+    // R31F1: claim the state root BEFORE anything below it is opened, read,
+    // or repaired. The listener bind is the only other exclusivity this
+    // process has and it happens much later, after the corpus index opens,
+    // after local-activation recovery, and after the coordinator-held pin
+    // clear that unlinks every writer temporary it walks past. A duplicate or
+    // leaked daemon that got that far reclaimed a LIVE peer's in-flight
+    // publication and failed the peer's reindex with an ENOENT. Refusing here
+    // means a second daemon on this root has mutated nothing.
+    let instance_lock = super::instance_lock::acquire_instance_lock(&cfg.paths.state_dir)?;
     // Push the config-resolved git-notes namespace into the corpus-core
     // foundation crate (dependency inversion: corpus-core must not reach up into
     // blackbox::config). Absent this, git::notes_namespace falls back to the
@@ -727,6 +740,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         store_dir,
         bind_host,
         bind_is_loopback,
+        instance_lock,
     })
 }
 

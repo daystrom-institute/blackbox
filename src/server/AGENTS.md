@@ -18,5 +18,14 @@
   can run, or the in-memory set purges the repo's files; alias
   materialization follows registry open and must tolerate per-repo failure
   (skip + warn — boot cannot fail closed the way registration does).
+- The FIRST thing `open_shared_state` does after loading config is claim the
+  root-scoped instance lock (`instance_lock.rs`, `<state_dir>/instance.lock`),
+  and `run` holds the guard for the process lifetime. Nothing that reads or
+  repairs shared state may move above it. The listener bind is NOT exclusivity
+  for this purpose: it happens after the corpus index opens, after
+  local-activation recovery, and after the coordinator-held pin clear, which
+  unlinks writer temporaries a live peer daemon may still be publishing
+  through. The offline `blackbox` CLI deliberately does not take this lock; it
+  cannot reach those paths and relies on the per-store locks instead.
 - `run_blocking`'s per-call log line (`tool`, `elapsed_ms`, `bytes`) is the
   only built-in tool telemetry; keep it intact when wrapping handlers.

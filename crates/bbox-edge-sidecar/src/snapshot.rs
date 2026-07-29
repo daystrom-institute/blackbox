@@ -1037,9 +1037,19 @@ fn legacy_pending_local_activations_path(edges_dir: &Path) -> PathBuf {
     crate::manifest::materialized_dir(edges_dir).join(PENDING_LOCAL_ACTIVATIONS_FILENAME)
 }
 
+/// The v2 pin directory for `edges_dir`.
+///
+/// Public so callers outside this crate can name the directory the
+/// coordinator-held reclamation walks without re-spelling the layout. The
+/// unix write paths still reach it through no-follow directory descriptors
+/// rather than this path.
+pub fn pending_local_activation_pins_dir(edges_dir: &Path) -> PathBuf {
+    crate::manifest::materialized_dir(edges_dir).join(PENDING_LOCAL_ACTIVATION_PINS_DIRNAME)
+}
+
 #[cfg(not(unix))]
 fn pending_local_activation_pins_path(edges_dir: &Path) -> PathBuf {
-    crate::manifest::materialized_dir(edges_dir).join(PENDING_LOCAL_ACTIVATION_PINS_DIRNAME)
+    pending_local_activation_pins_dir(edges_dir)
 }
 
 /// R27F4: the GC pin journal is authority, so its payload is bounded the same
