@@ -1078,61 +1078,74 @@ fn pending_local_activation_pin_leaf(project_id: &str) -> Result<String> {
 /// publication path also mints `.<leaf>.<pid>.<sequence>.tmp` siblings, which
 /// a crash between create and `renameat` leaves behind. Those temporaries are
 /// residue, not pins, so they must never consume a pin's budget.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum PendingLocalActivationPinEntry<'a> {
     Pin(&'a str),
-    WriterTemporary { pid: u32 },
+    WriterTemporary,
 }
 
-/// Whether the caller may reclaim residue minted by THIS process.
+/// Whether an enumeration may reclaim the writer temporaries it walks past.
+///
+/// R30F1: the pin coordinator is a process-local mutex, so nothing an
+/// enumeration observes proves anything about OTHER processes. A temporary
+/// carrying a foreign pid is indistinguishable from the in-flight publication
+/// of a live peer daemon, and unlinking one makes that peer's `renameat` fail
+/// with `ENOENT`. That is reachable without any tampering: a leaked or
+/// duplicate daemon runs this enumeration while opening shared state, before
+/// it ever binds a listener and discovers it is the second one.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PinTemporaryReclaim {
     /// The caller holds the manifest coordinator, which is the only lock a
-    /// pin write takes, so no publication in this process can be in flight:
-    /// every temporary present is crash residue and is reclaimed.
+    /// pin write takes, so no publication in this process can be in flight
+    /// and every temporary present is residue this process is entitled to
+    /// reclaim. Every boot's first pin set write or clear runs here, so crash
+    /// residue still goes away.
     CoordinatorHeld,
-    /// An unlocked read path. A temporary carrying this process's pid may
-    /// belong to a publication running right now, so it is left alone and the
-    /// next coordinator-held write or clear reclaims it. Foreign residue is
-    /// reclaimed here, because the process that minted it is by definition
-    /// not this one.
-    Concurrent,
+    /// An unlocked read path. Enumeration here is strictly NON-MUTATING: it
+    /// classifies temporaries so they never consume a pin's budget and leaves
+    /// every one of them on disk, whoever minted it. A residue-laden
+    /// directory therefore still loads, because classification precedes
+    /// budgeting, and the next coordinator-held write or clear reclaims.
+    ReadOnly,
 }
 
-/// The `pid` embedded in an atomic-writer temporary leaf, or `None` when the
-/// name is not one. Both publication paths mint
-/// `.<project id>.json.<pid>.<sequence>.tmp`.
-fn pending_local_activation_pin_temporary_pid(dotless: &str) -> Option<u32> {
-    let body = dotless.strip_suffix(".tmp")?;
-    let (head, sequence) = body.rsplit_once('.')?;
-    sequence.parse::<u64>().ok()?;
-    let (leaf, pid) = head.rsplit_once('.')?;
-    let pid = pid.parse::<u32>().ok()?;
-    leaf.strip_suffix(".json")?;
-    Some(pid)
+/// Whether `dotless` (a pin directory name with its leading dot stripped) is
+/// an atomic-writer temporary. Both publication paths mint
+/// `.<project id>.json.<pid>.<sequence>.tmp`, and every segment of that shape
+/// is validated: an entry in this directory that is neither a pin leaf nor
+/// exactly this shape is a typed refusal rather than a silent skip.
+fn is_pending_local_activation_pin_temporary(dotless: &str) -> bool {
+    let Some(body) = dotless.strip_suffix(".tmp") else {
+        return false;
+    };
+    let Some((head, sequence)) = body.rsplit_once('.') else {
+        return false;
+    };
+    if sequence.parse::<u64>().is_err() {
+        return false;
+    }
+    let Some((leaf, pid)) = head.rsplit_once('.') else {
+        return false;
+    };
+    if pid.parse::<u32>().is_err() {
+        return false;
+    }
+    leaf.ends_with(".json")
 }
 
 fn classify_pending_local_activation_pin_entry(
     name: &str,
 ) -> Result<PendingLocalActivationPinEntry<'_>> {
     if let Some(dotless) = name.strip_prefix('.') {
-        let Some(pid) = pending_local_activation_pin_temporary_pid(dotless) else {
+        if !is_pending_local_activation_pin_temporary(dotless) {
             anyhow::bail!("local activation pin directory holds an unrecognized entry");
-        };
-        return Ok(PendingLocalActivationPinEntry::WriterTemporary { pid });
+        }
+        return Ok(PendingLocalActivationPinEntry::WriterTemporary);
     }
     let Some(project_id) = name.strip_suffix(".json") else {
         anyhow::bail!("local activation pin directory holds an unrecognized entry");
     };
     Ok(PendingLocalActivationPinEntry::Pin(project_id))
-}
-
-/// Reclaim is best effort by construction: a temporary that cannot be
-/// unlinked (a read-only mount, a lost race with another reclaimer) still
-/// does not count against the pin budget, so the enumeration it would
-/// otherwise have broken still succeeds.
-fn should_reclaim_pin_temporary(reclaim: PinTemporaryReclaim, pid: u32) -> bool {
-    reclaim == PinTemporaryReclaim::CoordinatorHeld || pid != std::process::id()
 }
 
 /// R29F1: enumerate the pin directory under the PIN bound rather than the raw
@@ -1145,8 +1158,14 @@ fn should_reclaim_pin_temporary(reclaim: PinTemporaryReclaim, pid: u32) -> bool 
 /// every pin read failed before it could recognize the temporary as residue,
 /// and `clear` skipped temporaries instead of reclaiming them, so nothing in
 /// the system ever removed it. This enumerator classifies first: residue is
-/// reclaimed and never budgeted, and only legitimate pins are counted against
-/// `limit`.
+/// never budgeted, and only legitimate pins are counted against `limit`.
+///
+/// R30F1: unlinking is reserved for `PinTemporaryReclaim::CoordinatorHeld`. An
+/// unlocked read is strictly non-mutating, because the coordinator is
+/// process-local and a foreign pid says nothing about whether that writer is
+/// still alive. Reclaim stays best effort where it does run: a temporary that
+/// cannot be unlinked still does not count against the pin budget, so the
+/// enumeration it would otherwise have broken still succeeds.
 ///
 /// Returns project ids sorted, so no caller depends on enumeration order.
 #[cfg(unix)]
@@ -1164,7 +1183,7 @@ fn enumerate_pending_local_activation_pin_dir(
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("local activation pin name is not UTF-8"))?;
         match classify_pending_local_activation_pin_entry(name)? {
-            PendingLocalActivationPinEntry::WriterTemporary { pid } => {
+            PendingLocalActivationPinEntry::WriterTemporary => {
                 // Residue is bounded too, by the same cardinality: one
                 // in-flight publication per project is the writer's worst
                 // case, so more than that is not a directory this reader
@@ -1176,7 +1195,7 @@ fn enumerate_pending_local_activation_pin_dir(
                          the project catalog entry bound"
                     );
                 }
-                if should_reclaim_pin_temporary(reclaim, pid) {
+                if reclaim == PinTemporaryReclaim::CoordinatorHeld {
                     let leaf = std::ffi::CString::new(name.as_bytes())?;
                     unsafe { libc::unlinkat(directory.as_raw_fd(), leaf.as_ptr(), 0) };
                 }
@@ -1219,7 +1238,7 @@ fn enumerate_pending_local_activation_pin_dir(
             .into_string()
             .map_err(|_| anyhow::anyhow!("local activation pin name is not UTF-8"))?;
         match classify_pending_local_activation_pin_entry(&name)? {
-            PendingLocalActivationPinEntry::WriterTemporary { pid } => {
+            PendingLocalActivationPinEntry::WriterTemporary => {
                 temporaries += 1;
                 if temporaries > limit {
                     anyhow::bail!(
@@ -1227,7 +1246,7 @@ fn enumerate_pending_local_activation_pin_dir(
                          the project catalog entry bound"
                     );
                 }
-                if should_reclaim_pin_temporary(reclaim, pid) {
+                if reclaim == PinTemporaryReclaim::CoordinatorHeld {
                     let _ = fs::remove_file(directory.join(&name));
                 }
             }
@@ -1636,11 +1655,14 @@ fn read_pending_local_activation_pins_dir(
         Err(error) if is_not_found(&error) => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    // R29F1: the writer's crash-left temporaries are reclaimed here and never
-    // counted, so the declared pin cardinality is what this bound admits.
+    // R29F1: the writer's crash-left temporaries are classified out of the
+    // budget here, so the declared pin cardinality is what this bound admits.
+    // R30F1: they are not touched. This read runs with no lock at all, and on
+    // a path a second daemon reaches while opening shared state, so it must
+    // not unlink what a live peer may be publishing.
     let projects = enumerate_pending_local_activation_pin_dir(
         &directory,
-        PinTemporaryReclaim::Concurrent,
+        PinTemporaryReclaim::ReadOnly,
         MAX_PENDING_LOCAL_ACTIVATION_PINS,
     )?;
     let mut pins = Vec::new();
@@ -1671,7 +1693,7 @@ fn read_pending_local_activation_pins_dir(
     let directory = pending_local_activation_pins_path(edges_dir);
     let projects = enumerate_pending_local_activation_pin_dir(
         &directory,
-        PinTemporaryReclaim::Concurrent,
+        PinTemporaryReclaim::ReadOnly,
         MAX_PENDING_LOCAL_ACTIVATION_PINS,
     )?;
     let mut pins = Vec::new();
@@ -1797,10 +1819,15 @@ fn write_nonunix_pending_local_activation_pin(
 }
 
 /// The projects that currently hold a pin. R29F1: every caller of this holds
-/// the manifest coordinator, so a writer temporary present here is crash
-/// residue and is reclaimed rather than skipped. `clear` is built on this, so
-/// clearing the pin set now actually empties the directory instead of leaving
-/// residue that later reads must pay for.
+/// the manifest coordinator, so a writer temporary present here is residue no
+/// publication in this process can still be using, and it is reclaimed rather
+/// than skipped. `clear` is built on this, so clearing the pin set now
+/// actually empties the directory instead of leaving residue that later reads
+/// must pay for.
+///
+/// R30F1: this is the ONLY place reclamation happens. The unlocked read path
+/// enumerates without mutating, so residue survives until a pin set write or
+/// a clear runs here, which every boot does before it can publish a set.
 #[cfg(unix)]
 fn pending_local_activation_pin_projects(edges_dir: &Path) -> Result<Vec<String>> {
     let directory = match open_dir_under_root(
@@ -10423,9 +10450,10 @@ mod tests {
             publish(project_id);
         }
 
-        // Residue in both flavours: one left by a process that is gone, and
-        // one carrying this process's pid, which an unlocked reader cannot
-        // distinguish from a publication in flight.
+        // Residue in both flavours: one carrying a foreign pid and one
+        // carrying this process's pid. R30F1: an unlocked reader can prove
+        // nothing about EITHER, since the pin coordinator is process-local,
+        // so it must leave both alone.
         let foreign = pins_dir.join(format!(
             ".p{:03}.json.{}.0.tmp",
             SCALED_LIMIT,
@@ -10452,7 +10480,7 @@ mod tests {
 
         let projects = enumerate_pending_local_activation_pin_dir(
             &pin_dir_fd(),
-            PinTemporaryReclaim::Concurrent,
+            PinTemporaryReclaim::ReadOnly,
             SCALED_LIMIT,
         )
         .unwrap();
@@ -10461,12 +10489,8 @@ mod tests {
             "residue must not consume a legitimate pin's budget, and the set is sorted"
         );
         assert!(
-            !foreign.exists(),
-            "residue from a process that is gone is reclaimed"
-        );
-        assert!(
-            ours.exists(),
-            "an unlocked reader must not unlink a temporary this process may be writing"
+            foreign.exists() && ours.exists(),
+            "an unlocked reader is strictly non-mutating, whoever minted the temporary"
         );
 
         // The whole public read path agrees, at exactly the limit.
@@ -10479,8 +10503,10 @@ mod tests {
             expected
         );
 
-        // A coordinator-held enumeration owns the directory outright, so it
-        // reclaims what the unlocked read had to leave alone.
+        // A coordinator-held enumeration is the reclaiming one, and it takes
+        // both flavours: the coordinator proves this process has no
+        // publication in flight, which is the only exclusivity the pin
+        // representation has.
         let projects = enumerate_pending_local_activation_pin_dir(
             &pin_dir_fd(),
             PinTemporaryReclaim::CoordinatorHeld,
@@ -10488,7 +10514,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(projects, expected);
-        assert!(!ours.exists(), "coordinator-held reclamation is complete");
+        assert!(
+            !foreign.exists() && !ours.exists(),
+            "coordinator-held reclamation is complete"
+        );
 
         // The bound still applies to pins: the first genuinely excess one is
         // refused, temporaries or not.
@@ -10496,7 +10525,7 @@ mod tests {
         fs::write(&ours, b"{}").unwrap();
         let error = enumerate_pending_local_activation_pin_dir(
             &pin_dir_fd(),
-            PinTemporaryReclaim::Concurrent,
+            PinTemporaryReclaim::ReadOnly,
             SCALED_LIMIT,
         )
         .unwrap_err();
@@ -10536,12 +10565,141 @@ mod tests {
         }
         assert!(matches!(
             classify_pending_local_activation_pin_entry(".p1.json.4321.7.tmp").unwrap(),
-            PendingLocalActivationPinEntry::WriterTemporary { pid: 4321 }
+            PendingLocalActivationPinEntry::WriterTemporary
         ));
         assert!(matches!(
             classify_pending_local_activation_pin_entry("p1.json").unwrap(),
             PendingLocalActivationPinEntry::Pin("p1")
         ));
+    }
+
+    /// R30F1: an unlocked pin read must never unlink another process's
+    /// in-flight publication.
+    ///
+    /// The pin coordinator is a process-local mutex, so a reader that holds
+    /// nothing can prove nothing about a foreign pid: that temporary is just
+    /// as likely to be a live peer's publication between `create` and
+    /// `renameat` as it is to be crash residue. Reaching the bad case needs no
+    /// tampering, only a second daemon, which runs this exact read while
+    /// opening shared state and long before it binds a listener and discovers
+    /// it is the duplicate. Unlinking there makes the live daemon's rename
+    /// fail with `ENOENT` and its reindex fail with it.
+    ///
+    /// So the read path is strictly non-mutating, and reclamation waits for a
+    /// coordinator-held write or clear. This walks the whole sequence from the
+    /// peer's point of view: publish, read from "process B", complete the
+    /// publication, then reclaim under the coordinator.
+    #[cfg(unix)]
+    #[test]
+    fn r30_unlocked_pin_read_leaves_a_foreign_publication_in_flight() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let pins_dir = crate::manifest::materialized_dir(&edges_dir)
+            .join(PENDING_LOCAL_ACTIVATION_PINS_DIRNAME);
+        fs::create_dir_all(&pins_dir).unwrap();
+
+        let foreign_pid = std::process::id().wrapping_add(1);
+        let peer_activation = pin_test_activation("p_peer", "snapshot-peer");
+        let peer_bytes = encode_pending_local_activation_pin(&new_pending_local_activation_pin(
+            &peer_activation,
+        ))
+        .unwrap();
+
+        // One legitimate pin, published the way the writer publishes.
+        let settled = pin_test_activation("p_settled", "snapshot-a");
+        write_pending_local_activation_pins(&edges_dir, std::slice::from_ref(&settled)).unwrap();
+
+        // A live peer process is mid-publication: its O_EXCL temporary exists
+        // and its renameat has not run yet.
+        let in_flight = pins_dir.join(format!(".p_peer.json.{foreign_pid}.0.tmp"));
+        fs::write(&in_flight, &peer_bytes).unwrap();
+
+        // Residue from an earlier boot sits beside it, also foreign, and also
+        // indistinguishable from the above to an unlocked reader.
+        let residue = (1..=4)
+            .map(|index| {
+                let path = pins_dir.join(format!(".p_old{index}.json.{foreign_pid}.{index}.tmp"));
+                fs::write(&path, b"{}").unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+
+        // Process B's read. It succeeds, it sees exactly the settled pin, and
+        // it leaves every temporary on disk.
+        let loaded = load_pending_local_activation_pins(&edges_dir).unwrap();
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|pin| pin.activation.project_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p_settled"],
+            "an in-flight temporary is not a pin"
+        );
+        assert!(
+            in_flight.exists(),
+            "the unlocked read unlinked a live peer's in-flight publication"
+        );
+        assert!(
+            residue.iter().all(|path| path.exists()),
+            "the unlocked read is non-mutating even for residue it believes is dead"
+        );
+
+        // R29F1 still holds with nothing reclaimed: classification runs before
+        // budgeting, so the two populations are budgeted apart and a
+        // residue-laden directory still loads. Six raw entries pass a bound of
+        // five, because only one of them is a pin.
+        let pin_dir_fd = || {
+            open_dir_under_root(
+                &edges_dir,
+                Path::new("materialized")
+                    .join(PENDING_LOCAL_ACTIVATION_PINS_DIRNAME)
+                    .as_path(),
+                false,
+            )
+            .unwrap()
+        };
+        assert_eq!(fs::read_dir(&pins_dir).unwrap().count(), 6);
+        assert_eq!(
+            enumerate_pending_local_activation_pin_dir(
+                &pin_dir_fd(),
+                PinTemporaryReclaim::ReadOnly,
+                5,
+            )
+            .unwrap(),
+            vec!["p_settled".to_string()],
+            "unreclaimed temporaries must not consume a pin's budget"
+        );
+
+        // The peer's publication completes. This is the syscall the deleted
+        // temporary used to break.
+        fs::rename(&in_flight, pins_dir.join("p_peer.json")).unwrap();
+        let loaded = load_pending_local_activation_pins(&edges_dir).unwrap();
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|pin| pin.activation.project_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p_peer", "p_settled"],
+            "the completed publication is visible, and the set stays sorted"
+        );
+
+        // A coordinator-held write is where reclamation happens, and it takes
+        // the residue the readers left alone.
+        write_pending_local_activation_pins(&edges_dir, &[settled, peer_activation]).unwrap();
+        assert!(
+            residue.iter().all(|path| !path.exists()),
+            "a coordinator-held write reclaims what the read path could not"
+        );
+        let mut remaining = fs::read_dir(&pins_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            vec!["p_peer.json".to_string(), "p_settled.json".to_string()],
+            "the reclaimed directory holds pins and nothing else"
+        );
     }
 
     /// R28F2: the retired v1 document migrates to per-project pins on the
