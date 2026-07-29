@@ -34,6 +34,11 @@ const SNAPSHOT_MIN_RECORDS: usize = 100_000;
 
 static GLOBAL_STORE: OnceLock<Arc<VectorStore>> = OnceLock::new();
 
+/// The resolved vector-store root, installed once at startup by the daemon
+/// (see [`install_global_root`]). Empty until then, which is why
+/// [`default_vectors_dir`] still exists.
+static GLOBAL_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
 // Test-global-store plumbing — gated on `test` (this crate's own tests) OR the
 // `test-support` feature (downstream crates' tests, since cfg(test) doesn't cross
 // crate boundaries). The read-path checks in global()/try_global()/etc. below use
@@ -167,6 +172,34 @@ fn spawn_periodic_compactor(store: Arc<VectorStore>) {
         .expect("failed to spawn vector compaction thread");
 }
 
+/// Install the resolved vector-store root, once, before anything opens the
+/// global store.
+///
+/// R33F1: the runtime used to open the global store straight from
+/// [`default_vectors_dir`] while the migration inventory and the retirement
+/// discharge derived their own root from the configured state directory. With
+/// any non-default state directory those two are different directories, so
+/// retirement inventoried an empty store, discharged nothing, and passed its
+/// final proof with the live owner rows still in place. The daemon now
+/// resolves ONE vector root through its config and installs it here, so every
+/// consumer of [`global`] reads and writes the store the migration inventory
+/// captures.
+///
+/// Returns `false` when a root was already installed (the first one wins and
+/// stays authoritative, since a store may already be open on it).
+pub fn install_global_root(root: PathBuf) -> bool {
+    GLOBAL_ROOT.set(root).is_ok()
+}
+
+/// The vector-store root the global store opens at: the installed resolved
+/// root, or the platform default for a consumer that never installed one.
+pub fn global_root() -> PathBuf {
+    GLOBAL_ROOT
+        .get()
+        .cloned()
+        .unwrap_or_else(default_vectors_dir)
+}
+
 pub fn global() -> Arc<VectorStore> {
     #[cfg(any(test, feature = "test-support"))]
     if let Some(store) = test_global_store().read().clone() {
@@ -176,7 +209,7 @@ pub fn global() -> Arc<VectorStore> {
     GLOBAL_STORE
         .get_or_init(|| {
             let store = Arc::new(
-                VectorStore::open(default_vectors_dir()).expect("default vector store should open"),
+                VectorStore::open(global_root()).expect("default vector store should open"),
             );
             spawn_periodic_flusher(store.clone());
             spawn_periodic_compactor(store.clone());
@@ -315,6 +348,13 @@ pub fn self_recall_probe(route: &str, sample_every: usize, k: usize) -> Result<O
     store.self_recall_probe(route, sample_every, k)
 }
 
+/// The platform default vector-store root.
+///
+/// This is the DEFAULT-VALUE PROVIDER only: it feeds the daemon's config path
+/// resolution (`paths.vectors_path`) and nothing else should call it. Every
+/// consumer reads the resolved value instead, so the runtime store, the
+/// migration inventory, and the retirement discharge cannot disagree about
+/// which directory holds the rows (R33F1).
 pub fn default_vectors_dir() -> PathBuf {
     dirs::state_dir()
         .unwrap_or_else(|| {

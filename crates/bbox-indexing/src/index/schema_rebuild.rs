@@ -43,6 +43,7 @@ use crate::index::history_materializer::{
     HistoryMaterializerRequestV1, materialize_history_generations, prepare_rebuild_manifest,
 };
 use crate::project_catalog_store::ProjectCatalogStore;
+use std::path::PathBuf;
 
 /// Label bound into the prepared manifest as the planned lexical view: the
 /// schema the replacement targets.
@@ -65,9 +66,16 @@ fn planned_vector_label() -> String {
 /// rebuild manifest. Any refusal (missing generation, corrupt manifest,
 /// commitment mismatch) propagates out of the guard, which aborts the reset
 /// with the outgoing index and its lexical and vector views untouched.
+///
+/// `vector_root` is the caller's RESOLVED vector-store root
+/// (`paths.vectors_path`), not a path derived here: the materializer's
+/// equality proof recomputes a fingerprint over that store, and deriving it
+/// from the state directory made it a different store from the one the
+/// runtime writes whenever the state root is not the platform one (R33F1).
 pub fn catalog_schema_replacement_guard(
     store: Arc<ProjectCatalogStore>,
     scan_limits: HistoryScanLimitsV1,
+    vector_root: PathBuf,
 ) -> SchemaReplacementGuard {
     Arc::new(move |request: &SchemaReplacementRequest<'_>| {
         let scan = scan_commit_documents(request.index_path, scan_limits)
@@ -77,6 +85,7 @@ pub fn catalog_schema_replacement_guard(
             &HistoryMaterializerRequestV1 {
                 index_path: request.index_path.to_path_buf(),
                 projects_path: request.projects_path.to_path_buf(),
+                vector_root: vector_root.clone(),
                 scan_limits,
             },
         )

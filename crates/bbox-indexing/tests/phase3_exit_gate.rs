@@ -269,7 +269,15 @@ fn config(root: &Path) -> Config {
     let config_path = root.join("config.toml");
     write(
         &config_path,
-        format!("[paths]\nstate_dir = {:?}\n", root.join("protected")).as_bytes(),
+        // `vectors_dir` is explicit: the vector root defaults to the PLATFORM
+        // state directory (R33F1), and a fixture that omitted it would inventory
+        // the host's real vector store.
+        format!(
+            "[paths]\nstate_dir = {:?}\nvectors_dir = {:?}\n",
+            root.join("protected"),
+            root.join("protected").join("vectors")
+        )
+        .as_bytes(),
     );
     config::load_with(LoadOptions {
         config_path: Some(config_path),
@@ -1163,6 +1171,7 @@ fn the_forced_replacement_rematerializes_every_bucket_of_the_fixture() {
     let guard = catalog_schema_replacement_guard(
         Arc::new(ProjectCatalogStore::open_existing(&projects_path).unwrap()),
         HistoryScanLimitsV1::default(),
+        projects_path.parent().unwrap().join("vectors"),
     );
     guard(&replacement_request(&index_path, &projects_path)).expect("the catalog guard authorizes");
 
@@ -1368,6 +1377,7 @@ fn every_refusal_arm_preserves_the_last_good_views_of_the_whole_fixture() {
     let guard = catalog_schema_replacement_guard(
         Arc::new(ProjectCatalogStore::open_existing(&projects_path).unwrap()),
         HistoryScanLimitsV1::default(),
+        projects_path.parent().unwrap().join("vectors"),
     );
     let error = guard(&replacement_request(&index_path, &projects_path))
         .err()
@@ -1541,6 +1551,7 @@ fn no_document_or_vector_input_in_the_fixture_carries_a_host_path() {
         &HistoryMaterializerRequestV1 {
             index_path: fixture.index_path(),
             projects_path: fixture.projects_path(),
+            vector_root: fixture.projects_path().parent().unwrap().join("vectors"),
             scan_limits: HistoryScanLimitsV1::default(),
         },
     )
@@ -1639,6 +1650,7 @@ fn the_durable_overlay_map_roots_its_generation_and_clears_on_a_new_activation()
         &HistoryMaterializerRequestV1 {
             index_path: fixture.index_path(),
             projects_path: fixture.projects_path(),
+            vector_root: fixture.projects_path().parent().unwrap().join("vectors"),
             scan_limits: HistoryScanLimitsV1::default(),
         },
     )

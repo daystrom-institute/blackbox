@@ -305,6 +305,7 @@ fn the_catalog_guard_prepares_a_manifest_and_reemission_preserves_every_commit()
     let guard = catalog_schema_replacement_guard(
         Arc::new(ProjectCatalogStore::open_existing(&fixture.projects_path).unwrap()),
         HistoryScanLimitsV1::default(),
+        fixture.projects_path.parent().unwrap().join("vectors"),
     );
     let authorization = guard(&request(&fixture)).expect("the guard authorizes");
     assert!(
@@ -437,6 +438,7 @@ fn reemission_touches_only_commit_documents() {
     let guard = catalog_schema_replacement_guard(
         Arc::new(ProjectCatalogStore::open_existing(&fixture.projects_path).unwrap()),
         HistoryScanLimitsV1::default(),
+        fixture.projects_path.parent().unwrap().join("vectors"),
     );
     guard(&request(&fixture)).unwrap();
 
@@ -514,6 +516,7 @@ fn refusal_commitment_mismatch_keeps_the_old_index_readable() {
     let guard = catalog_schema_replacement_guard(
         Arc::new(ProjectCatalogStore::open_existing(&fixture.projects_path).unwrap()),
         HistoryScanLimitsV1::default(),
+        fixture.projects_path.parent().unwrap().join("vectors"),
     );
     let error = guard(&request(&fixture)).err().expect("the guard refuses");
     assert!(
@@ -557,6 +560,7 @@ fn refusal_missing_generation_keeps_the_old_index_readable() {
     let guard = catalog_schema_replacement_guard(
         Arc::new(ProjectCatalogStore::open_existing(&fixture.projects_path).unwrap()),
         HistoryScanLimitsV1::default(),
+        fixture.projects_path.parent().unwrap().join("vectors"),
     );
     guard(&request(&fixture)).unwrap();
 
@@ -841,6 +845,7 @@ fn a_collected_project_survives_the_guarded_replacement_and_stays_searchable() {
     catalog_schema_replacement_guard(
         Arc::new(ProjectCatalogStore::open_existing(&fixture.projects_path).unwrap()),
         HistoryScanLimitsV1::default(),
+        fixture.projects_path.parent().unwrap().join("vectors"),
     )(&request(&fixture))
     .expect("the catalog guard authorizes");
 
@@ -976,6 +981,7 @@ fn a_pre_marker_index_carries_its_commit_documents_through_both_guards() {
     let authorization = catalog_schema_replacement_guard(
         Arc::new(ProjectCatalogStore::open_existing(&fixture.projects_path).unwrap()),
         HistoryScanLimitsV1::default(),
+        fixture.projects_path.parent().unwrap().join("vectors"),
     )(&pre_marker_request)
     .expect("a pre-marker index must be authorized, not refused");
     assert!(
@@ -1137,6 +1143,7 @@ fn an_empty_pre_marker_directory_authorizes_with_nothing_carried() {
     let catalog = catalog_schema_replacement_guard(
         Arc::new(ProjectCatalogStore::open_existing(&projects_path).unwrap()),
         HistoryScanLimitsV1::default(),
+        projects_path.parent().unwrap().join("vectors"),
     )(&request)
     .expect("an empty pre-marker directory authorizes");
     assert!(
@@ -1211,6 +1218,7 @@ fn an_index_with_no_history_still_authorizes_both_guards() {
     catalog_schema_replacement_guard(
         Arc::new(ProjectCatalogStore::open_existing(&projects_path).unwrap()),
         HistoryScanLimitsV1::default(),
+        projects_path.parent().unwrap().join("vectors"),
     )(&request)
     .expect("a no-history catalog open authorizes");
     drop(store);

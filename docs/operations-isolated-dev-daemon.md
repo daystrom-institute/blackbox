@@ -57,6 +57,7 @@ cannot resolve auxiliary state outside the throwaway root:
 | `BLACKBOX_PACKETS_DIR` | `<state_dir>/packets` | Compiled rule packets |
 | `BLACKBOX_ARTIFACTS_DIR` | `<state_dir>/artifacts` | Artifact catalog |
 | `BRO_HOME` | `<state_dir>/bro` | Bro orchestration state |
+| `BLACKBOX_VECTORS_PATH` | platform state dir `blackbox/vectors` (NOT below `state_dir`) | Vector store |
 
 The script sets `BLACKBOX_STATE_DIR`, isolated HOME/XDG directories, and the
 corpus paths below. The remaining store paths inherit the default resolution
@@ -75,18 +76,22 @@ The claim is per root, not per state root, because the roots move
 independently. `BLACKBOX_STATE_DIR` alone is NOT isolation: the transcript
 index defaults to the XDG data directory, so two daemons with distinct state
 roots share one Tantivy index (one writer lock, two reindex passes purging
-each other's documents) unless `TRANSCRIPT_SEARCH_INDEX_PATH` moves too. Give
-the throwaway daemon a distinct value for every override in the table above
-plus `TRANSCRIPT_SEARCH_INDEX_PATH`, or an isolated `HOME`/XDG environment
+each other's documents) unless `TRANSCRIPT_SEARCH_INDEX_PATH` moves too. The
+vector store has the same property: it defaults to the platform state
+directory, so `BLACKBOX_VECTORS_PATH` (or `[paths].vectors_dir`) has to move
+with it. Give the throwaway daemon a distinct value for every override in the
+table above plus `TRANSCRIPT_SEARCH_INDEX_PATH`, or an isolated `HOME`/XDG environment
 that moves their defaults as a set — which is what the launcher below does.
 The lock file lives at `<state_dir>/instance.lock` for the state root and at
 `<root>.instance.lock` beside every other claimed root.
 
-Two paths are deliberately NOT claimed, because they follow the platform home
-/ state directory rather than config and macOS moves them only with `$HOME`:
-the rolling log directory and the vector store. A second daemon shares both
-unless it isolates `HOME` (and `XDG_STATE_HOME` on Linux), so the throwaway
-launcher below does exactly that.
+One path is deliberately NOT claimed, because it follows the platform home /
+state directory rather than config and macOS moves it only with `$HOME`: the
+rolling log directory. A second daemon shares it unless it isolates `HOME`
+(and `XDG_STATE_HOME` on Linux), so the throwaway launcher below does exactly
+that. The vector store used to sit here too; it is now the config-resolved
+`paths.vectors_path`, claimed like every other root, and its default is still
+the platform directory so an existing deployment keeps the store it has.
 
 ### Skipping heavy startup work
 

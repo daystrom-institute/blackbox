@@ -158,13 +158,19 @@ impl InstanceRoot {
 ///   state.
 /// - the defaults / user memory directories and transcript source roots: read
 ///   surfaces, never written by the daemon.
-/// - the rolling log directory and the vector store: both derive from the
-///   platform home / state directory rather than from config, and on platforms
-///   where `dirs` ignores `XDG_STATE_HOME` (macOS) nothing but `$HOME` moves
-///   them. Claiming them would refuse a second daemon that had given every
-///   CONFIGURED root a distinct value, which is the isolation recipe the
-///   operator docs teach. A second daemon still shares those two paths unless
-///   it also isolates `$HOME`; the docs say so.
+/// - the rolling log directory: it derives from the platform home / state
+///   directory rather than from config, and on platforms where `dirs` ignores
+///   `XDG_STATE_HOME` (macOS) nothing but `$HOME` moves it. Claiming it would
+///   refuse a second daemon that had given every CONFIGURED root a distinct
+///   value, which is the isolation recipe the operator docs teach. A second
+///   daemon still shares that path unless it also isolates `$HOME`; the docs
+///   say so.
+///
+/// The vector store used to sit in that exclusion for the same reason. R33F1
+/// moved it: it is now `paths.vectors_path`, a config-resolved root like any
+/// other, so the platform-derived exclusion no longer applies to it and a
+/// second daemon isolates it with `BLACKBOX_VECTORS_PATH` (or
+/// `[paths].vectors_dir`) like everything else here.
 pub fn instance_lock_roots(cfg: &crate::config::Config) -> Vec<InstanceRoot> {
     let paths = &cfg.paths;
     vec![
@@ -173,6 +179,11 @@ pub fn instance_lock_roots(cfg: &crate::config::Config) -> Vec<InstanceRoot> {
             "transcript index",
             "TRANSCRIPT_SEARCH_INDEX_PATH",
             paths.index_path.clone(),
+        ),
+        InstanceRoot::directory(
+            "vector store",
+            "BLACKBOX_VECTORS_PATH",
+            paths.vectors_path.clone(),
         ),
         InstanceRoot::directory("bro home", "BRO_HOME", paths.bro_home.clone()),
         InstanceRoot::directory(
@@ -509,6 +520,11 @@ mod tests {
         env.set("BLACKBOX_CONFIG", root.join("absent-config.toml"));
         env.set("BLACKBOX_STATE_DIR", state_dir);
         env.set("TRANSCRIPT_SEARCH_INDEX_PATH", index_path);
+        // The vector root defaults to the PLATFORM directory (R33F1), which
+        // the live daemon on this host claims. Keep the fixture's below the
+        // varied state root so the test neither contends with the host daemon
+        // nor makes two fixture configurations share one vector store.
+        env.set("BLACKBOX_VECTORS_PATH", state_dir.join("vectors"));
         for var in [
             "BRO_HOME",
             "BLACKBOX_PACKETS_DIR",
@@ -771,6 +787,7 @@ mod tests {
         for expected in [
             "state root",
             "transcript index",
+            "vector store",
             "bro home",
             "rule packet store",
             "artifact catalog",

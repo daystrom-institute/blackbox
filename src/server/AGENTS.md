@@ -24,11 +24,19 @@
   the claim, and `open_shared_state` takes the loaded config plus the held
   `InstanceLockSet` rather than reloading (a reload could resolve roots the
   claim does not cover). `run` holds the set for the process lifetime.
+- The vector store is one config-resolved root (`paths.vectors_path`), not a
+  derivation. The runtime store, the background embed lane, the migration
+  inventory, the retirement discharge and reprobe, and history materialization
+  all read that value, so an empty inventory means no rows rather than the
+  wrong directory. `bbox_vectors::default_vectors_dir()` is only the default
+  the config resolution falls back to, and `install_global_root` pins it
+  before anything reaches `vectors::global()`.
 - The claim covers EVERY mutable root the config resolves, not just
   `state_dir` (`instance_lock.rs::instance_lock_roots`): the transcript index
   defaults to the XDG data dir, and `BRO_HOME`, the packet/artifact dirs, and
   each JSON store carry independent overrides, so two daemons with distinct
-  state roots otherwise share a Tantivy index. Roots are canonicalized,
+  state roots otherwise share a Tantivy index. The vector root is claimed on
+  the same footing since R33F1 made it config-resolved. Roots are canonicalized,
   deduplicated, and reduced by containment; refusal names the contended root
   and lists every claimed root. The state root keeps its lock inside itself
   (`<state_dir>/instance.lock`); every other root uses a sibling

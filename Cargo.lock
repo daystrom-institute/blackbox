@@ -401,6 +401,7 @@ dependencies = [
  "anyhow",
  "bbox-corpus-core",
  "bbox-util",
+ "bbox-vectors",
  "dirs",
  "figment",
  "regex",

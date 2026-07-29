@@ -108,6 +108,14 @@ struct CapturedPartitionV1 {
 
 /// Capture the durable vector root without creating a missing root,
 /// partition, derived file, or repaired snapshot.
+///
+/// A missing root captures as `Missing`, which downstream reads as zero rows.
+/// That is sound only because `root` is the ONE resolved vector root
+/// (`paths.vectors_path`) that the runtime store also opens (R33F1): absence
+/// then means the store holds no rows, rather than meaning the caller derived
+/// a directory the daemon never wrote to. Pass a derived path here and this
+/// contract silently becomes "no rows observed", which is what let retirement
+/// discharge nothing and still pass its final proof.
 pub fn capture_migration_snapshot_no_create(
     root: &Path,
     limits: VectorMigrationSnapshotLimitsV1,

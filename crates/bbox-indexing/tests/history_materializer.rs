@@ -67,6 +67,17 @@ use tempfile::tempdir;
 // Shared fixture helpers
 // ---------------------------------------------------------------------------
 
+/// These fixtures resolve every root below one state directory, so the
+/// fixture's vector root is the state directory's `vectors`. Production reads
+/// `paths.vectors_path` instead, which is why the request carries the root
+/// rather than deriving it (R33F1).
+fn fixture_vector_root(projects_path: &Path) -> PathBuf {
+    projects_path
+        .parent()
+        .expect("the fixture projects path has a parent")
+        .join("vectors")
+}
+
 fn write(path: &Path, bytes: &[u8]) {
     fs::create_dir_all(path.parent().expect("fixture path has a parent")).unwrap();
     fs::write(path, bytes).unwrap();
@@ -181,7 +192,15 @@ fn config(root: &Path) -> Config {
     let config_path = root.join("config.toml");
     write(
         &config_path,
-        format!("[paths]\nstate_dir = {:?}\n", root.join("protected")).as_bytes(),
+        // `vectors_dir` is explicit: the vector root defaults to the PLATFORM
+        // state directory (R33F1), and a fixture that omitted it would inventory
+        // the host's real vector store.
+        format!(
+            "[paths]\nstate_dir = {:?}\nvectors_dir = {:?}\n",
+            root.join("protected"),
+            root.join("protected").join("vectors")
+        )
+        .as_bytes(),
     );
     config::load_with(LoadOptions {
         config_path: Some(config_path),
@@ -278,6 +297,7 @@ impl FreshFixture {
         HistoryMaterializerRequestV1 {
             index_path: self.index_path.clone(),
             projects_path: self.projects_path.clone(),
+            vector_root: fixture_vector_root(&self.projects_path),
             scan_limits: HistoryScanLimitsV1::default(),
         }
     }
@@ -931,6 +951,7 @@ impl MigratedFixture {
         HistoryMaterializerRequestV1 {
             index_path: self.index_path(),
             projects_path: self.projects_path(),
+            vector_root: fixture_vector_root(&self.projects_path()),
             scan_limits: HistoryScanLimitsV1::default(),
         }
     }

@@ -405,6 +405,7 @@ struct RawTranscriptConfig {
 struct RawPathsConfig {
     pub state_dir: Option<PathBuf>,
     pub bro_home: Option<PathBuf>,
+    pub vectors_dir: Option<PathBuf>,
     pub defaults_dir: Option<PathBuf>,
     pub memory_dir: Option<PathBuf>,
 }
@@ -483,6 +484,15 @@ pub struct ResolvedPathConfig {
     pub artifacts_dir: PathBuf,
     pub bro_home: PathBuf,
     pub index_path: PathBuf,
+    /// The ONE vector-store root (R33F1). The runtime store, the background
+    /// embedding lane, the migration inventory, the retirement discharge and
+    /// its reprobe, and history materialization all read this value, so an
+    /// inventory that observes no rows is evidence that there are none rather
+    /// than evidence that it looked in the wrong directory. Defaults to the
+    /// platform `bbox_vectors::default_vectors_dir()` so existing deployments
+    /// keep the store they already have; `BLACKBOX_VECTORS_PATH` or
+    /// `[paths].vectors_dir` moves it.
+    pub vectors_path: PathBuf,
     pub backup_dir: PathBuf,
     pub global_common_md: PathBuf,
     pub global_claude_md: PathBuf,
@@ -642,6 +652,7 @@ impl Config {
             paths: RawPathsConfig {
                 state_dir: Some(util::blackbox_state_dir(home)),
                 bro_home: None,
+                vectors_dir: None,
                 defaults_dir: None,
                 memory_dir: None,
             },
@@ -1445,6 +1456,23 @@ fn resolve_paths(
         .transpose()?
         .unwrap_or_else(|| state_dir.join("bro"));
 
+    // R33F1: ONE resolved vector root, used by the runtime store AND by every
+    // migration/retirement surface that inventories it. The default stays the
+    // platform directory so an existing deployment keeps the store it already
+    // wrote; a daemon that wants an isolated store moves it explicitly.
+    let vectors_path = std::env::var("BLACKBOX_VECTORS_PATH")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|value| expand_tilde(&value, home))
+        .transpose()?
+        .or(raw
+            .paths
+            .vectors_dir
+            .clone()
+            .map(|p| expand_tilde(&p.to_string_lossy(), home))
+            .transpose()?)
+        .unwrap_or_else(bbox_vectors::default_vectors_dir);
+
     let backup_dir = state_dir.join("backups");
 
     let home_path = home;
@@ -1529,6 +1557,7 @@ fn resolve_paths(
         artifacts_dir,
         bro_home,
         index_path,
+        vectors_path,
         backup_dir,
         global_common_md,
         global_claude_md,
@@ -2281,6 +2310,62 @@ port = 8000
                 || resolved.ends_with("share/blackbox/memories"),
             "unexpected defaults_memories_dir: {resolved}"
         );
+    }
+
+    /// R33F1. The vector root is one resolved value with three tiers, and the
+    /// default is deliberately the PLATFORM directory rather than
+    /// `state_dir/vectors`: existing deployments must keep the store they
+    /// already wrote, and the runtime opened exactly that path before this
+    /// value existed.
+    #[test]
+    fn vectors_path_resolves_env_then_config_then_platform_default() {
+        let _guard = bbox_util::util::test_env_lock();
+
+        let dir = tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        unsafe { env::set_var("HOME", &home) };
+        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")) };
+        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")) };
+        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")) };
+        unsafe { env::remove_var("BLACKBOX_VECTORS_PATH") };
+        unsafe { env::remove_var("BLACKBOX_STATE_DIR") };
+
+        let config_dir = home.join(".config").join("blackbox");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(&config_path, "[paths]\nstate_dir = \"~/isolated\"\n").unwrap();
+        unsafe {
+            env::set_var(
+                "BLACKBOX_CONFIG",
+                config_path.to_string_lossy().into_owned(),
+            )
+        };
+
+        // Tier 3: neither knob set. NOT below the configured state root.
+        let config = load().unwrap();
+        assert_eq!(
+            config.paths.vectors_path,
+            bbox_vectors::default_vectors_dir()
+        );
+        assert_ne!(
+            config.paths.vectors_path,
+            config.paths.state_dir.join("vectors")
+        );
+
+        // Tier 2: the config field, tilde-expanded.
+        std::fs::write(
+            &config_path,
+            "[paths]\nstate_dir = \"~/isolated\"\nvectors_dir = \"~/from-config\"\n",
+        )
+        .unwrap();
+        let config = load().unwrap();
+        assert_eq!(config.paths.vectors_path, home.join("from-config"));
+
+        // Tier 1: the env override wins over the config field.
+        unsafe { env::set_var("BLACKBOX_VECTORS_PATH", "~/from-env") };
+        let config = load().unwrap();
+        assert_eq!(config.paths.vectors_path, home.join("from-env"));
+        unsafe { env::remove_var("BLACKBOX_VECTORS_PATH") };
     }
 
     #[test]

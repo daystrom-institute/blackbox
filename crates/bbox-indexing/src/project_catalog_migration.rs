@@ -278,7 +278,11 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
                     catalog_immutable_root: catalog_paths.catalog_immutable_root,
                     publisher_refs_path: config.paths.bro_home.join("publisher-refs.json"),
                     index_root: config.paths.index_path.clone(),
-                    vector_root: config.paths.state_dir.join("vectors"),
+                    // R33F1: the RESOLVED vector root, not a state-directory
+                    // derivation. The runtime store opens at this path, so an
+                    // inventory captured here observes the rows retirement
+                    // must discharge.
+                    vector_root: config.paths.vectors_path.clone(),
                     edge_root,
                     git_meta_root,
                     knowledge_path: config.paths.knowledge_path.clone(),
@@ -5899,7 +5903,14 @@ mod tests {
         let config_path = root.join("config.toml");
         fs::write(
             &config_path,
-            format!("[paths]\nstate_dir = {:?}\n", root.join("live")),
+            // `vectors_dir` is explicit: the vector root defaults to the
+            // PLATFORM state directory (R33F1), and a fixture that omitted it
+            // would inventory the host's real vector store.
+            format!(
+                "[paths]\nstate_dir = {:?}\nvectors_dir = {:?}\n",
+                root.join("live"),
+                root.join("live").join("vectors")
+            ),
         )
         .unwrap();
         config::load_with(config::LoadOptions {

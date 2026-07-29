@@ -29,6 +29,11 @@ rust_analyzer_init_timeout_secs = 60
 [paths]
 # Use absolute path or ~/... (tilde will be expanded relative to $HOME)
 state_dir = "~/.local/state/blackbox-dev"
+# The vector store is NOT below state_dir by default: it resolves to the
+# platform state directory, which is where the production daemon's store
+# lives. Move it explicitly or the dev instance shares (and now refuses on)
+# the production vector root.
+vectors_dir = "~/.local/state/blackbox-dev/vectors"
 # state_dir is not the whole story: the daemon claims an instance lock on every
 # mutable root it resolves, and the transcript index derives from the XDG data
 # dir rather than from state_dir. It has no config field, so the dev service

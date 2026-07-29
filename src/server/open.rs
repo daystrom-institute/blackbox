@@ -167,6 +167,16 @@ pub(super) fn open_shared_state(
         instance_locks.covers(&cfg.paths.state_dir),
         "open_shared_state ran without a claim on the state root"
     );
+    debug_assert!(
+        instance_locks.covers(&cfg.paths.vectors_path),
+        "open_shared_state ran without a claim on the vector root"
+    );
+    // R33F1: install the ONE resolved vector root before anything can reach
+    // `vectors::global()`. The warmup thread, the embed queue, and the
+    // shutdown flush all open the store through it; without this they would
+    // open the platform default while the migration inventory and the
+    // retirement discharge read the configured root.
+    vectors::install_global_root(cfg.paths.vectors_path.clone());
     // Push the config-resolved git-notes namespace into the corpus-core
     // foundation crate (dependency inversion: corpus-core must not reach up into
     // blackbox::config). Absent this, git::notes_namespace falls back to the
@@ -284,6 +294,7 @@ pub(super) fn open_shared_state(
             Some(store) => bbox_indexing::index::schema_rebuild::catalog_schema_replacement_guard(
                 store.clone(),
                 bbox_corpus_index::index::history_generations::HistoryScanLimitsV1::default(),
+                cfg.paths.vectors_path.clone(),
             ),
             None => bbox_indexing::index::schema_rebuild::bridge_schema_replacement_guard(
                 records_provider.clone(),
@@ -712,7 +723,7 @@ pub(super) fn open_shared_state(
             ),
         )),
         vector_store: Arc::new(
-            vectors::VectorStore::open_unloaded(vectors::default_vectors_dir())
+            vectors::VectorStore::open_unloaded(cfg.paths.vectors_path.clone())
                 .expect("default vector store placeholder should open"),
         ),
         system_events: Arc::new(system_events::EventHub::new(

@@ -171,7 +171,15 @@ fn config(root: &Path) -> Config {
     let config_path = root.join("config.toml");
     write(
         &config_path,
-        format!("[paths]\nstate_dir = {:?}\n", root.join("protected")).as_bytes(),
+        // `vectors_dir` is explicit: the vector root defaults to the PLATFORM
+        // state directory (R33F1), and a fixture that omitted it would inventory
+        // the host's real vector store.
+        format!(
+            "[paths]\nstate_dir = {:?}\nvectors_dir = {:?}\n",
+            root.join("protected"),
+            root.join("protected").join("vectors")
+        )
+        .as_bytes(),
     );
     config::load_with(LoadOptions {
         config_path: Some(config_path),

@@ -116,6 +116,7 @@ fn run(args: &[&str]) -> Output {
         .args(args)
         .env_remove("BLACKBOX_CONFIG")
         .env_remove("BLACKBOX_STATE_DIR")
+        .env_remove("BLACKBOX_VECTORS_PATH")
         .env_remove("TRANSCRIPT_SEARCH_INDEX_PATH");
     command.output().unwrap()
 }
@@ -130,6 +131,7 @@ fn run_with_isolated_index(args: &[&str], index_path: &Path) -> Output {
         .args(args)
         .env_remove("BLACKBOX_CONFIG")
         .env_remove("BLACKBOX_STATE_DIR")
+        .env_remove("BLACKBOX_VECTORS_PATH")
         .env("TRANSCRIPT_SEARCH_INDEX_PATH", index_path);
     command.output().unwrap()
 }
@@ -145,6 +147,7 @@ fn run_with_isolated_index_and_env(
         .args(args)
         .env_remove("BLACKBOX_CONFIG")
         .env_remove("BLACKBOX_STATE_DIR")
+        .env_remove("BLACKBOX_VECTORS_PATH")
         .env("TRANSCRIPT_SEARCH_INDEX_PATH", index_path)
         .env(key, value);
     command.output().unwrap()
@@ -160,9 +163,13 @@ fn isolated_state_root(root: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     let projects_path = state.join("projects.json");
     drop(ProjectCatalogStore::initialize_empty(&projects_path).unwrap());
     let config_path = root.join("config.toml");
+    // `vectors_dir` is written explicitly: the vector root resolves to the
+    // PLATFORM state directory by default (R33F1), so a fixture that omitted
+    // it would inventory and discharge the host's real vector store.
+    let vectors = state.join("vectors");
     write(
         &config_path,
-        format!("[paths]\nstate_dir = {state:?}\n").as_bytes(),
+        format!("[paths]\nstate_dir = {state:?}\nvectors_dir = {vectors:?}\n").as_bytes(),
     );
     (state, projects_path, config_path, root.join("index"))
 }
@@ -302,7 +309,12 @@ fn domain_errors_use_one_redacted_json_envelope() {
     let config_path = root.join("config.toml");
     write(
         &config_path,
-        format!("[paths]\nstate_dir = {:?}\n", root.join("protected")).as_bytes(),
+        format!(
+            "[paths]\nstate_dir = {:?}\nvectors_dir = {:?}\n",
+            root.join("protected"),
+            root.join("protected").join("vectors")
+        )
+        .as_bytes(),
     );
 
     let output = run(&[
@@ -339,7 +351,12 @@ fn cli_runs_clean_preflight_apply_and_fresh_verify() {
     let config_path = root.join("config.toml");
     write(
         &config_path,
-        format!("[paths]\nstate_dir = {:?}\n", protected_root).as_bytes(),
+        format!(
+            "[paths]\nstate_dir = {:?}\nvectors_dir = {:?}\n",
+            protected_root,
+            protected_root.join("vectors")
+        )
+        .as_bytes(),
     );
     fs::create_dir_all(&protected_root).unwrap();
     initialize_empty_owner_state(&rehearsal_root, &config_path);
@@ -758,10 +775,14 @@ fn retire_refuses_on_a_producer_assignment() {
     // for the project's scope in the config file.
     let token_file = root.join("producer.token");
     write(&token_file, b"producer-secret-token");
+    // Rewriting the config drops what `isolated_state_root` wrote, so restate
+    // `vectors_dir`: without it the vector root resolves to the PLATFORM state
+    // directory and this test would probe the host's real vector store.
+    let vectors = state.join("vectors");
     write(
         &config_path,
         format!(
-            "[paths]\nstate_dir = {state:?}\n\
+            "[paths]\nstate_dir = {state:?}\nvectors_dir = {vectors:?}\n\
              [[code_collection.producers]]\n\
              producer_id = \"producerfamily-producer\"\n\
              token_file = {token_file:?}\n\
@@ -1000,6 +1021,125 @@ fn retire_treats_historical_scope_generations_as_provenance_only() {
             .join("generations")
             .join("d".repeat(64))
             .is_dir()
+    );
+}
+
+/// R33F1 regression: retirement discharges the RESOLVED vector root.
+///
+/// The fixture separates the two roots that used to be assumed equal: the
+/// configured state directory, which the inventory and the discharge derived
+/// `state_dir/vectors` from, and the vector store the runtime actually opens.
+/// The owner rows live only in the runtime store. Before the fix the
+/// inventory captured the state-derived directory, observed no rows, counted
+/// that as zero, discharged nothing, passed its final proof, and removed the
+/// project with its rows still live.
+#[test]
+fn retire_discharges_the_resolved_vector_root_not_a_state_derived_one() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let state = root.join("state");
+    fs::create_dir_all(&state).unwrap();
+    let projects_path = state.join("projects.json");
+    drop(ProjectCatalogStore::initialize_empty(&projects_path).unwrap());
+    let index_path = root.join("index");
+
+    // The runtime vector store, deliberately NOT below the state directory,
+    // exactly as the platform default sits outside a configured state root.
+    let runtime_vectors = root.join("runtime-vectors");
+    let state_derived_vectors = state.join("vectors");
+    let config_path = root.join("config.toml");
+    write(
+        &config_path,
+        format!("[paths]\nstate_dir = {state:?}\nvectors_dir = {runtime_vectors:?}\n").as_bytes(),
+    );
+
+    let projects = projects_path.to_str().unwrap();
+    let config = config_path.to_str().unwrap();
+    let project_id = add_published_project(projects, "vectorfamily", ".", "2026-07-24T00:00:00Z");
+
+    // One owner row in the runtime store, plus a decoy row for the same
+    // project in the state-derived directory the old derivation would have
+    // discharged instead.
+    let owner_ref = format!("project_file:{project_id}:src:lib.rs:v1");
+    let runtime = VectorStore::open(&runtime_vectors).unwrap();
+    runtime
+        .upsert("route-a", &owner_ref, &"c".repeat(64), vec![0.5, 0.5])
+        .unwrap();
+    runtime.flush_all().unwrap();
+    drop(runtime);
+    let decoy = VectorStore::open(&state_derived_vectors).unwrap();
+    decoy
+        .upsert("route-a", &owner_ref, &"d".repeat(64), vec![0.25, 0.75])
+        .unwrap();
+    decoy.flush_all().unwrap();
+    drop(decoy);
+
+    let captured = bbox_vectors::migration_inventory::capture_migration_snapshot_no_create(
+        &runtime_vectors,
+        Default::default(),
+    );
+    assert_eq!(
+        captured.project_scoped_refs.len(),
+        1,
+        "the fixture's owner row is in the runtime store"
+    );
+
+    // The journal path is what discharges owner rows, so drive that.
+    let plan_hash = retirement_plan_hash(projects, &project_id, config, None, &index_path);
+    let retired = success_json(&run_with_isolated_index(
+        &[
+            "project-catalog",
+            "retirement-journal",
+            "--projects-path",
+            projects,
+            "--project",
+            &project_id,
+            "--execute",
+            "--plan-hash",
+            &plan_hash,
+            "--config",
+            config,
+        ],
+        &index_path,
+    ));
+    assert!(
+        retired["result"]["unprobeable_reference_classes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let listed = success_json(&run(&[
+        "project-catalog",
+        "list",
+        "--projects-path",
+        projects,
+    ]));
+    assert!(listed["result"]["projects"].as_array().unwrap().is_empty());
+
+    // The runtime store is the one that was inventoried and discharged.
+    let after = bbox_vectors::migration_inventory::capture_migration_snapshot_no_create(
+        &runtime_vectors,
+        Default::default(),
+    );
+    assert!(
+        after
+            .project_scoped_refs
+            .iter()
+            .all(|row| row.project_id != project_id),
+        "retirement left owner rows in the runtime vector store: {:?}",
+        after.project_scoped_refs
+    );
+
+    // And the state-derived directory was never the authority: its rows are
+    // untouched, which is the discharge the pre-fix code performed instead.
+    let decoy_after = bbox_vectors::migration_inventory::capture_migration_snapshot_no_create(
+        &state_derived_vectors,
+        Default::default(),
+    );
+    assert_eq!(
+        decoy_after.project_scoped_refs.len(),
+        1,
+        "the state-derived directory is not a vector authority"
     );
 }
 

@@ -279,6 +279,11 @@ pub struct HistoryMaterializerRequestV1 {
     /// The catalog store's `projects.json` path, used to locate the
     /// migration asset root that holds the Phase 1 namespace inventory.
     pub projects_path: PathBuf,
+    /// The RESOLVED vector-store root (R33F1). Derived from the state
+    /// directory this used to be, which is a different directory from the one
+    /// the runtime opens whenever the configured state root is not the
+    /// platform one, so the recomputed fingerprint could never match.
+    pub vector_root: PathBuf,
     pub scan_limits: HistoryScanLimitsV1,
 }
 
@@ -435,17 +440,18 @@ fn select_proof_mode(
         return (HistoryProofModeV1::Drift, None, None);
     };
     let recorded = asset.source_index_fingerprint.as_str().to_string();
-    // The vector and cursor roots are siblings of the index under the same
-    // state directory, exactly as the migration layout derives them
-    // (`state_dir/{index,vectors,git_meta}`). Deriving them here keeps the
-    // request shape unchanged for callers that already construct it.
+    // The cursor root is a sibling of the catalog store under the same state
+    // directory, exactly as the migration layout derives it
+    // (`state_dir/git_meta`). The VECTOR root is not derived here at all: it
+    // is `paths.vectors_path`, carried on the request, because the runtime
+    // store and the migration inventory must read one directory (R33F1).
     let Some(state_dir) = request.projects_path.parent() else {
         return (HistoryProofModeV1::Drift, Some(recorded), None);
     };
     let observed = recompute_legacy_commit_namespace_source_fingerprint(
         &request.index_path,
         &state_dir.join("git_meta"),
-        &state_dir.join("vectors"),
+        &request.vector_root,
     )
     .map(|value| value.as_str().to_string());
     let mode = match observed.as_deref() {
@@ -1335,6 +1341,7 @@ mod tests {
         let request = HistoryMaterializerRequestV1 {
             index_path: PathBuf::from("/nonexistent/index"),
             projects_path: PathBuf::from("/nonexistent/projects.json"),
+            vector_root: PathBuf::from("/nonexistent/vectors"),
             scan_limits: HistoryScanLimitsV1::default(),
         };
         let (mode, recorded, observed) = select_proof_mode(None, &request);

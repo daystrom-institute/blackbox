@@ -1873,8 +1873,12 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             &selectors,
         )
         .map_err(|error| discharge_error("corpus_index_rows", error))?;
+        // R33F1: the RESOLVED vector root. Deriving it from the state
+        // directory discharged a directory the runtime never wrote to
+        // whenever the two differed, so retirement removed the project with
+        // its owner rows still live in the store the daemon reads.
         bbox_vectors::migration_inventory::discharge_project_rows(
-            &self.config.paths.state_dir.join("vectors"),
+            &self.config.paths.vectors_path,
             project_id.as_str(),
         )
         .map_err(|error| discharge_error("vector_entity_refs", error))?;
@@ -2603,7 +2607,7 @@ fn probe_retire_evidence(
     );
 
     let vectors = vector_inventory::capture_migration_snapshot_no_create(
-        &config.paths.state_dir.join("vectors"),
+        &config.paths.vectors_path,
         Default::default(),
     );
     probe.record(

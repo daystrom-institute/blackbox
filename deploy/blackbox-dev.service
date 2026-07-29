@@ -12,8 +12,10 @@ Environment=BLACKBOX_CONFIG=%h/.config/blackbox-dev/config.toml
 # XDG data dir), so without this the dev instance would share the production
 # Tantivy index and refuse to start against the running prod daemon.
 Environment=TRANSCRIPT_SEARCH_INDEX_PATH=%h/.local/share/blackbox-dev/index
-# Same reason for the vector store and the rolling log directory, which follow
-# the platform state dir rather than state_dir.
+# Same reason for the rolling log directory, which follows the platform state
+# dir rather than state_dir. The vector store is config-resolved now
+# ([paths].vectors_dir in config-dev.toml), but keep this so anything else
+# reaching for the platform state dir lands inside the dev tree too.
 Environment=XDG_STATE_HOME=%h/.local/state/blackbox-dev/xdg-state
 Environment=RUST_LOG=blackbox=info
 WorkingDirectory=%h

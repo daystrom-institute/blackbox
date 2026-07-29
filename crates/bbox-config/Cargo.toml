@@ -16,3 +16,6 @@ figment = { version = "0.10", features = ["toml", "env"] }
 tempfile = "3"
 toml_edit = "0.22"
 bbox-util = { path = "../bbox-util" }
+# The default-value provider for `paths.vectors_path` (R33F1). Pure leaf crate,
+# so this edge cannot cycle back into config.
+bbox-vectors = { path = "../bbox-vectors" }
