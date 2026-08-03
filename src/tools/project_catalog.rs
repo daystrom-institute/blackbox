@@ -957,6 +957,7 @@ impl BlackboxServer {
             Err(error) => return Self::err_text(&format!("Error: {error}")),
         };
         let committed = project_id.clone();
+        let dry_run = p.dry_run;
         let swap_uncertain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let swap_uncertain_inner = swap_uncertain.clone();
         let result = Self::run_blocking("bbox_project_publisher_advance", move || {
@@ -1030,7 +1031,21 @@ impl BlackboxServer {
         })
         .await;
         let succeeded = !result.is_error.unwrap_or(false);
-        if succeeded || swap_uncertain.load(std::sync::atomic::Ordering::SeqCst) {
+        let swapped = swap_uncertain.load(std::sync::atomic::Ordering::SeqCst);
+        if dry_run && swapped {
+            // Structurally impossible: commit_publish refuses a dry-run
+            // preparation before it takes the publication lock. Report it
+            // loudly and then converge, because the safe direction on a
+            // broken assumption is to reconcile, not to skip.
+            tracing::error!(
+                project_id = %project_id,
+                "a dry-run publish reported swap uncertainty; reconciling defensively"
+            );
+        }
+        // A dry run installs no generation and swaps no pointer, so it must
+        // not invalidate a projection or enqueue an index replacement. Its
+        // whole contract is that nothing durable moves.
+        if (succeeded && !dry_run) || swapped {
             // Accepted content identity may have changed. Drop the
             // projections and reconverge the published index from whatever
             // pointer is now installed (plan section 7.3 steps 17 to 19).
@@ -2186,6 +2201,95 @@ mod tests {
             .unwrap()
     }
 
+    /// A dry run must move nothing durable, including the search index.
+    ///
+    /// The handler used to treat any non-error result as a publish, so a
+    /// successful dry run invalidated the projections and enqueued a scope
+    /// replacement: a durable index mutation from an operation whose whole
+    /// contract is that nothing durable moves.
+    ///
+    /// Making that observable needs a pending divergence. The index is
+    /// converged at G1 and the accepted store is then moved to G2 without
+    /// converging, so a convergence the dry run should never perform would
+    /// visibly flip the index to G2.
+    #[tokio::test]
+    async fn a_dry_run_publish_moves_nothing_durable() {
+        use crate::server::state::catalog_fixture::{
+            COMMIT_ONE, COMMIT_TWO, CatalogFixture, knowledge_entry,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path().canonicalize().unwrap().join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        publishing_checkout(&checkout);
+        let scope = PublishedScope::try_new("repo_probe", ".").unwrap();
+
+        let fixture = CatalogFixture::new();
+        fixture.add_published_project("p_dryrun", &scope);
+        fixture.attach_checkout(
+            "p_dryrun",
+            &scope,
+            &checkout,
+            "att_00000000000000000000000000000d01",
+        );
+        fixture.install_publication(
+            "p_dryrun",
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-a", "generationone")],
+            &[],
+        );
+        let server = fixture.server();
+        server.state.install_code_read_view_commit_hook();
+        let project_id = ProjectId::parse("p_dryrun").unwrap();
+
+        // Converge the index at G1.
+        server.converge_published_knowledge_index(&project_id);
+        server.state.index_writer.flush_blocking().unwrap();
+        server.state.idx.write().reader_reload_for_test();
+        assert!(index_search(&server, "generationone").contains("knowledge-a"));
+
+        // Move accepted content to G2 WITHOUT converging: the index now
+        // lags the accepted store, so any convergence is observable.
+        fixture.install_publication(
+            "p_dryrun",
+            &scope,
+            COMMIT_TWO,
+            &[knowledge_entry("knowledge-a", "generationtwo")],
+            &[],
+        );
+        let runtime = server.state.accepted_publications.clone().unwrap();
+        let tokens = runtime.advance_tokens(&project_id).unwrap().unwrap();
+
+        let response = server
+            .bbox_project_publisher_advance(Parameters(ProjectPublisherAdvanceParams {
+                project_id: "p_dryrun".into(),
+                attachment_id: "att_00000000000000000000000000000d01".into(),
+                mode: "advance".into(),
+                full_ref: "refs/heads/main".into(),
+                expected_generation_id: Some(tokens.0),
+                expected_pointer_sha256: Some(tokens.1),
+                dry_run: true,
+                expected_catalog_epoch: fixture.epoch(),
+                audit_reason: "dry run".into(),
+            }))
+            .await;
+        let text = error_text(&response);
+        assert!(!response.is_error.unwrap_or(false), "{text}");
+        assert!(text.contains("\"dry_run\""), "{text}");
+
+        // No scope replacement was enqueued, so the index still lags at G1.
+        server.state.index_writer.flush_blocking().unwrap();
+        server.state.idx.write().reader_reload_for_test();
+        assert!(
+            index_search(&server, "generationone").contains("knowledge-a"),
+            "a dry run must not enqueue an index replacement"
+        );
+        assert!(
+            !index_search(&server, "generationtwo").contains("knowledge-a"),
+            "a dry run must not converge the index to newer accepted content"
+        );
+    }
     /// Denied publish requests must not touch a repository.
     ///
     /// The fixture has no checkout anywhere: the catalog holds one

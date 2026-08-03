@@ -1149,7 +1149,7 @@ pub(crate) struct BlackboxServer {
 /// installed through the owning crate's real preparation path.
 #[cfg(test)]
 pub(crate) mod catalog_fixture {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     use bbox_corpus_core::identity::PublishedScope;
@@ -1226,6 +1226,56 @@ pub(crate) mod catalog_fixture {
                     Ok(())
                 })
                 .unwrap();
+        }
+
+        /// Attach one real checkout to a project, with the capability a
+        /// publish requires. Cross-validation ties the row to its scope,
+        /// so the caller supplies a directory whose committed identity
+        /// matches.
+        pub(crate) fn attach_checkout(
+            &self,
+            project_id: &str,
+            scope: &PublishedScope,
+            checkout_dir: &Path,
+            attachment_id: &str,
+        ) {
+            let project_id = ProjectId::parse(project_id).unwrap();
+            let attachment_id = AttachmentId::parse(attachment_id).unwrap();
+            let scope = scope.clone();
+            let checkout_dir = checkout_dir.to_string_lossy().into_owned();
+            let epoch = self.store.snapshot().unwrap().epoch();
+            self.store
+                .transact(epoch, |_catalog, attachments| {
+                    attachments.attachments.insert(
+                        attachment_id.clone(),
+                        bbox_corpus_core::project_catalog::CheckoutAttachment {
+                            attachment_id: attachment_id.clone(),
+                            project_id: project_id.clone(),
+                            checkout_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01".into(),
+                            checkout_dir: checkout_dir.clone(),
+                            checkout_project_dir: checkout_dir.clone(),
+                            project_root_relpath: scope.bbox_root_relpath().to_string(),
+                            kind: bbox_corpus_core::project_catalog::AttachmentKind::Base,
+                            validated_scope: Some(scope.clone()),
+                            computed_repo_hint: None,
+                            branch_ref: Some("refs/heads/main".into()),
+                            capabilities:
+                                bbox_corpus_core::project_catalog::AttachmentCapabilities {
+                                    repo_knowledge: true,
+                                    ..Default::default()
+                                },
+                            status: bbox_corpus_core::project_catalog::AttachmentStatus::Attached,
+                            attached_at: "2026-08-03T00:00:00Z".into(),
+                            detached_at: None,
+                        },
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        pub(crate) fn epoch(&self) -> u64 {
+            self.store.snapshot().unwrap().epoch()
         }
 
         /// Migrate one project's catalog scope, leaving its accepted
