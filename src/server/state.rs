@@ -1300,6 +1300,32 @@ pub(crate) mod catalog_fixture {
             checkout_id: &str,
             repo_knowledge: bool,
         ) {
+            self.attach_overlay_checkout_at(
+                project_id,
+                scope,
+                checkout_dir,
+                checkout_dir,
+                attachment_id,
+                checkout_id,
+                repo_knowledge,
+            );
+        }
+
+        /// The same attachment with its project root nested below the
+        /// checkout root, which is what a published scope other than "."
+        /// looks like on disk: the repository is the checkout, and the
+        /// `.bbox` root lives at the scope's relative path inside it.
+        #[allow(clippy::too_many_arguments)] // one argument per durable attachment field
+        pub(crate) fn attach_overlay_checkout_at(
+            &self,
+            project_id: &str,
+            scope: &PublishedScope,
+            checkout_dir: &Path,
+            project_dir: &Path,
+            attachment_id: &str,
+            checkout_id: &str,
+            repo_knowledge: bool,
+        ) {
             std::fs::create_dir_all(checkout_dir.join(".bbox/local")).unwrap();
             std::fs::write(
                 checkout_dir.join(".bbox/local/checkout-id"),
@@ -1310,6 +1336,7 @@ pub(crate) mod catalog_fixture {
             let attachment_id = AttachmentId::parse(attachment_id).unwrap();
             let scope = scope.clone();
             let checkout_dir = checkout_dir.to_string_lossy().into_owned();
+            let project_dir = project_dir.to_string_lossy().into_owned();
             let checkout_id = checkout_id.to_string();
             let epoch = self.store.snapshot().unwrap().epoch();
             self.store
@@ -1321,7 +1348,7 @@ pub(crate) mod catalog_fixture {
                             project_id: project_id.clone(),
                             checkout_id: checkout_id.clone(),
                             checkout_dir: checkout_dir.clone(),
-                            checkout_project_dir: checkout_dir.clone(),
+                            checkout_project_dir: project_dir.clone(),
                             project_root_relpath: scope.bbox_root_relpath().to_string(),
                             kind: bbox_corpus_core::project_catalog::AttachmentKind::Base,
                             validated_scope: Some(scope.clone()),

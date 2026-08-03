@@ -2992,12 +2992,21 @@ mod catalog_overlay_tests {
         );
     }
 
+    /// Write one entry with the exact bytes the fixture's accepted
+    /// publication hashes.
+    ///
+    /// An accepted generation records the SHA-256 of the committed blob,
+    /// so in production the repository content and the accepted source
+    /// bytes ARE the same bytes. A fixture that commits one serialization
+    /// and publishes another makes every published digest miss, which
+    /// silently disables the byte-equality suppression rule instead of
+    /// failing.
     fn write_entry(root: &Path, entry: &KnowledgeEntry) {
         let dir = root.join(".bbox/knowledge");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(format!("{}.json", entry.id)),
-            serde_json::to_vec_pretty(entry).unwrap(),
+            serde_json::to_vec(entry).unwrap(),
         )
         .unwrap();
     }
@@ -3186,6 +3195,120 @@ mod catalog_overlay_tests {
         assert_eq!(publisher_commit, fixture.accepted_commit);
         assert_eq!(merge_base, fixture.accepted_commit);
         assert!(view.degraded_overlays.is_empty());
+    }
+
+    /// The digest map the diff consults is keyed by BASENAME, while the
+    /// accepted manifest keys are repository-relative. Feeding a manifest
+    /// key straight through makes every published file look absent, which
+    /// suppresses nothing and tombstones nothing: wrong answers rather
+    /// than errors, so only a behavioral test catches it.
+    ///
+    /// A published scope below the repository root gives the manifest key
+    /// a real directory prefix, and the two questions the diff asks about
+    /// published content are exercised separately: does this file exist
+    /// there, and do the working bytes already equal it.
+    #[test]
+    fn a_nested_published_scope_still_suppresses_and_tombstones_by_basename() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let base = root.join("base");
+        let nested = |dir: &Path| dir.join("sub");
+        std::fs::create_dir_all(nested(&base)).unwrap();
+        git(&base, &["init", "-q", "-b", "main"]);
+        git(&base, &["config", "user.email", "t@example.com"]);
+        git(&base, &["config", "user.name", "Test"]);
+
+        // One commit BEFORE accepted content, so the checkout's baseline
+        // and accepted content genuinely disagree. A worktree branched off
+        // the accepted commit would make baseline == published and the
+        // suppression question would never be asked.
+        write_entry(&nested(&base), &knowledge_entry("reapplied", "older"));
+        write_entry(&nested(&base), &knowledge_entry("remove", "published"));
+        git(&base, &["add", "sub/.bbox/knowledge"]);
+        git(&base, &["commit", "-q", "-m", "before accepted"]);
+        let branch_point = bbox_corpus_core::git::current_head(&base).unwrap();
+
+        let accepted = [
+            knowledge_entry("reapplied", "accepted"),
+            knowledge_entry("remove", "published"),
+        ];
+        write_entry(&nested(&base), &accepted[0]);
+        git(&base, &["add", "sub/.bbox/knowledge"]);
+        git(&base, &["commit", "-q", "-m", "accepted"]);
+        let accepted_commit = bbox_corpus_core::git::current_head(&base).unwrap();
+
+        let catalog = CatalogFixture::new();
+        let scope = CatalogFixture::scope("sub");
+        catalog.add_published_project(PROJECT, &scope);
+        catalog.install_publication(PROJECT, &scope, &accepted_commit, &accepted, &[]);
+
+        let worktree = root.join("peer");
+        git(
+            &base,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "peer",
+                worktree.to_str().unwrap(),
+                &branch_point,
+            ],
+        );
+        catalog.attach_overlay_checkout_at(
+            PROJECT,
+            &scope,
+            &worktree,
+            &nested(&worktree),
+            PEER_ATTACHMENT,
+            PEER_CHECKOUT,
+            true,
+        );
+
+        // The checkout re-applies exactly what accepted content holds. Its
+        // baseline still says "older", so the row survives the
+        // baseline-equality shortcut and only the published digest can
+        // suppress it.
+        write_entry(
+            &nested(&worktree),
+            &knowledge_entry("reapplied", "accepted"),
+        );
+        std::fs::remove_file(nested(&worktree).join(".bbox/knowledge/remove.json")).unwrap();
+
+        let server = catalog.server_with_checkout_authority();
+        let verified = server
+            .state
+            .accepted_publications
+            .as_ref()
+            .unwrap()
+            .load_verified(&ProjectId::parse(PROJECT).unwrap())
+            .unwrap();
+        // The manifest really does carry the prefix this test exists for.
+        assert!(
+            verified
+                .knowledge_manifest()
+                .keys()
+                .all(|filename| filename.as_str().starts_with("sub/.bbox/knowledge/")),
+            "the fixture must produce directory-prefixed manifest keys"
+        );
+
+        let snapshot = server
+            .refresh_catalog_knowledge_overlay(
+                &verified,
+                &attachment(PEER_ATTACHMENT, PEER_CHECKOUT),
+            )
+            .unwrap();
+        assert_eq!(snapshot.stamp.as_ref().unwrap().merge_base, branch_point);
+        assert!(
+            !snapshot.values.contains_key("reapplied"),
+            "working bytes equal to published content are already integrated: {:?}",
+            snapshot.values
+        );
+        assert!(
+            matches!(snapshot.values.get("remove"), Some(OverlayValue::Tombstone)),
+            "a deletion of a published file tombstones it: {:?}",
+            snapshot.values
+        );
     }
 
     #[test]

@@ -1667,12 +1667,16 @@ mod catalog_gap_overlay_tests {
         );
     }
 
+    /// Write one gap with the exact bytes the fixture's accepted
+    /// publication hashes. An accepted generation records the SHA-256 of
+    /// the committed blob, so committing one serialization and publishing
+    /// another would silently disable the byte-equality suppression rule.
     fn write_gap(root: &Path, gap: &GapNote) {
         let dir = root.join(".bbox/gaps");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(format!("{}.json", gap.id)),
-            serde_json::to_vec_pretty(gap).unwrap(),
+            serde_json::to_vec(gap).unwrap(),
         )
         .unwrap();
     }
@@ -1857,6 +1861,115 @@ mod catalog_gap_overlay_tests {
         assert_eq!(checkout_id, PEER_CHECKOUT);
         assert_eq!(publisher_commit, fixture.accepted_commit);
         assert_eq!(merge_base, fixture.accepted_commit);
+    }
+
+    /// The digest map the diff consults is keyed by BASENAME while the
+    /// accepted manifest keys are repository-relative. Feeding a manifest
+    /// key straight through makes every published gap look absent, which
+    /// suppresses nothing and tombstones nothing: wrong answers rather
+    /// than errors. A published scope below the repository root gives the
+    /// manifest key a real directory prefix.
+    #[test]
+    fn a_nested_published_scope_still_suppresses_and_tombstones_by_basename() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let base = root.join("base");
+        let nested = |dir: &Path| dir.join("sub");
+        std::fs::create_dir_all(nested(&base)).unwrap();
+        git_run(&base, &["init", "-q", "-b", "main"]);
+        git_run(&base, &["config", "user.email", "t@example.com"]);
+        git_run(&base, &["config", "user.name", "Test"]);
+
+        // A commit before accepted content, so the checkout's baseline and
+        // accepted content genuinely disagree and the suppression question
+        // is actually asked.
+        write_gap(&nested(&base), &edited("gap-11111111", "older"));
+        write_gap(&nested(&base), &gap_note("gap-22222222", "published"));
+        git_run(&base, &["add", "sub/.bbox/gaps"]);
+        git_run(&base, &["commit", "-q", "-m", "before accepted"]);
+        let branch_point = bbox_corpus_core::git::current_head(&base).unwrap();
+
+        let accepted = [
+            edited("gap-11111111", "accepted"),
+            gap_note("gap-22222222", "published"),
+        ];
+        write_gap(&nested(&base), &accepted[0]);
+        git_run(&base, &["add", "sub/.bbox/gaps"]);
+        git_run(&base, &["commit", "-q", "-m", "accepted"]);
+        let accepted_commit = bbox_corpus_core::git::current_head(&base).unwrap();
+
+        let catalog = CatalogFixture::new();
+        let scope = CatalogFixture::scope("sub");
+        catalog.add_published_project(PROJECT, &scope);
+        catalog.install_publication(
+            PROJECT,
+            &scope,
+            &accepted_commit,
+            &[knowledge_entry("knowledge-a", "accepted")],
+            &accepted,
+        );
+
+        let worktree = root.join("peer");
+        git_run(
+            &base,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "peer",
+                worktree.to_str().unwrap(),
+                &branch_point,
+            ],
+        );
+        catalog.attach_overlay_checkout_at(
+            PROJECT,
+            &scope,
+            &worktree,
+            &nested(&worktree),
+            PEER_ATTACHMENT,
+            PEER_CHECKOUT,
+            true,
+        );
+
+        // Re-apply exactly what accepted content holds: the baseline still
+        // disagrees, so only the published digest can suppress this row.
+        write_gap(&nested(&worktree), &edited("gap-11111111", "accepted"));
+        std::fs::remove_file(nested(&worktree).join(".bbox/gaps/gap-22222222.json")).unwrap();
+
+        let server = catalog.server_with_checkout_authority();
+        let verified = server
+            .state
+            .accepted_publications
+            .as_ref()
+            .unwrap()
+            .load_verified(&ProjectId::parse(PROJECT).unwrap())
+            .unwrap();
+        assert!(
+            verified
+                .gap_manifest()
+                .keys()
+                .all(|filename| filename.as_str().starts_with("sub/.bbox/gaps/")),
+            "the fixture must produce directory-prefixed manifest keys"
+        );
+
+        let snapshot = server
+            .refresh_catalog_gap_overlay(&verified, &attachment(PEER_ATTACHMENT, PEER_CHECKOUT))
+            .unwrap();
+        assert_eq!(snapshot.stamp.as_ref().unwrap().merge_base, branch_point);
+        assert!(
+            !snapshot.values.contains_key("gap-11111111"),
+            "working bytes equal to published content are already integrated: {:?}",
+            snapshot.values
+        );
+        assert!(
+            matches!(
+                snapshot.values.get("gap-22222222"),
+                Some(GapOverlayValue::Tombstone)
+            ),
+            "a deletion of a published gap tombstones it: {:?}",
+            snapshot.values
+        );
     }
 
     #[test]
