@@ -129,6 +129,9 @@ mod tests {
     /// rolling log file the moment it does.
     #[test]
     fn a_refused_claim_migrates_nothing_and_opens_no_log() {
+        // No faults, but hold the seam's lock so a concurrently-armed test in a
+        // single-process `cargo test` run cannot leak a fault into this one.
+        let _faults = crate::util::arm_legacy_migration_faults(&[]);
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().canonicalize().expect("canonicalize the fixture");
         let home = root.join("home");
@@ -312,6 +315,7 @@ mod tests {
     /// the same production-default paths, which neither had claimed.
     #[test]
     fn config_file_isolated_daemons_migrate_into_their_own_resolved_roots() {
+        let _faults = crate::util::arm_legacy_migration_faults(&[]);
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().canonicalize().expect("canonicalize the fixture");
         let home = root.join("home");

@@ -862,6 +862,8 @@ dependencies = [
  "bbox-corpus-core",
  "dirs",
  "fs2",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

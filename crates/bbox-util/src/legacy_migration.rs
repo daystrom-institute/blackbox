@@ -195,25 +195,241 @@ pub fn cross_device_temp_path(new: &Path) -> PathBuf {
     }
 }
 
-/// The EXDEV fallback: copy into a sibling temporary, fsync, then rename it
-/// onto the destination. `pub` so the interrupted-copy shape is testable
-/// without injecting a real device boundary.
-pub fn migrate_legacy_file_across_devices(old: &Path, new: &Path) -> anyhow::Result<()> {
-    let temp = cross_device_temp_path(new);
-    // Debris from an interrupted earlier attempt is overwritten, never adopted.
-    let _ = fs::remove_file(&temp);
-    let mut source = fs::File::open(old)?;
-    let mut dest = fs::File::create(&temp)?;
-    std::io::copy(&mut source, &mut dest)?;
-    dest.sync_all()?;
-    drop(source);
-    drop(dest);
-    fs::rename(&temp, new)?;
-    fs::remove_file(old)?;
+/// The durable record of the migration in flight, kept next to the legacy
+/// source claim (R34F2).
+///
+/// A cross-filesystem move is not one atomic operation: it stages a copy,
+/// publishes it, and only then deletes the source. Every boundary between
+/// those steps is a place a crash can land, and the old fallback recorded
+/// none of them — a crash after the destination rename but before the source
+/// was removed left BOTH names, and the next daemon (possibly one with
+/// entirely different roots) migrated the stale source a second time. The
+/// journal lives with the SOURCE because the source is the one object every
+/// daemon shares, so whoever next holds the claim finds and finishes the
+/// interrupted transaction.
+pub const LEGACY_MIGRATION_JOURNAL_NAME: &str = ".blackbox-legacy-migration.journal";
+
+/// The stable journal path for one legacy source tree.
+pub fn legacy_migration_journal_path(home: &Path) -> PathBuf {
+    home.join(LEGACY_MIGRATION_JOURNAL_NAME)
+}
+
+const MIGRATION_RECORD_VERSION: u32 = 1;
+
+/// How far the transaction got. The distinction that matters is whether the
+/// destination is durably published: before it is, the source is still the
+/// authority and the transaction rolls back; after it is, the destination is
+/// the authority and the transaction rolls forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MigrationPhase {
+    Prepared,
+    Published,
+}
+
+/// Whether the publish is a same-filesystem rename or a staged copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MigrationMode {
+    Rename,
+    Stage,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct MigrationRecord {
+    version: u32,
+    source: PathBuf,
+    destination: PathBuf,
+    stage: PathBuf,
+    mode: MigrationMode,
+    phase: MigrationPhase,
+}
+
+/// fsync one directory so the names it holds survive a crash.
+fn sync_dir(path: &Path) -> anyhow::Result<()> {
+    fs::File::open(path)
+        .with_context(|| format!("opening {} for fsync", path.display()))?
+        .sync_all()
+        .with_context(|| format!("fsync {}", path.display()))
+}
+
+/// fsync one directory, tolerating its absence. Recovery reaches for parents
+/// that a rolled-back transaction may never have created.
+fn sync_dir_if_present(path: &Path) -> anyhow::Result<()> {
+    match fs::File::open(path) {
+        Ok(directory) => directory
+            .sync_all()
+            .with_context(|| format!("fsync {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(anyhow::Error::new(error).context(format!("opening {} for fsync", path.display())))
+        }
+    }
+}
+
+/// Replace the journal with `record` and make the replacement durable.
+fn write_record(home: &Path, record: &MigrationRecord) -> anyhow::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let path = legacy_migration_journal_path(home);
+    let bytes = serde_json::to_vec_pretty(record)
+        .with_context(|| format!("encoding the migration journal {}", path.display()))?;
+    // Same no-follow open as the claim beside it: the journal hangs off
+    // `$HOME`, which no daemon owns.
+    let mut file = bbox_corpus_core::json_store::open_lock_path_nofollow(&path)
+        .with_context(|| format!("opening the migration journal {}", path.display()))?;
+    if !file.metadata()?.file_type().is_file() {
+        anyhow::bail!(
+            "the legacy migration journal is not a regular file: {}",
+            path.display()
+        );
+    }
+    file.set_len(0)
+        .with_context(|| format!("truncating the migration journal {}", path.display()))?;
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("rewinding the migration journal {}", path.display()))?;
+    file.write_all(&bytes)
+        .with_context(|| format!("writing the migration journal {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("fsync the migration journal {}", path.display()))?;
+    drop(file);
+    sync_dir(home)
+}
+
+/// Read the pending transaction, if there is one.
+///
+/// A journal that cannot be read or parsed is a refusal, never an assumed
+/// absence: the whole point of the record is that its absence means "nothing
+/// is in flight".
+fn read_record(home: &Path) -> anyhow::Result<Option<MigrationRecord>> {
+    let path = legacy_migration_journal_path(home);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow::Error::new(error)
+                .context(format!("reading the migration journal {}", path.display())));
+        }
+    };
+    // An empty journal is the file the claim's own open can leave behind.
+    if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Ok(None);
+    }
+    let record: MigrationRecord = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing the migration journal {}", path.display()))?;
+    if record.version != MIGRATION_RECORD_VERSION {
+        anyhow::bail!(
+            "the migration journal {} has unsupported version {}",
+            path.display(),
+            record.version
+        );
+    }
+    Ok(Some(record))
+}
+
+/// Drop the journal; the transaction it described is complete.
+fn clear_record(home: &Path) -> anyhow::Result<()> {
+    let path = legacy_migration_journal_path(home);
+    match fs::remove_file(&path) {
+        Ok(()) => sync_dir(home),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow::Error::new(error)
+            .context(format!("removing the migration journal {}", path.display()))),
+    }
+}
+
+/// Remove a file, a symlink, or a whole tree; absence is success.
+fn remove_any(path: &Path) -> anyhow::Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(anyhow::Error::new(error)
+                .context(format!("inspecting {} for removal", path.display())))
+        }
+        Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir_all(path)
+            .with_context(|| format!("removing the directory {}", path.display())),
+        Ok(_) => fs::remove_file(path).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+/// Copy one legacy entry onto the destination filesystem under a staging
+/// name, fsyncing every file and every directory it creates.
+///
+/// R34F2: the old fallback was file-only, so a legacy DIRECTORY (the
+/// transcript index, anything beneath `~/.bro`) could not cross a filesystem
+/// boundary at all and the upgrade refused on every boot. It also synced only
+/// the copied file, never the directories holding the new names, so a crash
+/// could lose a name the rename had already published.
+fn stage_entry(source: &Path, stage: &Path) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("inspecting {} for staging", source.display()))?;
+    let file_type = metadata.file_type();
+    if file_type.is_dir() {
+        fs::create_dir(stage)
+            .with_context(|| format!("creating the staging directory {}", stage.display()))?;
+        for entry in fs::read_dir(source)
+            .with_context(|| format!("reading the legacy directory {}", source.display()))?
+        {
+            let entry = entry
+                .with_context(|| format!("reading the legacy directory {}", source.display()))?;
+            stage_entry(&entry.path(), &stage.join(entry.file_name()))?;
+        }
+        fs::set_permissions(stage, metadata.permissions())
+            .with_context(|| format!("setting permissions on the staged {}", stage.display()))?;
+        // The children are durable before the parent name is published.
+        sync_dir(stage)?;
+    } else if file_type.is_file() {
+        let mut reader = fs::File::open(source)
+            .with_context(|| format!("opening the legacy file {}", source.display()))?;
+        let mut writer = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(stage)
+            .with_context(|| format!("creating the staged file {}", stage.display()))?;
+        std::io::copy(&mut reader, &mut writer)
+            .with_context(|| format!("copying {} to {}", source.display(), stage.display()))?;
+        writer
+            .set_permissions(metadata.permissions())
+            .with_context(|| format!("setting permissions on the staged {}", stage.display()))?;
+        writer
+            .sync_all()
+            .with_context(|| format!("fsync the staged {}", stage.display()))?;
+    } else if file_type.is_symlink() {
+        stage_symlink(source, stage)?;
+    } else {
+        anyhow::bail!(
+            "cannot migrate {}: it is neither a file, a directory, nor a symlink",
+            source.display()
+        );
+    }
     Ok(())
 }
 
-pub fn migrate_legacy_file(old: &Path, new: &Path) -> anyhow::Result<LegacyMove> {
+#[cfg(unix)]
+fn stage_symlink(source: &Path, stage: &Path) -> anyhow::Result<()> {
+    let target = fs::read_link(source)
+        .with_context(|| format!("reading the legacy symlink {}", source.display()))?;
+    std::os::unix::fs::symlink(&target, stage)
+        .with_context(|| format!("staging the symlink {}", stage.display()))
+}
+
+#[cfg(not(unix))]
+fn stage_symlink(source: &Path, _stage: &Path) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "cannot migrate the symlink {} across filesystems on this platform",
+        source.display()
+    )
+}
+
+/// Move one legacy entry into its destination as a recoverable transaction.
+///
+/// The ordering is the contract (R34F2). The journal records the intent
+/// before either name is touched; the staged copy is durable before it is
+/// published; the destination name is durable before publication is recorded;
+/// publication is recorded before the source is deleted; the source parent is
+/// durable before the journal is cleared. Every boundary between those steps
+/// is recoverable by [`recover_legacy_migration`].
+pub fn migrate_legacy_entry(home: &Path, old: &Path, new: &Path) -> anyhow::Result<LegacyMove> {
     if inspect(old, LegacyMigrationFault::InspectSource)?.is_none() {
         return Ok(LegacyMove::SkippedMissing {
             old: old.to_path_buf(),
@@ -226,34 +442,146 @@ pub fn migrate_legacy_file(old: &Path, new: &Path) -> anyhow::Result<LegacyMove>
         });
     }
 
-    if let Some(parent) = new.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let destination_parent = new
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let source_parent = old
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    fs::create_dir_all(&destination_parent).with_context(|| {
+        format!(
+            "creating the migration destination directory {}",
+            destination_parent.display()
+        )
+    })?;
 
-    // Try atomic rename first
-    if let Err(e) = fs::rename(old, new) {
-        if is_cross_device(&e) {
-            // EXDEV: Cross-device link
-            migrate_legacy_file_across_devices(old, new).map_err(|error| {
-                error.context(format!(
-                    "failed to copy {} to {}",
-                    old.display(),
-                    new.display()
-                ))
+    let mut record = MigrationRecord {
+        version: MIGRATION_RECORD_VERSION,
+        source: old.to_path_buf(),
+        destination: new.to_path_buf(),
+        stage: cross_device_temp_path(new),
+        mode: MigrationMode::Rename,
+        phase: MigrationPhase::Prepared,
+    };
+    // Durable BEFORE either name is touched: a crash from here on leaves a
+    // record the next holder of the claim can finish or roll back.
+    write_record(home, &record)?;
+
+    // A same-filesystem rename publishes and closes out the source in one
+    // atomic step; anything else has to stage.
+    let published = if injected_errno(LegacyMigrationFault::RenameCrossDevice).is_some() {
+        Err(std::io::Error::from_raw_os_error(EXDEV))
+    } else {
+        fs::rename(old, new)
+    };
+    match published {
+        Ok(()) => {}
+        Err(error) if is_cross_device(&error) => {
+            record.mode = MigrationMode::Stage;
+            write_record(home, &record)?;
+            // Debris from an interrupted earlier attempt is overwritten, never
+            // adopted.
+            remove_any(&record.stage)?;
+            stage_entry(old, &record.stage)
+                .with_context(|| format!("staging {} for {}", old.display(), new.display()))?;
+            // The staged tree is durable under its own name before publishing.
+            sync_dir(&destination_parent)?;
+            checkpoint(LegacyMigrationFault::AfterStage, &record.stage)?;
+            fs::rename(&record.stage, new).with_context(|| {
+                format!("publishing {} as {}", record.stage.display(), new.display())
             })?;
-        } else {
-            return Err(anyhow::anyhow!(e).context(format!(
+        }
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context(format!(
                 "failed to move {} to {}",
                 old.display(),
                 new.display()
             )));
         }
     }
+    // The destination name is durable.
+    sync_dir(&destination_parent)?;
+    checkpoint(LegacyMigrationFault::AfterPublish, new)?;
 
+    // Publication is recorded BEFORE the source is deleted, so a crash in the
+    // window below can only roll forward.
+    record.phase = MigrationPhase::Published;
+    write_record(home, &record)?;
+    checkpoint(LegacyMigrationFault::AfterPublishRecorded, new)?;
+
+    // A rename already consumed the source; a staged publish has not.
+    remove_any(old)?;
+    sync_dir_if_present(&source_parent)?;
+    checkpoint(LegacyMigrationFault::AfterSourceRemoved, old)?;
+
+    clear_record(home)?;
     Ok(LegacyMove::Moved {
         old: old.to_path_buf(),
         new: new.to_path_buf(),
     })
+}
+
+/// Finish or roll back the transaction an earlier run left in flight.
+///
+/// Runs under the legacy source claim, before any fresh migration, so exactly
+/// one process is ever deciding the fate of a pending record.
+pub fn recover_legacy_migration(home: &Path) -> anyhow::Result<Vec<String>> {
+    let Some(mut record) = read_record(home)? else {
+        return Ok(Vec::new());
+    };
+
+    let destination_parent = record
+        .destination
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    if record.phase == MigrationPhase::Prepared {
+        // The destination can only exist here because THIS transaction
+        // published it: the entry is only recorded once its destination has
+        // been inspected and found absent.
+        if inspect(
+            &record.destination,
+            LegacyMigrationFault::InspectDestination,
+        )?
+        .is_some()
+        {
+            record.phase = MigrationPhase::Published;
+            write_record(home, &record)?;
+        } else {
+            // Nothing was published; the source is still the authority. Drop
+            // the staged debris and let the ordinary pass migrate it again.
+            remove_any(&record.stage)?;
+            sync_dir_if_present(&destination_parent)?;
+            clear_record(home)?;
+            return Ok(vec![format!(
+                "recovered: rolled back an unpublished migration of {} to {}",
+                record.source.display(),
+                record.destination.display()
+            )]);
+        }
+    }
+
+    // Published: the destination is the authority, so roll forward. This is
+    // what stops a second, differently-rooted daemon from finding a stale
+    // source next to a committed destination and migrating it again.
+    remove_any(&record.stage)?;
+    sync_dir_if_present(&destination_parent)?;
+    remove_any(&record.source)?;
+    let source_parent = record
+        .source
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    sync_dir_if_present(&source_parent)?;
+    clear_record(home)?;
+    Ok(vec![format!(
+        "recovered: {} -> {} (finished an interrupted migration)",
+        record.source.display(),
+        record.destination.display()
+    )])
 }
 
 /// The name of the advisory lock guarding the one-time legacy migration,
@@ -355,7 +683,10 @@ pub fn migrate_legacy_defaults(
         return Ok(Vec::new());
     };
 
-    let mut moved = Vec::new();
+    // R34F2: finish whatever an interrupted earlier run left in flight before
+    // starting anything new. Recovery runs under the same claim, so exactly
+    // one process ever decides a pending record's fate.
+    let mut moved = recover_legacy_migration(home)?;
 
     for (label, old, new) in [
         (
@@ -384,7 +715,7 @@ pub fn migrate_legacy_defaults(
             destinations.global_common_md.clone(),
         ),
     ] {
-        if let LegacyMove::Moved { old, new } = migrate_legacy_file(&old, &new)? {
+        if let LegacyMove::Moved { old, new } = migrate_legacy_entry(home, &old, &new)? {
             moved.push(format!("{label}: {} -> {}", old.display(), new.display()));
         }
     }
@@ -395,14 +726,22 @@ pub fn migrate_legacy_defaults(
     let old_bro_is_dir = inspect(&old_bro, LegacyMigrationFault::InspectBroSource)?
         .is_some_and(|metadata| metadata.is_dir());
     if old_bro_is_dir {
-        for entry in fs::read_dir(&old_bro)? {
-            let entry = entry?;
-            let old_path = entry.path();
+        // Collect first: each migration below removes its source, and reading
+        // a directory while deleting from it has unspecified results.
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(&old_bro)
+            .with_context(|| format!("reading the legacy directory {}", old_bro.display()))?
+        {
+            let entry = entry
+                .with_context(|| format!("reading the legacy directory {}", old_bro.display()))?;
+            entries.push(entry.path());
+        }
+        for old_path in entries {
             let name = old_path
                 .file_name()
                 .ok_or_else(|| anyhow::anyhow!("invalid file name"))?;
             let new_path = new_bro.join(name);
-            match migrate_legacy_file(&old_path, &new_path)? {
+            match migrate_legacy_entry(home, &old_path, &new_path)? {
                 LegacyMove::Moved { old, new } => {
                     moved.push(format!("bro: {} -> {}", old.display(), new.display()));
                 }
@@ -469,6 +808,9 @@ mod tests {
 
     #[test]
     fn migrates_legacy_defaults_when_new_targets_absent() {
+        // No faults, but hold the seam's lock so a concurrently-armed test in a
+        // single-process `cargo test` run cannot leak a fault into this one.
+        let _faults = arm_legacy_migration_faults(&[]);
         let dir = tempdir().unwrap();
         let home = dir.path().canonicalize().unwrap();
         write_legacy_tree(&home);
@@ -505,6 +847,7 @@ mod tests {
     /// one production-default path neither had claimed.
     #[test]
     fn two_config_isolated_daemons_sharing_one_home_migrate_the_sources_once() {
+        let _faults = arm_legacy_migration_faults(&[]);
         let dir = tempdir().unwrap();
         let home = dir.path().canonicalize().unwrap();
         write_legacy_tree(&home);
@@ -547,8 +890,7 @@ mod tests {
     /// R33F2. An interrupted cross-device copy must never be mistaken for the
     /// migrated authority: the copy lands on a temporary name and is renamed
     /// into place, so debris at the temporary path is overwritten rather than
-    /// adopted. Asserted through the naming rather than by injecting a real
-    /// device boundary.
+    /// adopted.
     #[test]
     fn a_cross_device_copy_stages_under_a_temporary_name() {
         let dir = tempdir().unwrap();
@@ -573,13 +915,235 @@ mod tests {
             "a partial copy is never named as the authority"
         );
 
-        migrate_legacy_file_across_devices(&old, &new).unwrap();
+        let _faults =
+            arm_legacy_migration_faults(&[(LegacyMigrationFault::RenameCrossDevice, INJECTED_EIO)]);
+        migrate_legacy_entry(&home, &old, &new).unwrap();
         assert_eq!(fs::read_to_string(&new).unwrap(), "legacy body");
         assert!(
             !temp.exists(),
             "the staging name does not survive the rename"
         );
         assert!(!old.exists(), "the source is removed only after the rename");
+        assert!(
+            !legacy_migration_journal_path(&home).exists(),
+            "a completed transaction clears its journal"
+        );
+    }
+
+    /// A legacy tree holding only the transcript index, so a fault lands on a
+    /// DIRECTORY migration rather than on one of the JSON files ahead of it.
+    fn write_legacy_index_only(home: &Path) {
+        let old_shared = home.join(".claude-shared");
+        let index = old_shared.join("transcript-index");
+        fs::create_dir_all(index.join("segments")).unwrap();
+        fs::write(index.join("meta.json"), "{\"generation\":7}").unwrap();
+        fs::write(index.join("segments").join("0.store"), "segment bytes").unwrap();
+    }
+
+    fn assert_index_arrived(index: &Path) {
+        assert_eq!(
+            fs::read_to_string(index.join("meta.json")).unwrap(),
+            "{\"generation\":7}"
+        );
+        assert_eq!(
+            fs::read_to_string(index.join("segments").join("0.store")).unwrap(),
+            "segment bytes"
+        );
+    }
+
+    /// R34F2. The old fallback was file-only, so a legacy DIRECTORY could not
+    /// cross a filesystem boundary at all: the EXDEV branch opened the
+    /// directory as a file and the upgrade refused on every single boot. The
+    /// staged path has to carry whole trees.
+    #[test]
+    fn a_cross_device_directory_migration_publishes_the_whole_tree() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        write_legacy_index_only(&home);
+        let state = home.join("state");
+        let destinations = fixture_destinations(&state, &home);
+
+        let _faults =
+            arm_legacy_migration_faults(&[(LegacyMigrationFault::RenameCrossDevice, INJECTED_EIO)]);
+        let moved = migrate_legacy_defaults(&home, &destinations).unwrap();
+        assert!(
+            moved.iter().any(|line| line.starts_with("index:")),
+            "the directory migrated: {moved:?}"
+        );
+
+        assert_index_arrived(&destinations.index_path);
+        assert!(
+            !home
+                .join(".claude-shared")
+                .join("transcript-index")
+                .exists(),
+            "the legacy tree is removed once the destination is durable"
+        );
+        assert!(
+            !cross_device_temp_path(&destinations.index_path).exists(),
+            "no staging debris survives"
+        );
+        assert!(!legacy_migration_journal_path(&home).exists());
+    }
+
+    /// R34F2. A crash BEFORE publication leaves the source authoritative. The
+    /// next startup must roll the staged debris back and migrate again, not
+    /// adopt a partial tree.
+    #[test]
+    fn an_interruption_before_publication_rolls_back_and_migrates_on_the_next_run() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        write_legacy_index_only(&home);
+        let state = home.join("state");
+        let destinations = fixture_destinations(&state, &home);
+        let stage = cross_device_temp_path(&destinations.index_path);
+
+        let faults = arm_legacy_migration_faults(&[
+            (LegacyMigrationFault::RenameCrossDevice, INJECTED_EIO),
+            (LegacyMigrationFault::AfterStage, INJECTED_EIO),
+        ]);
+        migrate_legacy_defaults(&home, &destinations)
+            .expect_err("the interrupted migration must refuse");
+        assert!(
+            !destinations.index_path.exists(),
+            "nothing was published, so the destination name does not exist"
+        );
+        assert!(stage.exists(), "the staged tree is the interruption debris");
+        assert!(
+            legacy_migration_journal_path(&home).exists(),
+            "the pending transaction is recorded"
+        );
+        assert_index_arrived(&home.join(".claude-shared").join("transcript-index"));
+        drop(faults);
+
+        let _retry =
+            arm_legacy_migration_faults(&[(LegacyMigrationFault::RenameCrossDevice, INJECTED_EIO)]);
+        let moved = migrate_legacy_defaults(&home, &destinations).unwrap();
+        assert!(
+            moved.iter().any(|line| line.starts_with("recovered:")),
+            "the interrupted transaction is identified: {moved:?}"
+        );
+        assert!(
+            moved.iter().any(|line| line.starts_with("index:")),
+            "and the migration completes: {moved:?}"
+        );
+        assert_index_arrived(&destinations.index_path);
+        assert!(!stage.exists(), "the rolled-back debris is gone");
+        assert!(
+            !home
+                .join(".claude-shared")
+                .join("transcript-index")
+                .exists()
+        );
+        assert!(!legacy_migration_journal_path(&home).exists());
+    }
+
+    /// R34F2. A crash AFTER the destination rename but before the source was
+    /// removed used to leave both names, so a second, differently-rooted
+    /// daemon could migrate the stale source a second time and break
+    /// exactly-once destination selection. Recovery must roll FORWARD from a
+    /// durable destination, whichever side of the phase record the crash
+    /// landed on.
+    #[test]
+    fn an_interruption_after_publication_finishes_the_source_closeout() {
+        for (point, source_survives) in [
+            (LegacyMigrationFault::AfterPublish, true),
+            (LegacyMigrationFault::AfterPublishRecorded, true),
+            (LegacyMigrationFault::AfterSourceRemoved, false),
+        ] {
+            let dir = tempdir().unwrap();
+            let home = dir.path().canonicalize().unwrap();
+            write_legacy_index_only(&home);
+            let destinations = fixture_destinations(&home.join("state"), &home);
+            let legacy_index = home.join(".claude-shared").join("transcript-index");
+
+            let faults = arm_legacy_migration_faults(&[
+                (LegacyMigrationFault::RenameCrossDevice, INJECTED_EIO),
+                (point, INJECTED_EIO),
+            ]);
+            assert!(
+                migrate_legacy_defaults(&home, &destinations).is_err(),
+                "the interruption at {point:?} must refuse"
+            );
+            assert_index_arrived(&destinations.index_path);
+            assert_eq!(
+                legacy_index.exists(),
+                source_survives,
+                "the source state at {point:?} is what the interruption implies"
+            );
+            assert!(
+                legacy_migration_journal_path(&home).exists(),
+                "the interrupted transaction at {point:?} is recorded"
+            );
+            drop(faults);
+
+            // The next startup finds the record and rolls FORWARD: the
+            // destination is already the authority.
+            let moved = migrate_legacy_defaults(&home, &destinations).unwrap();
+            assert!(
+                moved.iter().any(|line| line.starts_with("recovered:")),
+                "{point:?} is finished by recovery: {moved:?}"
+            );
+            assert!(
+                !moved.iter().any(|line| line.starts_with("index:")),
+                "{point:?} must not migrate a second time: {moved:?}"
+            );
+            assert_index_arrived(&destinations.index_path);
+            assert!(
+                !legacy_index.exists(),
+                "{point:?} leaves no stale source behind"
+            );
+            assert!(
+                !cross_device_temp_path(&destinations.index_path).exists(),
+                "{point:?} leaves no staging debris"
+            );
+            assert!(
+                !legacy_migration_journal_path(&home).exists(),
+                "{point:?} clears the journal once the transaction is complete"
+            );
+        }
+    }
+
+    /// The second daemon in the R33F2 scenario, now crossing an interrupted
+    /// transaction: a stale source next to a committed destination must be
+    /// closed out by recovery, never migrated a second time into the other
+    /// daemon's roots.
+    #[test]
+    fn a_second_daemon_closes_out_an_interrupted_migration_instead_of_repeating_it() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        write_legacy_index_only(&home);
+        let first = fixture_destinations(&home.join("state-a"), &home);
+        let second = fixture_destinations(&home.join("state-b"), &home);
+        let legacy_index = home.join(".claude-shared").join("transcript-index");
+
+        let faults = arm_legacy_migration_faults(&[
+            (LegacyMigrationFault::RenameCrossDevice, INJECTED_EIO),
+            (LegacyMigrationFault::AfterPublish, INJECTED_EIO),
+        ]);
+        migrate_legacy_defaults(&home, &first).expect_err("the interrupted migration must refuse");
+        assert!(first.index_path.exists(), "the destination is published");
+        assert!(legacy_index.exists(), "the source is not yet closed out");
+        drop(faults);
+
+        // A differently-rooted daemon starts next. It must finish the FIRST
+        // daemon's transaction, not adopt the stale source.
+        let moved = migrate_legacy_defaults(&home, &second).unwrap();
+        assert!(
+            moved.iter().any(|line| line.starts_with("recovered:")),
+            "the interrupted transaction is finished: {moved:?}"
+        );
+        assert!(
+            !moved.iter().any(|line| line.starts_with("index:")),
+            "the stale source is never migrated a second time: {moved:?}"
+        );
+        assert_index_arrived(&first.index_path);
+        assert!(!legacy_index.exists(), "the stale source is closed out");
+        assert!(
+            !second.index_path.exists(),
+            "nothing landed in the second daemon's roots"
+        );
+        assert!(!legacy_migration_journal_path(&home).exists());
     }
 
     /// R34F1. `Path::exists()` collapses `EACCES` into `false`, so a legacy
@@ -707,6 +1271,7 @@ mod tests {
     #[test]
     fn util_migrate_legacy_file_skips_destination_exists() {
         let _guard = test_env_lock();
+        let _faults = arm_legacy_migration_faults(&[]);
         let dir = tempdir().unwrap();
         let home = dir.path();
         let old = home.join("old.txt");
@@ -714,7 +1279,7 @@ mod tests {
         fs::write(&old, "old").unwrap();
         fs::write(&new, "new").unwrap();
 
-        let res = migrate_legacy_file(&old, &new).unwrap();
+        let res = migrate_legacy_entry(home, &old, &new).unwrap();
         assert!(matches!(res, LegacyMove::SkippedDestinationExists { .. }));
         assert_eq!(fs::read_to_string(&old).unwrap(), "old");
         assert_eq!(fs::read_to_string(&new).unwrap(), "new");

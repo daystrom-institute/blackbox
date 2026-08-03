@@ -1319,8 +1319,27 @@ async fn main() -> Result<()> {
         let home = dirs::home_dir().context("home directory not found")?;
         let old = home.join(".bro").join("slack-identities.json");
         let new = cfg.paths.bro_home.join("slack-identities.json");
-        if old.exists() && !new.exists() {
-            let _ = bbox_util::util::migrate_legacy_file(&old, &new);
+        // R34F2: the move is a journaled transaction whose record lives beside
+        // the legacy source claim, so this sidecar has to take that claim like
+        // any other migrator. A contended claim means the daemon owns the move
+        // right now; skipping loses nothing, because the migration is
+        // one-time and idempotent.
+        match bbox_util::util::try_lock_legacy_migration(&home) {
+            Ok(Some(_claim)) => {
+                if let Err(error) =
+                    bbox_util::util::recover_legacy_migration(&home).and_then(|_| {
+                        bbox_util::util::migrate_legacy_entry(&home, &old, &new).map(|_| ())
+                    })
+                {
+                    tracing::warn!("legacy slack-identities migration skipped: {error:#}");
+                }
+            }
+            Ok(None) => tracing::info!(
+                "another process holds the legacy source; skipping the slack-identities migration"
+            ),
+            Err(error) => {
+                tracing::warn!("could not claim the legacy source: {error:#}");
+            }
         }
         new
     };

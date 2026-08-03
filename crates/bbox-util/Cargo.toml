@@ -13,6 +13,9 @@ anyhow = "1"
 # idiom as the daemon's instance lock.
 fs2 = "0.4"
 bbox-corpus-core = { path = "../bbox-corpus-core" }
+# The cross-filesystem migration journal (R34F2) is a small durable record.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tracing = "0.1"
 tokio = { version = "1", features = ["full"] }
 tempfile = "3"

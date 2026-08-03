@@ -31,9 +31,21 @@
   Its SOURCE (`~/.claude-shared`, `~/.bro`) belongs to no daemon, so
   `migrate_legacy_defaults` takes a non-blocking claim on
   `<home>/.blackbox-legacy-migration.lock` and SKIPS the migration when it
-  loses; the winner did it or will. The cross-device fallback copies to
-  `<dest>.migrating.tmp` and renames, so an interrupted copy is never named as
-  the authority.
+  loses; the winner did it or will.
+- Every probe in that migration is fallible: only `NotFound` means absent, and
+  any other inspection error refuses startup BEFORE a destination is created.
+  `Path::exists()`/`is_dir()` collapse `EACCES`/`EIO` into `false`, which made
+  a transient failure look like "already migrated" and permanently stranded
+  the legacy source on the next boot.
+- Each entry moves as a recoverable transaction journaled at
+  `<home>/.blackbox-legacy-migration.journal`, beside the source claim (the
+  one object every daemon shares). Files AND directory trees stage at
+  `<dest>.migrating.tmp` with their contents and directories fsynced, publish
+  by rename, record publication BEFORE the source is deleted, then fsync the
+  source parent. `recover_legacy_migration` runs first under the claim and
+  either rolls back an unpublished stage or finishes a published one, so a
+  crash mid-move cannot leave a committed destination next to a stale source
+  for a differently-rooted daemon to migrate again.
 - The vector store is one config-resolved root (`paths.vectors_path`), not a
   derivation. The runtime store, the background embed lane, the migration
   inventory, the retirement discharge and reprobe, and history materialization
