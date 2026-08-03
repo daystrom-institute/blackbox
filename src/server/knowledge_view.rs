@@ -694,6 +694,47 @@ impl BlackboxServer {
         snapshot
     }
 
+    /// Reconverge the published knowledge index for one catalog project
+    /// after its accepted content moved (plan section 7.3 step 19).
+    ///
+    /// The convergence is bounded: one scope replacement built from the
+    /// project's own view, enqueued on the single index writer. Failure is
+    /// degradation, not corruption, so it warns rather than propagating:
+    /// the pointer and the projected caches are already correct, and the
+    /// next reindex pass reconciles the search index.
+    ///
+    /// The gap lane has no counterpart on purpose. Gaps are not tantivy
+    /// documents; `session_gap_view` reads them live from accepted content
+    /// through the projection caches, so invalidating those caches IS the
+    /// gap lane's convergence and there is no index to replace.
+    pub(crate) fn converge_published_knowledge_index(&self, project_id: &ProjectId) {
+        let Some(runtime) = &self.state.accepted_publications else {
+            return;
+        };
+        let scope = match runtime.load_verified(project_id) {
+            Ok(verified) => verified.content_stamp().accepted_scope().clone(),
+            Err(error) => {
+                // No verified content to converge to. A project whose
+                // publication is missing or corrupt keeps whatever the
+                // index already holds; clearing it here would delete rows
+                // a Prior fallback may still be serving.
+                tracing::warn!(
+                    project_id = %project_id,
+                    code = error.code(),
+                    "published index convergence skipped: no verified accepted content"
+                );
+                return;
+            }
+        };
+        if let Err(error) = self.sync_knowledge_scope_to_index(&scope, project_id.as_str()) {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %error,
+                "published index convergence failed; the next reindex pass reconciles it"
+            );
+        }
+    }
+
     /// Drop every catalog-side cache derived from one project's accepted
     /// content. Advance calls this; rebind must not, because a binding
     /// change leaves accepted content identical.

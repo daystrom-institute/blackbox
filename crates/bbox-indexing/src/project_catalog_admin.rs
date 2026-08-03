@@ -834,6 +834,46 @@ pub struct PublisherPublishRequest {
     pub dry_run: bool,
 }
 
+/// Read-only authority preflight for a publish (plan §7.2 steps 1 to 3).
+///
+/// Catalog authority is decided BEFORE the caller opens a checkout. A
+/// request that fails here has proved nothing about the repository and
+/// must not cause the daemon to resolve a ref, read committed trees, or
+/// load source lanes: a denied caller learns only that it was denied.
+///
+/// It returns the catalog's current published scope, which the caller
+/// needs in order to read committed sources at the right `.bbox` root.
+pub fn preflight_publish_authority(
+    store: &ProjectCatalogStore,
+    expected_epoch: u64,
+    project_id: &ProjectId,
+    attachment_id: &AttachmentId,
+) -> std::result::Result<PublishedScope, PublishError> {
+    let state = store
+        .snapshot()
+        .map_err(|error| PublishError::refusal(error.code(), error.to_string()))?;
+    if state.epoch() != expected_epoch {
+        return Err(PublishError::refusal(
+            "error.project_catalog_stale_epoch",
+            "expected epoch does not match the current catalog epoch",
+        ));
+    }
+    let Some(project) = state.catalog().projects.get(project_id) else {
+        return Err(PublishError::refusal(
+            "error.project_catalog_admin_unknown_project",
+            "the requested project is not in the catalog",
+        ));
+    };
+    let ProjectScope::Published(catalog_scope) = &project.scope else {
+        return Err(PublishError::refusal(
+            "error.project_catalog_admin_scope_required",
+            "a legacy-local project has no published scope to publish at",
+        ));
+    };
+    validate_publisher_attachment(&state, project_id, attachment_id, catalog_scope)?;
+    Ok(catalog_scope.clone())
+}
+
 /// Establish or advance one project's accepted publication.
 ///
 /// Ordering is the whole safety argument. Catalog and attachment
@@ -850,32 +890,14 @@ pub fn publish_accepted_publication(
     request: &PublisherPublishRequest,
     probe: PublisherPublishProbe,
 ) -> std::result::Result<PublishReceipt, PublishError> {
-    let state = store
-        .snapshot()
-        .map_err(|error| PublishError::refusal(error.code(), error.to_string()))?;
-    if state.epoch() != request.expected_epoch {
-        return Err(PublishError::refusal(
-            "error.project_catalog_stale_epoch",
-            "expected epoch does not match the current catalog epoch",
-        ));
-    }
-    let Some(project) = state.catalog().projects.get(&request.project_id) else {
-        return Err(PublishError::refusal(
-            "error.project_catalog_admin_unknown_project",
-            "the requested project is not in the catalog",
-        ));
-    };
-    let ProjectScope::Published(catalog_scope) = &project.scope else {
-        return Err(PublishError::refusal(
-            "error.project_catalog_admin_scope_required",
-            "a legacy-local project has no published scope to publish at",
-        ));
-    };
-    validate_publisher_attachment(
-        &state,
+    // The same gates the caller's preflight ran, re-read here: a preflight
+    // is an early refusal that saves checkout work, never the authority of
+    // record for the mutation.
+    let catalog_scope = &preflight_publish_authority(
+        store,
+        request.expected_epoch,
         &request.project_id,
         &request.attachment_id,
-        catalog_scope,
     )?;
     // The committed identity at the accepted commit must agree with the
     // catalog's CURRENT scope. That is what makes an advance the operation
@@ -1017,13 +1039,6 @@ pub fn bind_publisher_attachment(
         acquire_accepted_publication_lock, rebind_pointer_attachment_locked,
     };
 
-    if !probe.accepted_commit_present {
-        return Err(admin_error(
-            "error.project_catalog_admin_commit_not_present",
-            "the new attachment's object database does not contain the accepted \
-             commit; fetch it before rebinding",
-        ));
-    }
     let paths = AcceptedPublicationStorePaths::derive(projects_path)
         .map_err(|error| admin_error(error.code(), "publication paths are invalid"))?;
     let guard = acquire_accepted_publication_lock(&paths)
@@ -1076,6 +1091,17 @@ pub fn bind_publisher_attachment(
             ERROR_ACCEPTED_PUBLICATION_SCOPE_ADVANCE_REQUIRED,
             "the accepted scope predates the catalog's current published scope; advance at the \
              current scope before rebinding",
+        ));
+    }
+    // Containment is checked AFTER the bridge, deliberately. While a bridge
+    // is open no rebind can succeed at any attachment, so fetching the
+    // accepted commit into this checkout would be work chasing the wrong
+    // refusal. Every open bridge points at new-scope advance.
+    if !probe.accepted_commit_present {
+        return Err(admin_error(
+            "error.project_catalog_admin_commit_not_present",
+            "the new attachment's object database does not contain the accepted \
+             commit; fetch it before rebinding",
         ));
     }
     // Freshness recheck immediately before the swap: catalog transactions
@@ -7361,22 +7387,28 @@ mod publisher_publish_tests {
         fixture.migrate_scope(&migrated);
 
         // Bind refuses while the bridge is open: attachment-only rebind
-        // cannot move a pointer to a new scope.
-        let bind = bind_publisher_attachment(
-            &fixture.store,
-            &fixture.projects_path,
-            fixture.epoch(),
-            &project_id(),
-            &attachment_id(ATTACHMENT),
-            &PublisherBindProbe {
-                accepted_commit_present: true,
-            },
-        )
-        .unwrap_err();
-        assert_eq!(
-            bind.code(),
-            ERROR_ACCEPTED_PUBLICATION_SCOPE_ADVANCE_REQUIRED
-        );
+        // cannot move a pointer to a new scope. It refuses the same way
+        // whether or not the attachment already contains the accepted
+        // commit, because fetching that commit would not make the rebind
+        // possible; only a new-scope advance closes the bridge.
+        for accepted_commit_present in [true, false] {
+            let bind = bind_publisher_attachment(
+                &fixture.store,
+                &fixture.projects_path,
+                fixture.epoch(),
+                &project_id(),
+                &attachment_id(ATTACHMENT),
+                &PublisherBindProbe {
+                    accepted_commit_present,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(
+                bind.code(),
+                ERROR_ACCEPTED_PUBLICATION_SCOPE_ADVANCE_REQUIRED,
+                "commit_present={accepted_commit_present}"
+            );
+        }
 
         // The old accepted content still serves, under its own scope.
         let before = fixture.runtime.load_verified(&project_id()).unwrap();
@@ -7479,6 +7511,28 @@ mod publisher_publish_tests {
         assert_eq!(
             state.attachments().attachments.get(&bound).unwrap().status,
             AttachmentStatus::Detached
+        );
+    }
+
+    #[test]
+    fn without_a_bridge_bind_still_requires_the_accepted_commit() {
+        let fixture = fixture();
+        fixture.establish(COMMIT_ONE).unwrap();
+
+        let error = bind_publisher_attachment(
+            &fixture.store,
+            &fixture.projects_path,
+            fixture.epoch(),
+            &project_id(),
+            &attachment_id(ATTACHMENT),
+            &PublisherBindProbe {
+                accepted_commit_present: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_admin_commit_not_present"
         );
     }
 

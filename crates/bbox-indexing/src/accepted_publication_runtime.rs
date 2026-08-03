@@ -579,18 +579,91 @@ pub struct PublishRequest {
     pub dry_run: bool,
 }
 
+/// Generations that are durably installed but not yet named by any
+/// pointer (plan §7.8, the in-flight root class).
+///
+/// A preparation writes its generation before the pointer moves, so
+/// between those two moments the file is referenced by nothing on disk. A
+/// collector reading only pointer arms would be free to remove it. The
+/// registry is refcounted because two preparations can legitimately
+/// produce one content id.
+#[derive(Debug, Default)]
+struct InFlightGenerations {
+    roots: RwLock<BTreeMap<ProjectId, BTreeMap<String, usize>>>,
+}
+
+impl InFlightGenerations {
+    fn acquire(
+        self: &Arc<Self>,
+        project_id: ProjectId,
+        generation_id: String,
+    ) -> InFlightGenerationGuard {
+        *self
+            .roots
+            .write()
+            .entry(project_id.clone())
+            .or_default()
+            .entry(generation_id.clone())
+            .or_insert(0) += 1;
+        InFlightGenerationGuard {
+            registry: Arc::clone(self),
+            project_id,
+            generation_id,
+        }
+    }
+
+    fn extend_into(&self, project_id: &ProjectId, roots: &mut BTreeSet<String>) {
+        if let Some(in_flight) = self.roots.read().get(project_id) {
+            roots.extend(in_flight.keys().cloned());
+        }
+    }
+}
+
+/// Holds one in-flight root for as long as its preparation is alive.
+/// Dropping the preparation, committed or abandoned, releases it: after a
+/// commit the pointer names the generation, and after an abandonment
+/// nothing does.
+#[derive(Debug)]
+struct InFlightGenerationGuard {
+    registry: Arc<InFlightGenerations>,
+    project_id: ProjectId,
+    generation_id: String,
+}
+
+impl Drop for InFlightGenerationGuard {
+    fn drop(&mut self) {
+        let mut roots = self.registry.roots.write();
+        let Some(project) = roots.get_mut(&self.project_id) else {
+            return;
+        };
+        if let Some(count) = project.get_mut(&self.generation_id) {
+            *count -= 1;
+            if *count == 0 {
+                project.remove(&self.generation_id);
+            }
+        }
+        if project.is_empty() {
+            roots.remove(&self.project_id);
+        }
+    }
+}
+
 /// The off-lock preparation result (plan §6.6).
 ///
 /// It carries no durable mutation receipt. For a real run the generation
 /// bytes are already installed when this exists; for a dry run nothing has
 /// been written and `commit_publish` refuses it.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PreparedPublish {
     project_id: ProjectId,
     expectation: PointerExpectationV1,
     prepared: PreparedAcceptedPublicationV1,
     generation_installed: bool,
     dry_run: bool,
+    /// Keeps the installed generation collectable-proof until this handle
+    /// is committed or dropped. `None` for a dry run, which installs
+    /// nothing.
+    _in_flight: Option<InFlightGenerationGuard>,
 }
 
 impl PreparedPublish {
@@ -681,6 +754,7 @@ impl PublishReceipt {
 pub struct PublishError {
     code: String,
     detail: String,
+    may_have_swapped: bool,
 }
 
 impl PublishError {
@@ -695,6 +769,7 @@ impl PublishError {
                 .map(|ch| if ch.is_control() { ' ' } else { ch })
                 .take(512)
                 .collect(),
+            may_have_swapped: false,
         }
     }
 
@@ -704,6 +779,22 @@ impl PublishError {
 
     pub fn detail(&self) -> &str {
         &self.detail
+    }
+
+    /// True when this failure was raised at or after the atomic pointer
+    /// replacement, so the installed pointer may be the new one.
+    ///
+    /// A caller holding derived state must reverify and reconverge on this,
+    /// exactly as it would after a success. Read-back failure is the case
+    /// that matters: the swap is durable and the transaction still reports
+    /// an error.
+    pub fn may_have_swapped(&self) -> bool {
+        self.may_have_swapped
+    }
+
+    fn with_swap_uncertainty(mut self, may_have_swapped: bool) -> Self {
+        self.may_have_swapped = may_have_swapped;
+        self
     }
 }
 
@@ -758,6 +849,7 @@ pub struct AcceptedPublicationRuntime {
     /// Test-only interruption hook for the publish transaction. Production
     /// leaves it `None`.
     faults: Option<Arc<dyn AcceptedPublicationFaultInjector>>,
+    in_flight: Arc<InFlightGenerations>,
 }
 
 impl AcceptedPublicationRuntime {
@@ -782,6 +874,7 @@ impl AcceptedPublicationRuntime {
             limits: AcceptedPublicationLimits::default(),
             cache: RwLock::new(BTreeMap::new()),
             faults: None,
+            in_flight: Arc::new(InFlightGenerations::default()),
         })
     }
 
@@ -899,6 +992,9 @@ impl AcceptedPublicationRuntime {
             {
                 roots.insert(pinned.stamp.generation_id.clone());
             }
+            // Installed-but-uncommitted preparations are referenced by no
+            // pointer yet and must survive collection anyway.
+            self.in_flight.extend_into(&project_id, &mut roots);
             protected.roots.insert(project_id, roots);
         }
         Ok(protected)
@@ -997,8 +1093,16 @@ impl AcceptedPublicationRuntime {
                 prepared,
                 generation_installed: false,
                 dry_run: true,
+                _in_flight: None,
             });
         }
+        // Register the root BEFORE the write: a collector that reads roots
+        // between the write and the registration would see an unreferenced
+        // file, which is the exact window this class of root exists for.
+        let in_flight = self.in_flight.acquire(
+            request.project_id.clone(),
+            prepared.generation_id.as_str().to_string(),
+        );
         let outcome = install_generation_off_lock(
             &self.paths,
             &request.project_id,
@@ -1011,6 +1115,7 @@ impl AcceptedPublicationRuntime {
             prepared,
             generation_installed: outcome.created,
             dry_run: false,
+            _in_flight: Some(in_flight),
         })
     }
 
@@ -1038,6 +1143,7 @@ impl AcceptedPublicationRuntime {
         }
         let guard = self.lock()?;
         let mut refusal: Option<PublishError> = None;
+        let mut swap_attempted = false;
         let receipt = commit_pointer_locked(
             &self.paths,
             &guard,
@@ -1058,14 +1164,24 @@ impl AcceptedPublicationRuntime {
                     ))
                 }
             },
+            &mut swap_attempted,
         );
         drop(guard);
+        // Invalidate on ANY outcome that reached the swap, not just success.
+        // A read-back failure leaves the new pointer durably installed while
+        // reporting an error, and a runtime that kept serving its cached
+        // content would serve a generation the store no longer points at.
+        if swap_attempted {
+            self.invalidate_content(&prepared.project_id);
+        }
         let receipt = match receipt {
             Ok(receipt) => receipt,
-            Err(error) => return Err(refusal.unwrap_or_else(|| error.into())),
+            Err(error) => {
+                return Err(refusal
+                    .unwrap_or_else(|| error.into())
+                    .with_swap_uncertainty(swap_attempted));
+            }
         };
-        // Content identity changed, so every projection of it is stale.
-        self.invalidate_content(&prepared.project_id);
         Ok(PublishReceipt {
             generation_id: receipt.generation_id.as_str().to_string(),
             generation_hash: prepared.prepared.generation_hash.as_str().to_string(),
@@ -2487,6 +2603,122 @@ mod tests {
                 .selection(),
             AcceptedPublicationSelection::Prior
         );
+    }
+
+    #[test]
+    fn a_live_runtime_reverifies_after_a_failure_that_reached_the_swap() {
+        let fixture = fixture();
+        let project_id = project("p_stale_cache");
+        let runtime = fixture.runtime();
+        run_publish(
+            &runtime,
+            establish_request(&project_id, COMMIT_ONE),
+            "first",
+        )
+        .unwrap();
+        // Prewarm THIS runtime: the cached content is the first generation.
+        let before = runtime.load_verified(&project_id).unwrap();
+        assert_eq!(before.content_stamp().accepted_commit(), COMMIT_ONE);
+
+        let tokens = runtime.advance_tokens(&project_id).unwrap().unwrap();
+        let mut runtime = runtime;
+        let prepared = runtime
+            .prepare_publish(
+                advance_request(&project_id, COMMIT_TWO, tokens),
+                sources("second"),
+            )
+            .unwrap();
+        let generation_path = fixture.paths.generation(
+            &project_id,
+            &AcceptedPublicationGenerationId::parse(prepared.generation_id().to_string()).unwrap(),
+        );
+        // Damage the new generation between the durable swap and read-back.
+        runtime.install_fault_injector_for_test(StdArc::new(FailAt {
+            point: AcceptedPublicationFaultPoint::AfterPointerSwap,
+            corrupt_generation: std::sync::Mutex::new(Some((
+                generation_path,
+                String::from("corrupt"),
+            ))),
+        }));
+        let error = runtime
+            .commit_publish(prepared, &mut || Ok(()))
+            .unwrap_err();
+        assert!(
+            error.may_have_swapped(),
+            "a read-back failure happens after a durable swap"
+        );
+
+        // The same runtime must not keep serving the generation the
+        // pointer no longer names. It reverifies and finds the installed
+        // pointer serving its prior arm.
+        let after = runtime.load_verified(&project_id).unwrap();
+        assert_eq!(
+            after.binding_stamp().selection(),
+            AcceptedPublicationSelection::Prior
+        );
+        assert_ne!(
+            before.binding_stamp().pointer_sha256(),
+            after.binding_stamp().pointer_sha256(),
+            "the installed pointer is the new one even though the commit reported failure"
+        );
+    }
+
+    #[test]
+    fn an_installed_but_uncommitted_generation_is_a_protected_root() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let project_id = project("p_inflight");
+        run_publish(
+            &runtime,
+            establish_request(&project_id, COMMIT_ONE),
+            "first",
+        )
+        .unwrap();
+        let tokens = runtime.advance_tokens(&project_id).unwrap().unwrap();
+
+        let prepared = runtime
+            .prepare_publish(
+                advance_request(&project_id, COMMIT_TWO, tokens),
+                sources("second"),
+            )
+            .unwrap();
+        // Durably installed, named by no pointer yet: exactly the window a
+        // collector reading only pointer arms would free.
+        let in_flight = prepared.generation_id().to_string();
+        let roots = runtime
+            .protected_generation_roots([project_id.clone()])
+            .unwrap();
+        assert!(
+            roots.protects(&project_id, &in_flight),
+            "an installed preparation must survive collection"
+        );
+
+        // Abandoning the preparation releases the root: nothing references
+        // those bytes any more.
+        drop(prepared);
+        let roots = runtime
+            .protected_generation_roots([project_id.clone()])
+            .unwrap();
+        assert!(!roots.protects(&project_id, &in_flight));
+    }
+
+    #[test]
+    fn a_committed_generation_stays_protected_by_its_pointer_after_the_handle_drops() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let project_id = project("p_inflight_commit");
+        let receipt = run_publish(
+            &runtime,
+            establish_request(&project_id, COMMIT_ONE),
+            "first",
+        )
+        .unwrap();
+        // The preparation handle is long gone; the pointer arm is what
+        // protects the generation now.
+        let roots = runtime
+            .protected_generation_roots([project_id.clone()])
+            .unwrap();
+        assert!(roots.protects(&project_id, receipt.generation_id()));
     }
 
     #[test]

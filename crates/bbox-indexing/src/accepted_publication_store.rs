@@ -1940,6 +1940,7 @@ pub(crate) fn commit_pointer_locked(
     limits: &AcceptedPublicationLimits,
     faults: Option<&dyn AcceptedPublicationFaultInjector>,
     freshness: &mut dyn FnMut() -> AcceptedPublicationStoreResult<()>,
+    swap_attempted: &mut bool,
 ) -> AcceptedPublicationStoreResult<PointerCommitReceiptV1> {
     ensure_matching_guard(paths, guard)?;
     limits.validate()?;
@@ -2022,6 +2023,11 @@ pub(crate) fn commit_pointer_locked(
                 "accepted-publication pointer directory is missing",
             )
         })?;
+    // From here the caller can no longer assume the installed pointer is
+    // unchanged: the replacement either lands or it does not, and a failure
+    // after this line does not prove which. Callers treat the flag as
+    // "reverify before serving cached content".
+    *swap_attempted = true;
     directory
         .atomic_replace(&format!("{project_id}.json"), &prepared.pointer_bytes)
         .map_err(accepted_io_error)?;

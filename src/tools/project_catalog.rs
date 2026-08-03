@@ -957,10 +957,24 @@ impl BlackboxServer {
             Err(error) => return Self::err_text(&format!("Error: {error}")),
         };
         let committed = project_id.clone();
+        let swap_uncertain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let swap_uncertain_inner = swap_uncertain.clone();
         let result = Self::run_blocking("bbox_project_publisher_advance", move || {
             let audit_reason = bounded_audit_reason(&p.audit_reason)?;
             let attachment_id = parse_attachment_id(&p.attachment_id)?;
             let mode = publish_mode_from_params(&p)?;
+            // Authority first, checkout second (plan section 7.2 steps 1
+            // to 3). A denied request must not make the daemon resolve a
+            // ref or read committed trees: it learns only that it was
+            // denied. The domain layer re-reads these same gates, so this
+            // is an early refusal, not the authority of record.
+            project_catalog_admin::preflight_publish_authority(
+                &store,
+                p.expected_catalog_epoch,
+                &committed,
+                &attachment_id,
+            )
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
             let state = store.snapshot().map_err(|error| anyhow::anyhow!("{error}"))?;
             let Some(row) = state.attachments().attachments.get(&attachment_id).cloned() else {
                 anyhow::bail!(
@@ -981,7 +995,17 @@ impl BlackboxServer {
                 },
                 probe,
             )
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
+            .map_err(|error| {
+                // A failure raised at or after the swap leaves the new
+                // pointer possibly installed. The caller still sees the
+                // refusal, and the daemon still has to reconverge from
+                // whatever is installed, so the flag travels out of the
+                // blocking closure beside the error.
+                if error.may_have_swapped() {
+                    swap_uncertain_inner.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                anyhow::anyhow!("{error}")
+            })?;
             tracing::info!(
                 tool = "bbox_project_publisher_advance",
                 project_id = %committed,
@@ -1005,10 +1029,16 @@ impl BlackboxServer {
             }))?)
         })
         .await;
-        if !result.is_error.unwrap_or(false) {
-            // Accepted content identity changed, so every projection of it
-            // is stale. Binding-only operations never reach this path.
+        let succeeded = !result.is_error.unwrap_or(false);
+        if succeeded || swap_uncertain.load(std::sync::atomic::Ordering::SeqCst) {
+            // Accepted content identity may have changed. Drop the
+            // projections and reconverge the published index from whatever
+            // pointer is now installed (plan section 7.3 steps 17 to 19).
+            // A reported failure that reached the swap converges too, or
+            // the index would keep serving a generation no pointer names.
+            // Binding-only operations never reach this path.
             self.invalidate_catalog_published_content(&project_id);
+            self.converge_published_knowledge_index(&project_id);
         }
         result
     }
@@ -2130,6 +2160,138 @@ mod tests {
                 .to_string()
                 .starts_with("error.accepted_publication_committed_identity"),
             "{error}"
+        );
+    }
+
+    fn index_search(server: &BlackboxServer, query: &str) -> String {
+        let view = server.state.code_read_view.read().clone();
+        server
+            .state
+            .idx
+            .read()
+            .search_with_active_selectors_and_searcher(
+                &crate::index::SearchParams {
+                    query: query.into(),
+                    mode: None,
+                    account: None,
+                    project: None,
+                    role: None,
+                    include_subagents: None,
+                    limit: Some(5),
+                    exclude_self: None,
+                },
+                &view.active_selectors,
+                &view.searcher,
+            )
+            .unwrap()
+    }
+
+    /// Denied publish requests must not touch a repository.
+    ///
+    /// The fixture has no checkout anywhere: the catalog holds one
+    /// published project and nothing else. If the handler probed before
+    /// deciding authority it would fail on the missing checkout and report
+    /// a ref or path error. Each refusal below is an authority code, which
+    /// is only reachable if the preflight ran first.
+    #[tokio::test]
+    async fn denied_publish_requests_never_reach_git_or_the_source_loaders() {
+        use crate::server::state::catalog_fixture::CatalogFixture;
+
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project("p_denied", &scope);
+        let server = fixture.server();
+
+        let stale = server
+            .bbox_project_publisher_advance(Parameters(ProjectPublisherAdvanceParams {
+                project_id: "p_denied".into(),
+                attachment_id: "att_00000000000000000000000000000f01".into(),
+                mode: "establish".into(),
+                full_ref: "refs/heads/main".into(),
+                expected_generation_id: None,
+                expected_pointer_sha256: None,
+                dry_run: false,
+                expected_catalog_epoch: 9_999,
+                audit_reason: "stale epoch".into(),
+            }))
+            .await;
+        let text = error_text(&stale);
+        assert!(text.contains("error.project_catalog_stale_epoch"), "{text}");
+
+        let epoch = server
+            .state
+            .project_authority
+            .catalog_store()
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .epoch();
+        let unknown_attachment = server
+            .bbox_project_publisher_advance(Parameters(ProjectPublisherAdvanceParams {
+                project_id: "p_denied".into(),
+                attachment_id: "att_00000000000000000000000000000f01".into(),
+                mode: "establish".into(),
+                full_ref: "refs/heads/main".into(),
+                expected_generation_id: None,
+                expected_pointer_sha256: None,
+                dry_run: false,
+                expected_catalog_epoch: epoch,
+                audit_reason: "unknown attachment".into(),
+            }))
+            .await;
+        let text = error_text(&unknown_attachment);
+        assert!(
+            text.contains("error.project_catalog_admin_unknown_attachment"),
+            "{text}"
+        );
+        // Neither refusal mentions a ref, a commit, or a path, which is
+        // what a probe-first handler would have produced here.
+        assert!(
+            !text.contains("error.accepted_publication_ref_missing"),
+            "{text}"
+        );
+    }
+
+    /// Convergence after a publish: the published knowledge reaches the
+    /// search index, and a project with no verified content leaves the
+    /// index alone rather than clearing rows a fallback may serve.
+    #[tokio::test]
+    async fn published_index_convergence_replaces_the_scope_and_skips_unverified_projects() {
+        use crate::server::state::catalog_fixture::{COMMIT_ONE, CatalogFixture, knowledge_entry};
+
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project("p_converge", &scope);
+        fixture.install_publication(
+            "p_converge",
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-a", "converged content")],
+            &[],
+        );
+        let server = fixture.server();
+        // The read view pins a searcher; without the commit hook a fresh
+        // commit is durable but invisible to this pinned view.
+        server.state.install_code_read_view_commit_hook();
+        let project_id = ProjectId::parse("p_converge").unwrap();
+
+        server.converge_published_knowledge_index(&project_id);
+        server.state.index_writer.flush_blocking().unwrap();
+        server.state.idx.write().reader_reload_for_test();
+        assert!(
+            index_search(&server, "converged").contains("knowledge-a"),
+            "the published entry reached the search index"
+        );
+
+        // A project with no publication at all: convergence is a no-op,
+        // not an index clear.
+        fixture.add_published_project("p_unpublished", &CatalogFixture::scope("sub/none"));
+        server.converge_published_knowledge_index(&ProjectId::parse("p_unpublished").unwrap());
+        server.state.index_writer.flush_blocking().unwrap();
+        server.state.idx.write().reader_reload_for_test();
+        assert!(
+            index_search(&server, "converged").contains("knowledge-a"),
+            "an unverifiable project must not clear another project rows"
         );
     }
 
