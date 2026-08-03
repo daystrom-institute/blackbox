@@ -1962,6 +1962,177 @@ mod tests {
         assert!(!probe.capabilities.repo_knowledge);
     }
 
+    fn git(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// One real publishing checkout: a git repository whose committed
+    /// `.bbox` tree declares a repo id and carries one record in each lane.
+    fn publishing_checkout(root: &Path) -> bbox_corpus_core::project_catalog::CheckoutAttachment {
+        std::fs::create_dir_all(root.join(".bbox/knowledge")).unwrap();
+        std::fs::create_dir_all(root.join(".bbox/gaps")).unwrap();
+        git(root, &["init", "-b", "main"]);
+        git(root, &["config", "user.email", "probe@example.invalid"]);
+        git(root, &["config", "user.name", "probe"]);
+        std::fs::write(
+            root.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"repo_probe\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".bbox/knowledge/knowledge-a.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "id": "knowledge-a",
+                "title": "probe entry",
+                "content": "accepted content",
+                "category": "convention",
+                "scope": "project",
+                "priority": "standard",
+                "status": "active",
+                "approval": "user_confirmed",
+                "source": "user",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-02T00:00:00Z",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".bbox/gaps/gap-1234abcd.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "id": "gap-1234abcd",
+                "title": "probe gap",
+                "gap_kind": "tooling",
+                "domain": "publication",
+                "wanted_capability": "probe the publish path",
+                "dedupe_key": "tooling/publication/probe",
+                "impact": "medium",
+                "blocking_level": "workaround_available",
+                "resolution": "unresolved",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-02T00:00:00Z",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-m", "publishable state"]);
+
+        bbox_corpus_core::project_catalog::CheckoutAttachment {
+            attachment_id: AttachmentId::parse("att_00000000000000000000000000000e01").unwrap(),
+            project_id: ProjectId::parse("p_000000000000000000000000000000e1").unwrap(),
+            checkout_id: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeee01".into(),
+            checkout_dir: root.to_string_lossy().into_owned(),
+            checkout_project_dir: root.to_string_lossy().into_owned(),
+            project_root_relpath: ".".into(),
+            kind: AttachmentKind::Base,
+            validated_scope: Some(PublishedScope::try_new("repo_probe", ".").unwrap()),
+            computed_repo_hint: None,
+            branch_ref: Some("refs/heads/main".into()),
+            capabilities: AttachmentCapabilities {
+                repo_knowledge: true,
+                ..Default::default()
+            },
+            status: AttachmentStatus::Attached,
+            attached_at: "2026-08-03T00:00:00Z".into(),
+            detached_at: None,
+        }
+    }
+
+    /// The publish probe against a real repository: the success path, then
+    /// the two refusals that stop a publish before the domain layer.
+    #[test]
+    fn the_publish_probe_captures_committed_state_and_refuses_unresolvable_refs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let row = publishing_checkout(&root);
+
+        // Success: the ref resolves, the committed identity at that commit
+        // supplies the scope, and both lanes are captured.
+        let probe = publisher_publish_probe(&row, "refs/heads/main").unwrap();
+        assert_eq!(probe.resolved_commit.len(), 40);
+        assert_eq!(
+            probe.committed_scope,
+            PublishedScope::try_new("repo_probe", ".").unwrap()
+        );
+        assert_eq!(probe.sources.knowledge.len(), 1);
+        assert_eq!(probe.sources.gaps.len(), 1);
+        assert_eq!(
+            probe.sources.knowledge[0].repository_relative_filename,
+            ".bbox/knowledge/knowledge-a.json"
+        );
+        // The in-lock re-resolver reads the same ref through the same path.
+        assert_eq!(
+            (probe.revalidate_ref)(),
+            Some(probe.resolved_commit.clone())
+        );
+
+        // A ref that does not exist.
+        let error = publisher_publish_probe(&row, "refs/heads/does-not-exist")
+            .err()
+            .expect("an unresolvable ref refuses");
+        assert!(
+            error
+                .to_string()
+                .starts_with("error.accepted_publication_ref_missing"),
+            "{error}"
+        );
+
+        // A ref that exists but names an object this repository does not
+        // have. The probe resolves the accepted commit THROUGH the ref with
+        // `rev-parse --verify <ref>^{commit}`, so a missing commit object is
+        // indistinguishable from a missing ref here: both are "this ref does
+        // not name a commit we have". The refusal is deliberately the same.
+        std::fs::write(
+            root.join(".git/refs/heads/dangling"),
+            format!("{}\n", "0".repeat(39) + "1"),
+        )
+        .unwrap();
+        let error = publisher_publish_probe(&row, "refs/heads/dangling")
+            .err()
+            .expect("a dangling ref refuses");
+        assert!(
+            error
+                .to_string()
+                .starts_with("error.accepted_publication_ref_missing"),
+            "{error}"
+        );
+    }
+
+    /// A commit that resolves but declares no repo id cannot name a scope,
+    /// so the publish refuses before any generation is built.
+    #[test]
+    fn the_publish_probe_refuses_a_commit_without_committed_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let row = publishing_checkout(&root);
+        // A second branch whose commit carries no committed repo id.
+        git(&root, &["checkout", "-b", "identityless"]);
+        std::fs::write(root.join(".bbox/config.toml"), "[project]\n").unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-m", "drop the committed repo id"]);
+
+        let error = publisher_publish_probe(&row, "refs/heads/identityless")
+            .err()
+            .expect("a commit without committed identity refuses");
+        assert!(
+            error
+                .to_string()
+                .starts_with("error.accepted_publication_committed_identity"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn project_catalog_probe_rejects_relative_and_missing_paths() {
         assert!(probe_checkout("relative/path").is_err());
