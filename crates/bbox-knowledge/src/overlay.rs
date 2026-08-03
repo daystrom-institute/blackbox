@@ -181,6 +181,12 @@ pub struct OverlayStamp {
     pub checkout_head: String,
     pub merge_base: String,
     pub working_fingerprint: String,
+    /// Accepted generation identity, catalog mode only. It makes overlay
+    /// invalidation explicit when published content advances without the
+    /// checkout moving. Absent on the bridge, where it is omitted from the
+    /// serialization entirely so snapshot ids stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_generation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +219,11 @@ pub enum TransientPreservationOutcome {
 pub enum OverlayRecomputeErrorKind {
     InvalidContent,
     Transient,
+    /// The checkout cannot prove the baseline: it does not contain the
+    /// accepted commit, or the two histories share no merge base. This is a
+    /// structural authority fact, not retryable I/O noise, so it must never
+    /// be masked by preserving a prior valid snapshot (plan section 4.12).
+    BaselineUnavailable,
 }
 
 #[derive(Debug)]
@@ -234,6 +245,20 @@ impl OverlayRecomputeError {
             kind: OverlayRecomputeErrorKind::Transient,
             diagnostic: format!("{error:#}"),
         }
+    }
+
+    pub fn baseline_unavailable(error: anyhow::Error) -> Self {
+        Self {
+            kind: OverlayRecomputeErrorKind::BaselineUnavailable,
+            diagnostic: format!("{error:#}"),
+        }
+    }
+
+    /// True when this failure is a structural fact about authority rather
+    /// than a retryable condition. A caller must not preserve a prior
+    /// snapshot over one of these.
+    pub fn is_structural(&self) -> bool {
+        matches!(self.kind, OverlayRecomputeErrorKind::BaselineUnavailable)
     }
 }
 
@@ -637,51 +662,115 @@ pub fn recompute_overlay(
 
 /// Recompute one checkout overlay while preserving whether a failure came
 /// from invalid repository content or from transient Git and filesystem work.
-pub fn recompute_overlay_result(
-    publisher_root: &Path,
-    published_ref: &str,
+/// Accepted published content plus the identity that stamps it.
+///
+/// There is deliberately no publisher root and no alternate object
+/// database on this type or on the function that consumes it. Accepted
+/// publication supplies content truth and nothing else; ancestry may come
+/// only from the checkout the overlay is computed in (D-007, plan section
+/// 4.11). A caller cannot pass a peer repository here because the
+/// signature has nowhere to put one.
+#[derive(Debug, Clone, Copy)]
+pub struct CatalogOverlayPublished<'a> {
+    pub published_scope: &'a PublishedScope,
+    pub checkout_id: &'a str,
+    /// The accepted full ref, for response provenance only.
+    pub full_ref: &'a str,
+    /// Accepted commit P: the checkout must contain it.
+    pub accepted_commit: &'a str,
+    /// Accepted generation identity, so an advance invalidates overlays
+    /// even when the checkout has not moved.
+    pub accepted_generation: &'a str,
+    /// Repository-relative filename to exact committed bytes, projected
+    /// from the accepted generation manifest.
+    pub published: &'a BTreeMap<String, Vec<u8>>,
+}
+
+/// Catalog-mode overlay recompute (plan sections 4.11 and 6.7).
+///
+/// Published content arrives as accepted bytes; ancestry is proved inside
+/// `checkout_root` alone. Missing accepted commit P or an absent merge
+/// base is `BaselineUnavailable`: a structural statement that this
+/// checkout cannot position itself against accepted content, which a
+/// caller must surface rather than paper over with a stale snapshot.
+pub fn recompute_catalog_overlay_result(
+    published: CatalogOverlayPublished<'_>,
     checkout_root: &Path,
     working: &WorkingKnowledgeSnapshot,
-    checkout: &ResolvedCheckoutScope,
 ) -> std::result::Result<OverlaySnapshot, OverlayRecomputeError> {
-    let publisher_commit = git::resolve_commit(publisher_root, published_ref)
-        .with_context(|| {
-            format!(
-                "published ref {published_ref} does not resolve in {}",
-                publisher_root.display()
-            )
-        })
-        .map_err(OverlayRecomputeError::transient)?;
     let checkout_head = git::current_head(checkout_root)
         .with_context(|| format!("checkout {} has no HEAD", checkout_root.display()))
         .map_err(OverlayRecomputeError::transient)?;
-    let merge_base = git::merge_base_with_alternate(
-        checkout_root,
-        &checkout_head,
-        &publisher_commit,
-        Some(publisher_root),
-    )
-    .with_context(|| {
-        format!(
-            "no merge base between checkout {} and published commit {}",
-            checkout_root.display(),
-            publisher_commit
-        )
-    })
-    .map_err(OverlayRecomputeError::transient)?;
-    let tree_dir = knowledge_tree_dir(&checkout.published_scope);
-    let baseline = read_committed_map(checkout_root, &merge_base, &tree_dir, Some(publisher_root))
-        .map_err(OverlayRecomputeError::transient)?;
-    let published = read_committed_map(publisher_root, &publisher_commit, &tree_dir, None)
+    // Containment first: without P in THIS object database there is no
+    // honest way to position the checkout against accepted content, and
+    // borrowing another repository to find one is the exact thing D-007
+    // forbids.
+    git::verify_commit_oid_with_alternate(checkout_root, published.accepted_commit, None)
+        .with_context(|| {
+            format!(
+                "checkout {} does not contain accepted commit {}",
+                checkout_root.display(),
+                published.accepted_commit
+            )
+        })
+        .map_err(OverlayRecomputeError::baseline_unavailable)?;
+    let merge_base = git::merge_base(checkout_root, &checkout_head, published.accepted_commit)
+        .with_context(|| {
+            format!(
+                "no merge base between checkout {} and accepted commit {}",
+                checkout_root.display(),
+                published.accepted_commit
+            )
+        })
+        .map_err(OverlayRecomputeError::baseline_unavailable)?;
+    let tree_dir = knowledge_tree_dir(published.published_scope);
+    // Baseline is read from the checkout at B, with no alternate.
+    let baseline = read_committed_map(checkout_root, &merge_base, &tree_dir, None)
         .map_err(OverlayRecomputeError::transient)?;
     let working = &working.files;
     validate_knowledge_map(&baseline, "baseline")
         .map_err(OverlayRecomputeError::invalid_content)?;
-    validate_knowledge_map(&published, "published")
+    validate_knowledge_map(published.published, "published")
         .map_err(OverlayRecomputeError::invalid_content)?;
     validate_knowledge_map(working, "working").map_err(OverlayRecomputeError::invalid_content)?;
     let working_fingerprint = fingerprint_map(working);
+    let values = overlay_values_from_maps(&baseline, published.published, working)?;
 
+    let stamp = OverlayStamp {
+        published_scope: published.published_scope.clone(),
+        checkout_id: published.checkout_id.to_string(),
+        published_ref: published.full_ref.to_string(),
+        publisher_commit: published.accepted_commit.to_string(),
+        checkout_head,
+        merge_base,
+        working_fingerprint,
+        accepted_generation: Some(published.accepted_generation.to_string()),
+    };
+    let snapshot_id = snapshot_id(&stamp, &values).map_err(OverlayRecomputeError::transient)?;
+    Ok(OverlaySnapshot {
+        snapshot_id,
+        key: OverlayKey {
+            published_scope: published.published_scope.clone(),
+            checkout_id: published.checkout_id.to_string(),
+        },
+        stamp: Some(stamp),
+        status: OverlayStatus::Valid,
+        values,
+        diagnostics: Vec::new(),
+    })
+}
+
+/// The overlay diff shared by the bridge and catalog entry points.
+///
+/// Baseline comes from the checkout at the merge base, published comes
+/// from whichever authority the caller resolved, and working comes from
+/// the lease. Keeping one implementation is what makes the two entry
+/// points differ only in where published content and ancestry come from.
+fn overlay_values_from_maps(
+    baseline: &BTreeMap<String, Vec<u8>>,
+    published: &BTreeMap<String, Vec<u8>>,
+    working: &BTreeMap<String, Vec<u8>>,
+) -> std::result::Result<BTreeMap<String, OverlayValue>, OverlayRecomputeError> {
     let mut paths = BTreeSet::new();
     paths.extend(baseline.keys().cloned());
     paths.extend(working.keys().cloned());
@@ -747,6 +836,54 @@ pub fn recompute_overlay_result(
             (None, None) => {}
         }
     }
+    Ok(values)
+}
+pub fn recompute_overlay_result(
+    publisher_root: &Path,
+    published_ref: &str,
+    checkout_root: &Path,
+    working: &WorkingKnowledgeSnapshot,
+    checkout: &ResolvedCheckoutScope,
+) -> std::result::Result<OverlaySnapshot, OverlayRecomputeError> {
+    let publisher_commit = git::resolve_commit(publisher_root, published_ref)
+        .with_context(|| {
+            format!(
+                "published ref {published_ref} does not resolve in {}",
+                publisher_root.display()
+            )
+        })
+        .map_err(OverlayRecomputeError::transient)?;
+    let checkout_head = git::current_head(checkout_root)
+        .with_context(|| format!("checkout {} has no HEAD", checkout_root.display()))
+        .map_err(OverlayRecomputeError::transient)?;
+    let merge_base = git::merge_base_with_alternate(
+        checkout_root,
+        &checkout_head,
+        &publisher_commit,
+        Some(publisher_root),
+    )
+    .with_context(|| {
+        format!(
+            "no merge base between checkout {} and published commit {}",
+            checkout_root.display(),
+            publisher_commit
+        )
+    })
+    .map_err(OverlayRecomputeError::transient)?;
+    let tree_dir = knowledge_tree_dir(&checkout.published_scope);
+    let baseline = read_committed_map(checkout_root, &merge_base, &tree_dir, Some(publisher_root))
+        .map_err(OverlayRecomputeError::transient)?;
+    let published = read_committed_map(publisher_root, &publisher_commit, &tree_dir, None)
+        .map_err(OverlayRecomputeError::transient)?;
+    let working = &working.files;
+    validate_knowledge_map(&baseline, "baseline")
+        .map_err(OverlayRecomputeError::invalid_content)?;
+    validate_knowledge_map(&published, "published")
+        .map_err(OverlayRecomputeError::invalid_content)?;
+    validate_knowledge_map(working, "working").map_err(OverlayRecomputeError::invalid_content)?;
+    let working_fingerprint = fingerprint_map(working);
+
+    let values = overlay_values_from_maps(&baseline, &published, working)?;
 
     let stamp = OverlayStamp {
         published_scope: checkout.published_scope.clone(),
@@ -756,6 +893,9 @@ pub fn recompute_overlay_result(
         checkout_head,
         merge_base,
         working_fingerprint,
+        // The bridge has no accepted generation; omitted from the
+        // serialization so snapshot ids are unchanged.
+        accepted_generation: None,
     };
     let snapshot_id = snapshot_id(&stamp, &values).map_err(OverlayRecomputeError::transient)?;
     Ok(OverlaySnapshot {
@@ -1026,6 +1166,261 @@ mod tests {
             }
         }
         WorkingKnowledgeSnapshot::new(files).unwrap()
+    }
+
+    // ── Catalog overlay baseline path (plan section 13.4) ────────────
+
+    /// The catalog entry point takes accepted content, a checkout, and a
+    /// working snapshot. Nothing else. A publisher root or alternate
+    /// object database has nowhere to go, so borrowed ancestry is a
+    /// compile error rather than a review question (plan section 4.11).
+    const _CATALOG_ENTRY_POINT_TAKES_NO_PUBLISHER_ROOT: fn(
+        CatalogOverlayPublished<'_>,
+        &Path,
+        &WorkingKnowledgeSnapshot,
+    ) -> std::result::Result<
+        OverlaySnapshot,
+        OverlayRecomputeError,
+    > = recompute_catalog_overlay_result;
+
+    struct CatalogFixture {
+        _temp: tempfile::TempDir,
+        base: std::path::PathBuf,
+        worktree: std::path::PathBuf,
+        accepted_commit: String,
+        published: BTreeMap<String, Vec<u8>>,
+        scope: PublishedScope,
+    }
+
+    /// One published repository at an accepted commit, plus a worktree on
+    /// its own branch: the ordinary shape of a checkout positioning
+    /// itself against accepted content.
+    fn catalog_fixture() -> CatalogFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("repo");
+        std::fs::create_dir_all(&base).unwrap();
+        run(&base, &["init", "-q", "-b", "main"]);
+        run(&base, &["config", "user.email", "t@example.com"]);
+        run(&base, &["config", "user.name", "Test"]);
+        write_entry(&base, &entry("keep", "accepted"));
+        write_entry(&base, &entry("remove", "accepted"));
+        run(&base, &["add", ".bbox/knowledge"]);
+        run(&base, &["commit", "-q", "-m", "accepted"]);
+        let accepted_commit = git::current_head(&base).unwrap();
+        // Accepted published content is BYTES, captured at that commit,
+        // never re-read from a repository during recompute.
+        let mut published = BTreeMap::new();
+        for id in ["keep", "remove"] {
+            published.insert(
+                format!("{id}.json"),
+                std::fs::read(base.join(format!(".bbox/knowledge/{id}.json"))).unwrap(),
+            );
+        }
+        let worktree = temp.path().join("worktree");
+        run(
+            &base,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        CatalogFixture {
+            _temp: temp,
+            base,
+            worktree,
+            accepted_commit,
+            published,
+            scope: PublishedScope::try_new("repo", ".").unwrap(),
+        }
+    }
+
+    impl CatalogFixture {
+        fn input(&self) -> CatalogOverlayPublished<'_> {
+            CatalogOverlayPublished {
+                published_scope: &self.scope,
+                checkout_id: "checkout-1",
+                full_ref: "refs/heads/main",
+                accepted_commit: &self.accepted_commit,
+                accepted_generation: "generation-1",
+                published: &self.published,
+            }
+        }
+
+        fn recompute(
+            &self,
+            root: &Path,
+        ) -> std::result::Result<OverlaySnapshot, OverlayRecomputeError> {
+            recompute_catalog_overlay_result(self.input(), root, &working_snapshot(root))
+        }
+    }
+
+    #[test]
+    fn catalog_overlay_diffs_the_checkout_against_accepted_content() {
+        let fixture = catalog_fixture();
+        write_entry(&fixture.worktree, &entry("keep", "changed"));
+        write_entry(&fixture.worktree, &entry("new", "untracked"));
+        std::fs::remove_file(fixture.worktree.join(".bbox/knowledge/remove.json")).unwrap();
+
+        let snapshot = fixture.recompute(&fixture.worktree).unwrap();
+        assert_eq!(snapshot.status, OverlayStatus::Valid);
+        assert!(matches!(
+            snapshot.values.get("keep"),
+            Some(OverlayValue::Upsert { .. })
+        ));
+        assert!(matches!(
+            snapshot.values.get("new"),
+            Some(OverlayValue::Upsert { .. })
+        ));
+        assert!(matches!(
+            snapshot.values.get("remove"),
+            Some(OverlayValue::Tombstone)
+        ));
+
+        let stamp = snapshot.stamp.unwrap();
+        assert_eq!(stamp.publisher_commit, fixture.accepted_commit);
+        // The baseline is the merge base inside this checkout, which for a
+        // branch off the accepted commit is the accepted commit itself.
+        assert_eq!(stamp.merge_base, fixture.accepted_commit);
+        assert_eq!(stamp.accepted_generation.as_deref(), Some("generation-1"));
+        assert_eq!(snapshot.key.checkout_id, "checkout-1");
+    }
+
+    #[test]
+    fn catalog_overlay_suppresses_working_content_equal_to_accepted() {
+        let fixture = catalog_fixture();
+        // The checkout re-applies exactly what accepted content already
+        // holds: integrated, so no provisional variant.
+        write_entry(&fixture.worktree, &entry("keep", "accepted"));
+
+        let snapshot = fixture.recompute(&fixture.worktree).unwrap();
+        assert!(snapshot.values.is_empty(), "{:?}", snapshot.values);
+    }
+
+    #[test]
+    fn a_checkout_without_the_accepted_commit_is_structurally_unavailable() {
+        let fixture = catalog_fixture();
+        // A peer repository with its own unrelated history: it cannot
+        // contain the accepted commit, and there is no publisher root to
+        // borrow it from.
+        let peer = fixture._temp.path().join("peer");
+        std::fs::create_dir_all(&peer).unwrap();
+        run(&peer, &["init", "-q", "-b", "main"]);
+        run(&peer, &["config", "user.email", "t@example.com"]);
+        run(&peer, &["config", "user.name", "Test"]);
+        write_entry(&peer, &entry("keep", "peer"));
+        run(&peer, &["add", ".bbox/knowledge"]);
+        run(&peer, &["commit", "-q", "-m", "peer"]);
+
+        let error = fixture.recompute(&peer).unwrap_err();
+        assert_eq!(error.kind, OverlayRecomputeErrorKind::BaselineUnavailable);
+        assert!(
+            error.is_structural(),
+            "a caller must not preserve a prior snapshot over this"
+        );
+    }
+
+    #[test]
+    fn an_absent_merge_base_is_structurally_unavailable() {
+        let fixture = catalog_fixture();
+        // An orphan branch in the SAME repository: the accepted commit is
+        // present in the object database, but the two histories share no
+        // ancestor, so no baseline exists.
+        run(
+            &fixture.worktree,
+            &["checkout", "-q", "--orphan", "detached"],
+        );
+        write_entry(&fixture.worktree, &entry("keep", "orphan"));
+        run(&fixture.worktree, &["add", ".bbox/knowledge"]);
+        run(&fixture.worktree, &["commit", "-q", "-m", "orphan"]);
+
+        let error = fixture.recompute(&fixture.worktree).unwrap_err();
+        assert_eq!(error.kind, OverlayRecomputeErrorKind::BaselineUnavailable);
+        assert!(error.is_structural());
+    }
+
+    #[test]
+    fn catalog_overlay_positions_a_checkout_at_ahead_and_behind_accepted() {
+        let fixture = catalog_fixture();
+
+        // At the accepted commit: the merge base is that commit and the
+        // working tree matches accepted content.
+        let at = fixture.recompute(&fixture.worktree).unwrap();
+        assert_eq!(
+            at.stamp.as_ref().unwrap().merge_base,
+            fixture.accepted_commit
+        );
+        assert!(at.values.is_empty());
+
+        // Ahead: a new commit on the branch keeps the accepted commit as
+        // the merge base, and its committed change is still a provisional
+        // variant because accepted content has not moved.
+        write_entry(&fixture.worktree, &entry("keep", "ahead"));
+        run(&fixture.worktree, &["add", ".bbox/knowledge"]);
+        run(&fixture.worktree, &["commit", "-q", "-m", "ahead"]);
+        let ahead = fixture.recompute(&fixture.worktree).unwrap();
+        assert_eq!(
+            ahead.stamp.as_ref().unwrap().merge_base,
+            fixture.accepted_commit
+        );
+        assert!(matches!(
+            ahead.values.get("keep"),
+            Some(OverlayValue::Upsert { .. })
+        ));
+        assert_ne!(
+            ahead.stamp.as_ref().unwrap().checkout_head,
+            fixture.accepted_commit
+        );
+
+        // Behind: the base repository advances past the accepted commit,
+        // which does not move the overlay at all, because accepted content
+        // is authority and the checkout has not changed.
+        write_entry(&fixture.base, &entry("keep", "newer than accepted"));
+        run(&fixture.base, &["add", ".bbox/knowledge"]);
+        run(&fixture.base, &["commit", "-q", "-m", "past accepted"]);
+        let behind = fixture.recompute(&fixture.worktree).unwrap();
+        assert_eq!(
+            behind.stamp.as_ref().unwrap().merge_base,
+            fixture.accepted_commit
+        );
+    }
+
+    #[test]
+    fn invalid_working_content_is_content_invalid_not_structural() {
+        let fixture = catalog_fixture();
+        std::fs::write(
+            fixture.worktree.join(".bbox/knowledge/keep.json"),
+            b"{not json",
+        )
+        .unwrap();
+
+        let error = fixture.recompute(&fixture.worktree).unwrap_err();
+        assert_eq!(error.kind, OverlayRecomputeErrorKind::InvalidContent);
+        assert!(!error.is_structural());
+    }
+
+    #[test]
+    fn an_accepted_generation_change_changes_the_snapshot_identity() {
+        let fixture = catalog_fixture();
+        write_entry(&fixture.worktree, &entry("keep", "changed"));
+        let first = fixture.recompute(&fixture.worktree).unwrap();
+
+        let mut input = fixture.input();
+        input.accepted_generation = "generation-2";
+        let second = recompute_catalog_overlay_result(
+            input,
+            &fixture.worktree,
+            &working_snapshot(&fixture.worktree),
+        )
+        .unwrap();
+
+        // Same key, same values, different identity: an advance must be
+        // able to invalidate an overlay whose checkout never moved.
+        assert_eq!(first.key, second.key);
+        assert_ne!(first.snapshot_id, second.snapshot_id);
     }
 
     #[test]
@@ -1424,6 +1819,7 @@ mod tests {
             checkout_head: "h".into(),
             merge_base: "b".into(),
             working_fingerprint: "w".into(),
+            accepted_generation: None,
         };
         let mut left_entry = entry("entry", "same bytes");
         left_entry.variants.insert("a".into(), "1".into());

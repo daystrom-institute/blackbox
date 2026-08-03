@@ -153,6 +153,10 @@ pub struct GapOverlayStamp {
     pub checkout_head: String,
     pub merge_base: String,
     pub working_fingerprint: String,
+    /// Accepted generation identity, catalog mode only. Omitted from the
+    /// serialization on the bridge so snapshot ids stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_generation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +189,10 @@ pub enum GapTransientPreservationOutcome {
 pub enum GapOverlayRecomputeErrorKind {
     InvalidContent,
     Transient,
+    /// The checkout cannot prove the baseline: it does not contain the
+    /// accepted commit, or the two histories share no merge base. Structural
+    /// authority, never transient-preserved (plan section 4.12).
+    BaselineUnavailable,
 }
 
 #[derive(Debug)]
@@ -206,6 +214,19 @@ impl GapOverlayRecomputeError {
             kind: GapOverlayRecomputeErrorKind::Transient,
             diagnostic: format!("{error:#}"),
         }
+    }
+
+    pub fn baseline_unavailable(error: anyhow::Error) -> Self {
+        Self {
+            kind: GapOverlayRecomputeErrorKind::BaselineUnavailable,
+            diagnostic: format!("{error:#}"),
+        }
+    }
+
+    /// True when this failure is a structural fact about authority rather
+    /// than a retryable condition.
+    pub fn is_structural(&self) -> bool {
+        matches!(self.kind, GapOverlayRecomputeErrorKind::BaselineUnavailable)
     }
 }
 
@@ -521,6 +542,140 @@ pub fn recompute_overlay(
     }
 }
 
+/// The gap overlay diff shared by the bridge and catalog entry points.
+/// One implementation keeps the two paths differing only in where
+/// published content and ancestry come from.
+fn gap_overlay_values_from_maps(
+    baseline: &BTreeMap<String, Vec<u8>>,
+    published: &BTreeMap<String, Vec<u8>>,
+    working: &BTreeMap<String, Vec<u8>>,
+    checkout_project_dir: &str,
+) -> std::result::Result<BTreeMap<String, GapOverlayValue>, GapOverlayRecomputeError> {
+    let mut paths = BTreeSet::new();
+    paths.extend(baseline.keys().cloned());
+    paths.extend(working.keys().cloned());
+    let mut values = BTreeMap::new();
+    let mut seen_ids = BTreeSet::new();
+    for filename in paths {
+        match (baseline.get(&filename), working.get(&filename)) {
+            (Some(before), Some(after)) if before == after => {}
+            (_, Some(after)) => {
+                if published.get(&filename) == Some(after) {
+                    continue;
+                }
+                let mut gap: GapNote = serde_json::from_slice(after)
+                    .with_context(|| format!("parsing working gap file {filename}"))
+                    .map_err(GapOverlayRecomputeError::invalid_content)?;
+                validate_filename_id(&filename, &gap.id, "working gap")
+                    .map_err(GapOverlayRecomputeError::invalid_content)?;
+                if !seen_ids.insert(gap.id.clone()) {
+                    return Err(GapOverlayRecomputeError::invalid_content(anyhow::anyhow!(
+                        "duplicate gap id in checkout overlay: {}",
+                        gap.id
+                    )));
+                }
+                stamp_gap(&mut gap, checkout_project_dir);
+                values.insert(
+                    gap.id.clone(),
+                    GapOverlayValue::Upsert {
+                        gap: Box::new(gap),
+                        content_hash: sha256(after),
+                    },
+                );
+            }
+            (Some(before), None) => {
+                let gap: GapNote = serde_json::from_slice(before)
+                    .with_context(|| format!("parsing baseline gap file {filename}"))
+                    .map_err(GapOverlayRecomputeError::invalid_content)?;
+                validate_filename_id(&filename, &gap.id, "baseline gap")
+                    .map_err(GapOverlayRecomputeError::invalid_content)?;
+                if published.contains_key(&filename) {
+                    values.insert(gap.id, GapOverlayValue::Tombstone);
+                }
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(values)
+}
+/// Accepted published gap content plus the identity that stamps it.
+///
+/// Like the knowledge twin, there is no publisher root and no alternate
+/// object database anywhere in this contract: ancestry may come only from
+/// the checkout the overlay is computed in (D-007, plan section 4.11).
+#[derive(Debug, Clone, Copy)]
+pub struct CatalogGapOverlayPublished<'a> {
+    pub published_scope: &'a PublishedScope,
+    pub checkout_id: &'a str,
+    pub full_ref: &'a str,
+    pub accepted_commit: &'a str,
+    pub accepted_generation: &'a str,
+    pub published: &'a BTreeMap<String, Vec<u8>>,
+}
+
+/// Catalog-mode gap overlay recompute (plan sections 4.11 and 6.7).
+pub fn recompute_catalog_overlay_result(
+    published: CatalogGapOverlayPublished<'_>,
+    checkout_root: &Path,
+    working: &WorkingGapSnapshot,
+) -> std::result::Result<GapOverlaySnapshot, GapOverlayRecomputeError> {
+    let checkout_head = git::current_head(checkout_root)
+        .with_context(|| format!("checkout {} has no HEAD", checkout_root.display()))
+        .map_err(GapOverlayRecomputeError::transient)?;
+    git::verify_commit_oid_with_alternate(checkout_root, published.accepted_commit, None)
+        .with_context(|| {
+            format!(
+                "checkout {} does not contain accepted commit {}",
+                checkout_root.display(),
+                published.accepted_commit
+            )
+        })
+        .map_err(GapOverlayRecomputeError::baseline_unavailable)?;
+    let merge_base = git::merge_base(checkout_root, &checkout_head, published.accepted_commit)
+        .with_context(|| {
+            format!(
+                "no merge base between checkout {} and accepted commit {}",
+                checkout_root.display(),
+                published.accepted_commit
+            )
+        })
+        .map_err(GapOverlayRecomputeError::baseline_unavailable)?;
+    let tree_dir = gaps_tree_dir(published.published_scope);
+    let baseline = read_committed_map(checkout_root, &merge_base, &tree_dir, None)
+        .map_err(GapOverlayRecomputeError::transient)?;
+    let working = &working.files;
+    validate_gap_map(&baseline, "baseline").map_err(GapOverlayRecomputeError::invalid_content)?;
+    validate_gap_map(published.published, "published")
+        .map_err(GapOverlayRecomputeError::invalid_content)?;
+    validate_gap_map(working, "working").map_err(GapOverlayRecomputeError::invalid_content)?;
+    let working_fingerprint = fingerprint_map(working);
+    // A catalog overlay row carries no host path: the gap view stamps
+    // project identity, and the checkout directory is not authority.
+    let values = gap_overlay_values_from_maps(&baseline, published.published, working, "")?;
+
+    let stamp = GapOverlayStamp {
+        published_scope: published.published_scope.clone(),
+        checkout_id: published.checkout_id.to_string(),
+        published_ref: published.full_ref.to_string(),
+        publisher_commit: published.accepted_commit.to_string(),
+        checkout_head,
+        merge_base,
+        working_fingerprint,
+        accepted_generation: Some(published.accepted_generation.to_string()),
+    };
+    let snapshot_id = snapshot_id(&stamp, &values);
+    Ok(GapOverlaySnapshot {
+        snapshot_id,
+        key: GapOverlayKey {
+            published_scope: published.published_scope.clone(),
+            checkout_id: published.checkout_id.to_string(),
+        },
+        stamp: Some(stamp),
+        status: GapOverlayStatus::Valid,
+        values,
+        diagnostics: Vec::new(),
+    })
+}
 pub fn recompute_overlay_result(
     publisher_root: &Path,
     published_ref: &str,
@@ -564,51 +719,12 @@ pub fn recompute_overlay_result(
     validate_gap_map(working, "working").map_err(GapOverlayRecomputeError::invalid_content)?;
     let working_fingerprint = fingerprint_map(working);
 
-    let mut paths = BTreeSet::new();
-    paths.extend(baseline.keys().cloned());
-    paths.extend(working.keys().cloned());
-    let mut values = BTreeMap::new();
-    let mut seen_ids = BTreeSet::new();
-    for filename in paths {
-        match (baseline.get(&filename), working.get(&filename)) {
-            (Some(before), Some(after)) if before == after => {}
-            (_, Some(after)) => {
-                if published.get(&filename) == Some(after) {
-                    continue;
-                }
-                let mut gap: GapNote = serde_json::from_slice(after)
-                    .with_context(|| format!("parsing working gap file {filename}"))
-                    .map_err(GapOverlayRecomputeError::invalid_content)?;
-                validate_filename_id(&filename, &gap.id, "working gap")
-                    .map_err(GapOverlayRecomputeError::invalid_content)?;
-                if !seen_ids.insert(gap.id.clone()) {
-                    return Err(GapOverlayRecomputeError::invalid_content(anyhow::anyhow!(
-                        "duplicate gap id in checkout overlay: {}",
-                        gap.id
-                    )));
-                }
-                stamp_gap(&mut gap, &checkout.checkout_project_dir);
-                values.insert(
-                    gap.id.clone(),
-                    GapOverlayValue::Upsert {
-                        gap: Box::new(gap),
-                        content_hash: sha256(after),
-                    },
-                );
-            }
-            (Some(before), None) => {
-                let gap: GapNote = serde_json::from_slice(before)
-                    .with_context(|| format!("parsing baseline gap file {filename}"))
-                    .map_err(GapOverlayRecomputeError::invalid_content)?;
-                validate_filename_id(&filename, &gap.id, "baseline gap")
-                    .map_err(GapOverlayRecomputeError::invalid_content)?;
-                if published.contains_key(&filename) {
-                    values.insert(gap.id, GapOverlayValue::Tombstone);
-                }
-            }
-            (None, None) => {}
-        }
-    }
+    let values = gap_overlay_values_from_maps(
+        &baseline,
+        &published,
+        working,
+        &checkout.checkout_project_dir,
+    )?;
 
     let stamp = GapOverlayStamp {
         published_scope: checkout.published_scope.clone(),
@@ -618,6 +734,9 @@ pub fn recompute_overlay_result(
         checkout_head,
         merge_base,
         working_fingerprint,
+        // The bridge has no accepted generation; omitted from the
+        // serialization so snapshot ids are unchanged.
+        accepted_generation: None,
     };
     let snapshot_id = snapshot_id(&stamp, &values);
     Ok(GapOverlaySnapshot {
@@ -824,6 +943,17 @@ mod tests {
         );
     }
 
+    /// The catalog gap entry point takes accepted content, a checkout, and
+    /// a working snapshot. A publisher root has nowhere to go.
+    const _CATALOG_ENTRY_POINT_TAKES_NO_PUBLISHER_ROOT: fn(
+        CatalogGapOverlayPublished<'_>,
+        &Path,
+        &WorkingGapSnapshot,
+    ) -> std::result::Result<
+        GapOverlaySnapshot,
+        GapOverlayRecomputeError,
+    > = recompute_catalog_overlay_result;
+
     fn gap(id: &str, title: &str) -> GapNote {
         GapNote {
             id: id.into(),
@@ -1024,6 +1154,149 @@ mod tests {
         assert_eq!(transient.kind, GapOverlayRecomputeErrorKind::Transient);
     }
 
+    // ── Catalog gap overlay baseline path (plan section 13.4) ────────
+
+    struct CatalogGapFixture {
+        temp: tempfile::TempDir,
+        worktree: std::path::PathBuf,
+        accepted_commit: String,
+        published: BTreeMap<String, Vec<u8>>,
+        scope: PublishedScope,
+    }
+
+    fn catalog_gap_fixture() -> CatalogGapFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("repo");
+        std::fs::create_dir_all(&base).unwrap();
+        git(&base, &["init", "-q", "-b", "main"]);
+        git(&base, &["config", "user.email", "t@example.com"]);
+        git(&base, &["config", "user.name", "Test"]);
+        write_gap(&base, &gap("gap-11111111", "accepted"));
+        write_gap(&base, &gap("gap-22222222", "accepted"));
+        git(&base, &["add", ".bbox/gaps"]);
+        git(&base, &["commit", "-q", "-m", "accepted"]);
+        let accepted_commit = git::current_head(&base).unwrap();
+        let mut published = BTreeMap::new();
+        for id in ["gap-11111111", "gap-22222222"] {
+            published.insert(
+                format!("{id}.json"),
+                std::fs::read(base.join(format!(".bbox/gaps/{id}.json"))).unwrap(),
+            );
+        }
+        let worktree = temp.path().join("worktree");
+        git(
+            &base,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        CatalogGapFixture {
+            temp,
+            worktree,
+            accepted_commit,
+            published,
+            scope: PublishedScope::try_new("repo", ".").unwrap(),
+        }
+    }
+
+    impl CatalogGapFixture {
+        fn recompute(
+            &self,
+            root: &Path,
+        ) -> std::result::Result<GapOverlaySnapshot, GapOverlayRecomputeError> {
+            recompute_catalog_overlay_result(
+                CatalogGapOverlayPublished {
+                    published_scope: &self.scope,
+                    checkout_id: "checkout-1",
+                    full_ref: "refs/heads/main",
+                    accepted_commit: &self.accepted_commit,
+                    accepted_generation: "generation-1",
+                    published: &self.published,
+                },
+                root,
+                &working_snapshot(root),
+            )
+        }
+    }
+
+    #[test]
+    fn catalog_gap_overlay_diffs_the_checkout_against_accepted_content() {
+        let fixture = catalog_gap_fixture();
+        write_gap(&fixture.worktree, &gap("gap-11111111", "changed"));
+        write_gap(&fixture.worktree, &gap("gap-33333333", "untracked"));
+        std::fs::remove_file(fixture.worktree.join(".bbox/gaps/gap-22222222.json")).unwrap();
+
+        let snapshot = fixture.recompute(&fixture.worktree).unwrap();
+        assert_eq!(snapshot.status, GapOverlayStatus::Valid);
+        assert!(matches!(
+            snapshot.values.get("gap-11111111"),
+            Some(GapOverlayValue::Upsert { .. })
+        ));
+        assert!(matches!(
+            snapshot.values.get("gap-33333333"),
+            Some(GapOverlayValue::Upsert { .. })
+        ));
+        assert!(matches!(
+            snapshot.values.get("gap-22222222"),
+            Some(GapOverlayValue::Tombstone)
+        ));
+        let stamp = snapshot.stamp.unwrap();
+        assert_eq!(stamp.publisher_commit, fixture.accepted_commit);
+        assert_eq!(stamp.merge_base, fixture.accepted_commit);
+        assert_eq!(stamp.accepted_generation.as_deref(), Some("generation-1"));
+        // A catalog overlay row carries no host path.
+        match snapshot.values.get("gap-11111111") {
+            Some(GapOverlayValue::Upsert { gap, .. }) => {
+                assert_eq!(gap.project.as_deref(), Some(""));
+                assert_eq!(gap.write_dir, None);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_gap_checkout_without_the_accepted_commit_is_structurally_unavailable() {
+        let fixture = catalog_gap_fixture();
+        let peer = fixture.temp.path().join("peer");
+        std::fs::create_dir_all(&peer).unwrap();
+        git(&peer, &["init", "-q", "-b", "main"]);
+        git(&peer, &["config", "user.email", "t@example.com"]);
+        git(&peer, &["config", "user.name", "Test"]);
+        write_gap(&peer, &gap("gap-11111111", "peer"));
+        git(&peer, &["add", ".bbox/gaps"]);
+        git(&peer, &["commit", "-q", "-m", "peer"]);
+
+        let error = fixture.recompute(&peer).unwrap_err();
+        assert_eq!(
+            error.kind,
+            GapOverlayRecomputeErrorKind::BaselineUnavailable
+        );
+        assert!(error.is_structural());
+    }
+
+    #[test]
+    fn an_absent_gap_merge_base_is_structurally_unavailable() {
+        let fixture = catalog_gap_fixture();
+        git(
+            &fixture.worktree,
+            &["checkout", "-q", "--orphan", "detached"],
+        );
+        write_gap(&fixture.worktree, &gap("gap-11111111", "orphan"));
+        git(&fixture.worktree, &["add", ".bbox/gaps"]);
+        git(&fixture.worktree, &["commit", "-q", "-m", "orphan"]);
+
+        let error = fixture.recompute(&fixture.worktree).unwrap_err();
+        assert_eq!(
+            error.kind,
+            GapOverlayRecomputeErrorKind::BaselineUnavailable
+        );
+        assert!(error.is_structural());
+    }
     #[test]
     fn working_snapshot_rejects_non_basename_paths() {
         for filename in ["../escape.json", "nested/gap.json", "gap.txt"] {
