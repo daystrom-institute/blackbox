@@ -966,7 +966,7 @@ mod catalog_tests {
                             checkout_dir: dir.clone(),
                             checkout_project_dir: dir.clone(),
                             project_root_relpath: ".".into(),
-                            kind: spec.kind.clone(),
+                            kind: spec.kind,
                             validated_scope: Some(scope.clone()),
                             computed_repo_hint: None,
                             branch_ref: Some("refs/heads/main".into()),
@@ -1250,17 +1250,31 @@ mod catalog_tests {
     }
 
     /// The file provider gates on `render_output`, its own capability bit,
-    /// and nothing else.
+    /// and nothing else. Both halves are asserted here because a
+    /// wrong-capability denial passes a one-sided test: an attachment
+    /// carrying ONLY `render_output` (no `repo_knowledge`) must resolve, and
+    /// an attachment missing `render_output` must be denied. A scope
+    /// discovery step riding `repo_knowledge` (D-032) would invert the first.
     #[test]
-    fn capability_denial_names_render_output() {
+    fn capability_gate_is_render_output_alone() {
         let fixture = Fixture::new();
         let scope = Fixture::scope("repo-one");
         fixture.add_project(PROJECT_ONE, &scope);
+        let (granted, _) = fixture.attach(spec(PROJECT_ONE, ATTACHMENT_ONE, "granted"), &scope);
+        std::fs::write(granted.join("file.rs"), "fn main() {}\n").unwrap();
+        assert!(
+            fixture.resolve("file.rs", None).is_ok(),
+            "render_output alone must be sufficient"
+        );
+
+        let denied = Fixture::new();
+        let scope = Fixture::scope("repo-one");
+        denied.add_project(PROJECT_ONE, &scope);
         let mut no_render = spec(PROJECT_ONE, ATTACHMENT_ONE, "base");
         no_render.render = false;
-        fixture.attach(no_render, &scope);
+        denied.attach(no_render, &scope);
 
-        let error = fixture.resolve("file.rs", None).unwrap_err().to_string();
+        let error = denied.resolve("file.rs", None).unwrap_err().to_string();
 
         assert!(
             error.starts_with("error.checkout_access.capability_denied"),
