@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use bbox_corpus_core::built_from::{BuiltFromStamp, BuiltFromTable};
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_core::identity::PublishedScope;
-use bbox_corpus_core::project_catalog::ProjectId;
+use bbox_corpus_core::project_catalog::{AttachmentStatus, ProjectId};
 use bbox_corpus_core::project_record::{ProjectRecord, ResolvedCheckoutScope};
 use bbox_indexing::accepted_publication_runtime::{
     AcceptedEdgeConfidenceV1, AcceptedKnowledgeApprovalV1, AcceptedKnowledgeCategoryV1,
@@ -15,14 +15,21 @@ use bbox_indexing::accepted_publication_runtime::{
     AcceptedPublicationScopeAgreement, AcceptedPublicationSelection,
     ERROR_ACCEPTED_PUBLICATION_MISSING, VerifiedAcceptedPublication,
 };
+use bbox_indexing::checkout_access::{
+    CheckoutAccessError, CheckoutAccessErrorCode, CheckoutAccessIntent, CheckoutAccessKind,
+    CheckoutAccessRequest, CheckoutAccessSourceLane, CheckoutAttachmentSelector,
+    ValidatedCheckoutLease,
+};
 use bbox_knowledge::knowledge::{
     Approval, Category, Knowledge, KnowledgeEdge, KnowledgeEdgeKind, KnowledgeEntry,
     KnowledgeViewMetadata, Priority, Scope, Status,
 };
 use bbox_knowledge::overlay::{
-    OverlaySnapshot, OverlayStatus, OverlayValue, ProvisionalMode, PublishedKnowledgeEntry,
-    PublishedKnowledgeSnapshot, load_published_snapshot_at_commit_unhydrated,
-    provisional_entity_ref,
+    AcceptedPublishedDigests, CatalogOverlayPublished, OverlayKey, OverlayRecomputeError,
+    OverlayRecomputeErrorKind, OverlaySnapshot, OverlayStatus, OverlayValue, ProvisionalMode,
+    PublishedKnowledgeEntry, PublishedKnowledgeSnapshot, TransientPreservationOutcome,
+    WorkingKnowledgeSnapshot, load_published_snapshot_at_commit_unhydrated, provisional_entity_ref,
+    recompute_catalog_overlay_result,
 };
 
 use super::BlackboxServer;
@@ -68,6 +75,10 @@ pub(crate) struct SessionKnowledgeView {
     pub(crate) items: Vec<KnowledgeViewItem>,
     pub(crate) built_from: BuiltFromTable,
     pub(crate) diagnostics: Vec<String>,
+    /// Checkouts `all` omitted because they could not position themselves
+    /// against accepted content. Empty in every other mode: `published`
+    /// ignores overlay failure and `own` refuses instead of omitting.
+    pub(crate) degraded_overlays: Vec<OverlayDegradation>,
 }
 
 impl SessionKnowledgeView {
@@ -215,11 +226,18 @@ impl SessionKnowledgeView {
                 .and_then(|metadata| metadata.built_from_ref.as_deref())
         });
         let built_from = self.built_from_for_refs(refs);
-        serde_json::json!({
+        let mut response = serde_json::json!({
             "rows": rows,
             "built_from": built_from,
             "diagnostics": &self.diagnostics,
-        })
+        });
+        // Bounded structured degradation for `all` (plan section 10.5).
+        // Omitted entirely when nothing degraded, so a bridge response and
+        // a healthy catalog response keep their existing shape.
+        if !self.degraded_overlays.is_empty() {
+            response["degraded"] = serde_json::json!({ "overlays": &self.degraded_overlays });
+        }
+        response
     }
 
     pub(crate) fn diagnostics_text(&self) -> Option<String> {
@@ -332,6 +350,7 @@ impl BlackboxServer {
         let mut items = BTreeMap::<String, KnowledgeViewItem>::new();
         let mut built_from = BuiltFromTable::default();
         let mut diagnostics = Vec::new();
+        let mut degraded_overlays = Vec::new();
         let mut has_legacy_compatibility_rows = false;
         for entry in self.state.kb.read().all_entries() {
             if self.path_fallback_is_cut() && entry.scope == Scope::Project {
@@ -367,9 +386,11 @@ impl BlackboxServer {
                 requested_project,
                 requested_project_id.as_deref(),
                 mode,
+                session_checkout.as_deref(),
                 &mut items,
                 &mut built_from,
                 &mut diagnostics,
+                &mut degraded_overlays,
             )?;
         }
         let selected_projects = if catalog_published {
@@ -514,7 +535,7 @@ impl BlackboxServer {
                     apply_own_overlay(
                         &mut items,
                         &snapshot,
-                        &project.canonical_path,
+                        OverlayRowProject::LegacyPath(&project.canonical_path),
                         overlay_ref.as_deref(),
                     );
                 }
@@ -555,7 +576,7 @@ impl BlackboxServer {
                         add_overlay_upserts(
                             &mut items,
                             &snapshot,
-                            &project.canonical_path,
+                            OverlayRowProject::LegacyPath(&project.canonical_path),
                             overlay_ref.as_deref(),
                         );
                     }
@@ -592,6 +613,7 @@ impl BlackboxServer {
             items,
             built_from,
             diagnostics,
+            degraded_overlays,
         })
     }
 
@@ -599,14 +621,17 @@ impl BlackboxServer {
     /// project. Nothing here can fail the whole view: a project whose
     /// publication is missing, corrupt, or serving its prior generation
     /// degrades to a bounded diagnostic while its peers keep serving.
+    #[allow(clippy::too_many_arguments)] // one accumulator per view output
     fn append_catalog_published_knowledge(
         &self,
         requested_selector: Option<&str>,
         requested_project_id: Option<&str>,
         mode: ProvisionalMode,
+        session_checkout: Option<&ResolvedCheckoutScope>,
         items: &mut BTreeMap<String, KnowledgeViewItem>,
         built_from: &mut BuiltFromTable,
         diagnostics: &mut Vec<String>,
+        degraded_overlays: &mut Vec<OverlayDegradation>,
     ) -> Result<()> {
         let Some(runtime) = self.state.accepted_publications.clone() else {
             diagnostics.push(
@@ -664,15 +689,374 @@ impl BlackboxServer {
                     None,
                 );
             }
-            if mode != ProvisionalMode::Published {
-                diagnostics.push(format!(
-                    "project {}: provisional overlays for catalog projects land with the \
-                     phase-5 catalog overlay baseline path",
-                    target.project_id
-                ));
+            match mode {
+                // Published ignores overlay failure entirely: accepted
+                // content is authority and needs no checkout (D-007).
+                ProvisionalMode::Published => {}
+                ProvisionalMode::Own => self.apply_catalog_own_knowledge_overlay(
+                    &target.project_id,
+                    &verified,
+                    session_checkout,
+                    items,
+                    built_from,
+                    diagnostics,
+                )?,
+                ProvisionalMode::All => self.append_catalog_all_knowledge_overlays(
+                    &target.project_id,
+                    &verified,
+                    items,
+                    built_from,
+                    diagnostics,
+                    degraded_overlays,
+                )?,
             }
         }
         Ok(())
+    }
+
+    /// Apply the session checkout's own provisional layer, or refuse.
+    ///
+    /// `own` is the strict mode: the caller asked for one named checkout's
+    /// view, and a checkout that cannot position itself against accepted
+    /// content has no honest answer to give. Borrowing another
+    /// attachment's ancestry to produce one is exactly what D-007 forbids,
+    /// so the failure travels out with its exact underlying code.
+    fn apply_catalog_own_knowledge_overlay(
+        &self,
+        project_id: &ProjectId,
+        verified: &VerifiedAcceptedPublication,
+        session_checkout: Option<&ResolvedCheckoutScope>,
+        items: &mut BTreeMap<String, KnowledgeViewItem>,
+        built_from: &mut BuiltFromTable,
+        diagnostics: &mut Vec<String>,
+    ) -> Result<()> {
+        // A session checkout belongs to one project. Every other selected
+        // project serves published rows only, exactly as the bridge does.
+        let Some(own) = session_checkout.filter(|own| own.project_id == project_id.as_str()) else {
+            return Ok(());
+        };
+        let attachment = self
+            .catalog_overlay_attachment(project_id, &own.checkout_id)
+            .context("selecting the attachment carrying the session checkout")?
+            .map_err(provisional_overlay_unavailable)?;
+        let snapshot = self
+            .refresh_catalog_knowledge_overlay(verified, &attachment)
+            .map_err(provisional_overlay_unavailable)?;
+        if snapshot.status != OverlayStatus::Valid {
+            anyhow::bail!(
+                "{ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE}: project {project_id} checkout {}: {}",
+                own.checkout_id,
+                snapshot.diagnostics.join("; ")
+            );
+        }
+        diagnostics.extend(snapshot.diagnostics.iter().map(|diagnostic| {
+            format!(
+                "project {project_id} checkout {}: {diagnostic}",
+                snapshot.key.checkout_id
+            )
+        }));
+        let overlay_ref = intern_overlay_stamp(built_from, &snapshot, diagnostics);
+        apply_own_overlay(
+            items,
+            &snapshot,
+            OverlayRowProject::Catalog(project_id.as_str()),
+            overlay_ref.as_deref(),
+        );
+        Ok(())
+    }
+
+    /// Add every peer checkout's provisional upserts, omitting only the
+    /// peers that failed and reporting each one.
+    ///
+    /// `all` is the survey mode: one unavailable peer is a fact about that
+    /// peer, not about the answer, so accepted content and every healthy
+    /// peer keep serving while the failures ride bounded degradation.
+    fn append_catalog_all_knowledge_overlays(
+        &self,
+        project_id: &ProjectId,
+        verified: &VerifiedAcceptedPublication,
+        items: &mut BTreeMap<String, KnowledgeViewItem>,
+        built_from: &mut BuiltFromTable,
+        diagnostics: &mut Vec<String>,
+        degraded_overlays: &mut Vec<OverlayDegradation>,
+    ) -> Result<()> {
+        for attachment in self.catalog_active_overlay_attachments(project_id)? {
+            let degraded = match self.refresh_catalog_knowledge_overlay(verified, &attachment) {
+                Ok(snapshot) if snapshot.status == OverlayStatus::Valid => {
+                    add_catalog_overlay_rows(project_id, &snapshot, items, built_from, diagnostics);
+                    continue;
+                }
+                Ok(snapshot) => {
+                    OverlayDegradation::invalid_snapshot(project_id, &attachment, &snapshot)
+                }
+                Err(degradation) => degradation,
+            };
+            // The peer is omitted, never faked: its reason rides both the
+            // structured report and the human diagnostics.
+            diagnostics.push(degraded.diagnostic_line());
+            degraded_overlays.push(degraded);
+        }
+        Ok(())
+    }
+
+    /// Every active attachment that may position its checkout against one
+    /// project's accepted content, in attachment-id order.
+    ///
+    /// Capability is deliberately not filtered here. `all` must report a
+    /// capability-denied peer rather than quietly drop it, so the broker
+    /// stays the only thing that answers whether an attachment may open a
+    /// checkout (plan section 9).
+    pub(crate) fn catalog_active_overlay_attachments(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<CatalogOverlayAttachment>> {
+        Ok(self
+            .catalog_project_attachments(project_id)?
+            .into_iter()
+            .filter(|(_, status)| *status == AttachmentStatus::Attached)
+            .map(|(attachment, _)| attachment)
+            .collect())
+    }
+
+    /// The attachment carrying one checkout, or the exact reason there is
+    /// none. `own` never falls back to another attachment: a checkout that
+    /// is gone or detached has no ancestry to lend it (D-007).
+    pub(crate) fn catalog_overlay_attachment(
+        &self,
+        project_id: &ProjectId,
+        checkout_id: &str,
+    ) -> Result<std::result::Result<CatalogOverlayAttachment, OverlayDegradation>> {
+        let found = self
+            .catalog_project_attachments(project_id)?
+            .into_iter()
+            .find(|(attachment, _)| attachment.checkout_id == checkout_id);
+        Ok(match found {
+            Some((attachment, AttachmentStatus::Attached)) => Ok(attachment),
+            Some((attachment, _)) => Err(OverlayDegradation {
+                project_id: project_id.as_str().to_string(),
+                checkout_id: checkout_id.to_string(),
+                attachment_id: Some(attachment.attachment_id),
+                code: CheckoutAccessErrorCode::AttachmentInactive.as_str(),
+                detail: "the attachment carrying this checkout is detached".into(),
+                transient: false,
+            }),
+            None => Err(OverlayDegradation {
+                project_id: project_id.as_str().to_string(),
+                checkout_id: checkout_id.to_string(),
+                attachment_id: None,
+                code: CheckoutAccessErrorCode::AttachmentNotFound.as_str(),
+                detail: "no attachment carries this checkout".into(),
+                transient: false,
+            }),
+        })
+    }
+
+    fn catalog_project_attachments(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<(CatalogOverlayAttachment, AttachmentStatus)>> {
+        let Some(store) = self.state.project_authority.catalog_store() else {
+            return Ok(Vec::new());
+        };
+        let state = store.snapshot().map_err(anyhow::Error::new)?;
+        Ok(state
+            .attachments()
+            .attachments
+            .values()
+            .filter(|row| &row.project_id == project_id)
+            .map(|row| {
+                (
+                    CatalogOverlayAttachment {
+                        attachment_id: row.attachment_id.as_str().to_string(),
+                        checkout_id: row.checkout_id.clone(),
+                    },
+                    row.status,
+                )
+            })
+            .collect())
+    }
+
+    /// Recompute one catalog checkout's provisional knowledge overlay
+    /// against verified accepted content.
+    ///
+    /// This lives beside its caller rather than next to the bridge refresh
+    /// in `src/tools/knowledge.rs`. That refresh is publisher-election
+    /// surface headed for the Phase 6 deletion inventory, and the two
+    /// paths share no authority: the bridge elects a publisher repository
+    /// and reads ancestry through it, while a catalog overlay takes
+    /// content from accepted bytes and ancestry from this checkout alone
+    /// (D-007). The file split is the intended end state, not debt.
+    pub(crate) fn refresh_catalog_knowledge_overlay(
+        &self,
+        verified: &VerifiedAcceptedPublication,
+        attachment: &CatalogOverlayAttachment,
+    ) -> std::result::Result<OverlaySnapshot, OverlayDegradation> {
+        let _refresh = self.state.knowledge_overlay_refresh.lock();
+        let content_stamp = verified.content_stamp();
+        let scope = content_stamp.accepted_scope().clone();
+        let key = OverlayKey {
+            published_scope: scope.clone(),
+            checkout_id: attachment.checkout_id.clone(),
+        };
+
+        let generation = self
+            .state
+            .knowledge_overlays
+            .write()
+            .begin_refresh(key.clone());
+        let prior = self
+            .state
+            .knowledge_overlays
+            .read()
+            .get(&scope, &attachment.checkout_id)
+            .cloned();
+        let prior_is_valid = prior
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.status == OverlayStatus::Valid);
+
+        let failure =
+            match self.compute_catalog_knowledge_overlay(verified, attachment, &scope, || {}) {
+                Ok(snapshot) => {
+                    // The refresh mutex is held across the whole sequence, so
+                    // no newer generation can exist here; publication is the
+                    // observability record, and the caller is served the
+                    // snapshot it just computed either way.
+                    self.state
+                        .knowledge_overlays
+                        .write()
+                        .publish_if_latest(generation, snapshot.clone());
+                    return Ok(snapshot);
+                }
+                Err(failure) => failure,
+            };
+
+        // Bounded preservation for transient failures only. A structural
+        // failure carries `transient = false` by construction, so a
+        // detached publisher, a missing accepted commit, or an absent
+        // merge base can never be masked by a stale valid snapshot
+        // (plan section 4.12).
+        if failure.transient && prior_is_valid {
+            let mut preserved = prior.expect("prior valid snapshot");
+            preserved.diagnostics = vec![failure.diagnostic_line()];
+            match self
+                .state
+                .knowledge_overlays
+                .write()
+                .preserve_transient_if_latest(generation, preserved.clone())
+            {
+                TransientPreservationOutcome::Preserved { .. }
+                | TransientPreservationOutcome::Superseded => return Ok(preserved),
+                TransientPreservationOutcome::Exhausted => {}
+            }
+        }
+        self.state.knowledge_overlays.write().publish_if_latest(
+            generation,
+            invalid_knowledge_overlay(&key, failure.diagnostic_line()),
+        );
+        Err(failure)
+    }
+
+    /// One checkout positioned against accepted content, with the lease and
+    /// the accepted identity both proved after the capture.
+    ///
+    /// `after_capture` runs inside the capture window. Production passes a
+    /// no-op; it is the seam that lets a test move the checkout, detach the
+    /// attachment, or advance accepted content at the exact point these
+    /// proofs exist to catch.
+    fn compute_catalog_knowledge_overlay(
+        &self,
+        verified: &VerifiedAcceptedPublication,
+        attachment: &CatalogOverlayAttachment,
+        scope: &PublishedScope,
+        after_capture: impl FnMut(),
+    ) -> std::result::Result<OverlaySnapshot, OverlayDegradation> {
+        let content_stamp = verified.content_stamp();
+        let project_id = content_stamp.project_id();
+        let published = accepted_knowledge_digests(verified);
+        let lease = self.acquire_catalog_overlay_lease(project_id, attachment, scope)?;
+        let snapshot = stable_catalog_knowledge_overlay(
+            CatalogOverlayPublished {
+                published_scope: scope,
+                checkout_id: &attachment.checkout_id,
+                full_ref: content_stamp.full_ref(),
+                accepted_commit: content_stamp.accepted_commit(),
+                accepted_generation: content_stamp.generation_id(),
+                published: &published,
+            },
+            &lease,
+            after_capture,
+        )
+        .map_err(|error| {
+            OverlayDegradation::from_knowledge_recompute(project_id, attachment, &error)
+        })?;
+        // Both identities are proved after the capture and before the
+        // snapshot is published (plan section 8, P5-D mechanics step 10):
+        // a detach makes the bytes unauthorized, and an advance makes them
+        // a position against content that is no longer published.
+        self.state
+            .checkout_access
+            .revalidate(&lease)
+            .map_err(|error| {
+                OverlayDegradation::from_checkout_access(project_id, Some(attachment), &error)
+            })?;
+        if !self.catalog_accepted_content_unchanged(content_stamp) {
+            return Err(OverlayDegradation {
+                project_id: project_id.as_str().to_string(),
+                checkout_id: attachment.checkout_id.clone(),
+                attachment_id: Some(attachment.attachment_id.clone()),
+                code: ERROR_OVERLAY_ACCEPTED_CONTENT_CHANGED,
+                detail: "accepted content advanced while the overlay was being computed".into(),
+                transient: false,
+            });
+        }
+        Ok(snapshot)
+    }
+
+    /// Acquire one native `KnowledgeGapOverlayRead` lease.
+    ///
+    /// The selector is the attachment id, so the observation rides the
+    /// native lane rather than a compatibility one. `expected_scope` is the
+    /// ACCEPTED scope, not the catalog's current scope: the diff is defined
+    /// under the accepted scope's knowledge directory, so an attachment
+    /// validated at a migrated scope must refuse rather than diff the wrong
+    /// tree (plan section 4.9).
+    pub(crate) fn acquire_catalog_overlay_lease(
+        &self,
+        project_id: &ProjectId,
+        attachment: &CatalogOverlayAttachment,
+        scope: &PublishedScope,
+    ) -> std::result::Result<ValidatedCheckoutLease, OverlayDegradation> {
+        self.state
+            .checkout_access
+            .acquire(CheckoutAccessRequest {
+                project_id: project_id.as_str().to_string(),
+                attachment: CheckoutAttachmentSelector::AttachmentId(
+                    attachment.attachment_id.clone(),
+                ),
+                expected_scope: Some(scope.clone()),
+                kind: CheckoutAccessKind::KnowledgeGapOverlayRead,
+                intent: CheckoutAccessIntent::Read,
+                source_lane: CheckoutAccessSourceLane::NativeAttachment,
+            })
+            .map_err(|error| {
+                OverlayDegradation::from_checkout_access(project_id, Some(attachment), &error)
+            })
+    }
+
+    /// True while the pointer still names the accepted content that stamped
+    /// an overlay. An advance during capture invalidates the snapshot.
+    pub(crate) fn catalog_accepted_content_unchanged(
+        &self,
+        content_stamp: &AcceptedPublicationContentStamp,
+    ) -> bool {
+        self.state
+            .accepted_publications
+            .as_ref()
+            .is_some_and(|runtime| {
+                runtime
+                    .load_verified(content_stamp.project_id())
+                    .is_ok_and(|current| current.content_stamp() == content_stamp)
+            })
     }
 
     /// Project accepted records once per accepted content identity. The
@@ -857,6 +1241,326 @@ impl BlackboxServer {
         })?;
         Ok(hydrated)
     }
+}
+
+// ── Catalog overlay baseline path (plan section 8, P5-D) ─────────────────
+
+/// `own` refuses with this code and carries the exact underlying overlay or
+/// checkout code inside it (plan sections 10.4 and 10.5).
+pub(crate) const ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE: &str =
+    "error.provisional_overlay_unavailable";
+/// The checkout cannot prove the baseline: it does not contain the accepted
+/// commit, or it shares no merge base with it. Structural, never transient.
+pub(crate) const ERROR_OVERLAY_BASELINE_UNAVAILABLE: &str = "error.overlay_baseline_unavailable";
+/// No current snapshot exists for this checkout. The overlay vocabulary has
+/// exactly one non-structural failure code, and both causes say the same
+/// thing to a caller: invalid working content, and a checkout that never
+/// settled across a bounded capture.
+pub(crate) const ERROR_OVERLAY_SNAPSHOT_STALE: &str = "error.overlay_snapshot_stale";
+/// Accepted content advanced between the capture and the publication, so the
+/// snapshot positions the checkout against bytes that are no longer published.
+pub(crate) const ERROR_OVERLAY_ACCEPTED_CONTENT_CHANGED: &str =
+    "error.overlay_accepted_content_changed";
+
+/// One attachment that may position its checkout against accepted content.
+/// Identity only: an overlay carrier never holds a host path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CatalogOverlayAttachment {
+    pub(crate) attachment_id: String,
+    pub(crate) checkout_id: String,
+}
+
+/// One checkout that could not position itself against accepted content.
+///
+/// Every field is bounded identity or a stable code. The underlying error
+/// text can name absolute paths and raw Git output, so it goes to the log
+/// and an authored sentence goes to the response (plan section 10.5).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct OverlayDegradation {
+    pub(crate) project_id: String,
+    pub(crate) checkout_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) attachment_id: Option<String>,
+    pub(crate) code: &'static str,
+    pub(crate) detail: String,
+    /// Whether a bounded transient window may preserve a prior valid
+    /// snapshot over this failure. Structural authority facts may not.
+    #[serde(skip)]
+    pub(crate) transient: bool,
+}
+
+impl OverlayDegradation {
+    pub(crate) fn diagnostic_line(&self) -> String {
+        match &self.attachment_id {
+            Some(attachment_id) => format!(
+                "project {} checkout {} (attachment {attachment_id}): {}: {}",
+                self.project_id, self.checkout_id, self.code, self.detail
+            ),
+            None => format!(
+                "project {} checkout {}: {}: {}",
+                self.project_id, self.checkout_id, self.code, self.detail
+            ),
+        }
+    }
+
+    /// Classify a checkout-access refusal into the plan's degradation
+    /// vocabulary (plan section 10.2). Only `lifecycle_busy` and a
+    /// momentarily unreadable observation store are retryable; every other
+    /// refusal is a fact about authority that a stale snapshot must not hide.
+    pub(crate) fn from_checkout_access(
+        project_id: &ProjectId,
+        attachment: Option<&CatalogOverlayAttachment>,
+        error: &CheckoutAccessError,
+    ) -> Self {
+        let detail = match error.code {
+            CheckoutAccessErrorCode::AttachmentNotFound => "no active attachment is available",
+            CheckoutAccessErrorCode::AttachmentInactive => "the attachment is detached",
+            CheckoutAccessErrorCode::CapabilityDenied => {
+                "the attachment does not record the repo-knowledge capability"
+            }
+            CheckoutAccessErrorCode::LifecycleBusy => "the checkout lifecycle is busy",
+            CheckoutAccessErrorCode::CheckoutIdentityMismatch => {
+                "the checkout no longer proves its recorded identity"
+            }
+            CheckoutAccessErrorCode::InvalidRoot
+            | CheckoutAccessErrorCode::UnsafeRelativePath
+            | CheckoutAccessErrorCode::ConservativePathGateDenied => {
+                "the checkout root is unsafe or no longer valid"
+            }
+            CheckoutAccessErrorCode::ScopeMismatch => {
+                "the attachment is validated at a different published scope"
+            }
+            _ => "the checkout could not be leased for an overlay read",
+        };
+        tracing::debug!(
+            project_id = %project_id,
+            code = error.code.as_str(),
+            error = %error,
+            "catalog overlay checkout access refused"
+        );
+        Self {
+            project_id: project_id.as_str().to_string(),
+            checkout_id: attachment
+                .map(|attachment| attachment.checkout_id.clone())
+                .unwrap_or_default(),
+            attachment_id: attachment.map(|attachment| attachment.attachment_id.clone()),
+            code: error.code.as_str(),
+            detail: detail.to_string(),
+            transient: matches!(
+                error.code,
+                CheckoutAccessErrorCode::LifecycleBusy
+                    | CheckoutAccessErrorCode::ObservationUnavailable
+            ),
+        }
+    }
+
+    fn from_knowledge_recompute(
+        project_id: &ProjectId,
+        attachment: &CatalogOverlayAttachment,
+        error: &OverlayRecomputeError,
+    ) -> Self {
+        let (code, detail, transient) = match error.kind {
+            OverlayRecomputeErrorKind::BaselineUnavailable => (
+                ERROR_OVERLAY_BASELINE_UNAVAILABLE,
+                "the checkout does not contain the accepted commit or shares no merge base with it",
+                false,
+            ),
+            OverlayRecomputeErrorKind::InvalidContent => (
+                ERROR_OVERLAY_SNAPSHOT_STALE,
+                "the checkout's knowledge files are not valid published content",
+                false,
+            ),
+            OverlayRecomputeErrorKind::Transient => (
+                ERROR_OVERLAY_SNAPSHOT_STALE,
+                "the checkout did not settle into a stable overlay snapshot",
+                true,
+            ),
+        };
+        tracing::debug!(
+            project_id = %project_id,
+            checkout_id = %attachment.checkout_id,
+            code,
+            error = %error,
+            "catalog knowledge overlay recompute failed"
+        );
+        Self {
+            project_id: project_id.as_str().to_string(),
+            checkout_id: attachment.checkout_id.clone(),
+            attachment_id: Some(attachment.attachment_id.clone()),
+            code,
+            detail: detail.to_string(),
+            transient,
+        }
+    }
+
+    /// A published-but-invalid snapshot: the peer has a store entry and no
+    /// usable values, which `all` reports rather than serving.
+    fn invalid_snapshot(
+        project_id: &ProjectId,
+        attachment: &CatalogOverlayAttachment,
+        snapshot: &OverlaySnapshot,
+    ) -> Self {
+        Self {
+            project_id: project_id.as_str().to_string(),
+            checkout_id: attachment.checkout_id.clone(),
+            attachment_id: Some(attachment.attachment_id.clone()),
+            code: ERROR_OVERLAY_SNAPSHOT_STALE,
+            detail: snapshot.diagnostics.join("; "),
+            transient: false,
+        }
+    }
+}
+
+/// Wrap one degradation in the mode's stable code. `own` returns a tool
+/// error, so the exact underlying code has to survive into the text.
+fn provisional_overlay_unavailable(degradation: OverlayDegradation) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE}: {}",
+        degradation.diagnostic_line()
+    )
+}
+
+/// An empty invalid snapshot for one overlay key.
+///
+/// The bridge builds this from a `ResolvedCheckoutScope`; a catalog refresh
+/// has no such compatibility carrier and builds it from the key it already
+/// reserved.
+fn invalid_knowledge_overlay(key: &OverlayKey, diagnostic: String) -> OverlaySnapshot {
+    OverlaySnapshot {
+        snapshot_id: String::new(),
+        key: key.clone(),
+        stamp: None,
+        status: OverlayStatus::Invalid,
+        values: BTreeMap::new(),
+        diagnostics: vec![diagnostic],
+    }
+}
+
+/// Capture one overlay the checkout agrees with twice in a row.
+///
+/// Head, merge base, and working fingerprint all ride the snapshot id, so
+/// one comparison covers every kind of movement during the capture. A
+/// checkout that never settles inside the bounded window is transient: it
+/// is busy, not wrong.
+///
+/// `after_capture` runs between the reads. Production passes a no-op; it is
+/// the seam that lets a test move the checkout at the exact point the
+/// stability discipline exists to catch.
+fn stable_catalog_knowledge_overlay(
+    published: CatalogOverlayPublished<'_>,
+    lease: &ValidatedCheckoutLease,
+    mut after_capture: impl FnMut(),
+) -> std::result::Result<OverlaySnapshot, OverlayRecomputeError> {
+    let pending = || {
+        lease
+            .checkout_relative_regular_file_exists(
+                ".bbox/local/knowledge-transactions/pending.json",
+            )
+            .map_err(anyhow::Error::new)
+            .map_err(OverlayRecomputeError::transient)
+    };
+    let working = || {
+        let files = lease
+            .read_relative_json_directory(".bbox/knowledge")
+            .map_err(anyhow::Error::new)
+            .map_err(OverlayRecomputeError::transient)?;
+        WorkingKnowledgeSnapshot::new(files).map_err(OverlayRecomputeError::transient)
+    };
+    if pending()? {
+        return Err(OverlayRecomputeError::transient(anyhow::anyhow!(
+            "checkout transaction is pending; catalog overlay refresh deferred"
+        )));
+    }
+    let first_working = working()?;
+    let mut candidate =
+        recompute_catalog_overlay_result(published, lease.checkout_root(), &first_working)?;
+    for _ in 0..2 {
+        after_capture();
+        if pending()? {
+            return Err(OverlayRecomputeError::transient(anyhow::anyhow!(
+                "checkout transaction began during catalog overlay refresh"
+            )));
+        }
+        let next_working = working()?;
+        let next =
+            recompute_catalog_overlay_result(published, lease.checkout_root(), &next_working)?;
+        if same_knowledge_snapshot(&candidate, &next) && !pending()? {
+            return Ok(next);
+        }
+        candidate = next;
+    }
+    Err(OverlayRecomputeError::transient(anyhow::anyhow!(
+        "checkout state changed repeatedly during catalog overlay refresh"
+    )))
+}
+
+fn same_knowledge_snapshot(left: &OverlaySnapshot, right: &OverlaySnapshot) -> bool {
+    left.snapshot_id == right.snapshot_id
+        && left.status == right.status
+        && left.diagnostics == right.diagnostics
+}
+
+/// Project the accepted knowledge manifest into the identity the diff asks
+/// for: does this file exist in published content, and do the working bytes
+/// already equal it.
+///
+/// Manifest keys are repository-relative and the diff compares basenames
+/// inside one published scope's knowledge directory. Basenames are unique
+/// there by construction, because every manifest entry names a file in that
+/// one directory.
+fn accepted_knowledge_digests(verified: &VerifiedAcceptedPublication) -> AcceptedPublishedDigests {
+    AcceptedPublishedDigests(
+        verified
+            .knowledge_manifest()
+            .iter()
+            .filter_map(|(filename, manifest)| {
+                Some((
+                    basename(filename.as_str())?,
+                    manifest.source_content_sha256.as_str().to_string(),
+                ))
+            })
+            .collect(),
+    )
+}
+
+pub(crate) fn basename(repository_relative: &str) -> Option<String> {
+    Path::new(repository_relative)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+}
+
+/// Merge one valid peer snapshot's provisional upserts into the view.
+fn add_catalog_overlay_rows(
+    project_id: &ProjectId,
+    snapshot: &OverlaySnapshot,
+    items: &mut BTreeMap<String, KnowledgeViewItem>,
+    built_from: &mut BuiltFromTable,
+    diagnostics: &mut Vec<String>,
+) {
+    diagnostics.extend(snapshot.diagnostics.iter().map(|diagnostic| {
+        format!(
+            "project {project_id} checkout {}: {diagnostic}",
+            snapshot.key.checkout_id
+        )
+    }));
+    // A peer's tombstone is a diagnostic, never a deletion: `all` surveys
+    // checkouts, and one peer may not retract another's published rows.
+    for (entry_id, value) in &snapshot.values {
+        if matches!(value, OverlayValue::Tombstone) {
+            diagnostics.push(format!(
+                "checkout {} tombstones knowledge:{entry_id}",
+                snapshot.key.checkout_id
+            ));
+        }
+    }
+    let overlay_ref = intern_overlay_stamp(built_from, snapshot, diagnostics);
+    add_overlay_upserts(
+        items,
+        snapshot,
+        OverlayRowProject::Catalog(project_id.as_str()),
+        overlay_ref.as_deref(),
+    );
 }
 
 /// Why one catalog project cannot serve published content. Only the stable
@@ -1074,10 +1778,21 @@ fn insert_published_item(
     );
 }
 
+/// How one overlay row names its project.
+///
+/// The bridge stamps the checkout path its records lane already carried. A
+/// catalog row has no path to stamp and carries durable identity instead,
+/// exactly as its published rows do.
+#[derive(Debug, Clone, Copy)]
+enum OverlayRowProject<'a> {
+    LegacyPath(&'a str),
+    Catalog(&'a str),
+}
+
 fn apply_own_overlay(
     items: &mut BTreeMap<String, KnowledgeViewItem>,
     snapshot: &OverlaySnapshot,
-    durable_project: &str,
+    project: OverlayRowProject<'_>,
     built_from_ref: Option<&str>,
 ) {
     for (entry_id, value) in &snapshot.values {
@@ -1088,14 +1803,7 @@ fn apply_own_overlay(
             .to_string(),
         );
         if matches!(value, OverlayValue::Upsert { .. }) {
-            insert_overlay_item(
-                items,
-                snapshot,
-                entry_id,
-                value,
-                durable_project,
-                built_from_ref,
-            );
+            insert_overlay_item(items, snapshot, entry_id, value, project, built_from_ref);
         }
     }
 }
@@ -1103,19 +1811,12 @@ fn apply_own_overlay(
 fn add_overlay_upserts(
     items: &mut BTreeMap<String, KnowledgeViewItem>,
     snapshot: &OverlaySnapshot,
-    durable_project: &str,
+    project: OverlayRowProject<'_>,
     built_from_ref: Option<&str>,
 ) {
     for (entry_id, value) in &snapshot.values {
         if matches!(value, OverlayValue::Upsert { .. }) {
-            insert_overlay_item(
-                items,
-                snapshot,
-                entry_id,
-                value,
-                durable_project,
-                built_from_ref,
-            );
+            insert_overlay_item(items, snapshot, entry_id, value, project, built_from_ref);
         }
     }
 }
@@ -1125,7 +1826,7 @@ fn insert_overlay_item(
     snapshot: &OverlaySnapshot,
     entry_id: &str,
     value: &OverlayValue,
-    durable_project: &str,
+    project: OverlayRowProject<'_>,
     built_from_ref: Option<&str>,
 ) {
     let OverlayValue::Upsert {
@@ -1141,7 +1842,13 @@ fn insert_overlay_item(
         entry_id,
     );
     let mut entry = (**entry).clone();
-    entry.project = Some(durable_project.to_string());
+    match project {
+        OverlayRowProject::LegacyPath(path) => entry.project = Some(path.to_string()),
+        OverlayRowProject::Catalog(project_id) => {
+            entry.project = None;
+            entry.project_id = Some(project_id.to_string());
+        }
+    }
     items.insert(
         entity_ref.clone(),
         KnowledgeViewItem {
@@ -2246,5 +2953,641 @@ mod catalog_view_tests {
             .unwrap();
         assert_eq!(row(&view, "knowledge-a").entry.content, "first project");
         assert!(view.items.iter().all(|item| item.entry.id != "knowledge-b"));
+    }
+}
+
+/// Catalog overlay baseline path (Phase 5 plan sections 8 P5-D and 13.4).
+///
+/// Every fixture here uses a real repository: the catalog overlay proves
+/// commit containment and a merge base inside one checkout and nowhere
+/// else, so synthetic ancestry would prove nothing.
+#[cfg(test)]
+mod catalog_overlay_tests {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    use bbox_indexing::accepted_publication_runtime::AcceptedPublicationSelection;
+
+    use crate::server::state::catalog_fixture::{CatalogFixture, knowledge_entry};
+
+    use super::*;
+
+    const PROJECT: &str = "p_overlay";
+    const BASE_ATTACHMENT: &str = "att_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01";
+    const BASE_CHECKOUT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01";
+    const PEER_ATTACHMENT: &str = "att_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa02";
+    const PEER_CHECKOUT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa02";
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn write_entry(root: &Path, entry: &KnowledgeEntry) {
+        let dir = root.join(".bbox/knowledge");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{}.json", entry.id)),
+            serde_json::to_vec_pretty(entry).unwrap(),
+        )
+        .unwrap();
+    }
+
+    struct OverlayFixture {
+        catalog: CatalogFixture,
+        _temp: tempfile::TempDir,
+        root: PathBuf,
+        base: PathBuf,
+        accepted_commit: String,
+        scope: PublishedScope,
+    }
+
+    impl OverlayFixture {
+        /// One published repository committed at the accepted commit and
+        /// attached as the project's base checkout.
+        fn new(entries: &[KnowledgeEntry]) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let base = root.join("base");
+            std::fs::create_dir_all(&base).unwrap();
+            git(&base, &["init", "-q", "-b", "main"]);
+            git(&base, &["config", "user.email", "t@example.com"]);
+            git(&base, &["config", "user.name", "Test"]);
+            for entry in entries {
+                write_entry(&base, entry);
+            }
+            git(&base, &["add", ".bbox/knowledge"]);
+            git(&base, &["commit", "-q", "-m", "accepted"]);
+            let accepted_commit = bbox_corpus_core::git::current_head(&base).unwrap();
+
+            let catalog = CatalogFixture::new();
+            let scope = CatalogFixture::scope(".");
+            catalog.add_published_project(PROJECT, &scope);
+            catalog.install_publication(PROJECT, &scope, &accepted_commit, entries, &[]);
+            catalog.attach_overlay_checkout(
+                PROJECT,
+                &scope,
+                &base,
+                BASE_ATTACHMENT,
+                BASE_CHECKOUT,
+                true,
+            );
+            Self {
+                catalog,
+                _temp: temp,
+                root,
+                base,
+                accepted_commit,
+                scope,
+            }
+        }
+
+        /// A worktree branched off the accepted commit: the ordinary shape
+        /// of a peer that can prove the baseline.
+        fn worktree(&self, name: &str, attachment_id: &str, checkout_id: &str) -> PathBuf {
+            let path = self.root.join(name);
+            git(
+                &self.base,
+                &["worktree", "add", "-q", "-b", name, path.to_str().unwrap()],
+            );
+            self.catalog.attach_overlay_checkout(
+                PROJECT,
+                &self.scope,
+                &path,
+                attachment_id,
+                checkout_id,
+                true,
+            );
+            path
+        }
+
+        /// A repository with its own unrelated history. It cannot contain
+        /// the accepted commit, and there is no publisher root to borrow
+        /// it from (D-007).
+        fn unrelated(&self, name: &str, attachment_id: &str, checkout_id: &str) -> PathBuf {
+            let path = self.root.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            git(&path, &["init", "-q", "-b", "main"]);
+            git(&path, &["config", "user.email", "t@example.com"]);
+            git(&path, &["config", "user.name", "Test"]);
+            write_entry(&path, &knowledge_entry("keep", "unrelated"));
+            git(&path, &["add", ".bbox/knowledge"]);
+            git(&path, &["commit", "-q", "-m", "unrelated"]);
+            self.catalog.attach_overlay_checkout(
+                PROJECT,
+                &self.scope,
+                &path,
+                attachment_id,
+                checkout_id,
+                true,
+            );
+            path
+        }
+
+        fn project_id(&self) -> ProjectId {
+            ProjectId::parse(PROJECT).unwrap()
+        }
+
+        fn verified(&self, server: &BlackboxServer) -> VerifiedAcceptedPublication {
+            server
+                .state
+                .accepted_publications
+                .as_ref()
+                .unwrap()
+                .load_verified(&self.project_id())
+                .unwrap()
+        }
+    }
+
+    fn attachment(attachment_id: &str, checkout_id: &str) -> CatalogOverlayAttachment {
+        CatalogOverlayAttachment {
+            attachment_id: attachment_id.to_string(),
+            checkout_id: checkout_id.to_string(),
+        }
+    }
+
+    fn provisional_row(view: &SessionKnowledgeView, entry_id: &str) -> KnowledgeViewItem {
+        view.items
+            .iter()
+            .find(|item| {
+                item.entry.id == entry_id && item.entity_ref.starts_with("provisional_knowledge:")
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("provisional row {entry_id} is present: {:?}", view.items))
+    }
+
+    #[test]
+    fn an_attached_checkout_positions_its_working_tree_against_accepted_content() {
+        let fixture = OverlayFixture::new(&[
+            knowledge_entry("keep", "accepted"),
+            knowledge_entry("remove", "accepted"),
+        ]);
+        let worktree = fixture.worktree("peer", PEER_ATTACHMENT, PEER_CHECKOUT);
+        write_entry(
+            &worktree,
+            &knowledge_entry("keep", "changed in the checkout"),
+        );
+        write_entry(&worktree, &knowledge_entry("new", "untracked"));
+        std::fs::remove_file(worktree.join(".bbox/knowledge/remove.json")).unwrap();
+
+        let server = fixture.catalog.server_with_checkout_authority();
+        server.set_session_checkout_for_test(
+            PROJECT.into(),
+            fixture.scope.clone(),
+            PEER_CHECKOUT.into(),
+            worktree.clone(),
+        );
+
+        let view = server.session_knowledge_view(None, Some("own")).unwrap();
+        assert_eq!(
+            provisional_row(&view, "keep").entry.content,
+            "changed in the checkout"
+        );
+        assert_eq!(provisional_row(&view, "new").entry.content, "untracked");
+        assert!(
+            view.items.iter().all(|item| item.entry.id != "remove"),
+            "a tombstoned entry leaves the own view: {:?}",
+            view.items
+        );
+
+        // A catalog overlay row carries durable identity, never a host
+        // path: the checkout directory is not authority.
+        let keep = provisional_row(&view, "keep");
+        assert_eq!(keep.entry.project, None);
+        assert_eq!(keep.entry.project_id.as_deref(), Some(PROJECT));
+
+        let stamp_ref = keep
+            .metadata
+            .built_from_ref
+            .clone()
+            .expect("an overlay row carries a provable stamp");
+        let stamp = view.built_from.get(&stamp_ref).cloned().unwrap();
+        let BuiltFromStamp::CheckoutOverlay {
+            checkout_id,
+            publisher_commit,
+            merge_base,
+            ..
+        } = stamp
+        else {
+            panic!("an overlay row stamps CheckoutOverlay: {stamp:?}");
+        };
+        assert_eq!(checkout_id, PEER_CHECKOUT);
+        // Accepted content supplies commit P; the baseline is proved in
+        // this checkout alone, and a branch off P has P as its merge base.
+        assert_eq!(publisher_commit, fixture.accepted_commit);
+        assert_eq!(merge_base, fixture.accepted_commit);
+        assert!(view.degraded_overlays.is_empty());
+    }
+
+    #[test]
+    fn a_detached_attachment_refuses_own_while_published_content_keeps_serving() {
+        let fixture = OverlayFixture::new(&[knowledge_entry("keep", "accepted")]);
+        fixture.catalog.detach(BASE_ATTACHMENT);
+        let server = fixture.catalog.server_with_checkout_authority();
+        server.set_session_checkout_for_test(
+            PROJECT.into(),
+            fixture.scope.clone(),
+            BASE_CHECKOUT.into(),
+            fixture.base.clone(),
+        );
+
+        let error = server
+            .session_knowledge_view(None, Some("own"))
+            .err()
+            .expect("own has no honest answer without its own checkout");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE),
+            "{text}"
+        );
+        assert!(text.contains("attachment_inactive"), "{text}");
+
+        // Detach does not touch accepted content, which is the whole point
+        // of durable publication.
+        let published = server
+            .session_knowledge_view(None, Some("published"))
+            .unwrap();
+        assert_eq!(
+            published
+                .items
+                .iter()
+                .find(|item| item.entry.id == "keep")
+                .unwrap()
+                .entry
+                .content,
+            "accepted"
+        );
+        assert!(published.degraded_overlays.is_empty());
+    }
+
+    #[test]
+    fn a_checkout_that_cannot_prove_the_baseline_refuses_own() {
+        let fixture = OverlayFixture::new(&[knowledge_entry("keep", "accepted")]);
+        let unrelated = fixture.unrelated("unrelated", PEER_ATTACHMENT, PEER_CHECKOUT);
+
+        let server = fixture.catalog.server_with_checkout_authority();
+        server.set_session_checkout_for_test(
+            PROJECT.into(),
+            fixture.scope.clone(),
+            PEER_CHECKOUT.into(),
+            unrelated,
+        );
+
+        let error = server
+            .session_knowledge_view(None, Some("own"))
+            .err()
+            .expect("a checkout without commit P cannot position itself");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE),
+            "{text}"
+        );
+        assert!(text.contains(ERROR_OVERLAY_BASELINE_UNAVAILABLE), "{text}");
+    }
+
+    #[test]
+    fn all_omits_only_the_failed_peer_and_reports_its_reason() {
+        let fixture = OverlayFixture::new(&[knowledge_entry("keep", "accepted")]);
+        let peer = fixture.worktree("peer", PEER_ATTACHMENT, PEER_CHECKOUT);
+        write_entry(&peer, &knowledge_entry("keep", "peer variant"));
+        const BROKEN_ATTACHMENT: &str = "att_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa03";
+        const BROKEN_CHECKOUT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa03";
+        fixture.unrelated("broken", BROKEN_ATTACHMENT, BROKEN_CHECKOUT);
+
+        let server = fixture.catalog.server_with_checkout_authority();
+        let view = server.session_knowledge_view(None, Some("all")).unwrap();
+
+        // Accepted content and the healthy peer both keep serving.
+        assert!(
+            view.items
+                .iter()
+                .any(|item| item.entry.id == "keep" && item.entity_ref.starts_with("knowledge:"))
+        );
+        assert_eq!(provisional_row(&view, "keep").entry.content, "peer variant");
+
+        assert_eq!(
+            view.degraded_overlays.len(),
+            1,
+            "{:?}",
+            view.degraded_overlays
+        );
+        let degraded = &view.degraded_overlays[0];
+        assert_eq!(degraded.checkout_id, BROKEN_CHECKOUT);
+        assert_eq!(degraded.attachment_id.as_deref(), Some(BROKEN_ATTACHMENT));
+        assert_eq!(degraded.code, ERROR_OVERLAY_BASELINE_UNAVAILABLE);
+        assert!(
+            view.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains(ERROR_OVERLAY_BASELINE_UNAVAILABLE)),
+            "{:?}",
+            view.diagnostics
+        );
+
+        // The structured report carries the same bounded rows and no path.
+        let structured = view.structured_response(&["keep".into()]);
+        let overlays = structured["degraded"]["overlays"].as_array().unwrap();
+        assert_eq!(overlays.len(), 1);
+        assert_eq!(overlays[0]["code"], ERROR_OVERLAY_BASELINE_UNAVAILABLE);
+        assert!(
+            !structured
+                .to_string()
+                .contains(fixture.root.to_str().unwrap()),
+            "a degradation must not carry an absolute path"
+        );
+    }
+
+    #[test]
+    fn published_ignores_overlay_failure_entirely() {
+        let fixture = OverlayFixture::new(&[knowledge_entry("keep", "accepted")]);
+        fixture.unrelated("broken", PEER_ATTACHMENT, PEER_CHECKOUT);
+
+        let server = fixture.catalog.server_with_checkout_authority();
+        let view = server
+            .session_knowledge_view(None, Some("published"))
+            .unwrap();
+
+        assert_eq!(
+            view.items
+                .iter()
+                .find(|item| item.entry.id == "keep")
+                .unwrap()
+                .entry
+                .content,
+            "accepted"
+        );
+        assert!(view.degraded_overlays.is_empty());
+        // Published never opens a checkout at all, so a broken peer cannot
+        // even be observed from this mode.
+        let health = server.state.checkout_access.health();
+        assert!(
+            health
+                .operations
+                .iter()
+                .all(|operation| operation.granted == 0 && operation.denied == 0)
+        );
+    }
+
+    #[test]
+    fn a_prior_generation_positions_the_checkout_against_prior_accepted_content() {
+        let fixture = OverlayFixture::new(&[knowledge_entry("keep", "generation one")]);
+        // Advance to a second real commit, then destroy that generation:
+        // the pointer falls back to its prior arm.
+        write_entry(&fixture.base, &knowledge_entry("keep", "generation two"));
+        git(&fixture.base, &["add", ".bbox/knowledge"]);
+        git(&fixture.base, &["commit", "-q", "-m", "advance"]);
+        let second_commit = bbox_corpus_core::git::current_head(&fixture.base).unwrap();
+        let installed = fixture.catalog.install_publication(
+            PROJECT,
+            &fixture.scope,
+            &second_commit,
+            &[knowledge_entry("keep", "generation two")],
+            &[],
+        );
+        fixture
+            .catalog
+            .corrupt_generation(PROJECT, &installed.generation_id);
+
+        let worktree = fixture.worktree("peer", PEER_ATTACHMENT, PEER_CHECKOUT);
+        write_entry(&worktree, &knowledge_entry("keep", "checkout variant"));
+
+        let server = fixture.catalog.server_with_checkout_authority();
+        let verified = fixture.verified(&server);
+        assert_eq!(
+            verified.binding_stamp().selection(),
+            AcceptedPublicationSelection::Prior
+        );
+
+        let snapshot = server
+            .refresh_catalog_knowledge_overlay(
+                &verified,
+                &attachment(PEER_ATTACHMENT, PEER_CHECKOUT),
+            )
+            .unwrap();
+        let stamp = snapshot.stamp.expect("a valid snapshot carries its stamp");
+        // The overlay positions the checkout against the content the
+        // pointer is actually serving, which is the prior generation.
+        assert_eq!(stamp.publisher_commit, fixture.accepted_commit);
+        assert_eq!(
+            stamp.accepted_generation.as_deref(),
+            Some(verified.content_stamp().generation_id())
+        );
+    }
+
+    /// The capture is a two-read agreement: head, merge base, and working
+    /// fingerprint all ride the snapshot id, so one comparison covers
+    /// every kind of movement.
+    #[test]
+    fn a_head_that_moves_once_during_capture_settles_on_the_later_read() {
+        let fixture = OverlayFixture::new(&[knowledge_entry("keep", "accepted")]);
+        let worktree = fixture.worktree("peer", PEER_ATTACHMENT, PEER_CHECKOUT);
+        let server = fixture.catalog.server_with_checkout_authority();
+        let verified = fixture.verified(&server);
+        let published = accepted_knowledge_digests(&verified);
+        let content_stamp = verified.content_stamp();
+        let lease = server
+            .acquire_catalog_overlay_lease(
+                &fixture.project_id(),
+                &attachment(PEER_ATTACHMENT, PEER_CHECKOUT),
+                &fixture.scope,
+            )
+            .unwrap();
+
+        let mut moves = 0;
+        let snapshot = stable_catalog_knowledge_overlay(
+            CatalogOverlayPublished {
+                published_scope: &fixture.scope,
+                checkout_id: PEER_CHECKOUT,
+                full_ref: content_stamp.full_ref(),
+                accepted_commit: content_stamp.accepted_commit(),
+                accepted_generation: content_stamp.generation_id(),
+                published: &published,
+            },
+            &lease,
+            || {
+                if moves == 0 {
+                    moves += 1;
+                    git(
+                        &worktree,
+                        &[
+                            "commit",
+                            "-q",
+                            "--allow-empty",
+                            "-m",
+                            "moved during capture",
+                        ],
+                    );
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(moves, 1);
+        assert_ne!(
+            snapshot.stamp.unwrap().checkout_head,
+            fixture.accepted_commit,
+            "the settled snapshot names the head the capture ended on"
+        );
+    }
+
+    #[test]
+    fn a_checkout_that_never_settles_during_capture_is_transient() {
+        let fixture = OverlayFixture::new(&[knowledge_entry("keep", "accepted")]);
+        let worktree = fixture.worktree("peer", PEER_ATTACHMENT, PEER_CHECKOUT);
+        let server = fixture.catalog.server_with_checkout_authority();
+        let verified = fixture.verified(&server);
+        let published = accepted_knowledge_digests(&verified);
+        let content_stamp = verified.content_stamp();
+        let lease = server
+            .acquire_catalog_overlay_lease(
+                &fixture.project_id(),
+                &attachment(PEER_ATTACHMENT, PEER_CHECKOUT),
+                &fixture.scope,
+            )
+            .unwrap();
+
+        // The working fingerprint changes on every read, so the two-read
+        // agreement never holds inside the bounded window.
+        let mut revision = 0;
+        let error = stable_catalog_knowledge_overlay(
+            CatalogOverlayPublished {
+                published_scope: &fixture.scope,
+                checkout_id: PEER_CHECKOUT,
+                full_ref: content_stamp.full_ref(),
+                accepted_commit: content_stamp.accepted_commit(),
+                accepted_generation: content_stamp.generation_id(),
+                published: &published,
+            },
+            &lease,
+            || {
+                revision += 1;
+                write_entry(
+                    &worktree,
+                    &knowledge_entry("keep", &format!("edit {revision}")),
+                );
+            },
+        )
+        .expect_err("a checkout that keeps moving is busy, not positioned");
+        assert_eq!(error.kind, OverlayRecomputeErrorKind::Transient);
+        assert!(!error.is_structural());
+    }
+
+    #[test]
+    fn a_detach_during_capture_fails_lease_revalidation() {
+        let fixture = OverlayFixture::new(&[knowledge_entry("keep", "accepted")]);
+        fixture.worktree("peer", PEER_ATTACHMENT, PEER_CHECKOUT);
+        let server = fixture.catalog.server_with_checkout_authority();
+        let verified = fixture.verified(&server);
+
+        let degradation = server
+            .compute_catalog_knowledge_overlay(
+                &verified,
+                &attachment(PEER_ATTACHMENT, PEER_CHECKOUT),
+                &fixture.scope,
+                || CatalogFixture::detach_in_server(&server, PEER_ATTACHMENT),
+            )
+            .err()
+            .expect("bytes captured under a lease that no longer holds are unpublishable");
+        assert_eq!(
+            degradation.code,
+            CheckoutAccessErrorCode::AttachmentInactive.as_str()
+        );
+        assert!(!degradation.transient);
+    }
+
+    #[test]
+    fn an_advance_during_capture_refuses_the_snapshot() {
+        let fixture = OverlayFixture::new(&[knowledge_entry("keep", "generation one")]);
+        let worktree = fixture.worktree("peer", PEER_ATTACHMENT, PEER_CHECKOUT);
+        write_entry(&worktree, &knowledge_entry("keep", "checkout variant"));
+        let server = fixture.catalog.server_with_checkout_authority();
+        let verified = fixture.verified(&server);
+
+        let degradation = server
+            .compute_catalog_knowledge_overlay(
+                &verified,
+                &attachment(PEER_ATTACHMENT, PEER_CHECKOUT),
+                &fixture.scope,
+                || {
+                    fixture.catalog.install_publication(
+                        PROJECT,
+                        &fixture.scope,
+                        &fixture.accepted_commit,
+                        &[knowledge_entry("keep", "generation two")],
+                        &[],
+                    );
+                    server.invalidate_catalog_published_content(&fixture.project_id());
+                },
+            )
+            .expect_err("a snapshot may not position a checkout against unpublished bytes");
+        assert_eq!(degradation.code, ERROR_OVERLAY_ACCEPTED_CONTENT_CHANGED);
+        assert!(!degradation.transient);
+    }
+
+    /// Plan section 4.12: a checkout that cannot prove the baseline is a
+    /// structural authority fact. Only a transient failure may hold a
+    /// prior valid snapshot open.
+    #[test]
+    fn a_structural_failure_replaces_a_prior_snapshot_that_a_transient_one_preserves() {
+        let fixture = OverlayFixture::new(&[knowledge_entry("keep", "accepted")]);
+        let worktree = fixture.worktree("peer", PEER_ATTACHMENT, PEER_CHECKOUT);
+        write_entry(&worktree, &knowledge_entry("keep", "checkout variant"));
+        let server = fixture.catalog.server_with_checkout_authority();
+        let verified = fixture.verified(&server);
+        let peer = attachment(PEER_ATTACHMENT, PEER_CHECKOUT);
+
+        let first = server
+            .refresh_catalog_knowledge_overlay(&verified, &peer)
+            .unwrap();
+        assert_eq!(first.status, OverlayStatus::Valid);
+
+        // A transient refusal keeps the prior valid snapshot open for a
+        // bounded window: the checkout is busy, not wrong.
+        let busy = server
+            .state
+            .checkout_access
+            .lifecycle_mutation_guard()
+            .unwrap();
+        let preserved = server
+            .refresh_catalog_knowledge_overlay(&verified, &peer)
+            .unwrap();
+        assert_eq!(preserved.status, OverlayStatus::Valid);
+        assert_eq!(preserved.snapshot_id, first.snapshot_id);
+        drop(busy);
+
+        // The same checkout on an orphan branch still contains commit P
+        // but shares no ancestor with it: no baseline exists, and that is
+        // a fact about authority rather than retryable noise.
+        git(&worktree, &["checkout", "-q", "--orphan", "orphaned"]);
+        git(&worktree, &["add", ".bbox/knowledge"]);
+        git(&worktree, &["commit", "-q", "-m", "orphan"]);
+
+        let degradation = server
+            .refresh_catalog_knowledge_overlay(&verified, &peer)
+            .expect_err("a structural failure has no valid answer");
+        assert_eq!(degradation.code, ERROR_OVERLAY_BASELINE_UNAVAILABLE);
+        assert!(!degradation.transient);
+
+        let stored = server
+            .state
+            .knowledge_overlays
+            .read()
+            .get(&fixture.scope, PEER_CHECKOUT)
+            .cloned()
+            .expect("the store keeps a record of the outcome");
+        assert_eq!(
+            stored.status,
+            OverlayStatus::Invalid,
+            "a structural failure must replace the prior snapshot, never preserve it"
+        );
+        assert!(stored.values.is_empty());
     }
 }

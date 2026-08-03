@@ -1284,6 +1284,101 @@ pub(crate) mod catalog_fixture {
                 .unwrap();
         }
 
+        /// Attach one real checkout with an explicit durable identity and
+        /// capability bit, and mint the checkout-id marker the catalog
+        /// authority reads back on every lease.
+        ///
+        /// Overlay work needs several checkouts per project, each with its
+        /// own identity, which the single-attachment helper above cannot
+        /// express.
+        pub(crate) fn attach_overlay_checkout(
+            &self,
+            project_id: &str,
+            scope: &PublishedScope,
+            checkout_dir: &Path,
+            attachment_id: &str,
+            checkout_id: &str,
+            repo_knowledge: bool,
+        ) {
+            std::fs::create_dir_all(checkout_dir.join(".bbox/local")).unwrap();
+            std::fs::write(
+                checkout_dir.join(".bbox/local/checkout-id"),
+                format!("{checkout_id}\n"),
+            )
+            .unwrap();
+            let project_id = ProjectId::parse(project_id).unwrap();
+            let attachment_id = AttachmentId::parse(attachment_id).unwrap();
+            let scope = scope.clone();
+            let checkout_dir = checkout_dir.to_string_lossy().into_owned();
+            let checkout_id = checkout_id.to_string();
+            let epoch = self.store.snapshot().unwrap().epoch();
+            self.store
+                .transact(epoch, |_catalog, attachments| {
+                    attachments.attachments.insert(
+                        attachment_id.clone(),
+                        bbox_corpus_core::project_catalog::CheckoutAttachment {
+                            attachment_id: attachment_id.clone(),
+                            project_id: project_id.clone(),
+                            checkout_id: checkout_id.clone(),
+                            checkout_dir: checkout_dir.clone(),
+                            checkout_project_dir: checkout_dir.clone(),
+                            project_root_relpath: scope.bbox_root_relpath().to_string(),
+                            kind: bbox_corpus_core::project_catalog::AttachmentKind::Base,
+                            validated_scope: Some(scope.clone()),
+                            computed_repo_hint: None,
+                            branch_ref: Some("refs/heads/main".into()),
+                            capabilities:
+                                bbox_corpus_core::project_catalog::AttachmentCapabilities {
+                                    repo_knowledge,
+                                    ..Default::default()
+                                },
+                            status: bbox_corpus_core::project_catalog::AttachmentStatus::Attached,
+                            attached_at: "2026-08-03T00:00:00Z".into(),
+                            detached_at: None,
+                        },
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        /// Detach one attachment, clearing its capability bits the way the
+        /// real detach operation does.
+        pub(crate) fn detach(&self, attachment_id: &str) {
+            Self::detach_in(&self.store, attachment_id);
+        }
+
+        /// Detach through one specific store handle.
+        ///
+        /// A server owns its own store instance, so a fixture-side
+        /// transaction is invisible to a request already in flight. A test
+        /// that needs a detach to land mid-request has to drive the store
+        /// the server is actually reading.
+        pub(crate) fn detach_in_server(server: &BlackboxServer, attachment_id: &str) {
+            Self::detach_in(
+                &server
+                    .state
+                    .project_authority
+                    .catalog_store()
+                    .expect("catalog authority"),
+                attachment_id,
+            );
+        }
+
+        fn detach_in(store: &ProjectCatalogStore, attachment_id: &str) {
+            let attachment_id = AttachmentId::parse(attachment_id).unwrap();
+            let epoch = store.snapshot().unwrap().epoch();
+            store
+                .transact(epoch, |_catalog, attachments| {
+                    let row = attachments.attachments.get_mut(&attachment_id).unwrap();
+                    row.status = bbox_corpus_core::project_catalog::AttachmentStatus::Detached;
+                    row.detached_at = Some("2026-08-03T01:00:00Z".into());
+                    row.capabilities = Default::default();
+                    Ok(())
+                })
+                .unwrap();
+        }
+
         pub(crate) fn epoch(&self) -> u64 {
             self.store.snapshot().unwrap().epoch()
         }
@@ -1370,6 +1465,32 @@ pub(crate) mod catalog_fixture {
                 &self.root,
                 &self.catalog_projects_path,
             )))
+        }
+
+        /// The same server with the real catalog checkout authority in
+        /// place of the deny probe.
+        ///
+        /// Published reads prove they need no checkout by running against
+        /// the deny probe; overlays are the one catalog read that does open
+        /// one, so they need the authority that actually resolves an
+        /// attachment, verifies its live checkout identity, and enforces
+        /// its capability bits.
+        pub(crate) fn server_with_checkout_authority(&self) -> BlackboxServer {
+            let mut state = SharedState::for_test_catalog(&self.root, &self.catalog_projects_path);
+            let store = state
+                .project_authority
+                .catalog_store()
+                .expect("catalog authority");
+            state.checkout_access =
+                Arc::new(bbox_indexing::checkout_access::CheckoutAccessBroker::new(
+                    Arc::new(
+                        bbox_indexing::checkout_access_v2::V2CatalogCheckoutAccessAuthority::new(
+                            store.clone(),
+                        ),
+                    ),
+                    state.checkout_access_observations.clone(),
+                ));
+            BlackboxServer::new(Arc::new(state))
         }
     }
 
