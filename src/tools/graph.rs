@@ -627,6 +627,59 @@ fn acquire_project_file(
     indexed_path_hint: &Path,
     projects: &[ProjectRecord],
 ) -> Result<AcquiredCheckoutFile> {
+    if server.state.project_authority.is_bridge() {
+        return acquire_bridge_project_file(
+            server,
+            broker,
+            project_id,
+            indexed_path_hint,
+            projects,
+        );
+    }
+    // Catalog identity is path-free. An absolute hint has no record root to
+    // strip and no attachment root may stand in for one: a hint rooted at some
+    // other checkout would otherwise read a foreign file under this project's
+    // identity.
+    if indexed_path_hint.is_absolute() {
+        bail!(
+            "error.indexed_path_mismatch: project_file path hint is absolute and catalog identity carries no record root"
+        );
+    }
+    if indexed_path_hint.as_os_str().is_empty() {
+        bail!("error.indexed_path_invalid: project_file path hint does not name a file");
+    }
+    let lease = acquire_selected_operation(
+        server,
+        broker,
+        project_id,
+        CheckoutAccessKind::Blame,
+        CheckoutAccessIntent::Read,
+    )?;
+    let (_, content) = lease
+        .read_relative_file(indexed_path_hint)
+        .map_err(checkout_access_error)?;
+    Ok(AcquiredCheckoutFile {
+        lease,
+        relative_path: indexed_path_hint.to_string_lossy().into_owned(),
+        content,
+    })
+}
+
+fn acquire_bridge_project_file(
+    server: &BlackboxServer,
+    broker: &CheckoutAccessBroker,
+    project_id: &str,
+    indexed_path_hint: &Path,
+    projects: &[ProjectRecord],
+) -> Result<AcquiredCheckoutFile> {
+    let project = unique_project(projects, project_id)?;
+    let lease = acquire_selected_operation(
+        server,
+        broker,
+        &project.project_id,
+        CheckoutAccessKind::Blame,
+        CheckoutAccessIntent::Read,
+    )?;
     // P3-E: the stored path IS the project-relative path, so the normal arm is
     // a straight consume. The absolute-strip arm survives ONLY as a tagged
     // compat path for a pre-bump ref (a `file_path` fallback resolved against a
@@ -634,16 +687,6 @@ fn acquire_project_file(
     // absolute hint); it is not the primary lane any more, and it never
     // fabricates a relative path from a foreign root.
     let relative = if indexed_path_hint.is_absolute() {
-        if !server.state.project_authority.is_bridge() {
-            // Catalog identity is path-free: there is no record root to strip
-            // and no attachment root may stand in for one, because a hint
-            // rooted at some other checkout would then read a foreign file
-            // under this project's identity.
-            bail!(
-                "error.indexed_path_mismatch: project_file path hint is absolute and catalog identity carries no record root"
-            );
-        }
-        let project = unique_project(projects, project_id)?;
         tracing::debug!(
             project_id = %project.project_id,
             "compat: de-fabricating a relative path from a pre-path-free absolute hint"
@@ -662,17 +705,6 @@ fn acquire_project_file(
     if relative.as_os_str().is_empty() {
         bail!("error.indexed_path_invalid: project_file path hint does not name a file");
     }
-    if server.state.project_authority.is_bridge() {
-        // The bridge validated membership before acquiring; keep that order.
-        unique_project(projects, project_id)?;
-    }
-    let lease = acquire_selected_operation(
-        server,
-        broker,
-        project_id,
-        CheckoutAccessKind::Blame,
-        CheckoutAccessIntent::Read,
-    )?;
     let (_, content) = lease
         .read_relative_file(&relative)
         .map_err(checkout_access_error)?;
@@ -694,7 +726,10 @@ fn acquire_project_file(
 /// section 8, P5-E blame items 4 and 5). A project with no overlay has no
 /// commit evidence to require, and the ladder selection stands on its own.
 fn require_snapshot_commit(
-    git_overlays: &HashMap<String, bbox_corpus_core::git_overlay::GitOverlaySelector>,
+    git_overlays: &std::collections::BTreeMap<
+        String,
+        bbox_corpus_core::git_overlay::GitOverlaySelector,
+    >,
     project_id: &str,
     checkout_root: &Path,
 ) -> Result<()> {
@@ -1104,11 +1139,7 @@ impl BlackboxServer {
                         &projects,
                     )?;
                     require_snapshot_commit(
-                        &read_view
-                            .git_overlays
-                            .iter()
-                            .map(|(key, value)| (key.clone(), value.clone()))
-                            .collect(),
+                        &read_view.git_overlays,
                         &project_id,
                         acquired.lease.checkout_root(),
                     )?;
@@ -2730,8 +2761,8 @@ mod catalog_adapter_tests {
     fn overlay_map(
         project_id: &str,
         repo_head: &str,
-    ) -> HashMap<String, bbox_corpus_core::git_overlay::GitOverlaySelector> {
-        HashMap::from([(
+    ) -> std::collections::BTreeMap<String, bbox_corpus_core::git_overlay::GitOverlaySelector> {
+        std::collections::BTreeMap::from([(
             project_id.to_string(),
             bbox_corpus_core::git_overlay::GitOverlaySelector {
                 project_id: project_id.to_string(),
@@ -2771,6 +2802,7 @@ mod catalog_adapter_tests {
         assert!(error.starts_with("error.blame_commit_mismatch"), "{error}");
 
         // A project with no pinned overlay has no commit evidence to require.
-        require_snapshot_commit(&HashMap::new(), PROJECT_ONE, &checkout).unwrap();
+        require_snapshot_commit(&std::collections::BTreeMap::new(), PROJECT_ONE, &checkout)
+            .unwrap();
     }
 }
