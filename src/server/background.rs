@@ -33,6 +33,13 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     // stalled mounts. Keep the initial pass off the listener startup path just
     // like subsequent periodic passes.
     tokio::spawn(run_knowledge_lifecycle_pass(shared.clone()));
+    // Reconcile the published knowledge index from durable accepted
+    // content. A process that died between a pointer swap and its index
+    // commit leaves accepted reads on the new generation and search on the
+    // old one; nothing else in the daemon closes that gap, because live
+    // convergence keeps no durable record. Off the listener startup path,
+    // like every other reconciliation pass here.
+    tokio::spawn(run_published_index_convergence_pass(shared.clone()));
     start_bbox_watcher(&shared);
     spawn_knowledge_lifecycle_reconciler(shared.clone());
     restore_runtime_state(&shared).await;
@@ -42,6 +49,26 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     crate::embed_runtime::spawn_embed_residue_sweeper(shared.clone());
     spawn_packet_self_heal_scanner(shared);
     Ok(())
+}
+
+async fn run_published_index_convergence_pass(shared: Arc<SharedState>) {
+    let result = tokio::task::spawn_blocking(move || {
+        crate::server::BlackboxServer::new(shared).converge_published_knowledge_at_startup()
+    })
+    .await;
+    match result {
+        Ok(report) if report.visited > 0 => tracing::info!(
+            visited = report.visited,
+            converged = report.converged,
+            skipped = report.skipped,
+            "published index reconciled from accepted content at startup"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            "startup published-index convergence pass failed to run"
+        ),
+    }
 }
 
 async fn run_knowledge_lifecycle_pass(shared: Arc<SharedState>) {

@@ -52,6 +52,17 @@ pub(crate) struct KnowledgeViewItem {
     pub(crate) metadata: KnowledgeViewMetadata,
 }
 
+/// What one startup published-index reconciliation pass did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct StartupConvergenceReport {
+    pub(crate) visited: usize,
+    pub(crate) converged: usize,
+    /// Projects with no verified accepted content. Their index rows are
+    /// left alone rather than cleared: a prior-generation fallback may
+    /// still be serving them.
+    pub(crate) skipped: usize,
+}
+
 pub(crate) struct SessionKnowledgeView {
     pub(crate) knowledge: Knowledge,
     pub(crate) items: Vec<KnowledgeViewItem>,
@@ -694,6 +705,45 @@ impl BlackboxServer {
         snapshot
     }
 
+    /// Reconcile the published knowledge index from durable accepted
+    /// content for every catalog project, at startup.
+    ///
+    /// Live convergence is an asynchronous enqueue with no durable record,
+    /// so a process that dies between the pointer swap and the index
+    /// commit would otherwise serve the new generation from accepted reads
+    /// and the old one from search, forever. This pass closes that window
+    /// by reprojecting from the pointer, which is the durable authority.
+    ///
+    /// It is deliberately stateless: no convergence obligation is
+    /// persisted at swap time, and no replay log has to be recovered.
+    /// Cost is one reprojection per published project per boot, bounded by
+    /// the catalog.
+    pub(crate) fn converge_published_knowledge_at_startup(&self) -> StartupConvergenceReport {
+        let mut report = StartupConvergenceReport::default();
+        if self.state.accepted_publications.is_none() {
+            return report;
+        }
+        let targets = match self.catalog_published_targets(None) {
+            Ok(targets) => targets,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "startup published-index convergence could not read the catalog"
+                );
+                return report;
+            }
+        };
+        for target in targets {
+            report.visited += 1;
+            if self.converge_published_knowledge_index(&target.project_id) {
+                report.converged += 1;
+            } else {
+                report.skipped += 1;
+            }
+        }
+        report
+    }
+
     /// Reconverge the published knowledge index for one catalog project
     /// after its accepted content moved (plan section 7.3 step 19).
     ///
@@ -707,9 +757,9 @@ impl BlackboxServer {
     /// documents; `session_gap_view` reads them live from accepted content
     /// through the projection caches, so invalidating those caches IS the
     /// gap lane's convergence and there is no index to replace.
-    pub(crate) fn converge_published_knowledge_index(&self, project_id: &ProjectId) {
+    pub(crate) fn converge_published_knowledge_index(&self, project_id: &ProjectId) -> bool {
         let Some(runtime) = &self.state.accepted_publications else {
-            return;
+            return false;
         };
         let scope = match runtime.load_verified(project_id) {
             Ok(verified) => verified.content_stamp().accepted_scope().clone(),
@@ -723,7 +773,7 @@ impl BlackboxServer {
                     code = error.code(),
                     "published index convergence skipped: no verified accepted content"
                 );
-                return;
+                return false;
             }
         };
         if let Err(error) = self.sync_knowledge_scope_to_index(&scope, project_id.as_str()) {
@@ -732,7 +782,9 @@ impl BlackboxServer {
                 error = %error,
                 "published index convergence failed; the next reindex pass reconciles it"
             );
+            return false;
         }
+        true
     }
 
     /// Drop every catalog-side cache derived from one project's accepted
@@ -1668,6 +1720,132 @@ mod catalog_view_tests {
             .find(|item| item.entry.id == entry_id)
             .cloned()
             .expect("row is present")
+    }
+
+    /// A crash between the pointer swap and the index commit must not
+    /// leave search on the old generation forever (R2-2).
+    ///
+    /// The daemon converges the index asynchronously and persists no
+    /// record of having done so, so the only thing that can repair a lost
+    /// convergence is a reprojection from the pointer at boot.
+    #[test]
+    fn startup_convergence_repairs_an_index_left_behind_by_a_crash() {
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project("p_crash", &scope);
+        fixture.install_publication(
+            "p_crash",
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-a", "generationone")],
+            &[],
+        );
+
+        // Boot one: converge the index at G1.
+        let first = fixture.server();
+        first.state.install_code_read_view_commit_hook();
+        let project_id = ProjectId::parse("p_crash").unwrap();
+        first.converge_published_knowledge_index(&project_id);
+        first.state.index_writer.flush_blocking().unwrap();
+        first.state.idx.write().reader_reload_for_test();
+        assert!(index_search(&first, "generationone").contains("knowledge-a"));
+
+        // The pointer advances to G2 and the process dies before the scope
+        // replacement commits: no convergence runs for G2 at all.
+        fixture.install_publication(
+            "p_crash",
+            &scope,
+            COMMIT_TWO,
+            &[knowledge_entry("knowledge-a", "generationtwo")],
+            &[],
+        );
+        drop(first);
+
+        // Boot two, with the project remote-only: no attachment exists
+        // anywhere, so the repair may only read durable accepted content.
+        let second = fixture.server();
+        second.state.install_code_read_view_commit_hook();
+        assert!(
+            second
+                .state
+                .project_authority
+                .catalog_store()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .attachments()
+                .attachments
+                .is_empty()
+        );
+        // The crash state is real: before the repair, search still answers
+        // with the superseded generation while accepted reads answer with
+        // the new one.
+        assert!(index_search(&second, "generationone").contains("knowledge-a"));
+        assert!(!index_search(&second, "generationtwo").contains("knowledge-a"));
+        assert_eq!(
+            second
+                .session_knowledge_view(None, None)
+                .unwrap()
+                .items
+                .first()
+                .unwrap()
+                .entry
+                .content,
+            "generationtwo"
+        );
+
+        let report = second.converge_published_knowledge_at_startup();
+        assert_eq!(report.visited, 1);
+        assert_eq!(report.converged, 1);
+        assert_eq!(report.skipped, 0);
+        second.state.index_writer.flush_blocking().unwrap();
+        second.state.idx.write().reader_reload_for_test();
+
+        assert!(
+            index_search(&second, "generationtwo").contains("knowledge-a"),
+            "search must serve the generation the pointer names"
+        );
+        assert!(
+            !index_search(&second, "generationone").contains("knowledge-a"),
+            "the superseded generation must not survive in the index"
+        );
+    }
+
+    /// A project whose publication cannot be verified is skipped, never
+    /// cleared: a prior-generation fallback may still be serving it.
+    #[test]
+    fn startup_convergence_skips_projects_without_verified_content() {
+        let fixture = CatalogFixture::new();
+        fixture.add_published_project("p_nopublication", &CatalogFixture::scope("."));
+        let server = fixture.server();
+
+        let report = server.converge_published_knowledge_at_startup();
+        assert_eq!(report.visited, 1);
+        assert_eq!(report.converged, 0);
+        assert_eq!(report.skipped, 1);
+    }
+
+    fn index_search(server: &BlackboxServer, query: &str) -> String {
+        let view = server.state.code_read_view.read().clone();
+        server
+            .state
+            .idx
+            .read()
+            .search_with_active_selectors_and_searcher(
+                &crate::index::SearchParams {
+                    query: query.into(),
+                    mode: None,
+                    account: None,
+                    project: None,
+                    role: None,
+                    include_subagents: None,
+                    limit: Some(5),
+                    exclude_self: None,
+                },
+                &view.active_selectors,
+                &view.searcher,
+            )
+            .unwrap()
     }
 
     #[test]
