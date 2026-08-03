@@ -60,6 +60,19 @@ the spec cut):
 the only client we own end to end and is the proving ground for every modern
 surface before that flip.
 
+### Convergence with locality-first decomposition
+
+This design was cross-checked against
+[locality-first-decomposition.md](../../daemon-runtime/locality-first-decomposition.md)
+(the checkout plane / corpus plane split) on 2026-08-03. The two arcs
+converge: locality-first says the corpus plane keeps only shared mutable
+state and coordination points, and the 2026-07-28 revision gives exactly
+those things their idiomatic protocol shapes (catalogs -> resources,
+coordination -> tasks/listen). The remote-daemon consequences are folded
+into the relevant sections below (spill-as-resource, stateless as
+deployment prerequisite, corpus-plane-only authority, reconcile-on-reconnect,
+fleetd task ownership, auth) and collected in the Decisions section.
+
 ## Design principles
 
 1. **Additive, capability-gated.** Every modern shape is offered only to
@@ -119,15 +132,27 @@ Scope channels, ranked by client reach:
 - The OnceLock session-pinning footgun class is deleted: no pinned pair to
   forget to pass (gap-310c36b6), no half-initialized session answering tool
   lists.
-- Checkout authority (`resolve_project_write` + dark overlay refresh) does
-  blocking fs/git probes and becomes per-request, so it needs a shared cache
-  keyed by raw selector. This is a write-authority decision: staleness has a
-  security flavor. Recommended: generation-keyed like `SurfaceDecisionCache`
-  with a short TTL backstop. (Open question Q4.)
+- Checkout authority (`resolve_project_write` + dark overlay refresh) must
+  be **corpus-plane-only** in the target state. Locality-first
+  decomposition removes the daemon's reach into checkouts (harness-native
+  blame, checkout-local render, collector-produced indexing, the
+  published-plus-provisional knowledge lane), so write-authority resolution
+  keys off the project registry, identity stores, and the provisional lane,
+  never daemon-local fs/git walks. That makes the required shared cache
+  (keyed by raw selector) trivially remote-safe. Invalidation: generation-
+  keyed like `SurfaceDecisionCache` with a short TTL backstop; this is a
+  write-authority decision, so staleness has a security flavor. (Open
+  question Q4.)
 - Deny semantics change: with no `initialize` to abort, a denied surface
   fails per-method. Recommended: deny at `server/discover` AND per-method
   (defense in depth), so misconfiguration is loud, not a silent empty tool
   list. (Open question Q5.)
+- Stateless is a **deployment prerequisite**, not just cleanup: a remote
+  corpus daemon wants restarts, an LB, maybe replicas, and stateful MCP
+  sessions pin clients to one process. 2026-07-28 stateless plus
+  `NeverSessionManager` (plus rmcp's distributed `EventStore` if replay is
+  ever needed) removes session affinity. The locality-first corpus move
+  (its slice 6) effectively requires this phase first.
 
 ### server/discover
 
@@ -172,6 +197,36 @@ Caveats:
   if the bro projection proves clean, otherwise as `blackbox://run/{id}`
   resources.
 
+### Task candidates beyond dispatch
+
+The classification rule: a task is anything whose implementation today is
+"spawn background work, hand back an ID, poll status later" or "block longer
+than a few seconds". By that rule:
+
+| Tool today | Why it is task-shaped |
+| --- | --- |
+| `bbox_reindex` (full) | Index builds are the canonical long job; today a background actor with no client-visible handle |
+| `bbox_reembed` | Embedding rebuilds run minutes to hours on large partitions |
+| `bbox_edge_compact(apply)` / `bbox_storage_gc(apply)` / `bbox_storage_migrate_legacy_edges(apply)` | Storage maintenance over many projects; dry-run stays a tool, apply becomes a task |
+| `consultant_apply_proposal` (and badgey) | Already secretly a task: dispatches work, returns `applied_task_id`, and its Pending -> Applying -> Applied/Failed state machine is literally the task lifecycle. The split begin/complete-apply pair exists only because the protocol had no task primitive |
+| `atom_invoke` | Atom runs are dispatched executions with run records |
+| `bro_retro` | A dispatch (resume with reflection prompt); falls out of the bro_exec mapping for free |
+| `bbox_project_register` | Registration is instant but schedules background indexing; the follow-through deserves a task handle |
+
+The pattern worth naming: `consultant_apply_proposal`, `bro_exec`, and
+`atom_invoke` each independently reinvented task-handle-over-tools. The
+extension collapses three bespoke lifecycles into one protocol shape.
+
+### fleetd and location-independent task handles
+
+Under locality-first slice 5, task execution moves to per-machine `fleetd`
+binaries (fully-resolved spawn specs from the daemon, narrow typed local
+RPC) while orchestration state stays corpus-plane. The tasks extension is
+the routing-agnostic control plane for that world: `tasks/get` against the
+corpus daemon does not care which machine executes the child. The task ID
+becomes the location-independent name for a piece of work, which also speaks
+to the decomposition doc's deferred multi-machine dispatch-routing question.
+
 ## Wake-on-done: three tiers
 
 - **Tier 0 (floor, all clients, keep forever):** `bro_wait` /
@@ -193,6 +248,15 @@ availability), not full task state. Terminal results can exceed the 80KB
 response cap; subscribers are waiting on "done", not the payload, and can
 `tasks/get` for the body.
 
+Reconnect semantics: 2026-07-28 removed SSE resumability (`Last-Event-ID`),
+so a dropped listen stream loses interim notifications. Clients must
+**reconcile on reconnect** (`tasks/get`, `resources/read`) rather than
+expect replay: durable handles plus reconcile, not redelivery. This shapes
+harness-child behavior and matters even more across a WAN, where held
+connections (bro_wait long-polls, progress ticks) die to LB idle timeouts
+and NAT reaping; polling `tasks/get` and a client-owned listen stream
+tolerate intermediaries far better.
+
 `toolsListChanged` rides the same stream: today a surface-packet mutation
 silently changes what `list_tools` returns while clients cache the old list
 forever. Emit `toolsListChanged` on surface/packet mutation and set `ttlMs`
@@ -212,6 +276,31 @@ blackbox://atom/{id}
 blackbox://task/{id}                     (live task state)
 blackbox://project/{project}/packet/{id} (explicit project encoding)
 ```
+
+The classification rule for resource candidacy: a durable ID plus a JSON
+body that clients currently enumerate through a bounded list tool. Beyond
+the five catalogs:
+
+- **Durable stores:** `blackbox://knowledge/{id}`, `blackbox://thread/{id}`,
+  `blackbox://gap/{id}`, `blackbox://note/{id}`, `blackbox://roadmap/{id}`,
+  `blackbox://whiteboard/{id}`, `blackbox://project/{id}`,
+  `blackbox://provider/{name}`.
+- **`blackbox://sm/{id}`** (system memories). Agents fetch `sm-*` runbooks
+  constantly via free-text `bbox_knowledge` when they already know the ID;
+  direct URI read is cheaper and deterministic. Probably the highest-traffic
+  resource we would serve.
+- **Live views with `ttlMs`:** `blackbox://roster`, `blackbox://inbox`,
+  `blackbox://dashboard`. `resourceSubscriptions` is a listen opt-in type,
+  so subscribing to `blackbox://roster` yields push roster updates
+  in-protocol, replacing the bespoke `/control/roster/stream` SSE endpoint
+  with a standard mechanism any MCP client can consume.
+- **`blackbox://session/{id}`** descriptors (metadata only; message bodies
+  stay tool-paginated since `resources/read` has no intra-resource cursor).
+- **`blackbox://spill/{id}`** (over-cap response payloads). See the spill
+  paragraph below: with a remote daemon this stops being optional.
+
+What stays a tool: search/query surfaces (ephemeral result sets are not
+durable objects), all mutations, anything parameterized ad hoc.
 
 - Catalog boundary: the five catalogs plus live tasks. Threads are
   borderline (cheap read projection, composes with subscriptions).
@@ -233,6 +322,17 @@ blackbox://project/{project}/packet/{id} (explicit project encoding)
   telemetry exists to flag.
 - `resourcesListChanged` over listen on catalog mutation (artifact install,
   packet compile, brofile upsert).
+
+### Spill becomes a resource
+
+The 80KB cap's spill envelope (`src/server/response.rs`) writes over-cap
+payloads to the daemon's disk with the explicit rationale that every client
+of this localhost daemon has file-read tools to recover the full payload.
+With a remote daemon that rationale is false: the client cannot read the
+daemon's disk. Spilled payloads must be served back over MCP as
+`blackbox://spill/{id}` resources. The corpus move converts the resource
+plane from a nice browse projection into a correctness requirement for the
+cap.
 
 ## Cache hints and tools/list hygiene (SEP-2549)
 
@@ -278,6 +378,11 @@ MRTR rounds.
    end-to-end before any prod capability flip.
 4. Scope channel: URL query params remain canonical; resource endpoints
    inherit scope filtering from the transport (no new plumbing).
+5. The design must hold with the corpus daemon on another machine
+   (locality-first decomposition). Consequences folded into this doc:
+   spill-as-resource, stateless as deployment prerequisite for the corpus
+   move, corpus-plane-only checkout authority, reconcile-on-reconnect
+   listen semantics, fleetd location-independent task handles.
 
 ## Open questions
 
@@ -302,6 +407,13 @@ Recommendations stated; operator red-lines here.
 - **Q7 (conformance gates)**: wire the official MCP conformance suite into
   lane verification, or run it manually per phase? Recommend manual per
   phase first; promote to gates only if it catches what nextest misses.
+- **Q8 (transport auth for a remote daemon)**: today's zero-auth is a
+  127.0.0.1 fact. Before the corpus move (locality-first slice 6), pick
+  the auth story: bearer token on the client transport (minimum), or the
+  spec's OAuth machinery (rmcp 3.0's reworked `AuthorizationRequest` path,
+  RFC 9728 protected-resource metadata). Recommend starting with bearer +
+  TLS and treating full OAuth as a later operator decision; scoped out of
+  Phases 0-1 but required before slice 6.
 
 ## References
 
@@ -314,3 +426,6 @@ Recommendations stated; operator red-lines here.
   migration guide (rust-sdk discussion #969)
 - Tasks extension spec: modelcontextprotocol/ext-tasks
 - Companion plan: [rmcp 3.0 Migration Plan](rmcp-3-migration-plan.md)
+- Decomposition context:
+  [locality-first-decomposition.md](../../daemon-runtime/locality-first-decomposition.md),
+  [remote-worker-boundary.md](../../bro-harness/remote-worker-boundary.md)

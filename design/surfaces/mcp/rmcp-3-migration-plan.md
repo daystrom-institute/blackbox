@@ -41,9 +41,10 @@ mechanics, and per-phase validation.
 | App-level cancellation (`bro_cancel` = SIGTERM + store transition) | `src/tools/dispatch.rs` | No protocol cancellation for tools today; tasks extension adds `tasks/cancel` in Phase 2 |
 | Client: workflow `mcp_call` op (stdio + streamable HTTP self-call), `().serve(transport)` | `src/mcp_client.rs` | `serve()` still works (legacy lifecycle); Phase 1 upgrades to `serve_with_lifecycle(Auto)` |
 | Client: harness child -> daemon, `StreamableHttpClientTransport` | `crates/bro-harness/src/mcp.rs` | Same; the one client pair we own end to end (proving ground) |
-| 80KB response cap + spill envelope | `src/server/response.rs` | Orthogonal; stays |
+| 80KB response cap + spill envelope | `src/server/response.rs` | Orthogonal while loopback, but the spill-to-daemon-disk rationale ("every client has file-read tools") is a localhost assumption. Phase 4 serves spills as `blackbox://spill/{id}`; required before the corpus daemon goes remote |
 | Capabilities: `enable_tools()` only; no resources/prompts/subscriptions | `src/server/handler.rs` (`get_info`) | Greenfield for Phase 4 resource projection |
 | `StreamableHttpService<S, M>` bound | `src/server/mcp.rs` | Now requires `S: ServerHandler` (was `Service<RoleServer>`); we already impl `ServerHandler` |
+| Zero auth (loopback trust) | transport layer, implicitly | Fine until the corpus daemon leaves the machine; Q8 picks the auth story (bearer + TLS minimum) before locality-first slice 6 |
 
 Not affected: OAuth (loopback daemon, no auth; the 3.0 OAuth rework is
 skipped entirely), roots/sampling/logging (never used), SSE resumability
@@ -102,7 +103,13 @@ path for current clients. No tasks/resources yet.
    keys `(surface, project, generation)`; hit path is two lock reads.
 2. Move checkout authority + dark overlay registration behind a shared cache
    keyed by raw selector (Q4 invalidation: generation + TTL backstop).
-   Blocking probes stay on the blocking pool.
+   Resolution must consult corpus-plane state only (project registry,
+   identity stores, provisional lane), never daemon-local fs/git walks:
+   locality-first decomposition removes the daemon's reach into checkouts,
+   so the wire head must not bake in a filesystem the corpus daemon will
+   not have. Any residual daemon-local probes needed during the overlap
+   stay on the blocking pool and are marked for retirement with the
+   decomposition's harness-ward moves.
 3. Delete the OnceLock session pins from `BlackboxServer`; handler instances
    become stateless carriers of `Arc<SharedState>` (cheap to construct per
    request).
@@ -181,6 +188,23 @@ Phases 0-1 are one arc (the migration): everything needed to speak
 the capability-gated accelerators, proven on the harness pair. Phases 4-5
 are independent and can be picked up or dropped without debt.
 
+### Interlock with locality-first decomposition
+
+[locality-first-decomposition.md](../../daemon-runtime/locality-first-decomposition.md)
+orders its work as: empty the daemon of checkout-coupled surfaces (slices
+1-4), extract `fleetd` (slice 5), then move the corpus off-host (slice 6).
+This plan interlocks at two points:
+
+- **Slice 6 requires our Phase 1.** A remote corpus daemon cannot afford
+  session affinity (restarts, LB, replicas); the 2026-07-28 stateless wire
+  head plus `NeverSessionManager` is the affinity-free shape. Order:
+  decomposition slices 1-4, our Phases 0-1, then slice 6.
+- **Slice 6 requires the Q8 auth decision and spill-as-resource.** Zero
+  auth and disk-spill recovery are loopback assumptions; both must be
+  resolved (bearer + TLS minimum, `blackbox://spill/{id}`) before the
+  daemon serves non-local clients. Spill-as-resource pulls a small piece
+  of Phase 4 forward into the slice-6 prerequisite list.
+
 ## Client-support tripwire
 
 Before flipping the prod version gate (Q2) or relying on any modern shape
@@ -204,3 +228,6 @@ shipped the revision.
 - Spec changelog 2026-07-28 and SEP list: see the target-surface doc
 - `docs/operations-isolated-dev-daemon.md` for dev-daemon validation
 - `src/server/CLAUDE.md` for the wire-head invariants this plan amends
+- Decomposition interlock:
+  [locality-first-decomposition.md](../../daemon-runtime/locality-first-decomposition.md),
+  [remote-worker-boundary.md](../../bro-harness/remote-worker-boundary.md)
