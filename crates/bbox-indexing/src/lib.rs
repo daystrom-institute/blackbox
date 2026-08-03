@@ -4,6 +4,11 @@
 
 pub mod accepted_publication_runtime;
 pub mod accepted_publication_store;
+// Test-only accepted-publication installation. `#[cfg(test)]` does not cross
+// crate boundaries, so downstream tests enable `test-support` through a
+// dev-dependency feature. Off by default: no production build carries it.
+#[cfg(any(test, feature = "test-support"))]
+pub mod accepted_publication_test_support;
 pub mod catalog_records;
 pub mod checkout_access;
 pub mod checkout_access_v1;

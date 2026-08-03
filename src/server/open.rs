@@ -746,6 +746,8 @@ pub(super) fn open_shared_state(
         path_fallback_cut: std::sync::atomic::AtomicBool::new(path_fallback_cut),
         knowledge_published_cache: RwLock::new(Default::default()),
         gap_published_cache: RwLock::new(Default::default()),
+        catalog_knowledge_published_cache: RwLock::new(Default::default()),
+        catalog_gap_published_cache: RwLock::new(Default::default()),
         publisher_authorization_cache: RwLock::new(Default::default()),
         packets: RwLock::new(packets_store),
         surface_decisions: crate::server::surface::SurfaceDecisionCache::default(),

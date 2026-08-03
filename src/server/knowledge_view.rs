@@ -6,11 +6,23 @@ use anyhow::{Context, Result};
 use bbox_corpus_core::built_from::{BuiltFromStamp, BuiltFromTable};
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_core::identity::PublishedScope;
+use bbox_corpus_core::project_catalog::ProjectId;
 use bbox_corpus_core::project_record::{ProjectRecord, ResolvedCheckoutScope};
-use bbox_knowledge::knowledge::{Knowledge, KnowledgeEntry, KnowledgeViewMetadata, Scope};
+use bbox_indexing::accepted_publication_runtime::{
+    AcceptedEdgeConfidenceV1, AcceptedKnowledgeApprovalV1, AcceptedKnowledgeCategoryV1,
+    AcceptedKnowledgeEdgeKindV1, AcceptedKnowledgeEntryV1, AcceptedKnowledgePriorityV1,
+    AcceptedKnowledgeStatusV1, AcceptedPublicationContentStamp, AcceptedPublicationRuntimeError,
+    AcceptedPublicationScopeAgreement, AcceptedPublicationSelection,
+    ERROR_ACCEPTED_PUBLICATION_MISSING, VerifiedAcceptedPublication,
+};
+use bbox_knowledge::knowledge::{
+    Approval, Category, Knowledge, KnowledgeEdge, KnowledgeEdgeKind, KnowledgeEntry,
+    KnowledgeViewMetadata, Priority, Scope, Status,
+};
 use bbox_knowledge::overlay::{
-    OverlaySnapshot, OverlayStatus, OverlayValue, ProvisionalMode, PublishedKnowledgeSnapshot,
-    load_published_snapshot_at_commit_unhydrated, provisional_entity_ref,
+    OverlaySnapshot, OverlayStatus, OverlayValue, ProvisionalMode, PublishedKnowledgeEntry,
+    PublishedKnowledgeSnapshot, load_published_snapshot_at_commit_unhydrated,
+    provisional_entity_ref,
 };
 
 use super::BlackboxServer;
@@ -21,6 +33,16 @@ pub(crate) struct PublishedKnowledgeCacheEntry {
     publisher_commit: String,
     durable_project: String,
     snapshot: PublishedKnowledgeSnapshot,
+}
+
+/// One catalog project's projected accepted knowledge, valid exactly while
+/// its accepted content identity is unchanged. Keyed by project rather than
+/// by stamp so the map stays bounded by the catalog: an advance replaces the
+/// entry instead of accumulating one per generation.
+#[derive(Clone)]
+pub(crate) struct CatalogPublishedKnowledgeCacheEntry {
+    pub(crate) content_stamp: AcceptedPublicationContentStamp,
+    pub(crate) snapshot: PublishedKnowledgeSnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -282,15 +304,15 @@ impl BlackboxServer {
         // Filter-class engine resolution (phase-2 §9.2): a miss keeps the
         // lenient unmanaged-scope view semantics; a hit joins the records
         // projection by identity.
-        let requested_record = requested_project
+        let requested_project_id = requested_project
             .and_then(|raw| self.resolve_project_filter(raw))
-            .and_then(|resolution| resolution.project_id().map(str::to_owned))
-            .and_then(|project_id| {
-                projects
-                    .iter()
-                    .find(|record| record.project_id == project_id)
-                    .cloned()
-            });
+            .and_then(|resolution| resolution.project_id().map(str::to_owned));
+        let requested_record = requested_project_id.as_ref().and_then(|project_id| {
+            projects
+                .iter()
+                .find(|record| &record.project_id == project_id)
+                .cloned()
+        });
         let explicit_managed_scope = requested_record.is_some();
         let managed_paths = projects
             .iter()
@@ -322,24 +344,24 @@ impl BlackboxServer {
             has_legacy_compatibility_rows = true;
         }
 
-        // Catalog-mode scoped views (phase-2 §10 item 2): the selector
-        // already resolved through the engine above; serving accepted
-        // published content for a catalog project is the phase-5
-        // catalog-keyed view wiring. Until then a scoped list returns its
-        // typed empty outcome with a diagnostic and acquires no lease: the
-        // publisher/overlay machinery below is version-1 lane code
-        // operating over the compatibility projection.
-        let catalog_scoped_view =
-            explicit_managed_scope && !self.state.project_authority.is_bridge();
-        if catalog_scoped_view {
-            let record = requested_record.as_ref().expect("scoped view has a record");
-            diagnostics.push(format!(
-                "catalog project {} resolved; published knowledge views for catalog \
-                 projects land with the phase-5 catalog-keyed view wiring",
-                record.project_id
-            ));
+        // Catalog published reads resolve durable project identity to a
+        // verified accepted generation (plan section 4.1). They never enter
+        // the version-1 lane below: no publisher election, no authorization
+        // TTL, no publisher root, no Git, and no recall sidecar. Scoped and
+        // unscoped reads take the same path, because a remote-only project
+        // has no compatibility row to enumerate.
+        let catalog_published = !self.state.project_authority.is_bridge();
+        if catalog_published {
+            self.append_catalog_published_knowledge(
+                requested_project,
+                requested_project_id.as_deref(),
+                mode,
+                &mut items,
+                &mut built_from,
+                &mut diagnostics,
+            )?;
         }
-        let selected_projects = if catalog_scoped_view {
+        let selected_projects = if catalog_published {
             Vec::new()
         } else {
             requested_record
@@ -562,6 +584,134 @@ impl BlackboxServer {
         })
     }
 
+    /// Serve accepted published knowledge for every selected catalog
+    /// project. Nothing here can fail the whole view: a project whose
+    /// publication is missing, corrupt, or serving its prior generation
+    /// degrades to a bounded diagnostic while its peers keep serving.
+    fn append_catalog_published_knowledge(
+        &self,
+        requested_selector: Option<&str>,
+        requested_project_id: Option<&str>,
+        mode: ProvisionalMode,
+        items: &mut BTreeMap<String, KnowledgeViewItem>,
+        built_from: &mut BuiltFromTable,
+        diagnostics: &mut Vec<String>,
+    ) -> Result<()> {
+        let Some(runtime) = self.state.accepted_publications.clone() else {
+            diagnostics.push(
+                "accepted-publication runtime is unavailable; no catalog published knowledge \
+                 can be served"
+                    .into(),
+            );
+            return Ok(());
+        };
+        if requested_selector.is_some() && requested_project_id.is_none() {
+            // Filter-class semantics: an unresolved selector narrows
+            // nothing. Say so rather than echoing the raw selector, which
+            // may be an operator path.
+            diagnostics.push(
+                "the requested project selector did not resolve to a catalog project; every \
+                 catalog project is included"
+                    .into(),
+            );
+        }
+        let targets = self.catalog_published_targets(requested_project_id)?;
+        if targets.is_empty() && requested_project_id.is_some() {
+            diagnostics.push("the requested project is not in the catalog".into());
+            return Ok(());
+        }
+        for target in targets {
+            let verified = match runtime.load_verified(&target.project_id) {
+                Ok(verified) => verified,
+                Err(error) => {
+                    diagnostics.push(catalog_publication_diagnostic(
+                        target.project_id.as_str(),
+                        &error,
+                    ));
+                    continue;
+                }
+            };
+            diagnostics.extend(catalog_publication_degradations(
+                target.project_id.as_str(),
+                &verified,
+                target.catalog_scope.as_ref(),
+            ));
+            let published = self.cached_catalog_published_knowledge(&target.project_id, &verified);
+            let published_scope = published.published_scope.clone();
+            let published_ref = built_from.intern(BuiltFromStamp::Published {
+                published_scope: published.published_scope,
+                published_ref: published.published_ref,
+                publisher_commit: published.publisher_commit,
+            });
+            for published_entry in published.entries.into_values() {
+                insert_published_item(
+                    items,
+                    published_entry.entry,
+                    Some(published_scope.clone()),
+                    Some(published_entry.content_hash),
+                    Some(&published_ref),
+                    None,
+                );
+            }
+            if mode != ProvisionalMode::Published {
+                diagnostics.push(format!(
+                    "project {}: provisional overlays for catalog projects land with the \
+                     phase-5 catalog overlay baseline path",
+                    target.project_id
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Project accepted records once per accepted content identity. The
+    /// content stamp is the validity token: a rebind leaves it unchanged and
+    /// keeps this entry, while an advance replaces it.
+    fn cached_catalog_published_knowledge(
+        &self,
+        project_id: &ProjectId,
+        verified: &VerifiedAcceptedPublication,
+    ) -> PublishedKnowledgeSnapshot {
+        let content_stamp = verified.content_stamp();
+        let cached = self
+            .state
+            .catalog_knowledge_published_cache
+            .read()
+            .get(project_id)
+            .filter(|entry| &entry.content_stamp == content_stamp)
+            .map(|entry| entry.snapshot.clone());
+        if let Some(cached) = cached {
+            return cached;
+        }
+        let snapshot = published_knowledge_from_accepted(verified);
+        self.state.catalog_knowledge_published_cache.write().insert(
+            project_id.clone(),
+            CatalogPublishedKnowledgeCacheEntry {
+                content_stamp: content_stamp.clone(),
+                snapshot: snapshot.clone(),
+            },
+        );
+        snapshot
+    }
+
+    /// Drop every catalog-side cache derived from one project's accepted
+    /// content. Advance calls this; rebind must not, because a binding
+    /// change leaves accepted content identical.
+    #[allow(dead_code)] // P5-B installs the invalidator; P5-C advance calls it.
+    pub(crate) fn invalidate_catalog_published_content(&self, project_id: &ProjectId) {
+        if let Some(runtime) = &self.state.accepted_publications {
+            runtime.invalidate_content(project_id);
+        }
+        self.state
+            .catalog_knowledge_published_cache
+            .write()
+            .remove(project_id);
+        self.state
+            .catalog_gap_published_cache
+            .write()
+            .remove(project_id);
+    }
+
     fn cached_published_knowledge_snapshot(
         &self,
         publisher: &super::knowledge_lifecycle::AuthorizedPublisher,
@@ -613,6 +763,181 @@ impl BlackboxServer {
             Ok(())
         })?;
         Ok(hydrated)
+    }
+}
+
+/// Why one catalog project cannot serve published content. Only the stable
+/// code crosses into a response: store detail can name store paths, and a
+/// diagnostic must not.
+pub(crate) fn catalog_publication_diagnostic(
+    project_id: &str,
+    error: &AcceptedPublicationRuntimeError,
+) -> String {
+    if error.code() == ERROR_ACCEPTED_PUBLICATION_MISSING {
+        return format!(
+            "project {project_id}: no accepted publication pointer, so published content is \
+             unavailable"
+        );
+    }
+    format!(
+        "project {project_id}: accepted publication is unavailable ({})",
+        error.code()
+    )
+}
+
+/// Degradations that still serve content: the prior-generation fallback and
+/// the scope-migration bridge. Both are read-only states the operator
+/// repairs through the publisher surface.
+pub(crate) fn catalog_publication_degradations(
+    project_id: &str,
+    verified: &VerifiedAcceptedPublication,
+    catalog_scope: Option<&PublishedScope>,
+) -> Vec<String> {
+    let mut degradations = Vec::new();
+    if verified.binding_stamp().selection() == AcceptedPublicationSelection::Prior {
+        degradations.push(format!(
+            "project {project_id}: the current accepted generation did not verify, so reads are \
+             served from the prior generation and publisher mutation refuses until repair"
+        ));
+    }
+    if verified.binding_stamp().scope_agreement(catalog_scope)
+        == AcceptedPublicationScopeAgreement::RefreshRequired
+    {
+        degradations.push(format!(
+            "project {project_id}: accepted content predates the catalog's current published \
+             scope; it keeps its accepted scope until a new-scope advance"
+        ));
+    }
+    degradations
+}
+
+/// Project one verified accepted generation into the published snapshot the
+/// view layer already consumes.
+///
+/// The manifest is the authoritative file list, and its
+/// `source_content_sha256` is the digest of the exact committed bytes, so a
+/// catalog row carries the same content hash the publisher-root read would
+/// have produced for the same commit.
+fn published_knowledge_from_accepted(
+    verified: &VerifiedAcceptedPublication,
+) -> PublishedKnowledgeSnapshot {
+    let content_stamp = verified.content_stamp();
+    let mut entries = BTreeMap::new();
+    for manifest in verified.knowledge_manifest().values() {
+        // Generation validation makes the manifest and the normalized
+        // records a bijection, so a miss here is unreachable rather than a
+        // silently dropped row.
+        let Some(record) = verified.knowledge_records().get(&manifest.record_id) else {
+            continue;
+        };
+        let entry = knowledge_entry_from_accepted(record, content_stamp.project_id());
+        entries.insert(
+            entry.id.clone(),
+            PublishedKnowledgeEntry {
+                entry,
+                content_hash: manifest.source_content_sha256.as_str().to_string(),
+            },
+        );
+    }
+    PublishedKnowledgeSnapshot {
+        published_scope: content_stamp.accepted_scope().clone(),
+        published_ref: content_stamp.full_ref().to_string(),
+        publisher_commit: content_stamp.accepted_commit().to_string(),
+        entries,
+    }
+}
+
+/// Rebuild the domain entry from its accepted record.
+///
+/// The host-local fields accepted normalization dropped stay dropped.
+/// `project` is a checkout path and a catalog read has no checkout, so
+/// identity travels in `project_id`. Recall telemetry stays zero: it is
+/// advisory, repo-local, and not part of accepted durable truth, and
+/// restoring it would mean opening a checkout for a remote-only read
+/// (plan section 4.14).
+fn knowledge_entry_from_accepted(
+    record: &AcceptedKnowledgeEntryV1,
+    project_id: &ProjectId,
+) -> KnowledgeEntry {
+    KnowledgeEntry {
+        id: record.id.as_str().to_string(),
+        title: record.title.clone(),
+        content: record.content.clone(),
+        cluster: record.cluster.clone(),
+        variants: record
+            .variants
+            .iter()
+            .map(|(provider, content)| (provider.clone(), content.clone()))
+            .collect(),
+        category: match record.category {
+            AcceptedKnowledgeCategoryV1::Profile => Category::Profile,
+            AcceptedKnowledgeCategoryV1::Convention => Category::Convention,
+            AcceptedKnowledgeCategoryV1::Steering => Category::Steering,
+            AcceptedKnowledgeCategoryV1::Build => Category::Build,
+            AcceptedKnowledgeCategoryV1::Tool => Category::Tool,
+            AcceptedKnowledgeCategoryV1::Memory => Category::Memory,
+            AcceptedKnowledgeCategoryV1::Workflow => Category::Workflow,
+            AcceptedKnowledgeCategoryV1::Decision => Category::Decision,
+        },
+        // An accepted project generation cannot contain global knowledge:
+        // normalization refuses it.
+        scope: Scope::Project,
+        project: None,
+        project_id: Some(project_id.as_str().to_string()),
+        providers: record.providers.clone(),
+        priority: match record.priority {
+            AcceptedKnowledgePriorityV1::Critical => Priority::Critical,
+            AcceptedKnowledgePriorityV1::Standard => Priority::Standard,
+            AcceptedKnowledgePriorityV1::Supplementary => Priority::Supplementary,
+        },
+        weight: record.weight,
+        status: match record.status {
+            AcceptedKnowledgeStatusV1::Active => Status::Active,
+            AcceptedKnowledgeStatusV1::Draft => Status::Draft,
+            AcceptedKnowledgeStatusV1::Superseded => Status::Superseded,
+            AcceptedKnowledgeStatusV1::Disabled => Status::Disabled,
+            AcceptedKnowledgeStatusV1::Deleted => Status::Deleted,
+        },
+        approval: match record.approval {
+            AcceptedKnowledgeApprovalV1::UserConfirmed => Approval::UserConfirmed,
+            AcceptedKnowledgeApprovalV1::AgentInferred => Approval::AgentInferred,
+            AcceptedKnowledgeApprovalV1::Imported => Approval::Imported,
+        },
+        render: record.render,
+        decay: record.decay,
+        review_at: record.review_at.clone(),
+        supersedes: record.supersedes.clone(),
+        links: record
+            .links
+            .iter()
+            .map(|edge| KnowledgeEdge {
+                target: edge.target.clone(),
+                kind: match edge.kind {
+                    AcceptedKnowledgeEdgeKindV1::Contradicts => KnowledgeEdgeKind::Contradicts,
+                    AcceptedKnowledgeEdgeKindV1::RelatesTo => KnowledgeEdgeKind::RelatesTo,
+                    AcceptedKnowledgeEdgeKindV1::TensionWith => KnowledgeEdgeKind::TensionWith,
+                    AcceptedKnowledgeEdgeKindV1::Supports => KnowledgeEdgeKind::Supports,
+                    AcceptedKnowledgeEdgeKindV1::DependsOn => KnowledgeEdgeKind::DependsOn,
+                    AcceptedKnowledgeEdgeKindV1::DerivedFrom => KnowledgeEdgeKind::DerivedFrom,
+                    AcceptedKnowledgeEdgeKindV1::Supersedes => KnowledgeEdgeKind::Supersedes,
+                    AcceptedKnowledgeEdgeKindV1::References => KnowledgeEdgeKind::References,
+                },
+                note: edge.note.clone(),
+                source_arc: edge.source_arc.clone(),
+                confidence: match edge.confidence {
+                    AcceptedEdgeConfidenceV1::Exact => bbox_chunker::EdgeConfidence::Exact,
+                    AcceptedEdgeConfidenceV1::Heuristic => bbox_chunker::EdgeConfidence::Heuristic,
+                    AcceptedEdgeConfidenceV1::Unknown => bbox_chunker::EdgeConfidence::Unknown,
+                },
+            })
+            .collect(),
+        rationale: record.rationale.clone(),
+        expires_at: record.expires_at.clone(),
+        source: record.source.clone(),
+        created_at: record.created_at.clone(),
+        updated_at: record.updated_at.clone(),
+        recall_count: 0,
+        last_recalled: None,
     }
 }
 
@@ -1272,5 +1597,368 @@ mod tests {
             explicit.diagnostics,
             vec![compatibility_diagnostic.to_owned()]
         );
+    }
+}
+
+/// Catalog published knowledge views (Phase 5 plan section 8, P5-B).
+#[cfg(test)]
+mod catalog_view_tests {
+    use crate::server::state::catalog_fixture::{
+        COMMIT_ONE, COMMIT_TWO, CatalogFixture, gap_note, knowledge_entry,
+    };
+
+    use super::*;
+
+    fn published_stamp(view: &SessionKnowledgeView, entry_id: &str) -> BuiltFromStamp {
+        let reference = view
+            .knowledge
+            .view_metadata(entry_id)
+            .and_then(|metadata| metadata.built_from_ref.clone())
+            .expect("catalog published rows carry a built_from stamp");
+        view.built_from
+            .get(&reference)
+            .cloned()
+            .expect("the stamp reference resolves in the view table")
+    }
+
+    fn row(view: &SessionKnowledgeView, entry_id: &str) -> KnowledgeViewItem {
+        view.items
+            .iter()
+            .find(|item| item.entry.id == entry_id)
+            .cloned()
+            .expect("row is present")
+    }
+
+    #[test]
+    fn a_remote_only_catalog_project_serves_accepted_knowledge_with_no_lease() {
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project("p_remote", &scope);
+        let installed = fixture.install_publication(
+            "p_remote",
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-a", "accepted content")],
+            &[gap_note("gap-1234abcd", "accepted gap")],
+        );
+        let server = fixture.server();
+
+        let view = server.session_knowledge_view(None, None).unwrap();
+        let item = row(&view, "knowledge-a");
+        assert_eq!(item.entry.content, "accepted content");
+        // Identity travels as a project id; the path field stays empty
+        // because a catalog read has no checkout.
+        assert_eq!(item.entry.project_id.as_deref(), Some("p_remote"));
+        assert_eq!(item.entry.project, None);
+        // Recall telemetry is repo-local and advisory: the source entry
+        // carried counts, accepted normalization dropped them, and the
+        // catalog read must not reopen a checkout to restore them.
+        assert_eq!(item.entry.recall_count, 0);
+        assert_eq!(item.entry.last_recalled, None);
+        assert_eq!(item.metadata.published_scope.as_ref(), Some(&scope));
+        assert!(item.metadata.content_hash.is_some());
+
+        assert_eq!(
+            published_stamp(&view, "knowledge-a"),
+            BuiltFromStamp::Published {
+                published_scope: scope.clone(),
+                published_ref: "refs/heads/main".into(),
+                publisher_commit: COMMIT_ONE.into(),
+            }
+        );
+        assert!(!installed.generation_id.is_empty());
+
+        // Published reads never enter the checkout plane. The broker is a
+        // deny probe, so any acquisition would also have failed the read.
+        let health = server.state.checkout_access.health();
+        assert!(
+            health
+                .operations
+                .iter()
+                .all(|operation| operation.granted == 0 && operation.denied == 0)
+        );
+    }
+
+    #[test]
+    fn a_restart_serves_the_same_accepted_generation() {
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project("p_restart", &scope);
+        fixture.install_publication(
+            "p_restart",
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-a", "generation one")],
+            &[],
+        );
+
+        let first = fixture.server().session_knowledge_view(None, None).unwrap();
+        // A second server over the same durable bytes is a restart: new
+        // runtime, empty caches, no attachment anywhere in the story.
+        let second = fixture.server().session_knowledge_view(None, None).unwrap();
+        assert_eq!(
+            row(&first, "knowledge-a").entry.content,
+            row(&second, "knowledge-a").entry.content
+        );
+        assert_eq!(
+            row(&first, "knowledge-a").metadata.content_hash,
+            row(&second, "knowledge-a").metadata.content_hash
+        );
+        assert_eq!(
+            published_stamp(&first, "knowledge-a"),
+            published_stamp(&second, "knowledge-a")
+        );
+    }
+
+    #[test]
+    fn a_project_without_a_pointer_reports_publication_unavailable() {
+        let fixture = CatalogFixture::new();
+        fixture.add_published_project("p_nopublication", &CatalogFixture::scope("."));
+        let server = fixture.server();
+
+        let view = server.session_knowledge_view(None, None).unwrap();
+        assert!(view.items.is_empty());
+        assert!(
+            view.diagnostics.iter().any(|diagnostic| {
+                diagnostic.contains("p_nopublication")
+                    && diagnostic.contains("no accepted publication pointer")
+            }),
+            "{:?}",
+            view.diagnostics
+        );
+    }
+
+    #[test]
+    fn one_corrupt_project_does_not_hide_a_healthy_peer() {
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        // One published scope is one project: the catalog refuses a
+        // duplicate, so peers live at distinct `.bbox` roots.
+        let broken_scope = CatalogFixture::scope("sub/broken");
+        fixture.add_published_project("p_healthy", &scope);
+        fixture.add_published_project("p_broken", &broken_scope);
+        fixture.install_publication(
+            "p_healthy",
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-a", "healthy")],
+            &[],
+        );
+        let broken = fixture.install_publication(
+            "p_broken",
+            &broken_scope,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-b", "broken")],
+            &[],
+        );
+        fixture.corrupt_generation("p_broken", &broken.generation_id);
+        let server = fixture.server();
+
+        let view = server.session_knowledge_view(None, None).unwrap();
+        assert_eq!(row(&view, "knowledge-a").entry.content, "healthy");
+        assert!(view.items.iter().all(|item| item.entry.id != "knowledge-b"));
+        assert!(
+            view.diagnostics.iter().any(|diagnostic| {
+                diagnostic.contains("p_broken") && diagnostic.contains("unavailable")
+            }),
+            "{:?}",
+            view.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_prior_fallback_serves_prior_rows_and_reports_repair() {
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project("p_prior", &scope);
+        let first = fixture.install_publication(
+            "p_prior",
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-a", "first generation")],
+            &[],
+        );
+        let second = fixture.install_publication(
+            "p_prior",
+            &scope,
+            COMMIT_TWO,
+            &[knowledge_entry("knowledge-a", "second generation")],
+            &[],
+        );
+        fixture.corrupt_generation("p_prior", &second.generation_id);
+        let server = fixture.server();
+
+        let view = server.session_knowledge_view(None, None).unwrap();
+        assert_eq!(
+            row(&view, "knowledge-a").entry.content,
+            "first generation",
+            "a damaged current arm serves the prior generation"
+        );
+        // The response provenance names the generation that actually
+        // served, not the pointer's damaged head.
+        assert_eq!(
+            published_stamp(&view, "knowledge-a"),
+            BuiltFromStamp::Published {
+                published_scope: scope,
+                published_ref: "refs/heads/main".into(),
+                publisher_commit: COMMIT_ONE.into(),
+            }
+        );
+        assert_ne!(first.generation_id, second.generation_id);
+        assert!(
+            view.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("served from the prior generation")),
+            "{:?}",
+            view.diagnostics
+        );
+    }
+
+    #[test]
+    fn scope_migration_keeps_the_old_accepted_scope_until_advance() {
+        let fixture = CatalogFixture::new();
+        let accepted_scope = CatalogFixture::scope(".");
+        fixture.add_published_project("p_scope", &accepted_scope);
+        fixture.install_publication(
+            "p_scope",
+            &accepted_scope,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-a", "old scope content")],
+            &[],
+        );
+        fixture.migrate_project_scope("p_scope", &CatalogFixture::scope("sub/project"));
+        let server = fixture.server();
+
+        let view = server.session_knowledge_view(None, None).unwrap();
+        // No accepted snapshot is ever relabeled: the response keeps the
+        // scope its content was published at.
+        assert_eq!(
+            published_stamp(&view, "knowledge-a"),
+            BuiltFromStamp::Published {
+                published_scope: accepted_scope.clone(),
+                published_ref: "refs/heads/main".into(),
+                publisher_commit: COMMIT_ONE.into(),
+            }
+        );
+        assert_eq!(
+            row(&view, "knowledge-a").metadata.published_scope.as_ref(),
+            Some(&accepted_scope)
+        );
+        assert!(
+            view.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("new-scope advance")),
+            "{:?}",
+            view.diagnostics
+        );
+    }
+
+    #[test]
+    fn the_content_cache_survives_repeat_reads_and_advance_replaces_it() {
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project("p_cache", &scope);
+        fixture.install_publication(
+            "p_cache",
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-a", "generation one")],
+            &[],
+        );
+        let server = fixture.server();
+        let project_id = ProjectId::parse("p_cache").unwrap();
+
+        server.session_knowledge_view(None, None).unwrap();
+        let first_stamp = server
+            .state
+            .catalog_knowledge_published_cache
+            .read()
+            .get(&project_id)
+            .expect("the first read installs a projected snapshot")
+            .content_stamp
+            .clone();
+        server.session_knowledge_view(None, None).unwrap();
+        assert_eq!(
+            server
+                .state
+                .catalog_knowledge_published_cache
+                .read()
+                .get(&project_id)
+                .unwrap()
+                .content_stamp,
+            first_stamp,
+            "a repeat read reuses the projection instead of rebuilding it"
+        );
+
+        fixture.install_publication(
+            "p_cache",
+            &scope,
+            COMMIT_TWO,
+            &[knowledge_entry("knowledge-a", "generation two")],
+            &[],
+        );
+        // Advance is what invalidates content. Without it the runtime keeps
+        // serving the generation it verified, which is the documented
+        // caching contract, not a staleness bug.
+        assert_eq!(
+            row(
+                &server.session_knowledge_view(None, None).unwrap(),
+                "knowledge-a"
+            )
+            .entry
+            .content,
+            "generation one"
+        );
+        server.invalidate_catalog_published_content(&project_id);
+        let after = server.session_knowledge_view(None, None).unwrap();
+        assert_eq!(row(&after, "knowledge-a").entry.content, "generation two");
+        assert_ne!(
+            server
+                .state
+                .catalog_knowledge_published_cache
+                .read()
+                .get(&project_id)
+                .unwrap()
+                .content_stamp,
+            first_stamp
+        );
+        assert_eq!(
+            published_stamp(&after, "knowledge-a"),
+            BuiltFromStamp::Published {
+                published_scope: scope,
+                published_ref: "refs/heads/main".into(),
+                publisher_commit: COMMIT_TWO.into(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_explicit_project_selector_narrows_to_one_catalog_project() {
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        let second_scope = CatalogFixture::scope("sub/second");
+        fixture.add_published_project("p_first", &scope);
+        fixture.add_published_project("p_second", &second_scope);
+        fixture.install_publication(
+            "p_first",
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-a", "first project")],
+            &[],
+        );
+        fixture.install_publication(
+            "p_second",
+            &second_scope,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-b", "second project")],
+            &[],
+        );
+        let server = fixture.server();
+
+        let view = server
+            .session_knowledge_view(Some("p_first"), None)
+            .unwrap();
+        assert_eq!(row(&view, "knowledge-a").entry.content, "first project");
+        assert!(view.items.iter().all(|item| item.entry.id != "knowledge-b"));
     }
 }

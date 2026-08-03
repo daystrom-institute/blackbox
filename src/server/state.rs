@@ -163,6 +163,24 @@ pub(crate) struct SharedState {
             super::gap_view::PublishedGapCacheEntry,
         >,
     >,
+    /// Catalog published knowledge projected from verified accepted
+    /// content, keyed by durable project identity and validated by the
+    /// accepted content stamp. Separate from the bridge cache above: that
+    /// one is scope-keyed and bound to publisher election, this one has no
+    /// publisher, no TTL, and no path.
+    pub(crate) catalog_knowledge_published_cache: RwLock<
+        BTreeMap<
+            bbox_corpus_core::project_catalog::ProjectId,
+            super::knowledge_view::CatalogPublishedKnowledgeCacheEntry,
+        >,
+    >,
+    /// The gap twin of `catalog_knowledge_published_cache`.
+    pub(crate) catalog_gap_published_cache: RwLock<
+        BTreeMap<
+            bbox_corpus_core::project_catalog::ProjectId,
+            super::gap_view::CatalogPublishedGapCacheEntry,
+        >,
+    >,
     /// Successful publisher authority resolutions are memoized briefly.
     /// The project inventory is part of each cache entry, so registry changes
     /// bypass the cached decision immediately.
@@ -771,6 +789,8 @@ impl SharedState {
             path_fallback_cut: AtomicBool::new(path_fallback_cut),
             knowledge_published_cache: RwLock::new(BTreeMap::new()),
             gap_published_cache: RwLock::new(BTreeMap::new()),
+            catalog_knowledge_published_cache: RwLock::new(BTreeMap::new()),
+            catalog_gap_published_cache: RwLock::new(BTreeMap::new()),
             publisher_authorization_cache: RwLock::new(Default::default()),
             packets: RwLock::new(Packets::open(store_dir).unwrap()),
             surface_decisions: crate::server::surface::SurfaceDecisionCache::default(),
@@ -854,6 +874,46 @@ impl SharedState {
                 store_dir.join("identities"),
             )),
         }
+    }
+
+    /// Catalog-authority variant of `for_test`.
+    ///
+    /// The catalog store lives beside the bridge fixture instead of
+    /// replacing it, so the surrounding harness keeps working while the
+    /// runtime authority, the record projection, and the accepted
+    /// publication runtime all come from the catalog. The checkout
+    /// authority is `DenyCheckoutAccess` on purpose: a catalog published
+    /// read that reaches for a checkout must fail its test rather than
+    /// quietly succeed on a developer machine that happens to have one.
+    #[cfg(test)]
+    pub(crate) fn for_test_catalog(
+        store_dir: &std::path::Path,
+        catalog_projects_path: &std::path::Path,
+    ) -> SharedState {
+        let mut state = SharedState::for_test(store_dir);
+        let store = Arc::new(
+            bbox_indexing::project_catalog_store::ProjectCatalogStore::open_existing(
+                catalog_projects_path,
+            )
+            .unwrap(),
+        );
+        state.project_authority = ProjectAuthority::Catalog {
+            store: store.clone(),
+        };
+        state.records_provider =
+            Arc::new(bbox_indexing::catalog_records::CatalogProjectRecordsProvider::new(store));
+        state.accepted_publications = Some(Arc::new(
+            bbox_indexing::accepted_publication_runtime::AcceptedPublicationRuntime::open_global(
+                catalog_projects_path,
+            )
+            .unwrap(),
+        ));
+        state.checkout_access =
+            Arc::new(bbox_indexing::checkout_access::CheckoutAccessBroker::new(
+                Arc::new(bbox_indexing::checkout_access::DenyCheckoutAccess),
+                state.checkout_access_observations.clone(),
+            ));
+        state
     }
 }
 
@@ -1082,4 +1142,230 @@ pub(crate) struct BlackboxServer {
     /// transport context at initialization. Tool arguments never replace it.
     pub(crate) session_checkout:
         OnceLock<Option<Arc<bbox_corpus_core::project_record::ResolvedCheckoutScope>>>,
+}
+
+/// Catalog-mode view fixtures shared by the published knowledge and gap
+/// view tests. Building catalog state means a catalog store, published
+/// projects with no attachment (the remote-only case), and accepted bytes
+/// installed through the owning crate's real preparation path.
+#[cfg(test)]
+pub(crate) mod catalog_fixture {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use bbox_corpus_core::identity::PublishedScope;
+    use bbox_corpus_core::project_catalog::{AttachmentId, CorpusProject, ProjectId, ProjectScope};
+    use bbox_gaps::gaps::{BlockingLevel, GapImpact, GapKind, GapNote, GapResolution};
+    use bbox_indexing::accepted_publication_test_support::{
+        AcceptedPublicationSourceFileForTest, InstalledAcceptedPublicationForTest,
+        corrupt_accepted_generation_for_test, install_accepted_publication_for_test,
+    };
+    use bbox_indexing::project_catalog_store::ProjectCatalogStore;
+    use bbox_knowledge::knowledge::{Approval, Category, KnowledgeEntry, Priority, Scope, Status};
+
+    use super::{BlackboxServer, SharedState};
+
+    pub(crate) const COMMIT_ONE: &str = "1111111111111111111111111111111111111111";
+    pub(crate) const COMMIT_TWO: &str = "2222222222222222222222222222222222222222";
+
+    pub(crate) struct CatalogFixture {
+        _directory: tempfile::TempDir,
+        root: PathBuf,
+        catalog_projects_path: PathBuf,
+        store: Arc<ProjectCatalogStore>,
+    }
+
+    impl CatalogFixture {
+        pub(crate) fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let catalog_root = root.join("catalog");
+            std::fs::create_dir_all(&catalog_root).unwrap();
+            let catalog_projects_path = catalog_root.join("projects.json");
+            let store =
+                Arc::new(ProjectCatalogStore::initialize_empty(&catalog_projects_path).unwrap());
+            Self {
+                _directory: directory,
+                root,
+                catalog_projects_path,
+                store,
+            }
+        }
+
+        pub(crate) fn scope(relative: &str) -> PublishedScope {
+            PublishedScope::try_new("repo_example", relative).unwrap()
+        }
+
+        pub(crate) fn attachment() -> AttachmentId {
+            AttachmentId::parse("att_11111111111111111111111111111111").unwrap()
+        }
+
+        /// Insert one published catalog project with no attachment. A
+        /// remote-only project is exactly the case catalog published reads
+        /// must serve.
+        pub(crate) fn add_published_project(&self, project_id: &str, scope: &PublishedScope) {
+            let project_id = ProjectId::parse(project_id).unwrap();
+            let scope = scope.clone();
+            let epoch = self.store.snapshot().unwrap().epoch();
+            self.store
+                .transact(epoch, |catalog, _attachments| {
+                    catalog.projects.insert(
+                        project_id.clone(),
+                        CorpusProject {
+                            project_id: project_id.clone(),
+                            scope: ProjectScope::Published(scope.clone()),
+                            operator_aliases: Default::default(),
+                            nominated_aliases: Default::default(),
+                            display_name: project_id.as_str().to_string(),
+                            created_at: "2026-07-25T00:00:00Z".into(),
+                            registered_at_compat: None,
+                            repo_history: None,
+                            languages: Default::default(),
+                        },
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        /// Migrate one project's catalog scope, leaving its accepted
+        /// publication untouched. That is the publication bridge state.
+        pub(crate) fn migrate_project_scope(&self, project_id: &str, scope: &PublishedScope) {
+            let project_id = ProjectId::parse(project_id).unwrap();
+            let scope = scope.clone();
+            let epoch = self.store.snapshot().unwrap().epoch();
+            self.store
+                .transact(epoch, |catalog, _attachments| {
+                    let project = catalog.projects.get_mut(&project_id).unwrap();
+                    project.scope = ProjectScope::Published(scope.clone());
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        pub(crate) fn install_publication(
+            &self,
+            project_id: &str,
+            scope: &PublishedScope,
+            accepted_commit: &str,
+            knowledge: &[KnowledgeEntry],
+            gaps: &[GapNote],
+        ) -> InstalledAcceptedPublicationForTest {
+            let project_id = ProjectId::parse(project_id).unwrap();
+            let relative = |lane: &str, id: &str| {
+                if scope.bbox_root_relpath() == "." {
+                    format!(".bbox/{lane}/{id}.json")
+                } else {
+                    format!("{}/.bbox/{lane}/{id}.json", scope.bbox_root_relpath())
+                }
+            };
+            install_accepted_publication_for_test(
+                &self.catalog_projects_path,
+                &project_id,
+                &Self::attachment(),
+                scope,
+                "refs/heads/main",
+                accepted_commit,
+                knowledge
+                    .iter()
+                    .map(|entry| AcceptedPublicationSourceFileForTest {
+                        repository_relative_filename: relative("knowledge", &entry.id),
+                        source_bytes: serde_json::to_vec(entry).unwrap(),
+                    })
+                    .collect(),
+                gaps.iter()
+                    .map(|gap| AcceptedPublicationSourceFileForTest {
+                        repository_relative_filename: relative("gaps", &gap.id),
+                        source_bytes: serde_json::to_vec(gap).unwrap(),
+                    })
+                    .collect(),
+            )
+            .unwrap()
+        }
+
+        pub(crate) fn corrupt_generation(&self, project_id: &str, generation_id: &str) {
+            corrupt_accepted_generation_for_test(
+                &self.catalog_projects_path,
+                &ProjectId::parse(project_id).unwrap(),
+                generation_id,
+            )
+            .unwrap();
+        }
+
+        /// A fresh server over the same durable bytes. Calling this twice
+        /// is a restart: new runtime, empty caches, unchanged state.
+        pub(crate) fn server(&self) -> BlackboxServer {
+            BlackboxServer::new(Arc::new(SharedState::for_test_catalog(
+                &self.root,
+                &self.catalog_projects_path,
+            )))
+        }
+    }
+
+    pub(crate) fn knowledge_entry(id: &str, content: &str) -> KnowledgeEntry {
+        KnowledgeEntry {
+            id: id.to_string(),
+            title: format!("entry {id}"),
+            content: content.to_string(),
+            cluster: None,
+            variants: Default::default(),
+            category: Category::Convention,
+            scope: Scope::Project,
+            // A committed repo-owned file carries no host path, and the
+            // accepted normalization drops the field regardless.
+            project: None,
+            project_id: None,
+            providers: Vec::new(),
+            priority: Priority::Standard,
+            weight: 100,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            render: true,
+            decay: false,
+            review_at: None,
+            supersedes: None,
+            links: Vec::new(),
+            rationale: None,
+            expires_at: None,
+            source: "user".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            recall_count: 7,
+            last_recalled: Some("2026-01-03T00:00:00Z".to_string()),
+        }
+    }
+
+    pub(crate) fn gap_note(id: &str, title: &str) -> GapNote {
+        GapNote {
+            id: id.to_string(),
+            title: title.to_string(),
+            gap_kind: GapKind::Tooling,
+            domain: "publication".to_string(),
+            wanted_capability: "serve accepted gaps by project identity".to_string(),
+            missing_primitive: None,
+            fallback_used: None,
+            evidence: Vec::new(),
+            impact: GapImpact::Medium,
+            blocking_level: BlockingLevel::WorkaroundAvailable,
+            dedupe_key: "tooling/publication/accepted-view".to_string(),
+            suggested_owner: None,
+            notes: None,
+            supersedes: None,
+            superseded_by: None,
+            resolution: GapResolution::Unresolved,
+            project: None,
+            project_id: None,
+            write_dir: None,
+            provisional_checkout_id: None,
+            task_id: None,
+            session_id: None,
+            provider: None,
+            bro: None,
+            thread_id: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            resolved_at: None,
+            resolution_note: None,
+        }
+    }
 }

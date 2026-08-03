@@ -147,7 +147,51 @@ impl PublisherAuthorizationCache {
     }
 }
 
+/// One catalog project selected for an accepted published read.
+///
+/// `catalog_scope` is the catalog's CURRENT published scope and exists only
+/// for the scope-bridge check. The scope that stamps a response comes from
+/// the verified accepted content, which keeps its own accepted scope until a
+/// new-scope advance clears the bridge (plan section 4.9).
+pub(crate) struct CatalogPublishedTarget {
+    pub(crate) project_id: bbox_corpus_core::project_catalog::ProjectId,
+    pub(crate) catalog_scope: Option<PublishedScope>,
+}
+
 impl BlackboxServer {
+    /// Select catalog projects for an accepted published read.
+    ///
+    /// Selection is by durable project identity and never joins
+    /// `ProjectRecord`: a remote-only project has no attached compatibility
+    /// row and must still serve its accepted content. A requested id that
+    /// names no catalog project selects nothing, and the caller reports it.
+    pub(crate) fn catalog_published_targets(
+        &self,
+        requested_project_id: Option<&str>,
+    ) -> Result<Vec<CatalogPublishedTarget>> {
+        use bbox_corpus_core::project_catalog::ProjectScope;
+
+        let Some(store) = self.state.project_authority.catalog_store() else {
+            return Ok(Vec::new());
+        };
+        let state = store.snapshot().map_err(anyhow::Error::new)?;
+        Ok(state
+            .catalog()
+            .projects
+            .iter()
+            .filter(|(project_id, _)| {
+                requested_project_id.is_none_or(|requested| project_id.as_str() == requested)
+            })
+            .map(|(project_id, project)| CatalogPublishedTarget {
+                project_id: project_id.clone(),
+                catalog_scope: match &project.scope {
+                    ProjectScope::Published(scope) => Some(scope.clone()),
+                    ProjectScope::LegacyLocal => None,
+                },
+            })
+            .collect())
+    }
+
     /// Resolve the one publisher using committed-HEAD scope claims, then bind
     /// the read to the immutable commit named by the host-local publisher pin.
     /// The pinned commit must carry the same committed scope as the HEAD

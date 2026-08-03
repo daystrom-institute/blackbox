@@ -6,6 +6,11 @@ edition = "2024"
 # Extracted from the origin crate by extract_rust_crate; the origin aliases
 # the moved modules back under their original `crate::<module>` paths.
 
+[features]
+# Exposes accepted-publication fixture installation to DOWNSTREAM crates'
+# tests (see src/accepted_publication_test_support.rs). Off by default.
+test-support = []
+
 [dependencies]
 tantivy = "0.22"
 serde = { version = "1", features = ["derive"] }

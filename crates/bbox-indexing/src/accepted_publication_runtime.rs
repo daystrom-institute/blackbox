@@ -22,12 +22,24 @@ use bbox_corpus_core::project_catalog::{AttachmentId, ProjectId};
 use parking_lot::RwLock;
 
 use crate::accepted_publication_store::{
-    AcceptedGapEntryV1, AcceptedKnowledgeEntryV1, AcceptedPublicationCountsV1,
     AcceptedPublicationGenerationV1, AcceptedPublicationLimits, AcceptedPublicationLockGuard,
-    AcceptedPublicationStoreError, AcceptedPublicationStorePaths, NormalizedRepoRelativeFilename,
-    PublicationFileManifestEntryV1, PublicationRecordId, VerifiedAcceptedPublicationSelectionV1,
-    acquire_accepted_publication_lock, pointer_generation_roots_locked, probe_global_store_locked,
+    AcceptedPublicationStoreError, AcceptedPublicationStorePaths,
+    VerifiedAcceptedPublicationSelectionV1, acquire_accepted_publication_lock,
+    pointer_generation_roots_locked, probe_global_store_locked,
     verify_selected_with_binding_locked,
+};
+
+/// The record and manifest shapes a verified view hands out. They are
+/// re-exported here so the facade stays the only accepted-publication API a
+/// crate-external caller imports; the generation and pointer containers that
+/// hold them remain crate-private.
+pub use crate::accepted_publication_store::{
+    AcceptedBlockingLevelV1, AcceptedEdgeConfidenceV1, AcceptedGapEntryV1, AcceptedGapImpactV1,
+    AcceptedGapKindV1, AcceptedGapResolutionV1, AcceptedKnowledgeApprovalV1,
+    AcceptedKnowledgeCategoryV1, AcceptedKnowledgeEdgeKindV1, AcceptedKnowledgeEdgeV1,
+    AcceptedKnowledgeEntryV1, AcceptedKnowledgePriorityV1, AcceptedKnowledgeScopeV1,
+    AcceptedKnowledgeStatusV1, AcceptedPublicationCountsV1, NormalizedRepoRelativeFilename,
+    PublicationFileManifestEntryV1, PublicationRecordId, PublicationSha256,
 };
 
 /// The accepted-publication authority itself could not be opened. This is

@@ -4,12 +4,20 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use bbox_corpus_core::built_from::{BuiltFromStamp, BuiltFromTable};
 use bbox_corpus_core::identity::PublishedScope;
+use bbox_corpus_core::project_catalog::ProjectId;
 use bbox_corpus_core::project_record::{ProjectRecord, ResolvedCheckoutScope};
-use bbox_gaps::gaps::{GapStore, GapViewMetadata};
+use bbox_gaps::gaps::{
+    BlockingLevel, GapImpact, GapKind, GapNote, GapResolution, GapStore, GapViewMetadata,
+};
 use bbox_gaps::overlay::{
     GapOverlayKey, GapOverlayRecomputeError, GapOverlayRecomputeErrorKind, GapOverlaySnapshot,
-    GapOverlayStatus, GapOverlayValue, GapTransientPreservationOutcome, PublishedGapSnapshot,
-    WorkingGapSnapshot, load_published_snapshot_at_commit, recompute_overlay_result,
+    GapOverlayStatus, GapOverlayValue, GapTransientPreservationOutcome, PublishedGapEntry,
+    PublishedGapSnapshot, WorkingGapSnapshot, load_published_snapshot_at_commit,
+    recompute_overlay_result,
+};
+use bbox_indexing::accepted_publication_runtime::{
+    AcceptedBlockingLevelV1, AcceptedGapEntryV1, AcceptedGapImpactV1, AcceptedGapKindV1,
+    AcceptedGapResolutionV1, AcceptedPublicationContentStamp, VerifiedAcceptedPublication,
 };
 use bbox_knowledge::overlay::ProvisionalMode;
 
@@ -21,6 +29,15 @@ pub(crate) struct PublishedGapCacheEntry {
     publisher_commit: String,
     durable_project: String,
     snapshot: PublishedGapSnapshot,
+}
+
+/// One catalog project's projected accepted gaps, valid exactly while its
+/// accepted content identity is unchanged. Bounded by the catalog for the
+/// same reason as the knowledge twin.
+#[derive(Clone)]
+pub(crate) struct CatalogPublishedGapCacheEntry {
+    pub(crate) content_stamp: AcceptedPublicationContentStamp,
+    pub(crate) snapshot: PublishedGapSnapshot,
 }
 
 pub(crate) struct SessionGapView {
@@ -185,15 +202,15 @@ impl BlackboxServer {
         // Filter-class engine resolution (phase-2 §9.2): a miss keeps the
         // lenient unmanaged-scope view semantics; a hit joins the records
         // projection by identity.
-        let requested_record = requested_project
+        let requested_project_id = requested_project
             .and_then(|raw| self.resolve_project_filter(raw))
-            .and_then(|resolution| resolution.project_id().map(str::to_owned))
-            .and_then(|project_id| {
-                projects
-                    .iter()
-                    .find(|record| record.project_id == project_id)
-                    .cloned()
-            });
+            .and_then(|resolution| resolution.project_id().map(str::to_owned));
+        let requested_record = requested_project_id.as_ref().and_then(|project_id| {
+            projects
+                .iter()
+                .find(|record| &record.project_id == project_id)
+                .cloned()
+        });
         let explicit_managed_scope = requested_record.is_some();
         let managed_paths = projects
             .iter()
@@ -218,22 +235,22 @@ impl BlackboxServer {
             has_legacy_compatibility_rows = true;
         }
 
-        // Catalog-mode scoped views (phase-2 §10 item 2): the selector
-        // already resolved through the engine above; serving accepted
-        // published gap content for a catalog project is the phase-5
-        // catalog-keyed view wiring. Until then a scoped list returns its
-        // typed empty outcome with a diagnostic and acquires no lease.
-        let catalog_scoped_view =
-            explicit_managed_scope && !self.state.project_authority.is_bridge();
-        if catalog_scoped_view {
-            let record = requested_record.as_ref().expect("scoped view has a record");
-            diagnostics.push(format!(
-                "catalog project {} resolved; published gap views for catalog \
-                 projects land with the phase-5 catalog-keyed view wiring",
-                record.project_id
-            ));
+        // Catalog published gap reads mirror the knowledge twin (plan
+        // section 4.1): durable project identity to a verified accepted
+        // generation, with no publisher election, publisher root, or Git.
+        let catalog_published = !self.state.project_authority.is_bridge();
+        if catalog_published {
+            self.append_catalog_published_gaps(
+                requested_project,
+                requested_project_id.as_deref(),
+                mode,
+                &mut gaps,
+                &mut metadata,
+                &mut built_from,
+                &mut diagnostics,
+            )?;
         }
-        let selected_projects = if catalog_scoped_view {
+        let selected_projects = if catalog_published {
             Vec::new()
         } else {
             requested_record
@@ -452,6 +469,112 @@ impl BlackboxServer {
         })
     }
 
+    /// Serve accepted published gaps for every selected catalog project.
+    /// One project's missing, corrupt, or prior-generation publication is a
+    /// bounded diagnostic, never a failure of the whole view.
+    #[allow(clippy::too_many_arguments)] // one accumulator per view output
+    fn append_catalog_published_gaps(
+        &self,
+        requested_selector: Option<&str>,
+        requested_project_id: Option<&str>,
+        mode: ProvisionalMode,
+        gaps: &mut Vec<bbox_gaps::gaps::GapNote>,
+        metadata: &mut BTreeMap<String, GapViewMetadata>,
+        built_from: &mut BuiltFromTable,
+        diagnostics: &mut Vec<String>,
+    ) -> Result<()> {
+        let Some(runtime) = self.state.accepted_publications.clone() else {
+            diagnostics.push(
+                "accepted-publication runtime is unavailable; no catalog published gaps can be \
+                 served"
+                    .into(),
+            );
+            return Ok(());
+        };
+        if requested_selector.is_some() && requested_project_id.is_none() {
+            diagnostics.push(
+                "the requested project selector did not resolve to a catalog project; every \
+                 catalog project is included"
+                    .into(),
+            );
+        }
+        let targets = self.catalog_published_targets(requested_project_id)?;
+        if targets.is_empty() && requested_project_id.is_some() {
+            diagnostics.push("the requested project is not in the catalog".into());
+            return Ok(());
+        }
+        for target in targets {
+            let verified = match runtime.load_verified(&target.project_id) {
+                Ok(verified) => verified,
+                Err(error) => {
+                    diagnostics.push(super::knowledge_view::catalog_publication_diagnostic(
+                        target.project_id.as_str(),
+                        &error,
+                    ));
+                    continue;
+                }
+            };
+            diagnostics.extend(super::knowledge_view::catalog_publication_degradations(
+                target.project_id.as_str(),
+                &verified,
+                target.catalog_scope.as_ref(),
+            ));
+            let published = self.cached_catalog_published_gaps(&target.project_id, &verified);
+            let published_ref = built_from.intern(BuiltFromStamp::Published {
+                published_scope: published.published_scope,
+                published_ref: published.published_ref,
+                publisher_commit: published.publisher_commit,
+            });
+            for (id, entry) in published.gaps {
+                metadata.insert(
+                    id,
+                    GapViewMetadata {
+                        built_from_ref: Some(published_ref.clone()),
+                        compatibility_lane: None,
+                    },
+                );
+                gaps.push(entry.gap);
+            }
+            if mode != ProvisionalMode::Published {
+                diagnostics.push(format!(
+                    "project {}: provisional gap overlays for catalog projects land with the \
+                     phase-5 catalog overlay baseline path",
+                    target.project_id
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Project accepted gap records once per accepted content identity; the
+    /// content stamp is the validity token.
+    fn cached_catalog_published_gaps(
+        &self,
+        project_id: &ProjectId,
+        verified: &VerifiedAcceptedPublication,
+    ) -> PublishedGapSnapshot {
+        let content_stamp = verified.content_stamp();
+        let cached = self
+            .state
+            .catalog_gap_published_cache
+            .read()
+            .get(project_id)
+            .filter(|entry| &entry.content_stamp == content_stamp)
+            .map(|entry| entry.snapshot.clone());
+        if let Some(cached) = cached {
+            return cached;
+        }
+        let snapshot = published_gaps_from_accepted(verified);
+        self.state.catalog_gap_published_cache.write().insert(
+            project_id.clone(),
+            CatalogPublishedGapCacheEntry {
+                content_stamp: content_stamp.clone(),
+                snapshot: snapshot.clone(),
+            },
+        );
+        snapshot
+    }
+
     fn cached_published_gap_snapshot(
         &self,
         publisher: &super::knowledge_lifecycle::AuthorizedPublisher,
@@ -493,6 +616,99 @@ impl BlackboxServer {
             },
         );
         Ok(snapshot)
+    }
+}
+
+/// Project one verified accepted generation into the published gap snapshot
+/// the view layer already consumes. The manifest supplies the content hash
+/// of the exact committed bytes, matching what a publisher-root read of the
+/// same commit would produce.
+fn published_gaps_from_accepted(verified: &VerifiedAcceptedPublication) -> PublishedGapSnapshot {
+    let content_stamp = verified.content_stamp();
+    let mut gaps = BTreeMap::new();
+    for manifest in verified.gap_manifest().values() {
+        // Generation validation makes the manifest and the normalized
+        // records a bijection, so a miss here is unreachable.
+        let Some(record) = verified.gap_records().get(&manifest.record_id) else {
+            continue;
+        };
+        let gap = gap_note_from_accepted(record, content_stamp.project_id());
+        gaps.insert(
+            gap.id.clone(),
+            PublishedGapEntry {
+                gap,
+                content_hash: manifest.source_content_sha256.as_str().to_string(),
+            },
+        );
+    }
+    PublishedGapSnapshot {
+        published_scope: content_stamp.accepted_scope().clone(),
+        published_ref: content_stamp.full_ref().to_string(),
+        publisher_commit: content_stamp.accepted_commit().to_string(),
+        gaps,
+    }
+}
+
+/// Rebuild the domain gap from its accepted record. The host-local carrier
+/// fields stay absent: `project` is a checkout path, `write_dir` is a
+/// transient write carrier, and a provisional checkout id belongs to an
+/// overlay row, not to accepted published truth. Identity travels in
+/// `project_id`.
+fn gap_note_from_accepted(record: &AcceptedGapEntryV1, project_id: &ProjectId) -> GapNote {
+    GapNote {
+        id: record.id.as_str().to_string(),
+        title: record.title.clone(),
+        gap_kind: match record.gap_kind {
+            AcceptedGapKindV1::PacketAst => GapKind::PacketAst,
+            AcceptedGapKindV1::Tooling => GapKind::Tooling,
+            AcceptedGapKindV1::Agent => GapKind::Agent,
+            AcceptedGapKindV1::Workflow => GapKind::Workflow,
+            AcceptedGapKindV1::RefactorPrimitive => GapKind::RefactorPrimitive,
+            AcceptedGapKindV1::McpSurface => GapKind::McpSurface,
+            AcceptedGapKindV1::Ontology => GapKind::Ontology,
+            AcceptedGapKindV1::EvalCoverage => GapKind::EvalCoverage,
+            AcceptedGapKindV1::DocsRunbook => GapKind::DocsRunbook,
+        },
+        domain: record.domain.clone(),
+        wanted_capability: record.wanted_capability.clone(),
+        missing_primitive: record.missing_primitive.clone(),
+        fallback_used: record.fallback_used.clone(),
+        evidence: record.evidence.clone(),
+        impact: match record.impact {
+            AcceptedGapImpactV1::Low => GapImpact::Low,
+            AcceptedGapImpactV1::Medium => GapImpact::Medium,
+            AcceptedGapImpactV1::High => GapImpact::High,
+            AcceptedGapImpactV1::Critical => GapImpact::Critical,
+        },
+        blocking_level: match record.blocking_level {
+            AcceptedBlockingLevelV1::None => BlockingLevel::None,
+            AcceptedBlockingLevelV1::WorkaroundAvailable => BlockingLevel::WorkaroundAvailable,
+            AcceptedBlockingLevelV1::BlocksTask => BlockingLevel::BlocksTask,
+            AcceptedBlockingLevelV1::BlocksClassOfWork => BlockingLevel::BlocksClassOfWork,
+        },
+        dedupe_key: record.dedupe_key.clone(),
+        suggested_owner: record.suggested_owner.clone(),
+        notes: record.notes.clone(),
+        supersedes: record.supersedes.clone(),
+        superseded_by: record.superseded_by.clone(),
+        resolution: match record.resolution {
+            AcceptedGapResolutionV1::Unresolved => GapResolution::Unresolved,
+            AcceptedGapResolutionV1::Acknowledged => GapResolution::Acknowledged,
+            AcceptedGapResolutionV1::Addressed => GapResolution::Addressed,
+        },
+        project: None,
+        project_id: Some(project_id.as_str().to_string()),
+        write_dir: None,
+        provisional_checkout_id: None,
+        task_id: record.task_id.clone(),
+        session_id: record.session_id.clone(),
+        provider: record.provider.clone(),
+        bro: record.bro.clone(),
+        thread_id: record.thread_id.clone(),
+        created_at: record.created_at.clone(),
+        updated_at: record.updated_at.clone(),
+        resolved_at: record.resolved_at.clone(),
+        resolution_note: record.resolution_note.clone(),
     }
 }
 
@@ -807,6 +1023,176 @@ mod tests {
         assert_ne!(
             provisional_gap_ref("checkout-a", "gap-12345678"),
             provisional_gap_ref("checkout-b", "gap-12345678")
+        );
+    }
+}
+
+/// Catalog published gap views (Phase 5 plan section 8, P5-B).
+#[cfg(test)]
+mod catalog_view_tests {
+    use crate::server::state::catalog_fixture::{
+        COMMIT_ONE, COMMIT_TWO, CatalogFixture, gap_note, knowledge_entry,
+    };
+
+    use super::*;
+
+    fn gap(view: &SessionGapView, id: &str) -> GapNote {
+        view.gaps
+            .all()
+            .iter()
+            .find(|gap| gap.id == id)
+            .cloned()
+            .expect("gap row is present")
+    }
+
+    fn published_stamp(view: &SessionGapView, id: &str) -> BuiltFromStamp {
+        let reference = view
+            .gaps
+            .view_metadata(id)
+            .and_then(|metadata| metadata.built_from_ref.clone())
+            .expect("catalog published gap rows carry a built_from stamp");
+        view.built_from
+            .get(&reference)
+            .cloned()
+            .expect("the stamp reference resolves in the view table")
+    }
+
+    #[test]
+    fn a_remote_only_catalog_project_serves_accepted_gaps_with_no_lease() {
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project("p_remote", &scope);
+        fixture.install_publication(
+            "p_remote",
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-a", "accepted content")],
+            &[gap_note("gap-1234abcd", "accepted gap")],
+        );
+        let server = fixture.server();
+
+        let view = server.session_gap_view(None, None).unwrap();
+        let row = gap(&view, "gap-1234abcd");
+        assert_eq!(row.title, "accepted gap");
+        assert_eq!(row.project_id.as_deref(), Some("p_remote"));
+        // The host-local carrier fields belong to a checkout, and a catalog
+        // published read has none.
+        assert_eq!(row.project, None);
+        assert_eq!(row.write_dir, None);
+        assert_eq!(row.provisional_checkout_id, None);
+        assert_eq!(
+            published_stamp(&view, "gap-1234abcd"),
+            BuiltFromStamp::Published {
+                published_scope: scope,
+                published_ref: "refs/heads/main".into(),
+                publisher_commit: COMMIT_ONE.into(),
+            }
+        );
+
+        let health = server.state.checkout_access.health();
+        assert!(
+            health
+                .operations
+                .iter()
+                .all(|operation| operation.granted == 0 && operation.denied == 0)
+        );
+    }
+
+    #[test]
+    fn accepted_gap_rows_survive_a_fully_detached_binding() {
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project("p_detached", &scope);
+        fixture.install_publication(
+            "p_detached",
+            &scope,
+            COMMIT_ONE,
+            &[],
+            &[gap_note("gap-1234abcd", "still readable")],
+        );
+        let server = fixture.server();
+
+        // The pointer names an attachment id, and the catalog holds no
+        // attachment at all: this is the detached binding, and the accepted
+        // bytes must keep serving through it.
+        assert!(
+            server
+                .state
+                .project_authority
+                .catalog_store()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .attachments()
+                .attachments
+                .is_empty()
+        );
+        let view = server.session_gap_view(None, None).unwrap();
+        assert_eq!(gap(&view, "gap-1234abcd").title, "still readable");
+    }
+
+    #[test]
+    fn a_project_without_a_pointer_reports_unavailable_gaps() {
+        let fixture = CatalogFixture::new();
+        fixture.add_published_project("p_nopublication", &CatalogFixture::scope("."));
+        let server = fixture.server();
+
+        let view = server.session_gap_view(None, None).unwrap();
+        assert!(view.gaps.all().is_empty());
+        assert!(
+            view.diagnostics.iter().any(|diagnostic| {
+                diagnostic.contains("p_nopublication")
+                    && diagnostic.contains("no accepted publication pointer")
+            }),
+            "{:?}",
+            view.diagnostics
+        );
+    }
+
+    #[test]
+    fn the_gap_content_cache_is_keyed_by_accepted_content_identity() {
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project("p_cache", &scope);
+        fixture.install_publication(
+            "p_cache",
+            &scope,
+            COMMIT_ONE,
+            &[],
+            &[gap_note("gap-1234abcd", "generation one")],
+        );
+        let server = fixture.server();
+        let project_id = ProjectId::parse("p_cache").unwrap();
+
+        server.session_gap_view(None, None).unwrap();
+        let first_stamp = server
+            .state
+            .catalog_gap_published_cache
+            .read()
+            .get(&project_id)
+            .expect("the first read installs a projected gap snapshot")
+            .content_stamp
+            .clone();
+
+        fixture.install_publication(
+            "p_cache",
+            &scope,
+            COMMIT_TWO,
+            &[],
+            &[gap_note("gap-1234abcd", "generation two")],
+        );
+        server.invalidate_catalog_published_content(&project_id);
+        let after = server.session_gap_view(None, None).unwrap();
+        assert_eq!(gap(&after, "gap-1234abcd").title, "generation two");
+        assert_ne!(
+            server
+                .state
+                .catalog_gap_published_cache
+                .read()
+                .get(&project_id)
+                .unwrap()
+                .content_stamp,
+            first_stamp
         );
     }
 }
