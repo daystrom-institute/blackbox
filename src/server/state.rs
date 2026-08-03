@@ -615,6 +615,16 @@ impl SharedState {
             projects: self.records_provider.as_ref(),
             checkout_registry: self.checkout_registry.as_ref(),
             checkout_access: self.checkout_access.as_ref(),
+            project_authority: match &self.project_authority {
+                ProjectAuthority::Bridge { .. } => {
+                    crate::providers::ProviderProjectAuthority::Bridge
+                }
+                ProjectAuthority::Catalog { store } => {
+                    crate::providers::ProviderProjectAuthority::Catalog {
+                        catalog: store.as_ref(),
+                    }
+                }
+            },
             packets: &self.packets,
             artifacts: &self.artifacts,
             whiteboards: self.whiteboards.as_ref(),

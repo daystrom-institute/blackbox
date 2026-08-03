@@ -86,10 +86,28 @@ pub struct CorpusStores<'a> {
     pub projects: &'a dyn bbox_corpus_core::project_record::ProjectRecordsProvider,
     pub checkout_registry: &'a RwLock<bbox_indexing::checkout_registry::CheckoutRegistry>,
     pub checkout_access: &'a bbox_indexing::checkout_access::CheckoutAccessBroker,
+    /// The runtime project authority the daemon selected at startup, handed
+    /// to providers explicitly.
+    pub project_authority: ProviderProjectAuthority<'a>,
     pub packets: &'a RwLock<Packets>,
     pub artifacts: &'a RwLock<ArtifactCatalog>,
     pub whiteboards: &'a WhiteboardRegistry,
     pub store_dir: &'a std::path::Path,
+}
+
+/// Which project authority the process is running under.
+///
+/// Passed explicitly because it cannot be inferred: a catalog deployment
+/// whose projects all carry a base attachment produces a record projection
+/// indistinguishable from a bridge deployment's, so reading the mode off
+/// record shape would be a guess that happens to be right most of the time
+/// (Phase 5 plan section 5.1, section 11).
+#[derive(Clone, Copy)]
+pub enum ProviderProjectAuthority<'a> {
+    Bridge,
+    Catalog {
+        catalog: &'a bbox_indexing::project_catalog_store::ProjectCatalogStore,
+    },
 }
 
 /// Path-free request authority for relative checkout-backed providers.
