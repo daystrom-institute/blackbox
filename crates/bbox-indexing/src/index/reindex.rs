@@ -15,7 +15,6 @@ use super::tool_edges::{ToolEdgeContext, ToolEdgeProjectAccess};
 use super::writer_actor::IndexWriterActor;
 use super::{FieldHandles, FileMetaSource, ReindexConfig};
 use crate::checkout_access::CheckoutAccessBroker;
-use crate::projects::ProjectRecord;
 #[cfg(test)]
 use crate::projects::ProjectRegistry;
 use bbox_corpus_core::project_record::ProjectRecordsProvider;
@@ -455,8 +454,12 @@ pub(super) fn execute_reindex_pass(
         leased
             .iter()
             .filter_map(|access| {
+                // The lower carrier is built ONLY from a live
+                // `LocalProjectWalk` lease, and `leased` holds that lease
+                // alive for the whole pass (plan section 8, tool-edge items
+                // 4 and 5).
                 access.local.as_ref().map(|local| ToolEdgeProjectAccess {
-                    project: access.project.clone(),
+                    project_id: access.project.project_id.clone(),
                     local_root: local.project_root().to_path_buf(),
                     git_root: access
                         .git
@@ -1066,7 +1069,7 @@ pub fn spawn_reindex_thread(
 /// Returns the number of new edges written.
 pub fn backfill_tool_edges_for_project<G>(
     config: &ReindexConfig,
-    project: &ProjectRecord,
+    project_id: &str,
     local_root: &std::path::Path,
     git_root: Option<&std::path::Path>,
     publication_guard: impl FnOnce() -> Result<G>,
@@ -1075,7 +1078,7 @@ pub fn backfill_tool_edges_for_project<G>(
         bbox_edge_index::edge_index::edges_dir_from_projects_path(&config.projects_path);
     let ctx = ToolEdgeContext::for_project_access(
         ToolEdgeProjectAccess {
-            project: project.clone(),
+            project_id: project_id.to_string(),
             local_root: local_root.to_path_buf(),
             git_root: git_root.map(std::path::Path::to_path_buf),
         },
@@ -1133,7 +1136,7 @@ pub fn backfill_tool_edges_for_project<G>(
     }
 
     let observed_dir = edges_dir.join("observed");
-    bbox_edge_index::edge_index::append_edges_dedup(&observed_dir, &project.project_id, &collected)
+    bbox_edge_index::edge_index::append_edges_dedup(&observed_dir, project_id, &collected)
 }
 
 #[cfg(test)]

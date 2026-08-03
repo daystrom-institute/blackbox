@@ -8,9 +8,13 @@ use sha2::{Digest, Sha256};
 use super::project_files;
 use bbox_chunker::{EdgeConfidence, EdgeProvenance};
 use bbox_corpus_core::entity_ref::EntityRef;
-use bbox_corpus_core::project_record::ProjectRecord;
 use bbox_edge_sidecar::edge_sidecar::Edge;
 use bro_transcript::{self as parser, ParsedEvent, ToolCallInfo, ToolCallKind};
+
+/// How many distinct sessions an unresolvable-path diagnostic names before
+/// it stops growing. The diagnostic must stay bounded regardless of corpus
+/// size, so the count keeps rising while the sample set does not.
+const MAX_UNRESOLVABLE_SAMPLES: usize = 8;
 
 pub struct ToolEdgeContext {
     projects: Vec<ToolEdgeProjectAccess>,
@@ -21,6 +25,37 @@ pub struct ToolEdgeContext {
     /// cwds are few relative to session files, and resolution can git-probe,
     /// so memoize per reindex pass.
     base_project_cache: std::sync::Mutex<BTreeMap<String, Option<String>>>,
+    unresolvable: std::sync::Mutex<ToolEdgePathDiagnostics>,
+}
+
+/// Bounded record of tool-call path events that no authorized local root
+/// resolves (plan section 9, tool/transcript-edge row).
+///
+/// A remote-only project contributes no local root to the pass, so its
+/// transcript path events cannot be attributed. They are skipped, never
+/// re-identified against some other project whose root happens to contain a
+/// same-named path, and counted here so the skip is observable rather than
+/// silent.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ToolEdgePathDiagnostics {
+    /// Total skipped path events. Saturating: a diagnostic must not panic a
+    /// reindex pass.
+    pub unresolvable_path_events: u64,
+    /// Bounded sample of the sessions that produced them.
+    pub sample_session_ids: std::collections::BTreeSet<String>,
+}
+
+impl ToolEdgePathDiagnostics {
+    pub fn is_empty(&self) -> bool {
+        self.unresolvable_path_events == 0
+    }
+
+    fn record(&mut self, session_id: &str) {
+        self.unresolvable_path_events = self.unresolvable_path_events.saturating_add(1);
+        if self.sample_session_ids.len() < MAX_UNRESOLVABLE_SAMPLES {
+            self.sample_session_ids.insert(session_id.to_string());
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -48,13 +83,17 @@ impl ToolEdgePublishBundle {
     }
 }
 
-/// Filesystem authority already validated by the daemon/indexing boundary.
-/// This lower corpus crate may consume these roots, but it may not discover a
-/// checkout from `ProjectRecord::canonical_path` or probe an alternate
-/// worktree on its own.
+/// Pure project identity plus the filesystem authority the daemon/indexing
+/// boundary already validated (plan section 4.15).
+///
+/// The carrier deliberately holds no `ProjectRecord`: the lease that proved
+/// these roots lives in the upper `bbox-indexing` layer, and putting a
+/// path-bearing record here would give this lower crate a second, unleased
+/// way to name a checkout. `local_root` and `git_root` are ephemeral for the
+/// duration of one pass and are valid only while that lease is alive.
 #[derive(Debug, Clone)]
 pub struct ToolEdgeProjectAccess {
-    pub project: ProjectRecord,
+    pub project_id: String,
     pub local_root: PathBuf,
     pub git_root: Option<PathBuf>,
 }
@@ -71,7 +110,23 @@ impl ToolEdgeContext {
             emit_sidecars,
             pending_edges: std::sync::Mutex::default(),
             base_project_cache: std::sync::Mutex::default(),
+            unresolvable: std::sync::Mutex::default(),
         }
+    }
+
+    /// The bounded unresolvable-path diagnostic accumulated so far.
+    pub fn path_diagnostics(&self) -> ToolEdgePathDiagnostics {
+        self.unresolvable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn record_unresolvable_path(&self, event: &ParsedEvent) {
+        self.unresolvable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record(&event.session_id);
     }
 
     /// Single-project context for backfill use — restricts edge resolution
@@ -97,7 +152,7 @@ impl ToolEdgeContext {
         let resolved = fs::canonicalize(cwd)
             .ok()
             .and_then(|cwd| self.project_for_absolute_path(&cwd))
-            .map(|(access, _)| access.project.project_id.clone());
+            .map(|(access, _)| access.project_id.clone());
         cache.insert(cwd.to_string(), resolved.clone());
         resolved
     }
@@ -184,10 +239,24 @@ impl ToolEdgeContext {
             return Ok(None);
         };
         let Some((access, root, absolute_path)) = self.resolve_project_path(event, raw_path) else {
+            // Never re-identified against another project: an unattributable
+            // path event is counted and dropped (plan section 9).
+            self.record_unresolvable_path(event);
             tracing::debug!(
                 path = raw_path,
                 cwd = event.cwd.as_deref().unwrap_or(""),
                 "skipping tool-call file edge outside registered projects"
+            );
+            return Ok(None);
+        };
+        // The anchor is a project-relative path by contract. `absolute_path`
+        // came from `project_for_absolute_path`, so it is under `root`; the
+        // refusal is the guard against a future caller weakening that.
+        let Some(relative_anchor) = normalized_relative_anchor(&root, &absolute_path) else {
+            self.record_unresolvable_path(event);
+            tracing::debug!(
+                path = %absolute_path.display(),
+                "skipping tool-call edge; path is not relative to its authorized root"
             );
             return Ok(None);
         };
@@ -200,7 +269,7 @@ impl ToolEdgeContext {
         };
         let byte_range = byte_range_for_tool(tool_call, &bytes);
         let Some(target) = project_files::resolve_current_chunk_entity(
-            &access.project,
+            &access.project_id,
             &root,
             &absolute_path,
             byte_range,
@@ -232,10 +301,9 @@ impl ToolEdgeContext {
             metadata: anchor_metadata(
                 event,
                 tool_call,
-                &access.project,
-                &root,
+                &access.project_id,
+                &relative_anchor,
                 access.git_root.as_deref(),
-                &absolute_path,
                 byte_range,
                 &bytes,
             ),
@@ -251,6 +319,7 @@ impl ToolEdgeContext {
         tool_call: &ToolCallInfo,
     ) -> Result<Option<Edge>> {
         let Some((access, _root)) = self.project_for_cwd(event) else {
+            self.record_unresolvable_path(event);
             tracing::debug!(
                 cwd = event.cwd.as_deref().unwrap_or(""),
                 "skipping bash tool edge outside registered projects"
@@ -272,7 +341,7 @@ impl ToolEdgeContext {
             },
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Exact,
-            metadata: bash_metadata(event, tool_call, &access.project, line_offset),
+            metadata: bash_metadata(event, tool_call, &access.project_id, line_offset),
         }))
     }
 
@@ -312,6 +381,7 @@ impl ToolEdgeContext {
         tool_call: &ToolCallInfo,
     ) -> Result<usize> {
         let Some((access, _root)) = self.project_for_cwd(event) else {
+            self.record_unresolvable_path(event);
             tracing::debug!(
                 cwd = event.cwd.as_deref().unwrap_or(""),
                 "skipping bash tool edge outside registered projects"
@@ -333,12 +403,13 @@ impl ToolEdgeContext {
             },
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Exact,
-            metadata: bash_metadata(event, tool_call, &access.project, line_offset),
+            metadata: bash_metadata(event, tool_call, &access.project_id, line_offset),
         };
+        let project_id = access.project_id.clone();
         self.pending_edges
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push((access.project.project_id.clone(), edge));
+            .push((project_id, edge));
         Ok(1)
     }
 
@@ -382,23 +453,36 @@ impl ToolEdgeContext {
     }
 }
 
+/// The project-relative anchor for a path inside an authorized root, with
+/// separators normalized so the emitted edge is stable across hosts.
+///
+/// `None` when the path is not under the root: the edge must then be
+/// skipped, never anchored to an absolute host path.
+fn normalized_relative_anchor(root: &Path, absolute_path: &Path) -> Option<String> {
+    let relative = absolute_path.strip_prefix(root).ok()?;
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    let normalized = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    (!normalized.is_empty()).then_some(normalized)
+}
+
 fn anchor_metadata(
     event: &ParsedEvent,
     tool_call: &ToolCallInfo,
-    project: &ProjectRecord,
-    root: &Path,
+    project_id: &str,
+    relative_anchor: &str,
     git_root: Option<&Path>,
-    absolute_path: &Path,
     byte_range: Option<(u64, u64)>,
     bytes: &[u8],
 ) -> BTreeMap<String, String> {
-    let rel_path = absolute_path.strip_prefix(root).unwrap_or(absolute_path);
     let mut metadata = BTreeMap::new();
-    metadata.insert(
-        "anchor.file_path".to_string(),
-        rel_path.to_string_lossy().to_string(),
-    );
-    metadata.insert("anchor.project_id".to_string(), project.project_id.clone());
+    metadata.insert("anchor.file_path".to_string(), relative_anchor.to_string());
+    metadata.insert("anchor.project_id".to_string(), project_id.to_string());
     if let Some((start, end)) = byte_range {
         metadata.insert("anchor.byte_start".to_string(), start.to_string());
         metadata.insert("anchor.byte_end".to_string(), end.to_string());
@@ -424,11 +508,11 @@ fn anchor_metadata(
 fn bash_metadata(
     event: &ParsedEvent,
     tool_call: &ToolCallInfo,
-    project: &ProjectRecord,
+    project_id: &str,
     line_offset: u64,
 ) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
-    metadata.insert("anchor.project_id".to_string(), project.project_id.clone());
+    metadata.insert("anchor.project_id".to_string(), project_id.to_string());
     metadata.insert(
         "anchor.edit_timestamp".to_string(),
         event
@@ -540,6 +624,7 @@ mod tests {
             emit_sidecars: false,
             pending_edges: Default::default(),
             base_project_cache: Default::default(),
+            unresolvable: Default::default(),
         };
         let event = ParsedEvent {
             role: MessageRole::ToolUse,
@@ -576,23 +661,14 @@ mod tests {
     }
 
     #[test]
-    fn explicit_local_root_works_with_bogus_record_path_and_without_git_metadata() {
+    fn explicit_local_root_resolves_edges_without_a_record_or_git_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let source = root.join("src.rs");
         fs::write(&source, "pub fn visible() {}\n").unwrap();
-        let project = ProjectRecord {
-            project_id: "project-1".into(),
-            repo_id: None,
-            canonical_path: "/unavailable/not-authority".into(),
-            registered_at: "2026-01-01T00:00:00Z".into(),
-            is_git_repo: true,
-            languages: Default::default(),
-            aliases: Default::default(),
-        };
         let ctx = ToolEdgeContext::with_project_access(
             vec![ToolEdgeProjectAccess {
-                project,
+                project_id: "project-1".into(),
                 local_root: root.clone(),
                 git_root: None,
             }],
@@ -633,5 +709,142 @@ mod tests {
         assert!(!publication.is_empty());
         publication.publish().unwrap();
         assert!(observed.exists());
+        assert!(
+            ctx.path_diagnostics().is_empty(),
+            "an attributable path event is not a diagnostic"
+        );
+    }
+
+    fn read_event(session_id: &str, cwd: &Path, file_path: &Path) -> ParsedEvent {
+        ParsedEvent {
+            role: MessageRole::ToolUse,
+            content: String::new(),
+            session_id: session_id.into(),
+            timestamp: None,
+            git_branch: None,
+            is_subagent: false,
+            agent_slug: None,
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            tool_call: Some(ToolCallInfo {
+                kind: ToolCallKind::Read,
+                name: "Read".into(),
+                tool_use_id: None,
+                input: json!({ "file_path": file_path }),
+            }),
+        }
+    }
+
+    /// A remote-only project contributes no local root, so its transcript
+    /// path events are unattributable. They must be counted and dropped, and
+    /// in particular must NOT be re-identified against the one project that
+    /// does have a root in this pass.
+    #[test]
+    fn unresolved_path_events_are_diagnosed_and_never_reidentified() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let attached = root.join("attached");
+        let remote = root.join("remote");
+        fs::create_dir_all(&attached).unwrap();
+        fs::create_dir_all(&remote).unwrap();
+        let remote_source = remote.join("src.rs");
+        fs::write(&remote_source, "pub fn elsewhere() {}\n").unwrap();
+
+        let ctx = ToolEdgeContext::with_project_access(
+            vec![ToolEdgeProjectAccess {
+                project_id: "attached-project".into(),
+                local_root: attached.clone(),
+                git_root: None,
+            }],
+            root.join("edges"),
+            true,
+        );
+        let event = read_event("sess-remote", &remote, &remote_source);
+
+        assert!(
+            ctx.build_event_edges(&event, "claude", 10, 0)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(ctx.emit_event_edges(&event, "claude", 10, 0).unwrap(), 0);
+        assert!(
+            ctx.take_publish_bundle().is_empty(),
+            "an unattributable path event must not be re-identified onto the attached project"
+        );
+
+        let diagnostics = ctx.path_diagnostics();
+        assert!(!diagnostics.is_empty());
+        assert_eq!(diagnostics.unresolvable_path_events, 2);
+        assert_eq!(
+            diagnostics.sample_session_ids,
+            std::collections::BTreeSet::from(["sess-remote".to_string()])
+        );
+    }
+
+    /// The diagnostic must stay bounded no matter how large the corpus is:
+    /// the count keeps rising, the sample set does not.
+    #[test]
+    fn unresolvable_path_diagnostic_sample_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let source = outside.join("src.rs");
+        fs::write(&source, "pub fn elsewhere() {}\n").unwrap();
+        let ctx = ToolEdgeContext::with_project_access(Vec::new(), root.join("edges"), true);
+
+        for index in 0..(MAX_UNRESOLVABLE_SAMPLES * 3) {
+            let event = read_event(&format!("sess-{index}"), &outside, &source);
+            assert_eq!(ctx.emit_event_edges(&event, "claude", 10, 0).unwrap(), 0);
+        }
+
+        let diagnostics = ctx.path_diagnostics();
+        assert_eq!(
+            diagnostics.unresolvable_path_events,
+            (MAX_UNRESOLVABLE_SAMPLES * 3) as u64
+        );
+        assert_eq!(
+            diagnostics.sample_session_ids.len(),
+            MAX_UNRESOLVABLE_SAMPLES
+        );
+    }
+
+    #[test]
+    fn anchor_file_path_is_the_normalized_project_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let nested = root.join("crates").join("inner");
+        fs::create_dir_all(&nested).unwrap();
+        let source = nested.join("src.rs");
+        fs::write(&source, "pub fn nested() {}\n").unwrap();
+        let ctx = ToolEdgeContext::with_project_access(
+            vec![ToolEdgeProjectAccess {
+                project_id: "project-1".into(),
+                local_root: root.clone(),
+                git_root: None,
+            }],
+            root.join("edges"),
+            true,
+        );
+
+        let edge = ctx
+            .build_event_edges(&read_event("sess-1", &root, &source), "claude", 10, 0)
+            .unwrap()
+            .expect("nested file resolves under the authorized root");
+        assert_eq!(edge.metadata["anchor.file_path"], "crates/inner/src.rs");
+        assert_eq!(edge.metadata["anchor.project_id"], "project-1");
+    }
+
+    #[test]
+    fn normalized_relative_anchor_refuses_paths_outside_the_root() {
+        let root = Path::new("/authorized/root");
+        assert_eq!(
+            normalized_relative_anchor(root, Path::new("/authorized/root/a/b.rs")),
+            Some("a/b.rs".to_string())
+        );
+        assert_eq!(normalized_relative_anchor(root, root), None);
+        assert_eq!(
+            normalized_relative_anchor(root, Path::new("/elsewhere/b.rs")),
+            None
+        );
     }
 }

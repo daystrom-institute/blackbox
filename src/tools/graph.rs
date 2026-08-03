@@ -1208,7 +1208,7 @@ impl BlackboxServer {
                  byte_range: Option<(u64, u64)>| {
                     let project = unique_project(&projects, project_id)?;
                     bbox_indexing::index::resolve_current_project_chunk_entity(
-                        &project,
+                        &project.project_id,
                         root,
                         absolute_path,
                         byte_range,

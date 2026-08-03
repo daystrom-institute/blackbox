@@ -1755,13 +1755,13 @@ impl TranscriptIndex {
             project_access
                 .iter()
                 .filter_map(|access| {
-                    // A local root implies an attached compatibility record;
-                    // tool edges are a checkout-bound lane and have nothing
-                    // to attribute for a detached project.
-                    let project = access.project?;
+                    // Tool edges are a checkout-bound lane: a detached or
+                    // remote-only project has no local root and nothing to
+                    // attribute. Identity comes from the source-neutral
+                    // `identity` field, never from a compatibility record.
                     let local_root = access.local_root?;
                     Some(crate::index::tool_edges::ToolEdgeProjectAccess {
-                        project: project.clone(),
+                        project_id: access.project_id().to_string(),
                         local_root: local_root.to_path_buf(),
                         git_root: access.git_root.map(Path::to_path_buf),
                     })

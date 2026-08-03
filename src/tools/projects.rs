@@ -483,7 +483,7 @@ impl BlackboxServer {
                             );
                         }
                         bbox_indexing::index::resolve_current_project_chunk_entity(
-                            &record,
+                            &record.project_id,
                             root,
                             absolute_path,
                             byte_range,
@@ -563,7 +563,7 @@ impl BlackboxServer {
                             .transpose()?;
                         index::backfill_tool_edges_for_project(
                             &reindex_cfg,
-                            &project_for_backfill,
+                            &project_for_backfill.project_id,
                             local.project_root(),
                             git.as_ref().map(|lease| lease.checkout_root()),
                             || {

@@ -2131,10 +2131,10 @@ pub use search::{
 };
 
 pub fn resolve_current_project_chunk_entity(
-    project: &bbox_corpus_core::project_record::ProjectRecord,
+    project_id: &str,
     root: &Path,
     absolute_path: &Path,
     byte_range: Option<(u64, u64)>,
 ) -> Result<Option<bbox_corpus_core::entity_ref::EntityRef>> {
-    project_files::resolve_current_chunk_entity(project, root, absolute_path, byte_range)
+    project_files::resolve_current_chunk_entity(project_id, root, absolute_path, byte_range)
 }

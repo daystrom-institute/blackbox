@@ -1834,8 +1834,15 @@ pub fn build_project_file_doc_for_source(
     doc
 }
 
+/// Resolve one absolute path inside an already-validated root to the entity
+/// ref of the chunk currently covering `byte_range`.
+///
+/// Identity is the durable project id alone (plan section 4.15): the
+/// resolution needs no path-bearing record, and taking one would let a
+/// caller's stale `canonical_path` reach a lower crate that must never
+/// discover a checkout for itself.
 pub fn resolve_current_chunk_entity(
-    project: &ProjectRecord,
+    project_id: &str,
     root: &Path,
     absolute_path: &Path,
     byte_range: Option<(u64, u64)>,
@@ -1857,7 +1864,7 @@ pub fn resolve_current_chunk_entity(
         return Ok(None);
     };
     let (chunks, _edges) = format.chunk(absolute_path, &bytes)?;
-    let chunks = bound_chunks(&finalize_chunks(&project.project_id, relative_path, chunks));
+    let chunks = bound_chunks(&finalize_chunks(project_id, relative_path, chunks));
     let selected = byte_range
         .and_then(|(start, _end)| {
             chunks
