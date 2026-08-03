@@ -141,7 +141,7 @@ impl BlackboxServer {
                         // for lacking an unrelated capability; the catalog row
                         // already carries the scope.
                         let broker = &server.state.checkout_access;
-                        let lease = crate::tools::graph::acquire_catalog_project_lease(
+                        let lease = crate::server::checkout_access::acquire_catalog_project_lease(
                             &server,
                             broker,
                             &project_id,

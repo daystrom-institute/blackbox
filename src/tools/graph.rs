@@ -3,14 +3,8 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
 use bbox_corpus_core::identity::PublishedScope;
-use bbox_corpus_core::project_catalog::{
-    AttachmentKind, AttachmentStatus, ProjectId, ProjectScope,
-};
+use bbox_corpus_core::project_catalog::AttachmentStatus;
 use bbox_corpus_core::project_record::{ProjectRecord, ResolvedCheckoutScope};
-use bbox_corpus_core::project_selector::{
-    ProjectSelectorRequest, ResolveIntent, ResolvedAttachment, ResolvedProjectIdentity,
-    SelectorClass, SessionCheckoutRef,
-};
 use bbox_indexing::checkout_access::{
     CheckoutAccessBroker, CheckoutAccessError, CheckoutAccessIntent, CheckoutAccessKind,
     CheckoutAccessRequest, CheckoutAccessSourceLane, CheckoutAttachmentSelector,
@@ -82,123 +76,6 @@ fn checkout_access_error(error: CheckoutAccessError) -> anyhow::Error {
     )
 }
 
-/// One selected attachment plus the scope its project already records.
-///
-/// Catalog scope comes from the catalog project row, so no preliminary
-/// `PublisherConfigTreeRead` lease is needed to discover it. That matters
-/// beyond cost: `PublisherConfigTreeRead` rides `repo_knowledge` (D-032), so
-/// discovering scope through it would gate blame, render, and provenance on
-/// a capability the section 9 table does not assign them.
-struct CatalogAttachmentTarget {
-    attachment_id: String,
-    expected_scope: Option<PublishedScope>,
-}
-
-fn catalog_project_scope(project: &ResolvedProjectIdentity) -> Option<PublishedScope> {
-    match project {
-        ResolvedProjectIdentity::Catalog { project } => match &project.scope {
-            ProjectScope::Published(scope) => Some(scope.clone()),
-            ProjectScope::LegacyLocal => None,
-        },
-        ResolvedProjectIdentity::V1Compat { .. } => None,
-    }
-}
-
-/// The unique active `Base` attachment, or `None` when the project has none
-/// or more than one.
-fn unique_active_base_attachment(
-    server: &BlackboxServer,
-    project_id: &str,
-) -> Option<CatalogAttachmentTarget> {
-    let store = server.state.project_authority.catalog_store()?;
-    let state = store.snapshot().ok()?;
-    let parsed = ProjectId::parse(project_id).ok()?;
-    let project = state.catalog().projects.get(&parsed)?;
-    let mut bases = state.attachments().attachments.values().filter(|row| {
-        row.status == AttachmentStatus::Attached
-            && row.project_id == parsed
-            && row.kind == AttachmentKind::Base
-    });
-    let base = bases.next()?;
-    if bases.next().is_some() {
-        return None;
-    }
-    Some(CatalogAttachmentTarget {
-        attachment_id: base.attachment_id.as_str().to_string(),
-        expected_scope: match &project.scope {
-            ProjectScope::Published(scope) => Some(scope.clone()),
-            ProjectScope::LegacyLocal => None,
-        },
-    })
-}
-
-/// Select one catalog attachment for an operation named by project identity.
-///
-/// The shared resolver owns the ladder: explicit attachment, session
-/// checkout, operator-selected default, single active attachment. D-033
-/// item 3 fixes the unique active `Base` attachment as the final rung and
-/// the resolver does not implement it, so it is applied here and ONLY where
-/// the resolver reported ambiguity. Applying it earlier would redirect a
-/// project whose default or sole attachment already resolved.
-fn catalog_attachment_target(
-    server: &BlackboxServer,
-    project_id: &str,
-) -> Result<CatalogAttachmentTarget> {
-    let session = server.authoritative_session_checkout();
-    let request = ProjectSelectorRequest {
-        selector: Some(project_id.to_owned()),
-        session: session.as_deref().map(|checkout| SessionCheckoutRef {
-            checkout_id: Some(checkout.checkout_id.clone()),
-            checkout_project_dir: None,
-        }),
-        intent: ResolveIntent::Read,
-        class: SelectorClass::Selection,
-        ..Default::default()
-    };
-    let resolved = server.with_project_resolver(|engine| engine.resolve_attached(&request))?;
-    let resolved = match resolved {
-        Ok(resolved) => resolved,
-        Err(error) if error.code() == "error.project_attachment_ambiguous" => {
-            return unique_active_base_attachment(server, project_id)
-                .ok_or_else(|| anyhow::Error::new(error));
-        }
-        Err(error) => return Err(anyhow::Error::new(error)),
-    };
-    let ResolvedAttachment::Catalog { attachment_id, .. } = &resolved.attachment else {
-        bail!("error.project_attachment_required: {project_id}");
-    };
-    Ok(CatalogAttachmentTarget {
-        attachment_id: attachment_id.clone(),
-        expected_scope: catalog_project_scope(&resolved.project),
-    })
-}
-
-/// Acquire one lease by catalog attachment for an operation named by project
-/// identity alone.
-///
-/// Catalog mode only. The bridge keeps its scope-discovery two-step in
-/// `crate::server::checkout_access`, whose refusal strings other bridge
-/// callers already depend on.
-pub(super) fn acquire_catalog_project_lease(
-    server: &BlackboxServer,
-    broker: &CheckoutAccessBroker,
-    project_id: &str,
-    kind: CheckoutAccessKind,
-    intent: CheckoutAccessIntent,
-) -> Result<ValidatedCheckoutLease> {
-    let target = catalog_attachment_target(server, project_id)?;
-    broker
-        .acquire(CheckoutAccessRequest {
-            project_id: project_id.to_string(),
-            attachment: CheckoutAttachmentSelector::AttachmentId(target.attachment_id),
-            expected_scope: target.expected_scope,
-            kind,
-            intent,
-            source_lane: CheckoutAccessSourceLane::NativeAttachment,
-        })
-        .map_err(checkout_access_error)
-}
-
 /// Acquire one lease for an operation named by project identity alone.
 ///
 /// The bridge arm keeps the legacy two-step exactly: version-1 records carry
@@ -213,7 +90,9 @@ fn acquire_selected_operation(
     intent: CheckoutAccessIntent,
 ) -> Result<ValidatedCheckoutLease> {
     if !server.state.project_authority.is_bridge() {
-        return acquire_catalog_project_lease(server, broker, project_id, kind, intent);
+        return crate::server::checkout_access::acquire_catalog_project_lease(
+            server, broker, project_id, kind, intent,
+        );
     }
     let discovery = acquire_scope_discovery(broker, project_id)?;
     let expected_scope = discovery.published_scope().cloned();
@@ -544,7 +423,7 @@ fn catalog_file_selection(
         Some(session) => session.project_id.clone(),
         None => sole_attached_catalog_project(server)?,
     };
-    let target = catalog_attachment_target(server, &project_id)?;
+    let target = crate::server::checkout_access::catalog_attachment_target(server, &project_id)?;
     Ok(CheckoutFileSelection {
         project_id,
         attachment: CheckoutAttachmentSelector::AttachmentId(target.attachment_id),
@@ -2276,6 +2155,10 @@ mod catalog_adapter_tests {
         fixture.attach(blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one"));
         let server = fixture.server();
 
+        // The fixture grants `blame` and NOTHING else: no `repo_knowledge`.
+        // Succeeding here is half the capability contract, and
+        // `blame_is_denied_on_its_own_capability_not_repo_knowledge` is the
+        // other half.
         let lease = acquire_blame(&server, PROJECT_ONE).unwrap();
 
         assert_eq!(lease.attachment_id(), ATTACHMENT_ONE);

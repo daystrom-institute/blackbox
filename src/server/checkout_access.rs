@@ -3,18 +3,37 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use bbox_artifacts::watcher::{
     ArtifactWatchAccess, ArtifactWatchAttachment, ArtifactWatchCarrier, ArtifactWatchRead,
 };
 use bbox_corpus_core::identity::PublishedScope;
+use bbox_corpus_core::project_catalog::{
+    AttachmentKind, AttachmentStatus, ProjectId, ProjectScope,
+};
 use bbox_corpus_core::project_record::ResolvedCheckoutScope;
+use bbox_corpus_core::project_selector::{
+    ProjectSelectorRequest, ResolveIntent, ResolvedAttachment, ResolvedProjectIdentity,
+    SelectorClass, SessionCheckoutRef,
+};
 use bbox_indexing::checkout_access::{
-    CheckoutAccessBroker, CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest,
-    CheckoutAccessSourceLane, CheckoutAttachmentSelector, ValidatedCheckoutLease,
+    CheckoutAccessBroker, CheckoutAccessError, CheckoutAccessIntent, CheckoutAccessKind,
+    CheckoutAccessRequest, CheckoutAccessSourceLane, CheckoutAttachmentSelector,
+    ValidatedCheckoutLease,
 };
 
 use super::SharedState;
+use crate::server::BlackboxServer;
+
+/// The catalog lease refusals adapters surface, in the code-prefixed shape
+/// the tool boundary renders through `err_text` (plan section 4.18).
+fn checkout_access_error(error: CheckoutAccessError) -> anyhow::Error {
+    anyhow!(
+        "error.checkout_access.{}: {}",
+        error.code.as_str(),
+        error.diagnostic
+    )
+}
 
 /// Return the daemon-owned broker over the shared version-1 registries and
 /// observation store. Reindex and staging must use this same handle so their
@@ -142,6 +161,134 @@ pub(crate) fn acquire_selected_project_access(
             source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
         })
         .map_err(anyhow::Error::new)
+}
+
+/// One selected attachment plus the scope its project already records.
+///
+/// Catalog scope comes from the catalog project row, so no preliminary
+/// `PublisherConfigTreeRead` lease is needed to discover it. That matters
+/// beyond cost: `PublisherConfigTreeRead` rides `repo_knowledge` (D-032), so
+/// discovering scope through it would gate blame, render, and provenance on
+/// a capability the section 9 table does not assign them.
+pub(crate) struct CatalogAttachmentTarget {
+    pub(crate) attachment_id: String,
+    pub(crate) expected_scope: Option<PublishedScope>,
+}
+
+fn catalog_project_scope(project: &ResolvedProjectIdentity) -> Option<PublishedScope> {
+    match project {
+        ResolvedProjectIdentity::Catalog { project } => match &project.scope {
+            ProjectScope::Published(scope) => Some(scope.clone()),
+            ProjectScope::LegacyLocal => None,
+        },
+        ResolvedProjectIdentity::V1Compat { .. } => None,
+    }
+}
+
+/// The unique active `Base` attachment, or `None` when the project has none
+/// or more than one.
+fn unique_active_base_attachment(
+    server: &BlackboxServer,
+    project_id: &str,
+) -> Option<CatalogAttachmentTarget> {
+    let store = server.state.project_authority.catalog_store()?;
+    let state = store.snapshot().ok()?;
+    let parsed = ProjectId::parse(project_id).ok()?;
+    let project = state.catalog().projects.get(&parsed)?;
+    let mut bases = state.attachments().attachments.values().filter(|row| {
+        row.status == AttachmentStatus::Attached
+            && row.project_id == parsed
+            && row.kind == AttachmentKind::Base
+    });
+    let base = bases.next()?;
+    if bases.next().is_some() {
+        return None;
+    }
+    Some(CatalogAttachmentTarget {
+        attachment_id: base.attachment_id.as_str().to_string(),
+        expected_scope: match &project.scope {
+            ProjectScope::Published(scope) => Some(scope.clone()),
+            ProjectScope::LegacyLocal => None,
+        },
+    })
+}
+
+/// Select one catalog attachment for an operation named by project identity.
+///
+/// The shared resolver owns the ladder: explicit attachment, session
+/// checkout, operator-selected default, single active attachment. D-033
+/// item 3 fixes the unique active `Base` attachment as the final rung and
+/// the resolver does not implement it, so it is applied here and ONLY where
+/// the resolver reported ambiguity. Applying it earlier would redirect a
+/// project whose default or sole attachment already resolved.
+pub(crate) fn catalog_attachment_target(
+    server: &BlackboxServer,
+    project_id: &str,
+) -> Result<CatalogAttachmentTarget> {
+    let session = server.authoritative_session_checkout();
+    let request = ProjectSelectorRequest {
+        selector: Some(project_id.to_owned()),
+        session: session.as_deref().map(|checkout| SessionCheckoutRef {
+            checkout_id: Some(checkout.checkout_id.clone()),
+            checkout_project_dir: None,
+        }),
+        intent: ResolveIntent::Read,
+        class: SelectorClass::Selection,
+        ..Default::default()
+    };
+    let resolved = server.with_project_resolver(|engine| engine.resolve_attached(&request))?;
+    let resolved = match resolved {
+        Ok(resolved) => resolved,
+        Err(error) if error.code() == "error.project_attachment_ambiguous" => {
+            return unique_active_base_attachment(server, project_id)
+                .ok_or_else(|| anyhow::Error::new(error));
+        }
+        Err(error) => return Err(anyhow::Error::new(error)),
+    };
+    let ResolvedAttachment::Catalog { attachment_id, .. } = &resolved.attachment else {
+        bail!("error.project_attachment_required: {project_id}");
+    };
+    Ok(CatalogAttachmentTarget {
+        attachment_id: attachment_id.clone(),
+        expected_scope: catalog_project_scope(&resolved.project),
+    })
+}
+
+/// Acquire one lease by catalog attachment for an operation named by project
+/// identity alone.
+///
+/// CATALOG MODE ONLY, and deliberately not a variant of
+/// [`acquire_selected_project_access`]. The bridge helper above must first
+/// take a `PublisherConfigTreeRead` lease purely to discover the published
+/// scope, because a version-1 record carries none. Reusing that shape here
+/// would be a capability defect, not just wasted work: `PublisherConfigTreeRead`
+/// rides `repo_knowledge` (D-032), so every catalog blame, render, provenance
+/// and file read would be gated on a capability the Phase 5 section 9 table
+/// does not assign it, and a render-capable attachment lacking `repo_knowledge`
+/// would be denied for the wrong reason. Each adapter must gate on its own
+/// capability bit alone. The catalog attachment already carries
+/// `validated_scope`, so the preliminary lease buys nothing anyway.
+///
+/// The bridge helpers keep their two-step and their refusal strings verbatim;
+/// other bridge callers depend on both.
+pub(crate) fn acquire_catalog_project_lease(
+    server: &BlackboxServer,
+    broker: &CheckoutAccessBroker,
+    project_id: &str,
+    kind: CheckoutAccessKind,
+    intent: CheckoutAccessIntent,
+) -> Result<ValidatedCheckoutLease> {
+    let target = catalog_attachment_target(server, project_id)?;
+    broker
+        .acquire(CheckoutAccessRequest {
+            project_id: project_id.to_string(),
+            attachment: CheckoutAttachmentSelector::AttachmentId(target.attachment_id),
+            expected_scope: target.expected_scope,
+            kind,
+            intent,
+            source_lane: CheckoutAccessSourceLane::NativeAttachment,
+        })
+        .map_err(checkout_access_error)
 }
 
 /// Run an exact checkout operation from the registry snapshot already held by
