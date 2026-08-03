@@ -375,7 +375,6 @@ impl KnowledgeRepoWrite for ConfinedKnowledgeRepoIo {
 mod tests {
     use std::collections::BTreeSet;
 
-    use bbox_corpus_core::identity::PublishedScope;
     use bbox_indexing::checkout_access::{
         CheckoutAccessAuthority, CheckoutAccessCandidate, CheckoutAccessError,
         CheckoutAccessObservations, CheckoutAttachmentStatus,
@@ -440,6 +439,16 @@ mod tests {
                 project_id: "project-1".into(),
                 checkout_id: "checkout-1".into(),
             },
+            RepoCarrierTarget::Attachment {
+                project_id: "project-1".into(),
+                attachment_id: "att_00000000000000000000000000000a01".into(),
+                expected_scope: None,
+            },
+            RepoCarrierTarget::Attachment {
+                project_id: "project-1".into(),
+                attachment_id: "att_00000000000000000000000000000a01".into(),
+                expected_scope: Some(PublishedScope::try_new("repo-1", ".").unwrap()),
+            },
         ];
         for target in targets {
             let encoded = encode_target(&target).unwrap();
@@ -493,6 +502,185 @@ mod tests {
             std::fs::read(project.join("written.txt")).unwrap(),
             b"written"
         );
+    }
+
+    /// Records every request the adapter makes so lease SHAPE, not just the
+    /// resolved root, is assertable.
+    #[derive(Clone)]
+    struct RecordingAuthority {
+        candidate: CheckoutAccessCandidate,
+        requests: Arc<std::sync::Mutex<Vec<CheckoutAccessRequest>>>,
+    }
+
+    impl CheckoutAccessAuthority for RecordingAuthority {
+        fn resolve(
+            &self,
+            request: &CheckoutAccessRequest,
+        ) -> std::result::Result<CheckoutAccessCandidate, CheckoutAccessError> {
+            self.requests.lock().unwrap().push(request.clone());
+            Ok(self.candidate.clone())
+        }
+
+        fn revalidate_conservative_path_gate(
+            &self,
+            _request: &CheckoutAccessRequest,
+            _candidate: &CheckoutAccessCandidate,
+        ) -> std::result::Result<(), CheckoutAccessError> {
+            Ok(())
+        }
+    }
+
+    fn recording_authority(
+        root: &Path,
+    ) -> (
+        RepoIoAuthority,
+        Arc<std::sync::Mutex<Vec<CheckoutAccessRequest>>>,
+    ) {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let scope = PublishedScope::try_new("repo-1", ".").unwrap();
+        let authority = RecordingAuthority {
+            candidate: CheckoutAccessCandidate {
+                project_id: "project-1".into(),
+                attachment_id: "att_00000000000000000000000000000a01".into(),
+                checkout_id: "checkout-1".into(),
+                published_scope: Some(scope),
+                branch_ref: Some("refs/heads/main".into()),
+                checkout_root: root.to_path_buf(),
+                project_root: root.join("project"),
+                status: CheckoutAttachmentStatus::Active,
+                capabilities: BTreeSet::from([
+                    CheckoutAccessKind::PublisherConfigTreeRead,
+                    CheckoutAccessKind::KnowledgeGapOverlayRead,
+                    CheckoutAccessKind::RepositoryMutation,
+                ]),
+                lifetime_guard: None,
+            },
+            requests: requests.clone(),
+        };
+        (
+            RepoIoAuthority::new(Arc::new(CheckoutAccessBroker::new(
+                Arc::new(authority),
+                CheckoutAccessObservations::in_memory(),
+            ))),
+            requests,
+        )
+    }
+
+    /// A native attachment carrier takes exactly ONE lease, on the read kind
+    /// the operation needs, over the native source lane. The absent
+    /// PublisherConfigTreeRead request is the point: a repo-knowledge-only
+    /// discovery step would have gated the read on a capability the section 9
+    /// table does not assign to it.
+    #[test]
+    fn attachment_carrier_takes_one_native_lease_with_no_scope_discovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let project = root.join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("entry.json"), b"{}").unwrap();
+        let (authority, requests) = recording_authority(&root);
+        let scope = PublishedScope::try_new("repo-1", ".").unwrap();
+        let carrier = RepoIoAuthority::knowledge_attachment_carrier(
+            "display-only",
+            "project-1",
+            "att_00000000000000000000000000000a01",
+            Some(scope.clone()),
+        )
+        .unwrap();
+
+        let mut observed = None;
+        let mut read = |resolved: &Path| {
+            observed = Some(resolved.to_path_buf());
+            Ok(())
+        };
+        KnowledgeRepoRead::with_read(&authority, &carrier, &mut read).unwrap();
+
+        assert_eq!(observed.as_deref(), Some(project.as_path()));
+        let requests = requests.lock().unwrap();
+        // Acquisition plus the closing revalidation, and nothing else: no
+        // scope-discovery step precedes them.
+        assert!(
+            requests.iter().all(|request| {
+                request.kind == CheckoutAccessKind::KnowledgeGapOverlayRead
+                    && request.intent == CheckoutAccessIntent::Read
+                    && request.attachment
+                        == CheckoutAttachmentSelector::AttachmentId(
+                            "att_00000000000000000000000000000a01".into(),
+                        )
+                    && request.source_lane == CheckoutAccessSourceLane::NativeAttachment
+                    && request.expected_scope == Some(scope.clone())
+            }),
+            "{requests:#?}"
+        );
+    }
+
+    /// The legacy targets keep their scope-discovery step exactly: version-1
+    /// records carry no scope, so removing it there would change bridge
+    /// behavior rather than sharpen it.
+    #[test]
+    fn legacy_carriers_keep_the_scope_discovery_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("project")).unwrap();
+        let (authority, requests) = recording_authority(&root);
+        let carrier = KnowledgeRepoCarrier::new(
+            "project",
+            encode_target(&RepoCarrierTarget::Selected {
+                project_id: "project-1".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut read = |_resolved: &Path| Ok(());
+        KnowledgeRepoRead::with_read(&authority, &carrier, &mut read).unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests[0].kind,
+            CheckoutAccessKind::PublisherConfigTreeRead,
+            "{requests:#?}"
+        );
+        assert_eq!(requests[0].attachment, CheckoutAttachmentSelector::Selected);
+        assert!(
+            requests[1..]
+                .iter()
+                .all(|request| request.kind == CheckoutAccessKind::KnowledgeGapOverlayRead),
+            "{requests:#?}"
+        );
+    }
+
+    /// The carrier's display value is stamped onto loaded entries and is not
+    /// authority: a stale or outright wrong display path still resolves to
+    /// the tree the lease opened, and the encoded id carries no path at all.
+    #[test]
+    fn carrier_display_path_is_not_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let project = root.join("project");
+        std::fs::create_dir(&project).unwrap();
+        let (authority, _) = recording_authority(&root);
+        let carrier = RepoIoAuthority::gap_attachment_carrier(
+            "/nonexistent/stale/path",
+            "project-1",
+            "att_00000000000000000000000000000a01",
+            Some(PublishedScope::try_new("repo-1", ".").unwrap()),
+        )
+        .unwrap();
+        assert!(
+            !carrier.carrier_id.contains("nonexistent"),
+            "carrier ids stay path-free: {}",
+            carrier.carrier_id
+        );
+
+        let mut observed = None;
+        let mut read = |resolved: &Path| {
+            observed = Some(resolved.to_path_buf());
+            Ok(())
+        };
+        GapRepoRead::with_read(&authority, &carrier, &mut read).unwrap();
+
+        assert_eq!(observed.as_deref(), Some(project.as_path()));
     }
 
     #[test]

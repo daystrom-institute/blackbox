@@ -629,3 +629,76 @@ mod tests {
         }
     }
 }
+
+/// Catalog-mode render tests (plan section 13.5).
+#[cfg(test)]
+mod catalog_render_tests {
+    use super::*;
+    use crate::server::state::catalog_fixture::CatalogFixture;
+    use rmcp::handler::server::wrapper::Parameters;
+
+    const PROJECT: &str = "p_000000000000000000000000000000a1";
+
+    fn is_error(result: &rmcp::model::CallToolResult) -> bool {
+        result.is_error == Some(true)
+    }
+
+    /// Global render is attachment-free: it writes host-level provider files,
+    /// not repository ones. The fixture server installs `DenyCheckoutAccess`,
+    /// so any lease this path took would fail the call outright, and the
+    /// observation counters would record the attempt.
+    #[tokio::test]
+    async fn global_render_takes_no_checkout_lease() {
+        let fixture = CatalogFixture::new();
+        fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
+        let server = fixture.server();
+
+        let result = server
+            .bbox_render(Parameters(RenderParams {
+                scope: Some("global".into()),
+                ..Default::default()
+            }))
+            .await;
+
+        assert!(!is_error(&result), "{result:?}");
+        let attempted: u64 = server
+            .state
+            .checkout_access
+            .health()
+            .operations
+            .into_iter()
+            .map(|operation| operation.granted + operation.denied)
+            .sum();
+        assert_eq!(attempted, 0, "global render acquired checkout authority");
+    }
+
+    /// A project render against a catalog project with no attachment reports
+    /// the attachment requirement rather than reaching a checkout. The
+    /// refusal is the resolver's, so no record path lookup stands between the
+    /// caller and the answer.
+    #[tokio::test]
+    async fn remote_only_project_render_refuses_without_reaching_a_checkout() {
+        let fixture = CatalogFixture::new();
+        fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
+        let server = fixture.server();
+
+        let result = server
+            .bbox_render(Parameters(RenderParams {
+                project: Some(PROJECT.into()),
+                scope: Some("project".into()),
+                ..Default::default()
+            }))
+            .await;
+
+        assert!(is_error(&result), "{result:?}");
+        let granted: u64 = server
+            .state
+            .checkout_access
+            .health()
+            .operations
+            .into_iter()
+            .map(|operation| operation.granted)
+            .sum();
+        assert_eq!(granted, 0, "a refused render must open no checkout");
+    }
+}
