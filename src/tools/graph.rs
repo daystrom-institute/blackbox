@@ -3,7 +3,14 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
 use bbox_corpus_core::identity::PublishedScope;
+use bbox_corpus_core::project_catalog::{
+    AttachmentKind, AttachmentStatus, ProjectId, ProjectScope,
+};
 use bbox_corpus_core::project_record::{ProjectRecord, ResolvedCheckoutScope};
+use bbox_corpus_core::project_selector::{
+    ProjectSelectorRequest, ResolveIntent, ResolvedAttachment, ResolvedProjectIdentity,
+    SelectorClass, SessionCheckoutRef,
+};
 use bbox_indexing::checkout_access::{
     CheckoutAccessBroker, CheckoutAccessError, CheckoutAccessIntent, CheckoutAccessKind,
     CheckoutAccessRequest, CheckoutAccessSourceLane, CheckoutAttachmentSelector,
@@ -33,13 +40,31 @@ use serde_json::json;
 
 const REF_SIZE_CAP: usize = 500;
 
+/// One resolved checkout-file target. The carrier holds logical identity
+/// only: a project id, an attachment selector, and the project-relative path
+/// (or the instruction to derive it from the acquired lease). No
+/// `ProjectRecord` and no host root participate, so nothing downstream can
+/// re-derive authority from a path (plan section 6.9).
 #[derive(Debug, Clone)]
 struct CheckoutFileSelection {
-    project: ProjectRecord,
+    project_id: String,
     attachment: CheckoutAttachmentSelector,
     expected_scope: Option<PublishedScope>,
     source_lane: CheckoutAccessSourceLane,
-    relative_path: PathBuf,
+    relative_path: FileRelativePath,
+}
+
+/// How a selection's project-relative path is determined.
+#[derive(Debug, Clone)]
+enum FileRelativePath {
+    /// Known before acquisition: an explicit relative input, or a bridge
+    /// candidate already matched against a registered root.
+    Fixed(PathBuf),
+    /// Stripped from the acquired lease's own project root. Catalog absolute
+    /// selection resolves the attachment through the catalog's active
+    /// attachments and strips that lease root, never a
+    /// `ProjectRecord::canonical_path` (plan section 8, P5-E file item 6).
+    UnderLeaseRoot(PathBuf),
 }
 
 #[derive(Debug)]
@@ -57,12 +82,139 @@ fn checkout_access_error(error: CheckoutAccessError) -> anyhow::Error {
     )
 }
 
-fn acquire_selected_operation(
+/// One selected attachment plus the scope its project already records.
+///
+/// Catalog scope comes from the catalog project row, so no preliminary
+/// `PublisherConfigTreeRead` lease is needed to discover it. That matters
+/// beyond cost: `PublisherConfigTreeRead` rides `repo_knowledge` (D-032), so
+/// discovering scope through it would gate blame, render, and provenance on
+/// a capability the section 9 table does not assign them.
+struct CatalogAttachmentTarget {
+    attachment_id: String,
+    expected_scope: Option<PublishedScope>,
+}
+
+fn catalog_project_scope(project: &ResolvedProjectIdentity) -> Option<PublishedScope> {
+    match project {
+        ResolvedProjectIdentity::Catalog { project } => match &project.scope {
+            ProjectScope::Published(scope) => Some(scope.clone()),
+            ProjectScope::LegacyLocal => None,
+        },
+        ResolvedProjectIdentity::V1Compat { .. } => None,
+    }
+}
+
+/// The unique active `Base` attachment, or `None` when the project has none
+/// or more than one.
+fn unique_active_base_attachment(
+    server: &BlackboxServer,
+    project_id: &str,
+) -> Option<CatalogAttachmentTarget> {
+    let store = server.state.project_authority.catalog_store()?;
+    let state = store.snapshot().ok()?;
+    let parsed = ProjectId::parse(project_id).ok()?;
+    let project = state.catalog().projects.get(&parsed)?;
+    let mut bases = state.attachments().attachments.values().filter(|row| {
+        row.status == AttachmentStatus::Attached
+            && row.project_id == parsed
+            && row.kind == AttachmentKind::Base
+    });
+    let base = bases.next()?;
+    if bases.next().is_some() {
+        return None;
+    }
+    Some(CatalogAttachmentTarget {
+        attachment_id: base.attachment_id.as_str().to_string(),
+        expected_scope: match &project.scope {
+            ProjectScope::Published(scope) => Some(scope.clone()),
+            ProjectScope::LegacyLocal => None,
+        },
+    })
+}
+
+/// Select one catalog attachment for an operation named by project identity.
+///
+/// The shared resolver owns the ladder: explicit attachment, session
+/// checkout, operator-selected default, single active attachment. D-033
+/// item 3 fixes the unique active `Base` attachment as the final rung and
+/// the resolver does not implement it, so it is applied here and ONLY where
+/// the resolver reported ambiguity. Applying it earlier would redirect a
+/// project whose default or sole attachment already resolved.
+fn catalog_attachment_target(
+    server: &BlackboxServer,
+    project_id: &str,
+) -> Result<CatalogAttachmentTarget> {
+    let session = server.authoritative_session_checkout();
+    let request = ProjectSelectorRequest {
+        selector: Some(project_id.to_owned()),
+        session: session.as_deref().map(|checkout| SessionCheckoutRef {
+            checkout_id: Some(checkout.checkout_id.clone()),
+            checkout_project_dir: None,
+        }),
+        intent: ResolveIntent::Read,
+        class: SelectorClass::Selection,
+        ..Default::default()
+    };
+    let resolved = server.with_project_resolver(|engine| engine.resolve_attached(&request))?;
+    let resolved = match resolved {
+        Ok(resolved) => resolved,
+        Err(error) if error.code() == "error.project_attachment_ambiguous" => {
+            return unique_active_base_attachment(server, project_id)
+                .ok_or_else(|| anyhow::Error::new(error));
+        }
+        Err(error) => return Err(anyhow::Error::new(error)),
+    };
+    let ResolvedAttachment::Catalog { attachment_id, .. } = &resolved.attachment else {
+        bail!("error.project_attachment_required: {project_id}");
+    };
+    Ok(CatalogAttachmentTarget {
+        attachment_id: attachment_id.clone(),
+        expected_scope: catalog_project_scope(&resolved.project),
+    })
+}
+
+/// Acquire one lease by catalog attachment for an operation named by project
+/// identity alone.
+///
+/// Catalog mode only. The bridge keeps its scope-discovery two-step in
+/// `crate::server::checkout_access`, whose refusal strings other bridge
+/// callers already depend on.
+pub(super) fn acquire_catalog_project_lease(
+    server: &BlackboxServer,
     broker: &CheckoutAccessBroker,
     project_id: &str,
     kind: CheckoutAccessKind,
     intent: CheckoutAccessIntent,
 ) -> Result<ValidatedCheckoutLease> {
+    let target = catalog_attachment_target(server, project_id)?;
+    broker
+        .acquire(CheckoutAccessRequest {
+            project_id: project_id.to_string(),
+            attachment: CheckoutAttachmentSelector::AttachmentId(target.attachment_id),
+            expected_scope: target.expected_scope,
+            kind,
+            intent,
+            source_lane: CheckoutAccessSourceLane::NativeAttachment,
+        })
+        .map_err(checkout_access_error)
+}
+
+/// Acquire one lease for an operation named by project identity alone.
+///
+/// The bridge arm keeps the legacy two-step exactly: version-1 records carry
+/// no scope, so the published scope is discoverable only through a
+/// `PublisherConfigTreeRead` lease. The catalog arm names its attachment
+/// natively and takes its scope from the catalog row.
+fn acquire_selected_operation(
+    server: &BlackboxServer,
+    broker: &CheckoutAccessBroker,
+    project_id: &str,
+    kind: CheckoutAccessKind,
+    intent: CheckoutAccessIntent,
+) -> Result<ValidatedCheckoutLease> {
+    if !server.state.project_authority.is_bridge() {
+        return acquire_catalog_project_lease(server, broker, project_id, kind, intent);
+    }
     let discovery = acquire_scope_discovery(broker, project_id)?;
     let expected_scope = discovery.published_scope().cloned();
     drop(discovery);
@@ -144,31 +296,28 @@ fn safe_scope_root(checkout_root: &Path, scope: &PublishedScope) -> Result<PathB
     Ok(checkout_root.join(relative))
 }
 
-fn selected_file_selection(
-    project: ProjectRecord,
-    relative_path: PathBuf,
-) -> CheckoutFileSelection {
+fn selected_file_selection(project_id: String, relative_path: PathBuf) -> CheckoutFileSelection {
     CheckoutFileSelection {
         expected_scope: None,
-        project,
+        project_id,
         attachment: CheckoutAttachmentSelector::Selected,
         source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
-        relative_path,
+        relative_path: FileRelativePath::Fixed(relative_path),
     }
 }
 
 fn checkout_file_selection(
-    project: ProjectRecord,
+    project_id: String,
     scope: PublishedScope,
     checkout_id: String,
     relative_path: PathBuf,
 ) -> CheckoutFileSelection {
     CheckoutFileSelection {
-        project,
+        project_id,
         attachment: CheckoutAttachmentSelector::CheckoutId(checkout_id),
         expected_scope: Some(scope),
         source_lane: CheckoutAccessSourceLane::LegacyCheckoutRegistry,
-        relative_path,
+        relative_path: FileRelativePath::Fixed(relative_path),
     }
 }
 
@@ -202,7 +351,7 @@ fn lexical_absolute_selection(
         candidates.push((
             root.components().count(),
             false,
-            selected_file_selection(project.clone(), relative.to_path_buf()),
+            selected_file_selection(project.project_id.clone(), relative.to_path_buf()),
         ));
     }
     for row in rows {
@@ -235,7 +384,7 @@ fn lexical_absolute_selection(
                 root.components().count(),
                 true,
                 checkout_file_selection(
-                    project.clone(),
+                    project.project_id.clone(),
                     scope.clone(),
                     row.checkout_id.clone(),
                     relative.to_path_buf(),
@@ -288,14 +437,14 @@ fn relative_file_selection(
     if let Some(project_dir) = project_dir {
         let selector = Path::new(project_dir);
         let mut selection = lexical_absolute_selection(broker, selector, projects, rows, true)?;
-        selection.relative_path = relative.to_path_buf();
+        selection.relative_path = FileRelativePath::Fixed(relative.to_path_buf());
         return Ok(selection);
     }
 
     if let Some(session) = session_checkout {
         let project = unique_project(projects, &session.project_id)?;
         return Ok(checkout_file_selection(
-            project,
+            project.project_id,
             session.published_scope.clone(),
             session.checkout_id.clone(),
             relative.to_path_buf(),
@@ -304,7 +453,7 @@ fn relative_file_selection(
 
     match projects {
         [project] => Ok(selected_file_selection(
-            project.clone(),
+            project.project_id.clone(),
             relative.to_path_buf(),
         )),
         [] => bail!("error.project_not_registered: no registered project can resolve the file"),
@@ -314,15 +463,107 @@ fn relative_file_selection(
     }
 }
 
+/// The catalog project a path-free relative read acts on when the caller
+/// named none: exactly one project carrying an active attachment. Zero and
+/// many are typed refusals; nothing silently picks a project.
+fn sole_attached_catalog_project(server: &BlackboxServer) -> Result<String> {
+    let store = server
+        .state
+        .project_authority
+        .catalog_store()
+        .ok_or_else(|| {
+            anyhow!("error.project_catalog_inactive: catalog authority is not active")
+        })?;
+    let state = store.snapshot().map_err(anyhow::Error::new)?;
+    let mut attached = state
+        .attachments()
+        .attachments
+        .values()
+        .filter(|row| row.status == AttachmentStatus::Attached)
+        .map(|row| row.project_id.as_str().to_string())
+        .collect::<Vec<_>>();
+    attached.sort();
+    attached.dedup();
+    match attached.as_slice() {
+        [project_id] => Ok(project_id.clone()),
+        [] => bail!(
+            "error.project_attachment_required: no catalog project has an active attachment on this host"
+        ),
+        _ => bail!(
+            "error.project_selector_ambiguous: relative file requires project_dir or an authoritative session checkout"
+        ),
+    }
+}
+
+/// Catalog selection for a caller-supplied file path.
+///
+/// Absolute inputs resolve through the catalog's own active-attachment
+/// containment arms (the `LegacyPath` selector routes into the catalog
+/// resolver's path arms in catalog mode); no candidate is ever matched
+/// against a `ProjectRecord::canonical_path` (plan section 8, P5-E file
+/// items 5 and 6).
+fn catalog_file_selection(
+    server: &BlackboxServer,
+    input: &str,
+    project_dir: Option<&str>,
+    session_checkout: Option<&ResolvedCheckoutScope>,
+) -> Result<CheckoutFileSelection> {
+    let path = Path::new(input);
+    let traverses = |candidate: &Path| {
+        candidate
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    };
+    if path.is_absolute() {
+        if traverses(path) {
+            bail!(
+                "error.checkout_path_invalid: selector must be an absolute lexical path without parent traversal"
+            );
+        }
+        return Ok(CheckoutFileSelection {
+            project_id: String::new(),
+            attachment: CheckoutAttachmentSelector::LegacyPath(input.to_owned()),
+            expected_scope: None,
+            source_lane: CheckoutAccessSourceLane::LegacyPathResolver,
+            relative_path: FileRelativePath::UnderLeaseRoot(path.to_path_buf()),
+        });
+    }
+    if path.as_os_str().is_empty() || traverses(path) {
+        bail!("error.checkout_path_invalid: expected a non-empty relative file path");
+    }
+    if let Some(project_dir) = project_dir {
+        return Ok(CheckoutFileSelection {
+            project_id: String::new(),
+            attachment: CheckoutAttachmentSelector::LegacyPath(project_dir.to_owned()),
+            expected_scope: None,
+            source_lane: CheckoutAccessSourceLane::LegacyPathResolver,
+            relative_path: FileRelativePath::Fixed(path.to_path_buf()),
+        });
+    }
+    let project_id = match session_checkout {
+        Some(session) => session.project_id.clone(),
+        None => sole_attached_catalog_project(server)?,
+    };
+    let target = catalog_attachment_target(server, &project_id)?;
+    Ok(CheckoutFileSelection {
+        project_id,
+        attachment: CheckoutAttachmentSelector::AttachmentId(target.attachment_id),
+        expected_scope: target.expected_scope,
+        source_lane: CheckoutAccessSourceLane::NativeAttachment,
+        relative_path: FileRelativePath::Fixed(path.to_path_buf()),
+    })
+}
+
 fn acquire_file_selection(
+    server: &BlackboxServer,
     broker: &CheckoutAccessBroker,
     selection: CheckoutFileSelection,
     kind: CheckoutAccessKind,
     intent: CheckoutAccessIntent,
 ) -> Result<AcquiredCheckoutFile> {
-    let project_id = selection.project.project_id;
+    let project_id = selection.project_id;
     let lease = if selection.attachment == CheckoutAttachmentSelector::Selected {
-        acquire_selected_operation(broker, &project_id, kind, intent)?
+        acquire_selected_operation(server, broker, &project_id, kind, intent)?
     } else {
         broker
             .acquire(CheckoutAccessRequest {
@@ -335,17 +576,32 @@ fn acquire_file_selection(
             })
             .map_err(checkout_access_error)?
     };
+    let relative = match selection.relative_path {
+        FileRelativePath::Fixed(relative) => relative,
+        FileRelativePath::UnderLeaseRoot(absolute) => absolute
+            .strip_prefix(lease.project_root())
+            .map_err(|_| {
+                anyhow!(
+                    "error.checkout_attachment_not_found: selector is not inside the selected attachment"
+                )
+            })?
+            .to_path_buf(),
+    };
+    if relative.as_os_str().is_empty() {
+        bail!("error.checkout_path_invalid: selector does not name a file inside the attachment");
+    }
     let (_, content) = lease
-        .read_relative_file(&selection.relative_path)
+        .read_relative_file(&relative)
         .map_err(checkout_access_error)?;
     Ok(AcquiredCheckoutFile {
         lease,
-        relative_path: selection.relative_path.to_string_lossy().into_owned(),
+        relative_path: relative.to_string_lossy().into_owned(),
         content,
     })
 }
 
 fn file_selection(
+    server: &BlackboxServer,
     broker: &CheckoutAccessBroker,
     input: &str,
     project_dir: Option<&str>,
@@ -353,6 +609,9 @@ fn file_selection(
     projects: &[ProjectRecord],
     rows: &[CheckoutRow],
 ) -> Result<CheckoutFileSelection> {
+    if !server.state.project_authority.is_bridge() {
+        return catalog_file_selection(server, input, project_dir, session_checkout);
+    }
     let path = Path::new(input);
     if path.is_absolute() {
         absolute_file_selection(broker, path, projects, rows)
@@ -362,18 +621,12 @@ fn file_selection(
 }
 
 fn acquire_project_file(
+    server: &BlackboxServer,
     broker: &CheckoutAccessBroker,
     project_id: &str,
     indexed_path_hint: &Path,
     projects: &[ProjectRecord],
 ) -> Result<AcquiredCheckoutFile> {
-    let project = unique_project(projects, project_id)?;
-    let lease = acquire_selected_operation(
-        broker,
-        &project.project_id,
-        CheckoutAccessKind::Blame,
-        CheckoutAccessIntent::Read,
-    )?;
     // P3-E: the stored path IS the project-relative path, so the normal arm is
     // a straight consume. The absolute-strip arm survives ONLY as a tagged
     // compat path for a pre-bump ref (a `file_path` fallback resolved against a
@@ -381,6 +634,16 @@ fn acquire_project_file(
     // absolute hint); it is not the primary lane any more, and it never
     // fabricates a relative path from a foreign root.
     let relative = if indexed_path_hint.is_absolute() {
+        if !server.state.project_authority.is_bridge() {
+            // Catalog identity is path-free: there is no record root to strip
+            // and no attachment root may stand in for one, because a hint
+            // rooted at some other checkout would then read a foreign file
+            // under this project's identity.
+            bail!(
+                "error.indexed_path_mismatch: project_file path hint is absolute and catalog identity carries no record root"
+            );
+        }
+        let project = unique_project(projects, project_id)?;
         tracing::debug!(
             project_id = %project.project_id,
             "compat: de-fabricating a relative path from a pre-path-free absolute hint"
@@ -399,6 +662,17 @@ fn acquire_project_file(
     if relative.as_os_str().is_empty() {
         bail!("error.indexed_path_invalid: project_file path hint does not name a file");
     }
+    if server.state.project_authority.is_bridge() {
+        // The bridge validated membership before acquiring; keep that order.
+        unique_project(projects, project_id)?;
+    }
+    let lease = acquire_selected_operation(
+        server,
+        broker,
+        project_id,
+        CheckoutAccessKind::Blame,
+        CheckoutAccessIntent::Read,
+    )?;
     let (_, content) = lease
         .read_relative_file(&relative)
         .map_err(checkout_access_error)?;
@@ -409,12 +683,53 @@ fn acquire_project_file(
     })
 }
 
+/// Corpus-identity blame must run against a repository that carries the
+/// corpus snapshot's Git evidence.
+///
+/// The pinned Git overlay is that evidence: it names the attachment whose
+/// head produced the project's commit edges and the head it observed. When
+/// the request-pinned view holds one for this project, the selected checkout
+/// must contain that commit; otherwise blame would report an arbitrary
+/// attachment's HEAD history against a snapshot it never produced (plan
+/// section 8, P5-E blame items 4 and 5). A project with no overlay has no
+/// commit evidence to require, and the ladder selection stands on its own.
+fn require_snapshot_commit(
+    git_overlays: &HashMap<String, bbox_corpus_core::git_overlay::GitOverlaySelector>,
+    project_id: &str,
+    checkout_root: &Path,
+) -> Result<()> {
+    let Some(overlay) = git_overlays.get(project_id) else {
+        return Ok(());
+    };
+    if bbox_corpus_core::git::resolve_commit(checkout_root, &overlay.repo_head).is_none() {
+        bail!(
+            "error.blame_commit_mismatch: the selected attachment does not contain the commit the corpus snapshot was indexed at"
+        );
+    }
+    Ok(())
+}
+
+/// The project ids one legacy Git-note operation covers.
+///
+/// Catalog mode selects the COMPLETE catalog set, remote-only projects
+/// included. Narrowing to the attached compatibility projection would turn
+/// an all-project operation into silent partial success, which D-020's
+/// governing rule and plan section 4.20 both forbid: the missing attachment
+/// must surface as the first typed refusal instead.
 fn requested_provenance_projects(
+    server: &BlackboxServer,
     params: &ProvenanceParams,
     projects: &[ProjectRecord],
-) -> Result<Vec<ProjectRecord>> {
+) -> Result<Vec<String>> {
+    if !server.state.project_authority.is_bridge() {
+        if let Some(project_id) = params.project_id.as_deref() {
+            return Ok(vec![server.validate_project_selection(project_id)?]);
+        }
+        let snapshot = server.state.records_provider.records_snapshot();
+        return Ok(snapshot.corpus_project_ids.iter().cloned().collect());
+    }
     if let Some(project_id) = params.project_id.as_deref() {
-        return Ok(vec![unique_project(projects, project_id)?]);
+        return Ok(vec![unique_project(projects, project_id)?.project_id]);
     }
     let mut seen = HashSet::new();
     for project in projects {
@@ -422,10 +737,14 @@ fn requested_provenance_projects(
             bail!("error.project_ambiguous: registered project ids are not unique");
         }
     }
-    Ok(projects.to_vec())
+    Ok(projects
+        .iter()
+        .map(|project| project.project_id.clone())
+        .collect())
 }
 
 fn acquire_provenance_projects(
+    server: &BlackboxServer,
     broker: &CheckoutAccessBroker,
     params: &ProvenanceParams,
     projects: &[ProjectRecord],
@@ -434,18 +753,21 @@ fn acquire_provenance_projects(
     Vec<ValidatedCheckoutLease>,
     Vec<mcp_tools::provenance::ProvenanceProject>,
 )> {
-    let requested = requested_provenance_projects(params, projects)?;
+    let requested = requested_provenance_projects(server, params, projects)?;
     let mut leases = Vec::with_capacity(requested.len());
     let mut inputs = Vec::with_capacity(requested.len());
-    for project in requested {
+    for project_id in requested {
+        // First typed refusal returns: no project is skipped and no partial
+        // result is assembled (plan section 4.20).
         let lease = acquire_selected_operation(
+            server,
             broker,
-            &project.project_id,
+            &project_id,
             CheckoutAccessKind::ProvenanceNoteIo,
             intent,
         )?;
         inputs.push(mcp_tools::provenance::ProvenanceProject {
-            project_id: project.project_id,
+            project_id,
             project_root: lease.project_root().to_path_buf(),
         });
         leases.push(lease);
@@ -647,6 +969,7 @@ impl BlackboxServer {
                     continue;
                 }
                 let resolved = file_selection(
+                    &server,
                     &broker,
                     &path,
                     p.project_dir.as_deref(),
@@ -656,6 +979,7 @@ impl BlackboxServer {
                 )
                 .and_then(|selection| {
                     acquire_file_selection(
+                        &server,
                         &broker,
                         selection,
                         CheckoutAccessKind::RenderFileProvider,
@@ -772,13 +1096,28 @@ impl BlackboxServer {
                     byte_offset,
                 } => {
                     validate_explicit_project_selection(&server, &project_id)?;
-                    let acquired =
-                        acquire_project_file(&broker, &project_id, &indexed_path_hint, &projects)?;
+                    let acquired = acquire_project_file(
+                        &server,
+                        &broker,
+                        &project_id,
+                        &indexed_path_hint,
+                        &projects,
+                    )?;
+                    require_snapshot_commit(
+                        &read_view
+                            .git_overlays
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.clone()))
+                            .collect(),
+                        &project_id,
+                        acquired.lease.checkout_root(),
+                    )?;
                     (acquired, line, Some(byte_offset))
                 }
                 mcp_tools::blame::BlameTargetIdentity::File { input_path, line } => {
                     let checkout_rows = server.state.checkout_registry.read().rows().to_vec();
                     let selection = file_selection(
+                        &server,
                         &broker,
                         &input_path,
                         None,
@@ -787,6 +1126,7 @@ impl BlackboxServer {
                         &checkout_rows,
                     )?;
                     let acquired = acquire_file_selection(
+                        &server,
                         &broker,
                         selection,
                         CheckoutAccessKind::Blame,
@@ -838,8 +1178,13 @@ impl BlackboxServer {
             }
             let projects = server.state.records_provider.records_snapshot().records;
             let broker = crate::server::checkout_access::checkout_access_broker(&server.state);
-            let (leases, inputs) =
-                acquire_provenance_projects(&broker, &p, &projects, CheckoutAccessIntent::Write)?;
+            let (leases, inputs) = acquire_provenance_projects(
+                &server,
+                &broker,
+                &p,
+                &projects,
+                CheckoutAccessIntent::Write,
+            )?;
             let read_view = server.state.code_read_view.read().clone();
             let output = if leases.is_empty() {
                 mcp_tools::provenance::export_provenance(read_view.edge_index.as_ref(), &inputs)?
@@ -886,14 +1231,24 @@ impl BlackboxServer {
                     "error.invalid_checkout_scope: authoritative checkout has no durable project scope"
                 );
             }
-            let projects = server.state.records_provider.records_snapshot().records;
-            if !projects
-                .iter()
-                .any(|project| project.project_id == checkout.project_id)
-            {
-                anyhow::bail!(
-                    "error.project_not_registered: authoritative checkout project is absent from the registry"
-                );
+            // Plan section 4.20: the plan stays pure corpus computation. It
+            // opens no Git notes, so it takes no `ProvenanceNoteIo` lease and,
+            // in catalog mode, asks only whether the catalog knows the
+            // project. The attached-row membership check is a version-1
+            // question: it would refuse a perfectly publishable remote-only
+            // catalog project for lacking a compatibility row.
+            if server.state.project_authority.is_bridge() {
+                let projects = server.state.records_provider.records_snapshot().records;
+                if !projects
+                    .iter()
+                    .any(|project| project.project_id == checkout.project_id)
+                {
+                    anyhow::bail!(
+                        "error.project_not_registered: authoritative checkout project is absent from the registry"
+                    );
+                }
+            } else {
+                server.validate_project_selection(&checkout.project_id)?;
             }
             let notes_ref = git::notes_ref("provenance")?;
             let page = mcp_tools::provenance_plan::export_plan_page(
@@ -928,8 +1283,13 @@ impl BlackboxServer {
             }
             let projects = server.state.records_provider.records_snapshot().records;
             let broker = crate::server::checkout_access::checkout_access_broker(&server.state);
-            let (leases, inputs) =
-                acquire_provenance_projects(&broker, &p, &projects, CheckoutAccessIntent::Read)?;
+            let (leases, inputs) = acquire_provenance_projects(
+                &server,
+                &broker,
+                &p,
+                &projects,
+                CheckoutAccessIntent::Read,
+            )?;
             let edges_dir = edge_index::edges_dir_from_bro_store(&server.state.store_dir);
             let resolve_legacy_target =
                 |project_id: &str,
@@ -1103,7 +1463,9 @@ mod tests {
             HashMap::from([("project-one".into(), scope.clone())]),
         );
 
+        let server = test_server(&dir);
         let lease = acquire_selected_operation(
+            &server,
             &broker,
             "project-one",
             CheckoutAccessKind::Blame,
@@ -1134,9 +1496,11 @@ mod tests {
         );
         let project = test_record(&root, "project-one");
 
+        let server = test_server(&dir);
         let error = acquire_file_selection(
+            &server,
             &broker,
-            selected_file_selection(project, PathBuf::from("file.rs")),
+            selected_file_selection(project.project_id, PathBuf::from("file.rs")),
             CheckoutAccessKind::Blame,
             CheckoutAccessIntent::Read,
         )
@@ -1179,7 +1543,9 @@ mod tests {
         )
         .unwrap();
 
+        let server = test_server(&dir);
         let acquired = acquire_file_selection(
+            &server,
             &broker,
             selection,
             CheckoutAccessKind::RenderFileProvider,
@@ -1235,7 +1601,9 @@ mod tests {
             selection.attachment,
             CheckoutAttachmentSelector::CheckoutId("checkout-one".into())
         );
+        let server = test_server(&dir);
         let acquired = acquire_file_selection(
+            &server,
             &broker,
             selection,
             CheckoutAccessKind::RenderFileProvider,
@@ -1255,9 +1623,11 @@ mod tests {
         let project = test_record(&root, "project-one");
         let (broker, _, _) = recording_broker(HashMap::from([(project.project_id.clone(), root)]));
 
+        let server = test_server(&dir);
         let error = acquire_file_selection(
+            &server,
             &broker,
-            selected_file_selection(project, PathBuf::from("../escape.rs")),
+            selected_file_selection(project.project_id, PathBuf::from("../escape.rs")),
             CheckoutAccessKind::RenderFileProvider,
             CheckoutAccessIntent::Read,
         )
@@ -1283,7 +1653,9 @@ mod tests {
             ("project-two".into(), second),
         ]));
 
+        let server = test_server(&dir);
         let (leases, inputs) = acquire_provenance_projects(
+            &server,
             &broker,
             &ProvenanceParams { project_id: None },
             &projects,
@@ -1653,5 +2025,752 @@ mod tests {
             .await;
         assert_eq!(result.is_error, Some(true));
         assert!(extract_text(&result).contains("error.project_not_registered"));
+    }
+}
+
+/// Catalog-mode adapter tests (plan section 13.5).
+///
+/// The shared `catalog_fixture` in `src/server/state.rs` builds catalog state
+/// for the published-read milestones and installs `DenyCheckoutAccess`, which
+/// is exactly wrong for adapters whose whole subject is which lease they take.
+/// This scaffold instead runs the real catalog checkout authority over real
+/// checkouts so capability, identity, and revalidation refusals are the
+/// authority's, not a stub's.
+#[cfg(test)]
+mod catalog_adapter_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use bbox_corpus_core::identity::PublishedScope;
+    use bbox_corpus_core::project_catalog::{
+        AttachmentCapabilities, AttachmentId, AttachmentKind, AttachmentStatus, CheckoutAttachment,
+        CorpusProject, ProjectId, ProjectScope,
+    };
+    use bbox_indexing::checkout_access::{
+        CheckoutAccessBroker, CheckoutAccessIntent, CheckoutAccessKind,
+    };
+    use bbox_indexing::project_catalog_store::ProjectCatalogStore;
+
+    use super::*;
+    use crate::server::state::SharedState;
+
+    const PROJECT_ONE: &str = "p_000000000000000000000000000000a1";
+    const PROJECT_TWO: &str = "p_000000000000000000000000000000b1";
+    const ATTACHMENT_ONE: &str = "att_00000000000000000000000000000a01";
+    const ATTACHMENT_TWO: &str = "att_00000000000000000000000000000a02";
+
+    struct CatalogAdapters {
+        _directory: tempfile::TempDir,
+        root: PathBuf,
+        catalog_path: PathBuf,
+        store: Arc<ProjectCatalogStore>,
+    }
+
+    /// Everything an attachment row needs that is not derivable from its
+    /// checkout. Spelled out per test so a capability or lifecycle refusal is
+    /// visibly the row's, never a default's.
+    struct AttachSpec<'a> {
+        project_id: &'a str,
+        attachment_id: &'a str,
+        dir_name: &'a str,
+        kind: AttachmentKind,
+        status: AttachmentStatus,
+        capabilities: AttachmentCapabilities,
+        scope: Option<PublishedScope>,
+        default_for_project: bool,
+    }
+
+    fn capabilities(kinds: &[CheckoutAccessKind]) -> AttachmentCapabilities {
+        let mut capabilities = AttachmentCapabilities::default();
+        for kind in kinds {
+            match kind {
+                CheckoutAccessKind::LocalProjectWalk => capabilities.local_code_source = true,
+                CheckoutAccessKind::GitHistory => capabilities.git_history = true,
+                CheckoutAccessKind::PublisherConfigTreeRead
+                | CheckoutAccessKind::KnowledgeGapOverlayRead => capabilities.repo_knowledge = true,
+                CheckoutAccessKind::Blame => capabilities.blame = true,
+                CheckoutAccessKind::RenderFileProvider => capabilities.render_output = true,
+                CheckoutAccessKind::ProvenanceNoteIo => capabilities.provenance_note_io = true,
+                CheckoutAccessKind::ArtifactWatchDiscovery => capabilities.artifact_watching = true,
+                CheckoutAccessKind::RepositoryMutation => capabilities.repo_mutation = true,
+            }
+        }
+        capabilities
+    }
+
+    impl CatalogAdapters {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let catalog_root = root.join("catalog");
+            std::fs::create_dir_all(&catalog_root).unwrap();
+            let catalog_path = catalog_root.join("projects.json");
+            let store = Arc::new(ProjectCatalogStore::initialize_empty(&catalog_path).unwrap());
+            Self {
+                _directory: directory,
+                root,
+                catalog_path,
+                store,
+            }
+        }
+
+        fn scope(repo: &str) -> PublishedScope {
+            PublishedScope::try_new(repo, ".").unwrap()
+        }
+
+        fn add_project(&self, project_id: &str, scope: Option<PublishedScope>) {
+            let project_id = ProjectId::parse(project_id).unwrap();
+            let epoch = self.store.snapshot().unwrap().epoch();
+            self.store
+                .transact(epoch, |catalog, _attachments| {
+                    catalog.projects.insert(
+                        project_id.clone(),
+                        CorpusProject {
+                            project_id: project_id.clone(),
+                            scope: match &scope {
+                                Some(scope) => ProjectScope::Published(scope.clone()),
+                                None => ProjectScope::LegacyLocal,
+                            },
+                            operator_aliases: Default::default(),
+                            nominated_aliases: Default::default(),
+                            display_name: project_id.as_str().to_string(),
+                            created_at: "2026-08-03T00:00:00Z".into(),
+                            registered_at_compat: None,
+                            repo_history: None,
+                            languages: Default::default(),
+                        },
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        /// Materialize the checkout, mint its durable identity marker, and
+        /// record the attachment. The marker is minted rather than invented:
+        /// the catalog authority verifies it on every acquisition.
+        fn attach(&self, spec: AttachSpec<'_>) -> PathBuf {
+            let checkout_dir = self.root.join(spec.dir_name);
+            std::fs::create_dir_all(&checkout_dir).unwrap();
+            let checkout_dir = checkout_dir.canonicalize().unwrap();
+            let checkout_id =
+                bbox_corpus_core::identity::ensure_checkout_id(&checkout_dir).unwrap();
+            let project_id = ProjectId::parse(spec.project_id).unwrap();
+            let attachment_id = AttachmentId::parse(spec.attachment_id).unwrap();
+            let dir = checkout_dir.to_string_lossy().into_owned();
+            let epoch = self.store.snapshot().unwrap().epoch();
+            self.store
+                .transact(epoch, |_catalog, attachments| {
+                    attachments.attachments.insert(
+                        attachment_id.clone(),
+                        CheckoutAttachment {
+                            attachment_id: attachment_id.clone(),
+                            project_id: project_id.clone(),
+                            checkout_id: checkout_id.clone(),
+                            checkout_dir: dir.clone(),
+                            checkout_project_dir: dir.clone(),
+                            project_root_relpath: ".".into(),
+                            kind: spec.kind.clone(),
+                            validated_scope: spec.scope.clone(),
+                            computed_repo_hint: None,
+                            branch_ref: Some("refs/heads/main".into()),
+                            capabilities: spec.capabilities.clone(),
+                            status: spec.status.clone(),
+                            attached_at: "2026-08-03T00:00:00Z".into(),
+                            detached_at: match spec.status {
+                                AttachmentStatus::Attached => None,
+                                _ => Some("2026-08-03T00:00:01Z".into()),
+                            },
+                        },
+                    );
+                    if spec.default_for_project {
+                        attachments
+                            .default_attachments
+                            .insert(project_id.clone(), attachment_id.clone());
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            checkout_dir
+        }
+
+        /// A catalog-authority server over the same durable bytes, with the
+        /// REAL catalog checkout authority rather than the deny stub.
+        fn server(&self) -> BlackboxServer {
+            let mut state = SharedState::for_test_catalog(&self.root, &self.catalog_path);
+            let store = state
+                .project_authority
+                .catalog_store()
+                .expect("catalog authority")
+                .clone();
+            state.checkout_access = Arc::new(CheckoutAccessBroker::new(
+                Arc::new(
+                    bbox_indexing::checkout_access_v2::V2CatalogCheckoutAccessAuthority::new(store),
+                ),
+                state.checkout_access_observations.clone(),
+            ));
+            BlackboxServer::new(Arc::new(state))
+        }
+    }
+
+    fn blame_spec<'a>(project_id: &'a str, attachment_id: &'a str, dir: &'a str) -> AttachSpec<'a> {
+        AttachSpec {
+            project_id,
+            attachment_id,
+            dir_name: dir,
+            kind: AttachmentKind::Base,
+            status: AttachmentStatus::Attached,
+            capabilities: capabilities(&[CheckoutAccessKind::Blame]),
+            scope: Some(CatalogAdapters::scope("repo-one")),
+            default_for_project: false,
+        }
+    }
+
+    fn acquire_blame(server: &BlackboxServer, project_id: &str) -> Result<ValidatedCheckoutLease> {
+        acquire_selected_operation(
+            server,
+            &server.state.checkout_access.clone(),
+            project_id,
+            CheckoutAccessKind::Blame,
+            CheckoutAccessIntent::Read,
+        )
+    }
+
+    /// The single active attachment is selected, natively, with the catalog's
+    /// own scope and with no `PublisherConfigTreeRead` lease in front of it.
+    #[test]
+    fn single_active_attachment_is_selected_natively_without_a_scope_lease() {
+        let fixture = CatalogAdapters::new();
+        let scope = CatalogAdapters::scope("repo-one");
+        fixture.add_project(PROJECT_ONE, Some(scope.clone()));
+        fixture.attach(blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one"));
+        let server = fixture.server();
+
+        let lease = acquire_blame(&server, PROJECT_ONE).unwrap();
+
+        assert_eq!(lease.attachment_id(), ATTACHMENT_ONE);
+        assert_eq!(lease.published_scope(), Some(&scope));
+        assert_eq!(lease.kind(), CheckoutAccessKind::Blame);
+        assert_eq!(
+            lease.source_lane(),
+            CheckoutAccessSourceLane::NativeAttachment
+        );
+        // The publisher-config capability was never requested, so a project
+        // whose attachment lacks `repo_knowledge` still blames.
+        let publisher_operations = server
+            .state
+            .checkout_access
+            .health()
+            .operations
+            .into_iter()
+            .find(|operation| operation.kind == CheckoutAccessKind::PublisherConfigTreeRead)
+            .map(|operation| operation.granted + operation.denied)
+            .unwrap_or_default();
+        assert_eq!(publisher_operations, 0);
+    }
+
+    /// The operator-selected default wins over the other active attachments.
+    #[test]
+    fn operator_default_attachment_wins_over_other_active_attachments() {
+        let fixture = CatalogAdapters::new();
+        let scope = CatalogAdapters::scope("repo-one");
+        fixture.add_project(PROJECT_ONE, Some(scope.clone()));
+        fixture.attach(blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one"));
+        let mut second = blame_spec(PROJECT_ONE, ATTACHMENT_TWO, "checkout-two");
+        second.kind = AttachmentKind::Worktree;
+        second.default_for_project = true;
+        fixture.attach(second);
+        let server = fixture.server();
+
+        let lease = acquire_blame(&server, PROJECT_ONE).unwrap();
+
+        assert_eq!(lease.attachment_id(), ATTACHMENT_TWO);
+    }
+
+    /// A session-pinned checkout outranks the operator default: the request
+    /// runs where the caller is, not where the host prefers.
+    #[test]
+    fn session_pinned_checkout_outranks_the_operator_default() {
+        let fixture = CatalogAdapters::new();
+        let scope = CatalogAdapters::scope("repo-one");
+        fixture.add_project(PROJECT_ONE, Some(scope.clone()));
+        let mut default = blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one");
+        default.default_for_project = true;
+        fixture.attach(default);
+        let mut pinned = blame_spec(PROJECT_ONE, ATTACHMENT_TWO, "checkout-two");
+        pinned.kind = AttachmentKind::Worktree;
+        let pinned_dir = fixture.attach(pinned);
+        let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&pinned_dir).unwrap();
+        let server = fixture.server();
+        server
+            .session_checkout
+            .set(Some(Arc::new(
+                bbox_corpus_core::project_record::ResolvedCheckoutScope {
+                    project_id: PROJECT_ONE.into(),
+                    published_scope: scope.clone(),
+                    checkout_id,
+                    checkout_dir: pinned_dir.to_string_lossy().into_owned(),
+                    checkout_project_dir: pinned_dir.to_string_lossy().into_owned(),
+                    branch_ref: Some("refs/heads/main".into()),
+                },
+            )))
+            .unwrap();
+
+        let lease = acquire_blame(&server, PROJECT_ONE).unwrap();
+
+        assert_eq!(lease.attachment_id(), ATTACHMENT_TWO);
+    }
+
+    /// D-033 item 3's last rung: with two active attachments, no session pin
+    /// and no operator default, the unique active `Base` decides.
+    #[test]
+    fn unique_active_base_resolves_an_otherwise_ambiguous_project() {
+        let fixture = CatalogAdapters::new();
+        let scope = CatalogAdapters::scope("repo-one");
+        fixture.add_project(PROJECT_ONE, Some(scope.clone()));
+        fixture.attach(blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one"));
+        let mut worktree = blame_spec(PROJECT_ONE, ATTACHMENT_TWO, "checkout-two");
+        worktree.kind = AttachmentKind::Worktree;
+        fixture.attach(worktree);
+        let server = fixture.server();
+
+        let lease = acquire_blame(&server, PROJECT_ONE).unwrap();
+
+        assert_eq!(lease.attachment_id(), ATTACHMENT_ONE);
+    }
+
+    /// Two active bases have no unique base rung left, so the ambiguity the
+    /// resolver reported stands rather than being silently broken.
+    #[test]
+    fn two_active_bases_stay_ambiguous() {
+        let fixture = CatalogAdapters::new();
+        let scope = CatalogAdapters::scope("repo-one");
+        fixture.add_project(PROJECT_ONE, Some(scope.clone()));
+        fixture.attach(blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one"));
+        fixture.attach(blame_spec(PROJECT_ONE, ATTACHMENT_TWO, "checkout-two"));
+        let server = fixture.server();
+
+        let error = acquire_blame(&server, PROJECT_ONE).unwrap_err().to_string();
+
+        assert!(
+            error.starts_with("error.project_attachment_ambiguous"),
+            "{error}"
+        );
+    }
+
+    /// A remote-only catalog project degrades to attachment-required, not to
+    /// project-not-found (plan section 10.5).
+    #[test]
+    fn remote_only_project_requires_an_attachment() {
+        let fixture = CatalogAdapters::new();
+        fixture.add_project(PROJECT_ONE, Some(CatalogAdapters::scope("repo-one")));
+        let server = fixture.server();
+
+        let error = acquire_blame(&server, PROJECT_ONE).unwrap_err().to_string();
+
+        assert!(
+            error.starts_with("error.project_attachment_required"),
+            "{error}"
+        );
+    }
+
+    /// A detached attachment is not an attachment: the row exists, and the
+    /// refusal is still attachment-required rather than a lease denial.
+    #[test]
+    fn detached_attachment_requires_an_attachment() {
+        let fixture = CatalogAdapters::new();
+        fixture.add_project(PROJECT_ONE, Some(CatalogAdapters::scope("repo-one")));
+        let mut detached = blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one");
+        detached.status = AttachmentStatus::Detached;
+        detached.capabilities = AttachmentCapabilities::default();
+        fixture.attach(detached);
+        let server = fixture.server();
+
+        let error = acquire_blame(&server, PROJECT_ONE).unwrap_err().to_string();
+
+        assert!(
+            error.starts_with("error.project_attachment_required"),
+            "{error}"
+        );
+    }
+
+    /// The denial names the capability the OPERATION needs. An attachment
+    /// carrying `repo_knowledge` but not `blame` must still be denied, which
+    /// is the asymmetry a scope-discovery lease would have inverted.
+    #[test]
+    fn blame_is_denied_on_its_own_capability_not_repo_knowledge() {
+        let fixture = CatalogAdapters::new();
+        fixture.add_project(PROJECT_ONE, Some(CatalogAdapters::scope("repo-one")));
+        let mut knowledge_only = blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one");
+        knowledge_only.capabilities = capabilities(&[CheckoutAccessKind::PublisherConfigTreeRead]);
+        fixture.attach(knowledge_only);
+        let server = fixture.server();
+
+        let error = acquire_blame(&server, PROJECT_ONE).unwrap_err().to_string();
+
+        assert!(
+            error.starts_with("error.checkout_access.capability_denied"),
+            "{error}"
+        );
+    }
+
+    /// Scope disagreement never reaches an adapter: the request pins the
+    /// catalog project's own scope, and the pair store refuses to record an
+    /// attachment validated at a different one. The adapter's `expected_scope`
+    /// pin is the second line of defense behind that, not the first.
+    #[test]
+    fn attachment_scope_disagreement_cannot_be_recorded() {
+        let fixture = CatalogAdapters::new();
+        fixture.add_project(PROJECT_ONE, Some(CatalogAdapters::scope("repo-one")));
+        let mut foreign = blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one");
+        foreign.scope = Some(CatalogAdapters::scope("repo-other"));
+
+        let refusal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fixture.attach(foreign);
+        }))
+        .unwrap_err();
+
+        let message = refusal
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            message.contains("error.project_attachments_scope_mismatch"),
+            "{message}"
+        );
+    }
+
+    /// Identity is the marker, not the path: a checkout whose marker names a
+    /// different checkout denies even though the directory still exists.
+    #[test]
+    fn checkout_identity_marker_divergence_is_refused() {
+        let fixture = CatalogAdapters::new();
+        fixture.add_project(PROJECT_ONE, Some(CatalogAdapters::scope("repo-one")));
+        let checkout = fixture.attach(blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one"));
+        std::fs::write(
+            checkout.join(".bbox/local/checkout-id"),
+            "ffffffffffffffffffffffffffffffff",
+        )
+        .unwrap();
+        let server = fixture.server();
+
+        let error = acquire_blame(&server, PROJECT_ONE).unwrap_err().to_string();
+
+        assert!(
+            error.starts_with("error.checkout_access.checkout_identity_mismatch"),
+            "{error}"
+        );
+    }
+
+    /// Revalidation is a real recheck, not a formality: identity lost after
+    /// acquisition fails the operation rather than blessing the read.
+    #[test]
+    fn revalidation_fails_when_identity_is_lost_after_acquisition() {
+        let fixture = CatalogAdapters::new();
+        fixture.add_project(PROJECT_ONE, Some(CatalogAdapters::scope("repo-one")));
+        let checkout = fixture.attach(blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one"));
+        let server = fixture.server();
+        let lease = acquire_blame(&server, PROJECT_ONE).unwrap();
+
+        std::fs::remove_file(checkout.join(".bbox/local/checkout-id")).unwrap();
+        let error = server
+            .state
+            .checkout_access
+            .revalidate(&lease)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("checkout_identity_mismatch"), "{error}");
+    }
+
+    /// An absolute selector resolves through the catalog's active attachments
+    /// and strips the LEASE root. No `ProjectRecord::canonical_path`
+    /// participates: the project here has no compatibility row at all,
+    /// because its only attachment is a worktree.
+    #[test]
+    fn absolute_selection_resolves_without_a_compatibility_record() {
+        let fixture = CatalogAdapters::new();
+        fixture.add_project(PROJECT_ONE, Some(CatalogAdapters::scope("repo-one")));
+        let mut worktree = blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one");
+        worktree.kind = AttachmentKind::Worktree;
+        worktree.capabilities = capabilities(&[CheckoutAccessKind::RenderFileProvider]);
+        let checkout = fixture.attach(worktree);
+        std::fs::write(checkout.join("file.rs"), "fn main() {}\n").unwrap();
+        let server = fixture.server();
+        assert!(
+            server
+                .state
+                .records_provider
+                .records_snapshot()
+                .records
+                .is_empty(),
+            "a worktree-only project has no compatibility row to match"
+        );
+
+        let selection = file_selection(
+            &server,
+            &server.state.checkout_access.clone(),
+            checkout.join("file.rs").to_str().unwrap(),
+            None,
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
+        let acquired = acquire_file_selection(
+            &server,
+            &server.state.checkout_access.clone(),
+            selection,
+            CheckoutAccessKind::RenderFileProvider,
+            CheckoutAccessIntent::Read,
+        )
+        .unwrap();
+
+        assert_eq!(acquired.relative_path, "file.rs");
+        assert_eq!(acquired.content, b"fn main() {}\n");
+    }
+
+    /// A path outside every active attachment is refused; nothing falls back
+    /// to a registered root.
+    #[test]
+    fn absolute_selection_outside_every_attachment_is_refused() {
+        let fixture = CatalogAdapters::new();
+        fixture.add_project(PROJECT_ONE, Some(CatalogAdapters::scope("repo-one")));
+        fixture.attach(blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one"));
+        let stranger = fixture.root.join("stranger");
+        std::fs::create_dir_all(&stranger).unwrap();
+        std::fs::write(stranger.join("file.rs"), "fn main() {}\n").unwrap();
+        let server = fixture.server();
+
+        let selection = file_selection(
+            &server,
+            &server.state.checkout_access.clone(),
+            stranger.join("file.rs").to_str().unwrap(),
+            None,
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
+        let error = acquire_file_selection(
+            &server,
+            &server.state.checkout_access.clone(),
+            selection,
+            CheckoutAccessKind::RenderFileProvider,
+            CheckoutAccessIntent::Read,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.starts_with("error.checkout_access.attachment_not_found"),
+            "{error}"
+        );
+    }
+
+    /// Traversal is refused before any authority is consulted.
+    #[test]
+    fn traversal_selectors_are_refused_before_acquisition() {
+        let fixture = CatalogAdapters::new();
+        fixture.add_project(PROJECT_ONE, Some(CatalogAdapters::scope("repo-one")));
+        fixture.attach(blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one"));
+        let server = fixture.server();
+
+        for selector in ["../escape.rs", "nested/../../escape.rs"] {
+            let error = catalog_file_selection(&server, selector, None, None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.starts_with("error.checkout_path_invalid"),
+                "{selector}: {error}"
+            );
+        }
+    }
+
+    /// A relative read reaching outside the attachment through a symlink is
+    /// refused by the lease's own path gate, after acquisition.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_is_refused_by_the_lease_path_gate() {
+        let fixture = CatalogAdapters::new();
+        fixture.add_project(PROJECT_ONE, Some(CatalogAdapters::scope("repo-one")));
+        let mut render = blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one");
+        render.capabilities = capabilities(&[CheckoutAccessKind::RenderFileProvider]);
+        let checkout = fixture.attach(render);
+        let outside = fixture.root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(&outside, checkout.join("escape")).unwrap();
+        let server = fixture.server();
+
+        let selection = catalog_file_selection(&server, "escape/secret.txt", None, None).unwrap();
+        let error = acquire_file_selection(
+            &server,
+            &server.state.checkout_access.clone(),
+            selection,
+            CheckoutAccessKind::RenderFileProvider,
+            CheckoutAccessIntent::Read,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.starts_with("error.checkout_access.conservative_path_gate_denied"),
+            "{error}"
+        );
+    }
+
+    /// A relative read with no session pin and more than one attached project
+    /// refuses rather than picking one.
+    #[test]
+    fn relative_read_without_a_session_refuses_when_more_than_one_project_is_attached() {
+        let fixture = CatalogAdapters::new();
+        fixture.add_project(PROJECT_ONE, Some(CatalogAdapters::scope("repo-one")));
+        fixture.add_project(PROJECT_TWO, Some(CatalogAdapters::scope("repo-two")));
+        fixture.attach(blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one"));
+        let mut second = blame_spec(PROJECT_TWO, ATTACHMENT_TWO, "checkout-two");
+        second.scope = Some(CatalogAdapters::scope("repo-two"));
+        fixture.attach(second);
+        let server = fixture.server();
+
+        let error = catalog_file_selection(&server, "file.rs", None, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.starts_with("error.project_selector_ambiguous"),
+            "{error}"
+        );
+    }
+
+    /// A host with catalog projects but no attachment at all reports the
+    /// attachment requirement, not an empty registry.
+    #[test]
+    fn relative_read_without_any_attachment_requires_one() {
+        let fixture = CatalogAdapters::new();
+        fixture.add_project(PROJECT_ONE, Some(CatalogAdapters::scope("repo-one")));
+        let server = fixture.server();
+
+        let error = catalog_file_selection(&server, "file.rs", None, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.starts_with("error.project_attachment_required"),
+            "{error}"
+        );
+    }
+
+    /// A legacy all-project Git-note operation covers the COMPLETE catalog
+    /// set. A remote-only peer therefore fails the whole call at the first
+    /// typed refusal instead of being skipped (plan section 4.20).
+    #[test]
+    fn legacy_provenance_covers_every_catalog_project_and_is_never_partial() {
+        let fixture = CatalogAdapters::new();
+        fixture.add_project(PROJECT_ONE, Some(CatalogAdapters::scope("repo-one")));
+        fixture.add_project(PROJECT_TWO, Some(CatalogAdapters::scope("repo-two")));
+        let mut notes = blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one");
+        notes.capabilities = capabilities(&[CheckoutAccessKind::ProvenanceNoteIo]);
+        fixture.attach(notes);
+        let server = fixture.server();
+        let params = ProvenanceParams { project_id: None };
+
+        let requested = requested_provenance_projects(&server, &params, &[]).unwrap();
+        assert_eq!(requested.len(), 2, "the remote-only peer is not dropped");
+
+        let error = acquire_provenance_projects(
+            &server,
+            &server.state.checkout_access.clone(),
+            &params,
+            &[],
+            CheckoutAccessIntent::Read,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.starts_with("error.project_attachment_required"),
+            "{error}"
+        );
+    }
+
+    /// Corpus-identity blame refuses an absolute indexed hint in catalog
+    /// mode: catalog identity carries no record root, and no attachment root
+    /// may stand in for one.
+    #[test]
+    fn absolute_indexed_hint_is_refused_under_catalog_identity() {
+        let fixture = CatalogAdapters::new();
+        fixture.add_project(PROJECT_ONE, Some(CatalogAdapters::scope("repo-one")));
+        let checkout = fixture.attach(blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one"));
+        let server = fixture.server();
+
+        let error = acquire_project_file(
+            &server,
+            &server.state.checkout_access.clone(),
+            PROJECT_ONE,
+            &checkout.join("src/lib.rs"),
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.starts_with("error.indexed_path_mismatch"), "{error}");
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(args)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} failed in {dir:?}");
+    }
+
+    fn overlay_map(
+        project_id: &str,
+        repo_head: &str,
+    ) -> HashMap<String, bbox_corpus_core::git_overlay::GitOverlaySelector> {
+        HashMap::from([(
+            project_id.to_string(),
+            bbox_corpus_core::git_overlay::GitOverlaySelector {
+                project_id: project_id.to_string(),
+                code_generation: "cg_test".into(),
+                repo_history_generation: "rhg_test".into(),
+                attachment_id: ATTACHMENT_ONE.into(),
+                repo_head: repo_head.to_string(),
+                commit_namespace: "ns".into(),
+                overlay_generation: 1,
+            },
+        )])
+    }
+
+    /// The corpus snapshot's Git evidence must be present in the checkout the
+    /// ladder selected. Present passes; absent refuses rather than reporting
+    /// an unrelated attachment's HEAD history.
+    #[test]
+    fn snapshot_commit_must_be_contained_in_the_selected_checkout() {
+        let fixture = CatalogAdapters::new();
+        fixture.add_project(PROJECT_ONE, Some(CatalogAdapters::scope("repo-one")));
+        let checkout = fixture.attach(blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one"));
+        git(&checkout, &["init", "--initial-branch", "main"]);
+        git(&checkout, &["config", "user.email", "t@example.com"]);
+        git(&checkout, &["config", "user.name", "t"]);
+        std::fs::write(checkout.join("file.rs"), "fn main() {}\n").unwrap();
+        git(&checkout, &["add", "file.rs"]);
+        git(&checkout, &["commit", "-m", "seed"]);
+        let head = bbox_corpus_core::git::current_head(&checkout).unwrap();
+
+        let present = overlay_map(PROJECT_ONE, &head);
+        require_snapshot_commit(&present, PROJECT_ONE, &checkout).unwrap();
+
+        let missing = overlay_map(PROJECT_ONE, "0123456789012345678901234567890123456789");
+        let error = require_snapshot_commit(&missing, PROJECT_ONE, &checkout)
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("error.blame_commit_mismatch"), "{error}");
+
+        // A project with no pinned overlay has no commit evidence to require.
+        require_snapshot_commit(&HashMap::new(), PROJECT_ONE, &checkout).unwrap();
     }
 }

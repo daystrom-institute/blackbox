@@ -91,8 +91,13 @@ impl BlackboxServer {
                 && matches!(p.scope.as_deref().unwrap_or("both"), "project" | "both");
             let rendered = if project_render {
                 let raw = p.project.clone().expect("project render has a target");
+                // Project identity is resolved before any render target is
+                // opened (plan section 8, P5-E render item 1). The write root
+                // below always comes from the acquired lease; no branch
+                // re-derives one from a project record path.
                 let resolution = server.resolve_project_write(&raw)?;
                 let durable_scope = resolution.durable_scope;
+                let resolved_project_id = resolution.project_id;
                 let checkout = resolution.checkout_scope;
                 if let Some(checkout) = checkout.as_ref() {
                     server.register_dark_knowledge_checkout(checkout)?;
@@ -115,22 +120,38 @@ impl BlackboxServer {
                         |lease| render(lease.project_root()),
                     )?
                 } else {
-                    let projects = server.state.records_provider.records_snapshot().records;
-                    let project = projects
-                        .iter()
-                        .find(|project| project.canonical_path == durable_scope)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "error.attachment_required: project render target is not a registered attachment"
-                            )
-                        })?;
-                    crate::server::checkout_access::with_selected_project_access(
-                        &server.state.checkout_access,
-                        &project.project_id,
-                        bbox_indexing::checkout_access::CheckoutAccessKind::RenderFileProvider,
-                        bbox_indexing::checkout_access::CheckoutAccessIntent::Write,
-                        |lease| render(lease.project_root()),
-                    )?
+                    let project_id = resolved_project_id.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "error.attachment_required: project render target is not a registered attachment"
+                        )
+                    })?;
+                    if server.state.project_authority.is_bridge() {
+                        crate::server::checkout_access::with_selected_project_access(
+                            &server.state.checkout_access,
+                            &project_id,
+                            bbox_indexing::checkout_access::CheckoutAccessKind::RenderFileProvider,
+                            bbox_indexing::checkout_access::CheckoutAccessIntent::Write,
+                            |lease| render(lease.project_root()),
+                        )?
+                    } else {
+                        // Catalog render gates on `render_output` alone. The
+                        // bridge helper first takes a `PublisherConfigTreeRead`
+                        // lease to discover scope, which rides `repo_knowledge`
+                        // (D-032) and would deny a render-capable attachment
+                        // for lacking an unrelated capability; the catalog row
+                        // already carries the scope.
+                        let broker = &server.state.checkout_access;
+                        let lease = crate::tools::graph::acquire_catalog_project_lease(
+                            &server,
+                            broker,
+                            &project_id,
+                            bbox_indexing::checkout_access::CheckoutAccessKind::RenderFileProvider,
+                            bbox_indexing::checkout_access::CheckoutAccessIntent::Write,
+                        )?;
+                        let rendered = render(lease.project_root());
+                        broker.revalidate(&lease).map_err(anyhow::Error::new)?;
+                        rendered?
+                    }
                 }
             } else {
                 let scope_project = p.scope_project.as_deref().or(p.project.as_deref());
