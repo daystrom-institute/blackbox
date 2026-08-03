@@ -20,6 +20,11 @@ use bbox_corpus_core::project_catalog::{
     ProjectId, ProjectScope,
 };
 
+use crate::accepted_publication_runtime::{
+    AcceptedPublicationRuntime, ERROR_ACCEPTED_PUBLICATION_REF_MOVED,
+    ERROR_ACCEPTED_PUBLICATION_SCOPE_ADVANCE_REQUIRED, PublishError, PublishReceipt,
+    PublishRequest, PublishSources, PublisherPublishMode,
+};
 use crate::project_catalog_store::{
     ProjectCatalogCommit, ProjectCatalogStore, ProjectCatalogStoreError,
 };
@@ -801,6 +806,177 @@ fn apply_scope_migration(
     Ok(())
 }
 
+/// Daemon-probed publish evidence (plan §7.2 steps 3 to 11).
+///
+/// The tool layer resolved the requested ref inside the attachment's
+/// checkout, read the committed project identity and both source lanes at
+/// that commit, and can re-resolve the ref on demand. Admin never opens a
+/// checkout, exactly like every other operation in this module.
+pub struct PublisherPublishProbe {
+    /// The commit the full ref resolved to during preparation.
+    pub resolved_commit: String,
+    /// The published scope declared by the committed project identity at
+    /// that commit.
+    pub committed_scope: PublishedScope,
+    pub sources: PublishSources,
+    /// Re-resolves the full ref immediately before the pointer swap, from
+    /// inside the publication lock (plan §7.3 step 6). `None` means the ref
+    /// no longer resolves at all.
+    pub revalidate_ref: Box<dyn Fn() -> Option<String> + Send + Sync>,
+}
+
+pub struct PublisherPublishRequest {
+    pub mode: PublisherPublishMode,
+    pub project_id: ProjectId,
+    pub attachment_id: AttachmentId,
+    pub full_ref: String,
+    pub expected_epoch: u64,
+    pub dry_run: bool,
+}
+
+/// Establish or advance one project's accepted publication.
+///
+/// Ordering is the whole safety argument. Catalog and attachment
+/// validation, Git resolution, source capture, normalization, encoding, and
+/// the generation write all happen before the publication lock exists. The
+/// lock covers token verification, the freshness recheck, one atomic
+/// pointer replacement, and read-back (plan §4.6).
+///
+/// Errors keep the refusing layer's own code: a stale epoch stays a catalog
+/// refusal, a token mismatch stays an accepted-publication conflict.
+pub fn publish_accepted_publication(
+    store: &ProjectCatalogStore,
+    runtime: &AcceptedPublicationRuntime,
+    request: &PublisherPublishRequest,
+    probe: PublisherPublishProbe,
+) -> std::result::Result<PublishReceipt, PublishError> {
+    let state = store
+        .snapshot()
+        .map_err(|error| PublishError::refusal(error.code(), error.to_string()))?;
+    if state.epoch() != request.expected_epoch {
+        return Err(PublishError::refusal(
+            "error.project_catalog_stale_epoch",
+            "expected epoch does not match the current catalog epoch",
+        ));
+    }
+    let Some(project) = state.catalog().projects.get(&request.project_id) else {
+        return Err(PublishError::refusal(
+            "error.project_catalog_admin_unknown_project",
+            "the requested project is not in the catalog",
+        ));
+    };
+    let ProjectScope::Published(catalog_scope) = &project.scope else {
+        return Err(PublishError::refusal(
+            "error.project_catalog_admin_scope_required",
+            "a legacy-local project has no published scope to publish at",
+        ));
+    };
+    validate_publisher_attachment(
+        &state,
+        &request.project_id,
+        &request.attachment_id,
+        catalog_scope,
+    )?;
+    // The committed identity at the accepted commit must agree with the
+    // catalog's CURRENT scope. That is what makes an advance the operation
+    // which clears a scope-migration bridge: the new generation is always
+    // published at the scope the catalog holds now (plan §4.9).
+    if &probe.committed_scope != catalog_scope {
+        return Err(PublishError::refusal(
+            "error.project_catalog_admin_scope_mismatch",
+            "the committed project identity at the accepted commit declares a different scope \
+             than the catalog's current published scope",
+        ));
+    }
+
+    let prepared = runtime.prepare_publish(
+        PublishRequest {
+            mode: request.mode.clone(),
+            project_id: request.project_id.clone(),
+            attachment_id: request.attachment_id.clone(),
+            scope: catalog_scope.clone(),
+            full_ref: request.full_ref.clone(),
+            accepted_commit: probe.resolved_commit.clone(),
+            dry_run: request.dry_run,
+        },
+        probe.sources,
+    )?;
+    if request.dry_run {
+        // Nothing durable was written, so there is nothing to commit and
+        // nothing to roll back.
+        return Ok(PublishReceipt::dry_run(&prepared));
+    }
+
+    let expected_epoch = request.expected_epoch;
+    let project_id = request.project_id.clone();
+    let attachment_id = request.attachment_id.clone();
+    let catalog_scope = catalog_scope.clone();
+    let resolved_commit = probe.resolved_commit.clone();
+    let revalidate_ref = probe.revalidate_ref;
+    runtime.commit_publish(prepared, &mut || {
+        let fresh = store
+            .snapshot()
+            .map_err(|error| PublishError::refusal(error.code(), error.to_string()))?;
+        if fresh.epoch() != expected_epoch {
+            return Err(PublishError::refusal(
+                "error.project_catalog_stale_epoch",
+                "the catalog changed while the publish was being committed",
+            ));
+        }
+        validate_publisher_attachment(&fresh, &project_id, &attachment_id, &catalog_scope)?;
+        // A ref that moved after preparation would install a generation
+        // naming a commit the ref no longer points at.
+        match revalidate_ref() {
+            Some(commit) if commit == resolved_commit => Ok(()),
+            _ => Err(PublishError::refusal(
+                ERROR_ACCEPTED_PUBLICATION_REF_MOVED,
+                "the full ref moved between preparation and the pointer swap",
+            )),
+        }
+    })
+}
+
+/// The attachment rules every publish shares: same project, attached, scope
+/// agreement with the catalog, and the recorded repo-knowledge capability.
+fn validate_publisher_attachment(
+    state: &crate::project_catalog_store::ProjectCatalogState,
+    project_id: &ProjectId,
+    attachment_id: &AttachmentId,
+    catalog_scope: &PublishedScope,
+) -> std::result::Result<(), PublishError> {
+    let Some(row) = state.attachments().attachments.get(attachment_id) else {
+        return Err(PublishError::refusal(
+            "error.project_catalog_admin_unknown_attachment",
+            "the named attachment is not in the store",
+        ));
+    };
+    if &row.project_id != project_id {
+        return Err(PublishError::refusal(
+            "error.project_catalog_admin_attachment_project_mismatch",
+            "the named attachment belongs to another project",
+        ));
+    }
+    if row.status != AttachmentStatus::Attached {
+        return Err(PublishError::refusal(
+            "error.project_catalog_admin_attachment_detached",
+            "a detached attachment cannot publish",
+        ));
+    }
+    if row.validated_scope.as_ref() != Some(catalog_scope) {
+        return Err(PublishError::refusal(
+            "error.project_catalog_admin_scope_mismatch",
+            "the named attachment does not carry the catalog's current published scope",
+        ));
+    }
+    if !row.capabilities.repo_knowledge {
+        return Err(PublishError::refusal(
+            "error.project_capability_denied",
+            "the named attachment does not carry the repo_knowledge capability",
+        ));
+    }
+    Ok(())
+}
+
 /// Daemon-probed publisher-bind evidence: the tool layer proved the new
 /// attachment's object database contains the pointer's accepted commit
 /// (the containment a later advance and overlay recomputation need).
@@ -886,6 +1062,22 @@ pub fn bind_publisher_attachment(
         ));
     };
     let limits = AcceptedPublicationLimits::default();
+    // Bind is attachment-only, so it cannot move a pointer to a new scope.
+    // While the catalog's scope and the pointer's accepted scope disagree,
+    // the publication bridge is open and only an advance at the current
+    // scope closes it (plan §7.5 step 5, §4.9).
+    if let Some((pointer, _)) = crate::accepted_publication_store::installed_pointer_tokens_locked(
+        &paths, &guard, project_id, &limits,
+    )
+    .map_err(|error| admin_error(error.code(), error.to_string()))?
+        && pointer.accepted_scope != attachment_scope
+    {
+        return Err(admin_error(
+            ERROR_ACCEPTED_PUBLICATION_SCOPE_ADVANCE_REQUIRED,
+            "the accepted scope predates the catalog's current published scope; advance at the \
+             current scope before rebinding",
+        ));
+    }
     // Freshness recheck immediately before the swap: catalog transactions
     // (detach) do not take the publication lock (plan §11 lock order keeps
     // the pointer store's lock independent), so a detach can still commit

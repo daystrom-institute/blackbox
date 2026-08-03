@@ -22,10 +22,15 @@ use bbox_corpus_core::project_catalog::{AttachmentId, ProjectId};
 use parking_lot::RwLock;
 
 use crate::accepted_publication_store::{
+    AcceptedGapSourceV1, AcceptedKnowledgeSourceV1, AcceptedPublicationBuildInputV1,
+    AcceptedPublicationFaultInjector, AcceptedPublicationGenerationId,
     AcceptedPublicationGenerationV1, AcceptedPublicationLimits, AcceptedPublicationLockGuard,
-    AcceptedPublicationStoreError, AcceptedPublicationStorePaths,
-    VerifiedAcceptedPublicationSelectionV1, acquire_accepted_publication_lock,
-    pointer_generation_roots_locked, probe_global_store_locked,
+    AcceptedPublicationPointerV1, AcceptedPublicationPriorPointerV1, AcceptedPublicationStoreError,
+    AcceptedPublicationStorePaths, FullPublisherRef, GitObjectId, PointerExpectationV1,
+    PreparedAcceptedPublicationV1, VerifiedAcceptedPublicationSelectionV1,
+    acquire_accepted_publication_lock, commit_pointer_locked, install_generation_off_lock,
+    installed_pointer_tokens_locked, pointer_generation_roots_locked,
+    prepare_accepted_publication_v1, probe_global_store_locked,
     verify_selected_with_binding_locked,
 };
 
@@ -58,6 +63,25 @@ pub const ERROR_ACCEPTED_PUBLICATION_MISSING: &str = "error.accepted_publication
 /// (plan section 4.8).
 pub const ERROR_ACCEPTED_PUBLICATION_REPAIR_REQUIRED: &str =
     "error.accepted_publication_repair_required";
+
+/// An advance presented compare-and-swap tokens that do not match the
+/// installed pointer, or an establish found a pointer already present.
+pub const ERROR_ACCEPTED_PUBLICATION_POINTER_CONFLICT: &str =
+    "error.accepted_publication_pointer_conflict";
+/// The full ref moved between preparation and the pointer swap, so the
+/// accepted commit this generation names is no longer what the ref points
+/// at.
+pub const ERROR_ACCEPTED_PUBLICATION_REF_MOVED: &str = "error.accepted_publication_ref_moved";
+/// The catalog's current published scope differs from the accepted scope,
+/// and only an advance at the current scope clears the bridge.
+pub const ERROR_ACCEPTED_PUBLICATION_SCOPE_ADVANCE_REQUIRED: &str =
+    "error.accepted_publication_scope_advance_required";
+/// A dry-run preparation was handed to the commit path.
+pub const ERROR_ACCEPTED_PUBLICATION_DRY_RUN: &str = "error.accepted_publication_dry_run";
+/// Internal marker: the caller's freshness recheck refused. The caller's
+/// own refusal is what surfaces, never this code.
+const ERROR_ACCEPTED_PUBLICATION_FRESHNESS_REFUSED: &str =
+    "error.accepted_publication_freshness_refused";
 
 /// Failure detail retained per project by a startup scan. The scan visits
 /// every catalog project, so the report is capped and reports how many
@@ -509,6 +533,200 @@ impl ProtectedGenerationRoots {
     }
 }
 
+/// The two publish modes (plan §6.5, D-040).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublisherPublishMode {
+    /// Create a project's first pointer. Carries no expected-pointer
+    /// token: absence under the lock is the whole precondition, and a
+    /// present pointer is a conflict rather than an overwrite.
+    Establish,
+    /// Move an existing pointer. Carries the pointer-specific
+    /// compare-and-swap tokens, because the catalog epoch does not
+    /// serialize a store the catalog does not own.
+    Advance {
+        expected_generation_id: String,
+        expected_pointer_sha256: String,
+    },
+}
+
+/// One committed source file, byte-exact as the publisher read it at the
+/// accepted commit.
+#[derive(Debug, Clone)]
+pub struct PublishSourceFile {
+    pub repository_relative_filename: String,
+    pub source_bytes: Vec<u8>,
+}
+
+/// Both lanes of one publication. Knowledge and gaps travel together
+/// because the codec binds them into one generation (plan §4.7).
+#[derive(Debug, Clone, Default)]
+pub struct PublishSources {
+    pub knowledge: Vec<PublishSourceFile>,
+    pub gaps: Vec<PublishSourceFile>,
+}
+
+/// A publish request after the caller has resolved Git and read sources.
+#[derive(Debug, Clone)]
+pub struct PublishRequest {
+    pub mode: PublisherPublishMode,
+    pub project_id: ProjectId,
+    pub attachment_id: AttachmentId,
+    /// The catalog's current published scope. Advance always publishes at
+    /// this scope, which is what clears a scope-migration bridge.
+    pub scope: PublishedScope,
+    pub full_ref: String,
+    pub accepted_commit: String,
+    pub dry_run: bool,
+}
+
+/// The off-lock preparation result (plan §6.6).
+///
+/// It carries no durable mutation receipt. For a real run the generation
+/// bytes are already installed when this exists; for a dry run nothing has
+/// been written and `commit_publish` refuses it.
+#[derive(Debug, Clone)]
+pub struct PreparedPublish {
+    project_id: ProjectId,
+    expectation: PointerExpectationV1,
+    prepared: PreparedAcceptedPublicationV1,
+    generation_installed: bool,
+    dry_run: bool,
+}
+
+impl PreparedPublish {
+    pub fn project_id(&self) -> &ProjectId {
+        &self.project_id
+    }
+
+    pub fn generation_id(&self) -> &str {
+        self.prepared.generation_id.as_str()
+    }
+
+    pub fn generation_hash(&self) -> &str {
+        self.prepared.generation_hash.as_str()
+    }
+
+    /// Digest of the pointer this preparation would install.
+    pub fn pointer_sha256(&self) -> &str {
+        self.prepared.pointer_hash.as_str()
+    }
+
+    pub fn is_dry_run(&self) -> bool {
+        self.dry_run
+    }
+
+    /// False when the content-addressed generation was already present
+    /// with identical bytes, which is a resumed preparation.
+    pub fn generation_installed(&self) -> bool {
+        self.generation_installed
+    }
+
+    pub fn counts(&self) -> &AcceptedPublicationCountsV1 {
+        &self.prepared.generation.counts
+    }
+}
+
+/// The durable outcome of one publish.
+#[derive(Debug, Clone)]
+pub struct PublishReceipt {
+    generation_id: String,
+    generation_hash: String,
+    pointer_sha256: String,
+    previous_pointer_sha256: Option<String>,
+    dry_run: bool,
+}
+
+impl PublishReceipt {
+    /// The receipt a dry run produces: the identities the real publish
+    /// would install, and the explicit statement that nothing was written.
+    pub fn dry_run(prepared: &PreparedPublish) -> Self {
+        Self {
+            generation_id: prepared.generation_id().to_string(),
+            generation_hash: prepared.generation_hash().to_string(),
+            pointer_sha256: prepared.pointer_sha256().to_string(),
+            previous_pointer_sha256: None,
+            dry_run: true,
+        }
+    }
+
+    pub fn generation_id(&self) -> &str {
+        &self.generation_id
+    }
+
+    pub fn generation_hash(&self) -> &str {
+        &self.generation_hash
+    }
+
+    /// The compare-and-swap token a following advance must present.
+    pub fn pointer_sha256(&self) -> &str {
+        &self.pointer_sha256
+    }
+
+    pub fn previous_pointer_sha256(&self) -> Option<&str> {
+        self.previous_pointer_sha256.as_deref()
+    }
+
+    pub fn is_dry_run(&self) -> bool {
+        self.dry_run
+    }
+}
+
+/// A publish failure that keeps the refusing layer's own vocabulary.
+///
+/// Accepted-publication failures carry their `error.accepted_publication_*`
+/// code; a caller's freshness refusal carries the caller's code verbatim,
+/// because relabelling a stale-epoch or detached-attachment refusal as a
+/// publication error would lose the operator's actual repair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishError {
+    code: String,
+    detail: String,
+}
+
+impl PublishError {
+    /// Build a refusal from a caller-owned stable code, for use inside a
+    /// freshness recheck.
+    pub fn refusal(code: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            detail: detail
+                .into()
+                .chars()
+                .map(|ch| if ch.is_control() { ' ' } else { ch })
+                .take(512)
+                .collect(),
+        }
+    }
+
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl fmt::Display for PublishError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.detail)
+    }
+}
+
+impl std::error::Error for PublishError {}
+
+impl From<AcceptedPublicationStoreError> for PublishError {
+    fn from(error: AcceptedPublicationStoreError) -> Self {
+        Self::refusal(error.code(), error.to_string())
+    }
+}
+
+impl From<AcceptedPublicationRuntimeError> for PublishError {
+    fn from(error: AcceptedPublicationRuntimeError) -> Self {
+        Self::refusal(error.code(), error.detail())
+    }
+}
+
 #[derive(Debug, Default)]
 struct ProjectCacheEntry {
     /// Retained across a binding change: rebinding a pointer to another
@@ -537,6 +755,9 @@ pub struct AcceptedPublicationRuntime {
     paths: AcceptedPublicationStorePaths,
     limits: AcceptedPublicationLimits,
     cache: RwLock<BTreeMap<ProjectId, ProjectCacheEntry>>,
+    /// Test-only interruption hook for the publish transaction. Production
+    /// leaves it `None`.
+    faults: Option<Arc<dyn AcceptedPublicationFaultInjector>>,
 }
 
 impl AcceptedPublicationRuntime {
@@ -560,6 +781,7 @@ impl AcceptedPublicationRuntime {
             paths,
             limits: AcceptedPublicationLimits::default(),
             cache: RwLock::new(BTreeMap::new()),
+            faults: None,
         })
     }
 
@@ -680,6 +902,202 @@ impl AcceptedPublicationRuntime {
             protected.roots.insert(project_id, roots);
         }
         Ok(protected)
+    }
+
+    /// Off-lock preparation (plan §7.2 and §4.6).
+    ///
+    /// Everything expensive happens here: normalization, dual-lane
+    /// validation, encoding, and the immutable generation write with its
+    /// fsync. The publication lock is taken only for the brief token read
+    /// that builds an advance's prior arm, never across encoding or the
+    /// generation write. A dry run stops before any durable write.
+    pub fn prepare_publish(
+        &self,
+        request: PublishRequest,
+        sources: PublishSources,
+    ) -> Result<PreparedPublish, PublishError> {
+        let full_ref = FullPublisherRef::parse(request.full_ref)?;
+        let accepted_commit = GitObjectId::parse(request.accepted_commit)?;
+        let (expectation, prior_pointer) = match &request.mode {
+            PublisherPublishMode::Establish => (PointerExpectationV1::Establish, None),
+            PublisherPublishMode::Advance {
+                expected_generation_id,
+                expected_pointer_sha256,
+            } => {
+                let expected_generation =
+                    AcceptedPublicationGenerationId::parse(expected_generation_id.clone())?;
+                let expected_pointer_sha256 =
+                    PublicationSha256::parse(expected_pointer_sha256.clone())?;
+                // One short locked read: the prior arm must be the exact
+                // pointer this advance intends to replace, and presenting
+                // the wrong token here fails before any encoding work.
+                let guard = self.lock()?;
+                let installed = installed_pointer_tokens_locked(
+                    &self.paths,
+                    &guard,
+                    &request.project_id,
+                    &self.limits,
+                )?;
+                drop(guard);
+                let Some((pointer, digest)) = installed else {
+                    return Err(PublishError::refusal(
+                        ERROR_ACCEPTED_PUBLICATION_POINTER_CONFLICT,
+                        "advance requires an installed pointer; establish creates the first one",
+                    ));
+                };
+                if digest != expected_pointer_sha256
+                    || pointer.accepted_generation != expected_generation
+                {
+                    return Err(PublishError::refusal(
+                        ERROR_ACCEPTED_PUBLICATION_POINTER_CONFLICT,
+                        "the installed pointer does not match the expected compare-and-swap tokens",
+                    ));
+                }
+                let prior = prior_pointer_from(&pointer);
+                (
+                    PointerExpectationV1::Advance {
+                        expected_generation,
+                        expected_pointer_sha256,
+                    },
+                    Some(prior),
+                )
+            }
+        };
+        let prepared = prepare_accepted_publication_v1(
+            AcceptedPublicationBuildInputV1 {
+                project_id: request.project_id.clone(),
+                attachment_id: request.attachment_id,
+                scope: request.scope,
+                full_ref,
+                accepted_commit,
+                knowledge: sources
+                    .knowledge
+                    .into_iter()
+                    .map(|file| AcceptedKnowledgeSourceV1 {
+                        repository_relative_filename: file.repository_relative_filename,
+                        source_bytes: file.source_bytes,
+                    })
+                    .collect(),
+                gaps: sources
+                    .gaps
+                    .into_iter()
+                    .map(|file| AcceptedGapSourceV1 {
+                        repository_relative_filename: file.repository_relative_filename,
+                        source_bytes: file.source_bytes,
+                    })
+                    .collect(),
+                prior_pointer,
+            },
+            &self.limits,
+        )?;
+        if request.dry_run {
+            return Ok(PreparedPublish {
+                project_id: request.project_id,
+                expectation,
+                prepared,
+                generation_installed: false,
+                dry_run: true,
+            });
+        }
+        let outcome = install_generation_off_lock(
+            &self.paths,
+            &request.project_id,
+            &prepared,
+            self.faults.as_deref(),
+        )?;
+        Ok(PreparedPublish {
+            project_id: request.project_id,
+            expectation,
+            prepared,
+            generation_installed: outcome.created,
+            dry_run: false,
+        })
+    }
+
+    /// Pointer commit under the publication lock (plan §7.3).
+    ///
+    /// `freshness` runs inside the lock immediately before the swap: it is
+    /// where the caller rechecks catalog epoch, attachment status, and the
+    /// live ref. Its refusal propagates verbatim.
+    ///
+    /// D-033 item 1 survives this design and is not claimed closed: catalog
+    /// detach does not take the publication lock, so a detach landing in
+    /// the final window leaves a pointer naming a freshly detached
+    /// attachment. That is a misleading binding, reported by status and
+    /// repaired by bind, never corruption.
+    pub fn commit_publish(
+        &self,
+        prepared: PreparedPublish,
+        freshness: &mut dyn FnMut() -> Result<(), PublishError>,
+    ) -> Result<PublishReceipt, PublishError> {
+        if prepared.dry_run {
+            return Err(PublishError::refusal(
+                ERROR_ACCEPTED_PUBLICATION_DRY_RUN,
+                "a dry-run preparation installs nothing and cannot be committed",
+            ));
+        }
+        let guard = self.lock()?;
+        let mut refusal: Option<PublishError> = None;
+        let receipt = commit_pointer_locked(
+            &self.paths,
+            &guard,
+            &prepared.project_id,
+            &prepared.prepared,
+            &prepared.expectation,
+            &self.limits,
+            self.faults.as_deref(),
+            &mut || match freshness() {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    // Carry the caller's code out around the store's error
+                    // type instead of flattening it into a publication code.
+                    refusal = Some(error);
+                    Err(AcceptedPublicationStoreError::new(
+                        ERROR_ACCEPTED_PUBLICATION_FRESHNESS_REFUSED,
+                        "the caller's freshness recheck refused this publish",
+                    ))
+                }
+            },
+        );
+        drop(guard);
+        let receipt = match receipt {
+            Ok(receipt) => receipt,
+            Err(error) => return Err(refusal.unwrap_or_else(|| error.into())),
+        };
+        // Content identity changed, so every projection of it is stale.
+        self.invalidate_content(&prepared.project_id);
+        Ok(PublishReceipt {
+            generation_id: receipt.generation_id.as_str().to_string(),
+            generation_hash: prepared.prepared.generation_hash.as_str().to_string(),
+            pointer_sha256: receipt.pointer_sha256.as_str().to_string(),
+            previous_pointer_sha256: receipt
+                .previous_pointer_sha256
+                .map(|digest| digest.as_str().to_string()),
+            dry_run: false,
+        })
+    }
+
+    /// The compare-and-swap tokens a following advance must present, or
+    /// `None` when this project has no pointer and must establish first.
+    pub fn advance_tokens(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Option<(String, String)>, AcceptedPublicationRuntimeError> {
+        let guard = self.lock()?;
+        let installed =
+            installed_pointer_tokens_locked(&self.paths, &guard, project_id, &self.limits)
+                .map_err(|error| AcceptedPublicationRuntimeError::from_store(&error))?;
+        Ok(installed.map(|(pointer, digest)| {
+            (
+                pointer.accepted_generation.as_str().to_string(),
+                digest.as_str().to_string(),
+            )
+        }))
+    }
+
+    #[cfg(test)]
+    fn install_fault_injector(&mut self, faults: Arc<dyn AcceptedPublicationFaultInjector>) {
+        self.faults = Some(faults);
     }
 
     fn lock(&self) -> Result<AcceptedPublicationLockGuard, AcceptedPublicationRuntimeError> {
@@ -809,6 +1227,18 @@ impl AcceptedPublicationRuntime {
     }
 }
 
+/// The prior arm an advance carries: the exact pointer it replaces.
+fn prior_pointer_from(pointer: &AcceptedPublicationPointerV1) -> AcceptedPublicationPriorPointerV1 {
+    AcceptedPublicationPriorPointerV1 {
+        attachment_id: pointer.attachment_id.clone(),
+        full_ref: pointer.full_ref.clone(),
+        accepted_commit: pointer.accepted_commit.clone(),
+        accepted_scope: pointer.accepted_scope.clone(),
+        accepted_generation: pointer.accepted_generation.clone(),
+        generation_hash: pointer.generation_hash.clone(),
+    }
+}
+
 fn status_from(project_id: &ProjectId, outcome: &ProjectReadOutcome) -> AcceptedPublicationStatus {
     let (state, content_stamp, binding_stamp, mutation, failure) = match outcome {
         ProjectReadOutcome::Missing => (
@@ -864,7 +1294,7 @@ mod tests {
 
     use crate::accepted_publication_store::fixtures;
     use crate::accepted_publication_store::{
-        AcceptedPublicationGenerationId, AcceptedPublicationLimits,
+        AcceptedPublicationFaultPoint, AcceptedPublicationGenerationId, AcceptedPublicationLimits,
         MAX_ACCEPTED_PUBLICATION_POINTER_BYTES, PreparedAcceptedPublicationV1,
         acquire_accepted_publication_lock, rebind_pointer_attachment_locked,
     };
@@ -876,6 +1306,7 @@ mod tests {
 
     const COMMIT_ONE: &str = "1111111111111111111111111111111111111111";
     const COMMIT_TWO: &str = "2222222222222222222222222222222222222222";
+    const COMMIT_THREE: &str = "3333333333333333333333333333333333333333";
 
     struct Fixture {
         _directory: tempfile::TempDir,
@@ -1433,6 +1864,598 @@ mod tests {
             .unwrap();
         assert!(roots.protects(&pinned, pinned_first.generation_id.as_str()));
         assert!(roots.protects(&pinned, pinned_second.generation_id.as_str()));
+    }
+
+    // ── Publish transaction (plan §13.2, §13.7) ──────────────────────
+
+    fn sources(content: &str) -> PublishSources {
+        PublishSources {
+            knowledge: vec![PublishSourceFile {
+                repository_relative_filename: ".bbox/knowledge/knowledge-a.json".into(),
+                source_bytes: serde_json::to_vec(&fixtures::knowledge_entry(
+                    "knowledge-a",
+                    content,
+                ))
+                .unwrap(),
+            }],
+            gaps: vec![PublishSourceFile {
+                repository_relative_filename: ".bbox/gaps/gap-1234abcd.json".into(),
+                source_bytes: serde_json::to_vec(&fixtures::gap_note("gap-1234abcd")).unwrap(),
+            }],
+        }
+    }
+
+    fn establish_request(project_id: &ProjectId, commit: &str) -> PublishRequest {
+        PublishRequest {
+            mode: PublisherPublishMode::Establish,
+            project_id: project_id.clone(),
+            attachment_id: attachment("a1"),
+            scope: scope(),
+            full_ref: "refs/heads/main".into(),
+            accepted_commit: commit.into(),
+            dry_run: false,
+        }
+    }
+
+    fn advance_request(
+        project_id: &ProjectId,
+        commit: &str,
+        tokens: (String, String),
+    ) -> PublishRequest {
+        PublishRequest {
+            mode: PublisherPublishMode::Advance {
+                expected_generation_id: tokens.0,
+                expected_pointer_sha256: tokens.1,
+            },
+            project_id: project_id.clone(),
+            attachment_id: attachment("a1"),
+            scope: scope(),
+            full_ref: "refs/heads/main".into(),
+            accepted_commit: commit.into(),
+            dry_run: false,
+        }
+    }
+
+    fn run_publish(
+        runtime: &AcceptedPublicationRuntime,
+        request: PublishRequest,
+        content: &str,
+    ) -> Result<PublishReceipt, PublishError> {
+        let prepared = runtime.prepare_publish(request, sources(content))?;
+        runtime.commit_publish(prepared, &mut || Ok(()))
+    }
+
+    #[test]
+    fn establish_creates_the_first_pointer_and_advance_retains_it_as_prior() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let project_id = project("p_publish");
+
+        let established = run_publish(
+            &runtime,
+            establish_request(&project_id, COMMIT_ONE),
+            "first",
+        )
+        .unwrap();
+        assert!(!established.is_dry_run());
+        assert_eq!(established.previous_pointer_sha256(), None);
+        let verified = runtime.load_verified(&project_id).unwrap();
+        assert_eq!(
+            verified.binding_stamp().pointer_sha256(),
+            established.pointer_sha256()
+        );
+        assert_eq!(
+            verified.content_stamp().generation_id(),
+            established.generation_id()
+        );
+        assert_eq!(verified.content_stamp().accepted_commit(), COMMIT_ONE);
+
+        let tokens = runtime.advance_tokens(&project_id).unwrap().unwrap();
+        let advanced = run_publish(
+            &runtime,
+            advance_request(&project_id, COMMIT_TWO, tokens),
+            "second",
+        )
+        .unwrap();
+        assert_eq!(
+            advanced.previous_pointer_sha256(),
+            Some(established.pointer_sha256())
+        );
+        let verified = runtime.load_verified(&project_id).unwrap();
+        assert_eq!(verified.content_stamp().accepted_commit(), COMMIT_TWO);
+        assert_eq!(
+            verified
+                .knowledge_records()
+                .values()
+                .next()
+                .unwrap()
+                .content,
+            "second"
+        );
+
+        // The replaced generation stays referenced as the prior arm, so a
+        // collector must not remove it.
+        let roots = runtime
+            .protected_generation_roots([project_id.clone()])
+            .unwrap();
+        assert!(roots.protects(&project_id, established.generation_id()));
+        assert!(roots.protects(&project_id, advanced.generation_id()));
+    }
+
+    #[test]
+    fn establish_refuses_a_project_that_already_publishes() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let project_id = project("p_second_establish");
+        run_publish(
+            &runtime,
+            establish_request(&project_id, COMMIT_ONE),
+            "first",
+        )
+        .unwrap();
+
+        let error = run_publish(
+            &runtime,
+            establish_request(&project_id, COMMIT_TWO),
+            "second",
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ERROR_ACCEPTED_PUBLICATION_POINTER_CONFLICT);
+        // The refusal changed nothing.
+        assert_eq!(
+            runtime
+                .load_verified(&project_id)
+                .unwrap()
+                .content_stamp()
+                .accepted_commit(),
+            COMMIT_ONE
+        );
+    }
+
+    #[test]
+    fn two_concurrent_establishes_leave_exactly_one_winner() {
+        let fixture = fixture();
+        let project_id = project("p_race_establish");
+        let barrier = StdArc::new(std::sync::Barrier::new(2));
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = ["first", "second"]
+                .into_iter()
+                .map(|content| {
+                    let barrier = StdArc::clone(&barrier);
+                    let fixture = &fixture;
+                    let project_id = project_id.clone();
+                    scope.spawn(move || {
+                        // Both threads prepare fully, then race the swap.
+                        let runtime = fixture.runtime();
+                        let prepared = runtime
+                            .prepare_publish(
+                                establish_request(&project_id, COMMIT_ONE),
+                                sources(content),
+                            )
+                            .unwrap();
+                        barrier.wait();
+                        runtime.commit_publish(prepared, &mut || Ok(()))
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        let winners = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+        assert_eq!(winners, 1, "{outcomes:?}");
+        let loser = outcomes.iter().find_map(|outcome| outcome.as_ref().err());
+        assert_eq!(
+            loser.unwrap().code(),
+            ERROR_ACCEPTED_PUBLICATION_POINTER_CONFLICT
+        );
+        // Whichever won, the installed pointer verifies as its own current
+        // generation and both lanes came from one preparation.
+        let runtime = fixture.runtime();
+        let verified = runtime.load_verified(&project_id).unwrap();
+        assert_eq!(
+            verified.binding_stamp().selection(),
+            AcceptedPublicationSelection::Current
+        );
+        assert_eq!(verified.counts().knowledge_entries, 1);
+        assert_eq!(verified.counts().gap_entries, 1);
+    }
+
+    #[test]
+    fn two_concurrent_advances_at_one_epoch_leave_exactly_one_winner() {
+        let fixture = fixture();
+        let project_id = project("p_race_advance");
+        let setup = fixture.runtime();
+        run_publish(&setup, establish_request(&project_id, COMMIT_ONE), "first").unwrap();
+        let tokens = setup.advance_tokens(&project_id).unwrap().unwrap();
+
+        let barrier = StdArc::new(std::sync::Barrier::new(2));
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = [(COMMIT_TWO, "second"), (COMMIT_THREE, "third")]
+                .into_iter()
+                .map(|(commit, content)| {
+                    let barrier = StdArc::clone(&barrier);
+                    let fixture = &fixture;
+                    let project_id = project_id.clone();
+                    let tokens = tokens.clone();
+                    scope.spawn(move || {
+                        // Both hold the SAME compare-and-swap tokens, which
+                        // is the interleaving a catalog epoch cannot serialize.
+                        let runtime = fixture.runtime();
+                        let prepared = runtime
+                            .prepare_publish(
+                                advance_request(&project_id, commit, tokens),
+                                sources(content),
+                            )
+                            .unwrap();
+                        barrier.wait();
+                        runtime.commit_publish(prepared, &mut || Ok(()))
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_ok()).count(),
+            1,
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .find_map(|outcome| outcome.as_ref().err())
+                .unwrap()
+                .code(),
+            ERROR_ACCEPTED_PUBLICATION_POINTER_CONFLICT
+        );
+        let runtime = fixture.runtime();
+        let verified = runtime.load_verified(&project_id).unwrap();
+        assert_eq!(
+            verified.binding_stamp().selection(),
+            AcceptedPublicationSelection::Current
+        );
+    }
+
+    #[test]
+    fn advance_refuses_stale_generation_and_pointer_tokens() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let project_id = project("p_tokens");
+        run_publish(
+            &runtime,
+            establish_request(&project_id, COMMIT_ONE),
+            "first",
+        )
+        .unwrap();
+        let (generation_id, pointer_sha) = runtime.advance_tokens(&project_id).unwrap().unwrap();
+
+        let wrong_generation = run_publish(
+            &runtime,
+            advance_request(
+                &project_id,
+                COMMIT_TWO,
+                ("c".repeat(64), pointer_sha.clone()),
+            ),
+            "second",
+        )
+        .unwrap_err();
+        assert_eq!(
+            wrong_generation.code(),
+            ERROR_ACCEPTED_PUBLICATION_POINTER_CONFLICT
+        );
+
+        let wrong_pointer = run_publish(
+            &runtime,
+            advance_request(&project_id, COMMIT_TWO, (generation_id, "d".repeat(64))),
+            "second",
+        )
+        .unwrap_err();
+        assert_eq!(
+            wrong_pointer.code(),
+            ERROR_ACCEPTED_PUBLICATION_POINTER_CONFLICT
+        );
+        assert_eq!(
+            runtime
+                .load_verified(&project_id)
+                .unwrap()
+                .content_stamp()
+                .accepted_commit(),
+            COMMIT_ONE
+        );
+    }
+
+    #[test]
+    fn advance_refuses_while_reads_are_served_from_prior() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let project_id = project("p_prior_mutation");
+        run_publish(
+            &runtime,
+            establish_request(&project_id, COMMIT_ONE),
+            "first",
+        )
+        .unwrap();
+        let tokens = runtime.advance_tokens(&project_id).unwrap().unwrap();
+        let second = run_publish(
+            &runtime,
+            advance_request(&project_id, COMMIT_TWO, tokens),
+            "second",
+        )
+        .unwrap();
+        // Damage the current arm: reads fall back to prior, and mutation
+        // must refuse rather than advancing from a damaged pointer.
+        fixtures::corrupt_generation(
+            &fixture.paths,
+            &project_id,
+            &AcceptedPublicationGenerationId::parse(second.generation_id().to_string()).unwrap(),
+        );
+        let runtime = fixture.runtime();
+        assert_eq!(
+            runtime
+                .load_verified(&project_id)
+                .unwrap()
+                .binding_stamp()
+                .selection(),
+            AcceptedPublicationSelection::Prior
+        );
+
+        let tokens = runtime.advance_tokens(&project_id).unwrap().unwrap();
+        let error = run_publish(
+            &runtime,
+            advance_request(&project_id, COMMIT_THREE, tokens),
+            "third",
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ERROR_ACCEPTED_PUBLICATION_REPAIR_REQUIRED);
+    }
+
+    #[test]
+    fn a_dry_run_writes_nothing_and_cannot_be_committed() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let project_id = project("p_dry");
+        let mut request = establish_request(&project_id, COMMIT_ONE);
+        request.dry_run = true;
+
+        let prepared = runtime.prepare_publish(request, sources("first")).unwrap();
+        assert!(prepared.is_dry_run());
+        assert!(!prepared.generation_installed());
+        assert_eq!(prepared.counts().knowledge_entries, 1);
+        // Nothing durable exists: no pointer, no generation directory.
+        assert!(!fixture.paths.pointer(&project_id).exists());
+        assert!(
+            !fixture
+                .paths
+                .generations()
+                .join(project_id.as_str())
+                .exists()
+        );
+
+        let error = runtime
+            .commit_publish(prepared, &mut || Ok(()))
+            .unwrap_err();
+        assert_eq!(error.code(), ERROR_ACCEPTED_PUBLICATION_DRY_RUN);
+    }
+
+    #[test]
+    fn a_freshness_refusal_keeps_its_own_code_and_installs_no_pointer() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let project_id = project("p_freshness");
+        let prepared = runtime
+            .prepare_publish(establish_request(&project_id, COMMIT_ONE), sources("first"))
+            .unwrap();
+        // The generation is durable before the lock; only the pointer is
+        // gated on freshness.
+        assert!(prepared.generation_installed());
+
+        let error = runtime
+            .commit_publish(prepared, &mut || {
+                Err(PublishError::refusal(
+                    "error.project_catalog_stale_epoch",
+                    "the catalog moved",
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_stale_epoch");
+        assert!(!fixture.paths.pointer(&project_id).exists());
+    }
+
+    #[test]
+    fn one_lane_validation_failure_installs_nothing() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let project_id = project("p_badlane");
+        let mut broken = sources("first");
+        broken.gaps[0].source_bytes = b"{not json".to_vec();
+
+        let error = runtime
+            .prepare_publish(establish_request(&project_id, COMMIT_ONE), broken)
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.accepted_publication_invalid_generation"
+        );
+        assert!(!fixture.paths.pointer(&project_id).exists());
+    }
+
+    #[test]
+    fn preparing_the_same_generation_twice_is_idempotent() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let project_id = project("p_idempotent");
+        let first = runtime
+            .prepare_publish(establish_request(&project_id, COMMIT_ONE), sources("first"))
+            .unwrap();
+        assert!(first.generation_installed());
+        let second = runtime
+            .prepare_publish(establish_request(&project_id, COMMIT_ONE), sources("first"))
+            .unwrap();
+        // Same content, same content-derived id, already on disk.
+        assert_eq!(first.generation_id(), second.generation_id());
+        assert!(!second.generation_installed());
+        runtime.commit_publish(second, &mut || Ok(())).unwrap();
+        assert!(runtime.load_verified(&project_id).is_ok());
+    }
+
+    #[derive(Debug)]
+    struct FailAt {
+        point: AcceptedPublicationFaultPoint,
+        corrupt_generation: std::sync::Mutex<Option<(std::path::PathBuf, String)>>,
+    }
+
+    impl AcceptedPublicationFaultInjector for FailAt {
+        fn checkpoint(
+            &self,
+            point: AcceptedPublicationFaultPoint,
+        ) -> Result<(), AcceptedPublicationStoreError> {
+            if point != self.point {
+                return Ok(());
+            }
+            if let Some((path, _)) = self.corrupt_generation.lock().unwrap().take() {
+                // Simulate the generation becoming unreadable between the
+                // swap and the read-back.
+                std::fs::write(path, b"corrupt").unwrap();
+                return Ok(());
+            }
+            Err(AcceptedPublicationStoreError::new(
+                "error.accepted_publication_io",
+                "injected fault",
+            ))
+        }
+    }
+
+    fn runtime_failing_at(
+        fixture: &Fixture,
+        point: AcceptedPublicationFaultPoint,
+    ) -> AcceptedPublicationRuntime {
+        let mut runtime = fixture.runtime();
+        runtime.install_fault_injector(StdArc::new(FailAt {
+            point,
+            corrupt_generation: std::sync::Mutex::new(None),
+        }));
+        runtime
+    }
+
+    #[test]
+    fn every_publish_failpoint_leaves_a_complete_old_or_complete_new_pointer() {
+        use AcceptedPublicationFaultPoint::*;
+
+        for point in [
+            BeforeGenerationInstall,
+            AfterGenerationInstall,
+            BeforePointerTokenCheck,
+            BeforeFreshnessRecheck,
+            BeforePointerSwap,
+            AfterPointerSwap,
+        ] {
+            let fixture = fixture();
+            let project_id = project("p_faults");
+            // Establish a first generation with a clean runtime so every
+            // failpoint is exercised against a real advance.
+            let clean = fixture.runtime();
+            let first =
+                run_publish(&clean, establish_request(&project_id, COMMIT_ONE), "first").unwrap();
+            let tokens = clean.advance_tokens(&project_id).unwrap().unwrap();
+
+            let runtime = runtime_failing_at(&fixture, point);
+            let attempt = runtime
+                .prepare_publish(
+                    advance_request(&project_id, COMMIT_TWO, tokens),
+                    sources("second"),
+                )
+                .and_then(|prepared| runtime.commit_publish(prepared, &mut || Ok(())));
+
+            // Whatever failed, a fresh reader observes ONE complete
+            // publication, never a mixed-lane or half-written state.
+            let reader = fixture.runtime();
+            let verified = reader.load_verified(&project_id).unwrap();
+            assert_eq!(
+                verified.binding_stamp().selection(),
+                AcceptedPublicationSelection::Current,
+                "{point:?}"
+            );
+            assert_eq!(verified.counts().knowledge_entries, 1, "{point:?}");
+            assert_eq!(verified.counts().gap_entries, 1, "{point:?}");
+            let content = verified
+                .knowledge_records()
+                .values()
+                .next()
+                .unwrap()
+                .content
+                .clone();
+            match point {
+                // The swap already happened, so the new publication is
+                // installed even though the transaction reported failure.
+                AfterPointerSwap => {
+                    assert_eq!(content, "second", "{point:?}");
+                    assert_eq!(verified.content_stamp().accepted_commit(), COMMIT_TWO);
+                }
+                _ => {
+                    assert_eq!(content, "first", "{point:?}");
+                    assert_eq!(
+                        verified.content_stamp().generation_id(),
+                        first.generation_id(),
+                        "{point:?}"
+                    );
+                    assert!(attempt.is_err(), "{point:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_back_that_no_longer_verifies_is_reported_after_a_durable_swap() {
+        let fixture = fixture();
+        let project_id = project("p_readback");
+        let clean = fixture.runtime();
+        run_publish(&clean, establish_request(&project_id, COMMIT_ONE), "first").unwrap();
+        let tokens = clean.advance_tokens(&project_id).unwrap().unwrap();
+
+        let mut runtime = fixture.runtime();
+        let prepared = runtime
+            .prepare_publish(
+                advance_request(&project_id, COMMIT_TWO, tokens),
+                sources("second"),
+            )
+            .unwrap();
+        let generation_path = fixture.paths.generation(
+            &project_id,
+            &AcceptedPublicationGenerationId::parse(prepared.generation_id().to_string()).unwrap(),
+        );
+        runtime.install_fault_injector(StdArc::new(FailAt {
+            point: AcceptedPublicationFaultPoint::AfterPointerSwap,
+            corrupt_generation: std::sync::Mutex::new(Some((
+                generation_path,
+                String::from("corrupt"),
+            ))),
+        }));
+
+        let error = runtime
+            .commit_publish(prepared, &mut || Ok(()))
+            .unwrap_err();
+        // Read-back refuses because the installed pointer no longer reads
+        // back as its OWN current generation: the strict verifier finds the
+        // damaged current arm and falls to prior, which is not what this
+        // commit installed.
+        assert_eq!(error.code(), "error.accepted_publication_invalid_pointer");
+        // The pointer swap was durable, so the prior arm is what keeps the
+        // project readable. This is a repair state, not a loss.
+        let reader = fixture.runtime();
+        assert_eq!(
+            reader
+                .load_verified(&project_id)
+                .unwrap()
+                .binding_stamp()
+                .selection(),
+            AcceptedPublicationSelection::Prior
+        );
     }
 
     #[test]

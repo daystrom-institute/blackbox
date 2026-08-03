@@ -46,7 +46,7 @@ pub(crate) struct AcceptedPublicationStoreError {
 }
 
 impl AcceptedPublicationStoreError {
-    fn new(code: &'static str, detail: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, detail: impl Into<String>) -> Self {
         let detail = detail
             .into()
             .chars()
@@ -1781,6 +1781,287 @@ pub(crate) fn probe_global_store_locked(
         }
     }
     Ok(())
+}
+
+/// Stable interruption points in the publish transaction (plan §13.7).
+///
+/// Every point sits at a transaction boundary rather than inside one
+/// durable primitive. The primitives are atomic: a generation file and a
+/// pointer file each become visible whole through one rename, so "write
+/// failed" and "fsync failed" are the same observable durable state as
+/// "did not run". What a fault test must distinguish is which boundary the
+/// process died at, and that is exactly this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum AcceptedPublicationFaultPoint {
+    /// Before the generation file exists durably.
+    BeforeGenerationInstall,
+    /// After the generation is durable, before the publication lock.
+    AfterGenerationInstall,
+    /// Inside the lock, before the expected-pointer tokens are checked.
+    BeforePointerTokenCheck,
+    /// After the tokens verified, before the caller's freshness recheck.
+    BeforeFreshnessRecheck,
+    /// After freshness, immediately before the atomic pointer replacement.
+    BeforePointerSwap,
+    /// After the pointer swap is durable, before read-back verification.
+    AfterPointerSwap,
+}
+
+/// Test-only fault injection for the publish transaction. Production
+/// installs none, so the checkpoint calls are one `Option` test away from
+/// free.
+pub(crate) trait AcceptedPublicationFaultInjector: Send + Sync + fmt::Debug {
+    fn checkpoint(
+        &self,
+        point: AcceptedPublicationFaultPoint,
+    ) -> AcceptedPublicationStoreResult<()>;
+}
+
+fn checkpoint(
+    faults: Option<&dyn AcceptedPublicationFaultInjector>,
+    point: AcceptedPublicationFaultPoint,
+) -> AcceptedPublicationStoreResult<()> {
+    match faults {
+        Some(injector) => injector.checkpoint(point),
+        None => Ok(()),
+    }
+}
+
+fn pointer_conflict(detail: impl Into<String>) -> AcceptedPublicationStoreError {
+    AcceptedPublicationStoreError::new("error.accepted_publication_pointer_conflict", detail)
+}
+
+fn repair_required(detail: impl Into<String>) -> AcceptedPublicationStoreError {
+    AcceptedPublicationStoreError::new("error.accepted_publication_repair_required", detail)
+}
+
+/// What the installed pointer must look like for this commit to proceed.
+///
+/// Establish carries no token at all: absence is the whole precondition, so
+/// a present pointer is a conflict and never an overwrite (D-040). Advance
+/// carries the pointer-specific compare-and-swap tokens, because the
+/// catalog epoch does not serialize a store the catalog does not own
+/// (plan §4.5).
+#[derive(Debug, Clone)]
+pub(crate) enum PointerExpectationV1 {
+    Establish,
+    Advance {
+        expected_generation: AcceptedPublicationGenerationId,
+        expected_pointer_sha256: PublicationSha256,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GenerationInstallOutcomeV1 {
+    /// False when the content-addressed file was already present with
+    /// byte-identical content, which is a resumed preparation rather than
+    /// a new install.
+    pub(crate) created: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PointerCommitReceiptV1 {
+    pub(crate) generation_id: AcceptedPublicationGenerationId,
+    pub(crate) pointer_sha256: PublicationSha256,
+    pub(crate) previous_pointer_sha256: Option<PublicationSha256>,
+}
+
+/// Install one immutable generation off-lock (plan §7.2 steps 15 to 17).
+///
+/// The id is the content digest, so an existing file with identical bytes
+/// is the same generation and the install is idempotent. An existing file
+/// with different bytes under the same id would mean the content addressing
+/// was violated, so it fails closed rather than replacing anything.
+pub(crate) fn install_generation_off_lock(
+    paths: &AcceptedPublicationStorePaths,
+    project_id: &ProjectId,
+    prepared: &PreparedAcceptedPublicationV1,
+    faults: Option<&dyn AcceptedPublicationFaultInjector>,
+) -> AcceptedPublicationStoreResult<GenerationInstallOutcomeV1> {
+    let project_generations = paths.generations().join(project_id.as_str());
+    std::fs::create_dir_all(&project_generations).map_err(accepted_io_error)?;
+    std::fs::create_dir_all(paths.pointers()).map_err(accepted_io_error)?;
+    let directory = NofollowDirectory::open_existing(&project_generations)
+        .map_err(accepted_io_error)?
+        .ok_or_else(|| {
+            AcceptedPublicationStoreError::new(
+                "error.accepted_publication_missing",
+                "accepted-publication generation directory is missing",
+            )
+        })?;
+    let filename = format!("{}.json", prepared.generation_id);
+    if let Some(existing) = directory
+        .read_regular(
+            &filename,
+            prepared.generation_bytes.len().max(1),
+            "accepted-publication generation",
+        )
+        .map_err(accepted_io_error)?
+    {
+        if existing != prepared.generation_bytes {
+            return Err(invalid_generation(
+                "a different generation is already installed under this content id",
+            ));
+        }
+        return Ok(GenerationInstallOutcomeV1 { created: false });
+    }
+    checkpoint(
+        faults,
+        AcceptedPublicationFaultPoint::BeforeGenerationInstall,
+    )?;
+    // One atomic replace: temporary create, write, fsync, rename, parent
+    // fsync. The generation is either absent or complete after a crash.
+    directory
+        .atomic_replace(&filename, &prepared.generation_bytes)
+        .map_err(accepted_io_error)?;
+    checkpoint(
+        faults,
+        AcceptedPublicationFaultPoint::AfterGenerationInstall,
+    )?;
+    Ok(GenerationInstallOutcomeV1 { created: true })
+}
+
+/// Compare-and-swap one pointer under the publication lock (plan §7.3).
+///
+/// The generation this pointer names is already durable before the lock is
+/// taken, so the critical section holds no Git, no source reads, and no
+/// encoding: token verification, the caller's freshness recheck, one atomic
+/// replacement, and read-back.
+///
+/// `freshness` is the caller's recheck (catalog epoch, attachment status,
+/// live ref) executed inside the lock immediately before the swap. Its
+/// refusal is returned verbatim so a catalog refusal keeps its own code.
+pub(crate) fn commit_pointer_locked(
+    paths: &AcceptedPublicationStorePaths,
+    guard: &AcceptedPublicationLockGuard,
+    project_id: &ProjectId,
+    prepared: &PreparedAcceptedPublicationV1,
+    expectation: &PointerExpectationV1,
+    limits: &AcceptedPublicationLimits,
+    faults: Option<&dyn AcceptedPublicationFaultInjector>,
+    freshness: &mut dyn FnMut() -> AcceptedPublicationStoreResult<()>,
+) -> AcceptedPublicationStoreResult<PointerCommitReceiptV1> {
+    ensure_matching_guard(paths, guard)?;
+    limits.validate()?;
+    checkpoint(
+        faults,
+        AcceptedPublicationFaultPoint::BeforePointerTokenCheck,
+    )?;
+    let installed = read_pointer_optional_locked(paths, project_id, limits.max_pointer_bytes)?;
+    let previous_pointer_sha256 = installed
+        .as_deref()
+        .map(|bytes| PublicationSha256::digest(bytes));
+    match (expectation, installed.as_deref()) {
+        (PointerExpectationV1::Establish, None) => {}
+        (PointerExpectationV1::Establish, Some(_)) => {
+            return Err(pointer_conflict(
+                "establish requires pointer absence; this project already publishes",
+            ));
+        }
+        (PointerExpectationV1::Advance { .. }, None) => {
+            return Err(pointer_conflict(
+                "advance requires an installed pointer; establish creates the first one",
+            ));
+        }
+        (
+            PointerExpectationV1::Advance {
+                expected_generation,
+                expected_pointer_sha256,
+            },
+            Some(bytes),
+        ) => {
+            if previous_pointer_sha256.as_ref() != Some(expected_pointer_sha256) {
+                return Err(pointer_conflict(
+                    "the installed pointer digest is not the expected compare-and-swap token",
+                ));
+            }
+            let current = decode_pointer_v1(bytes, limits)?;
+            if &current.accepted_generation != expected_generation {
+                return Err(pointer_conflict(
+                    "the installed pointer names a different accepted generation",
+                ));
+            }
+            // Advancing from a pointer whose current arm does not verify
+            // would discard the evidence a repair needs (plan §4.8).
+            let verified =
+                verify_selected_from_pointer_locked(paths, project_id, bytes.to_vec(), limits)?;
+            if verified.selection != VerifiedAcceptedPublicationSelectionV1::Current {
+                return Err(repair_required(
+                    "the installed pointer is serving its prior generation; repair before advancing",
+                ));
+            }
+            // The prepared prior must be exactly the pointer being
+            // replaced, or this preparation raced another advance.
+            let prepared_prior = prepared.pointer.prior_pointer.as_ref().ok_or_else(|| {
+                pointer_conflict("an advance must carry the replaced pointer as its prior")
+            })?;
+            if prepared_prior.accepted_generation != current.accepted_generation
+                || prepared_prior.generation_hash != current.generation_hash
+                || prepared_prior.accepted_commit != current.accepted_commit
+                || prepared_prior.accepted_scope != current.accepted_scope
+                || prepared_prior.full_ref != current.full_ref
+                || prepared_prior.attachment_id != current.attachment_id
+            {
+                return Err(pointer_conflict(
+                    "the prepared prior pointer does not match the installed pointer",
+                ));
+            }
+        }
+    }
+    checkpoint(
+        faults,
+        AcceptedPublicationFaultPoint::BeforeFreshnessRecheck,
+    )?;
+    freshness()?;
+    checkpoint(faults, AcceptedPublicationFaultPoint::BeforePointerSwap)?;
+    let directory = NofollowDirectory::open_existing(paths.pointers())
+        .map_err(accepted_io_error)?
+        .ok_or_else(|| {
+            AcceptedPublicationStoreError::new(
+                "error.accepted_publication_missing",
+                "accepted-publication pointer directory is missing",
+            )
+        })?;
+    directory
+        .atomic_replace(&format!("{project_id}.json"), &prepared.pointer_bytes)
+        .map_err(accepted_io_error)?;
+    checkpoint(faults, AcceptedPublicationFaultPoint::AfterPointerSwap)?;
+    // Read back through the same strict path a startup scan uses: the
+    // installed bytes must be exactly what was prepared, and they must
+    // still agree with the generation they name.
+    let verified =
+        verify_installed_locked(paths, guard, project_id, &prepared.pointer_hash, limits)?;
+    if verified.selection != VerifiedAcceptedPublicationSelectionV1::Current
+        || verified.generation_id != prepared.generation_id
+    {
+        return Err(invalid_pointer(
+            "the installed pointer did not read back as its own current generation",
+        ));
+    }
+    Ok(PointerCommitReceiptV1 {
+        generation_id: prepared.generation_id.clone(),
+        pointer_sha256: prepared.pointer_hash.clone(),
+        previous_pointer_sha256,
+    })
+}
+
+/// Read the installed pointer's advance tokens without verifying content.
+/// The publisher surface needs them to build the prior arm and to hand a
+/// caller the compare-and-swap tokens for its next advance.
+pub(crate) fn installed_pointer_tokens_locked(
+    paths: &AcceptedPublicationStorePaths,
+    guard: &AcceptedPublicationLockGuard,
+    project_id: &ProjectId,
+    limits: &AcceptedPublicationLimits,
+) -> AcceptedPublicationStoreResult<Option<(AcceptedPublicationPointerV1, PublicationSha256)>> {
+    ensure_matching_guard(paths, guard)?;
+    limits.validate()?;
+    let Some(bytes) = read_pointer_optional_locked(paths, project_id, limits.max_pointer_bytes)?
+    else {
+        return Ok(None);
+    };
+    let digest = PublicationSha256::digest(&bytes);
+    Ok(Some((decode_pointer_v1(&bytes, limits)?, digest)))
 }
 
 /// Phase-2 §7.7: rebind the publisher attachment only. The pointer's full
