@@ -1,0 +1,20 @@
+{
+  "id": "gap-8c0457ba",
+  "title": "bro-pool build lanes accumulate cargo incremental state; incremental defeats sccache and nothing GCs target",
+  "gap_kind": "tooling",
+  "domain": "bro-pool",
+  "wanted_capability": "Pool-lane build hygiene: project_dispatch env for transcript-search should set CARGO_INCREMENTAL=0 alongside RUSTC_WRAPPER=sccache (incremental crates bypass sccache entirely AND leave per-session incremental dirs nothing prunes), plus a periodic target GC or cheap lane recycle (bpool lanes are ZFS clones of a gen with a warm seeded target; recreation is cheaper than letting divergence grow).",
+  "fallback_used": "manual rm -rf of lane-bpool1 target/debug/incremental via pod exec 2026-07-28 (freed ~54G apparent; debug now 46G = seeded deps)",
+  "evidence": [
+    "lane bpool1 (crane): target/debug/incremental 54G apparent across 1246 incremental dirs after 463 bh-test sessions 2026-07-26..28; ZFS USED 69.6G vs 15.5G sibling baseline",
+    "bpool3-6: zero bh-test sessions, pristine ~50G-apparent seeded target, 15.5G USED (clone-shared) - dispatch affinity pins all build/test load to bpool1 (warm-cache-friendly, but concentrates bloat)",
+    "fleet.json project_dispatch for transcript-search: RUSTC_WRAPPER=sccache set, CARGO_INCREMENTAL not set (debug default on)"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-pool/cargo-incremental-target-accumulation",
+  "suggested_owner": "blackbox",
+  "resolution": "unresolved",
+  "created_at": "2026-07-28T14:26:48Z",
+  "updated_at": "2026-07-28T14:26:48Z"
+}
