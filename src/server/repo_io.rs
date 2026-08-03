@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_record::{ProjectRecord, ResolvedCheckoutScope};
 use bbox_gaps::repo_io::{GapRepoCarrier, GapRepoRead, GapRepoWrite};
 use bbox_indexing::checkout_access::{
@@ -17,6 +18,13 @@ use serde::{Deserialize, Serialize};
 const CARRIER_PREFIX: &str = "repoio-v1:";
 const MAX_CARRIER_ID_BYTES: usize = 4 * 1024;
 
+/// What a repository carrier id names.
+///
+/// Every variant is path-free by construction: the carrier's `project` field
+/// is a display value stamped onto loaded entries and never participates in
+/// resolution, and the id itself encodes only logical identity. A caller
+/// holding a stale display path therefore gains no authority over the tree
+/// the operation actually opens.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "selector", rename_all = "snake_case", deny_unknown_fields)]
 enum RepoCarrierTarget {
@@ -26,6 +34,15 @@ enum RepoCarrierTarget {
     Checkout {
         project_id: String,
         checkout_id: String,
+    },
+    /// Native catalog target (plan section 8, P5-E repo-read item 1): the
+    /// attachment is named outright, so no scope-discovery lease precedes
+    /// the operation's own capability gate.
+    Attachment {
+        project_id: String,
+        attachment_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_scope: Option<PublishedScope>,
     },
 }
 
@@ -119,6 +136,46 @@ impl RepoIoAuthority {
         )
     }
 
+    /// Native catalog knowledge carrier. `display` is stamped onto loaded
+    /// entries and is deliberately not authority: resolution uses the
+    /// attachment id alone.
+    // Constructed by the catalog carrier call sites converted in P5-F; P5-E
+    // lands the target variant and its resolution path.
+    #[allow(dead_code)]
+    pub(crate) fn knowledge_attachment_carrier(
+        display: impl Into<String>,
+        project_id: &str,
+        attachment_id: &str,
+        expected_scope: Option<PublishedScope>,
+    ) -> Result<KnowledgeRepoCarrier> {
+        KnowledgeRepoCarrier::new(
+            display,
+            encode_target(&RepoCarrierTarget::Attachment {
+                project_id: project_id.to_owned(),
+                attachment_id: attachment_id.to_owned(),
+                expected_scope,
+            })?,
+        )
+    }
+
+    /// Gap-side counterpart to [`Self::knowledge_attachment_carrier`].
+    #[allow(dead_code)]
+    pub(crate) fn gap_attachment_carrier(
+        display: impl Into<String>,
+        project_id: &str,
+        attachment_id: &str,
+        expected_scope: Option<PublishedScope>,
+    ) -> Result<GapRepoCarrier> {
+        GapRepoCarrier::new(
+            display,
+            encode_target(&RepoCarrierTarget::Attachment {
+                project_id: project_id.to_owned(),
+                attachment_id: attachment_id.to_owned(),
+                expected_scope,
+            })?,
+        )
+    }
+
     fn with_access(
         &self,
         carrier_id: &str,
@@ -129,31 +186,54 @@ impl RepoIoAuthority {
         let target = decode_target(carrier_id)?;
         let project_id = match &target {
             RepoCarrierTarget::Selected { project_id }
-            | RepoCarrierTarget::Checkout { project_id, .. } => project_id,
+            | RepoCarrierTarget::Checkout { project_id, .. }
+            | RepoCarrierTarget::Attachment { project_id, .. } => project_id,
         }
         .clone();
-        let scope_lease = self
-            .broker
-            .acquire(CheckoutAccessRequest {
-                project_id: project_id.clone(),
-                attachment: CheckoutAttachmentSelector::Selected,
-                expected_scope: None,
-                kind: CheckoutAccessKind::PublisherConfigTreeRead,
-                intent: CheckoutAccessIntent::Read,
-                source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
-            })
-            .map_err(anyhow::Error::new)?;
-        let expected_scope = scope_lease.published_scope().cloned();
-        drop(scope_lease);
-        let (attachment, source_lane) = match target {
-            RepoCarrierTarget::Selected { .. } => (
-                CheckoutAttachmentSelector::Selected,
-                CheckoutAccessSourceLane::LegacyProjectRecord,
+        // A native attachment target names its checkout outright, so it needs
+        // no scope-discovery lease. Skipping it also keeps the gate honest:
+        // `PublisherConfigTreeRead` rides `repo_knowledge` (D-032), so
+        // discovering scope through it would make every repository operation
+        // depend on a capability the section 9 table assigns only to the
+        // publisher and overlay lanes.
+        let (attachment, expected_scope, source_lane) = match target {
+            RepoCarrierTarget::Attachment {
+                attachment_id,
+                expected_scope,
+                ..
+            } => (
+                CheckoutAttachmentSelector::AttachmentId(attachment_id),
+                expected_scope,
+                CheckoutAccessSourceLane::NativeAttachment,
             ),
-            RepoCarrierTarget::Checkout { checkout_id, .. } => (
-                CheckoutAttachmentSelector::CheckoutId(checkout_id),
-                CheckoutAccessSourceLane::LegacyCheckoutRegistry,
-            ),
+            legacy => {
+                let scope_lease = self
+                    .broker
+                    .acquire(CheckoutAccessRequest {
+                        project_id: project_id.clone(),
+                        attachment: CheckoutAttachmentSelector::Selected,
+                        expected_scope: None,
+                        kind: CheckoutAccessKind::PublisherConfigTreeRead,
+                        intent: CheckoutAccessIntent::Read,
+                        source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+                    })
+                    .map_err(anyhow::Error::new)?;
+                let expected_scope = scope_lease.published_scope().cloned();
+                drop(scope_lease);
+                match legacy {
+                    RepoCarrierTarget::Selected { .. } => (
+                        CheckoutAttachmentSelector::Selected,
+                        expected_scope,
+                        CheckoutAccessSourceLane::LegacyProjectRecord,
+                    ),
+                    RepoCarrierTarget::Checkout { checkout_id, .. } => (
+                        CheckoutAttachmentSelector::CheckoutId(checkout_id),
+                        expected_scope,
+                        CheckoutAccessSourceLane::LegacyCheckoutRegistry,
+                    ),
+                    RepoCarrierTarget::Attachment { .. } => unreachable!("handled above"),
+                }
+            }
         };
         let lease = self
             .broker
