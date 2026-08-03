@@ -44,6 +44,9 @@ pub enum LegacyMigrationFault {
     InspectBroSource,
     /// Probing whether `~/.bro` is empty after its entries moved.
     ProbeBroEmptiness,
+    /// The standalone presence probe callers outside the migration use to
+    /// prove a path is really absent ([`legacy_entry_present`]).
+    InspectPresence,
     /// Force every publish onto the cross-device staging path, as if the
     /// destination lived on another filesystem.
     RenameCrossDevice,
@@ -55,6 +58,17 @@ pub enum LegacyMigrationFault {
     AfterPublishRecorded,
     /// After the source deletion is durable, before the journal is cleared.
     AfterSourceRemoved,
+    /// Journal replacement boundaries (R35F1). Each site fires once with the
+    /// replacement staged but NOT renamed (the journal still holds the
+    /// PREVIOUS record) and once with it renamed and `$HOME` synced.
+    JournalPrepareBeforeRename,
+    JournalPrepareAfterRename,
+    JournalSwitchToStageBeforeRename,
+    JournalSwitchToStageAfterRename,
+    JournalPublishBeforeRename,
+    JournalPublishAfterRename,
+    JournalRecoverPromoteBeforeRename,
+    JournalRecoverPromoteAfterRename,
 }
 
 static FAULTS_ARMED: AtomicBool = AtomicBool::new(false);
@@ -147,6 +161,17 @@ fn inspect(path: &Path, point: LegacyMigrationFault) -> anyhow::Result<Option<fs
             path.display()
         ))),
     }
+}
+
+/// Whether a legacy migration path is present, with the R34F1 discipline:
+/// only `NotFound` is absence, and any other inspection error propagates.
+///
+/// `pub` because callers outside the migration itself have to prove a path is
+/// really absent before treating that absence as authoritative (R35F2: the
+/// Slack sidecar must not read an absent identity map as an empty ACL while a
+/// migration could still publish it).
+pub fn legacy_entry_present(path: &Path) -> anyhow::Result<bool> {
+    Ok(inspect(path, LegacyMigrationFault::InspectPresence)?.is_some())
 }
 
 /// Whether `path` holds no entries, refusing rather than guessing when the
@@ -267,56 +292,211 @@ fn sync_dir_if_present(path: &Path) -> anyhow::Result<()> {
     }
 }
 
-/// Replace the journal with `record` and make the replacement durable.
-fn write_record(home: &Path, record: &MigrationRecord) -> anyhow::Result<()> {
-    use std::io::{Seek, SeekFrom, Write};
+/// Which transition a journal replacement is recording. Each site owns its own
+/// pair of fault points so a test can interrupt one specific boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JournalWriteSite {
+    /// The intent record, before either name is touched.
+    Prepare,
+    /// The switch to the staged-copy mode after a rename reported EXDEV.
+    SwitchToStage,
+    /// The Prepared -> Published transition, once the destination is durable.
+    Publish,
+    /// Recovery promoting an interrupted Prepared record to Published.
+    RecoverPromote,
+}
+
+impl JournalWriteSite {
+    /// Fires with the replacement staged and synced but NOT yet renamed, so
+    /// the journal still holds the previous record.
+    fn before_rename(self) -> LegacyMigrationFault {
+        match self {
+            Self::Prepare => LegacyMigrationFault::JournalPrepareBeforeRename,
+            Self::SwitchToStage => LegacyMigrationFault::JournalSwitchToStageBeforeRename,
+            Self::Publish => LegacyMigrationFault::JournalPublishBeforeRename,
+            Self::RecoverPromote => LegacyMigrationFault::JournalRecoverPromoteBeforeRename,
+        }
+    }
+
+    /// Fires with the replacement renamed into place and `$HOME` synced.
+    fn after_rename(self) -> LegacyMigrationFault {
+        match self {
+            Self::Prepare => LegacyMigrationFault::JournalPrepareAfterRename,
+            Self::SwitchToStage => LegacyMigrationFault::JournalSwitchToStageAfterRename,
+            Self::Publish => LegacyMigrationFault::JournalPublishAfterRename,
+            Self::RecoverPromote => LegacyMigrationFault::JournalRecoverPromoteAfterRename,
+        }
+    }
+}
+
+/// The prefix every journal staging temporary shares, so recovery can sweep
+/// the debris an interrupted replacement leaves in `$HOME`.
+const JOURNAL_TEMP_PREFIX: &str = ".blackbox-legacy-migration.journal.";
+const JOURNAL_TEMP_SUFFIX: &str = ".tmp";
+/// A journal record is a handful of paths. Anything larger is not ours, and
+/// reading it unbounded would be a denial of service on `$HOME`.
+const JOURNAL_MAX_BYTES: u64 = 64 * 1024;
+
+static JOURNAL_TEMP_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn journal_temp_path(home: &Path) -> PathBuf {
+    let nonce = JOURNAL_TEMP_NONCE.fetch_add(1, Ordering::SeqCst);
+    home.join(format!(
+        "{JOURNAL_TEMP_PREFIX}{}-{nonce}{JOURNAL_TEMP_SUFFIX}",
+        std::process::id()
+    ))
+}
+
+/// Replace the journal with `record` as one atomic durable substitution.
+///
+/// R35F1: this used to open the sole journal, `set_len(0)`, and rewrite in
+/// place. A crash inside that window left the journal EMPTY, which the reader
+/// then treated as "no transaction in flight" — so the next startup saw a
+/// durable destination beside a surviving source, took the
+/// destination-exists branch, and left the source for a differently-rooted
+/// daemon to migrate a second time. That is exactly the duplicate-authority
+/// failure the journal exists to prevent. A partial non-empty rewrite was no
+/// better: it became a permanent parse refusal.
+///
+/// The replacement is now staged in a unique `O_EXCL` sibling, synced, and
+/// renamed over the journal, so every crash leaves either the whole previous
+/// record or the whole new one. Both are recoverable.
+fn write_record(
+    home: &Path,
+    record: &MigrationRecord,
+    site: JournalWriteSite,
+) -> anyhow::Result<()> {
+    use std::io::Write;
 
     let path = legacy_migration_journal_path(home);
     let bytes = serde_json::to_vec_pretty(record)
         .with_context(|| format!("encoding the migration journal {}", path.display()))?;
-    // Same no-follow open as the claim beside it: the journal hangs off
-    // `$HOME`, which no daemon owns.
-    let mut file = bbox_corpus_core::json_store::open_lock_path_nofollow(&path)
-        .with_context(|| format!("opening the migration journal {}", path.display()))?;
-    if !file.metadata()?.file_type().is_file() {
+    if bytes.len() as u64 > JOURNAL_MAX_BYTES {
         anyhow::bail!(
-            "the legacy migration journal is not a regular file: {}",
-            path.display()
+            "the migration journal record for {} exceeds {JOURNAL_MAX_BYTES} bytes",
+            record.source.display()
         );
     }
-    file.set_len(0)
-        .with_context(|| format!("truncating the migration journal {}", path.display()))?;
-    file.seek(SeekFrom::Start(0))
-        .with_context(|| format!("rewinding the migration journal {}", path.display()))?;
-    file.write_all(&bytes)
-        .with_context(|| format!("writing the migration journal {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("fsync the migration journal {}", path.display()))?;
-    drop(file);
-    sync_dir(home)
+
+    let temp = journal_temp_path(home);
+    // `create_new` is O_CREAT|O_EXCL: it cannot adopt existing debris and it
+    // cannot follow a symlink planted at the staging name.
+    let staged = (|| -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()
+    })();
+    if let Err(error) = staged {
+        let _ = fs::remove_file(&temp);
+        return Err(anyhow::Error::new(error).context(format!(
+            "staging the migration journal at {}",
+            temp.display()
+        )));
+    }
+
+    if let Err(error) = checkpoint(site.before_rename(), &temp) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+
+    // Atomic substitution: the journal name never holds a partial record.
+    if let Err(error) = fs::rename(&temp, &path) {
+        let _ = fs::remove_file(&temp);
+        return Err(anyhow::Error::new(error).context(format!(
+            "publishing the migration journal {}",
+            path.display()
+        )));
+    }
+    sync_dir(home)?;
+    checkpoint(site.after_rename(), &path)
+}
+
+/// Remove the staging debris an interrupted journal replacement left behind.
+///
+/// Runs under the source claim, so no other process is staging concurrently.
+fn sweep_journal_temporaries(home: &Path) -> anyhow::Result<()> {
+    let entries = match fs::read_dir(home) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(anyhow::Error::new(error)
+                .context(format!("reading {} for journal debris", home.display())));
+        }
+    };
+    let mut swept = false;
+    for entry in entries {
+        let entry =
+            entry.with_context(|| format!("reading {} for journal debris", home.display()))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with(JOURNAL_TEMP_PREFIX) && name.ends_with(JOURNAL_TEMP_SUFFIX) {
+            fs::remove_file(entry.path()).with_context(|| {
+                format!("removing the journal debris {}", entry.path().display())
+            })?;
+            swept = true;
+        }
+    }
+    if swept {
+        sync_dir(home)?;
+    }
+    Ok(())
 }
 
 /// Read the pending transaction, if there is one.
 ///
-/// A journal that cannot be read or parsed is a refusal, never an assumed
-/// absence: the whole point of the record is that its absence means "nothing
-/// is in flight".
+/// R35F1: a journal that exists but cannot be read, is empty, or does not
+/// parse is a REFUSAL, never an assumed absence. Only the journal's absence
+/// means "nothing is in flight", and conflating the two is what let a
+/// half-written record read as a completed migration.
 fn read_record(home: &Path) -> anyhow::Result<Option<MigrationRecord>> {
     let path = legacy_migration_journal_path(home);
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(anyhow::Error::new(error)
-                .context(format!("reading the migration journal {}", path.display())));
+            return Err(anyhow::Error::new(error).context(format!(
+                "inspecting the migration journal {}",
+                path.display()
+            )));
         }
     };
-    // An empty journal is the file the claim's own open can leave behind.
-    if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
-        return Ok(None);
+    if !metadata.file_type().is_file() {
+        anyhow::bail!(
+            "the legacy migration journal is not a regular file: {}. Inspect it and \
+             remove it by hand before starting the daemon again.",
+            path.display()
+        );
     }
-    let record: MigrationRecord = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parsing the migration journal {}", path.display()))?;
+    if metadata.len() > JOURNAL_MAX_BYTES {
+        anyhow::bail!(
+            "the legacy migration journal {} is {} bytes, larger than the {JOURNAL_MAX_BYTES} \
+             byte bound. Inspect it and remove it by hand before starting the daemon again.",
+            path.display(),
+            metadata.len()
+        );
+    }
+    let bytes = fs::read(&path)
+        .with_context(|| format!("reading the migration journal {}", path.display()))?;
+    if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
+        anyhow::bail!(
+            "the legacy migration journal {} is empty, so an interrupted migration cannot be \
+             classified. Compare the legacy sources against this daemon's resolved stores and \
+             remove the journal by hand before starting the daemon again.",
+            path.display()
+        );
+    }
+    let record: MigrationRecord = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "parsing the migration journal {}. Compare the legacy sources against this daemon's \
+             resolved stores and remove the journal by hand before starting the daemon again",
+            path.display()
+        )
+    })?;
     if record.version != MIGRATION_RECORD_VERSION {
         anyhow::bail!(
             "the migration journal {} has unsupported version {}",
@@ -467,7 +647,7 @@ pub fn migrate_legacy_entry(home: &Path, old: &Path, new: &Path) -> anyhow::Resu
     };
     // Durable BEFORE either name is touched: a crash from here on leaves a
     // record the next holder of the claim can finish or roll back.
-    write_record(home, &record)?;
+    write_record(home, &record, JournalWriteSite::Prepare)?;
 
     // A same-filesystem rename publishes and closes out the source in one
     // atomic step; anything else has to stage.
@@ -480,7 +660,7 @@ pub fn migrate_legacy_entry(home: &Path, old: &Path, new: &Path) -> anyhow::Resu
         Ok(()) => {}
         Err(error) if is_cross_device(&error) => {
             record.mode = MigrationMode::Stage;
-            write_record(home, &record)?;
+            write_record(home, &record, JournalWriteSite::SwitchToStage)?;
             // Debris from an interrupted earlier attempt is overwritten, never
             // adopted.
             remove_any(&record.stage)?;
@@ -508,7 +688,7 @@ pub fn migrate_legacy_entry(home: &Path, old: &Path, new: &Path) -> anyhow::Resu
     // Publication is recorded BEFORE the source is deleted, so a crash in the
     // window below can only roll forward.
     record.phase = MigrationPhase::Published;
-    write_record(home, &record)?;
+    write_record(home, &record, JournalWriteSite::Publish)?;
     checkpoint(LegacyMigrationFault::AfterPublishRecorded, new)?;
 
     // A rename already consumed the source; a staged publish has not.
@@ -528,6 +708,11 @@ pub fn migrate_legacy_entry(home: &Path, old: &Path, new: &Path) -> anyhow::Resu
 /// Runs under the legacy source claim, before any fresh migration, so exactly
 /// one process is ever deciding the fate of a pending record.
 pub fn recover_legacy_migration(home: &Path) -> anyhow::Result<Vec<String>> {
+    // R35F1: an interrupted journal replacement leaves an O_EXCL sibling in
+    // `$HOME`. It is never adopted (each replacement stages under a fresh
+    // unique name), but it should not accumulate either.
+    sweep_journal_temporaries(home)?;
+
     let Some(mut record) = read_record(home)? else {
         return Ok(Vec::new());
     };
@@ -549,7 +734,7 @@ pub fn recover_legacy_migration(home: &Path) -> anyhow::Result<Vec<String>> {
         .is_some()
         {
             record.phase = MigrationPhase::Published;
-            write_record(home, &record)?;
+            write_record(home, &record, JournalWriteSite::RecoverPromote)?;
         } else {
             // Nothing was published; the source is still the authority. Drop
             // the staged debris and let the ordinary pass migrate it again.
@@ -1102,6 +1287,190 @@ mod tests {
                 "{point:?} clears the journal once the transaction is complete"
             );
         }
+    }
+
+    /// R35F1. A crash inside a journal replacement must leave the journal
+    /// holding a WHOLE record, never a truncated or empty one. Every
+    /// replacement boundary is interrupted here, and after each the journal
+    /// must still classify the transaction: the migration completes without
+    /// duplicating the destination and without stranding the source.
+    #[test]
+    fn an_interrupted_journal_replacement_leaves_a_classifiable_record() {
+        for point in [
+            LegacyMigrationFault::JournalPrepareBeforeRename,
+            LegacyMigrationFault::JournalPrepareAfterRename,
+            LegacyMigrationFault::JournalSwitchToStageBeforeRename,
+            LegacyMigrationFault::JournalSwitchToStageAfterRename,
+            LegacyMigrationFault::JournalPublishBeforeRename,
+            LegacyMigrationFault::JournalPublishAfterRename,
+        ] {
+            let dir = tempdir().unwrap();
+            let home = dir.path().canonicalize().unwrap();
+            write_legacy_index_only(&home);
+            let destinations = fixture_destinations(&home.join("state"), &home);
+            let legacy_index = home.join(".claude-shared").join("transcript-index");
+            let journal = legacy_migration_journal_path(&home);
+
+            let faults = arm_legacy_migration_faults(&[
+                (LegacyMigrationFault::RenameCrossDevice, INJECTED_EIO),
+                (point, INJECTED_EIO),
+            ]);
+            assert!(
+                migrate_legacy_defaults(&home, &destinations).is_err(),
+                "the interruption at {point:?} must refuse"
+            );
+            // Whatever survived is a WHOLE record or no record at all: never
+            // the empty file an in-place truncate-and-rewrite could leave.
+            if journal.exists() {
+                let bytes = fs::read(&journal).unwrap();
+                assert!(
+                    !bytes.iter().all(|byte| byte.is_ascii_whitespace()),
+                    "{point:?} left an empty journal, which cannot classify anything"
+                );
+                serde_json::from_slice::<MigrationRecord>(&bytes).unwrap_or_else(|error| {
+                    panic!("{point:?} left an unparseable journal: {error}")
+                });
+            }
+            drop(faults);
+
+            let _retry = arm_legacy_migration_faults(&[(
+                LegacyMigrationFault::RenameCrossDevice,
+                INJECTED_EIO,
+            )]);
+            migrate_legacy_defaults(&home, &destinations)
+                .unwrap_or_else(|error| panic!("{point:?} must be recoverable: {error:#}"));
+
+            assert_index_arrived(&destinations.index_path);
+            assert!(
+                !legacy_index.exists(),
+                "{point:?} leaves no stale source beside the published destination"
+            );
+            assert!(
+                !journal.exists(),
+                "{point:?} clears the journal once the transaction is complete"
+            );
+            assert!(
+                journal_temporaries(&home).is_empty(),
+                "{point:?} leaves no journal staging debris"
+            );
+        }
+    }
+
+    /// R35F1, the impact the finding names. A crash inside the Prepared ->
+    /// Published replacement used to blank the journal, so the next startup
+    /// saw only "durable destination + surviving source" and took
+    /// SkippedDestinationExists. A DIFFERENTLY-ROOTED daemon then found the
+    /// stale source and migrated it into its own roots: two authorities for
+    /// one store. Recovery must close the source out instead.
+    #[test]
+    fn an_interrupted_published_transition_cannot_be_remigrated_by_another_daemon() {
+        for point in [
+            LegacyMigrationFault::JournalPublishBeforeRename,
+            LegacyMigrationFault::JournalPublishAfterRename,
+        ] {
+            let dir = tempdir().unwrap();
+            let home = dir.path().canonicalize().unwrap();
+            write_legacy_index_only(&home);
+            let first = fixture_destinations(&home.join("state-a"), &home);
+            let second = fixture_destinations(&home.join("state-b"), &home);
+            let legacy_index = home.join(".claude-shared").join("transcript-index");
+
+            let faults = arm_legacy_migration_faults(&[
+                (LegacyMigrationFault::RenameCrossDevice, INJECTED_EIO),
+                (point, INJECTED_EIO),
+            ]);
+            assert!(
+                migrate_legacy_defaults(&home, &first).is_err(),
+                "the interruption at {point:?} must refuse"
+            );
+            // The state the finding describes: a durable destination beside a
+            // source that has not been closed out yet.
+            assert_index_arrived(&first.index_path);
+            assert!(legacy_index.exists());
+            drop(faults);
+
+            // A daemon with entirely different roots starts next.
+            let moved = migrate_legacy_defaults(&home, &second).unwrap();
+            assert!(
+                moved.iter().any(|line| line.starts_with("recovered:")),
+                "{point:?} is finished by recovery: {moved:?}"
+            );
+            assert!(
+                !moved.iter().any(|line| line.starts_with("index:")),
+                "{point:?} must not remigrate the stale source: {moved:?}"
+            );
+            assert_index_arrived(&first.index_path);
+            assert!(
+                !second.index_path.exists(),
+                "{point:?} put nothing in the second daemon's roots"
+            );
+            assert!(!legacy_index.exists(), "{point:?} closed the source out");
+        }
+    }
+
+    /// R35F1. An empty or malformed journal is a refusal, not an absence: it
+    /// means an interrupted transaction cannot be classified, and guessing is
+    /// what produced duplicate authority in the first place.
+    #[test]
+    fn an_unclassifiable_journal_refuses_rather_than_reading_as_absent() {
+        for body in ["", "   \n", "{not json", "{\"version\":99}"] {
+            let dir = tempdir().unwrap();
+            let home = dir.path().canonicalize().unwrap();
+            let _faults = arm_legacy_migration_faults(&[]);
+            write_legacy_tree(&home);
+            let state = home.join("state");
+            let destinations = fixture_destinations(&state, &home);
+            fs::write(legacy_migration_journal_path(&home), body).unwrap();
+
+            let error = migrate_legacy_defaults(&home, &destinations)
+                .expect_err("an unclassifiable journal must refuse the startup");
+            assert!(
+                format!("{error:#}").contains("journal"),
+                "the refusal names the journal: {error:#}"
+            );
+            assert!(
+                home.join(".claude-shared")
+                    .join("blackbox-knowledge.json")
+                    .exists(),
+                "the legacy sources are untouched"
+            );
+            assert!(!state.exists(), "no destination was created");
+        }
+    }
+
+    /// R35F1. Interrupted replacements stage under unique O_EXCL siblings,
+    /// which must never be adopted and must not accumulate in `$HOME`.
+    #[test]
+    fn journal_staging_debris_is_swept_and_never_adopted() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        write_legacy_tree(&home);
+        let destinations = fixture_destinations(&home.join("state"), &home);
+
+        // Debris from an interrupted earlier replacement, carrying a record
+        // that points somewhere else entirely.
+        let debris = home.join(format!("{JOURNAL_TEMP_PREFIX}999-0{JOURNAL_TEMP_SUFFIX}"));
+        fs::write(&debris, "{\"version\":1,\"source\":\"/nope\"}").unwrap();
+
+        let _faults = arm_legacy_migration_faults(&[]);
+        let moved = migrate_legacy_defaults(&home, &destinations).unwrap();
+        assert!(moved.iter().any(|line| line.starts_with("knowledge:")));
+        assert!(!debris.exists(), "the debris is swept");
+        assert!(
+            journal_temporaries(&home).is_empty(),
+            "no staging debris survives a completed run"
+        );
+        assert!(destinations.knowledge_path.exists());
+    }
+
+    fn journal_temporaries(home: &Path) -> Vec<String> {
+        fs::read_dir(home)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                name.starts_with(JOURNAL_TEMP_PREFIX) && name.ends_with(JOURNAL_TEMP_SUFFIX)
+            })
+            .collect()
     }
 
     /// The second daemon in the R33F2 scenario, now crossing an interrupted

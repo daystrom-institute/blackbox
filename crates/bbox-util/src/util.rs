@@ -11,8 +11,9 @@ pub use crate::legacy_migration::{
     INJECTED_EACCES, INJECTED_EIO, LEGACY_MIGRATION_JOURNAL_NAME, LEGACY_MIGRATION_LOCK_NAME,
     LegacyMigrationDestinations, LegacyMigrationFault, LegacyMigrationFaultGuard,
     LegacyMigrationLock, LegacyMove, arm_legacy_migration_faults, cross_device_temp_path,
-    legacy_migration_journal_path, legacy_migration_lock_path, migrate_legacy_defaults,
-    migrate_legacy_entry, recover_legacy_migration, try_lock_legacy_migration,
+    legacy_entry_present, legacy_migration_journal_path, legacy_migration_lock_path,
+    migrate_legacy_defaults, migrate_legacy_entry, recover_legacy_migration,
+    try_lock_legacy_migration,
 };
 
 pub const DEFAULT_BLACKBOX_MCP_NAME: &str = "blackbox";

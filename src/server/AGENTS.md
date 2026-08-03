@@ -46,6 +46,14 @@
   either rolls back an unpublished stage or finishes a published one, so a
   crash mid-move cannot leave a committed destination next to a stale source
   for a differently-rooted daemon to migrate again.
+- Journal updates are atomic durable replacements, never in-place rewrites:
+  a unique `O_EXCL` sibling under `.blackbox-legacy-migration.journal.*.tmp`
+  is written, fsynced, renamed over the journal, then `$HOME` is fsynced. An
+  in-place truncate-and-rewrite could leave the journal EMPTY, and an empty
+  journal read as "nothing in flight" is precisely the duplicate-authority
+  failure. A journal that exists but is empty, oversized, non-regular, or
+  unparseable REFUSES startup with an operator-actionable message; only its
+  absence means no transaction. Recovery sweeps stale staging siblings.
 - The vector store is one config-resolved root (`paths.vectors_path`), not a
   derivation. The runtime store, the background embed lane, the migration
   inventory, the retirement discharge and reprobe, and history materialization
