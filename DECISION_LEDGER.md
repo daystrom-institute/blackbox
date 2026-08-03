@@ -1067,3 +1067,47 @@ until a later entry explicitly supersedes it.
 - Revisit only if: a future body field is content-bearing but added
   outside the preimage view (the view struct is the audit point), or
   the advance is ever changed to compare anything other than ids.
+
+## D-040: Publisher establishment is explicit and pointer-absence-gated
+
+- Date: 2026-08-03
+- Phase: durable project catalog, Phase 5 (recorded ahead of P5-C
+  implementation per the Phase 5 plan section 4.4)
+- Status: recorded before implementation; ratification by the Phase 5
+  closing review
+- Decision: the publisher advance surface accepts two request modes,
+  Establish and Advance. Establish creates a project's first
+  accepted-publication pointer and requires, under the publication
+  lock, proof of pointer absence plus one named attachment, a full
+  publisher ref, a resolved accepted commit, committed scope equal to
+  the catalog's current scope, and complete dual-lane knowledge and
+  gap validation. Establish carries no expected-pointer token: pointer
+  presence is a pointer-conflict error, never an overwrite. Advance
+  alone carries the pointer-specific CAS fields (expected catalog
+  epoch, expected generation id, expected pointer SHA-256).
+- Evidence:
+  - Migration may record no_published_content_acknowledged and create
+    no pointer. Without an explicit establishment mode such a project
+    can never begin publishing: Advance requires an existing pointer
+    to CAS against, and bind is attachment-only.
+  - Attachment-only bind cannot choose or validate content identity;
+    plan section 4.4 fixes bind as changing pointer binding bytes
+    only. Overloading bind with first-publication semantics would give
+    one operation two authority shapes.
+  - The Phase 1 store has no advance or establish writer; the first
+    pointer write is a new operation either way, so the mode split
+    costs no compatibility.
+- Rationale: first publication is an authority-creating act, not an
+  update. Gating it on proved absence plus full dual-lane validation
+  makes pointer creation idempotent-hostile by design: two concurrent
+  Establish requests cannot both succeed, and a pointer that exists
+  can only move through the CAS-carrying Advance path.
+- Rejected alternative: overload attachment-only bind to create the
+  first pointer when none exists. Bind validates neither ref, commit,
+  scope, nor lane content, so it would mint unvalidated authority; it
+  also turns a read-repair operation into a write-creation operation
+  depending on store state, which no caller can reason about.
+- Revisit only if: the pointer store ever gains a representation for
+  "project publishes nothing" that is itself a pointer (which would
+  make absence ambiguous), or Establish is ever asked to succeed
+  without a live named attachment.
