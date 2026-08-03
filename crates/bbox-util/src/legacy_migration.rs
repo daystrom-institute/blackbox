@@ -6,8 +6,166 @@
 //! performed, so it owns a claim, a set of resolved destinations, and the
 //! cross-device fallback that a `$HOME`-to-state-dir move can need.
 
+// Sanctioned blocking context (concurrency-model §5, invariant I2): the
+// migration runs on the startup thread, before the daemon binds a listener or
+// spawns any runtime work, so none of these filesystem calls can land on a
+// tokio worker. It is also inherently synchronous — the whole point is that
+// nothing else runs until the move is durable.
+#![allow(clippy::disallowed_methods)]
+
+use anyhow::Context;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// `EACCES`, injected by tests. The value is identical on every platform this
+/// daemon runs on, and the migration only ever compares errnos.
+pub const INJECTED_EACCES: i32 = 13;
+/// `EIO`, injected by tests.
+pub const INJECTED_EIO: i32 = 5;
+/// `EXDEV`. The cross-device rename refusal the staged fallback exists for.
+const EXDEV: i32 = 18;
+
+/// The points the one-time migration crosses that a test can fail on demand.
+///
+/// R34F1/R34F2: both findings are about what the migration does when an
+/// inspection or a durability step fails, and neither is reachable from a
+/// test that can only supply well-behaved files. Faults are injected rather
+/// than provoked with real permissions so the tests are deterministic and do
+/// not depend on the test process being unprivileged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyMigrationFault {
+    /// Inspecting a legacy source entry.
+    InspectSource,
+    /// Inspecting the destination the entry would move to.
+    InspectDestination,
+    /// Inspecting the legacy `~/.bro` directory.
+    InspectBroSource,
+    /// Probing whether `~/.bro` is empty after its entries moved.
+    ProbeBroEmptiness,
+    /// Force every publish onto the cross-device staging path, as if the
+    /// destination lived on another filesystem.
+    RenameCrossDevice,
+    /// After the staged copy is durable, before it is published.
+    AfterStage,
+    /// After the destination name is durable, before publication is recorded.
+    AfterPublish,
+    /// After publication is recorded, before the source is deleted.
+    AfterPublishRecorded,
+    /// After the source deletion is durable, before the journal is cleared.
+    AfterSourceRemoved,
+}
+
+static FAULTS_ARMED: AtomicBool = AtomicBool::new(false);
+static FAULTS: Mutex<Vec<(LegacyMigrationFault, i32)>> = Mutex::new(Vec::new());
+/// Serializes fault-armed tests. Deliberately NOT `test_env_lock`: tests that
+/// arm faults also mutate environment, and the two locks must be takeable
+/// together.
+static FAULT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Holds the armed faults for one test; disarms on drop, including on panic.
+pub struct LegacyMigrationFaultGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for LegacyMigrationFaultGuard {
+    fn drop(&mut self) {
+        FAULTS_ARMED.store(false, Ordering::SeqCst);
+        FAULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+}
+
+/// Arm the listed faults for the lifetime of the returned guard.
+///
+/// A test seam, not an API: production never calls this, and the armed check
+/// is one relaxed atomic load per checkpoint.
+pub fn arm_legacy_migration_faults(
+    faults: &[(LegacyMigrationFault, i32)],
+) -> LegacyMigrationFaultGuard {
+    let lock = FAULT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    {
+        let mut armed = FAULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        armed.clear();
+        armed.extend_from_slice(faults);
+    }
+    FAULTS_ARMED.store(true, Ordering::SeqCst);
+    LegacyMigrationFaultGuard { _lock: lock }
+}
+
+fn injected_errno(point: LegacyMigrationFault) -> Option<i32> {
+    if !FAULTS_ARMED.load(Ordering::Relaxed) {
+        return None;
+    }
+    FAULTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(armed, _)| *armed == point)
+        .map(|(_, errno)| *errno)
+}
+
+/// Fail at `point` when a test has armed it.
+fn checkpoint(point: LegacyMigrationFault, subject: &Path) -> anyhow::Result<()> {
+    match injected_errno(point) {
+        None => Ok(()),
+        Some(errno) => Err(anyhow::Error::new(std::io::Error::from_raw_os_error(errno))
+            .context(format!("injected {point:?} fault at {}", subject.display()))),
+    }
+}
+
+/// Whether an error is the kernel's cross-filesystem rename refusal.
+fn is_cross_device(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(EXDEV)
+}
+
+/// Inspect one migration entry without collapsing inspection failures into
+/// absence.
+///
+/// R34F1: `Path::exists()` and `Path::is_dir()` map EVERY error — `EACCES` on
+/// a parent component, `EIO` from a failing device — onto `false`. A transient
+/// inspection failure therefore read as "the legacy source is not there", the
+/// migration reported it skipped, and startup went on to create a fresh
+/// destination. The next startup then took the destination-exists branch and
+/// stranded the legacy source permanently. Only `NotFound` is absence here;
+/// every other error propagates and refuses the startup before any destination
+/// is created.
+fn inspect(path: &Path, point: LegacyMigrationFault) -> anyhow::Result<Option<fs::Metadata>> {
+    checkpoint(point, path)?;
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(anyhow::Error::new(error).context(format!(
+            "inspecting the legacy migration entry {}",
+            path.display()
+        ))),
+    }
+}
+
+/// Whether `path` holds no entries, refusing rather than guessing when the
+/// directory cannot be read.
+///
+/// R34F1: the old probe was `read_dir(...).map(...).unwrap_or(false)`, which
+/// treated an unreadable directory as non-empty. That direction happens to be
+/// the safe one, but it hid the failure; the caller now sees it.
+fn directory_is_empty(path: &Path) -> anyhow::Result<bool> {
+    checkpoint(LegacyMigrationFault::ProbeBroEmptiness, path)?;
+    let mut entries = fs::read_dir(path)
+        .with_context(|| format!("reading the legacy directory {}", path.display()))?;
+    match entries.next() {
+        None => Ok(true),
+        Some(Ok(_)) => Ok(false),
+        Some(Err(error)) => Err(anyhow::Error::new(error)
+            .context(format!("reading the legacy directory {}", path.display()))),
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum LegacyMove {
@@ -56,12 +214,12 @@ pub fn migrate_legacy_file_across_devices(old: &Path, new: &Path) -> anyhow::Res
 }
 
 pub fn migrate_legacy_file(old: &Path, new: &Path) -> anyhow::Result<LegacyMove> {
-    if !old.exists() {
+    if inspect(old, LegacyMigrationFault::InspectSource)?.is_none() {
         return Ok(LegacyMove::SkippedMissing {
             old: old.to_path_buf(),
         });
     }
-    if new.exists() {
+    if inspect(new, LegacyMigrationFault::InspectDestination)?.is_some() {
         return Ok(LegacyMove::SkippedDestinationExists {
             old: old.to_path_buf(),
             new: new.to_path_buf(),
@@ -74,7 +232,7 @@ pub fn migrate_legacy_file(old: &Path, new: &Path) -> anyhow::Result<LegacyMove>
 
     // Try atomic rename first
     if let Err(e) = fs::rename(old, new) {
-        if e.raw_os_error() == Some(18) {
+        if is_cross_device(&e) {
             // EXDEV: Cross-device link
             migrate_legacy_file_across_devices(old, new).map_err(|error| {
                 error.context(format!(
@@ -234,7 +392,9 @@ pub fn migrate_legacy_defaults(
     // Task 3: ~/.bro/ migration
     let old_bro = home.join(".bro");
     let new_bro = destinations.bro_home.clone();
-    if old_bro.is_dir() {
+    let old_bro_is_dir = inspect(&old_bro, LegacyMigrationFault::InspectBroSource)?
+        .is_some_and(|metadata| metadata.is_dir());
+    if old_bro_is_dir {
         for entry in fs::read_dir(&old_bro)? {
             let entry = entry?;
             let old_path = entry.path();
@@ -256,13 +416,18 @@ pub fn migrate_legacy_defaults(
                 _ => {}
             }
         }
-        // If empty after migration, try to remove old dir
-        if old_bro
-            .read_dir()
-            .map(|mut d| d.next().is_none())
-            .unwrap_or(false)
+        // If empty after migration, try to remove old dir. The PROBE refuses
+        // on an inspection failure (R34F1); the removal itself stays
+        // best-effort, because an empty legacy directory strands nothing and
+        // the next startup simply finds it empty again.
+        if directory_is_empty(&old_bro)?
+            && let Err(error) = fs::remove_dir(&old_bro)
+            && error.kind() != std::io::ErrorKind::NotFound
         {
-            let _ = fs::remove_dir(&old_bro);
+            tracing::warn!(
+                "could not remove the emptied legacy directory {}: {error}",
+                old_bro.display()
+            );
         }
     }
 
@@ -415,6 +580,128 @@ mod tests {
             "the staging name does not survive the rename"
         );
         assert!(!old.exists(), "the source is removed only after the rename");
+    }
+
+    /// R34F1. `Path::exists()` collapses `EACCES` into `false`, so a legacy
+    /// source the daemon merely could not read reported as already migrated.
+    /// The migration must refuse instead, and it must refuse before it creates
+    /// anything at the destination: a created destination is what makes the
+    /// next startup take the destination-exists branch and strand the source
+    /// permanently.
+    #[test]
+    fn an_unreadable_legacy_source_refuses_instead_of_reporting_it_absent() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        write_legacy_tree(&home);
+        let state = home.join("state");
+        let destinations = fixture_destinations(&state, &home);
+
+        let _faults =
+            arm_legacy_migration_faults(&[(LegacyMigrationFault::InspectSource, INJECTED_EACCES)]);
+        let error = migrate_legacy_defaults(&home, &destinations)
+            .expect_err("an unreadable legacy source must refuse the startup");
+        assert!(
+            format!("{error:#}").contains("InspectSource"),
+            "the refusal names the inspection that failed: {error:#}"
+        );
+
+        assert!(
+            !state.exists(),
+            "the refusal must not create any destination"
+        );
+        assert!(
+            home.join(".claude-shared")
+                .join("blackbox-knowledge.json")
+                .exists(),
+            "the legacy source is untouched"
+        );
+    }
+
+    /// R34F1. The destination probe fails open the same way: an `EIO` while
+    /// inspecting the destination read as "the destination is not there" and
+    /// the migration went on to rename onto a path it had not really
+    /// inspected.
+    #[test]
+    fn an_unreadable_destination_refuses_before_creating_it() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        write_legacy_tree(&home);
+        let state = home.join("state");
+        let destinations = fixture_destinations(&state, &home);
+
+        let _faults = arm_legacy_migration_faults(&[(
+            LegacyMigrationFault::InspectDestination,
+            INJECTED_EIO,
+        )]);
+        let error = migrate_legacy_defaults(&home, &destinations)
+            .expect_err("an uninspectable destination must refuse the startup");
+        assert!(
+            format!("{error:#}").contains("InspectDestination"),
+            "the refusal names the inspection that failed: {error:#}"
+        );
+
+        assert!(
+            !state.exists(),
+            "the refusal must not create any destination"
+        );
+        assert!(
+            home.join(".claude-shared")
+                .join("blackbox-knowledge.json")
+                .exists()
+        );
+    }
+
+    /// R34F1. `old_bro.is_dir()` was the same fail-open shape: an unreadable
+    /// `~/.bro` reported as "not a directory" and the whole orchestration
+    /// state was silently left behind.
+    #[test]
+    fn an_unreadable_bro_directory_refuses_instead_of_reporting_it_absent() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        write_legacy_tree(&home);
+        let state = home.join("state");
+        let destinations = fixture_destinations(&state, &home);
+
+        let _faults = arm_legacy_migration_faults(&[(
+            LegacyMigrationFault::InspectBroSource,
+            INJECTED_EACCES,
+        )]);
+        let error = migrate_legacy_defaults(&home, &destinations)
+            .expect_err("an unreadable legacy bro home must refuse the startup");
+        assert!(
+            format!("{error:#}").contains("InspectBroSource"),
+            "the refusal names the inspection that failed: {error:#}"
+        );
+        assert!(
+            home.join(".bro").join("tasks.json").exists(),
+            "the legacy orchestration state is untouched"
+        );
+        assert!(
+            !destinations.bro_home.exists(),
+            "no bro destination was created"
+        );
+    }
+
+    /// R34F1. The post-migration emptiness probe swallowed its errors too.
+    #[test]
+    fn a_failed_bro_emptiness_probe_refuses() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        write_legacy_tree(&home);
+        let destinations = fixture_destinations(&home.join("state"), &home);
+
+        let _faults =
+            arm_legacy_migration_faults(&[(LegacyMigrationFault::ProbeBroEmptiness, INJECTED_EIO)]);
+        let error = migrate_legacy_defaults(&home, &destinations)
+            .expect_err("an unreadable legacy bro home must refuse the startup");
+        assert!(
+            format!("{error:#}").contains("ProbeBroEmptiness"),
+            "the refusal names the probe that failed: {error:#}"
+        );
+        assert!(
+            home.join(".bro").exists(),
+            "the emptied legacy directory is left for the next startup"
+        );
     }
 
     #[test]

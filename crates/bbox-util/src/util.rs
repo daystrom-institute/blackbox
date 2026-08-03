@@ -8,9 +8,11 @@ use std::path::{Path, PathBuf};
 /// enough to own one), but every caller reaches it through `util::`, so the
 /// surface is re-exported here rather than repointed across four crates.
 pub use crate::legacy_migration::{
-    LEGACY_MIGRATION_LOCK_NAME, LegacyMigrationDestinations, LegacyMigrationLock, LegacyMove,
-    cross_device_temp_path, legacy_migration_lock_path, migrate_legacy_defaults,
-    migrate_legacy_file, migrate_legacy_file_across_devices, try_lock_legacy_migration,
+    INJECTED_EACCES, INJECTED_EIO, LEGACY_MIGRATION_LOCK_NAME, LegacyMigrationDestinations,
+    LegacyMigrationFault, LegacyMigrationFaultGuard, LegacyMigrationLock, LegacyMove,
+    arm_legacy_migration_faults, cross_device_temp_path, legacy_migration_lock_path,
+    migrate_legacy_defaults, migrate_legacy_file, migrate_legacy_file_across_devices,
+    try_lock_legacy_migration,
 };
 
 pub const DEFAULT_BLACKBOX_MCP_NAME: &str = "blackbox";

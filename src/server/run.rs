@@ -211,6 +211,97 @@ mod tests {
         assert!(state.join("bro").join("tasks.json").exists());
     }
 
+    /// The R34F1 regression, driven through startup itself. An upgrading
+    /// daemon that cannot INSPECT a legacy source (a transient `EACCES` on the
+    /// parent, an `EIO` from the device) used to be told the source was
+    /// absent, report the migration skipped, and go on to open a fresh
+    /// destination. The next startup then saw the destination exist, took the
+    /// destination-exists branch, and stranded the legacy source for good.
+    ///
+    /// Startup must refuse, and it must refuse having created no destination
+    /// at all — that is what keeps the next startup on the migrating path.
+    #[test]
+    fn a_failed_legacy_inspection_refuses_startup_without_creating_a_destination() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonicalize the fixture");
+        let home = root.join("home");
+        let state = root.join("state");
+
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_CONFIG", root.join("absent-config.toml"));
+        env.set("BLACKBOX_STATE_DIR", &state);
+        env.set("TRANSCRIPT_SEARCH_INDEX_PATH", root.join("index"));
+        env.set("BLACKBOX_VECTORS_PATH", root.join("vectors"));
+        env.set("BLACKBOX_GLOBAL_COMMON_MD", root.join("BLACKBOX.md"));
+        for var in [
+            "BLACKBOX_KNOWLEDGE_PATH",
+            "BLACKBOX_THREADS_PATH",
+            "BLACKBOX_NOTES_PATH",
+            "BRO_HOME",
+        ] {
+            env.remove(var);
+        }
+        let cfg = crate::config::load().expect("load the daemon config");
+
+        let legacy = home.join(".claude-shared");
+        std::fs::create_dir_all(&legacy).expect("create the legacy tree");
+        std::fs::write(legacy.join("blackbox-knowledge.json"), b"[]").expect("legacy knowledge");
+        std::fs::create_dir_all(home.join(".bro")).expect("create the legacy bro home");
+        std::fs::write(home.join(".bro").join("tasks.json"), b"[]").expect("legacy bro state");
+
+        let roots = vec![InstanceRoot::state_root(state.clone())];
+
+        for (point, errno) in [
+            (
+                crate::util::LegacyMigrationFault::InspectSource,
+                crate::util::INJECTED_EACCES,
+            ),
+            (
+                crate::util::LegacyMigrationFault::InspectDestination,
+                crate::util::INJECTED_EIO,
+            ),
+        ] {
+            let faults = crate::util::arm_legacy_migration_faults(&[(point, errno)]);
+            let error = claim_roots_then_migrate(&home, &cfg, &roots)
+                .expect_err("an uninspectable legacy entry must refuse the startup");
+            assert!(
+                format!("{error:#}").contains(&format!("{point:?}")),
+                "the refusal names the inspection that failed: {error:#}"
+            );
+            drop(faults);
+
+            // The legacy sources are intact and nothing was created at any
+            // destination beyond the lock the claim itself had to open.
+            assert!(legacy.join("blackbox-knowledge.json").exists());
+            assert!(home.join(".bro").join("tasks.json").exists());
+            let residue: Vec<String> = std::fs::read_dir(&state)
+                .expect("the claim created the state root")
+                .map(|entry| {
+                    entry
+                        .expect("read the state root")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            assert_eq!(
+                residue,
+                vec!["instance.lock".to_string()],
+                "the refused startup leaves only the lock file it had to open"
+            );
+        }
+
+        // With the fault gone the same startup migrates, which is what the
+        // refusals above deferred rather than lost.
+        let (_locks, migrated) =
+            claim_roots_then_migrate(&home, &cfg, &roots).expect("a readable legacy tree migrates");
+        assert!(
+            migrated.iter().any(|line| line.starts_with("knowledge:")),
+            "the migration runs once the inspection succeeds: {migrated:?}"
+        );
+        assert!(state.join("blackbox-knowledge.json").exists());
+    }
+
     /// The R33F2 regression, driven through the surface the finding names:
     /// two daemons isolated ONLY by `[paths].state_dir` in their own config
     /// files, sharing one `$HOME` and therefore one legacy source tree.
