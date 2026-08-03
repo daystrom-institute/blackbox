@@ -10,18 +10,26 @@ use bbox_gaps::gaps::{
     BlockingLevel, GapImpact, GapKind, GapNote, GapResolution, GapStore, GapViewMetadata,
 };
 use bbox_gaps::overlay::{
-    GapOverlayKey, GapOverlayRecomputeError, GapOverlayRecomputeErrorKind, GapOverlaySnapshot,
-    GapOverlayStatus, GapOverlayValue, GapTransientPreservationOutcome, PublishedGapEntry,
-    PublishedGapSnapshot, WorkingGapSnapshot, load_published_snapshot_at_commit,
+    AcceptedPublishedGapDigests, CatalogGapOverlayPublished, GapOverlayKey,
+    GapOverlayRecomputeError, GapOverlayRecomputeErrorKind, GapOverlaySnapshot, GapOverlayStatus,
+    GapOverlayValue, GapTransientPreservationOutcome, PublishedGapEntry, PublishedGapSnapshot,
+    WorkingGapSnapshot, load_published_snapshot_at_commit,
+    recompute_catalog_overlay_result as recompute_catalog_gap_overlay_result,
     recompute_overlay_result,
 };
 use bbox_indexing::accepted_publication_runtime::{
     AcceptedBlockingLevelV1, AcceptedGapEntryV1, AcceptedGapImpactV1, AcceptedGapKindV1,
     AcceptedGapResolutionV1, AcceptedPublicationContentStamp, VerifiedAcceptedPublication,
 };
+use bbox_indexing::checkout_access::ValidatedCheckoutLease;
 use bbox_knowledge::overlay::ProvisionalMode;
 
 use super::BlackboxServer;
+use super::knowledge_view::{
+    CatalogOverlayAttachment, ERROR_OVERLAY_ACCEPTED_CONTENT_CHANGED,
+    ERROR_OVERLAY_BASELINE_UNAVAILABLE, ERROR_OVERLAY_SNAPSHOT_STALE,
+    ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE, OverlayDegradation, basename,
+};
 
 #[derive(Clone)]
 pub(crate) struct PublishedGapCacheEntry {
@@ -43,6 +51,12 @@ pub(crate) struct CatalogPublishedGapCacheEntry {
 pub(crate) struct SessionGapView {
     pub(crate) gaps: GapStore,
     pub(crate) built_from: BuiltFromTable,
+    /// Includes the bounded reason for every checkout `all` omitted.
+    ///
+    /// The knowledge lane also carries those reasons as typed rows in its
+    /// structured response; the gap response is assembled by its tool from
+    /// this channel alone, so one bounded line per omitted peer is the
+    /// whole report here.
     pub(crate) diagnostics: Vec<String>,
 }
 
@@ -244,6 +258,7 @@ impl BlackboxServer {
                 requested_project,
                 requested_project_id.as_deref(),
                 mode,
+                session_checkout.as_deref(),
                 &mut gaps,
                 &mut metadata,
                 &mut built_from,
@@ -478,6 +493,7 @@ impl BlackboxServer {
         requested_selector: Option<&str>,
         requested_project_id: Option<&str>,
         mode: ProvisionalMode,
+        session_checkout: Option<&ResolvedCheckoutScope>,
         gaps: &mut Vec<bbox_gaps::gaps::GapNote>,
         metadata: &mut BTreeMap<String, GapViewMetadata>,
         built_from: &mut BuiltFromTable,
@@ -525,25 +541,271 @@ impl BlackboxServer {
                 published_ref: published.published_ref,
                 publisher_commit: published.publisher_commit,
             });
-            for (id, entry) in published.gaps {
-                metadata.insert(
-                    id,
-                    GapViewMetadata {
-                        built_from_ref: Some(published_ref.clone()),
-                        compatibility_lane: None,
-                    },
-                );
-                gaps.push(entry.gap);
+            // The project's published rows are assembled as a map first so
+            // an own-checkout tombstone can retract one before it reaches
+            // the view, exactly as the bridge does.
+            let mut project_gaps = published
+                .gaps
+                .into_iter()
+                .map(|(id, entry)| {
+                    metadata.insert(
+                        id.clone(),
+                        GapViewMetadata {
+                            built_from_ref: Some(published_ref.clone()),
+                            compatibility_lane: None,
+                        },
+                    );
+                    (id, entry.gap)
+                })
+                .collect::<BTreeMap<_, _>>();
+
+            match mode {
+                // Published ignores overlay failure entirely: accepted
+                // content is authority and needs no checkout (D-007).
+                ProvisionalMode::Published => {}
+                ProvisionalMode::Own => self.apply_catalog_own_gap_overlay(
+                    &target.project_id,
+                    &verified,
+                    session_checkout,
+                    &mut project_gaps,
+                    metadata,
+                    built_from,
+                    diagnostics,
+                )?,
+                ProvisionalMode::All => self.append_catalog_all_gap_overlays(
+                    &target.project_id,
+                    &verified,
+                    gaps,
+                    metadata,
+                    built_from,
+                    diagnostics,
+                )?,
             }
-            if mode != ProvisionalMode::Published {
-                diagnostics.push(format!(
-                    "project {}: provisional gap overlays for catalog projects land with the \
-                     phase-5 catalog overlay baseline path",
-                    target.project_id
-                ));
+            gaps.extend(project_gaps.into_values());
+        }
+        Ok(())
+    }
+
+    /// Apply the session checkout's own provisional gap layer, or refuse.
+    ///
+    /// `own` is the strict mode for the same reason as its knowledge twin:
+    /// the caller named one checkout, and no other attachment's ancestry
+    /// may stand in for it (D-007).
+    #[allow(clippy::too_many_arguments)] // one accumulator per view output
+    fn apply_catalog_own_gap_overlay(
+        &self,
+        project_id: &ProjectId,
+        verified: &VerifiedAcceptedPublication,
+        session_checkout: Option<&ResolvedCheckoutScope>,
+        project_gaps: &mut BTreeMap<String, GapNote>,
+        metadata: &mut BTreeMap<String, GapViewMetadata>,
+        built_from: &mut BuiltFromTable,
+        diagnostics: &mut Vec<String>,
+    ) -> Result<()> {
+        let Some(own) = session_checkout.filter(|own| own.project_id == project_id.as_str()) else {
+            return Ok(());
+        };
+        let attachment = self
+            .catalog_overlay_attachment(project_id, &own.checkout_id)
+            .context("selecting the attachment carrying the session checkout")?
+            .map_err(|degradation| {
+                anyhow::anyhow!(
+                    "{ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE}: {}",
+                    degradation.diagnostic_line()
+                )
+            })?;
+        let snapshot = self
+            .refresh_catalog_gap_overlay(verified, &attachment)
+            .map_err(|degradation| {
+                anyhow::anyhow!(
+                    "{ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE}: {}",
+                    degradation.diagnostic_line()
+                )
+            })?;
+        if snapshot.status != GapOverlayStatus::Valid {
+            anyhow::bail!(
+                "{ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE}: project {project_id} checkout {}: {}",
+                own.checkout_id,
+                snapshot.diagnostics.join("; ")
+            );
+        }
+        diagnostics.extend(snapshot.diagnostics.iter().map(|diagnostic| {
+            format!(
+                "project {project_id} gap checkout {}: {diagnostic}",
+                snapshot.key.checkout_id
+            )
+        }));
+        let overlay_ref = intern_gap_overlay_stamp(built_from, &snapshot, diagnostics);
+        for (id, value) in snapshot.values {
+            match value {
+                GapOverlayValue::Upsert { mut gap, .. } => {
+                    stamp_catalog_gap(&mut gap, project_id, &snapshot.key.checkout_id);
+                    metadata.insert(id.clone(), overlay_gap_metadata(overlay_ref.as_deref()));
+                    project_gaps.insert(id, *gap);
+                }
+                GapOverlayValue::Tombstone => {
+                    project_gaps.remove(&id);
+                    metadata.remove(&id);
+                }
             }
         }
         Ok(())
+    }
+
+    /// Add every peer checkout's provisional gaps, omitting only the peers
+    /// that failed and reporting each one.
+    fn append_catalog_all_gap_overlays(
+        &self,
+        project_id: &ProjectId,
+        verified: &VerifiedAcceptedPublication,
+        gaps: &mut Vec<GapNote>,
+        metadata: &mut BTreeMap<String, GapViewMetadata>,
+        built_from: &mut BuiltFromTable,
+        diagnostics: &mut Vec<String>,
+    ) -> Result<()> {
+        for attachment in self.catalog_active_overlay_attachments(project_id)? {
+            let degraded = match self.refresh_catalog_gap_overlay(verified, &attachment) {
+                Ok(snapshot) if snapshot.status == GapOverlayStatus::Valid => {
+                    add_catalog_gap_overlay_rows(
+                        project_id,
+                        &snapshot,
+                        gaps,
+                        metadata,
+                        built_from,
+                        diagnostics,
+                    );
+                    continue;
+                }
+                Ok(snapshot) => OverlayDegradation {
+                    project_id: project_id.as_str().to_string(),
+                    checkout_id: attachment.checkout_id.clone(),
+                    attachment_id: Some(attachment.attachment_id.clone()),
+                    code: ERROR_OVERLAY_SNAPSHOT_STALE,
+                    detail: snapshot.diagnostics.join("; "),
+                    transient: false,
+                },
+                Err(degradation) => degradation,
+            };
+            // The peer is omitted, never faked: its bounded reason is the
+            // report.
+            diagnostics.push(degraded.diagnostic_line());
+        }
+        Ok(())
+    }
+
+    /// Recompute one catalog checkout's provisional gap overlay against
+    /// verified accepted content.
+    ///
+    /// The knowledge twin in `knowledge_view.rs` carries the reasoning for
+    /// the shape; the two lanes differ only in which committed directory
+    /// they diff and which store they publish into.
+    pub(crate) fn refresh_catalog_gap_overlay(
+        &self,
+        verified: &VerifiedAcceptedPublication,
+        attachment: &CatalogOverlayAttachment,
+    ) -> std::result::Result<GapOverlaySnapshot, OverlayDegradation> {
+        let _refresh = self.state.gap_overlay_refresh.lock();
+        let content_stamp = verified.content_stamp();
+        let scope = content_stamp.accepted_scope().clone();
+        let key = GapOverlayKey {
+            published_scope: scope.clone(),
+            checkout_id: attachment.checkout_id.clone(),
+        };
+
+        let generation = self.state.gap_overlays.write().begin_refresh(key.clone());
+        let prior = self
+            .state
+            .gap_overlays
+            .read()
+            .get(&scope, &attachment.checkout_id)
+            .cloned();
+        let prior_is_valid = prior
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.status == GapOverlayStatus::Valid);
+
+        let failure = match self.compute_catalog_gap_overlay(verified, attachment, &scope, || {}) {
+            Ok(snapshot) => {
+                self.state
+                    .gap_overlays
+                    .write()
+                    .publish_if_latest(generation, snapshot.clone());
+                return Ok(snapshot);
+            }
+            Err(failure) => failure,
+        };
+
+        // Bounded preservation for transient failures only. A structural
+        // failure carries `transient = false` by construction, so a missing
+        // accepted commit or an absent merge base can never be masked by a
+        // stale valid snapshot (plan section 4.12).
+        if failure.transient && prior_is_valid {
+            let mut preserved = prior.expect("prior valid snapshot");
+            preserved.diagnostics = vec![failure.diagnostic_line()];
+            match self
+                .state
+                .gap_overlays
+                .write()
+                .preserve_transient_if_latest(generation, preserved.clone())
+            {
+                GapTransientPreservationOutcome::Preserved { .. }
+                | GapTransientPreservationOutcome::Superseded => return Ok(preserved),
+                GapTransientPreservationOutcome::Exhausted => {}
+            }
+        }
+        self.state.gap_overlays.write().publish_if_latest(
+            generation,
+            invalid_gap_overlay(&key, failure.diagnostic_line()),
+        );
+        Err(failure)
+    }
+
+    /// One checkout positioned against accepted gap content, with the lease
+    /// and the accepted identity both proved after the capture.
+    ///
+    /// `after_capture` runs inside the capture window. Production passes a
+    /// no-op; it is the test seam for movement at the exact point these
+    /// proofs exist to catch.
+    fn compute_catalog_gap_overlay(
+        &self,
+        verified: &VerifiedAcceptedPublication,
+        attachment: &CatalogOverlayAttachment,
+        scope: &PublishedScope,
+        after_capture: impl FnMut(),
+    ) -> std::result::Result<GapOverlaySnapshot, OverlayDegradation> {
+        let content_stamp = verified.content_stamp();
+        let project_id = content_stamp.project_id();
+        let published = accepted_gap_digests(verified);
+        let lease = self.acquire_catalog_overlay_lease(project_id, attachment, scope)?;
+        let snapshot = stable_catalog_gap_overlay(
+            CatalogGapOverlayPublished {
+                published_scope: scope,
+                checkout_id: &attachment.checkout_id,
+                full_ref: content_stamp.full_ref(),
+                accepted_commit: content_stamp.accepted_commit(),
+                accepted_generation: content_stamp.generation_id(),
+                published: &published,
+            },
+            &lease,
+            after_capture,
+        )
+        .map_err(|error| gap_recompute_degradation(project_id, attachment, &error))?;
+        self.state
+            .checkout_access
+            .revalidate(&lease)
+            .map_err(|error| {
+                OverlayDegradation::from_checkout_access(project_id, Some(attachment), &error)
+            })?;
+        if !self.catalog_accepted_content_unchanged(content_stamp) {
+            return Err(OverlayDegradation {
+                project_id: project_id.as_str().to_string(),
+                checkout_id: attachment.checkout_id.clone(),
+                attachment_id: Some(attachment.attachment_id.clone()),
+                code: ERROR_OVERLAY_ACCEPTED_CONTENT_CHANGED,
+                detail: "accepted content advanced while the overlay was being computed".into(),
+                transient: false,
+            });
+        }
+        Ok(snapshot)
     }
 
     /// Project accepted gap records once per accepted content identity; the
@@ -752,6 +1014,181 @@ fn intern_gap_overlay_stamp(
         merge_base: stamp.merge_base.clone(),
         working_fingerprint: stamp.working_fingerprint.clone(),
     }))
+}
+
+// ── Catalog gap overlay baseline path (plan section 8, P5-D) ─────────────
+
+/// Stamp one catalog overlay gap row.
+///
+/// `project` is a checkout path and a catalog row has none, so identity
+/// travels in `project_id`, matching the published rows beside it. The
+/// provisional checkout id stays, because that is what makes the row a
+/// checkout's claim rather than published truth.
+fn stamp_catalog_gap(gap: &mut GapNote, project_id: &ProjectId, checkout_id: &str) {
+    gap.project = None;
+    gap.project_id = Some(project_id.as_str().to_string());
+    gap.provisional_checkout_id = Some(checkout_id.to_string());
+}
+
+/// Merge one valid peer snapshot's provisional gaps into the view.
+fn add_catalog_gap_overlay_rows(
+    project_id: &ProjectId,
+    snapshot: &GapOverlaySnapshot,
+    gaps: &mut Vec<GapNote>,
+    metadata: &mut BTreeMap<String, GapViewMetadata>,
+    built_from: &mut BuiltFromTable,
+    diagnostics: &mut Vec<String>,
+) {
+    diagnostics.extend(snapshot.diagnostics.iter().map(|diagnostic| {
+        format!(
+            "project {project_id} gap checkout {}: {diagnostic}",
+            snapshot.key.checkout_id
+        )
+    }));
+    let overlay_ref = intern_gap_overlay_stamp(built_from, snapshot, diagnostics);
+    for (id, value) in &snapshot.values {
+        match value {
+            GapOverlayValue::Upsert { gap, .. } => {
+                let mut gap = (**gap).clone();
+                stamp_catalog_gap(&mut gap, project_id, &snapshot.key.checkout_id);
+                // A peer's row is a distinct entity, never a replacement
+                // for the published one it varies from.
+                gap.id = provisional_gap_ref(&snapshot.key.checkout_id, &gap.id);
+                metadata.insert(gap.id.clone(), overlay_gap_metadata(overlay_ref.as_deref()));
+                gaps.push(gap);
+            }
+            // A peer's tombstone is a diagnostic, never a deletion: one
+            // peer may not retract another's published rows.
+            GapOverlayValue::Tombstone => diagnostics.push(format!(
+                "checkout {} tombstones gap {id}",
+                snapshot.key.checkout_id
+            )),
+        }
+    }
+}
+
+/// An empty invalid snapshot for one gap overlay key. The bridge builds
+/// this from a `ResolvedCheckoutScope`; a catalog refresh has no such
+/// compatibility carrier and builds it from the key it already reserved.
+fn invalid_gap_overlay(key: &GapOverlayKey, diagnostic: String) -> GapOverlaySnapshot {
+    GapOverlaySnapshot {
+        snapshot_id: String::new(),
+        key: key.clone(),
+        stamp: None,
+        status: GapOverlayStatus::Invalid,
+        values: BTreeMap::new(),
+        diagnostics: vec![diagnostic],
+    }
+}
+
+fn gap_recompute_degradation(
+    project_id: &ProjectId,
+    attachment: &CatalogOverlayAttachment,
+    error: &GapOverlayRecomputeError,
+) -> OverlayDegradation {
+    let (code, detail, transient) = match error.kind {
+        GapOverlayRecomputeErrorKind::BaselineUnavailable => (
+            ERROR_OVERLAY_BASELINE_UNAVAILABLE,
+            "the checkout does not contain the accepted commit or shares no merge base with it",
+            false,
+        ),
+        GapOverlayRecomputeErrorKind::InvalidContent => (
+            ERROR_OVERLAY_SNAPSHOT_STALE,
+            "the checkout's gap files are not valid published content",
+            false,
+        ),
+        GapOverlayRecomputeErrorKind::Transient => (
+            ERROR_OVERLAY_SNAPSHOT_STALE,
+            "the checkout did not settle into a stable overlay snapshot",
+            true,
+        ),
+    };
+    tracing::debug!(
+        project_id = %project_id,
+        checkout_id = %attachment.checkout_id,
+        code,
+        error = %error,
+        "catalog gap overlay recompute failed"
+    );
+    OverlayDegradation {
+        project_id: project_id.as_str().to_string(),
+        checkout_id: attachment.checkout_id.clone(),
+        attachment_id: Some(attachment.attachment_id.clone()),
+        code,
+        detail: detail.to_string(),
+        transient,
+    }
+}
+
+/// Project the accepted gap manifest into the identity the diff asks for.
+/// Manifest keys are repository-relative; the diff compares basenames
+/// inside one published scope's gap directory.
+fn accepted_gap_digests(verified: &VerifiedAcceptedPublication) -> AcceptedPublishedGapDigests {
+    AcceptedPublishedGapDigests(
+        verified
+            .gap_manifest()
+            .iter()
+            .filter_map(|(filename, manifest)| {
+                Some((
+                    basename(filename.as_str())?,
+                    manifest.source_content_sha256.as_str().to_string(),
+                ))
+            })
+            .collect(),
+    )
+}
+
+/// Capture one gap overlay the checkout agrees with twice in a row.
+///
+/// Head, merge base, and working fingerprint all ride the snapshot id, so
+/// one comparison covers every kind of movement. `after_capture` runs
+/// between the reads; production passes a no-op.
+fn stable_catalog_gap_overlay(
+    published: CatalogGapOverlayPublished<'_>,
+    lease: &ValidatedCheckoutLease,
+    mut after_capture: impl FnMut(),
+) -> std::result::Result<GapOverlaySnapshot, GapOverlayRecomputeError> {
+    let pending = || {
+        lease
+            .checkout_relative_regular_file_exists(
+                ".bbox/local/knowledge-transactions/pending.json",
+            )
+            .map_err(anyhow::Error::new)
+            .map_err(GapOverlayRecomputeError::transient)
+    };
+    let working = || {
+        let files = lease
+            .read_relative_json_directory(".bbox/gaps")
+            .map_err(anyhow::Error::new)
+            .map_err(GapOverlayRecomputeError::transient)?;
+        WorkingGapSnapshot::new(files).map_err(GapOverlayRecomputeError::transient)
+    };
+    if pending()? {
+        return Err(GapOverlayRecomputeError::transient(anyhow::anyhow!(
+            "checkout transaction is pending; catalog gap overlay refresh deferred"
+        )));
+    }
+    let first_working = working()?;
+    let mut candidate =
+        recompute_catalog_gap_overlay_result(published, lease.checkout_root(), &first_working)?;
+    for _ in 0..2 {
+        after_capture();
+        if pending()? {
+            return Err(GapOverlayRecomputeError::transient(anyhow::anyhow!(
+                "checkout transaction began during catalog gap overlay refresh"
+            )));
+        }
+        let next_working = working()?;
+        let next =
+            recompute_catalog_gap_overlay_result(published, lease.checkout_root(), &next_working)?;
+        if same_gap_snapshot(&candidate, &next) && !pending()? {
+            return Ok(next);
+        }
+        candidate = next;
+    }
+    Err(GapOverlayRecomputeError::transient(anyhow::anyhow!(
+        "checkout state changed repeatedly during catalog gap overlay refresh"
+    )))
 }
 
 fn stable_gap_overlay(
@@ -1194,5 +1631,461 @@ mod catalog_view_tests {
                 .content_stamp,
             first_stamp
         );
+    }
+}
+
+/// Catalog gap overlay baseline path (Phase 5 plan sections 8 P5-D and
+/// 13.4). The knowledge twin covers the shared lease, attachment, and
+/// accepted-identity plumbing; these cover the gap lane's own diff, row
+/// stamping, and store.
+#[cfg(test)]
+mod catalog_gap_overlay_tests {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    use crate::server::state::catalog_fixture::{CatalogFixture, gap_note, knowledge_entry};
+
+    use super::*;
+
+    const PROJECT: &str = "p_gapoverlay";
+    const BASE_ATTACHMENT: &str = "att_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01";
+    const BASE_CHECKOUT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01";
+    const PEER_ATTACHMENT: &str = "att_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb02";
+    const PEER_CHECKOUT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb02";
+
+    fn git_run(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn write_gap(root: &Path, gap: &GapNote) {
+        let dir = root.join(".bbox/gaps");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{}.json", gap.id)),
+            serde_json::to_vec_pretty(gap).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn edited(id: &str, title: &str) -> GapNote {
+        let mut gap = gap_note(id, title);
+        gap.notes = Some(title.to_string());
+        gap
+    }
+
+    struct GapOverlayFixture {
+        catalog: CatalogFixture,
+        _temp: tempfile::TempDir,
+        root: PathBuf,
+        base: PathBuf,
+        accepted_commit: String,
+        scope: PublishedScope,
+    }
+
+    impl GapOverlayFixture {
+        fn new(gaps: &[GapNote]) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let base = root.join("base");
+            std::fs::create_dir_all(&base).unwrap();
+            git_run(&base, &["init", "-q", "-b", "main"]);
+            git_run(&base, &["config", "user.email", "t@example.com"]);
+            git_run(&base, &["config", "user.name", "Test"]);
+            for gap in gaps {
+                write_gap(&base, gap);
+            }
+            git_run(&base, &["add", ".bbox/gaps"]);
+            git_run(&base, &["commit", "-q", "-m", "accepted"]);
+            let accepted_commit = bbox_corpus_core::git::current_head(&base).unwrap();
+
+            let catalog = CatalogFixture::new();
+            let scope = CatalogFixture::scope(".");
+            catalog.add_published_project(PROJECT, &scope);
+            catalog.install_publication(
+                PROJECT,
+                &scope,
+                &accepted_commit,
+                &[knowledge_entry("knowledge-a", "accepted")],
+                gaps,
+            );
+            catalog.attach_overlay_checkout(
+                PROJECT,
+                &scope,
+                &base,
+                BASE_ATTACHMENT,
+                BASE_CHECKOUT,
+                true,
+            );
+            Self {
+                catalog,
+                _temp: temp,
+                root,
+                base,
+                accepted_commit,
+                scope,
+            }
+        }
+
+        fn worktree(&self, name: &str, attachment_id: &str, checkout_id: &str) -> PathBuf {
+            let path = self.root.join(name);
+            git_run(
+                &self.base,
+                &["worktree", "add", "-q", "-b", name, path.to_str().unwrap()],
+            );
+            self.catalog.attach_overlay_checkout(
+                PROJECT,
+                &self.scope,
+                &path,
+                attachment_id,
+                checkout_id,
+                true,
+            );
+            path
+        }
+
+        /// A repository with unrelated history: it cannot contain the
+        /// accepted commit, and there is no publisher root to borrow it
+        /// from (D-007).
+        fn unrelated(&self, name: &str, attachment_id: &str, checkout_id: &str) -> PathBuf {
+            let path = self.root.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            git_run(&path, &["init", "-q", "-b", "main"]);
+            git_run(&path, &["config", "user.email", "t@example.com"]);
+            git_run(&path, &["config", "user.name", "Test"]);
+            write_gap(&path, &gap_note("gap-unrelated", "unrelated"));
+            git_run(&path, &["add", ".bbox/gaps"]);
+            git_run(&path, &["commit", "-q", "-m", "unrelated"]);
+            self.catalog.attach_overlay_checkout(
+                PROJECT,
+                &self.scope,
+                &path,
+                attachment_id,
+                checkout_id,
+                true,
+            );
+            path
+        }
+
+        fn project_id(&self) -> ProjectId {
+            ProjectId::parse(PROJECT).unwrap()
+        }
+
+        fn verified(&self, server: &BlackboxServer) -> VerifiedAcceptedPublication {
+            server
+                .state
+                .accepted_publications
+                .as_ref()
+                .unwrap()
+                .load_verified(&self.project_id())
+                .unwrap()
+        }
+    }
+
+    fn attachment(attachment_id: &str, checkout_id: &str) -> CatalogOverlayAttachment {
+        CatalogOverlayAttachment {
+            attachment_id: attachment_id.to_string(),
+            checkout_id: checkout_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn an_attached_checkout_positions_its_gaps_against_accepted_content() {
+        let fixture = GapOverlayFixture::new(&[
+            gap_note("gap-11111111", "accepted"),
+            gap_note("gap-22222222", "removed in the checkout"),
+        ]);
+        let worktree = fixture.worktree("peer", PEER_ATTACHMENT, PEER_CHECKOUT);
+        write_gap(
+            &worktree,
+            &edited("gap-11111111", "changed in the checkout"),
+        );
+        std::fs::remove_file(worktree.join(".bbox/gaps/gap-22222222.json")).unwrap();
+
+        let server = fixture.catalog.server_with_checkout_authority();
+        server.set_session_checkout_for_test(
+            PROJECT.into(),
+            fixture.scope.clone(),
+            PEER_CHECKOUT.into(),
+            worktree,
+        );
+
+        let view = server.session_gap_view(None, Some("own")).unwrap();
+        let changed = view
+            .gaps
+            .all()
+            .iter()
+            .find(|gap| gap.id == "gap-11111111")
+            .expect("the checkout variant replaces the published row");
+        assert_eq!(changed.notes.as_deref(), Some("changed in the checkout"));
+        // A catalog overlay row carries durable identity and its checkout,
+        // never a host path.
+        assert_eq!(changed.project, None);
+        assert_eq!(changed.project_id.as_deref(), Some(PROJECT));
+        assert_eq!(
+            changed.provisional_checkout_id.as_deref(),
+            Some(PEER_CHECKOUT)
+        );
+        assert!(
+            view.gaps.all().iter().all(|gap| gap.id != "gap-22222222"),
+            "a tombstoned gap leaves the own view"
+        );
+
+        let stamp_ref = view
+            .gaps
+            .view_metadata("gap-11111111")
+            .and_then(|row| row.built_from_ref.clone())
+            .expect("an overlay row carries a provable stamp");
+        let BuiltFromStamp::CheckoutOverlay {
+            checkout_id,
+            publisher_commit,
+            merge_base,
+            ..
+        } = view.built_from.get(&stamp_ref).cloned().unwrap()
+        else {
+            panic!("an overlay row stamps CheckoutOverlay");
+        };
+        assert_eq!(checkout_id, PEER_CHECKOUT);
+        assert_eq!(publisher_commit, fixture.accepted_commit);
+        assert_eq!(merge_base, fixture.accepted_commit);
+    }
+
+    #[test]
+    fn a_detached_attachment_refuses_own_while_published_gaps_keep_serving() {
+        let fixture = GapOverlayFixture::new(&[gap_note("gap-11111111", "accepted")]);
+        fixture.catalog.detach(BASE_ATTACHMENT);
+        let server = fixture.catalog.server_with_checkout_authority();
+        server.set_session_checkout_for_test(
+            PROJECT.into(),
+            fixture.scope.clone(),
+            BASE_CHECKOUT.into(),
+            fixture.base.clone(),
+        );
+
+        let error = server
+            .session_gap_view(None, Some("own"))
+            .err()
+            .expect("own has no honest answer without its own checkout");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE),
+            "{text}"
+        );
+        assert!(text.contains("attachment_inactive"), "{text}");
+
+        let published = server.session_gap_view(None, Some("published")).unwrap();
+        assert!(
+            published
+                .gaps
+                .all()
+                .iter()
+                .any(|gap| gap.id == "gap-11111111")
+        );
+        assert!(
+            published
+                .diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.contains("overlay")),
+            "published ignores overlay failure entirely: {:?}",
+            published.diagnostics
+        );
+    }
+
+    #[test]
+    fn all_omits_only_the_failed_gap_peer_and_reports_its_reason() {
+        let fixture = GapOverlayFixture::new(&[gap_note("gap-11111111", "accepted")]);
+        let peer = fixture.worktree("peer", PEER_ATTACHMENT, PEER_CHECKOUT);
+        write_gap(&peer, &edited("gap-11111111", "peer variant"));
+        const BROKEN_ATTACHMENT: &str = "att_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb03";
+        const BROKEN_CHECKOUT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb03";
+        fixture.unrelated("broken", BROKEN_ATTACHMENT, BROKEN_CHECKOUT);
+
+        let server = fixture.catalog.server_with_checkout_authority();
+        let view = server.session_gap_view(None, Some("all")).unwrap();
+
+        // Accepted content and the healthy peer both keep serving, and the
+        // peer's variant is a distinct row rather than a replacement.
+        assert!(view.gaps.all().iter().any(|gap| gap.id == "gap-11111111"));
+        let peer_row = view
+            .gaps
+            .all()
+            .iter()
+            .find(|gap| gap.id == format!("provisional_gap:{PEER_CHECKOUT}:gap-11111111"))
+            .expect("a healthy peer contributes its variant");
+        assert_eq!(peer_row.notes.as_deref(), Some("peer variant"));
+        assert_eq!(peer_row.project_id.as_deref(), Some(PROJECT));
+
+        let reason = view
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.contains(ERROR_OVERLAY_BASELINE_UNAVAILABLE))
+            .unwrap_or_else(|| panic!("the omitted peer is reported: {:?}", view.diagnostics));
+        assert!(reason.contains(BROKEN_CHECKOUT), "{reason}");
+        assert!(reason.contains(BROKEN_ATTACHMENT), "{reason}");
+        assert!(
+            !reason.contains(fixture.root.to_str().unwrap()),
+            "a degradation must not carry an absolute path: {reason}"
+        );
+    }
+
+    #[test]
+    fn an_advance_during_capture_refuses_the_gap_snapshot() {
+        let fixture = GapOverlayFixture::new(&[gap_note("gap-11111111", "generation one")]);
+        let worktree = fixture.worktree("peer", PEER_ATTACHMENT, PEER_CHECKOUT);
+        write_gap(&worktree, &edited("gap-11111111", "checkout variant"));
+        let server = fixture.catalog.server_with_checkout_authority();
+        let verified = fixture.verified(&server);
+
+        let degradation = server
+            .compute_catalog_gap_overlay(
+                &verified,
+                &attachment(PEER_ATTACHMENT, PEER_CHECKOUT),
+                &fixture.scope,
+                || {
+                    fixture.catalog.install_publication(
+                        PROJECT,
+                        &fixture.scope,
+                        &fixture.accepted_commit,
+                        &[knowledge_entry("knowledge-a", "accepted")],
+                        &[gap_note("gap-11111111", "generation two")],
+                    );
+                    server.invalidate_catalog_published_content(&fixture.project_id());
+                },
+            )
+            .err()
+            .expect("a snapshot may not position a checkout against unpublished bytes");
+        assert_eq!(degradation.code, ERROR_OVERLAY_ACCEPTED_CONTENT_CHANGED);
+        assert!(!degradation.transient);
+    }
+
+    #[test]
+    fn a_detach_during_capture_fails_gap_lease_revalidation() {
+        let fixture = GapOverlayFixture::new(&[gap_note("gap-11111111", "accepted")]);
+        fixture.worktree("peer", PEER_ATTACHMENT, PEER_CHECKOUT);
+        let server = fixture.catalog.server_with_checkout_authority();
+        let verified = fixture.verified(&server);
+
+        let degradation = server
+            .compute_catalog_gap_overlay(
+                &verified,
+                &attachment(PEER_ATTACHMENT, PEER_CHECKOUT),
+                &fixture.scope,
+                || CatalogFixture::detach_in_server(&server, PEER_ATTACHMENT),
+            )
+            .err()
+            .expect("bytes captured under a lease that no longer holds are unpublishable");
+        assert_eq!(
+            degradation.code,
+            bbox_indexing::checkout_access::CheckoutAccessErrorCode::AttachmentInactive.as_str()
+        );
+        assert!(!degradation.transient);
+    }
+
+    /// Plan section 4.12: a checkout that cannot prove the baseline is a
+    /// structural authority fact. Only a transient failure may hold a
+    /// prior valid snapshot open.
+    #[test]
+    fn a_structural_gap_failure_replaces_a_prior_snapshot_that_a_transient_one_preserves() {
+        let fixture = GapOverlayFixture::new(&[gap_note("gap-11111111", "accepted")]);
+        let worktree = fixture.worktree("peer", PEER_ATTACHMENT, PEER_CHECKOUT);
+        write_gap(&worktree, &edited("gap-11111111", "checkout variant"));
+        let server = fixture.catalog.server_with_checkout_authority();
+        let verified = fixture.verified(&server);
+        let peer = attachment(PEER_ATTACHMENT, PEER_CHECKOUT);
+
+        let first = server
+            .refresh_catalog_gap_overlay(&verified, &peer)
+            .unwrap();
+        assert_eq!(first.status, GapOverlayStatus::Valid);
+
+        // A transient refusal keeps the prior valid snapshot open for a
+        // bounded window: the checkout is busy, not wrong.
+        let busy = server
+            .state
+            .checkout_access
+            .lifecycle_mutation_guard()
+            .unwrap();
+        let preserved = server
+            .refresh_catalog_gap_overlay(&verified, &peer)
+            .unwrap();
+        assert_eq!(preserved.snapshot_id, first.snapshot_id);
+        drop(busy);
+
+        // The same checkout on an orphan branch still contains commit P
+        // but shares no ancestor with it: no baseline exists.
+        git_run(&worktree, &["checkout", "-q", "--orphan", "orphaned"]);
+        git_run(&worktree, &["add", ".bbox/gaps"]);
+        git_run(&worktree, &["commit", "-q", "-m", "orphan"]);
+
+        let degradation = server
+            .refresh_catalog_gap_overlay(&verified, &peer)
+            .err()
+            .expect("a structural failure has no valid answer");
+        assert_eq!(degradation.code, ERROR_OVERLAY_BASELINE_UNAVAILABLE);
+        assert!(!degradation.transient);
+
+        let stored = server
+            .state
+            .gap_overlays
+            .read()
+            .get(&fixture.scope, PEER_CHECKOUT)
+            .cloned()
+            .expect("the store keeps a record of the outcome");
+        assert_eq!(
+            stored.status,
+            GapOverlayStatus::Invalid,
+            "a structural failure must replace the prior snapshot, never preserve it"
+        );
+        assert!(stored.values.is_empty());
+    }
+
+    #[test]
+    fn a_gap_checkout_that_never_settles_during_capture_is_transient() {
+        let fixture = GapOverlayFixture::new(&[gap_note("gap-11111111", "accepted")]);
+        let worktree = fixture.worktree("peer", PEER_ATTACHMENT, PEER_CHECKOUT);
+        let server = fixture.catalog.server_with_checkout_authority();
+        let verified = fixture.verified(&server);
+        let published = accepted_gap_digests(&verified);
+        let content_stamp = verified.content_stamp();
+        let lease = server
+            .acquire_catalog_overlay_lease(
+                &fixture.project_id(),
+                &attachment(PEER_ATTACHMENT, PEER_CHECKOUT),
+                &fixture.scope,
+            )
+            .unwrap();
+
+        let mut revision = 0;
+        let error = stable_catalog_gap_overlay(
+            CatalogGapOverlayPublished {
+                published_scope: &fixture.scope,
+                checkout_id: PEER_CHECKOUT,
+                full_ref: content_stamp.full_ref(),
+                accepted_commit: content_stamp.accepted_commit(),
+                accepted_generation: content_stamp.generation_id(),
+                published: &published,
+            },
+            &lease,
+            || {
+                revision += 1;
+                write_gap(
+                    &worktree,
+                    &edited("gap-11111111", &format!("edit {revision}")),
+                );
+            },
+        )
+        .err()
+        .expect("a checkout that keeps moving is busy, not positioned");
+        assert_eq!(error.kind, GapOverlayRecomputeErrorKind::Transient);
+        assert!(!error.is_structural());
     }
 }
