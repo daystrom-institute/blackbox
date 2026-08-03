@@ -1181,6 +1181,53 @@ mod tests {
         );
     }
 
+    /// R34F1, corroborated without the injection seam: a REAL `EACCES` from an
+    /// untraversable legacy directory must refuse too. This is the shape the
+    /// old `Path::exists()` reported as `SkippedMissing`.
+    ///
+    /// Skips itself where the process can traverse a `0o000` directory anyway
+    /// (running privileged); the injected cases above still cover the
+    /// classification there.
+    #[cfg(unix)]
+    #[test]
+    fn a_real_permission_failure_refuses_rather_than_reporting_absence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _faults = arm_legacy_migration_faults(&[]);
+        let dir = tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        write_legacy_tree(&home);
+        let state = home.join("state");
+        let destinations = fixture_destinations(&state, &home);
+        let legacy = home.join(".claude-shared");
+
+        let restore = fs::metadata(&legacy).unwrap().permissions();
+        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o000)).unwrap();
+        let blocked = fs::metadata(legacy.join("blackbox-knowledge.json")).is_err();
+        let outcome = if blocked {
+            Some(migrate_legacy_defaults(&home, &destinations))
+        } else {
+            None
+        };
+        // Restore before any assertion so a failure cannot leave the fixture
+        // undeletable.
+        fs::set_permissions(&legacy, restore).unwrap();
+
+        let Some(outcome) = outcome else {
+            eprintln!("skipped: this process can traverse a 0o000 directory");
+            return;
+        };
+        let error = outcome.expect_err("an unreadable legacy source must refuse the startup");
+        assert!(
+            format!("{error:#}").contains("blackbox-knowledge.json"),
+            "the refusal names the entry it could not inspect: {error:#}"
+        );
+        assert!(
+            !state.exists(),
+            "the refusal must not create any destination"
+        );
+    }
+
     /// R34F1. The destination probe fails open the same way: an `EIO` while
     /// inspecting the destination read as "the destination is not there" and
     /// the migration went on to rename onto a path it had not really
