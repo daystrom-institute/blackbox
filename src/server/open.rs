@@ -32,6 +32,72 @@ pub(super) struct OpenedServer {
     pub(super) bind_is_loopback: bool,
 }
 
+/// Open the accepted-publication authority and verify every catalog
+/// project's pointer before the read view is built (Phase 5 plan section
+/// 5.4, P5-A). Bridge mode returns `None`: its published reads keep the
+/// legacy publisher authority untouched.
+///
+/// Only a global-store failure propagates. Per-project damage is reported
+/// and leaves that project's published capability unavailable.
+fn open_accepted_publications(
+    catalog_store: &Option<Arc<bbox_indexing::project_catalog_store::ProjectCatalogStore>>,
+    projects_path: &Path,
+) -> anyhow::Result<
+    Option<Arc<bbox_indexing::accepted_publication_runtime::AcceptedPublicationRuntime>>,
+> {
+    use bbox_corpus_core::project_catalog::ProjectScope;
+
+    let Some(store) = catalog_store else {
+        return Ok(None);
+    };
+    let runtime = Arc::new(
+        bbox_indexing::accepted_publication_runtime::AcceptedPublicationRuntime::open_global(
+            projects_path,
+        )
+        .map_err(|error| anyhow::anyhow!("accepted-publication store open: {error}"))?,
+    );
+    let snapshot = store
+        .snapshot()
+        .map_err(|error| anyhow::anyhow!("catalog snapshot for the accepted scan: {error}"))?;
+    let targets: Vec<_> = snapshot
+        .catalog()
+        .projects
+        .iter()
+        .map(|(project_id, project)| {
+            let scope = match &project.scope {
+                ProjectScope::Published(scope) => Some(scope.clone()),
+                ProjectScope::LegacyLocal => None,
+            };
+            (project_id.clone(), scope)
+        })
+        .collect();
+    let scan = runtime
+        .startup_scan(targets)
+        .map_err(|error| anyhow::anyhow!("accepted-publication startup scan: {error}"))?;
+    tracing::info!(
+        scanned = scan.scanned(),
+        current = scan.current(),
+        prior = scan.prior(),
+        missing = scan.missing(),
+        corrupt = scan.corrupt(),
+        "Accepted publication: pre-bind scan"
+    );
+    for (project_id, failure) in scan.failures() {
+        tracing::warn!(
+            project_id = %project_id,
+            code = failure.code(),
+            "published capability unavailable for this project"
+        );
+    }
+    if scan.dropped_failures() > 0 {
+        tracing::warn!(
+            dropped = scan.dropped_failures(),
+            "further accepted-publication failures were not reported individually"
+        );
+    }
+    Ok(Some(runtime))
+}
+
 fn sync_project_aliases_at_startup(
     projects: &Arc<RwLock<ProjectRegistry>>,
     load_aliases: impl Fn(
@@ -551,6 +617,19 @@ pub(super) fn open_shared_state(
     idx.refresh_active_code_selectors()
         .context("refreshing active code selectors after pre-bind catalog recovery")?;
 
+    // Pre-bind accepted-publication authority (Phase 5 plan section 5.4).
+    // The ordering relation is load-bearing: catalog recovery first, the
+    // global accepted-store open second, the per-project scan third,
+    // `CodeReadView` construction fourth, listener bind last.
+    //
+    // The two failure policies differ deliberately. Losing the global store
+    // means this process cannot act as the accepted-publication authority
+    // at all, so it must not bind. A single project whose pointer is
+    // missing or whose generations do not verify loses only its own
+    // published capability; code search and every other project keep
+    // serving. Bridge mode never constructs the runtime.
+    let accepted_publications = open_accepted_publications(&catalog_store, &projects_path)?;
+
     // The grant table is built after the writer actor spawns, so the
     // planner's assignment view is installed here rather than passed to
     // `spawn` (same shape as the post-commit searcher hook).
@@ -645,6 +724,7 @@ pub(super) fn open_shared_state(
         pins: pins_store,
         pins_persister,
         project_authority,
+        accepted_publications,
         records_provider,
         checkout_registry,
         checkout_access_observations,
@@ -933,6 +1013,66 @@ fn refresh_history_reference_manifest(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn bridge_mode_never_opens_the_accepted_publication_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        assert!(
+            open_accepted_publications(&None, &root.join("projects.json"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn catalog_mode_opens_and_scans_before_the_read_view() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let projects_path = root.join("projects.json");
+        let store = Arc::new(
+            bbox_indexing::project_catalog_store::ProjectCatalogStore::initialize_empty(
+                &projects_path,
+            )
+            .unwrap(),
+        );
+
+        // A catalog with no published project scans clean: an absent
+        // accepted store is the state of a catalog that has not published.
+        assert!(
+            open_accepted_publications(&Some(store), &projects_path)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_global_accepted_store_blocks_the_bind() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let projects_path = root.join("projects.json");
+        let store = Arc::new(
+            bbox_indexing::project_catalog_store::ProjectCatalogStore::initialize_empty(
+                &projects_path,
+            )
+            .unwrap(),
+        );
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::create_dir_all(root.join("accepted-publications")).unwrap();
+        symlink(&elsewhere, root.join("accepted-publications/pointers")).unwrap();
+
+        let error = open_accepted_publications(&Some(store), &projects_path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("error.accepted_publication_global_store_unavailable"),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn unreadable_committed_config_preserves_materialized_aliases() {

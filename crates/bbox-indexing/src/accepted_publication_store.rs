@@ -91,11 +91,14 @@ fn byte_limit(label: &'static str) -> AcceptedPublicationStoreError {
     )
 }
 
+// The visibility parameter governs the TYPE only. `parse` stays crate-private
+// on every instantiation: the runtime facade may hand a validated value out,
+// but no crate-external caller may mint one (plan section 4.2).
 macro_rules! validated_string_type {
-    ($name:ident, $validator:ident) => {
+    ($vis:vis $name:ident, $validator:ident) => {
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
         #[serde(transparent)]
-        pub(crate) struct $name(String);
+        $vis struct $name(String);
 
         impl $name {
             pub(crate) fn parse(value: impl Into<String>) -> AcceptedPublicationStoreResult<Self> {
@@ -104,7 +107,7 @@ macro_rules! validated_string_type {
                 Ok(Self(value))
             }
 
-            pub(crate) fn as_str(&self) -> &str {
+            $vis fn as_str(&self) -> &str {
                 &self.0
             }
         }
@@ -213,13 +216,13 @@ fn validate_repository_relative_filename(value: &str) -> AcceptedPublicationStor
     Ok(())
 }
 
-validated_string_type!(PublicationSha256, validate_sha256);
-validated_string_type!(AcceptedPublicationGenerationId, validate_sha256);
-validated_string_type!(GitObjectId, validate_git_object_id);
-validated_string_type!(FullPublisherRef, validate_full_publisher_ref);
-validated_string_type!(PublicationRecordId, validate_record_id);
+validated_string_type!(pub PublicationSha256, validate_sha256);
+validated_string_type!(pub(crate) AcceptedPublicationGenerationId, validate_sha256);
+validated_string_type!(pub(crate) GitObjectId, validate_git_object_id);
+validated_string_type!(pub(crate) FullPublisherRef, validate_full_publisher_ref);
+validated_string_type!(pub PublicationRecordId, validate_record_id);
 validated_string_type!(
-    NormalizedRepoRelativeFilename,
+    pub NormalizedRepoRelativeFilename,
     validate_repository_relative_filename
 );
 
@@ -276,7 +279,7 @@ where
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum AcceptedKnowledgeCategoryV1 {
+pub enum AcceptedKnowledgeCategoryV1 {
     Profile,
     Convention,
     Steering,
@@ -289,14 +292,14 @@ pub(crate) enum AcceptedKnowledgeCategoryV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum AcceptedKnowledgeScopeV1 {
+pub enum AcceptedKnowledgeScopeV1 {
     Global,
     Project,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum AcceptedKnowledgePriorityV1 {
+pub enum AcceptedKnowledgePriorityV1 {
     Critical,
     Standard,
     Supplementary,
@@ -304,7 +307,7 @@ pub(crate) enum AcceptedKnowledgePriorityV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum AcceptedKnowledgeStatusV1 {
+pub enum AcceptedKnowledgeStatusV1 {
     Active,
     Draft,
     Superseded,
@@ -314,7 +317,7 @@ pub(crate) enum AcceptedKnowledgeStatusV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum AcceptedKnowledgeApprovalV1 {
+pub enum AcceptedKnowledgeApprovalV1 {
     UserConfirmed,
     AgentInferred,
     Imported,
@@ -322,7 +325,7 @@ pub(crate) enum AcceptedKnowledgeApprovalV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum AcceptedKnowledgeEdgeKindV1 {
+pub enum AcceptedKnowledgeEdgeKindV1 {
     Contradicts,
     RelatesTo,
     TensionWith,
@@ -335,7 +338,7 @@ pub(crate) enum AcceptedKnowledgeEdgeKindV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum AcceptedEdgeConfidenceV1 {
+pub enum AcceptedEdgeConfidenceV1 {
     Exact,
     Heuristic,
     Unknown,
@@ -343,7 +346,7 @@ pub(crate) enum AcceptedEdgeConfidenceV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum AcceptedGapKindV1 {
+pub enum AcceptedGapKindV1 {
     PacketAst,
     Tooling,
     Agent,
@@ -357,7 +360,7 @@ pub(crate) enum AcceptedGapKindV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum AcceptedGapImpactV1 {
+pub enum AcceptedGapImpactV1 {
     Low,
     Medium,
     High,
@@ -366,7 +369,7 @@ pub(crate) enum AcceptedGapImpactV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum AcceptedBlockingLevelV1 {
+pub enum AcceptedBlockingLevelV1 {
     None,
     WorkaroundAvailable,
     BlocksTask,
@@ -375,7 +378,7 @@ pub(crate) enum AcceptedBlockingLevelV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum AcceptedGapResolutionV1 {
+pub enum AcceptedGapResolutionV1 {
     Unresolved,
     Acknowledged,
     Addressed,
@@ -383,97 +386,97 @@ pub(crate) enum AcceptedGapResolutionV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AcceptedKnowledgeEdgeV1 {
-    pub(crate) target: String,
-    pub(crate) kind: AcceptedKnowledgeEdgeKindV1,
-    pub(crate) note: Option<String>,
-    pub(crate) source_arc: Option<String>,
-    pub(crate) confidence: AcceptedEdgeConfidenceV1,
+pub struct AcceptedKnowledgeEdgeV1 {
+    pub target: String,
+    pub kind: AcceptedKnowledgeEdgeKindV1,
+    pub note: Option<String>,
+    pub source_arc: Option<String>,
+    pub confidence: AcceptedEdgeConfidenceV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AcceptedKnowledgeEntryV1 {
-    pub(crate) id: PublicationRecordId,
-    pub(crate) title: String,
-    pub(crate) content: String,
-    pub(crate) cluster: Option<String>,
+pub struct AcceptedKnowledgeEntryV1 {
+    pub id: PublicationRecordId,
+    pub title: String,
+    pub content: String,
+    pub cluster: Option<String>,
     #[serde(deserialize_with = "deserialize_unique_btree_map")]
-    pub(crate) variants: BTreeMap<String, String>,
-    pub(crate) category: AcceptedKnowledgeCategoryV1,
-    pub(crate) scope: AcceptedKnowledgeScopeV1,
-    pub(crate) providers: Vec<String>,
-    pub(crate) priority: AcceptedKnowledgePriorityV1,
-    pub(crate) weight: u32,
-    pub(crate) status: AcceptedKnowledgeStatusV1,
-    pub(crate) approval: AcceptedKnowledgeApprovalV1,
-    pub(crate) render: bool,
-    pub(crate) decay: bool,
-    pub(crate) review_at: Option<String>,
-    pub(crate) supersedes: Option<String>,
-    pub(crate) links: Vec<AcceptedKnowledgeEdgeV1>,
-    pub(crate) rationale: Option<String>,
-    pub(crate) expires_at: Option<String>,
-    pub(crate) source: String,
-    pub(crate) created_at: String,
-    pub(crate) updated_at: String,
+    pub variants: BTreeMap<String, String>,
+    pub category: AcceptedKnowledgeCategoryV1,
+    pub scope: AcceptedKnowledgeScopeV1,
+    pub providers: Vec<String>,
+    pub priority: AcceptedKnowledgePriorityV1,
+    pub weight: u32,
+    pub status: AcceptedKnowledgeStatusV1,
+    pub approval: AcceptedKnowledgeApprovalV1,
+    pub render: bool,
+    pub decay: bool,
+    pub review_at: Option<String>,
+    pub supersedes: Option<String>,
+    pub links: Vec<AcceptedKnowledgeEdgeV1>,
+    pub rationale: Option<String>,
+    pub expires_at: Option<String>,
+    pub source: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AcceptedGapEntryV1 {
-    pub(crate) id: PublicationRecordId,
-    pub(crate) title: String,
-    pub(crate) gap_kind: AcceptedGapKindV1,
-    pub(crate) domain: String,
-    pub(crate) wanted_capability: String,
-    pub(crate) missing_primitive: Option<String>,
-    pub(crate) fallback_used: Option<String>,
-    pub(crate) evidence: Vec<String>,
-    pub(crate) impact: AcceptedGapImpactV1,
-    pub(crate) blocking_level: AcceptedBlockingLevelV1,
-    pub(crate) dedupe_key: String,
-    pub(crate) suggested_owner: Option<String>,
-    pub(crate) notes: Option<String>,
-    pub(crate) supersedes: Option<String>,
-    pub(crate) superseded_by: Option<String>,
-    pub(crate) resolution: AcceptedGapResolutionV1,
-    pub(crate) task_id: Option<String>,
-    pub(crate) session_id: Option<String>,
-    pub(crate) provider: Option<String>,
-    pub(crate) bro: Option<String>,
-    pub(crate) thread_id: Option<String>,
-    pub(crate) created_at: String,
-    pub(crate) updated_at: String,
-    pub(crate) resolved_at: Option<String>,
-    pub(crate) resolution_note: Option<String>,
+pub struct AcceptedGapEntryV1 {
+    pub id: PublicationRecordId,
+    pub title: String,
+    pub gap_kind: AcceptedGapKindV1,
+    pub domain: String,
+    pub wanted_capability: String,
+    pub missing_primitive: Option<String>,
+    pub fallback_used: Option<String>,
+    pub evidence: Vec<String>,
+    pub impact: AcceptedGapImpactV1,
+    pub blocking_level: AcceptedBlockingLevelV1,
+    pub dedupe_key: String,
+    pub suggested_owner: Option<String>,
+    pub notes: Option<String>,
+    pub supersedes: Option<String>,
+    pub superseded_by: Option<String>,
+    pub resolution: AcceptedGapResolutionV1,
+    pub task_id: Option<String>,
+    pub session_id: Option<String>,
+    pub provider: Option<String>,
+    pub bro: Option<String>,
+    pub thread_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub resolved_at: Option<String>,
+    pub resolution_note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct PublicationFileManifestEntryV1 {
-    pub(crate) record_id: PublicationRecordId,
-    pub(crate) source_content_sha256: PublicationSha256,
-    pub(crate) normalized_record_sha256: PublicationSha256,
-    pub(crate) encoded_bytes: u64,
+pub struct PublicationFileManifestEntryV1 {
+    pub record_id: PublicationRecordId,
+    pub source_content_sha256: PublicationSha256,
+    pub normalized_record_sha256: PublicationSha256,
+    pub encoded_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AcceptedPublicationHashesV1 {
-    pub(crate) knowledge_file_manifest_sha256: PublicationSha256,
-    pub(crate) gap_file_manifest_sha256: PublicationSha256,
-    pub(crate) normalized_knowledge_sha256: PublicationSha256,
-    pub(crate) normalized_gaps_sha256: PublicationSha256,
+pub struct AcceptedPublicationHashesV1 {
+    pub knowledge_file_manifest_sha256: PublicationSha256,
+    pub gap_file_manifest_sha256: PublicationSha256,
+    pub normalized_knowledge_sha256: PublicationSha256,
+    pub normalized_gaps_sha256: PublicationSha256,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AcceptedPublicationCountsV1 {
-    pub(crate) knowledge_files: u64,
-    pub(crate) knowledge_entries: u64,
-    pub(crate) gap_files: u64,
-    pub(crate) gap_entries: u64,
+pub struct AcceptedPublicationCountsV1 {
+    pub knowledge_files: u64,
+    pub knowledge_entries: u64,
+    pub gap_files: u64,
+    pub gap_entries: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1693,6 +1696,93 @@ fn verify_selected_from_pointer_locked(
     })
 }
 
+/// One strict selected read plus the binding evidence the runtime facade
+/// reports and the later advance path compares against.
+///
+/// `pointer_sha256` is digested from the exact bytes this read verified,
+/// never re-encoded from the decoded pointer: it is a compare-and-swap
+/// token, so it must name what is installed rather than what a re-encode
+/// would produce.
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedAcceptedPublicationBindingV1 {
+    pub(crate) pointer: AcceptedPublicationPointerV1,
+    pub(crate) pointer_sha256: PublicationSha256,
+    pub(crate) verified: VerifiedAcceptedPublicationV1,
+}
+
+/// `Ok(None)` means this project has no accepted pointer at all, which is
+/// the migration outcome for a project that acknowledged no published
+/// content. Every other failure is damage and stays an error.
+pub(crate) fn verify_selected_with_binding_locked(
+    paths: &AcceptedPublicationStorePaths,
+    guard: &AcceptedPublicationLockGuard,
+    project_id: &ProjectId,
+    limits: &AcceptedPublicationLimits,
+) -> AcceptedPublicationStoreResult<Option<VerifiedAcceptedPublicationBindingV1>> {
+    ensure_matching_guard(paths, guard)?;
+    limits.validate()?;
+    let Some(pointer_bytes) =
+        read_pointer_optional_locked(paths, project_id, limits.max_pointer_bytes)?
+    else {
+        return Ok(None);
+    };
+    let pointer_sha256 = PublicationSha256::digest(&pointer_bytes);
+    let pointer = decode_pointer_v1(&pointer_bytes, limits)?;
+    let verified = verify_selected_from_pointer_locked(paths, project_id, pointer_bytes, limits)?;
+    Ok(Some(VerifiedAcceptedPublicationBindingV1 {
+        pointer,
+        pointer_sha256,
+        verified,
+    }))
+}
+
+/// The durably referenced generation ids for one project: current first,
+/// then prior when the pointer carries one. `Ok(None)` means no pointer
+/// exists. A pointer that cannot be decoded is an error, never an empty
+/// root set, because a collector must not treat unreadable authority as
+/// proof that nothing is referenced (plan section 7.8).
+pub(crate) fn pointer_generation_roots_locked(
+    paths: &AcceptedPublicationStorePaths,
+    guard: &AcceptedPublicationLockGuard,
+    project_id: &ProjectId,
+    limits: &AcceptedPublicationLimits,
+) -> AcceptedPublicationStoreResult<Option<Vec<AcceptedPublicationGenerationId>>> {
+    ensure_matching_guard(paths, guard)?;
+    limits.validate()?;
+    let Some(pointer_bytes) =
+        read_pointer_optional_locked(paths, project_id, limits.max_pointer_bytes)?
+    else {
+        return Ok(None);
+    };
+    let pointer = decode_pointer_v1(&pointer_bytes, limits)?;
+    let mut roots = vec![pointer.accepted_generation];
+    if let Some(prior) = pointer.prior_pointer {
+        roots.push(prior.accepted_generation);
+    }
+    Ok(Some(roots))
+}
+
+/// Prove this process can act as the accepted-publication authority before
+/// routes bind: the store lock is held and every store directory that
+/// exists is a real directory rather than a redirect. An absent store root
+/// is not a failure. It is the state of a catalog whose projects have not
+/// published yet, and the per-project scan reports each of those as
+/// publication-missing.
+pub(crate) fn probe_global_store_locked(
+    paths: &AcceptedPublicationStorePaths,
+    guard: &AcceptedPublicationLockGuard,
+) -> AcceptedPublicationStoreResult<()> {
+    ensure_matching_guard(paths, guard)?;
+    for directory in [paths.root(), paths.pointers(), paths.generations()] {
+        if let Some(opened) =
+            NofollowDirectory::open_existing(directory).map_err(accepted_io_error)?
+        {
+            opened.ensure_still_current().map_err(accepted_io_error)?;
+        }
+    }
+    Ok(())
+}
+
 /// Phase-2 §7.7: rebind the publisher attachment only. The pointer's full
 /// ref, accepted commit, accepted scope, generation id, hashes, and prior
 /// pointer are untouched, so the strict pointer/generation startup
@@ -1749,24 +1839,32 @@ fn read_pointer_locked(
     project_id: &ProjectId,
     max_bytes: usize,
 ) -> AcceptedPublicationStoreResult<Vec<u8>> {
-    let directory = NofollowDirectory::open_existing(paths.pointers())
-        .map_err(accepted_io_error)?
-        .ok_or_else(|| {
-            AcceptedPublicationStoreError::new(
-                "error.accepted_publication_missing",
-                "accepted-publication pointer directory is missing",
-            )
-        })?;
+    read_pointer_optional_locked(paths, project_id, max_bytes)?.ok_or_else(|| {
+        AcceptedPublicationStoreError::new(
+            "error.accepted_publication_missing",
+            "accepted-publication pointer is missing",
+        )
+    })
+}
+
+/// Absence and damage are different runtime states: a project that never
+/// published has no pointer, while a project whose pointer cannot be read
+/// or decoded is corrupt. Only an absent directory or absent file is
+/// reported as `None`; every other failure stays an error.
+fn read_pointer_optional_locked(
+    paths: &AcceptedPublicationStorePaths,
+    project_id: &ProjectId,
+    max_bytes: usize,
+) -> AcceptedPublicationStoreResult<Option<Vec<u8>>> {
+    let Some(directory) =
+        NofollowDirectory::open_existing(paths.pointers()).map_err(accepted_io_error)?
+    else {
+        return Ok(None);
+    };
     let filename = format!("{project_id}.json");
     let bytes = directory
         .read_regular(&filename, max_bytes, "accepted-publication pointer")
-        .map_err(accepted_io_error)?
-        .ok_or_else(|| {
-            AcceptedPublicationStoreError::new(
-                "error.accepted_publication_missing",
-                "accepted-publication pointer is missing",
-            )
-        })?;
+        .map_err(accepted_io_error)?;
     directory
         .ensure_still_current()
         .map_err(accepted_io_error)?;
@@ -1809,6 +1907,162 @@ fn accepted_io_error(error: impl fmt::Display) -> AcceptedPublicationStoreError 
         "error.accepted_publication_io",
         format!("accepted-publication I/O failed: {error}"),
     )
+}
+
+/// Accepted-publication builders shared by the crate's own tests. The
+/// runtime facade tests need installed pointers and generations, and the
+/// only honest way to produce them is the real preparation path.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use std::collections::HashMap;
+    use std::fs;
+
+    use bbox_gaps::gaps::GapNote;
+    use bbox_knowledge::knowledge::{KnowledgeEdge, KnowledgeEntry};
+
+    use super::*;
+
+    pub(crate) fn knowledge_entry(id: &str, content: &str) -> KnowledgeEntry {
+        KnowledgeEntry {
+            id: id.to_string(),
+            title: "Accepted publication is path-free".to_string(),
+            content: content.to_string(),
+            cluster: Some("runtime".to_string()),
+            variants: HashMap::new(),
+            category: Category::Convention,
+            scope: Scope::Project,
+            project: None,
+            project_id: None,
+            providers: vec!["provider-a".to_string()],
+            priority: Priority::Standard,
+            weight: 100,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            render: true,
+            decay: false,
+            review_at: None,
+            supersedes: None,
+            links: Vec::<KnowledgeEdge>::new(),
+            rationale: None,
+            expires_at: None,
+            source: "user".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            recall_count: 0,
+            last_recalled: None,
+        }
+    }
+
+    pub(crate) fn gap_note(id: &str) -> GapNote {
+        GapNote {
+            id: id.to_string(),
+            title: "Need a public accepted runtime".to_string(),
+            gap_kind: GapKind::Tooling,
+            domain: "publication".to_string(),
+            wanted_capability: "Read verified accepted content by project id".to_string(),
+            missing_primitive: None,
+            fallback_used: None,
+            evidence: Vec::new(),
+            impact: GapImpact::Medium,
+            blocking_level: BlockingLevel::WorkaroundAvailable,
+            dedupe_key: "tooling/publication/runtime-facade".to_string(),
+            suggested_owner: None,
+            notes: None,
+            supersedes: None,
+            superseded_by: None,
+            resolution: GapResolution::Unresolved,
+            project: None,
+            project_id: None,
+            write_dir: None,
+            provisional_checkout_id: None,
+            task_id: None,
+            session_id: None,
+            provider: None,
+            bro: None,
+            thread_id: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            resolved_at: None,
+            resolution_note: None,
+        }
+    }
+
+    /// One complete dual-lane generation plus its pointer, built through
+    /// the real preparation path so every hash and id is authentic.
+    pub(crate) fn prepare(
+        project_id: &ProjectId,
+        attachment_id: &AttachmentId,
+        scope: &PublishedScope,
+        accepted_commit: &str,
+        content: &str,
+        prior_pointer: Option<AcceptedPublicationPriorPointerV1>,
+    ) -> PreparedAcceptedPublicationV1 {
+        let relative = |lane: &str, id: &str| {
+            if scope.bbox_root_relpath() == "." {
+                format!(".bbox/{lane}/{id}.json")
+            } else {
+                format!("{}/.bbox/{lane}/{id}.json", scope.bbox_root_relpath())
+            }
+        };
+        let input = AcceptedPublicationBuildInputV1 {
+            project_id: project_id.clone(),
+            attachment_id: attachment_id.clone(),
+            scope: scope.clone(),
+            full_ref: FullPublisherRef::parse("refs/heads/main").unwrap(),
+            accepted_commit: GitObjectId::parse(accepted_commit).unwrap(),
+            knowledge: vec![AcceptedKnowledgeSourceV1 {
+                repository_relative_filename: relative("knowledge", "knowledge-a"),
+                source_bytes: serde_json::to_vec(&knowledge_entry("knowledge-a", content)).unwrap(),
+            }],
+            gaps: vec![AcceptedGapSourceV1 {
+                repository_relative_filename: relative("gaps", "gap-1234abcd"),
+                source_bytes: serde_json::to_vec(&gap_note("gap-1234abcd")).unwrap(),
+            }],
+            prior_pointer,
+        };
+        prepare_accepted_publication_v1(input, &AcceptedPublicationLimits::default()).unwrap()
+    }
+
+    pub(crate) fn prior_of(
+        prepared: &PreparedAcceptedPublicationV1,
+    ) -> AcceptedPublicationPriorPointerV1 {
+        AcceptedPublicationPriorPointerV1 {
+            attachment_id: prepared.pointer.attachment_id.clone(),
+            full_ref: prepared.pointer.full_ref.clone(),
+            accepted_commit: prepared.pointer.accepted_commit.clone(),
+            accepted_scope: prepared.pointer.accepted_scope.clone(),
+            accepted_generation: prepared.pointer.accepted_generation.clone(),
+            generation_hash: prepared.pointer.generation_hash.clone(),
+        }
+    }
+
+    /// Install the prepared pair exactly as the catalog transaction owner
+    /// would: the generation under its content-derived id, then the
+    /// pointer that names it.
+    pub(crate) fn install(
+        paths: &AcceptedPublicationStorePaths,
+        project_id: &ProjectId,
+        prepared: &PreparedAcceptedPublicationV1,
+    ) {
+        fs::create_dir_all(paths.pointers()).unwrap();
+        fs::create_dir_all(paths.generations().join(project_id.as_str())).unwrap();
+        fs::write(
+            paths.generation(project_id, &prepared.generation_id),
+            prepared.generation_bytes.as_slice(),
+        )
+        .unwrap();
+        fs::write(paths.pointer(project_id), prepared.pointer_bytes.as_slice()).unwrap();
+    }
+
+    /// Overwrite one installed generation file so its bytes no longer
+    /// verify against the pointer that names it.
+    pub(crate) fn corrupt_generation(
+        paths: &AcceptedPublicationStorePaths,
+        project_id: &ProjectId,
+        generation_id: &AcceptedPublicationGenerationId,
+    ) {
+        fs::write(paths.generation(project_id, generation_id), b"corrupt").unwrap();
+    }
 }
 
 #[cfg(test)]

@@ -110,6 +110,13 @@ pub(crate) struct SharedState {
     /// `records_provider`, checkout access through the broker, and the
     /// remaining version-1 mutators call `bridge_registry()`.
     pub(crate) project_authority: ProjectAuthority,
+    /// The accepted-publication runtime facade, opened and scanned before
+    /// the listener bind (Phase 5 plan section 5.4). `None` in bridge mode:
+    /// bridge published reads keep the legacy publisher authority, and no
+    /// bridge caller constructs this runtime.
+    #[allow(dead_code)] // P5-A installs the runtime; P5-B reads it.
+    pub(crate) accepted_publications:
+        Option<Arc<bbox_indexing::accepted_publication_runtime::AcceptedPublicationRuntime>>,
     /// Injected project-record authority handed to every runtime consumer that
     /// only enumerates records (index writer, index selectors, providers).
     pub(crate) records_provider: Arc<dyn bbox_corpus_core::project_record::ProjectRecordsProvider>,
@@ -739,6 +746,9 @@ impl SharedState {
             pins: pins_store,
             pins_persister,
             project_authority,
+            // `for_test` builds the bridge authority, which never has an
+            // accepted-publication runtime.
+            accepted_publications: None,
             records_provider,
             checkout_registry,
             checkout_access_observations,

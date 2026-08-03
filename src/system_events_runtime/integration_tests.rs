@@ -111,6 +111,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
             registry: projects,
             persister: projects_persister,
         },
+        accepted_publications: None,
         records_provider,
         checkout_registry,
         checkout_access_observations,
