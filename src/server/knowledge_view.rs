@@ -1677,6 +1677,72 @@ mod catalog_view_tests {
                 .iter()
                 .all(|operation| operation.granted == 0 && operation.denied == 0)
         );
+        // The version-1 lane is not merely unused, it is untouched: no
+        // publisher authorization was resolved and no scope-keyed published
+        // snapshot was loaded. Both are the entry points to publisher
+        // election, the publisher root, Git, and recall hydration, so an
+        // empty pair is the negative proof for all four.
+        assert!(server.state.publisher_authorization_cache.read().is_empty());
+        assert!(server.state.knowledge_published_cache.read().is_empty());
+        assert!(server.state.gap_published_cache.read().is_empty());
+    }
+
+    #[test]
+    fn a_rebind_changes_binding_identity_without_evicting_projected_content() {
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project("p_rebind", &scope);
+        fixture.install_publication(
+            "p_rebind",
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-a", "accepted content")],
+            &[],
+        );
+        let server = fixture.server();
+        let project_id = ProjectId::parse("p_rebind").unwrap();
+
+        server.session_knowledge_view(None, None).unwrap();
+        let before = server
+            .state
+            .catalog_knowledge_published_cache
+            .read()
+            .get(&project_id)
+            .expect("the first read installs a projected snapshot")
+            .content_stamp
+            .clone();
+
+        // Attachment-only rebind: the pointer bytes and their digest
+        // change, the accepted content does not.
+        fixture.rebind("p_rebind", "att_22222222222222222222222222222222");
+        server
+            .state
+            .accepted_publications
+            .as_ref()
+            .unwrap()
+            .invalidate_binding(&project_id);
+
+        let after = server.session_knowledge_view(None, None).unwrap();
+        assert_eq!(row(&after, "knowledge-a").entry.content, "accepted content");
+        assert_eq!(
+            server
+                .state
+                .catalog_knowledge_published_cache
+                .read()
+                .get(&project_id)
+                .unwrap()
+                .content_stamp,
+            before,
+            "a binding change must not change content identity"
+        );
+        assert_eq!(
+            published_stamp(&after, "knowledge-a"),
+            BuiltFromStamp::Published {
+                published_scope: scope,
+                published_ref: "refs/heads/main".into(),
+                publisher_commit: COMMIT_ONE.into(),
+            }
+        );
     }
 
     #[test]

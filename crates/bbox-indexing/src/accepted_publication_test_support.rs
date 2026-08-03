@@ -21,8 +21,9 @@ use bbox_corpus_core::project_catalog::{AttachmentId, ProjectId};
 use crate::accepted_publication_store::{
     AcceptedGapSourceV1, AcceptedKnowledgeSourceV1, AcceptedPublicationBuildInputV1,
     AcceptedPublicationGenerationId, AcceptedPublicationLimits, AcceptedPublicationPriorPointerV1,
-    AcceptedPublicationStorePaths, FullPublisherRef, GitObjectId, decode_pointer_v1,
-    prepare_accepted_publication_v1,
+    AcceptedPublicationStorePaths, FullPublisherRef, GitObjectId,
+    acquire_accepted_publication_lock, decode_pointer_v1, prepare_accepted_publication_v1,
+    rebind_pointer_attachment_locked,
 };
 
 /// One committed source file, byte-exact, as the publisher would have read
@@ -116,6 +117,22 @@ pub fn install_accepted_publication_for_test(
         generation_hash: prepared.generation_hash.as_str().to_string(),
         pointer_sha256: prepared.pointer_hash.as_str().to_string(),
     })
+}
+
+/// Rebind one installed pointer to another attachment, changing binding
+/// identity while leaving accepted content byte-identical. This is the real
+/// attachment-only rebind, not a fixture shortcut.
+#[doc(hidden)]
+pub fn rebind_accepted_pointer_for_test(
+    projects_path: &Path,
+    project_id: &ProjectId,
+    new_attachment: &AttachmentId,
+) -> anyhow::Result<()> {
+    let paths = AcceptedPublicationStorePaths::derive(projects_path)?;
+    let limits = AcceptedPublicationLimits::default();
+    let guard = acquire_accepted_publication_lock(&paths)?;
+    rebind_pointer_attachment_locked(&paths, &guard, project_id, new_attachment, None, &limits)?;
+    Ok(())
 }
 
 /// Overwrite one installed generation file so it no longer verifies against

@@ -114,7 +114,6 @@ pub(crate) struct SharedState {
     /// the listener bind (Phase 5 plan section 5.4). `None` in bridge mode:
     /// bridge published reads keep the legacy publisher authority, and no
     /// bridge caller constructs this runtime.
-    #[allow(dead_code)] // P5-A installs the runtime; P5-B reads it.
     pub(crate) accepted_publications:
         Option<Arc<bbox_indexing::accepted_publication_runtime::AcceptedPublicationRuntime>>,
     /// Injected project-record authority handed to every runtime consumer that
@@ -1159,6 +1158,7 @@ pub(crate) mod catalog_fixture {
     use bbox_indexing::accepted_publication_test_support::{
         AcceptedPublicationSourceFileForTest, InstalledAcceptedPublicationForTest,
         corrupt_accepted_generation_for_test, install_accepted_publication_for_test,
+        rebind_accepted_pointer_for_test,
     };
     use bbox_indexing::project_catalog_store::ProjectCatalogStore;
     use bbox_knowledge::knowledge::{Approval, Category, KnowledgeEntry, Priority, Scope, Status};
@@ -1281,6 +1281,17 @@ pub(crate) mod catalog_fixture {
                     .collect(),
             )
             .unwrap()
+        }
+
+        /// Move one pointer to another attachment. Accepted content does
+        /// not change, so a content-stamp-keyed cache must survive it.
+        pub(crate) fn rebind(&self, project_id: &str, new_attachment: &str) {
+            rebind_accepted_pointer_for_test(
+                &self.catalog_projects_path,
+                &ProjectId::parse(project_id).unwrap(),
+                &AttachmentId::parse(new_attachment).unwrap(),
+            )
+            .unwrap();
         }
 
         pub(crate) fn corrupt_generation(&self, project_id: &str, generation_id: &str) {
