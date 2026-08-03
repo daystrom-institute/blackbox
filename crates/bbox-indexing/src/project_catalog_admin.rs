@@ -6945,3 +6945,492 @@ mod tests {
         assert!(result.is_ok(), "valid journal must load: {:?}", result);
     }
 }
+
+/// Publisher establish and advance (Phase 5 plan section 13.2, catalog side).
+///
+/// These exercise the refusals that belong to the catalog rather than to the
+/// pointer store: epoch, attachment identity and status, scope agreement,
+/// capability, and the ref that moved after preparation. The probe is data,
+/// so none of them opens a repository.
+#[cfg(test)]
+mod publisher_publish_tests {
+    use super::*;
+    use crate::accepted_publication_runtime::{
+        AcceptedPublicationRuntime, PublishSourceFile, PublisherPublishMode,
+    };
+    use crate::accepted_publication_store::fixtures;
+    use bbox_corpus_core::project_catalog::CorpusProject;
+
+    const PROJECT: &str = "p_000000000000000000000000000000c1";
+    const ATTACHMENT: &str = "att_00000000000000000000000000000c01";
+    const OTHER_ATTACHMENT: &str = "att_00000000000000000000000000000c02";
+    const COMMIT_ONE: &str = "1111111111111111111111111111111111111111";
+    const COMMIT_TWO: &str = "2222222222222222222222222222222222222222";
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        projects_path: std::path::PathBuf,
+        store: ProjectCatalogStore,
+        runtime: AcceptedPublicationRuntime,
+    }
+
+    fn scope(relative: &str) -> PublishedScope {
+        PublishedScope::try_new("repo_publish", relative).unwrap()
+    }
+
+    fn project_id() -> ProjectId {
+        ProjectId::parse(PROJECT).unwrap()
+    }
+
+    fn attachment_id(raw: &str) -> AttachmentId {
+        AttachmentId::parse(raw).unwrap()
+    }
+
+    fn capabilities(repo_knowledge: bool) -> AttachmentCapabilities {
+        AttachmentCapabilities {
+            repo_knowledge,
+            ..Default::default()
+        }
+    }
+
+    fn checkout_project_dir(scope: &PublishedScope) -> String {
+        match scope.bbox_root_relpath() {
+            "." => "/tmp/publish".to_string(),
+            relative => format!("/tmp/publish/{relative}"),
+        }
+    }
+
+    fn attachment_row(
+        raw: &str,
+        project: &ProjectId,
+        scope: &PublishedScope,
+        status: AttachmentStatus,
+        capabilities: AttachmentCapabilities,
+    ) -> CheckoutAttachment {
+        CheckoutAttachment {
+            attachment_id: attachment_id(raw),
+            project_id: project.clone(),
+            checkout_id: "cccccccccccccccccccccccccccccc01".into(),
+            checkout_dir: "/tmp/publish".into(),
+            // Cross-validation ties the row's relpath to its scope, and the
+            // project directory to the checkout top plus that relpath.
+            checkout_project_dir: checkout_project_dir(scope),
+            project_root_relpath: scope.bbox_root_relpath().to_string(),
+            kind: AttachmentKind::Base,
+            validated_scope: Some(scope.clone()),
+            computed_repo_hint: None,
+            branch_ref: None,
+            // A detached row carries no active capability and a detach
+            // timestamp; the snapshot validator enforces both.
+            capabilities: match status {
+                AttachmentStatus::Detached => AttachmentCapabilities::default(),
+                _ => capabilities,
+            },
+            status,
+            attached_at: "2026-08-03T00:00:00Z".into(),
+            detached_at: match status {
+                AttachmentStatus::Detached => Some("2026-08-03T01:00:00Z".to_string()),
+                _ => None,
+            },
+        }
+    }
+
+    fn fixture() -> Fixture {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let projects_path = root.join("projects.json");
+        let store = ProjectCatalogStore::initialize_empty(&projects_path).unwrap();
+        let runtime = AcceptedPublicationRuntime::open_global(&projects_path).unwrap();
+        let fixture = Fixture {
+            _directory: directory,
+            projects_path,
+            store,
+            runtime,
+        };
+        fixture.seed_project(&scope("."));
+        fixture.upsert_attachment(attachment_row(
+            ATTACHMENT,
+            &project_id(),
+            &scope("."),
+            AttachmentStatus::Attached,
+            capabilities(true),
+        ));
+        fixture
+    }
+
+    impl Fixture {
+        fn epoch(&self) -> u64 {
+            self.store.snapshot().unwrap().epoch()
+        }
+
+        fn seed_project(&self, scope: &PublishedScope) {
+            let scope = scope.clone();
+            self.store
+                .transact(self.epoch(), |catalog, _attachments| {
+                    catalog.projects.insert(
+                        project_id(),
+                        CorpusProject {
+                            project_id: project_id(),
+                            scope: ProjectScope::Published(scope.clone()),
+                            operator_aliases: Default::default(),
+                            nominated_aliases: Default::default(),
+                            display_name: "publish-test".into(),
+                            created_at: "2026-08-03T00:00:00Z".into(),
+                            registered_at_compat: None,
+                            repo_history: None,
+                            languages: Default::default(),
+                        },
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        fn upsert_attachment(&self, row: CheckoutAttachment) {
+            self.store
+                .transact(self.epoch(), |_catalog, attachments| {
+                    attachments
+                        .attachments
+                        .insert(row.attachment_id.clone(), row.clone());
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        /// Migrate the catalog's scope without touching the pointer, which
+        /// is the publication-bridge state.
+        fn migrate_scope(&self, scope: &PublishedScope) {
+            let scope = scope.clone();
+            self.store
+                .transact(self.epoch(), |catalog, attachments| {
+                    catalog.projects.get_mut(&project_id()).unwrap().scope =
+                        ProjectScope::Published(scope.clone());
+                    for row in attachments.attachments.values_mut() {
+                        row.validated_scope = Some(scope.clone());
+                        row.project_root_relpath = scope.bbox_root_relpath().to_string();
+                        row.checkout_project_dir = checkout_project_dir(&scope);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        fn probe(&self, committed_scope: &PublishedScope, commit: &str) -> PublisherPublishProbe {
+            self.probe_with_revalidation(committed_scope, commit, commit)
+        }
+
+        /// A probe whose in-lock re-resolution returns `revalidated`,
+        /// which is how a ref that moved after preparation is simulated.
+        fn probe_with_revalidation(
+            &self,
+            committed_scope: &PublishedScope,
+            commit: &str,
+            revalidated: &str,
+        ) -> PublisherPublishProbe {
+            let revalidated = revalidated.to_string();
+            let relative = |lane: &str, id: &str| {
+                if committed_scope.bbox_root_relpath() == "." {
+                    format!(".bbox/{lane}/{id}.json")
+                } else {
+                    format!(
+                        "{}/.bbox/{lane}/{id}.json",
+                        committed_scope.bbox_root_relpath()
+                    )
+                }
+            };
+            PublisherPublishProbe {
+                resolved_commit: commit.to_string(),
+                committed_scope: committed_scope.clone(),
+                sources: PublishSources {
+                    knowledge: vec![PublishSourceFile {
+                        repository_relative_filename: relative("knowledge", "knowledge-a"),
+                        source_bytes: serde_json::to_vec(&fixtures::knowledge_entry(
+                            "knowledge-a",
+                            commit,
+                        ))
+                        .unwrap(),
+                    }],
+                    gaps: vec![PublishSourceFile {
+                        repository_relative_filename: relative("gaps", "gap-1234abcd"),
+                        source_bytes: serde_json::to_vec(&fixtures::gap_note("gap-1234abcd"))
+                            .unwrap(),
+                    }],
+                },
+                revalidate_ref: Box::new(move || Some(revalidated.clone())),
+            }
+        }
+
+        fn request(&self, mode: PublisherPublishMode, attachment: &str) -> PublisherPublishRequest {
+            PublisherPublishRequest {
+                mode,
+                project_id: project_id(),
+                attachment_id: attachment_id(attachment),
+                full_ref: "refs/heads/main".into(),
+                expected_epoch: self.epoch(),
+                dry_run: false,
+            }
+        }
+
+        fn establish(&self, commit: &str) -> Result<PublishReceipt, PublishError> {
+            publish_accepted_publication(
+                &self.store,
+                &self.runtime,
+                &self.request(PublisherPublishMode::Establish, ATTACHMENT),
+                self.probe(&scope("."), commit),
+            )
+        }
+    }
+
+    #[test]
+    fn establish_then_advance_succeeds_through_the_catalog_gates() {
+        let fixture = fixture();
+        let established = fixture.establish(COMMIT_ONE).unwrap();
+        assert_eq!(established.previous_pointer_sha256(), None);
+
+        let tokens = fixture
+            .runtime
+            .advance_tokens(&project_id())
+            .unwrap()
+            .unwrap();
+        let advanced = publish_accepted_publication(
+            &fixture.store,
+            &fixture.runtime,
+            &fixture.request(
+                PublisherPublishMode::Advance {
+                    expected_generation_id: tokens.0,
+                    expected_pointer_sha256: tokens.1,
+                },
+                ATTACHMENT,
+            ),
+            fixture.probe(&scope("."), COMMIT_TWO),
+        )
+        .unwrap();
+        assert_eq!(
+            advanced.previous_pointer_sha256(),
+            Some(established.pointer_sha256())
+        );
+        assert_eq!(
+            fixture
+                .runtime
+                .load_verified(&project_id())
+                .unwrap()
+                .content_stamp()
+                .accepted_commit(),
+            COMMIT_TWO
+        );
+    }
+
+    #[test]
+    fn a_stale_catalog_epoch_refuses_before_any_write() {
+        let fixture = fixture();
+        let mut request = fixture.request(PublisherPublishMode::Establish, ATTACHMENT);
+        request.expected_epoch = fixture.epoch() + 1;
+
+        let error = publish_accepted_publication(
+            &fixture.store,
+            &fixture.runtime,
+            &request,
+            fixture.probe(&scope("."), COMMIT_ONE),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_stale_epoch");
+        assert!(fixture.runtime.load_verified(&project_id()).is_err());
+    }
+
+    #[test]
+    fn every_attachment_refusal_keeps_its_own_code() {
+        let fixture = fixture();
+        // Unknown attachment.
+        let error = publish_accepted_publication(
+            &fixture.store,
+            &fixture.runtime,
+            &fixture.request(PublisherPublishMode::Establish, OTHER_ATTACHMENT),
+            fixture.probe(&scope("."), COMMIT_ONE),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_admin_unknown_attachment"
+        );
+
+        // Another project's attachment.
+        let other_project = ProjectId::parse("p_000000000000000000000000000000d1").unwrap();
+        fixture
+            .store
+            .transact(fixture.epoch(), |catalog, attachments| {
+                catalog.projects.insert(
+                    other_project.clone(),
+                    CorpusProject {
+                        project_id: other_project.clone(),
+                        scope: ProjectScope::Published(scope("other")),
+                        operator_aliases: Default::default(),
+                        nominated_aliases: Default::default(),
+                        display_name: "other".into(),
+                        created_at: "2026-08-03T00:00:00Z".into(),
+                        registered_at_compat: None,
+                        repo_history: None,
+                        languages: Default::default(),
+                    },
+                );
+                attachments.attachments.insert(
+                    attachment_id(OTHER_ATTACHMENT),
+                    attachment_row(
+                        OTHER_ATTACHMENT,
+                        &other_project,
+                        &scope("other"),
+                        AttachmentStatus::Attached,
+                        capabilities(true),
+                    ),
+                );
+                Ok(())
+            })
+            .unwrap();
+        let error = publish_accepted_publication(
+            &fixture.store,
+            &fixture.runtime,
+            &fixture.request(PublisherPublishMode::Establish, OTHER_ATTACHMENT),
+            fixture.probe(&scope("."), COMMIT_ONE),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_admin_attachment_project_mismatch"
+        );
+
+        // Detached.
+        fixture.upsert_attachment(attachment_row(
+            ATTACHMENT,
+            &project_id(),
+            &scope("."),
+            AttachmentStatus::Detached,
+            capabilities(true),
+        ));
+        let error = fixture.establish(COMMIT_ONE).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_admin_attachment_detached"
+        );
+
+        // Attached again but without the repo-knowledge capability.
+        fixture.upsert_attachment(attachment_row(
+            ATTACHMENT,
+            &project_id(),
+            &scope("."),
+            AttachmentStatus::Attached,
+            capabilities(false),
+        ));
+        let error = fixture.establish(COMMIT_ONE).unwrap_err();
+        assert_eq!(error.code(), "error.project_capability_denied");
+        assert!(fixture.runtime.load_verified(&project_id()).is_err());
+    }
+
+    #[test]
+    fn a_committed_scope_that_disagrees_with_the_catalog_refuses() {
+        let fixture = fixture();
+        let error = publish_accepted_publication(
+            &fixture.store,
+            &fixture.runtime,
+            &fixture.request(PublisherPublishMode::Establish, ATTACHMENT),
+            fixture.probe(&scope("elsewhere"), COMMIT_ONE),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_admin_scope_mismatch");
+    }
+
+    #[test]
+    fn a_ref_that_moves_after_preparation_refuses_at_the_swap() {
+        let fixture = fixture();
+        let error = publish_accepted_publication(
+            &fixture.store,
+            &fixture.runtime,
+            &fixture.request(PublisherPublishMode::Establish, ATTACHMENT),
+            fixture.probe_with_revalidation(&scope("."), COMMIT_ONE, COMMIT_TWO),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ERROR_ACCEPTED_PUBLICATION_REF_MOVED);
+        // The generation was installed off-lock, but no pointer names it.
+        assert!(fixture.runtime.load_verified(&project_id()).is_err());
+    }
+
+    #[test]
+    fn a_scope_migration_bridge_is_cleared_by_advancing_at_the_new_scope() {
+        let fixture = fixture();
+        fixture.establish(COMMIT_ONE).unwrap();
+        let migrated = scope("services/api");
+        fixture.migrate_scope(&migrated);
+
+        // Bind refuses while the bridge is open: attachment-only rebind
+        // cannot move a pointer to a new scope.
+        let bind = bind_publisher_attachment(
+            &fixture.store,
+            &fixture.projects_path,
+            fixture.epoch(),
+            &project_id(),
+            &attachment_id(ATTACHMENT),
+            &PublisherBindProbe {
+                accepted_commit_present: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            bind.code(),
+            ERROR_ACCEPTED_PUBLICATION_SCOPE_ADVANCE_REQUIRED
+        );
+
+        // The old accepted content still serves, under its own scope.
+        let before = fixture.runtime.load_verified(&project_id()).unwrap();
+        assert_eq!(before.content_stamp().accepted_scope(), &scope("."));
+
+        // Advance at the catalog's CURRENT scope closes the bridge and
+        // keeps the old pointer as prior.
+        let tokens = fixture
+            .runtime
+            .advance_tokens(&project_id())
+            .unwrap()
+            .unwrap();
+        publish_accepted_publication(
+            &fixture.store,
+            &fixture.runtime,
+            &fixture.request(
+                PublisherPublishMode::Advance {
+                    expected_generation_id: tokens.0,
+                    expected_pointer_sha256: tokens.1,
+                },
+                ATTACHMENT,
+            ),
+            fixture.probe(&migrated, COMMIT_TWO),
+        )
+        .unwrap();
+        let after = fixture.runtime.load_verified(&project_id()).unwrap();
+        assert_eq!(after.content_stamp().accepted_scope(), &migrated);
+        assert_eq!(
+            after.binding_stamp().scope_agreement(Some(&migrated)),
+            crate::accepted_publication_runtime::AcceptedPublicationScopeAgreement::Agreed
+        );
+    }
+
+    #[test]
+    fn a_dry_run_validates_everything_and_writes_no_pointer() {
+        let fixture = fixture();
+        let mut request = fixture.request(PublisherPublishMode::Establish, ATTACHMENT);
+        request.dry_run = true;
+
+        let receipt = publish_accepted_publication(
+            &fixture.store,
+            &fixture.runtime,
+            &request,
+            fixture.probe(&scope("."), COMMIT_ONE),
+        )
+        .unwrap();
+        assert!(receipt.is_dry_run());
+        assert!(!receipt.generation_id().is_empty());
+        assert!(fixture.runtime.load_verified(&project_id()).is_err());
+        assert!(
+            fixture
+                .runtime
+                .advance_tokens(&project_id())
+                .unwrap()
+                .is_none()
+        );
+    }
+}

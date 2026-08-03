@@ -452,6 +452,22 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Use after detaching or replacing the checkout that carried the publisher binding, so a later publication advance has a live attachment. Fetch the accepted commit into the new checkout first.",
         example: None,
     },
+    ToolDoc {
+        name: "bbox_project_publisher_advance",
+        category: ToolCategory::ProjectCatalog,
+        summary: "Establish or advance one published project's accepted publication. mode=establish creates the project's first pointer and requires that no pointer exists; mode=advance moves an existing pointer and requires expected_generation_id and expected_pointer_sha256, which bbox_project_publisher_status returns. The named attachment must be attached, carry the catalog's current published scope, and hold the repo_knowledge capability. The daemon resolves full_ref in that checkout, reads the committed project identity and both source lanes at that commit, validates knowledge and gaps into one immutable generation, and swaps the pointer only after rechecking the catalog epoch, the attachment, and the ref. Publishing always uses the catalog's CURRENT scope, which is what clears a scope-migration bridge. dry_run validates and writes nothing. Requires expected_catalog_epoch and a bounded audit_reason. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority.",
+        when_to_use: "Use to start publishing for a project migration left with no pointer (`establish`), or to move published knowledge and gaps to a newer commit (`advance`). Read `bbox_project_publisher_status` first for the compare-and-swap tokens, and run `dry_run=true` before a first advance.",
+        example: Some(
+            r#"bbox_project_publisher_advance(project_id="p_4f6a1c9e5b2d47a8b0c3e1f5a9d76b24", attachment_id="att_1b7d3f", mode="advance", full_ref="refs/heads/main", expected_generation_id="9f2c...", expected_pointer_sha256="41ab...", expected_catalog_epoch=7, audit_reason="publish reviewed knowledge")"#,
+        ),
+    },
+    ToolDoc {
+        name: "bbox_project_publisher_status",
+        category: ToolCategory::ProjectCatalog,
+        summary: "Read-only accepted-publication status for one catalog project. Reports whether the project serves its current generation, has fallen back to its prior generation, has no pointer at all, or is corrupt; the accepted scope, ref, commit, and generation identity; the bound attachment and the pointer SHA-256; whether the accepted scope still agrees with the catalog's current scope; and whether an advance is available. The generation id and pointer SHA-256 it returns are the compare-and-swap tokens bbox_project_publisher_advance requires. Opens no checkout and takes no lease. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority.",
+        when_to_use: "Use before an advance to read its compare-and-swap tokens, and when diagnosing why published knowledge or gaps are unavailable, degraded to a prior generation, or refusing to advance.",
+        example: None,
+    },
     // ── Knowledge ────────────────────────────────────────────────────
     ToolDoc {
         name: "bbox_learn",
