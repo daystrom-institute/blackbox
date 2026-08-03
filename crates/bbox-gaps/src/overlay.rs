@@ -542,12 +542,48 @@ pub fn recompute_overlay(
     }
 }
 
+/// What the gap diff needs to know about published content. The bridge
+/// answers from committed bytes; the catalog answers from the accepted
+/// generation manifest, which records each source file digest rather than
+/// its blob.
+trait PublishedGapAuthority {
+    fn contains(&self, filename: &str) -> bool;
+    fn matches(&self, filename: &str, working: &[u8]) -> bool;
+}
+
+impl PublishedGapAuthority for BTreeMap<String, Vec<u8>> {
+    fn contains(&self, filename: &str) -> bool {
+        self.contains_key(filename)
+    }
+
+    fn matches(&self, filename: &str, working: &[u8]) -> bool {
+        self.get(filename).is_some_and(|bytes| bytes == working)
+    }
+}
+
+/// Repository-relative filename to the lowercase SHA-256 of its exact
+/// committed bytes, from an accepted generation manifest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AcceptedPublishedGapDigests(pub BTreeMap<String, String>);
+
+impl PublishedGapAuthority for AcceptedPublishedGapDigests {
+    fn contains(&self, filename: &str) -> bool {
+        self.0.contains_key(filename)
+    }
+
+    fn matches(&self, filename: &str, working: &[u8]) -> bool {
+        self.0
+            .get(filename)
+            .is_some_and(|digest| digest == &sha256(working))
+    }
+}
+
 /// The gap overlay diff shared by the bridge and catalog entry points.
 /// One implementation keeps the two paths differing only in where
 /// published content and ancestry come from.
 fn gap_overlay_values_from_maps(
     baseline: &BTreeMap<String, Vec<u8>>,
-    published: &BTreeMap<String, Vec<u8>>,
+    published: &dyn PublishedGapAuthority,
     working: &BTreeMap<String, Vec<u8>>,
     checkout_project_dir: &str,
 ) -> std::result::Result<BTreeMap<String, GapOverlayValue>, GapOverlayRecomputeError> {
@@ -560,7 +596,7 @@ fn gap_overlay_values_from_maps(
         match (baseline.get(&filename), working.get(&filename)) {
             (Some(before), Some(after)) if before == after => {}
             (_, Some(after)) => {
-                if published.get(&filename) == Some(after) {
+                if published.matches(&filename, after) {
                     continue;
                 }
                 let mut gap: GapNote = serde_json::from_slice(after)
@@ -589,7 +625,7 @@ fn gap_overlay_values_from_maps(
                     .map_err(GapOverlayRecomputeError::invalid_content)?;
                 validate_filename_id(&filename, &gap.id, "baseline gap")
                     .map_err(GapOverlayRecomputeError::invalid_content)?;
-                if published.contains_key(&filename) {
+                if published.contains(&filename) {
                     values.insert(gap.id, GapOverlayValue::Tombstone);
                 }
             }
@@ -610,7 +646,8 @@ pub struct CatalogGapOverlayPublished<'a> {
     pub full_ref: &'a str,
     pub accepted_commit: &'a str,
     pub accepted_generation: &'a str,
-    pub published: &'a BTreeMap<String, Vec<u8>>,
+    /// Filename to committed-source digest, from the accepted manifest.
+    pub published: &'a AcceptedPublishedGapDigests,
 }
 
 /// Catalog-mode gap overlay recompute (plan sections 4.11 and 6.7).
@@ -645,8 +682,6 @@ pub fn recompute_catalog_overlay_result(
         .map_err(GapOverlayRecomputeError::transient)?;
     let working = &working.files;
     validate_gap_map(&baseline, "baseline").map_err(GapOverlayRecomputeError::invalid_content)?;
-    validate_gap_map(published.published, "published")
-        .map_err(GapOverlayRecomputeError::invalid_content)?;
     validate_gap_map(working, "working").map_err(GapOverlayRecomputeError::invalid_content)?;
     let working_fingerprint = fingerprint_map(working);
     // A catalog overlay row carries no host path: the gap view stamps
@@ -1160,7 +1195,7 @@ mod tests {
         temp: tempfile::TempDir,
         worktree: std::path::PathBuf,
         accepted_commit: String,
-        published: BTreeMap<String, Vec<u8>>,
+        published: AcceptedPublishedGapDigests,
         scope: PublishedScope,
     }
 
@@ -1176,11 +1211,11 @@ mod tests {
         git(&base, &["add", ".bbox/gaps"]);
         git(&base, &["commit", "-q", "-m", "accepted"]);
         let accepted_commit = git::current_head(&base).unwrap();
-        let mut published = BTreeMap::new();
+        let mut published = AcceptedPublishedGapDigests::default();
         for id in ["gap-11111111", "gap-22222222"] {
-            published.insert(
+            published.0.insert(
                 format!("{id}.json"),
-                std::fs::read(base.join(format!(".bbox/gaps/{id}.json"))).unwrap(),
+                sha256(&std::fs::read(base.join(format!(".bbox/gaps/{id}.json"))).unwrap()),
             );
         }
         let worktree = temp.path().join("worktree");

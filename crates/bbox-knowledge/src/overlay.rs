@@ -681,9 +681,11 @@ pub struct CatalogOverlayPublished<'a> {
     /// Accepted generation identity, so an advance invalidates overlays
     /// even when the checkout has not moved.
     pub accepted_generation: &'a str,
-    /// Repository-relative filename to exact committed bytes, projected
-    /// from the accepted generation manifest.
-    pub published: &'a BTreeMap<String, Vec<u8>>,
+    /// Repository-relative filename to the SHA-256 of its exact committed
+    /// bytes, projected from the accepted generation manifest. Accepted
+    /// generations record source digests, not source blobs, and identity is
+    /// all the diff needs.
+    pub published: &'a AcceptedPublishedDigests,
 }
 
 /// Catalog-mode overlay recompute (plan sections 4.11 and 6.7).
@@ -730,8 +732,6 @@ pub fn recompute_catalog_overlay_result(
     let working = &working.files;
     validate_knowledge_map(&baseline, "baseline")
         .map_err(OverlayRecomputeError::invalid_content)?;
-    validate_knowledge_map(published.published, "published")
-        .map_err(OverlayRecomputeError::invalid_content)?;
     validate_knowledge_map(working, "working").map_err(OverlayRecomputeError::invalid_content)?;
     let working_fingerprint = fingerprint_map(working);
     let values = overlay_values_from_maps(&baseline, published.published, working)?;
@@ -760,6 +760,46 @@ pub fn recompute_catalog_overlay_result(
     })
 }
 
+/// What the diff needs to know about published content: whether a file
+/// exists there, and whether the working bytes already equal it.
+///
+/// The bridge answers from committed bytes it read out of the publisher
+/// repository. The catalog answers from the accepted generation manifest,
+/// which records the SHA-256 of each committed source file rather than the
+/// bytes: content identity is what the diff actually needs, and hashes
+/// keep an accepted generation from having to carry every source blob.
+trait PublishedAuthority {
+    fn contains(&self, filename: &str) -> bool;
+    fn matches(&self, filename: &str, working: &[u8]) -> bool;
+}
+
+impl PublishedAuthority for BTreeMap<String, Vec<u8>> {
+    fn contains(&self, filename: &str) -> bool {
+        self.contains_key(filename)
+    }
+
+    fn matches(&self, filename: &str, working: &[u8]) -> bool {
+        self.get(filename).is_some_and(|bytes| bytes == working)
+    }
+}
+
+/// Repository-relative filename to the lowercase SHA-256 of its exact
+/// committed bytes, as recorded by an accepted generation manifest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AcceptedPublishedDigests(pub BTreeMap<String, String>);
+
+impl PublishedAuthority for AcceptedPublishedDigests {
+    fn contains(&self, filename: &str) -> bool {
+        self.0.contains_key(filename)
+    }
+
+    fn matches(&self, filename: &str, working: &[u8]) -> bool {
+        self.0
+            .get(filename)
+            .is_some_and(|digest| digest == &sha256(working))
+    }
+}
+
 /// The overlay diff shared by the bridge and catalog entry points.
 ///
 /// Baseline comes from the checkout at the merge base, published comes
@@ -768,7 +808,7 @@ pub fn recompute_catalog_overlay_result(
 /// points differ only in where published content and ancestry come from.
 fn overlay_values_from_maps(
     baseline: &BTreeMap<String, Vec<u8>>,
-    published: &BTreeMap<String, Vec<u8>>,
+    published: &dyn PublishedAuthority,
     working: &BTreeMap<String, Vec<u8>>,
 ) -> std::result::Result<BTreeMap<String, OverlayValue>, OverlayRecomputeError> {
     let mut paths = BTreeSet::new();
@@ -783,7 +823,7 @@ fn overlay_values_from_maps(
                 // Equality at the pinned published ref is already integrated;
                 // suppress the provisional variant even for a cherry-pick or
                 // content-equivalent merge with different ancestry.
-                if published.get(&filename) == Some(after) {
+                if published.matches(&filename, after) {
                     continue;
                 }
                 let entry: KnowledgeEntry = serde_json::from_slice(after)
@@ -829,7 +869,7 @@ fn overlay_values_from_maps(
                         entry.id
                     )));
                 }
-                if published.contains_key(&filename) {
+                if published.contains(&filename) {
                     values.insert(entry.id, OverlayValue::Tombstone);
                 }
             }
@@ -1188,7 +1228,7 @@ mod tests {
         base: std::path::PathBuf,
         worktree: std::path::PathBuf,
         accepted_commit: String,
-        published: BTreeMap<String, Vec<u8>>,
+        published: AcceptedPublishedDigests,
         scope: PublishedScope,
     }
 
@@ -1209,11 +1249,12 @@ mod tests {
         let accepted_commit = git::current_head(&base).unwrap();
         // Accepted published content is BYTES, captured at that commit,
         // never re-read from a repository during recompute.
-        let mut published = BTreeMap::new();
+        // The manifest records digests of the exact committed bytes.
+        let mut published = AcceptedPublishedDigests::default();
         for id in ["keep", "remove"] {
-            published.insert(
+            published.0.insert(
                 format!("{id}.json"),
-                std::fs::read(base.join(format!(".bbox/knowledge/{id}.json"))).unwrap(),
+                sha256(&std::fs::read(base.join(format!(".bbox/knowledge/{id}.json"))).unwrap()),
             );
         }
         let worktree = temp.path().join("worktree");

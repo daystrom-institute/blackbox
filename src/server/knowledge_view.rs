@@ -1266,6 +1266,7 @@ mod tests {
                 checkout_head: format!("head-{checkout_id}"),
                 merge_base: "merge-base-for-test".into(),
                 working_fingerprint: format!("dirty-{checkout_id}"),
+                accepted_generation: None,
             }),
             status: OverlayStatus::Valid,
             values,
