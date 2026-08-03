@@ -34,3 +34,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# Per-test tempdir homes for the legacy-migration ordering tests (R35F2).
+tempfile = "3"

@@ -21,7 +21,7 @@
 //! endpoint. The daemon never links a Slack crate.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -1296,6 +1296,91 @@ async fn backoff_sleep(
     }
 }
 
+// ── Identity path resolution ────────────────────────────────────────
+
+/// How long the sidecar waits for a concurrent legacy migration to publish
+/// the identity map before refusing to start.
+const IDENTITY_MIGRATION_WAIT: Duration = Duration::from_secs(60);
+/// How often it re-checks while waiting.
+const IDENTITY_MIGRATION_POLL: Duration = Duration::from_millis(200);
+
+/// Resolve the identities file, settling the one-time legacy migration first.
+///
+/// R35F2: this used to skip the migration on a contended claim and merely warn
+/// on any migration error, then immediately load the destination. Starting
+/// concurrently with a daemon that held the claim and had not yet published
+/// `slack-identities.json` therefore produced an EMPTY identity map, which the
+/// ACL layer turns into anonymous `["read"]` for every user: configured
+/// identities and audit attribution vanish for the sidecar's lifetime,
+/// dispatch-authorized users are denied, and an explicitly mapped identity
+/// with `scopes: []` is WIDENED to the anonymous default. Nothing reloads
+/// afterwards, so the window is permanent.
+///
+/// An absent destination is now only allowed to mean "no identities are
+/// configured" once that is PROVEN: either this process holds the claim (so
+/// nothing else can publish and the migration has been run to completion
+/// here), or both the legacy source and any pending migration journal are
+/// provably absent. Otherwise the sidecar waits for the holder and, if the
+/// wait runs out, refuses to start rather than warming an empty ACL.
+fn resolve_identities_path(
+    home: &Path,
+    bro_home: &Path,
+    wait_budget: Duration,
+    poll: Duration,
+) -> Result<PathBuf> {
+    let old = home.join(".bro").join("slack-identities.json");
+    let new = bro_home.join("slack-identities.json");
+    let journal = bbox_util::util::legacy_migration_journal_path(home);
+    let deadline = Instant::now() + wait_budget;
+
+    loop {
+        // The destination is authoritative the moment it exists: publication
+        // is a rename of a fully synced staged copy, never a partial write.
+        if bbox_util::util::legacy_entry_present(&new)? {
+            return Ok(new);
+        }
+
+        // Errors propagate from here on. A warning followed by an empty ACL is
+        // exactly the authority regression this function exists to prevent.
+        match bbox_util::util::try_lock_legacy_migration(home)? {
+            Some(_claim) => {
+                bbox_util::util::recover_legacy_migration(home)?;
+                bbox_util::util::migrate_legacy_entry(home, &old, &new)?;
+                // Holding the claim IS the proof: nothing else could publish,
+                // recovery settled any pending journal, and the migration
+                // either moved the source or found it genuinely absent.
+                return Ok(new);
+            }
+            None => {
+                if !bbox_util::util::legacy_entry_present(&old)?
+                    && !bbox_util::util::legacy_entry_present(&journal)?
+                {
+                    // Nothing to migrate and nothing in flight, so an absent
+                    // destination really does mean no identities are mapped.
+                    return Ok(new);
+                }
+                if Instant::now() >= deadline {
+                    return Err(anyhow!(
+                        "the legacy slack-identities migration is still in flight after {:?}: \
+                         source {} or journal {} is present and {} has not been published. \
+                         Refusing to start, because an empty identity map would widen every \
+                         configured identity to anonymous read.",
+                        wait_budget,
+                        old.display(),
+                        journal.display(),
+                        new.display()
+                    ));
+                }
+                tracing::info!(
+                    "waiting for the legacy slack-identities migration to publish {}",
+                    new.display()
+                );
+                std::thread::sleep(poll);
+            }
+        }
+    }
+}
+
 // ── Main entry point ────────────────────────────────────────────────
 
 #[tokio::main]
@@ -1317,31 +1402,19 @@ async fn main() -> Result<()> {
         bbox_util::util::resolve_tilde(&p)
     } else {
         let home = dirs::home_dir().context("home directory not found")?;
-        let old = home.join(".bro").join("slack-identities.json");
-        let new = cfg.paths.bro_home.join("slack-identities.json");
-        // R34F2: the move is a journaled transaction whose record lives beside
-        // the legacy source claim, so this sidecar has to take that claim like
-        // any other migrator. A contended claim means the daemon owns the move
-        // right now; skipping loses nothing, because the migration is
-        // one-time and idempotent.
-        match bbox_util::util::try_lock_legacy_migration(&home) {
-            Ok(Some(_claim)) => {
-                if let Err(error) =
-                    bbox_util::util::recover_legacy_migration(&home).and_then(|_| {
-                        bbox_util::util::migrate_legacy_entry(&home, &old, &new).map(|_| ())
-                    })
-                {
-                    tracing::warn!("legacy slack-identities migration skipped: {error:#}");
-                }
-            }
-            Ok(None) => tracing::info!(
-                "another process holds the legacy source; skipping the slack-identities migration"
-            ),
-            Err(error) => {
-                tracing::warn!("could not claim the legacy source: {error:#}");
-            }
-        }
-        new
+        let bro_home = cfg.paths.bro_home.clone();
+        // The migration is blocking filesystem work with a bounded wait, so it
+        // runs off the runtime workers (concurrency-model I2).
+        tokio::task::spawn_blocking(move || {
+            resolve_identities_path(
+                &home,
+                &bro_home,
+                IDENTITY_MIGRATION_WAIT,
+                IDENTITY_MIGRATION_POLL,
+            )
+        })
+        .await
+        .context("resolving the slack identities path")??
     };
 
     let identities = load_identities(&identities_path)?;
@@ -1537,6 +1610,244 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::path::PathBuf;
+
+    // ── Identity path resolution under the legacy migration (R35F2) ──
+
+    const MAPPED: &str = r#"{"T1":{"U1":{"bbox_user":"alice","scopes":["all"]}}}"#;
+
+    /// A fixture `$HOME` plus the daemon's resolved bro home, both canonical.
+    fn migration_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let bro_home = root.join("state").join("bro");
+        std::fs::create_dir_all(&home).unwrap();
+        (dir, home, bro_home)
+    }
+
+    fn mapped_count(path: &Path) -> usize {
+        load_identities(path)
+            .unwrap()
+            .workspaces
+            .values()
+            .map(|w| w.len())
+            .sum()
+    }
+
+    /// The claim is free, so the sidecar performs the move itself and reads a
+    /// populated map.
+    #[test]
+    fn resolve_identities_migrates_the_legacy_map_when_it_can_claim() {
+        let (_dir, home, bro_home) = migration_fixture();
+        let _faults = bbox_util::util::arm_legacy_migration_faults(&[]);
+        let old = home.join(".bro").join("slack-identities.json");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, MAPPED).unwrap();
+
+        let path = resolve_identities_path(
+            &home,
+            &bro_home,
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        assert_eq!(path, bro_home.join("slack-identities.json"));
+        assert_eq!(mapped_count(&path), 1, "the configured identity survives");
+        assert!(!old.exists(), "the legacy source was closed out");
+    }
+
+    /// The two-process ordering case the finding names. The daemon holds the
+    /// claim and has not published yet; the sidecar must WAIT rather than warm
+    /// an empty ACL that widens every configured identity to anonymous read.
+    #[test]
+    fn resolve_identities_waits_for_a_contended_migration_instead_of_warming_an_empty_acl() {
+        let (_dir, home, bro_home) = migration_fixture();
+        let _faults = bbox_util::util::arm_legacy_migration_faults(&[]);
+        let old = home.join(".bro").join("slack-identities.json");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, MAPPED).unwrap();
+        let new = bro_home.join("slack-identities.json");
+
+        // The daemon is inside its migration, holding the legacy source.
+        let held = bbox_util::util::try_lock_legacy_migration(&home)
+            .unwrap()
+            .expect("the daemon claims the legacy source");
+
+        let (sidecar_home, sidecar_bro_home) = (home.clone(), bro_home.clone());
+        // The sidecar reports what it would have loaded, so an early return
+        // shows up as an empty ACL rather than as a timing detail.
+        let sidecar = std::thread::spawn(move || {
+            let path = resolve_identities_path(
+                &sidecar_home,
+                &sidecar_bro_home,
+                Duration::from_secs(10),
+                Duration::from_millis(10),
+            )?;
+            let count = load_identities(&path)?
+                .workspaces
+                .values()
+                .map(|w| w.len())
+                .sum::<usize>();
+            anyhow::Ok((path, count))
+        });
+
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !sidecar.is_finished(),
+            "the sidecar must not resolve an unpublished identity map"
+        );
+
+        // The daemon publishes and releases.
+        std::fs::create_dir_all(&bro_home).unwrap();
+        std::fs::write(&new, MAPPED).unwrap();
+        drop(held);
+
+        let (path, count) = sidecar.join().unwrap().unwrap();
+        assert_eq!(path, new);
+        assert_eq!(
+            count, 1,
+            "the sidecar loaded the migrated map, never an empty ACL"
+        );
+    }
+
+    /// A contended claim whose holder never publishes must refuse startup, not
+    /// fall through to an empty identity map.
+    #[test]
+    fn resolve_identities_refuses_when_a_contended_migration_never_publishes() {
+        let (_dir, home, bro_home) = migration_fixture();
+        let _faults = bbox_util::util::arm_legacy_migration_faults(&[]);
+        let old = home.join(".bro").join("slack-identities.json");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, MAPPED).unwrap();
+
+        let _held = bbox_util::util::try_lock_legacy_migration(&home)
+            .unwrap()
+            .expect("the daemon claims the legacy source");
+
+        let error = resolve_identities_path(
+            &home,
+            &bro_home,
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        )
+        .expect_err("an unmigrated identity map must refuse startup");
+        assert!(
+            format!("{error:#}").contains("Refusing to start"),
+            "the refusal explains the authority risk: {error:#}"
+        );
+    }
+
+    /// A pending journal counts as "in flight" even with no legacy source
+    /// left: the holder may be mid-transaction, about to publish.
+    #[test]
+    fn resolve_identities_refuses_while_a_migration_journal_is_pending() {
+        let (_dir, home, bro_home) = migration_fixture();
+        let _faults = bbox_util::util::arm_legacy_migration_faults(&[]);
+        std::fs::write(
+            bbox_util::util::legacy_migration_journal_path(&home),
+            "{\"version\":1}",
+        )
+        .unwrap();
+
+        let _held = bbox_util::util::try_lock_legacy_migration(&home)
+            .unwrap()
+            .expect("the daemon claims the legacy source");
+
+        resolve_identities_path(
+            &home,
+            &bro_home,
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        )
+        .expect_err("a pending journal must refuse startup");
+    }
+
+    /// A contended claim is fine once the destination is published: there is
+    /// nothing left to wait for.
+    #[test]
+    fn resolve_identities_uses_a_published_map_even_while_the_claim_is_held() {
+        let (_dir, home, bro_home) = migration_fixture();
+        let _faults = bbox_util::util::arm_legacy_migration_faults(&[]);
+        std::fs::create_dir_all(&bro_home).unwrap();
+        std::fs::write(bro_home.join("slack-identities.json"), MAPPED).unwrap();
+
+        let _held = bbox_util::util::try_lock_legacy_migration(&home)
+            .unwrap()
+            .expect("the daemon claims the legacy source");
+
+        let path = resolve_identities_path(
+            &home,
+            &bro_home,
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        assert_eq!(mapped_count(&path), 1);
+    }
+
+    /// An empty ACL is legitimate only once BOTH the destination and every
+    /// legacy/pending source are provably absent.
+    #[test]
+    fn resolve_identities_allows_an_empty_map_only_when_nothing_is_pending() {
+        let (_dir, home, bro_home) = migration_fixture();
+        let _faults = bbox_util::util::arm_legacy_migration_faults(&[]);
+
+        let path = resolve_identities_path(
+            &home,
+            &bro_home,
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        assert_eq!(mapped_count(&path), 0, "nothing was ever configured");
+    }
+
+    /// Migration and recovery failures propagate. Warning and continuing is
+    /// what turned an inspection failure into an anonymous-read ACL.
+    #[test]
+    fn resolve_identities_propagates_a_migration_failure() {
+        let (_dir, home, bro_home) = migration_fixture();
+        let old = home.join(".bro").join("slack-identities.json");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, MAPPED).unwrap();
+
+        let _faults = bbox_util::util::arm_legacy_migration_faults(&[(
+            bbox_util::util::LegacyMigrationFault::InspectSource,
+            bbox_util::util::INJECTED_EACCES,
+        )]);
+        let error = resolve_identities_path(
+            &home,
+            &bro_home,
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        )
+        .expect_err("a failed migration must refuse startup");
+        assert!(
+            format!("{error:#}").contains("InspectSource"),
+            "the refusal names the failure: {error:#}"
+        );
+    }
+
+    /// An unclassifiable journal is a refusal at the sidecar too, reached
+    /// through recovery under the claim rather than through the wait loop.
+    #[test]
+    fn resolve_identities_propagates_an_unclassifiable_journal() {
+        let (_dir, home, bro_home) = migration_fixture();
+        let _faults = bbox_util::util::arm_legacy_migration_faults(&[]);
+        std::fs::write(bbox_util::util::legacy_migration_journal_path(&home), "").unwrap();
+
+        let error = resolve_identities_path(
+            &home,
+            &bro_home,
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        )
+        .expect_err("an unclassifiable journal must refuse startup");
+        assert!(
+            format!("{error:#}").contains("journal"),
+            "the refusal names the journal: {error:#}"
+        );
+    }
 
     // ── Identity loading ────────────────────────────────────────
 
