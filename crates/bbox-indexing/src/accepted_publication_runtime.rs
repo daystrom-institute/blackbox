@@ -1095,8 +1095,12 @@ impl AcceptedPublicationRuntime {
         }))
     }
 
+    /// Test-only: install the publish transaction's interruption hook.
     #[cfg(test)]
-    fn install_fault_injector(&mut self, faults: Arc<dyn AcceptedPublicationFaultInjector>) {
+    pub(crate) fn install_fault_injector_for_test(
+        &mut self,
+        faults: Arc<dyn AcceptedPublicationFaultInjector>,
+    ) {
         self.faults = Some(faults);
     }
 
@@ -2304,6 +2308,33 @@ mod tests {
         assert!(runtime.load_verified(&project_id).is_ok());
     }
 
+    #[test]
+    fn a_foreign_generation_under_one_content_id_fails_closed() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let project_id = project("p_foreign");
+        let prepared = runtime
+            .prepare_publish(establish_request(&project_id, COMMIT_ONE), sources("first"))
+            .unwrap();
+        // Replace the installed generation with different bytes under the
+        // same content id. Content addressing makes this unreachable
+        // through the public path, so the guard is the last line of
+        // defence rather than an expected state.
+        let generation_path = fixture.paths.generation(
+            &project_id,
+            &AcceptedPublicationGenerationId::parse(prepared.generation_id().to_string()).unwrap(),
+        );
+        std::fs::write(&generation_path, b"{\"version\":1}").unwrap();
+
+        let error = runtime
+            .prepare_publish(establish_request(&project_id, COMMIT_ONE), sources("first"))
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.accepted_publication_invalid_generation"
+        );
+    }
+
     #[derive(Debug)]
     struct FailAt {
         point: AcceptedPublicationFaultPoint,
@@ -2336,7 +2367,7 @@ mod tests {
         point: AcceptedPublicationFaultPoint,
     ) -> AcceptedPublicationRuntime {
         let mut runtime = fixture.runtime();
-        runtime.install_fault_injector(StdArc::new(FailAt {
+        runtime.install_fault_injector_for_test(StdArc::new(FailAt {
             point,
             corrupt_generation: std::sync::Mutex::new(None),
         }));
@@ -2429,7 +2460,7 @@ mod tests {
             &project_id,
             &AcceptedPublicationGenerationId::parse(prepared.generation_id().to_string()).unwrap(),
         );
-        runtime.install_fault_injector(StdArc::new(FailAt {
+        runtime.install_fault_injector_for_test(StdArc::new(FailAt {
             point: AcceptedPublicationFaultPoint::AfterPointerSwap,
             corrupt_generation: std::sync::Mutex::new(Some((
                 generation_path,

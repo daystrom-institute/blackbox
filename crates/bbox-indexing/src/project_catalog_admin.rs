@@ -6970,7 +6970,7 @@ mod publisher_publish_tests {
     struct Fixture {
         _directory: tempfile::TempDir,
         projects_path: std::path::PathBuf,
-        store: ProjectCatalogStore,
+        store: std::sync::Arc<ProjectCatalogStore>,
         runtime: AcceptedPublicationRuntime,
     }
 
@@ -7039,7 +7039,8 @@ mod publisher_publish_tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let projects_path = root.join("projects.json");
-        let store = ProjectCatalogStore::initialize_empty(&projects_path).unwrap();
+        let store =
+            std::sync::Arc::new(ProjectCatalogStore::initialize_empty(&projects_path).unwrap());
         let runtime = AcceptedPublicationRuntime::open_global(&projects_path).unwrap();
         let fixture = Fixture {
             _directory: directory,
@@ -7406,6 +7407,78 @@ mod publisher_publish_tests {
         assert_eq!(
             after.binding_stamp().scope_agreement(Some(&migrated)),
             crate::accepted_publication_runtime::AcceptedPublicationScopeAgreement::Agreed
+        );
+    }
+
+    /// D-033 item 1, stated as a test rather than as a claim.
+    ///
+    /// Catalog detach deliberately does not take the publication lock, so a
+    /// detach can still land after the freshness recheck and before the
+    /// swap. The residual is a misleading binding, never corruption: the
+    /// accepted content is intact, published reads keep serving, and an
+    /// explicit bind repairs the binding. Nothing in this milestone claims
+    /// the window is closed.
+    #[derive(Debug)]
+    struct DetachAtSwap {
+        store: std::sync::Arc<ProjectCatalogStore>,
+    }
+
+    impl crate::accepted_publication_store::AcceptedPublicationFaultInjector for DetachAtSwap {
+        fn checkpoint(
+            &self,
+            point: crate::accepted_publication_store::AcceptedPublicationFaultPoint,
+        ) -> Result<(), crate::accepted_publication_store::AcceptedPublicationStoreError> {
+            if point
+                != crate::accepted_publication_store::AcceptedPublicationFaultPoint::BeforePointerSwap
+            {
+                return Ok(());
+            }
+            let epoch = self.store.snapshot().unwrap().epoch();
+            self.store
+                .transact(epoch, |_catalog, attachments| {
+                    let row = attachments
+                        .attachments
+                        .get_mut(&attachment_id(ATTACHMENT))
+                        .unwrap();
+                    row.status = AttachmentStatus::Detached;
+                    row.capabilities = AttachmentCapabilities::default();
+                    row.detached_at = Some("2026-08-03T02:00:00Z".into());
+                    Ok(())
+                })
+                .unwrap();
+            // Continue into the swap: this is the interleaving, not a fault.
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_detach_inside_the_final_swap_window_leaves_a_binding_to_repair() {
+        let mut fixture = fixture();
+        fixture
+            .runtime
+            .install_fault_injector_for_test(std::sync::Arc::new(DetachAtSwap {
+                store: fixture.store.clone(),
+            }));
+
+        // The publish itself succeeds: freshness passed, and the detach
+        // landed after it.
+        let receipt = fixture.establish(COMMIT_ONE).unwrap();
+
+        // Accepted content is intact and still readable.
+        let verified = fixture.runtime.load_verified(&project_id()).unwrap();
+        assert_eq!(verified.content_stamp().accepted_commit(), COMMIT_ONE);
+        assert_eq!(
+            verified.binding_stamp().pointer_sha256(),
+            receipt.pointer_sha256()
+        );
+
+        // The pointer names an attachment the catalog now reports detached.
+        // That is the residual: a binding an operator repairs with bind.
+        let bound = verified.binding_stamp().attachment_id().clone();
+        let state = fixture.store.snapshot().unwrap();
+        assert_eq!(
+            state.attachments().attachments.get(&bound).unwrap().status,
+            AttachmentStatus::Detached
         );
     }
 
