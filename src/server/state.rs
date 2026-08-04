@@ -2112,6 +2112,39 @@ pub(crate) mod catalog_fixture {
                 .unwrap();
         }
 
+        /// Replace one attachment's capability bits.
+        ///
+        /// Additive companion to the attach helpers, which grant
+        /// `repo_knowledge` only and therefore cannot express the section 9
+        /// rows whose gate is a different bit. Composes with any of them
+        /// rather than duplicating their identity-marker setup, so a row
+        /// that needs `render_output` or `blame` attaches normally and then
+        /// says so.
+        pub(crate) fn grant_capabilities(
+            &self,
+            attachment_id: &str,
+            capabilities: bbox_corpus_core::project_catalog::AttachmentCapabilities,
+        ) {
+            let attachment_id = AttachmentId::parse(attachment_id).unwrap();
+            let epoch = self.store.snapshot().unwrap().epoch();
+            self.store
+                .transact(epoch, |_catalog, attachments| {
+                    attachments
+                        .attachments
+                        .get_mut(&attachment_id)
+                        .expect("attachment exists")
+                        .capabilities = capabilities;
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        /// The fixture's temp root, for tests that need to materialize a
+        /// checkout directory before attaching it.
+        pub(crate) fn root(&self) -> &Path {
+            &self.root
+        }
+
         pub(crate) fn epoch(&self) -> u64 {
             self.store.snapshot().unwrap().epoch()
         }
@@ -2320,5 +2353,308 @@ pub(crate) mod catalog_fixture {
             resolved_at: None,
             resolution_note: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod clause_two_proof_a {
+    //! Plan section 14.2 Proof A: the runtime denial probe.
+    //!
+    //! Every adapter in the section 9 table is exercised against a catalog
+    //! server whose checkout authority is `DenyCheckoutAccess`. Two claims
+    //! are asserted per row, and the second is what makes the first mean
+    //! something:
+    //!
+    //! 1. the operation returns its typed refusal or documented degradation;
+    //! 2. NOTHING was granted. `granted_leases` sums the broker's per-kind
+    //!    grant counters, so a row that refused after opening a checkout, or
+    //!    that opened one and then failed for an unrelated reason, fails
+    //!    here rather than reading as a clean denial.
+    //!
+    //! "Before raw filesystem or Git access" is proved structurally rather
+    //! than by watching for reads: a `ValidatedCheckoutLease` is the only
+    //! handle that yields a checkout root, so zero grants means no adapter
+    //! held one. Proof B is what keeps that true by rejecting new unleased
+    //! paths to a checkout root; the two proofs are load-bearing together.
+    //!
+    //! Corpus-only rows assert the complementary claim from the same plan
+    //! sentence: the observation sequence is UNCHANGED, so those paths did
+    //! not consult checkout authority at all.
+
+    use std::path::PathBuf;
+
+    use rmcp::handler::server::wrapper::Parameters;
+
+    use super::BlackboxServer;
+    use super::catalog_fixture::{COMMIT_ONE, CatalogFixture, gap_note, knowledge_entry};
+
+    const PROJECT: &str = "p_proof_a";
+
+    const ATTACHMENT: &str = "att_00000000000000000000000000000e01";
+    const CHECKOUT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaae01";
+
+    /// A published catalog project with accepted content AND a fully capable
+    /// attached checkout.
+    ///
+    /// The attachment is the load-bearing part of this proof, and it is easy
+    /// to get wrong in the direction that makes every row pass vacuously.
+    /// With no attachment, each adapter refuses with attachment-required no
+    /// matter what the authority does, so the probe would prove remote-only
+    /// degradation (clause 3's job) while claiming to prove denial. Granting
+    /// every capability leaves `DenyCheckoutAccess` as the ONLY reason any
+    /// row can refuse, which is what makes the mutation control below able
+    /// to turn these rows red.
+    fn denied_fixture() -> (
+        CatalogFixture,
+        bbox_corpus_core::identity::PublishedScope,
+        PathBuf,
+    ) {
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        fixture.install_publication(
+            PROJECT,
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-a", "published")],
+            &[gap_note("gap-11111111", "published")],
+        );
+        let checkout = fixture.root().join("capable-checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(checkout.join("probe.txt"), b"real").unwrap();
+        fixture.attach_overlay_checkout(PROJECT, &scope, &checkout, ATTACHMENT, CHECKOUT_ID, true);
+        fixture.grant_capabilities(ATTACHMENT, every_capability());
+        (fixture, scope, checkout)
+    }
+
+    fn every_capability() -> bbox_corpus_core::project_catalog::AttachmentCapabilities {
+        bbox_corpus_core::project_catalog::AttachmentCapabilities {
+            local_code_source: true,
+            git_history: true,
+            repo_knowledge: true,
+            blame: true,
+            render_output: true,
+            provenance_note_io: true,
+            artifact_watching: true,
+            repo_mutation: true,
+        }
+    }
+
+    fn granted_leases(server: &BlackboxServer) -> u64 {
+        server
+            .state
+            .checkout_access
+            .health()
+            .operations
+            .iter()
+            .map(|operation| operation.granted)
+            .sum()
+    }
+
+    fn observation_sequence(server: &BlackboxServer) -> u64 {
+        server.state.checkout_access.health().sequence
+    }
+
+    fn text_of(result: &rmcp::model::CallToolResult) -> String {
+        format!("{:?}", result.content)
+    }
+
+    /// Assert one checkout-backed row: refused, and nothing opened.
+    fn assert_denied(server: &BlackboxServer, row: &str, refusal: &str) {
+        assert_eq!(
+            granted_leases(server),
+            0,
+            "{row}: a denied row must not have opened a checkout"
+        );
+        assert!(
+            refusal.contains("attachment")
+                || refusal.contains("denied")
+                || refusal.contains("capability")
+                || refusal.contains("unavailable")
+                || refusal.contains("catalog"),
+            "{row}: refusal is not a typed degradation: {refusal}"
+        );
+    }
+
+    /// Row 5 (render/file provider) and row 4 (blame) reach the checkout
+    /// through the tool surface; both must refuse without opening one.
+    #[tokio::test]
+    async fn blame_and_render_refuse_without_opening_a_checkout() {
+        let (fixture, _, _) = denied_fixture();
+        let server = fixture.server();
+
+        let blame = server
+            .bbox_blame(Parameters(crate::mcp_tools::blame::BlameParams {
+                file: Some("src/lib.rs".into()),
+                line: Some(1),
+                entity_ref: None,
+            }))
+            .await;
+        assert_eq!(blame.is_error, Some(true), "{blame:?}");
+        assert_denied(&server, "blame", &text_of(&blame));
+
+        let render = server
+            .bbox_render(Parameters(crate::knowledge::RenderParams {
+                project: Some(PROJECT.into()),
+                scope: Some("project".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(render.is_error, Some(true), "{render:?}");
+        assert_denied(&server, "render", &text_of(&render));
+    }
+
+    /// Row 5, the provider half: a `file:` ref resolves through the same
+    /// authority and must refuse rather than reading the working tree.
+    #[test]
+    fn file_provider_refuses_without_opening_a_checkout() {
+        let (fixture, _, _) = denied_fixture();
+        let server = fixture.server();
+        let context = server.provider_context();
+
+        let error = bbox_providers::providers::file::resolve_file(&context, "src/lib.rs")
+            .expect_err("file refs need a checkout");
+
+        assert_denied(&server, "file provider", &error.to_string());
+    }
+
+    /// Row 6: legacy Git-note import and export both refuse; the PLAN is
+    /// corpus computation and is covered by the corpus-only row below.
+    #[tokio::test]
+    async fn provenance_note_io_refuses_without_opening_a_checkout() {
+        let (fixture, _, _) = denied_fixture();
+        let server = fixture.server();
+
+        let export = server
+            .bbox_provenance_export(Parameters(crate::mcp_tools::provenance::ProvenanceParams {
+                project_id: Some(PROJECT.into()),
+            }))
+            .await;
+        assert_eq!(export.is_error, Some(true), "{export:?}");
+        assert_denied(&server, "provenance export", &text_of(&export));
+
+        let import = server
+            .bbox_provenance_import(Parameters(crate::mcp_tools::provenance::ProvenanceParams {
+                project_id: Some(PROJECT.into()),
+            }))
+            .await;
+        assert_eq!(import.is_error, Some(true), "{import:?}");
+        assert_denied(&server, "provenance import", &text_of(&import));
+    }
+
+    /// Row 7: catalog-targeted mutation refuses. Eject is the mutation the
+    /// plan names explicitly (section 4.19 keeps unregistered init as the
+    /// one sanctioned bootstrap exception, so it is not this row).
+    #[tokio::test]
+    async fn catalog_mutation_refuses_without_opening_a_checkout() {
+        let (fixture, _, _) = denied_fixture();
+        let server = fixture.server();
+
+        let eject = server
+            .bbox_project_eject(Parameters(bbox_indexing::projects::ProjectEjectParams {
+                project: PROJECT.into(),
+                dry_run: None,
+            }))
+            .await;
+
+        assert_eq!(eject.is_error, Some(true), "{eject:?}");
+        assert_denied(&server, "mutation", &text_of(&eject));
+    }
+
+    /// Row 2, overlay half: `own` visibility needs `KnowledgeGapOverlayRead`
+    /// and degrades with the typed overlay error rather than serving a
+    /// snapshot it could not compute.
+    ///
+    /// The row is driven through a real session checkout on a real
+    /// attachment deliberately. Calling `own` with no session context
+    /// refuses one gate EARLIER, on missing authoritative context, and would
+    /// have made this row pass without the overlay lease ever being
+    /// attempted: a green test proving nothing about the capability it
+    /// claims to cover.
+    #[test]
+    fn own_overlay_degrades_without_opening_a_checkout() {
+        let (fixture, scope, checkout) = denied_fixture();
+        let server = fixture.server();
+        server.set_session_checkout_for_test(
+            PROJECT.into(),
+            scope.clone(),
+            CHECKOUT_ID.into(),
+            checkout.clone(),
+        );
+
+        let error = server
+            .session_knowledge_view(None, Some("own"))
+            .err()
+            .expect("own cannot answer without its overlay lease");
+        let refusal = format!("{error:#}");
+
+        assert!(
+            refusal.contains("error.provisional_overlay_unavailable"),
+            "own must degrade with its typed overlay error: {refusal}"
+        );
+        assert_denied(&server, "own overlay", &refusal);
+
+        // Published content is unaffected: the accepted generation needs no
+        // checkout at all, which is the degradation the table promises.
+        assert!(
+            server
+                .session_knowledge_view(None, Some("published"))
+                .is_ok_and(|view| !view.knowledge.all_entries().is_empty())
+        );
+    }
+
+    /// Rows 2 (published read), 6 (plan), and the corpus half of the table:
+    /// these consult NO checkout authority, so the observation sequence is
+    /// untouched. An unchanged sequence is a stronger statement than zero
+    /// grants: it means the broker was never even asked.
+    #[test]
+    fn corpus_only_reads_leave_the_observation_sequence_unchanged() {
+        let (fixture, _, _) = denied_fixture();
+        let server = fixture.server();
+        let before = observation_sequence(&server);
+
+        let knowledge = server
+            .session_knowledge_view(None, None)
+            .expect("published knowledge serves from accepted content");
+        assert!(
+            !knowledge.knowledge.all_entries().is_empty(),
+            "the row is vacuous unless accepted content actually served"
+        );
+        let gaps = server
+            .session_gap_view(None, None)
+            .expect("published gaps serve from accepted content");
+        assert!(!gaps.gaps.all().is_empty(), "accepted gaps served");
+
+        assert_eq!(
+            observation_sequence(&server),
+            before,
+            "a published read must not consult checkout authority at all"
+        );
+        assert_eq!(granted_leases(&server), 0);
+    }
+
+    /// The vacuity guard, and the mutation control the plan's "blocking"
+    /// wording actually requires.
+    ///
+    /// Every row above asserts a REFUSAL, and refusals are easy to produce
+    /// by accident. Against the REAL catalog authority, over the same
+    /// fixture and the same capable attachment, the identical file read
+    /// succeeds and the grant counter moves. Swapping any denial row above
+    /// to this authority therefore turns it red, which is what makes those
+    /// rows evidence rather than decoration.
+    #[test]
+    fn the_probe_is_not_vacuous_against_a_real_authority() {
+        let (fixture, _, _) = denied_fixture();
+        let server = fixture.server_with_checkout_authority();
+
+        let file =
+            bbox_providers::providers::file::resolve_file(&server.provider_context(), "probe.txt")
+                .expect("the positive control must succeed against a real authority");
+
+        assert_eq!(file.content, b"real");
+        assert!(
+            granted_leases(&server) > 0,
+            "a successful read must be lease-counted"
+        );
     }
 }
