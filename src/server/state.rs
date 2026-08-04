@@ -1476,6 +1476,16 @@ pub(crate) struct ArcSnapshot {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct ProjectRuntimeStatus {
     pub(crate) project_id: String,
+    /// `available`, or `unavailable` when the catalog pair could not be
+    /// read for this projection.
+    ///
+    /// A project whose catalog authority is unreadable must still be
+    /// REPORTED. Returning `None` and letting the caller drop it made an
+    /// unreadable catalog look like a healthy host with fewer projects,
+    /// which is the failure mode most likely to be believed. Everything
+    /// catalog-derived is empty in that state and none of it is a denial:
+    /// nothing was attempted (plan 4.17).
+    pub(crate) catalog_authority: &'static str,
     /// Absent for a `LegacyLocal` project, which publishes under no scope.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) catalog_scope: Option<PublishedScopeView>,
@@ -1617,6 +1627,52 @@ fn recorded_capabilities(
 }
 
 impl SharedState {
+    /// The projection for a project whose catalog pair cannot be read.
+    ///
+    /// Accepted publication is consulted anyway: it is its own durable
+    /// store, verified independently of the catalog, and losing its status
+    /// because a different file was unreadable would understate what the
+    /// host can still serve. Scope agreement cannot be evaluated without
+    /// the catalog, so no scope is passed and the accepted view reports
+    /// `unevaluated` rather than guessing.
+    fn unreadable_catalog_status(
+        &self,
+        project_id: &bbox_corpus_core::project_catalog::ProjectId,
+    ) -> ProjectRuntimeStatus {
+        let accepted_status = self
+            .accepted_publications
+            .as_ref()
+            .and_then(|runtime| runtime.status(project_id, None).ok());
+        ProjectRuntimeStatus {
+            project_id: project_id.as_str().to_string(),
+            catalog_authority: "unavailable",
+            catalog_scope: None,
+            accepted: AcceptedRuntimeView::project(accepted_status.as_ref()),
+            binding: BindingRuntimeView {
+                // The pointer's own bytes are readable; whether the
+                // attachment it names is still attached is a CATALOG
+                // question, and the catalog is what could not be read.
+                status: "unknown_attachment",
+                attachment_id: accepted_status
+                    .as_ref()
+                    .and_then(|status| status.binding_stamp())
+                    .map(|stamp| stamp.attachment_id().as_str().to_string()),
+                pointer_sha256: accepted_status
+                    .as_ref()
+                    .and_then(|status| status.binding_stamp())
+                    .map(|stamp| stamp.pointer_sha256().to_string()),
+            },
+            // Empty because unknown, never because denied.
+            attachments: Vec::new(),
+            overlays: Vec::new(),
+            watcher: WatcherRuntimeView {
+                watcher_running: false,
+                registered_attachments: Vec::new(),
+                capable_but_unregistered: Vec::new(),
+            },
+        }
+    }
+
     /// Project one catalog project's runtime status (plan 6.8).
     ///
     /// `None` in bridge mode: there is no catalog project to project, and
@@ -1625,8 +1681,15 @@ impl SharedState {
         use bbox_corpus_core::project_catalog::{AttachmentStatus, ProjectId, ProjectScope};
 
         let store = self.project_authority.catalog_store()?;
-        let snapshot = store.snapshot().ok()?;
         let parsed = ProjectId::parse(project_id).ok()?;
+        let snapshot = match store.snapshot() {
+            Ok(snapshot) => snapshot,
+            // The catalog pair is unreadable. Accepted publication is a
+            // SEPARATE durable store and is still independently verifiable,
+            // so the honest projection reports the authority as unavailable
+            // and keeps whatever published status stands on its own.
+            Err(_) => return Some(self.unreadable_catalog_status(&parsed)),
+        };
         let project = snapshot.catalog().projects.get(&parsed)?;
         let catalog_scope = match &project.scope {
             ProjectScope::Published(scope) => Some(scope.clone()),
@@ -1730,6 +1793,7 @@ impl SharedState {
         let watcher = self.watcher_runtime_view(&rows);
 
         Some(ProjectRuntimeStatus {
+            catalog_authority: "available",
             project_id: project_id.to_string(),
             catalog_scope: catalog_scope.as_ref().map(PublishedScopeView::from_scope),
             accepted,
@@ -2928,60 +2992,106 @@ mod clause_three_exit_proof {
         );
     }
 
-    /// An unreadable catalog pair is not a denial, and does not take
-    /// durable publication down with it.
+    /// An unreadable catalog pair is REPORTED, not dropped, and does not
+    /// take durable publication down with it.
     ///
-    /// Plan 4.17 forbids synthesizing denied counts for operations nobody
-    /// attempted, and the tempting failure is to report an unreadable
-    /// catalog as "everything denied". Driven through the store's REAL
-    /// poisoned state rather than a mock, which is what makes the observed
-    /// answer worth recording: accepted publication is its own store and
-    /// keeps serving, so a catalog-pair read failure degrades attachment
-    /// knowledge without touching published content.
+    /// The first cut of this row was vacuous in a way worth recording: it
+    /// poisoned the FIXTURE's store handle and then queried a server that
+    /// `CatalogFixture::server()` had opened over the same files with its
+    /// OWN handle. Nothing under test was ever poisoned, the row passed,
+    /// and it hid a real production defect underneath. Poisoning the
+    /// server-owned handle is the difference between exercising the state
+    /// and describing it.
     #[test]
-    fn a_poisoned_authority_reports_unavailable_without_inventing_denials() {
-        let (fixture, server) = remote_only();
+    fn an_unreadable_catalog_pair_is_reported_without_inventing_denials() {
+        let (_fixture, server) = remote_only();
         let before = server.state.checkout_access.health().sequence;
+        // The handle the SERVER reads through, not the fixture's.
+        let store = server
+            .state
+            .project_authority
+            .catalog_store()
+            .expect("catalog authority")
+            .clone();
 
-        let restore = fixture
-            .store()
+        let restore = store
             .poison_for_test("clause three: catalog pair unreadable")
-            .expect("the fixture store is readable before poisoning");
+            .expect("the store is readable before poisoning");
 
-        let poisoned = server.state.project_runtime_status(PROJECT);
-        let poisoned = poisoned.expect("status is still answerable");
-        // The property worth pinning is not that everything collapses. It
-        // is that a catalog-pair read failure does NOT take durable
-        // published content down with it: accepted publication is its own
-        // store, and this is exactly the separation that lets a remote-only
-        // project keep serving.
+        let poisoned = server
+            .state
+            .project_runtime_status(PROJECT)
+            .expect("an unreadable catalog must still report the project");
+        assert_eq!(
+            poisoned.catalog_authority, "unavailable",
+            "the cause is named explicitly: {poisoned:?}"
+        );
+        // Accepted publication is a SEPARATE durable store and is verified
+        // independently, so it keeps reporting through a catalog failure.
+        // That separation is the architectural point of the split.
         assert!(
             poisoned.accepted.serves_published_content,
             "accepted publication survives an unreadable catalog pair: {:?}",
             poisoned.accepted
         );
-        // And the part plan 4.17 forbids: no attachment appears, and none
-        // is reported as denied, because nothing was attempted.
-        assert!(
-            poisoned.attachments.is_empty(),
-            "an unreadable catalog invents no attachments and no denials: {:?}",
-            poisoned.attachments
-        );
+        // Everything catalog-derived is empty because it is UNKNOWN. None
+        // of it is a denial; nothing was attempted (plan 4.17).
+        assert!(poisoned.attachments.is_empty());
+        assert!(poisoned.overlays.is_empty());
+        assert!(poisoned.watcher.capable_but_unregistered.is_empty());
         assert_eq!(
             server.state.checkout_access.health().sequence,
             before,
             "a poisoned catalog must not manufacture checkout observations"
         );
 
-        fixture.store().unpoison_for_test(restore);
+        store.unpoison_for_test(restore);
         let recovered = server
             .state
             .project_runtime_status(PROJECT)
             .expect("status returns once the pair is readable again");
+        assert_eq!(
+            recovered.catalog_authority, "available",
+            "the row above was not passing on a permanently broken fixture"
+        );
+        assert!(recovered.accepted.serves_published_content);
+    }
+
+    /// The half the vacuous row could never have caught: doctor must
+    /// REPORT the project, not silently drop it.
+    ///
+    /// `catalog_project_statuses` collects through `filter_map`, so a
+    /// status of `None` removed the project from the report entirely and an
+    /// unreadable catalog looked like a healthy host with fewer projects.
+    #[test]
+    fn doctor_reports_a_project_whose_catalog_authority_is_unreadable() {
+        let (_fixture, server) = remote_only();
+        let store = server
+            .state
+            .project_authority
+            .catalog_store()
+            .expect("catalog authority")
+            .clone();
+        let healthy = crate::doctor::catalog_sections_for_test(&server.state);
         assert!(
-            recovered.accepted.serves_published_content,
-            "unpoisoning restores the real answer, so the row above was not \
-             passing on a permanently broken fixture"
+            healthy.iter().any(|line| line.contains(PROJECT)) || !healthy.is_empty(),
+            "the healthy report mentions the catalog sections at all: {healthy:?}"
+        );
+
+        let restore = store
+            .poison_for_test("doctor: catalog pair unreadable")
+            .unwrap();
+        let rendered = crate::doctor::catalog_sections_for_test(&server.state);
+        store.unpoison_for_test(restore);
+
+        let joined = rendered.join("\n");
+        assert!(
+            joined.contains(PROJECT),
+            "an unreadable project must appear in the report: {joined}"
+        );
+        assert!(
+            joined.contains("could not be read from the catalog pair"),
+            "and must name the cause rather than a downstream symptom: {joined}"
         );
     }
 

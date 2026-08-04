@@ -264,6 +264,23 @@ fn accepted_publication_section(
     let mut considered = 0;
     let mut current = 0;
     for status in statuses {
+        // An unreadable catalog pair is reported FIRST and unconditionally.
+        // It is not a project-level content problem, and letting it fall
+        // through to the accepted-state arms below would describe the
+        // symptom (missing or unevaluated) instead of the cause.
+        if status.catalog_authority == "unavailable" {
+            considered += 1;
+            if considered <= MAX_PROJECT_FINDINGS {
+                findings.push(Finding::action(
+                    format!(
+                        "project {} could not be read from the catalog pair; its                          catalog-derived status is unavailable, not denied, and its                          accepted publication is reported independently below",
+                        status.project_id
+                    ),
+                    "bbox_doctor",
+                ));
+            }
+            continue;
+        }
         let notable = match status.accepted.state {
             "current" => status.accepted.scope_agreement == "refresh_required",
             _ => true,
@@ -1258,6 +1275,37 @@ pub(crate) fn classify_embed_route(
         "route `{route}` ok ({} indexed, {} queued)",
         status.indexed_count, status.queue_depth
     ))
+}
+
+// Test-only, and deliberately placed immediately above the file's existing
+// test module rather than beside the sections it renders. The catalog
+// ownership ratchet truncates each file at its FIRST `#[cfg(test)]`, so a
+// test-only item inserted mid-file silently drops every tracked pattern
+// below it from the count and reads as a baseline shrink. Keeping the
+// truncation point where it was keeps the Phase 6 deletion inventory honest.
+/// The catalog sections' rendered findings, for tests that need to assert
+/// what an operator would actually see rather than what the projection
+/// carries. Kept beside the sections so it cannot drift from them.
+#[cfg(test)]
+pub(crate) fn catalog_sections_for_test(state: &crate::server::state::SharedState) -> Vec<String> {
+    let Some(statuses) = catalog_project_statuses(state) else {
+        return Vec::new();
+    };
+    [
+        accepted_publication_section(&statuses),
+        publisher_binding_section(&statuses),
+        overlay_baseline_section(&statuses),
+        attachment_capability_section(&statuses),
+        artifact_watcher_section(&statuses),
+    ]
+    .iter()
+    .flat_map(|section| {
+        section
+            .findings
+            .iter()
+            .map(|finding| finding.message.clone())
+    })
+    .collect()
 }
 
 #[cfg(test)]
