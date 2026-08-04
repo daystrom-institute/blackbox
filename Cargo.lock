@@ -585,6 +585,7 @@ dependencies = [
  "bbox-edge-index",
  "bbox-edge-sidecar",
  "bbox-gaps",
+ "bbox-indexing",
  "bbox-knowledge",
  "bbox-packets",
  "bbox-provenance",

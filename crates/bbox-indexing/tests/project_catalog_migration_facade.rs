@@ -16,7 +16,8 @@ use bbox_code_source_store::{
 use bbox_config::config::{self, Config, LoadOptions};
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_catalog::{
-    AttachmentKind, AttachmentStatus, ProjectId, decode_attachment_snapshot,
+    AttachmentId, AttachmentKind, AttachmentStatus, CorpusProject, ProjectId, ProjectScope,
+    ScopeMigrationKind, decode_attachment_snapshot,
 };
 use bbox_corpus_index::index::TranscriptIndex;
 use bbox_edge_sidecar::manifest::ManifestIndex;
@@ -31,6 +32,7 @@ use bbox_indexing::project_catalog_migration::{
     ProjectCatalogMigrationResolvedLayoutV1, ProjectCatalogMigrationVerifyRequestV1,
     project_catalog_migration_store_limits,
 };
+use bbox_indexing::project_catalog_store::ProjectCatalogStore;
 use bbox_indexing::publisher::PublisherRefStore;
 use bbox_vectors::VectorStore;
 use sha2::{Digest, Sha256};
@@ -1427,7 +1429,20 @@ fn produce_migrated_smoke_fixture_from_env_root() {
         eprintln!("BBOX_SMOKE_FIXTURE_ROOT is not set; nothing to produce");
         return;
     };
-    let root = PathBuf::from(root).canonicalize().unwrap();
+    produce_migrated_smoke_fixture_at(&PathBuf::from(root).canonicalize().unwrap());
+}
+
+/// The producer body, callable without the environment variable.
+///
+/// Split out because the env-gated arm above is UNREACHABLE from the gates:
+/// the lane build shim forwards only a fixed env allowlist into the builder
+/// pod, so a producer that existed only behind `BBOX_SMOKE_FIXTURE_ROOT`
+/// would be compiled and never run anywhere the suite runs. Splitting it
+/// lets `the_producer_materializes_the_migrated_root_and_the_full_set`
+/// exercise the real ceremony on every workspace run, which is what makes a
+/// broken producer fail here rather than in someone's live smoke.
+fn produce_migrated_smoke_fixture_at(root: &Path) -> serde_json::Value {
+    let root = root.to_path_buf();
     let config = config(&root);
     let rehearsal_root = root.join("rehearsal");
     fs::create_dir_all(&rehearsal_root).unwrap();
@@ -1502,7 +1517,17 @@ fn produce_migrated_smoke_fixture_from_env_root() {
         resolution_path,
     })
     .unwrap();
+    // The migrated root now carries the COMPLETE section 13.8 set, built by
+    // the same function the workspace gate builds it with. Before this the
+    // producer emitted only the three migration-shaped projects, and every
+    // catalog fixture shape a live smoke wanted had to be improvised at the
+    // smoke's own layer - which is how the smoke and the unit suites came
+    // to disagree about what each shape means.
+    let catalog_shapes =
+        build_section_13_8_fixture_set(&rehearsal_root.join("state/projects.json"), &root);
+
     let summary = serde_json::json!({
+        "catalog_fixture_shapes": catalog_shapes,
         "config_path": root.join("config.toml"),
         "rehearsal_root": rehearsal_root,
         "projects_path": rehearsal_root.join("state/projects.json"),
@@ -1522,6 +1547,48 @@ fn produce_migrated_smoke_fixture_from_env_root() {
     )
     .unwrap();
     eprintln!("smoke fixture produced at {}", root.display());
+    summary
+}
+
+/// The D-030 producer runs end to end on every workspace run.
+///
+/// It drives the full facade ceremony (assessment, scope-owner resolution,
+/// collected quarantine, clean preflight, apply) and then materializes the
+/// complete section 13.8 set onto the migrated root, so the summary the
+/// live bootsmoke driver and the stable-signed CLI consume is proved to
+/// carry every named shape before anyone runs a smoke.
+#[test]
+fn the_producer_materializes_the_migrated_root_and_the_full_set() {
+    let dir = tempdir().unwrap();
+    let summary = produce_migrated_smoke_fixture_at(&dir.path().canonicalize().unwrap());
+
+    let shapes: Vec<String> = summary["catalog_fixture_shapes"]
+        .as_array()
+        .expect("the summary carries the fixture set")
+        .iter()
+        .map(|shape| shape["shape"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        shapes, SECTION_13_8_SHAPES,
+        "the produced root must carry exactly section 13.8's set, in order"
+    );
+    // The migration-shaped projects the producer already emitted stay in
+    // the summary: the set is an ADDITION to the D-030 contract, not a
+    // replacement, and a consumer keyed on the old fields must not break.
+    for key in [
+        "config_path",
+        "rehearsal_root",
+        "projects_path",
+        "winner_project",
+        "collision_winner_project",
+        "loser_project",
+        "collision_scope",
+    ] {
+        assert!(
+            !summary[key].is_null(),
+            "the producer dropped the pre-existing summary field {key}"
+        );
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -2569,4 +2636,883 @@ fn r2f1_unprobeable_classes_block_journal() {
         RetirementJournalStage::Complete,
         "journal must not complete when unprobeable classes remain"
     );
+}
+
+// ----------------------------------------------------------------------------
+// Phase 5 section 13.8 fixture set (P5-H mechanic 1)
+// ----------------------------------------------------------------------------
+//
+// Section 13.8 names thirteen fixture projects. Before this block each of
+// them that anyone needed was minted ad hoc inside whichever P5-B, P5-D, or
+// P5-G test wanted it, which is how a set drifts: two suites disagree about
+// what "Prior fallback" means and neither is wrong, because neither is the
+// definition.
+//
+// So the set is DATA here, declared once, and it has two consumers that
+// cannot disagree: `the_section_13_8_fixture_set_builds_every_named_shape`
+// gates it on every workspace run, and the ignored D-030 producer
+// materializes the same set onto the migrated root it already produces and
+// records it in the summary the live bootsmoke driver and the stable-signed
+// CLI read.
+//
+// Two rules the set inherits from the phase and does not get to relax:
+//
+// 1. Every knowledge and gap byte goes through the single-owner committed
+//    encoders. A fixture with its own encoding produces generations
+//    describing bytes no writer would ever commit, every digest matches
+//    itself, and the suite goes vacuously green. The bytes written into the
+//    repository and the bytes handed to the installer are literally the
+//    same `Vec<u8>` here, so they cannot drift even by editing.
+//
+// 2. Catalog and attachment shapes are built through the admin facade
+//    (`catalog_add`, `attach_checkout`, `scope_migrate_attested`), not by
+//    hand-writing store rows. A hand-written row can express a state the
+//    facade would refuse, and a fixture that encodes an impossible state
+//    proves nothing about the system that has to serve it.
+//
+// The corrupt shapes are the one exception and necessarily so: corruption
+// is what the facade exists to prevent, so it arrives through the explicit
+// damage helper instead.
+
+use bbox_corpus_core::project_catalog::AttachmentCapabilities;
+use bbox_gaps::gaps::committed_gap_note_bytes;
+use bbox_indexing::accepted_publication_test_support::{
+    AcceptedPublicationSourceFileForTest, corrupt_accepted_generation_for_test,
+    install_accepted_publication_for_test,
+};
+use bbox_indexing::project_catalog_admin::{
+    self, AttachProbe, CatalogAddKind, MigrationAttachmentProbe, ScopeMigrationRequest,
+};
+use bbox_knowledge::knowledge::committed_knowledge_entry_bytes;
+
+/// The thirteen shapes, by the names section 13.8 gives them.
+const SECTION_13_8_SHAPES: &[&str] = &[
+    "remote_only_valid_g1",
+    "attached_valid_g1",
+    "attached_peer_contains_p",
+    "attached_peer_missing_p",
+    "prior_fallback",
+    "no_pointer_after_no_content_acknowledgement",
+    "corrupt_current_and_prior",
+    "scope_migration_publication_bridge",
+    "all_capabilities_attachment",
+    "repo_knowledge_only_attachment",
+    "no_capability_attachment",
+    "watcher_capable_attachment",
+    "legacy_local_bootstrap",
+];
+
+/// One built shape, in the terms a consumer asserts on.
+#[derive(Debug, Clone, serde::Serialize)]
+struct FixtureShape {
+    shape: String,
+    project_id: String,
+    /// Attachment ids in declaration order; empty for a remote-only project.
+    attachment_ids: Vec<String>,
+    /// `null` when the shape is deliberately pointerless.
+    accepted_generation: Option<String>,
+    /// Present once a second publication has pushed the first to Prior.
+    prior_generation: Option<String>,
+    /// Generations deliberately damaged, so a consumer knows the difference
+    /// between a fixture defect and the state under test.
+    corrupted_generations: Vec<String>,
+    /// Catalog scope after any migration, as `repo_id` + relpath, or `null`
+    /// for a legacy-local project.
+    catalog_scope: Option<(String, String)>,
+    /// The scope the accepted pointer still names, which differs from the
+    /// catalog scope exactly while a publication bridge is open.
+    accepted_scope: Option<(String, String)>,
+}
+
+fn published_scope_of(project: &CorpusProject) -> Option<(String, String)> {
+    match &project.scope {
+        ProjectScope::Published(scope) => Some((
+            scope.repo_id().to_string(),
+            scope.bbox_root_relpath().to_string(),
+        )),
+        ProjectScope::LegacyLocal => None,
+    }
+}
+
+/// A deterministic, strong-shaped checkout marker.
+///
+/// The attachment snapshot validates that a checkout id looks like the
+/// random marker production mints, so a fixture cannot spell one out of the
+/// shape name. Hashing the name keeps it deterministic (the same fixture
+/// twice is the same id, which the live smoke driver depends on) while
+/// still being 32 lowercase hex.
+fn checkout_marker(name: &str) -> String {
+    hex::encode(Sha256::digest(format!("bbox-13.8-checkout:{name}")))[..32].to_string()
+}
+
+fn capabilities(bits: &[&str]) -> AttachmentCapabilities {
+    let mut capabilities = AttachmentCapabilities::default();
+    for bit in bits {
+        match *bit {
+            "local_code_source" => capabilities.local_code_source = true,
+            "git_history" => capabilities.git_history = true,
+            "blame" => capabilities.blame = true,
+            "repo_knowledge" => capabilities.repo_knowledge = true,
+            "repo_mutation" => capabilities.repo_mutation = true,
+            "render_output" => capabilities.render_output = true,
+            "provenance_note_io" => capabilities.provenance_note_io = true,
+            "artifact_watching" => capabilities.artifact_watching = true,
+            other => panic!("unknown capability bit {other}"),
+        }
+    }
+    capabilities
+}
+
+/// One committed publishable checkout: a repository whose `.bbox` lanes
+/// hold exactly the bytes a writer commits, at a pinned identity so the
+/// accepted commit is stable.
+struct PublishableCheckout {
+    dir: PathBuf,
+    accepted_commit: String,
+    knowledge: Vec<AcceptedPublicationSourceFileForTest>,
+    gaps: Vec<AcceptedPublicationSourceFileForTest>,
+}
+
+fn publishable_checkout(
+    root: &Path,
+    name: &str,
+    scope: &PublishedScope,
+    marker: &str,
+) -> PublishableCheckout {
+    let dir = root.join("catalog-checkouts").join(name);
+    fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q"]);
+    git(&dir, &["checkout", "-qb", "main"]);
+    write(
+        &dir.join(".bbox/config.toml"),
+        format!("[project]\nrepo_id = {:?}\n", scope.repo_id()).as_bytes(),
+    );
+
+    let relative = |lane: &str, id: &str| {
+        if scope.bbox_root_relpath() == "." {
+            format!(".bbox/{lane}/{id}.json")
+        } else {
+            format!("{}/.bbox/{lane}/{id}.json", scope.bbox_root_relpath())
+        }
+    };
+    // Encode ONCE. The repository bytes and the accepted source bytes are
+    // the same value below, not two encodings that happen to agree today.
+    let entry = fixture_knowledge_entry(&format!("k-{marker}"), marker);
+    let knowledge_bytes = committed_knowledge_entry_bytes(&entry).unwrap();
+    let gap = fixture_gap_note(&format!("gap-{:0>8}", marker.len()), marker);
+    let gap_bytes = committed_gap_note_bytes(&gap).unwrap();
+    write(
+        &dir.join(relative("knowledge", &entry.id)),
+        &knowledge_bytes,
+    );
+    write(&dir.join(relative("gaps", &gap.id)), &gap_bytes);
+
+    git(&dir, &["add", ".bbox"]);
+    git(&dir, &["commit", "-qm", "seed catalog fixture lanes"]);
+    let accepted_commit = git(&dir, &["rev-parse", "HEAD"]);
+    write(
+        &dir.join(".bbox/local/checkout-id"),
+        format!("{}\n", checkout_marker(marker)).as_bytes(),
+    );
+    PublishableCheckout {
+        dir,
+        accepted_commit,
+        knowledge: vec![AcceptedPublicationSourceFileForTest {
+            repository_relative_filename: relative("knowledge", &entry.id),
+            source_bytes: knowledge_bytes,
+        }],
+        gaps: vec![AcceptedPublicationSourceFileForTest {
+            repository_relative_filename: relative("gaps", &gap.id),
+            source_bytes: gap_bytes,
+        }],
+    }
+}
+
+fn fixture_knowledge_entry(id: &str, content: &str) -> bbox_knowledge::knowledge::KnowledgeEntry {
+    use bbox_knowledge::knowledge::{Approval, Category, Priority, Scope, Status};
+    bbox_knowledge::knowledge::KnowledgeEntry {
+        id: id.to_string(),
+        title: format!("entry {id}"),
+        content: content.to_string(),
+        cluster: None,
+        variants: Default::default(),
+        category: Category::Convention,
+        scope: Scope::Project,
+        project: None,
+        project_id: None,
+        providers: Vec::new(),
+        priority: Priority::Standard,
+        weight: 100,
+        status: Status::Active,
+        approval: Approval::UserConfirmed,
+        render: true,
+        decay: false,
+        review_at: None,
+        supersedes: None,
+        links: Vec::new(),
+        rationale: None,
+        expires_at: None,
+        source: "user".to_string(),
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        updated_at: "2026-01-02T00:00:00Z".to_string(),
+        recall_count: 0,
+        last_recalled: None,
+    }
+}
+
+fn fixture_gap_note(id: &str, title: &str) -> bbox_gaps::gaps::GapNote {
+    use bbox_gaps::gaps::{BlockingLevel, GapImpact, GapKind, GapResolution};
+    bbox_gaps::gaps::GapNote {
+        id: id.to_string(),
+        title: title.to_string(),
+        gap_kind: GapKind::Tooling,
+        domain: "catalog-fixture".to_string(),
+        wanted_capability: "serve the section 13.8 fixture set".to_string(),
+        missing_primitive: None,
+        fallback_used: None,
+        evidence: Vec::new(),
+        impact: GapImpact::Medium,
+        blocking_level: BlockingLevel::WorkaroundAvailable,
+        dedupe_key: "tooling/catalog-fixture/section-13-8".to_string(),
+        suggested_owner: None,
+        notes: None,
+        supersedes: None,
+        superseded_by: None,
+        resolution: GapResolution::Unresolved,
+        project: None,
+        project_id: None,
+        write_dir: None,
+        provisional_checkout_id: None,
+        task_id: None,
+        session_id: None,
+        provider: None,
+        bro: None,
+        thread_id: None,
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        updated_at: "2026-01-02T00:00:00Z".to_string(),
+        resolved_at: None,
+        resolution_note: None,
+    }
+}
+
+/// Build the complete section 13.8 set into the catalog at `projects_path`.
+///
+/// One function, one definition. Both consumers below call exactly this.
+fn build_section_13_8_fixture_set(projects_path: &Path, root: &Path) -> Vec<FixtureShape> {
+    let store = ProjectCatalogStore::open_existing(projects_path).unwrap();
+    let mut shapes = Vec::new();
+
+    let epoch = |store: &ProjectCatalogStore| store.snapshot().unwrap().epoch();
+    let add = |store: &ProjectCatalogStore, kind: CatalogAddKind, name: &str| {
+        project_catalog_admin::catalog_add(
+            store,
+            epoch(store),
+            &kind,
+            name,
+            &[],
+            "2026-08-03T00:00:00Z",
+        )
+        .unwrap()
+        .0
+    };
+    let attach = |store: &ProjectCatalogStore,
+                  project_id: &ProjectId,
+                  checkout: &Path,
+                  checkout_id: &str,
+                  scope: Option<&PublishedScope>,
+                  bits: &[&str]| {
+        project_catalog_admin::attach_checkout(
+            store,
+            epoch(store),
+            project_id,
+            &AttachProbe {
+                checkout_id: checkout_id.to_string(),
+                checkout_dir: checkout.to_string_lossy().into_owned(),
+                checkout_project_dir: checkout.to_string_lossy().into_owned(),
+                project_root_relpath: scope
+                    .map(|scope| scope.bbox_root_relpath().to_string())
+                    .unwrap_or_else(|| ".".into()),
+                kind: AttachmentKind::Base,
+                validated_scope: scope.cloned(),
+                computed_repo_hint: None,
+                branch_ref: Some("refs/heads/main".into()),
+                capabilities: capabilities(bits),
+                attached_at: "2026-08-03T00:00:00Z".into(),
+            },
+        )
+        .unwrap()
+        .attachment_id
+    };
+
+    // Shapes 1 and 2: the two baseline publications. Remote-only is the
+    // case a catalog published read must serve with ZERO leases, so it
+    // deliberately never gets an attachment - but its pointer still needs a
+    // bound attachment id, which is exactly the remote-host binding a
+    // remote-only project carries.
+    for (shape, attach_locally) in [("remote_only_valid_g1", false), ("attached_valid_g1", true)] {
+        let scope = PublishedScope::try_new(format!("repo-{shape}"), ".").unwrap();
+        let checkout = publishable_checkout(root, shape, &scope, shape);
+        let project_id = add(&store, CatalogAddKind::Published(scope.clone()), shape);
+        let attachment_id = attach(
+            &store,
+            &project_id,
+            &checkout.dir,
+            &checkout_marker(shape),
+            Some(&scope),
+            &["repo_knowledge"],
+        );
+        let installed = install_accepted_publication_for_test(
+            projects_path,
+            &project_id,
+            &attachment_id,
+            &scope,
+            "refs/heads/main",
+            &checkout.accepted_commit,
+            checkout.knowledge.clone(),
+            checkout.gaps.clone(),
+        )
+        .unwrap();
+        let mut attachment_ids = vec![attachment_id.to_string()];
+        if !attach_locally {
+            // The publication is established, THEN the local attachment is
+            // detached: a remote-only project on this host is one whose
+            // accepted content outlives any local checkout, not one that
+            // never had a pointer.
+            project_catalog_admin::detach_attachment(
+                &store,
+                epoch(&store),
+                &AttachmentId::parse(&attachment_ids[0]).unwrap(),
+                "2026-08-03T02:00:00Z",
+            )
+            .unwrap();
+            attachment_ids.clear();
+        }
+        shapes.push(FixtureShape {
+            shape: shape.into(),
+            project_id: project_id.to_string(),
+            attachment_ids,
+            accepted_generation: Some(installed.generation_id),
+            prior_generation: None,
+            corrupted_generations: Vec::new(),
+            catalog_scope: Some((scope.repo_id().into(), scope.bbox_root_relpath().into())),
+            accepted_scope: Some((scope.repo_id().into(), scope.bbox_root_relpath().into())),
+        });
+    }
+
+    // Shapes 3 and 4: peer containment. The overlay baseline turns on
+    // whether a peer's object database actually holds the accepted commit
+    // P, so the two peers differ in exactly that and nothing else: one is a
+    // clone of the publisher (has P), the other is an independent
+    // repository at the same scope (does not).
+    {
+        let scope = PublishedScope::try_new("repo-peer-containment", ".").unwrap();
+        let base = publishable_checkout(root, "peer-base", &scope, "peerbase");
+        let project_id = add(
+            &store,
+            CatalogAddKind::Published(scope.clone()),
+            "peer_containment",
+        );
+        let base_attachment = attach(
+            &store,
+            &project_id,
+            &base.dir,
+            &checkout_marker("peerbase"),
+            Some(&scope),
+            &["repo_knowledge"],
+        );
+        let installed = install_accepted_publication_for_test(
+            projects_path,
+            &project_id,
+            &base_attachment,
+            &scope,
+            "refs/heads/main",
+            &base.accepted_commit,
+            base.knowledge.clone(),
+            base.gaps.clone(),
+        )
+        .unwrap();
+
+        let containing = root.join("catalog-checkouts").join("peer-containing");
+        let clone = Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                base.dir.to_str().unwrap(),
+                containing.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(clone.status.success(), "cloning the containing peer failed");
+        write(
+            &containing.join(".bbox/local/checkout-id"),
+            format!("{}\n", checkout_marker("peercontains")).as_bytes(),
+        );
+        assert!(
+            git(&containing, &["cat-file", "-t", &base.accepted_commit]) == "commit",
+            "the containing peer must actually hold P"
+        );
+        let containing_attachment = attach(
+            &store,
+            &project_id,
+            &containing,
+            &checkout_marker("peercontains"),
+            Some(&scope),
+            &["repo_knowledge"],
+        );
+
+        let missing = publishable_checkout(root, "peer-missing", &scope, "peermissing");
+        assert_ne!(
+            missing.accepted_commit, base.accepted_commit,
+            "the missing peer must be an independent history"
+        );
+        let missing_attachment = attach(
+            &store,
+            &project_id,
+            &missing.dir,
+            &checkout_marker("peermissing"),
+            Some(&scope),
+            &["repo_knowledge"],
+        );
+
+        for (shape, attachment) in [
+            ("attached_peer_contains_p", &containing_attachment),
+            ("attached_peer_missing_p", &missing_attachment),
+        ] {
+            shapes.push(FixtureShape {
+                shape: shape.into(),
+                project_id: project_id.to_string(),
+                attachment_ids: vec![base_attachment.to_string(), attachment.to_string()],
+                accepted_generation: Some(installed.generation_id.clone()),
+                prior_generation: None,
+                corrupted_generations: Vec::new(),
+                catalog_scope: Some((scope.repo_id().into(), scope.bbox_root_relpath().into())),
+                accepted_scope: Some((scope.repo_id().into(), scope.bbox_root_relpath().into())),
+            });
+        }
+    }
+
+    // Shapes 5 and 7: Prior fallback and total corruption. Both need two
+    // installed generations, and they differ only in how much damage is
+    // done, so they are built the same way and then damaged differently.
+    for shape in ["prior_fallback", "corrupt_current_and_prior"] {
+        let scope = PublishedScope::try_new(format!("repo-{shape}"), ".").unwrap();
+        let first =
+            publishable_checkout(root, &format!("{shape}-g1"), &scope, &format!("{shape}1"));
+        let project_id = add(&store, CatalogAddKind::Published(scope.clone()), shape);
+        let attachment_id = attach(
+            &store,
+            &project_id,
+            &first.dir,
+            &checkout_marker(shape),
+            Some(&scope),
+            &["repo_knowledge"],
+        );
+        let install = |knowledge: Vec<AcceptedPublicationSourceFileForTest>,
+                       gaps: Vec<AcceptedPublicationSourceFileForTest>,
+                       commit: &str| {
+            install_accepted_publication_for_test(
+                projects_path,
+                &project_id,
+                &attachment_id,
+                &scope,
+                "refs/heads/main",
+                commit,
+                knowledge,
+                gaps,
+            )
+            .unwrap()
+        };
+        let g1 = install(
+            first.knowledge.clone(),
+            first.gaps.clone(),
+            &first.accepted_commit,
+        );
+        // A second publishable checkout at the same scope with different
+        // content: installing it pushes G1 to the prior arm.
+        let second =
+            publishable_checkout(root, &format!("{shape}-g2"), &scope, &format!("{shape}22"));
+        let g2 = install(
+            second.knowledge.clone(),
+            second.gaps.clone(),
+            &second.accepted_commit,
+        );
+        assert_ne!(
+            g1.generation_id, g2.generation_id,
+            "two generations with different content must not share an id"
+        );
+
+        // Corruption is the one thing the facade will not produce, so it
+        // arrives through the explicit damage helper.
+        let mut corrupted = vec![g2.generation_id.clone()];
+        corrupt_accepted_generation_for_test(projects_path, &project_id, &g2.generation_id)
+            .unwrap();
+        if shape == "corrupt_current_and_prior" {
+            corrupt_accepted_generation_for_test(projects_path, &project_id, &g1.generation_id)
+                .unwrap();
+            corrupted.push(g1.generation_id.clone());
+        }
+        shapes.push(FixtureShape {
+            shape: shape.into(),
+            project_id: project_id.to_string(),
+            attachment_ids: vec![attachment_id.to_string()],
+            accepted_generation: Some(g2.generation_id),
+            prior_generation: Some(g1.generation_id),
+            corrupted_generations: corrupted,
+            catalog_scope: Some((scope.repo_id().into(), scope.bbox_root_relpath().into())),
+            accepted_scope: Some((scope.repo_id().into(), scope.bbox_root_relpath().into())),
+        });
+    }
+
+    // Shape 6: an attached, capable project that has acknowledged it has no
+    // content to publish. D-040 makes pointer ABSENCE the establish gate,
+    // so this is the state establish is allowed to act on, and it must be
+    // distinguishable from a project whose pointer went missing.
+    {
+        let shape = "no_pointer_after_no_content_acknowledgement";
+        let scope = PublishedScope::try_new("repo-no-pointer", ".").unwrap();
+        let checkout = publishable_checkout(root, shape, &scope, "nopointer");
+        let project_id = add(&store, CatalogAddKind::Published(scope.clone()), shape);
+        let attachment_id = attach(
+            &store,
+            &project_id,
+            &checkout.dir,
+            &checkout_marker("nopointer"),
+            Some(&scope),
+            &["repo_knowledge"],
+        );
+        shapes.push(FixtureShape {
+            shape: shape.into(),
+            project_id: project_id.to_string(),
+            attachment_ids: vec![attachment_id.to_string()],
+            accepted_generation: None,
+            prior_generation: None,
+            corrupted_generations: Vec::new(),
+            catalog_scope: Some((scope.repo_id().into(), scope.bbox_root_relpath().into())),
+            accepted_scope: None,
+        });
+    }
+
+    // Shape 8: the publication bridge. The catalog scope moves and the
+    // accepted pointer does not, which is the whole state: old truth keeps
+    // serving until an advance at the NEW scope clears it (plan 4.9).
+    {
+        let shape = "scope_migration_publication_bridge";
+        let old_scope = PublishedScope::try_new("repo-bridge", ".").unwrap();
+        let new_scope = PublishedScope::try_new("repo-bridge", "services/api").unwrap();
+        let checkout = publishable_checkout(root, shape, &old_scope, "bridge");
+        let project_id = add(&store, CatalogAddKind::Published(old_scope.clone()), shape);
+        let attachment_id = attach(
+            &store,
+            &project_id,
+            &checkout.dir,
+            &checkout_marker("bridge"),
+            Some(&old_scope),
+            &["repo_knowledge"],
+        );
+        let installed = install_accepted_publication_for_test(
+            projects_path,
+            &project_id,
+            &attachment_id,
+            &old_scope,
+            "refs/heads/main",
+            &checkout.accepted_commit,
+            checkout.knowledge.clone(),
+            checkout.gaps.clone(),
+        )
+        .unwrap();
+        fs::create_dir_all(checkout.dir.join("services/api")).unwrap();
+        // The attachment-PROVED channel, because this project has an active
+        // attachment. The attested channel is for the unattached case and
+        // refuses here, which is the right refusal: a live attachment must
+        // prove the new scope rather than be attested around.
+        project_catalog_admin::scope_migrate_attached(
+            &store,
+            epoch(&store),
+            &ScopeMigrationRequest {
+                project_id: project_id.clone(),
+                expected_old_scope: old_scope.clone(),
+                new_scope: new_scope.clone(),
+                kind: ScopeMigrationKind::RelpathMove,
+                designated_attachment: attachment_id.clone(),
+                acknowledge_repo_authority_change: false,
+                attachment_probes: [(
+                    attachment_id.clone(),
+                    MigrationAttachmentProbe {
+                        resolved_scope: Some(new_scope.clone()),
+                        new_project_root_relpath: "services/api".into(),
+                        new_checkout_project_dir: checkout
+                            .dir
+                            .join("services/api")
+                            .to_string_lossy()
+                            .into_owned(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                code_bridge_generation: None,
+                publication_bridge_generation: Some(installed.generation_id.clone()),
+                operator_invocation: "section 13.8 fixture set".into(),
+                operator_reason: Some("materialize the publication bridge shape".into()),
+                migrated_at: "2026-08-03T01:00:00Z".into(),
+            },
+            false,
+        )
+        .unwrap()
+        .expect("a committed scope migration returns its receipt");
+        shapes.push(FixtureShape {
+            shape: shape.into(),
+            project_id: project_id.to_string(),
+            attachment_ids: vec![attachment_id.to_string()],
+            accepted_generation: Some(installed.generation_id),
+            prior_generation: None,
+            corrupted_generations: Vec::new(),
+            catalog_scope: Some((
+                new_scope.repo_id().into(),
+                new_scope.bbox_root_relpath().into(),
+            )),
+            accepted_scope: Some((
+                old_scope.repo_id().into(),
+                old_scope.bbox_root_relpath().into(),
+            )),
+        });
+    }
+
+    // Shapes 9 through 12: the capability variants. One project per shape,
+    // because a capability bit is per attachment and section 9's
+    // degradation table is read per project.
+    for (shape, bits) in [
+        (
+            "all_capabilities_attachment",
+            &[
+                "local_code_source",
+                "git_history",
+                "blame",
+                "repo_knowledge",
+                "repo_mutation",
+                "render_output",
+                "provenance_note_io",
+                "artifact_watching",
+            ][..],
+        ),
+        ("repo_knowledge_only_attachment", &["repo_knowledge"][..]),
+        ("no_capability_attachment", &[][..]),
+        ("watcher_capable_attachment", &["artifact_watching"][..]),
+    ] {
+        let scope = PublishedScope::try_new(format!("repo-{shape}"), ".").unwrap();
+        let checkout = publishable_checkout(root, shape, &scope, shape);
+        let project_id = add(&store, CatalogAddKind::Published(scope.clone()), shape);
+        let attachment_id = attach(
+            &store,
+            &project_id,
+            &checkout.dir,
+            &checkout_marker(shape),
+            Some(&scope),
+            bits,
+        );
+        shapes.push(FixtureShape {
+            shape: shape.into(),
+            project_id: project_id.to_string(),
+            attachment_ids: vec![attachment_id.to_string()],
+            accepted_generation: None,
+            prior_generation: None,
+            corrupted_generations: Vec::new(),
+            catalog_scope: Some((scope.repo_id().into(), scope.bbox_root_relpath().into())),
+            accepted_scope: None,
+        });
+    }
+
+    // Shape 13: the legacy-local bootstrap. Section 13.8 says "where
+    // applicable", and it applies: a project with no published scope has no
+    // accepted publication to serve, which is a different unavailability
+    // from a published project whose pointer is missing, and the two must
+    // not collapse into one status.
+    {
+        let shape = "legacy_local_bootstrap";
+        let dir = root.join("catalog-checkouts").join(shape);
+        fs::create_dir_all(&dir).unwrap();
+        write(&dir.join("README.md"), b"not a git repository\n");
+        write(
+            &dir.join(".bbox/local/checkout-id"),
+            format!("{}\n", checkout_marker("legacylocal")).as_bytes(),
+        );
+        let project_id = add(&store, CatalogAddKind::LegacyLocal, shape);
+        let attachment_id = attach(
+            &store,
+            &project_id,
+            &dir,
+            &checkout_marker("legacylocal"),
+            // A legacy-local project attaches only a checkout that records
+            // NO committed authority; supplying one is a promotion, not an
+            // attach, and the facade refuses it.
+            None,
+            &["local_code_source"],
+        );
+        shapes.push(FixtureShape {
+            shape: shape.into(),
+            project_id: project_id.to_string(),
+            attachment_ids: vec![attachment_id.to_string()],
+            accepted_generation: None,
+            prior_generation: None,
+            corrupted_generations: Vec::new(),
+            catalog_scope: None,
+            accepted_scope: None,
+        });
+    }
+
+    // Returned in SECTION_13_8_SHAPES order, not build order. Prior
+    // fallback and the corrupt shape share a builder because they differ
+    // only in how much damage is done, which is a construction detail; the
+    // set a consumer sees is the plan's.
+    shapes.sort_by_key(|shape| {
+        SECTION_13_8_SHAPES
+            .iter()
+            .position(|name| *name == shape.shape)
+            .unwrap_or_else(|| panic!("shape {} is not named in section 13.8", shape.shape))
+    });
+    shapes
+}
+
+/// The set is gated on every workspace run, not only by the live bootsmoke.
+///
+/// Without this the definition would be exercised exclusively by an ignored
+/// producer, which is the same as not being exercised: a shape could stop
+/// building and nobody would find out until someone ran the smoke by hand.
+#[test]
+fn the_section_13_8_fixture_set_builds_every_named_shape() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let projects_path = root.join("state").join("projects.json");
+    fs::create_dir_all(projects_path.parent().unwrap()).unwrap();
+    ProjectCatalogStore::initialize_empty(&projects_path).unwrap();
+
+    let shapes = build_section_13_8_fixture_set(&projects_path, &root);
+
+    let built: Vec<&str> = shapes.iter().map(|shape| shape.shape.as_str()).collect();
+    assert_eq!(
+        built, SECTION_13_8_SHAPES,
+        "the built set must be exactly section 13.8's thirteen shapes, in order"
+    );
+
+    // Every shape is asserted against the CATALOG, not against what the
+    // builder claims it did. A receipt that agrees with itself proves
+    // nothing; the store is the authority.
+    let state = ProjectCatalogStore::open_existing(&projects_path)
+        .unwrap()
+        .snapshot()
+        .unwrap();
+    for shape in &shapes {
+        let project_id = ProjectId::parse(&shape.project_id).unwrap();
+        let project = state
+            .catalog()
+            .projects
+            .get(&project_id)
+            .unwrap_or_else(|| panic!("shape {} is not in the catalog", shape.shape));
+        assert_eq!(
+            published_scope_of(project),
+            shape.catalog_scope,
+            "shape {} catalog scope",
+            shape.shape
+        );
+        for attachment_id in &shape.attachment_ids {
+            let row = state
+                .attachments()
+                .attachments
+                .get(&AttachmentId::parse(attachment_id).unwrap())
+                .unwrap_or_else(|| panic!("shape {} lost an attachment row", shape.shape));
+            assert_eq!(row.project_id, project_id, "shape {}", shape.shape);
+            assert_eq!(
+                row.status,
+                AttachmentStatus::Attached,
+                "shape {} attachment status",
+                shape.shape
+            );
+        }
+    }
+
+    // The distinguishing property of each shape, one assertion apiece.
+    let by_name = |name: &str| {
+        shapes
+            .iter()
+            .find(|shape| shape.shape == name)
+            .unwrap_or_else(|| panic!("missing shape {name}"))
+    };
+    assert!(
+        by_name("remote_only_valid_g1").attachment_ids.is_empty(),
+        "remote-only must have no attached row on this host"
+    );
+    assert!(
+        by_name("remote_only_valid_g1")
+            .accepted_generation
+            .is_some(),
+        "remote-only must still serve accepted content"
+    );
+    assert_eq!(
+        by_name("attached_peer_contains_p").project_id,
+        by_name("attached_peer_missing_p").project_id,
+        "both peer shapes must be peers OF ONE PROJECT, or they are not peers"
+    );
+    assert_ne!(
+        by_name("attached_peer_contains_p").attachment_ids[1],
+        by_name("attached_peer_missing_p").attachment_ids[1],
+        "the two peers must be distinct attachments"
+    );
+    let prior = by_name("prior_fallback");
+    assert!(
+        prior.prior_generation.is_some()
+            && prior.corrupted_generations == vec![prior.accepted_generation.clone().unwrap()],
+        "Prior fallback damages the CURRENT generation only"
+    );
+    let corrupt = by_name("corrupt_current_and_prior");
+    assert_eq!(
+        corrupt.corrupted_generations.len(),
+        2,
+        "the corrupt shape damages both arms"
+    );
+    assert!(
+        by_name("no_pointer_after_no_content_acknowledgement")
+            .accepted_generation
+            .is_none(),
+        "the no-pointer shape must carry no pointer"
+    );
+    let bridge = by_name("scope_migration_publication_bridge");
+    assert_ne!(
+        bridge.catalog_scope, bridge.accepted_scope,
+        "an open publication bridge is exactly a catalog scope the accepted \
+         pointer does not name yet"
+    );
+    assert!(
+        by_name("legacy_local_bootstrap").catalog_scope.is_none(),
+        "a legacy-local project has no published scope"
+    );
+
+    // Capability variants: read the recorded bits back off the store.
+    let bits_of = |name: &str| {
+        let shape = by_name(name);
+        state
+            .attachments()
+            .attachments
+            .get(&AttachmentId::parse(&shape.attachment_ids[0]).unwrap())
+            .unwrap()
+            .capabilities
+    };
+    let all = bits_of("all_capabilities_attachment");
+    assert!(
+        all.local_code_source
+            && all.git_history
+            && all.blame
+            && all.repo_knowledge
+            && all.repo_mutation
+            && all.render_output
+            && all.provenance_note_io
+            && all.artifact_watching,
+        "the all-capabilities shape must record every bit"
+    );
+    let only = bits_of("repo_knowledge_only_attachment");
+    assert!(only.repo_knowledge && !only.blame && !only.artifact_watching);
+    assert!(
+        !bits_of("no_capability_attachment").any(),
+        "the no-capability shape must record nothing"
+    );
+    let watcher = bits_of("watcher_capable_attachment");
+    assert!(watcher.artifact_watching && !watcher.repo_knowledge);
 }

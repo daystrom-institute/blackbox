@@ -62,3 +62,11 @@ bbox-config = { path = "../bbox-config" }
 bbox-threads = { path = "../bbox-threads" }
 bbox-edge-index = { path = "../bbox-edge-index" }
 bbox-vectors = { path = "../bbox-vectors" }
+
+[dev-dependencies]
+# Enable this crate's own `test-support` feature for its integration tests.
+# `#[cfg(test)]` does not reach an integration test, and the section 13.8
+# fixture set has to install accepted publications through the SAME
+# single-owner helpers the daemon fixtures use rather than growing a second
+# installer. Dev-only: no production build carries the feature.
+bbox-indexing = { path = ".", features = ["test-support"] }
