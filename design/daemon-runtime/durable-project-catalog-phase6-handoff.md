@@ -1,7 +1,7 @@
 ---
 title: "Durable project catalog Phase 6 handoff inventory"
 kind: design
-lifecycle: complete
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - daemon-runtime
@@ -166,20 +166,31 @@ Reversing 4 and 5 breaks the cut: the projection is what keeps v1-shaped
 consumers alive while they are being converted.
 
 ## 6. Status of this document
-`lifecycle: complete` as of the Phase 5 exit gate. The two P5-H deliverables
-this document was waiting on have both landed and are both blocking:
+`lifecycle: partial`. Both P5-H deliverables this document was waiting on
+have landed and both run blocking:
 
 - the checkout-open call-site audit, recorded in section 2.1 as a
   machine-checked input;
 - the bridge parity fixture, recorded in section 2.1 as a machine-checked
   input and in section 3.7 as its own deletion inventory.
 
-The pairing this document is built on now holds in both directions: every
-prose row in section 3 has a machine-checked counterpart in section 2, and
-every machine-checked input in section 2 has a stated Phase 6 disposition
-in section 3. Neither half can rot without the other failing.
+### 6.1 Why this is still partial
+This document was briefly marked `complete` on the strength of those two
+inputs existing and running blocking. The closing bookend review then found
+that existing and running is not the same as VALID, and its findings
+contradict assertions this document makes. A handoff inventory whose prose
+outruns its machine checks is the exact failure mode section 1 says the
+pairing exists to prevent, so the marker goes back until the checks are
+worth what the prose claims for them.
 
-What Phase 6 should re-read before starting: section 5 for the ordering
-constraint, section 2.1 for why the parity verifier is run green before AND
-after each deletion step, and section 4 for the three residuals it inherits
-rather than fixes.
+Open findings, all in the closing bookend round:
+
+| Finding | Contradicted assertion |
+|---|---|
+| 4 (high) | Section 2.1 says the parity fixture catches a bridge RESPONSE change. It does not catch one confined to a field the harness projects rather than compares: the system-memory body on the published views, the exact observation counters and sequences, and doctor finding messages. Section 3.7's claim that widening a projection converts the proof into a formality applies to the harness's own three projections first. |
+| 2, 3 | Findings against the other P5-H proofs, held by their own workers. They bear on section 2.1's claim that the three machine-checked inputs together leave no unwatched gap. |
+
+Re-completion is a final-round act, not a same-round one: it happens after
+the re-review passes, not after the fixes are pushed. Until then, treat
+section 2.1's coverage claims as the INTENT of the inputs rather than a
+statement of what they currently prove.
