@@ -1,12 +1,16 @@
 {
   "contract": "Phase 5 plan section 11 bridge parity. Every row is a full response from a bridge-mode server over one canonical fixture. A diff here is a bridge output change and needs a new explicit decision, not a regenerated fixture.",
   "normalizations": {
+    ":\"<OBSERVED_AT_UNIX_SECS>\"": "wall-clock second a counter last moved",
     "<FIXTURE_ROOT>": "per-run temporary directory",
+    "<HOST_STATE_DIR>": "host state directory outside the fixture",
+    "<OBSERVED_AT_UNIX_SECS>": "wall-clock second a counter last moved",
     "<PLAN_GENERATION>": "digest over the per-run registry project id",
     "<REGISTERED_AT>": "registry stamps wall-clock time",
     "<REGISTRY_PROJECT_ID>": "hash of the per-run canonical fixture path",
     "<WORKING_FINGERPRINT_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01>": "derived from filesystem metadata",
-    "<WORKING_FINGERPRINT_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb02>": "derived from filesystem metadata"
+    "<WORKING_FINGERPRINT_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb02>": "derived from filesystem metadata",
+    "blackboxd <DAEMON_VERSION>": "CARGO_PKG_VERSION, moves every release"
   },
   "rows": {
     "all_gaps": {
@@ -15,8 +19,7 @@
     },
     "all_knowledge": {
       "is_error": false,
-      "system_memories_present": true,
-      "text": "4 entries:\n\n[bp-deleted] Convention/project | all | entry bp-deleted [invariant] | built_from=built_from_0\n  content_bytes=17\n  PUBLISHED_DELETED\n\n[bp-shared] Convention/project | all | entry bp-shared [invariant] | built_from=built_from_0\n  content_bytes=17\n  PUBLISHED_CONTENT\n\n[provisional_knowledge:620dca8072866f7ea8c8396c0548c7968f9a4442e493875851dab6bf22e8fab0:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01:bp-shared] Convention/project | all | entry bp-shared [invariant] | built_from=built_from_1\n  content_bytes=11\n  OWN_CONTENT\n\n[provisional_knowledge:620dca8072866f7ea8c8396c0548c7968f9a4442e493875851dab6bf22e8fab0:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb02:bp-shared] Convention/project | all | entry bp-shared [invariant] | built_from=built_from_2\n  content_bytes=12\n  PEER_CONTENT\n\nprovisional visibility degraded:\n- checkout bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01 tombstones knowledge:bp-deleted"
+      "text": "4 entries:\n\n[bp-deleted] Convention/project | all | entry bp-deleted [invariant] | built_from=built_from_0\n  content_bytes=17\n  PUBLISHED_DELETED\n\n[bp-shared] Convention/project | all | entry bp-shared [invariant] | built_from=built_from_0\n  content_bytes=17\n  PUBLISHED_CONTENT\n\n[provisional_knowledge:620dca8072866f7ea8c8396c0548c7968f9a4442e493875851dab6bf22e8fab0:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01:bp-shared] Convention/project | all | entry bp-shared [invariant] | built_from=built_from_1\n  content_bytes=11\n  OWN_CONTENT\n\n[provisional_knowledge:620dca8072866f7ea8c8396c0548c7968f9a4442e493875851dab6bf22e8fab0:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb02:bp-shared] Convention/project | all | entry bp-shared [invariant] | built_from=built_from_2\n  content_bytes=12\n  PEER_CONTENT\n\nprovisional visibility degraded:\n- checkout bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01 tombstones knowledge:bp-deleted\n\n── System memories ──────────────────────────\n[system] sm-bridge-parity-alpha — Bridge parity fixture memory alpha\n  ref: system_memory:sm-bridge-parity-alpha\n  tags: bridge-parity, fixture\n  Bridge parity fixture memory alpha\n  → full runbook: bbox_knowledge(query=\"sm-bridge-parity-alpha\"); bundle ref: system_memory:sm-bridge-parity-alpha\n\n[system] sm-bridge-parity-beta — Bridge parity fixture memory beta\n  ref: system_memory:sm-bridge-parity-beta\n  tags: bridge-parity, fixture\n  Bridge parity fixture memory beta\n  → full runbook: bbox_knowledge(query=\"sm-bridge-parity-beta\"); bundle ref: system_memory:sm-bridge-parity-beta\n\n  (signposts only — query an exact sm-* id for the full runbook body)\n\n── Next steps ───────────────────────────────\n  → Inspect the top entry's edges + provenance: bbox_inspect_entity(entity_ref=\"knowledge:bp-deleted\")\n  → Package an answer: bbox_bundle_evidence(question=<q>, entity_refs=[\"knowledge:bp-deleted\"])\n\n\nbuilt_from:\n- built_from_0 published scope=ad6d311991239fa1ea5a9cbdd91eae19f82b61e8:. ref=refs/heads/main commit=da9971af82c4bcd459bb2dae63f0f3c45755eef1\n- built_from_1 checkout_overlay scope=ad6d311991239fa1ea5a9cbdd91eae19f82b61e8:. checkout=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01 publisher_commit=da9971af82c4bcd459bb2dae63f0f3c45755eef1 checkout_head=da9971af82c4bcd459bb2dae63f0f3c45755eef1 merge_base=da9971af82c4bcd459bb2dae63f0f3c45755eef1 working_fingerprint=1101b6a4141a8f77370d926dcb4b4d7390be810ab3d3593d06922cf58e9d3a33\n- built_from_2 checkout_overlay scope=ad6d311991239fa1ea5a9cbdd91eae19f82b61e8:. checkout=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb02 publisher_commit=da9971af82c4bcd459bb2dae63f0f3c45755eef1 checkout_head=da9971af82c4bcd459bb2dae63f0f3c45755eef1 merge_base=da9971af82c4bcd459bb2dae63f0f3c45755eef1 working_fingerprint=b9191c067f94698085fb0a0a699067cc13a7029cccec0d35da8c761fa6644774\n"
     },
     "blame": {
       "is_error": false,
@@ -34,228 +37,118 @@
     },
     "checkout_observations": {
       "active_compatibility_lanes": [
-        "LegacyProjectRecord",
-        "LegacyCheckoutRegistry",
-        "LegacyPathResolver"
+        "legacy_project_record",
+        "legacy_checkout_registry",
+        "legacy_path_resolver"
       ],
-      "counter_key_space": [
+      "counters": [
         {
-          "kind": "PublisherConfigTreeRead",
-          "outcome": "Granted",
-          "source_lane": "LegacyProjectRecord"
+          "count": 45,
+          "kind": "publisher_config_tree_read",
+          "last_sequence": 55,
+          "last_unix_secs": "<OBSERVED_AT_UNIX_SECS>",
+          "outcome": "granted",
+          "source_lane": "legacy_project_record"
         },
         {
-          "kind": "KnowledgeGapOverlayRead",
-          "outcome": "Granted",
-          "source_lane": "LegacyCheckoutRegistry"
+          "count": 4,
+          "kind": "knowledge_gap_overlay_read",
+          "last_sequence": 22,
+          "last_unix_secs": "<OBSERVED_AT_UNIX_SECS>",
+          "outcome": "granted",
+          "source_lane": "legacy_checkout_registry"
         },
         {
-          "kind": "Blame",
-          "outcome": "Granted",
-          "source_lane": "LegacyCheckoutRegistry"
+          "count": 1,
+          "kind": "blame",
+          "last_sequence": 44,
+          "last_unix_secs": "<OBSERVED_AT_UNIX_SECS>",
+          "outcome": "granted",
+          "source_lane": "legacy_checkout_registry"
         },
         {
-          "kind": "RenderFileProvider",
-          "outcome": "Granted",
-          "source_lane": "LegacyCheckoutRegistry"
+          "count": 3,
+          "kind": "render_file_provider",
+          "last_sequence": 50,
+          "last_unix_secs": "<OBSERVED_AT_UNIX_SECS>",
+          "outcome": "granted",
+          "source_lane": "legacy_checkout_registry"
         },
         {
-          "kind": "ProvenanceNoteIo",
-          "outcome": "Granted",
-          "source_lane": "LegacyProjectRecord"
+          "count": 2,
+          "kind": "provenance_note_io",
+          "last_sequence": 56,
+          "last_unix_secs": "<OBSERVED_AT_UNIX_SECS>",
+          "outcome": "granted",
+          "source_lane": "legacy_project_record"
         },
         {
-          "kind": "RepositoryMutation",
-          "outcome": "Granted",
-          "source_lane": "LegacyPathResolver"
+          "count": 1,
+          "kind": "repository_mutation",
+          "last_sequence": 45,
+          "last_unix_secs": "<OBSERVED_AT_UNIX_SECS>",
+          "outcome": "granted",
+          "source_lane": "legacy_path_resolver"
         }
       ],
       "operations": [
         {
           "denied": 0,
-          "granted_any": false,
-          "kind": "LocalProjectWalk"
+          "granted": 0,
+          "kind": "local_project_walk"
         },
         {
           "denied": 0,
-          "granted_any": false,
-          "kind": "GitHistory"
+          "granted": 0,
+          "kind": "git_history"
         },
         {
           "denied": 0,
-          "granted_any": true,
-          "kind": "PublisherConfigTreeRead"
+          "granted": 45,
+          "kind": "publisher_config_tree_read",
+          "last_success_unix_secs": "<OBSERVED_AT_UNIX_SECS>"
         },
         {
           "denied": 0,
-          "granted_any": true,
-          "kind": "KnowledgeGapOverlayRead"
+          "granted": 4,
+          "kind": "knowledge_gap_overlay_read",
+          "last_success_unix_secs": "<OBSERVED_AT_UNIX_SECS>"
         },
         {
           "denied": 0,
-          "granted_any": true,
-          "kind": "Blame"
+          "granted": 1,
+          "kind": "blame",
+          "last_success_unix_secs": "<OBSERVED_AT_UNIX_SECS>"
         },
         {
           "denied": 0,
-          "granted_any": true,
-          "kind": "RenderFileProvider"
+          "granted": 3,
+          "kind": "render_file_provider",
+          "last_success_unix_secs": "<OBSERVED_AT_UNIX_SECS>"
         },
         {
           "denied": 0,
-          "granted_any": true,
-          "kind": "ProvenanceNoteIo"
+          "granted": 2,
+          "kind": "provenance_note_io",
+          "last_success_unix_secs": "<OBSERVED_AT_UNIX_SECS>"
         },
         {
           "denied": 0,
-          "granted_any": false,
-          "kind": "ArtifactWatchDiscovery"
+          "granted": 0,
+          "kind": "artifact_watch_discovery"
         },
         {
           "denied": 0,
-          "granted_any": true,
-          "kind": "RepositoryMutation"
+          "granted": 1,
+          "kind": "repository_mutation",
+          "last_success_unix_secs": "<OBSERVED_AT_UNIX_SECS>"
         }
-      ]
+      ],
+      "sequence": 56
     },
-    "doctor_sections": {
-      "checkout_access_present": true,
-      "sections": [
-        {
-          "finding_count": 1,
-          "findings": [
-            {
-              "level": "ok",
-              "next": null
-            }
-          ],
-          "section": "daemon"
-        },
-        {
-          "finding_count": 1,
-          "findings": [
-            {
-              "level": "ok",
-              "next": null
-            }
-          ],
-          "section": "index"
-        },
-        {
-          "finding_count": 1,
-          "findings": [
-            {
-              "level": "ok",
-              "next": null
-            }
-          ],
-          "section": "code_sources"
-        },
-        {
-          "finding_count": 1,
-          "findings": [
-            {
-              "level": "info",
-              "next": null
-            }
-          ],
-          "section": "vectors"
-        },
-        {
-          "finding_count": 1,
-          "findings": [
-            {
-              "level": "info",
-              "next": null
-            }
-          ],
-          "section": "graph"
-        },
-        {
-          "finding_count": 1,
-          "findings": [
-            {
-              "level": "ok",
-              "next": null
-            }
-          ],
-          "section": "projects"
-        },
-        {
-          "finding_count": 7,
-          "findings": [
-            {
-              "level": "info",
-              "next": null
-            },
-            {
-              "level": "info",
-              "next": null
-            },
-            {
-              "level": "info",
-              "next": null
-            },
-            {
-              "level": "info",
-              "next": null
-            },
-            {
-              "level": "info",
-              "next": null
-            },
-            {
-              "level": "info",
-              "next": null
-            },
-            {
-              "level": "info",
-              "next": null
-            }
-          ],
-          "section": "checkout_access"
-        },
-        {
-          "finding_count": 1,
-          "findings": [
-            {
-              "level": "info",
-              "next": null
-            }
-          ],
-          "section": "resolver_compat"
-        },
-        {
-          "finding_count": 1,
-          "findings": [
-            {
-              "level": "ok",
-              "next": null
-            }
-          ],
-          "section": "memories"
-        },
-        {
-          "finding_count": 1,
-          "findings": [
-            {
-              "level": "ok",
-              "next": null
-            }
-          ],
-          "section": "knowledge"
-        },
-        {
-          "finding_count": 1,
-          "findings": [
-            {
-              "level": "ok",
-              "next": null
-            }
-          ],
-          "section": "attention"
-        }
-      ]
+    "doctor_report": {
+      "is_error": false,
+      "text": "{\n  \"status\": \"info\",\n  \"sections\": [\n    {\n      \"section\": \"daemon\",\n      \"findings\": [\n        {\n          \"level\": \"ok\",\n          \"message\": \"blackboxd <DAEMON_VERSION> on 127.0.0.1:7264 (mcp `blackbox`); state <HOST_STATE_DIR>, runtime store <FIXTURE_ROOT>/state\"\n        }\n      ]\n    },\n    {\n      \"section\": \"index\",\n      \"findings\": [\n        {\n          \"level\": \"ok\",\n          \"message\": \"4 indexed documents\"\n        }\n      ]\n    },\n    {\n      \"section\": \"code_sources\",\n      \"findings\": [\n        {\n          \"level\": \"ok\",\n          \"message\": \"code collection disabled; project sources are local\"\n        }\n      ]\n    },\n    {\n      \"section\": \"vectors\",\n      \"findings\": [\n        {\n          \"level\": \"info\",\n          \"message\": \"no embedding routes active yet\"\n        }\n      ]\n    },\n    {\n      \"section\": \"graph\",\n      \"findings\": [\n        {\n          \"level\": \"info\",\n          \"message\": \"agentic graph has no entities yet (populated by indexing)\"\n        }\n      ]\n    },\n    {\n      \"section\": \"projects\",\n      \"findings\": [\n        {\n          \"level\": \"ok\",\n          \"message\": \"1 registered project(s), all present\"\n        }\n      ]\n    },\n    {\n      \"section\": \"checkout_access\",\n      \"findings\": [\n        {\n          \"level\": \"info\",\n          \"message\": \"publisher_config_tree_read: 45 granted, 0 denied, last success <OBSERVED_AT_UNIX_SECS>\"\n        },\n        {\n          \"level\": \"info\",\n          \"message\": \"knowledge_gap_overlay_read: 4 granted, 0 denied, last success <OBSERVED_AT_UNIX_SECS>\"\n        },\n        {\n          \"level\": \"info\",\n          \"message\": \"blame: 1 granted, 0 denied, last success <OBSERVED_AT_UNIX_SECS>\"\n        },\n        {\n          \"level\": \"info\",\n          \"message\": \"render_file_provider: 3 granted, 0 denied, last success <OBSERVED_AT_UNIX_SECS>\"\n        },\n        {\n          \"level\": \"info\",\n          \"message\": \"provenance_note_io: 2 granted, 0 denied, last success <OBSERVED_AT_UNIX_SECS>\"\n        },\n        {\n          \"level\": \"info\",\n          \"message\": \"repository_mutation: 1 granted, 0 denied, last success <OBSERVED_AT_UNIX_SECS>\"\n        },\n        {\n          \"level\": \"info\",\n          \"message\": \"active checkout compatibility lanes: legacy_project_record, legacy_checkout_registry, legacy_path_resolver\"\n        }\n      ]\n    },\n    {\n      \"section\": \"resolver_compat\",\n      \"findings\": [\n        {\n          \"level\": \"info\",\n          \"message\": \"no resolver compatibility lane has fired yet\"\n        }\n      ]\n    },\n    {\n      \"section\": \"memories\",\n      \"findings\": [\n        {\n          \"level\": \"ok\",\n          \"message\": \"2 system memories loaded\"\n        }\n      ]\n    },\n    {\n      \"section\": \"knowledge\",\n      \"findings\": [\n        {\n          \"level\": \"ok\",\n          \"message\": \"knowledge lint clean\"\n        }\n      ]\n    },\n    {\n      \"section\": \"attention\",\n      \"findings\": [\n        {\n          \"level\": \"ok\",\n          \"message\": \"no unresolved attention items\"\n        }\n      ]\n    }\n  ],\n  \"checkout_access\": {\n    \"sequence\": 56,\n    \"operations\": [\n      {\n        \"kind\": \"local_project_walk\",\n        \"granted\": 0,\n        \"denied\": 0\n      },\n      {\n        \"kind\": \"git_history\",\n        \"granted\": 0,\n        \"denied\": 0\n      },\n      {\n        \"kind\": \"publisher_config_tree_read\",\n        \"granted\": 45,\n        \"denied\": 0,\n        \"last_success_unix_secs\": <OBSERVED_AT_UNIX_SECS>\n      },\n      {\n        \"kind\": \"knowledge_gap_overlay_read\",\n        \"granted\": 4,\n        \"denied\": 0,\n        \"last_success_unix_secs\": <OBSERVED_AT_UNIX_SECS>\n      },\n      {\n        \"kind\": \"blame\",\n        \"granted\": 1,\n        \"denied\": 0,\n        \"last_success_unix_secs\": <OBSERVED_AT_UNIX_SECS>\n      },\n      {\n        \"kind\": \"render_file_provider\",\n        \"granted\": 3,\n        \"denied\": 0,\n        \"last_success_unix_secs\": <OBSERVED_AT_UNIX_SECS>\n      },\n      {\n        \"kind\": \"provenance_note_io\",\n        \"granted\": 2,\n        \"denied\": 0,\n        \"last_success_unix_secs\": <OBSERVED_AT_UNIX_SECS>\n      },\n      {\n        \"kind\": \"artifact_watch_discovery\",\n        \"granted\": 0,\n        \"denied\": 0\n      },\n      {\n        \"kind\": \"repository_mutation\",\n        \"granted\": 1,\n        \"denied\": 0,\n        \"last_success_unix_secs\": <OBSERVED_AT_UNIX_SECS>\n      }\n    ],\n    \"counters\": [\n      {\n        \"kind\": \"publisher_config_tree_read\",\n        \"source_lane\": \"legacy_project_record\",\n        \"outcome\": \"granted\",\n        \"count\": 45,\n        \"last_sequence\": 55,\n        \"last_unix_secs\": <OBSERVED_AT_UNIX_SECS>\n      },\n      {\n        \"kind\": \"knowledge_gap_overlay_read\",\n        \"source_lane\": \"legacy_checkout_registry\",\n        \"outcome\": \"granted\",\n        \"count\": 4,\n        \"last_sequence\": 22,\n        \"last_unix_secs\": <OBSERVED_AT_UNIX_SECS>\n      },\n      {\n        \"kind\": \"blame\",\n        \"source_lane\": \"legacy_checkout_registry\",\n        \"outcome\": \"granted\",\n        \"count\": 1,\n        \"last_sequence\": 44,\n        \"last_unix_secs\": <OBSERVED_AT_UNIX_SECS>\n      },\n      {\n        \"kind\": \"render_file_provider\",\n        \"source_lane\": \"legacy_checkout_registry\",\n        \"outcome\": \"granted\",\n        \"count\": 3,\n        \"last_sequence\": 50,\n        \"last_unix_secs\": <OBSERVED_AT_UNIX_SECS>\n      },\n      {\n        \"kind\": \"provenance_note_io\",\n        \"source_lane\": \"legacy_project_record\",\n        \"outcome\": \"granted\",\n        \"count\": 2,\n        \"last_sequence\": 56,\n        \"last_unix_secs\": <OBSERVED_AT_UNIX_SECS>\n      },\n      {\n        \"kind\": \"repository_mutation\",\n        \"source_lane\": \"legacy_path_resolver\",\n        \"outcome\": \"granted\",\n        \"count\": 1,\n        \"last_sequence\": 45,\n        \"last_unix_secs\": <OBSERVED_AT_UNIX_SECS>\n      }\n    ],\n    \"active_compatibility_lanes\": [\n      \"legacy_project_record\",\n      \"legacy_checkout_registry\",\n      \"legacy_path_resolver\"\n    ]\n  }\n}"
     },
     "file_provider": {
       "is_error": false,
@@ -267,8 +160,7 @@
     },
     "own_knowledge": {
       "is_error": false,
-      "system_memories_present": true,
-      "text": "1 entries:\n\n[provisional_knowledge:620dca8072866f7ea8c8396c0548c7968f9a4442e493875851dab6bf22e8fab0:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01:bp-shared] Convention/project | all | entry bp-shared [invariant] | built_from=built_from_1\n  content_bytes=11\n  OWN_CONTENT"
+      "text": "1 entries:\n\n[provisional_knowledge:620dca8072866f7ea8c8396c0548c7968f9a4442e493875851dab6bf22e8fab0:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01:bp-shared] Convention/project | all | entry bp-shared [invariant] | built_from=built_from_1\n  content_bytes=11\n  OWN_CONTENT\n\n── System memories ──────────────────────────\n[system] sm-bridge-parity-alpha — Bridge parity fixture memory alpha\n  ref: system_memory:sm-bridge-parity-alpha\n  tags: bridge-parity, fixture\n  Bridge parity fixture memory alpha\n  → full runbook: bbox_knowledge(query=\"sm-bridge-parity-alpha\"); bundle ref: system_memory:sm-bridge-parity-alpha\n\n[system] sm-bridge-parity-beta — Bridge parity fixture memory beta\n  ref: system_memory:sm-bridge-parity-beta\n  tags: bridge-parity, fixture\n  Bridge parity fixture memory beta\n  → full runbook: bbox_knowledge(query=\"sm-bridge-parity-beta\"); bundle ref: system_memory:sm-bridge-parity-beta\n\n  (signposts only — query an exact sm-* id for the full runbook body)\n\n── Next steps ───────────────────────────────\n  → Inspect the top entry's edges + provenance: bbox_inspect_entity(entity_ref=\"provisional_knowledge:620dca8072866f7ea8c8396c0548c7968f9a4442e493875851dab6bf22e8fab0:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01:bp-shared\")\n  → Package an answer: bbox_bundle_evidence(question=<q>, entity_refs=[\"provisional_knowledge:620dca8072866f7ea8c8396c0548c7968f9a4442e493875851dab6bf22e8fab0:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01:bp-shared\"])\n\n\nbuilt_from:\n- built_from_1 checkout_overlay scope=ad6d311991239fa1ea5a9cbdd91eae19f82b61e8:. checkout=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01 publisher_commit=da9971af82c4bcd459bb2dae63f0f3c45755eef1 checkout_head=da9971af82c4bcd459bb2dae63f0f3c45755eef1 merge_base=da9971af82c4bcd459bb2dae63f0f3c45755eef1 working_fingerprint=1101b6a4141a8f77370d926dcb4b4d7390be810ab3d3593d06922cf58e9d3a33\n"
     },
     "project_administration": {
       "is_error": false,
@@ -292,8 +184,7 @@
     },
     "published_knowledge": {
       "is_error": false,
-      "system_memories_present": true,
-      "text": "2 entries:\n\n[bp-deleted] Convention/project | all | entry bp-deleted [invariant] | built_from=built_from_0\n  content_bytes=17\n  PUBLISHED_DELETED\n\n[bp-shared] Convention/project | all | entry bp-shared [invariant] | built_from=built_from_0\n  content_bytes=17\n  PUBLISHED_CONTENT"
+      "text": "2 entries:\n\n[bp-deleted] Convention/project | all | entry bp-deleted [invariant] | built_from=built_from_0\n  content_bytes=17\n  PUBLISHED_DELETED\n\n[bp-shared] Convention/project | all | entry bp-shared [invariant] | built_from=built_from_0\n  content_bytes=17\n  PUBLISHED_CONTENT\n\n── System memories ──────────────────────────\n[system] sm-bridge-parity-alpha — Bridge parity fixture memory alpha\n  ref: system_memory:sm-bridge-parity-alpha\n  tags: bridge-parity, fixture\n  Bridge parity fixture memory alpha\n  → full runbook: bbox_knowledge(query=\"sm-bridge-parity-alpha\"); bundle ref: system_memory:sm-bridge-parity-alpha\n\n[system] sm-bridge-parity-beta — Bridge parity fixture memory beta\n  ref: system_memory:sm-bridge-parity-beta\n  tags: bridge-parity, fixture\n  Bridge parity fixture memory beta\n  → full runbook: bbox_knowledge(query=\"sm-bridge-parity-beta\"); bundle ref: system_memory:sm-bridge-parity-beta\n\n  (signposts only — query an exact sm-* id for the full runbook body)\n\n── Next steps ───────────────────────────────\n  → Inspect the top entry's edges + provenance: bbox_inspect_entity(entity_ref=\"knowledge:bp-deleted\")\n  → Package an answer: bbox_bundle_evidence(question=<q>, entity_refs=[\"knowledge:bp-deleted\"])\n\n\nbuilt_from:\n- built_from_0 published scope=ad6d311991239fa1ea5a9cbdd91eae19f82b61e8:. ref=refs/heads/main commit=da9971af82c4bcd459bb2dae63f0f3c45755eef1\n"
     },
     "publisher_authorization": {
       "authorized_publisher": {

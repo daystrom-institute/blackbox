@@ -129,18 +129,29 @@ Each row names the bridge surface it pins and what happens to that row:
 
 Two properties Phase 6 must not quietly relax:
 
-- **Normalizations are exact-value, never pattern.** Five substitutions,
-  each declared per row and self-policing in both directions: a declared
-  substitution that never fires fails as vacuous, an undeclared one that
-  fires fails as unaudited. A Phase 6 change that reaches for a regex
+- **Normalizations are exact-value, never pattern.** Each is declared per
+  row and self-policing in both directions: a declared substitution that
+  never fires fails as vacuous, an undeclared one that fires fails as
+  unaudited, and a substitution that lands inside an unrelated token fails
+  as a mid-token landing. A Phase 6 change that reaches for a regex
   normalization to make a row pass has converted the proof into a
   formality.
-- **Three surfaces are projected, not captured verbatim**, each stated in
-  the module header with its still-fails case: doctor findings, the
-  system-memory trailer on the rendered views, and observation counts
-  (which track the 250 ms publisher-authorization cache TTL and move with
-  machine load). Widening a projection to absorb a Phase 6 diff is the same
-  failure as widening a normalization.
+- **Every row compares the COMPLETE serialized response.** Nothing is
+  dropped or summarized. Three surfaces were briefly projected instead
+  (the system-memory trailer, exact observation counters, doctor finding
+  messages) and the closing bookend review was right to reject that:
+  changes confined to an omitted field left the comparison green.
+  Determinism for each was bought at the source instead. The system-memory
+  catalog is pinned to a fixture-owned pair, so the trailer is captured
+  whole and moves only when the harness moves. Observation counters are
+  exact because the harness drops the publisher-authorization cache before
+  every row, which removes the 250 millisecond TTL from the measurement
+  rather than tolerating its variance. Doctor is captured whole, with the
+  daemon version and the host state directory substituted by exact value
+  from the same sources doctor renders them from.
+
+Re-projecting any of those three to make a Phase 6 diff go away would
+re-open the finding, not resolve it.
 
 The section 13.8 fixture set
 (`crates/bbox-indexing/tests/project_catalog_migration_facade.rs`) is NOT
@@ -187,7 +198,7 @@ Open findings, all in the closing bookend round:
 
 | Finding | Contradicted assertion |
 |---|---|
-| 4 (high) | Section 2.1 says the parity fixture catches a bridge RESPONSE change. It does not catch one confined to a field the harness projects rather than compares: the system-memory body on the published views, the exact observation counters and sequences, and doctor finding messages. Section 3.7's claim that widening a projection converts the proof into a formality applies to the harness's own three projections first. |
+| 4 (high) | Section 2.1 says the parity fixture catches a bridge RESPONSE change. It did not catch one confined to a field the harness projected rather than compared: the system-memory body on the published views, the exact observation counters and sequences, and doctor finding messages. Section 3.7's claim that widening a projection converts the proof into a formality applied to the harness's own three projections first. FIX LANDED, awaiting re-review: all three are captured complete, with determinism bought at the source and only exact-value substitutions remaining. |
 | 2, 3 | Findings against the other P5-H proofs, held by their own workers. They bear on section 2.1's claim that the three machine-checked inputs together leave no unwatched gap. |
 
 Re-completion is a final-round act, not a same-round one: it happens after

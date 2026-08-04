@@ -134,6 +134,21 @@ mod harness {
         /// and the notes ref are pinned, so what varies is the project id -
         /// the same per-run path hash, one indirection further on.
         PlanGeneration,
+        /// `last_unix_secs` / `last_success_unix_secs` on a checkout
+        /// observation: the wall-clock second a counter last moved. The
+        /// counter key-space, the exact counts, and the sequences are all
+        /// captured verbatim; only the clock reading is substituted.
+        ObservationWallClock,
+        /// The daemon version in doctor's `daemon` section. It is
+        /// `CARGO_PKG_VERSION`, so it moves on every release with no bridge
+        /// behavior having changed.
+        DaemonVersion,
+        /// `cfg.paths.state_dir` in doctor's `daemon` section: the HOST's
+        /// configured state directory, which sits outside the fixture root
+        /// and differs per machine and per lane. It must not reach the
+        /// committed bytes for a second reason beyond determinism: it
+        /// carries the operator's home path, and this is a public repo.
+        HostStateDir,
     }
 
     impl Normalization {
@@ -144,6 +159,9 @@ mod harness {
                 Self::RegisteredAt => "<REGISTERED_AT>",
                 Self::WorkingFingerprint => "<WORKING_FINGERPRINT>",
                 Self::PlanGeneration => "<PLAN_GENERATION>",
+                Self::ObservationWallClock => "<OBSERVED_AT_UNIX_SECS>",
+                Self::DaemonVersion => "blackboxd <DAEMON_VERSION>",
+                Self::HostStateDir => "<HOST_STATE_DIR>",
             }
         }
 
@@ -157,6 +175,9 @@ mod harness {
                 Self::RegisteredAt => "registry stamps wall-clock time",
                 Self::WorkingFingerprint => "derived from filesystem metadata",
                 Self::PlanGeneration => "digest over the per-run registry project id",
+                Self::ObservationWallClock => "wall-clock second a counter last moved",
+                Self::DaemonVersion => "CARGO_PKG_VERSION, moves every release",
+                Self::HostStateDir => "host state directory outside the fixture",
             }
         }
     }
@@ -389,6 +410,24 @@ mod harness {
             );
         }
 
+        /// Force the next publisher authorization to be a cold miss.
+        ///
+        /// This is what makes the observation counters EXACT rather than
+        /// projected. The authorization cache has a 250 millisecond TTL, so
+        /// whether a given call takes a lease depended on how fast the machine
+        /// was: the same replay produced different counts under load. Dropping
+        /// the cache entry before every captured row removes the timer from the
+        /// measurement entirely, so the replay always takes its full cold-path
+        /// lease count.
+        ///
+        /// It also captures the more interesting path. A warm run measures how
+        /// often the cache happened to hit; a cold run measures what the bridge
+        /// actually does when it has to resolve authority.
+        fn cold_authorization(&self) {
+            self.server
+                .invalidate_publisher_authority_cache(&self.scope);
+        }
+
         fn checkout(&self, dir: &Path, checkout_id: &str) -> ResolvedCheckoutScope {
             ResolvedCheckoutScope {
                 project_id: self.registry_project_id.clone(),
@@ -421,6 +460,33 @@ mod harness {
                 substitution(
                     Normalization::RegisteredAt,
                     self.registered_at.clone(),
+                    None,
+                ),
+                // Read from the SAME sources doctor renders them from, not
+                // parsed back out of the captured text: a substitution
+                // derived from the capture would agree with whatever the
+                // capture happened to say.
+                // ANCHORED to the rendered prefix, not the bare version.
+                // A bare "0.0.1" also matches inside the bind address
+                // 127.0.0.1, and the first regenerated capture duly read
+                // "127.<DAEMON_VERSION>". Short, low-entropy values have to
+                // carry enough surrounding context to be unambiguous; the
+                // guard below catches the general case.
+                substitution(
+                    Normalization::DaemonVersion,
+                    format!("blackboxd {}", env!("CARGO_PKG_VERSION")),
+                    None,
+                ),
+                substitution(
+                    Normalization::HostStateDir,
+                    self.server
+                        .state
+                        .config
+                        .read()
+                        .paths
+                        .state_dir
+                        .display()
+                        .to_string(),
                     None,
                 ),
             ];
@@ -487,30 +553,56 @@ mod harness {
         })
     }
 
-    /// The rendered knowledge and gap views append the process-wide
-    /// system-memory catalog.
+    /// Pin the process-wide system-memory catalog to a fixture-owned set.
     ///
-    /// That trailer is the SECOND structural exclusion in this harness, and for
-    /// the same reason as the doctor one: it is neither bridge nor catalog
-    /// content, it is identical in both modes, and capturing it verbatim would
-    /// break bridge parity on every unrelated `system-defaults/memories` edit -
-    /// noise that trains a reader to regenerate the fixture, which is precisely
-    /// how a parity harness dies. The exclusion is narrow and still fails loud
-    /// if the trailer disappears: `system_memories_present` is captured beside
-    /// the truncated body.
-    const SYSTEM_MEMORY_SECTION: &str = "\u{2500}\u{2500} System memories";
+    /// The rendered knowledge and gap views append this catalog. The bookend
+    /// review is right that truncating it was a projection: a change confined
+    /// to the trailer left the comparison green. Truncation was reached for
+    /// because capturing the REAL catalog verbatim would break bridge parity
+    /// on every unrelated `system-defaults/memories` edit.
+    ///
+    /// Pinning removes both problems instead of trading one for the other. The
+    /// catalog becomes two small fixture memories, so the trailer is captured
+    /// COMPLETE and byte for byte, and it moves only when this file moves.
+    ///
+    /// Two memories rather than one, because one cannot show ordering.
+    fn pin_system_memory_catalog(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        for (slug, title, order) in [
+            (
+                "bridge-parity-alpha",
+                "Bridge parity fixture memory alpha",
+                0,
+            ),
+            ("bridge-parity-beta", "Bridge parity fixture memory beta", 1),
+        ] {
+            let body = format!(
+                "+++\ntitle = {title:?}\ntags = [\"bridge-parity\", \"fixture\"]\n\
+             order = {order}\ntemplate = false\n+++\n\n\
+             # {title}\n\nFixture memory pinned by the bridge parity harness.\n"
+            );
+            std::fs::write(dir.join(format!("{slug}.md")), body).unwrap();
+        }
+        crate::system_memory::init_for_tests_from(dir);
 
-    fn tool_row_without_system_memories(result: &CallToolResult) -> Value {
-        let text = tool_text(result);
-        let (bridge_text, present) = match text.find(SYSTEM_MEMORY_SECTION) {
-            Some(at) => (text[..at].trim_end().to_string(), true),
-            None => (text.clone(), false),
-        };
-        json!({
-            "is_error": result.is_error.unwrap_or(false),
-            "system_memories_present": present,
-            "text": bridge_text,
-        })
+        // The catalog is a process-wide `OnceLock`. Under nextest every test is
+        // its own process so the pin always wins, but the documented plain
+        // `cargo test` fallback shares one process, and there `get_or_init`
+        // would silently keep whoever initialized first. Silently comparing
+        // against the REAL catalog is precisely the kind of confusion this
+        // harness exists to prevent, so prove the pin took.
+        assert!(
+            crate::system_memory::get("sm-bridge-parity-alpha").is_some(),
+            "the fixture system-memory catalog did not take. Another test in \
+         this process initialized the process-wide catalog first; run the \
+         bridge parity tests under nextest, which isolates per process."
+        );
+        assert!(
+            crate::system_memory::get("sm-agentic-opening-sequence").is_none(),
+            "the REAL system-memory catalog is live in this process, so the \
+         published views would capture repo memories instead of the pinned \
+         fixture pair."
+        );
     }
 
     /// One captured surface plus the normalizations it declares.
@@ -591,6 +683,38 @@ mod harness {
             );
             rendered = rendered.replace(substitution.actual.as_str(), &substitution.placeholder);
             fired.insert(substitution.normalization);
+        }
+        // Guard the whole substring-substitution technique, not just the
+        // one value that got caught. A short or low-entropy `actual` can
+        // match inside an unrelated token, and the result reads as a
+        // plausible capture rather than as an error: the first version
+        // substitution landed inside the bind address and produced
+        // "127.<DAEMON_VERSION>". A placeholder that ends up welded to
+        // adjacent word characters is that mistake, whatever caused it.
+        for substitution in substitutions {
+            let token = substitution
+                .placeholder
+                .trim_matches(|c| c == ':' || c == '"');
+            let mut from = 0;
+            while let Some(at) = rendered[from..].find(token) {
+                let start = from + at;
+                let end = start + token.len();
+                let before = rendered[..start].chars().next_back();
+                let after = rendered[end..].chars().next();
+                assert!(
+                    !before.is_some_and(|c| c.is_alphanumeric())
+                        && !after.is_some_and(|c| c.is_alphanumeric()),
+                    "row {}: substitution {:?} landed INSIDE a token \
+                     ({:?}...{:?} around {token}). The replaced value is \
+                     too short or too low-entropy to be unambiguous; anchor \
+                     it with surrounding context.",
+                    row.name,
+                    substitution.normalization,
+                    before,
+                    after
+                );
+                from = end;
+            }
         }
         for declared in &row.declares {
             assert!(
@@ -738,7 +862,7 @@ mod harness {
                     ..Default::default()
                 }))
                 .await;
-            rows.push(row(name, tool_row_without_system_memories(&result), &[]));
+            rows.push(row(name, tool_row(&result), &[]));
         }
         for (name, mode) in [
             ("published_gaps", "published"),
@@ -889,67 +1013,34 @@ mod harness {
         )
     }
 
-    /// The checkout observation snapshot after the whole replay.
+    /// The checkout observation snapshot after the whole replay, COMPLETE.
     ///
-    /// THIRD structural projection, and the narrowest of the three. Exact
-    /// counts and sequence numbers are a function of the 250 millisecond
-    /// publisher-authorization cache TTL: under parallel load the same replay
-    /// takes more cache misses and therefore more
-    /// `publisher_config_tree_read` leases, with no bridge behavior having
-    /// changed at all. Freezing those numbers would make the harness fail on
-    /// machine load, which trains a reader to regenerate the fixture - the one
-    /// habit that kills a parity harness.
+    /// Previously projected to kinds, denials, booleans, and the counter
+    /// key-space, because exact counts moved with machine load: the 250
+    /// millisecond publisher-authorization cache TTL means a slower run takes
+    /// more cache misses and therefore more `PublisherConfigTreeRead` leases.
     ///
-    /// What plan item 16 actually freezes is that observations stay
-    /// low-cardinality and schema-compatible, so that is what the row carries:
-    /// the operation kind inventory IN ORDER, `denied` EXACTLY (a denial is
-    /// never load-dependent, and a new one must fail), whether each kind was
-    /// granted at all, and the complete counter key-space of
-    /// kind x outcome x source lane. A new kind, a dropped kind, a reordering,
-    /// a new denial, a kind that stops being exercised, or a new counter
-    /// dimension all still fail.
+    /// The projection is gone and the variance is removed at its source
+    /// instead. `pin_publisher_authorization_misses` invalidates the scope's
+    /// authorization cache before every captured row, so every authorization
+    /// in the replay is a cold miss by construction rather than a race against
+    /// a 250 millisecond timer. Counts, sequences, and the granted totals are
+    /// all exact again; only the wall-clock reading is substituted.
     fn checkout_observation_row(fixture: &BridgeFixture) -> Row {
         let health = fixture.server.state.checkout_access_observations.health();
-        let operations = health
-            .operations
-            .iter()
-            .map(|operation| {
-                json!({
-                    "kind": format!("{:?}", operation.kind),
-                    "denied": operation.denied,
-                    "granted_any": operation.granted > 0,
-                })
-            })
-            .collect::<Vec<_>>();
-        let counter_key_space = health
-            .counters
-            .iter()
-            .map(|counter| {
-                json!({
-                    "kind": format!("{:?}", counter.kind),
-                    "outcome": format!("{:?}", counter.outcome),
-                    "source_lane": format!("{:?}", counter.source_lane),
-                })
-            })
-            .collect::<Vec<_>>();
         row(
             "checkout_observations",
-            json!({
-                "operations": operations,
-                "counter_key_space": counter_key_space,
-                "active_compatibility_lanes": health
-                    .active_compatibility_lanes
-                    .iter()
-                    .map(|lane| format!("{lane:?}"))
-                    .collect::<Vec<_>>(),
-            }),
-            &[],
+            serde_json::to_value(&health).unwrap(),
+            &[Normalization::ObservationWallClock],
         )
     }
 
-    /// Doctor, structurally. See the module header: findings embed host-global
-    /// state, so the row carries the section inventory in order, each section's
-    /// finding count, and each finding's level and suggested-next command.
+    /// Doctor, COMPLETE, including every finding message.
+    ///
+    /// Previously projected to sections, counts, levels, and next commands.
+    /// Finding messages are captured verbatim now; the fields that genuinely
+    /// cannot be pinned are named individually in the ledger entry and
+    /// substituted by exact value, not dropped.
     async fn doctor_row(fixture: &BridgeFixture) -> Row {
         let result = fixture
             .server
@@ -957,34 +1048,15 @@ mod harness {
                 format: Some("json".into()),
             }))
             .await;
-        let report: Value = serde_json::from_str(&tool_text(&result)).expect("doctor json");
-        let sections = report["sections"]
-            .as_array()
-            .expect("doctor sections")
-            .iter()
-            .map(|section| {
-                json!({
-                    "section": section["section"],
-                    "finding_count": section["findings"].as_array().map(Vec::len),
-                    "findings": section["findings"]
-                        .as_array()
-                        .unwrap_or(&Vec::new())
-                        .iter()
-                        .map(|finding| json!({
-                            "level": finding["level"],
-                            "next": finding.get("next"),
-                        }))
-                        .collect::<Vec<_>>(),
-                })
-            })
-            .collect::<Vec<_>>();
         row(
-            "doctor_sections",
-            json!({
-                "sections": sections,
-                "checkout_access_present": !report["checkout_access"].is_null(),
-            }),
-            &[],
+            "doctor_report",
+            tool_row(&result),
+            &[
+                Normalization::FixtureRoot,
+                Normalization::ObservationWallClock,
+                Normalization::DaemonVersion,
+                Normalization::HostStateDir,
+            ],
         )
     }
 
@@ -1032,6 +1104,72 @@ mod harness {
         )
     }
 
+    /// Every wall-clock reading present in the captured rows.
+    ///
+    /// Collected from the CAPTURE itself rather than from a second health
+    /// read, so the substituted value is exactly the one in the row.
+    fn observation_wall_clock_substitutions(rows: &[Row]) -> Vec<Substitution> {
+        let mut readings = BTreeSet::new();
+        for row in rows {
+            collect_wall_clock(&row.value, &mut readings);
+        }
+        readings
+            .into_iter()
+            .flat_map(|reading| {
+                // The same reading appears in TWO JSON positions: as a bare
+                // NUMBER on an observation counter, and inside a doctor
+                // message STRING. One placeholder cannot be valid in both,
+                // so each reading emits two substitutions and the
+                // value-position form runs first.
+                //
+                // Matching the leading colon is what makes the
+                // value-position form safe: it cannot match a quoted string
+                // that merely starts with the same digits, because a quote
+                // sits between the colon and the digits there.
+                let token = Normalization::ObservationWallClock.placeholder();
+                [
+                    Substitution {
+                        normalization: Normalization::ObservationWallClock,
+                        actual: format!(":{reading}"),
+                        placeholder: format!(":\"{token}\""),
+                    },
+                    Substitution {
+                        normalization: Normalization::ObservationWallClock,
+                        actual: reading.to_string(),
+                        placeholder: token.to_string(),
+                    },
+                ]
+            })
+            .collect()
+    }
+
+    fn collect_wall_clock(value: &Value, out: &mut BTreeSet<u64>) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    if (key == "last_unix_secs" || key == "last_success_unix_secs")
+                        && let Some(reading) = child.as_u64()
+                    {
+                        // Guard the string substitution: a COUNT must never be
+                        // mistaken for a clock reading and blanked.
+                        assert!(
+                            reading >= 1_000_000_000,
+                            "{key} {reading} is too small to be a clock reading"
+                        );
+                        out.insert(reading);
+                    }
+                    collect_wall_clock(child, out);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    collect_wall_clock(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// The plan generation digest, read out of the captured plan row itself.
     fn plan_generation_substitutions(rows: &[Row]) -> Vec<Substitution> {
         let Some(plan) = rows.iter().find(|row| row.name == "provenance_export_plan") else {
@@ -1075,20 +1213,37 @@ mod harness {
     async fn capture(audit: bool) -> Value {
         // Several captured tools consult the process-wide system-memory
         // catalog. Without it they refuse with a panic-shaped error, which
-        // would freeze a broken response as the parity baseline.
-        crate::init_system_memory_for_tests();
+        // would freeze a broken response as the parity baseline. Pinned to
+        // a fixture-owned pair so the trailer they append is captured
+        // COMPLETE and moves only when this file moves.
+        let memories = tempfile::tempdir().unwrap();
+        pin_system_memory_catalog(memories.path());
         let fixture = BridgeFixture::new();
         fixture.recompute_overlays();
 
-        let mut rows = vec![publisher_authorization_row(&fixture)];
+        // Every row starts from a cold authorization cache, so the lease
+        // counts the observation row captures are a property of the code
+        // path and not of how fast this machine happened to be.
+        let mut rows = Vec::new();
+        fixture.cold_authorization();
+        rows.push(publisher_authorization_row(&fixture));
+        fixture.cold_authorization();
         rows.extend(view_rows(&fixture).await);
+        fixture.cold_authorization();
         rows.push(file_provider_row(&fixture).await);
+        fixture.cold_authorization();
         rows.push(blame_row(&fixture).await);
+        fixture.cold_authorization();
         rows.push(render_row(&fixture).await);
+        fixture.cold_authorization();
         rows.extend(provenance_rows(&fixture).await);
+        fixture.cold_authorization();
         rows.push(project_administration_row(&fixture));
+        fixture.cold_authorization();
         rows.push(watcher_row(&fixture));
+        fixture.cold_authorization();
         rows.push(catalog_only_refusal_row(&fixture).await);
+        fixture.cold_authorization();
         rows.push(doctor_row(&fixture).await);
         // Last: the observation snapshot must reflect every lease the replay
         // above actually took.
@@ -1114,7 +1269,7 @@ mod harness {
             "project_administration",
             "watcher_carriers",
             "catalog_only_tools_refuse",
-            "doctor_sections",
+            "doctor_report",
             "checkout_observations",
         ]
         .into_iter()
@@ -1130,6 +1285,7 @@ mod harness {
         // not from a second health read, so the substituted value is exactly
         // the one in the capture.
         substitutions.extend(plan_generation_substitutions(&rows));
+        substitutions.extend(observation_wall_clock_substitutions(&rows));
         let mut normalized = serde_json::Map::new();
         let mut observed = BTreeMap::new();
         for row in &rows {
