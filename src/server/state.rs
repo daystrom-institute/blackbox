@@ -927,6 +927,190 @@ impl SharedState {
 }
 
 #[cfg(test)]
+pub(crate) mod recordless_provider {
+    //! Clause 1 of the exit proof (plan section 14.1): no corpus-only
+    //! request requires `ProjectRecord`.
+    //!
+    //! The denial seam is FIELD-level, not method-level. `ProjectRecordsProvider`
+    //! exposes one method and `ProjectRecordsSnapshot` carries two distinct
+    //! views: `records` is the attached-only, path-bearing compatibility
+    //! rows, and `corpus_project_ids` is the complete catalog id set that
+    //! seeds corpus identity surfaces. Panicking on `records_snapshot`
+    //! would deny both at once and kill the very paths this clause must
+    //! prove.
+    //!
+    //! So `records` is EMPTY with `omitted_catalog_count` equal to the
+    //! catalog count, while `corpus_project_ids`, `authority_epoch`, and
+    //! `code_identities` stay live. Empty is the stronger proof: a panic
+    //! shows only that the accessor went uncalled, while an empty
+    //! attached-row view lets any path that still derives behavior from
+    //! `ProjectRecord` content surface a typed refusal or an observably
+    //! empty result instead of passing by luck.
+
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use bbox_corpus_core::code_project_identity::CodeProjectIdentity;
+    use bbox_corpus_core::project_record::{ProjectRecordsProvider, ProjectRecordsSnapshot};
+
+    /// Wraps the real catalog provider and blanks exactly one field.
+    pub(crate) struct RecordlessProjectRecordsProvider {
+        inner: Arc<dyn ProjectRecordsProvider>,
+    }
+
+    impl RecordlessProjectRecordsProvider {
+        pub(crate) fn new(inner: Arc<dyn ProjectRecordsProvider>) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl ProjectRecordsProvider for RecordlessProjectRecordsProvider {
+        fn records_snapshot(&self) -> ProjectRecordsSnapshot {
+            let live = self.inner.records_snapshot();
+            let omitted = live.corpus_project_ids.len() as u64;
+            ProjectRecordsSnapshot {
+                records: Arc::new(Vec::new()),
+                corpus_project_ids: live.corpus_project_ids,
+                omitted_catalog_count: omitted,
+                authority_epoch: live.authority_epoch,
+            }
+        }
+
+        fn code_identities(&self) -> BTreeMap<String, CodeProjectIdentity> {
+            // Identity is corpus-side, not record-side. Blanking it would
+            // deny a surface the clause is meant to prove still works.
+            self.inner.code_identities()
+        }
+
+        fn last_degradation(&self) -> Option<String> {
+            self.inner.last_degradation()
+        }
+    }
+}
+
+#[cfg(test)]
+mod clause_one_exit_proof {
+    //! Plan section 14.1. Every corpus-only operation must behave
+    //! IDENTICALLY against a provider whose attached-row view is empty.
+    //! Equality is the proof: success alone would not rule out a path
+    //! quietly deriving behavior from `ProjectRecord` content.
+
+    use std::sync::Arc;
+
+    use super::catalog_fixture::{COMMIT_ONE, CatalogFixture, gap_note, knowledge_entry};
+    use super::recordless_provider::RecordlessProjectRecordsProvider;
+    use super::{BlackboxServer, SharedState};
+
+    const PROJECT: &str = "p_clause_one";
+
+    /// A populated server and its recordless twin over the same durable
+    /// bytes, so any difference is the blanked field and nothing else.
+    fn twin(fixture: &CatalogFixture) -> (BlackboxServer, BlackboxServer) {
+        let populated = fixture.server();
+        let recordless = fixture.server_with_records_provider(|inner| {
+            Arc::new(RecordlessProjectRecordsProvider::new(inner))
+        });
+        (populated, recordless)
+    }
+
+    fn fixture_with_content() -> CatalogFixture {
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        fixture.install_publication(
+            PROJECT,
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-a", "published")],
+            &[gap_note("gap-11111111", "published")],
+        );
+        fixture
+    }
+
+    /// The seam itself: `records` is empty, the corpus id set is not, and
+    /// the omitted count names exactly what was withheld.
+    #[test]
+    fn the_denial_seam_is_field_level_not_method_level() {
+        let fixture = fixture_with_content();
+        let (populated, recordless) = twin(&fixture);
+
+        let full = populated.state.records_provider.records_snapshot();
+        let blanked = recordless.state.records_provider.records_snapshot();
+
+        assert!(blanked.records.is_empty(), "attached rows are withheld");
+        assert_eq!(
+            blanked.corpus_project_ids, full.corpus_project_ids,
+            "the corpus id set stays live; denying it would kill the paths under proof"
+        );
+        assert_eq!(blanked.authority_epoch, full.authority_epoch);
+        assert_eq!(
+            blanked.omitted_catalog_count,
+            full.corpus_project_ids.len() as u64
+        );
+        assert_eq!(
+            recordless.state.records_provider.code_identities(),
+            populated.state.records_provider.code_identities(),
+            "code identity is corpus-side, not record-side"
+        );
+    }
+
+    /// Published knowledge and gaps are corpus-only reads: identical bytes
+    /// with and without the attached-row view.
+    #[test]
+    fn published_views_are_byte_identical_without_attached_rows() {
+        let fixture = fixture_with_content();
+        let (populated, recordless) = twin(&fixture);
+
+        let expected = populated.session_knowledge_view(None, None).unwrap();
+        let actual = recordless.session_knowledge_view(None, None).unwrap();
+        let ids = expected
+            .knowledge
+            .all_entries()
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            !ids.is_empty(),
+            "the fixture publishes knowledge to compare"
+        );
+        assert_eq!(
+            serde_json::to_string(&actual.structured_response(&ids)).unwrap(),
+            serde_json::to_string(&expected.structured_response(&ids)).unwrap(),
+            "published knowledge must not vary with the attached-row view"
+        );
+
+        let expected = populated.session_gap_view(None, None).unwrap();
+        let actual = recordless.session_gap_view(None, None).unwrap();
+        assert_eq!(
+            serde_json::to_string(actual.gaps.all()).unwrap(),
+            serde_json::to_string(expected.gaps.all()).unwrap(),
+            "published gaps must not vary with the attached-row view"
+        );
+        assert_eq!(actual.diagnostics, expected.diagnostics);
+    }
+
+    /// A remote-only project has no attached row in EITHER provider, so
+    /// this row also proves the equality is not vacuous for the populated
+    /// side: the populated provider genuinely carries rows for attached
+    /// projects elsewhere in the fixture set.
+    #[test]
+    fn the_corpus_id_set_still_seeds_identity_for_a_remote_only_project() {
+        let fixture = fixture_with_content();
+        let (_, recordless) = twin(&fixture);
+        let snapshot = recordless.state.records_provider.records_snapshot();
+        assert!(snapshot.corpus_project_ids.contains(PROJECT));
+        assert!(
+            recordless
+                .state
+                .records_provider
+                .code_identities()
+                .contains_key(PROJECT),
+            "identity for a project with no attached row still resolves"
+        );
+    }
+}
+
+#[cfg(test)]
 mod committed_bytes_parity_tests {
     //! The fixture must hash exactly what a writer commits.
     //!
@@ -1985,6 +2169,24 @@ pub(crate) mod catalog_fixture {
                 &self.root,
                 &self.catalog_projects_path,
             )))
+        }
+
+        /// A server whose records provider is wrapped, over the same
+        /// durable bytes as `server()`.
+        ///
+        /// Added for the clause 1 exit proof, which needs two servers that
+        /// differ ONLY in the attached-row view. Wrapping happens before
+        /// the state is shared, so no cached projection straddles the swap.
+        pub(crate) fn server_with_records_provider(
+            &self,
+            wrap: impl FnOnce(
+                Arc<dyn bbox_corpus_core::project_record::ProjectRecordsProvider>,
+            )
+                -> Arc<dyn bbox_corpus_core::project_record::ProjectRecordsProvider>,
+        ) -> BlackboxServer {
+            let mut state = SharedState::for_test_catalog(&self.root, &self.catalog_projects_path);
+            state.records_provider = wrap(state.records_provider.clone());
+            BlackboxServer::new(Arc::new(state))
         }
 
         /// The same server with the real catalog checkout authority in
