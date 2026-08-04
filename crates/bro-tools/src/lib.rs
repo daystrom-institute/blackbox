@@ -9,6 +9,14 @@
 //! Nothing here knows about Anthropic, providers, or the stream-json wire
 //! format — those live in `bro-harness`.
 
+// Phase 4 concurrency enforcement (concurrency-model §5): this crate denies
+// clippy::disallowed_methods so blocking fs and process calls stay out of
+// production actor contexts. Test code legitimately spawns processes and
+// touches the filesystem, so the lint is allowed only under cfg(test). The
+// non-test build of this same code is still checked: --all-targets compiles
+// this target without cfg(test) too, with the deny in force.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 pub mod edits;
 pub mod fleet_worktree;
 pub mod promise;

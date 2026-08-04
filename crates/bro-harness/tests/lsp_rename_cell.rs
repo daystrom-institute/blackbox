@@ -4,6 +4,12 @@
 //!
 //! Skips (like bro-lsp's rust_analyzer test) when rust-analyzer is absent.
 
+// This target is entirely test code, which legitimately spawns rust-analyzer
+// and writes fixture trees. The crate-level deny on clippy::disallowed_methods
+// exists to keep blocking calls out of production actor contexts
+// (concurrency-model §5); it has no production surface to protect here.
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Stdio;

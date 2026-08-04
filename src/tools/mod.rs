@@ -3,6 +3,12 @@
 // exceptions (run_blocking-closure helpers, tracked migration debt) carry
 // reasoned #[allow]s; everything else is a build error.
 #![deny(clippy::disallowed_methods)]
+// Tests in these modules legitimately build fixture trees and spawn git, and
+// they run on their own threads rather than tokio workers, so the deny above
+// has no production surface to protect there. The handler bodies it does
+// protect are still checked: --all-targets compiles these modules without
+// cfg(test) too, and scripts/lint-concurrency.sh is the syntactic backstop.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 pub mod agents;
 pub mod artifacts;
 pub mod atoms;
